@@ -10,10 +10,16 @@ version 记。系统派生的运行（评测、对账、召回）不比：它们
 MAX_CANDIDATES 份（按工作流、版本、节点排好的先后）。
 
 **怎么比。** data/sql_semantics.match_template：先绑定参数（只是启发），再按绑定渲染口径的取数 SQL 交 explain_sql_diff 证明。
+
+**助手选用的（composed）。** 问数据的助手 use_caliber 选用口径时，取数节点是服务端照那一版拷进来的（ledger/compose.py），
+口径卡的 caliber_from 带着改名映射 {原 id: 新 id}。这几个节点交回的查询照样要证明：证明了的那一份记 how=composed，查询
+状态记 composed——数确实来自口径，但「这份口径答的就是这个问题」是助手凭问法判断的，不能说成「等价已证明」（拍板 L1：
+自动正式出具只给独立等价的）。没能证明的（拷进来之后在画布上被改过）照常是相关口径，另写一句为什么。映射从这次运行
+封存的图里读（composed_nodes），比对时把那一份口径排在最前面，不会因为候选太多被挤掉。
 schema 用这条查询当时冻结的表结构（表结构快照），列的中文名取同一份快照里冻结的数据目录。只读封存范围内的快照（api/evidence
 的 _sealed 读法），读不出、被改过的快照不比，记 skipped。
 
-**资源。** 每次运行限时 TIMEOUT_S（缺省 8 秒），在线程里跑，同时最多 CONCURRENCY（2）个（照 scheduler/auto_compare 的做法：
+**资源。** 每次运行限时（设置 ledger.match_timeout_s，缺省 TIMEOUT_S = 8 秒），在线程里跑，同时最多 CONCURRENCY（2）个（照 scheduler/auto_compare 的做法：
 信号量按事件循环分开，线程池两个线程）。时限按绑定逐组看：过了时限，还没比的口径记 skipped（比对超时）；整次比对卡在线程里
 过了时限再加 GRACE_S 还没回来，整次记 skipped。解析失败同样照实记 skipped 和原因。都只记日志和 skipped，不影响运行本身。
 
@@ -68,6 +74,7 @@ SNAPSHOT_MISSING = "查询快照读不出来，不比对"
 NO_SQL = "查询快照里没有 SQL，不比对"
 PARSE_FAILED = "这次的 SQL 无法解析，没有比对"
 MERGED = "合并查询的格不和口径比对（它的数来自各个输入的查询）"
+COMPOSED_UNPROVEN = "这条查询出自助手选用的口径，但和口径的取数没能证明一致（可能被改过）"
 MORE_CANDIDATES = "另有 {n} 份相关口径没有比对（每条查询最多比 {max} 份）"
 
 #: 不比对的原因（GET 账本时照实说）
@@ -304,11 +311,32 @@ def _skipped(caliber: Caliber, fetch: Fetch, reason: str) -> dict[str, Any]:
             "level": caliber.level, "node_id": fetch.node_id, "status": "skipped", "reason": reason}
 
 
-def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: float | None = None
-                    ) -> list[dict[str, Any]]:
+def composed_nodes(graph: Any) -> dict[str, tuple[str, str]]:
+    """这次运行的图里助手选用口径拷进来的取数节点：{这张图里的节点 id: (「工作流@版本」, 那一版里的原 id)}。从口径卡的
+    caliber_from.nodes 读（ledger/compose.py 实例化时写的）；没有改名映射的口径卡不算（蓝图复用口径时取数是模型写的）。"""
+    out: dict[str, tuple[str, str]] = {}
+    for node in (graph or {}).get("nodes") or [] if isinstance(graph, dict) else []:
+        if not isinstance(node, dict) or node.get("type") != "metrics":
+            continue
+        cfg = (node.get("data") or {}).get("config") if isinstance(node.get("data"), dict) else None
+        ref = cfg.get("caliber_from") if isinstance(cfg, dict) else None
+        rename = ref.get("nodes") if isinstance(ref, dict) else None
+        version = ref.get("workflow_version") if isinstance(ref, dict) else None
+        if not isinstance(rename, dict) or not ref.get("workflow_id") or not str(version or "").isdigit():
+            continue
+        key = ledger_labels.caliber_key(str(ref["workflow_id"]), int(version))
+        for old, new in rename.items():
+            if isinstance(old, str) and isinstance(new, str):
+                out.setdefault(new, (key, old))
+    return out
+
+
+def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: float | None = None,
+                    composed: dict[str, tuple[str, str]] | None = None) -> list[dict[str, Any]]:
     """每条查询和预筛出来的口径取数逐个比（match_template），给出 [{artifact, node_id, source, tables, status, reason?,
-    candidates}]。status：proven（和某一份等价）/ related（有同源同表的口径，都不等价）/ none（没有相关的口径）/ skipped
-    （没比完：超时、解析失败、快照读不出）。纯计算，从不抛异常。评测逐题比 SQL 也调它。"""
+    candidates}]。status：proven（和某一份等价）/ composed（助手选用的那一份，证明了）/ related（有同源同表的口径，都不
+    等价）/ none（没有相关的口径）/ skipped（没比完：超时、解析失败、快照读不出）。composed 是 composed_nodes 的结果，
+    不给就没有助手选用的。纯计算，从不抛异常。评测逐题比 SQL 也调它。"""
     from app.data.sql_semantics import match_template, normalize_sql
 
     out: list[dict[str, Any]] = []
@@ -318,7 +346,11 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
         if query.problem:
             out.append({**row, "status": "skipped", "reason": query.problem, "candidates": []})
             continue
+        chosen = (composed or {}).get(str(query.node_id or ""))
         pool = [(c, f) for c in calibers for f in c.fetches if f.source == query.source and f.tables & query.tables]
+        if chosen is not None:
+            # 助手选用的那一份排最前面：候选多的时候也一定比到它
+            pool.sort(key=lambda cf: (cf[0].key, cf[1].node_id) != chosen)
         if not pool:
             out.append({**row, "status": "none", "candidates": []})
             continue
@@ -337,9 +369,18 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
                 logger.exception("口径比对出错（运行查询 %s，口径 %s）", query.artifact[:12], caliber.key)
                 candidates.append(_skipped(caliber, fetch, "比对出错"))
                 continue
-            candidates.append(_candidate(caliber, fetch, m))
+            cand = _candidate(caliber, fetch, m)
+            if chosen is not None and (caliber.key, fetch.node_id) == chosen:
+                if cand["status"] == "proven":
+                    cand["how"] = "composed"
+                else:
+                    cand.setdefault("reason", COMPOSED_UNPROVEN)
+            candidates.append(cand)
         statuses = {c["status"] for c in candidates}
         status = "proven" if "proven" in statuses else "skipped" if "skipped" in statuses else "related"
+        if status == "proven" and any(c.get("how") == "composed" for c in candidates):
+            # 证明了的是助手选用的那一份：数来自口径，但不是这次独立写出来的（见模块说明）。同时和别的口径等价的也按选用的算
+            status = "composed"
         if len(pool) > MAX_CANDIDATES:
             row["note"] = MORE_CANDIDATES.format(n=len(pool) - MAX_CANDIDATES, max=MAX_CANDIDATES)
         if status == "skipped":
@@ -359,7 +400,7 @@ def compute(sealed: Any, calibers: list[Caliber], kinds: dict[str, str | None], 
         results = [{"artifact": q.artifact, "node_id": q.node_id, "source": q.source, "tables": sorted(q.tables),
                     "status": "skipped", "reason": SEAL_BROKEN, "candidates": []} for q in queries]
     else:
-        results = compare_queries(queries, calibers, deadline=deadline)
+        results = compare_queries(queries, calibers, deadline=deadline, composed=composed_nodes(sealed.graph))
     used = {c["caliber"] for q in results for c in q["candidates"]}
     considered = [c for c in calibers if c.key in used]
     by_key = {c.key: {"level": c.level, "fields": c.summary()["fields"], "expressions": list(c.expressions)}
@@ -436,15 +477,21 @@ async def _kinds(session: Any) -> dict[str, str | None]:
     return {name: kind for name, kind in (await session.execute(select(DataSource.name, DataSource.kind))).all()}
 
 
-async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float = TIMEOUT_S) -> str | None:
+async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float | None = None) -> str | None:
     """比对一次运行，存工件、追加 ledger.matched；返回工件 id。不比对（不是探索运行、没成功、没封存、没有查询）、比对期间
-    运行换了封存时返回 None。比对本身出的问题都记成 skipped，不抛。"""
+    运行换了封存时返回 None。比对本身出的问题都记成 skipped，不抛。timeout 不给按设置（ledger.match_timeout_s）。
+
+    运行一封存就比的（trigger=sealed）比完接着看能不能按口径自动正式出具（ledger/issue.auto_issue，拍板 L1）：事后补比、
+    按需比的不自动出具——那是按现在的口径回看老答案，不该替人补发正式运行。"""
     from app.api.evidence import _sealed
+    from app.api.settings import ledger_settings
 
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if ineligible(run) is not None:
             return None
+        if timeout is None:
+            timeout = float((await ledger_settings(session))["match_timeout_s"])
     sealed = await _sealed(run_id)
     if not sealed.queries:
         return None
@@ -459,7 +506,12 @@ async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float = TI
         except TimeoutError:
             logger.warning("运行 %s 的口径比对超过 %g 秒仍未完成，记为没比完", run_id, timeout + GRACE_S)
             content = _timed_out(sealed)
-    return await store.save(run_id, content, seal=(sealed.run_manifest_seq, sealed.manifest_hash), trigger=trigger)
+    artifact = await store.save(run_id, content, seal=(sealed.run_manifest_seq, sealed.manifest_hash), trigger=trigger)
+    if artifact is not None and trigger == "sealed" and (content.get("whole") or {}).get("equivalent"):
+        from app.ledger import issue
+
+        await issue.auto_issue(run_id)
+    return artifact
 
 
 def schedule(run_id: str, *, trigger: str = "sealed") -> bool:
@@ -544,9 +596,17 @@ def _mine() -> list[asyncio.Task[Any]]:
 
 
 async def drain() -> None:
-    """等这个事件循环里的后台比对都做完（测试用）。"""
-    while tasks := _mine():
-        await asyncio.gather(*tasks, return_exceptions=True)
+    """等这个事件循环里的后台比对都做完（测试用）。只等还没做完的：已经做完、还留在登记里的（完成回调还没来得及跑）顺手
+    去掉——不然对着做完的任务反复 gather，事件循环原地空转（并行跑全量测试时偶发过）。"""
+    while True:
+        tasks = _mine()
+        for task in tasks:
+            if task.done():
+                _background.discard(task)
+        live = [task for task in tasks if not task.done()]
+        if not live:
+            return
+        await asyncio.gather(*live, return_exceptions=True)
 
 
 async def shutdown() -> None:
@@ -558,5 +618,5 @@ async def shutdown() -> None:
 
 
 __all__ = ["BACKFILL_DAYS", "CONCURRENCY", "EXPLORE_ORIGINS", "TIMEOUT_S", "Caliber", "Fetch", "Query", "backfill",
-           "caliber_of", "compare_queries", "compute", "drain", "ineligible", "load_calibers", "match_run", "pending",
-           "read_queries", "schedule", "shutdown", "start_backfill", "wanted"]
+           "caliber_of", "compare_queries", "composed_nodes", "compute", "drain", "ineligible", "load_calibers",
+           "match_run", "pending", "read_queries", "schedule", "shutdown", "start_backfill", "wanted"]

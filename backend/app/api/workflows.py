@@ -576,6 +576,10 @@ async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: Wo
     workflow.published_version = snapshot.version
     workflow.published_by = actor
     await session.commit()
+    # 口径账本（next-round 02 做法 8）：从问数据固化出的口径发布了，来源运行在后台按它补比一次（不挡发布）
+    from app.ledger.certify import after_publish
+
+    after_publish(workflow.id, workflow.origin)
     return {
         "ok": True,
         "level": level,

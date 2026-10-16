@@ -699,6 +699,10 @@ async def unresolved_caliber_upgrades(
             ref = node.config["caliber_from"]
             pinned, wf_id = ref.get("workflow_version"), ref.get("workflow_id")
             extra = {"caliber_node": ref.get("node_id")}
+            if isinstance(ref.get("nodes"), dict) and ref["nodes"]:
+                # 拷进这张图时改了名的取数节点（next-round 02 做法 4）：升版事件照记映射，证据面板说得清这张卡读的是哪几个
+                # 节点；升不升版、怎么处置和没改名的卡同一套规则
+                extra["caliber_nodes"] = dict(ref["nodes"])
             what = f"「{node.title}」（口径卡）引用的口径卡固定在 v{pinned}"
         else:
             continue

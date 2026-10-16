@@ -9,6 +9,11 @@
 读别的（整形、沙箱、模型写的、按别的行号取）的卡照实说不能复用，请按表重新对。
 
 点名写法：source 写工作流名（或 id），name 写指标名（或指标 id）；只写 source 列那个工作流的全部指标。
+
+**问数据里**（compose=True，next-round 02 做法 4）：同一套口径，另给每张卡的入口字段（类型、必填、可选值、格式、缺省值，
+同 apps/describe 的写法）和「能不能组合」，能组合的写出 use_caliber 的写法；仍然不给 SQL（SQL 里可能写着遮罩值，组合
+时取数节点由服务端照抄，见 ledger/compose.py）。能不能组合由 ledger/derive.load_pinned 判（和对账、评测同一个认法），
+读好的版本快照交给 GraphApplier（流里不碰库）。蓝图助手不走这一支，行为不变。
 """
 from __future__ import annotations
 
@@ -32,6 +37,13 @@ DETAIL_REUSE_PROMPT = ("    复用写法（「看哪些数」这一项的 reuse 
                        "    这张卡读：{inputs}。实例化时那个库的取数节点就叫这个名字、交出这几列，复用才算得出来")
 DETAIL_INPUT_PROMPT = "{node}（{tool}）的列 {columns}"
 DETAIL_NOT_REUSABLE_PROMPT = "    不能复用：{reason}。请按表重新对"
+#: 问数据里（compose）每张卡写一次：入口字段、能不能组合
+DETAIL_FIELDS_PROMPT = "    口径「{workflow}」v{version} 的入口字段：{fields}"
+DETAIL_FIELD_PROMPT = "{name}（{bits}）{desc}"
+DETAIL_NO_FIELDS_PROMPT = "    口径「{workflow}」v{version} 的入口没有字段"
+DETAIL_COMPOSE_PROMPT = ("    能组合：选用写法 {op}（id 自己起，它就是口径卡的节点 id；inputs 按上面的入口字段填，没写的取缺省值；"
+                         "metrics 写要用的指标 id）")
+DETAIL_NOT_COMPOSABLE_PROMPT = "    不能组合：{reason}。这份口径只能作为参考，查库交给 agent"
 BRIEF_PROMPT = "· {name}（{workflow} v{version}）：字数超过上限，只列名字，要看指标式时点名再 look"
 MISSING_PROMPT = "没找到口径：{items}（只能查看已发布且未退役的版本里的口径卡；别拿名字相近的顶替）"
 INDEX_LINE_PROMPT = "{workflow}｜{card}｜{name}（{metric}）｜{unit}"
@@ -145,17 +157,36 @@ def views_of(workflow_id: str, workflow_name: str, version: Any) -> list[Caliber
     return out
 
 
+def field_text(f: dict[str, Any]) -> str:
+    """入口字段写给模型的一段：名字（类型，必填，可选值，格式，缺省值）：说明。同 apps/describe 的写法，多写缺省值。"""
+    bits = [str(f.get("type") or "string")]
+    if f.get("required") and f.get("default") in (None, ""):
+        bits.append("必填")
+    if isinstance(f.get("enum"), list):
+        bits.append("可选值 " + " / ".join(str(v) for v in f["enum"][:10]))
+    if f.get("format"):
+        bits.append(f"格式 {f['format']}")
+    if f.get("default") not in (None, ""):
+        bits.append(f"缺省 {f['default']}")
+    desc = f"：{f['description']}" if f.get("description") else ""
+    return DETAIL_FIELD_PROMPT.format(name=f.get("name"), bits="，".join(bits), desc=desc)
+
+
 class CaliberKind:
     kind = "caliber"
     label = "口径"
 
-    def __init__(self, items: list[CaliberView], *, picker: Picker | None = None) -> None:
+    def __init__(self, items: list[CaliberView], *, picker: Picker | None = None,
+                 options: list[Any] | None = None) -> None:
         self.items = items
         self.picker = picker
+        #: 问数据里（compose）：每张卡能不能组合（ledger/compose.Option），没开组合时为 None
+        self.options = options
 
     @classmethod
-    async def load(cls, session: Any, *, picker: Picker | None = None) -> CaliberKind:
-        """读每个工作流最新的已发布且未退役的版本里的口径卡。用调用方的会话，开流之前读好。"""
+    async def load(cls, session: Any, *, picker: Picker | None = None, compose: bool = False) -> CaliberKind:
+        """读每个工作流最新的已发布且未退役的版本里的口径卡。用调用方的会话，开流之前读好。compose：问数据里，另把每张卡
+        的那一版读好、判能不能组合（见模块说明）。"""
         from sqlalchemy import select
 
         from app.apps import versions as app_versions
@@ -166,7 +197,13 @@ class CaliberKind:
             latest = await app_versions.latest_published(session, wf.id)
             if latest is not None:
                 items += views_of(wf.id, wf.name, latest)
-        return cls(items, picker=picker)
+        return cls(items, picker=picker, options=await _options(session, items) if compose else None)
+
+    def option_of(self, item: CaliberView) -> Any | None:
+        if self.options is None:
+            return None
+        return next((o for o in self.options if (o.workflow_id, o.version, o.node_id) ==
+                     (item.workflow_id, item.version, item.node_id)), None)
 
     def _workflows(self) -> dict[str, list[CaliberView]]:
         out: dict[str, list[CaliberView]] = {}
@@ -243,14 +280,18 @@ class CaliberKind:
                      missing: list[LookTarget] = ()) -> tuple[str, list[dict[str, Any]]]:
         lines: list[str] = []
         used = 0
+        #: 问数据里每张卡的入口字段、组合写法只写一次（同一张卡的几个指标挨着列）
+        seen: set[tuple[str, int, str]] = set()
         for item, _how in objects:
             block = [DETAIL_HEAD_PROMPT.format(name=item.name, metric=item.metric_id,
                                                unit=f"，单位 {item.unit}" if item.unit else "",
                                                workflow=item.workflow_name, version=item.version, card=item.card,
                                                caliber=item.caliber),
                      DETAIL_EXPR_PROMPT.format(expression=item.expression)]
-            reuse = item.reuse()
-            if reuse is not None:
+            option = self.option_of(item)
+            if option is not None:
+                block += _compose_lines(item, option, seen)
+            elif (reuse := item.reuse()) is not None:
                 block.append(DETAIL_REUSE_PROMPT.format(
                     reuse=json.dumps({k: v for k, v in reuse.items() if k != "inputs"}, ensure_ascii=False),
                     inputs="；".join(DETAIL_INPUT_PROMPT.format(node=n, tool=t, columns="、".join(cols))
@@ -279,6 +320,50 @@ class CaliberKind:
                     ref.get("workflow_id"), ref.get("version"), ref.get("node_id"), ref.get("metric_id")):
                 return (item.reuse(), None) if item.reason is None else (None, item.reason)
         return None, "只能复用已发布且未退役的版本里的口径卡（look 给出的那一版）"
+
+
+async def _options(session: Any, items: list[CaliberView]) -> list[Any]:
+    """每张卡（工作流、版本、卡）读一次那一版、判能不能组合：ledger/derive.load_pinned（和对账、评测同一个认法），再看
+    取数 SQL 模板里的参数认不认得出写在哪（ledger/compose 校验参数要用）。"""
+    from app.ledger.compose import ComposeRefused, Option, _slot_contexts
+    from app.ledger.derive import NotDerivable, load_pinned
+
+    out: list[Any] = []
+    for item in items:
+        if any((o.workflow_id, o.version, o.node_id) == (item.workflow_id, item.version, item.node_id) for o in out):
+            continue
+        base = {"workflow_id": item.workflow_id, "workflow_name": item.workflow_name, "version": item.version,
+                "level": item.level, "node_id": item.node_id, "card": item.card}
+        try:
+            pinned = await load_pinned(session, item.workflow_id, item.version, item.node_id)
+            _slot_contexts(pinned)
+        except NotDerivable as e:
+            out.append(Option(**base, reason=e.message))
+            continue
+        except ComposeRefused as e:
+            out.append(Option(**base, reason=e.message))
+            continue
+        out.append(Option(**base, pinned=pinned))
+    return out
+
+
+def _compose_lines(item: CaliberView, option: Any, seen: set[tuple[str, int, str]]) -> list[str]:
+    """问数据里一张卡的入口字段和组合写法（同一张卡只写一次）。"""
+    key = (item.workflow_id, item.version, item.node_id)
+    if key in seen:
+        return []
+    seen.add(key)
+    if not option.composable:
+        return [DETAIL_NOT_COMPOSABLE_PROMPT.format(reason=option.reason)]
+    fields = [f for f in option.pinned.entry_fields if f.get("name")]
+    lines = [DETAIL_FIELDS_PROMPT.format(workflow=item.workflow_name, version=item.version,
+                                         fields="；".join(field_text(f) for f in fields))
+             if fields else DETAIL_NO_FIELDS_PROMPT.format(workflow=item.workflow_name, version=item.version)]
+    example = {"op": "use_caliber", "id": "c1", "workflow_id": item.workflow_id, "version": item.version,
+               "card": item.node_id, "metrics": [m["id"] for m in option.pinned.metrics][:6],
+               "inputs": {str(f["name"]): "…" for f in fields}}
+    lines.append(DETAIL_COMPOSE_PROMPT.format(op=json.dumps(example, ensure_ascii=False)))
+    return lines
 
 
 async def verify_reuse(session: Any, ref: dict[str, Any]) -> dict[str, Any]:

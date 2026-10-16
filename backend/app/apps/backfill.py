@@ -107,19 +107,26 @@ async def _upgrade(session: AsyncSession, app: Any, version: AppVersion, view_id
 
 async def _side_effect(session: AsyncSession, state: Any) -> str | None:
     """新版本的图补算时会不会碰到人或外部系统：会的交回一句原因（接在「「周报 v3」」后面），不会的返回 None。
+    作为流程固定的一律算；别的按图判（graph_side_effect）。"""
+    if state.pin.get("use") == "process":
+        return "是作为流程固定的"
+    return await graph_side_effect(session, state.graph, level=state.level)
+
+
+async def graph_side_effect(session: AsyncSession, graph_json: Any, *, level: str | None = None) -> str | None:
+    """一张图替人重跑一次会不会碰到人或外部系统：会的交回一句原因（接在「「周报 v3」」后面），不会的返回 None。按新口径
+    补算（这里）和按口径正式出具（ledger/issue.py：自动出具、一键出具都不代人做这些事）共用这一个判断。
 
     判断沿用应用检查对流程钉住项的那一套（apps/lint._lint_process）：人工节点、写外部系统的能力
     （capabilities.registry.writes_externally，和运行时、发布检查同一个判断）、process.* 问题（子工作流先读好，
-    process.human_in_subgraph 才查得到）。"""
+    process.human_in_subgraph 才查得到）。level 是那一版发布时的级别（门禁按它查），没有按 published。"""
     from app.capabilities.registry import effective_effect, get_capability, writes_externally
     from app.engine.governance import publish_issues
     from app.engine.lint_process import load_subgraphs, with_subgraphs
     from app.engine.schema import GraphSpec, NodeType
 
-    if state.pin.get("use") == "process":
-        return "是作为流程固定的"
     try:
-        graph = GraphSpec.model_validate(state.graph)
+        graph = GraphSpec.model_validate(graph_json)
     except ValueError:
         return "的图无法解析"
     if humans := [n.title for n in graph.nodes if n.type == NodeType.HUMAN]:
@@ -132,7 +139,7 @@ async def _side_effect(session: AsyncSession, state: Any) -> str | None:
         if cap is not None and writes_externally(cap.name, effective_effect(cap), cap.endpoint_id):
             return f"的「{node.title}」会写外部系统（{name}）"
     with with_subgraphs(await load_subgraphs(session, graph)):
-        issues = publish_issues(graph, level=state.level or "published")
+        issues = publish_issues(graph, level=level or "published")
     if process := [i for i in issues if (i.code or "").startswith("process.")]:
         return f"按流程使用不安全：{process[0].message.rstrip('。')}"
     return None

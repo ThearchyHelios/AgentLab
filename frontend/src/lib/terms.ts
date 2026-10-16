@@ -4552,10 +4552,24 @@ export const LEDGER_TEXT = {
   /** 副标题：比对在封存之后；事后补比、打开时按需比的另写一句 */
   sub: '封存后比对，不在封存范围内',
   retro: '按现在的口径回看',
+  /** 从问数据固化出的口径发布之后，对来源运行补比的那一次（服务端 trigger=certified） */
+  certified: '按之后发布的口径回看',
   /** 标签的四种、认法的两种（第 4 波的证据面板、轮次摘要用同一套） */
   kind: { caliber: '来自口径', related: '相关口径', reasoning: '这次的推理', unknown: '没有比对' },
   how: { independent: '等价已证明', composed: '助手选用' },
   level: { governed: '受管', published: '已发布' },
+  /**
+   * 问数据的助手选用已发布口径（use_caliber，服务端 ledger/compose.py 按那一版生成取数节点和口径卡）：过程里照实写一行。
+   * 拒收的（参数不对、版本不对……）同样一行，写服务端给的原因
+   */
+  use: {
+    title: (name: string, version: number | null, level: string) =>
+      `选用口径「${name}」${version != null ? ` v${version}` : ''}${level ? `（${level}）` : ''}`,
+    detail: (fetches: number, card: string, metrics: string) =>
+      `按这一版生成取数节点 ${formatNumber(fetches)} 个和口径卡「${card}」${metrics ? `，用到的指标：${metrics}` : ''}`,
+    refused: '没有选用口径',
+    status: '正在选用口径…',
+  },
 }
 
 /**

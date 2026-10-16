@@ -16,7 +16,8 @@ cell(nodes.X, 0, '列')、X 是查库的调用工具节点（look/calibers.card_
 模板只引用入口字段（{{ input.字段 }}）——引用 vars.、nodes.、模板函数（file_text……）的，拷出来就拿不到同样的值，照实
 拒收、给原因（NotDerivable）。工作流、版本、节点不在了也照实说。
 
-**这一波实现的**：caliber_probe —— 一份口径的取数 + 口径卡（评测口径题的期望）。
+**已实现的**：caliber_probe —— 一份口径的取数 + 口径卡（评测口径题的期望）；reconcile —— 口径对账（第 3 波，
+reconcile_graph）；组合式问数用的 caliber_block(card_id, inputs)（第 3 波）。
 
 **扩展点**（第 3 波的账本按这里扩，不另写生成器）：
 - 口径对账（02 做法 6）：assemble("reconcile", [ours, caliber_block(pinned)], tail=[对账卡])。ours 是「这次的取数」
@@ -24,9 +25,10 @@ cell(nodes.X, 0, '列')、X 是查库的调用工具节点（look/calibers.card_
   相对差，式子引用 cell(nodes.ours_q1, 0, '列') 和口径卡的指标，on_missing=null），出口的契约写 metrics_from。
 - 口径召回（02 做法 7）：assemble("recall", [caliber_block(old, prefix="old_"), caliber_block(new, prefix="new_")],
   tail=[召回卡])。同一张图里放两份口径，取数节点 id 会撞：caliber_block 带 prefix 时把拷出来的节点改名，口径卡的
-  caliber_from 带上改名映射 nodes={原 id: 新 id}。**运行时认这个映射是 02 做法 4（metrics._pinned_caliber 按 AST 改写
-  式子里的 cell(nodes.X…) 和 nodes.X），归第 3 波的账本包**；在那之前带前缀的段跑起来口径卡取不到输入（缺输入，照实
-  失败，不会算错），这一波只有不带前缀的 caliber_probe 有调用方。
+  caliber_from 带上改名映射 nodes={原 id: 新 id}，运行时 metrics._pinned_caliber 按语法树改写式子里的 cell(nodes.X…)
+  和 nodes.X（第 3 波起）。
+- 组合式问数（02 做法 4，ledger/compose.py）：不经 assemble（拷进的是问数据那张图），只用 caliber_block(prefix=…,
+  card_id=…, inputs=…)：取数节点改名、模板按助手给的参数渲染成字面 SQL，口径卡带改名映射。
 - 新的派生种类登记进 KINDS，入口字段、出口、首尾相接都走 assemble，不在调用方拼节点。
 
 派生图都是探索运行（正式运行只从已发布未退役的版本发起）；来源（origin_kind）由调用方定：评测 eval、对账 reconcile、
@@ -42,7 +44,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-#: 派生图的种类。这一波实现 caliber_probe；reconcile、recall 归第 3 波的账本（见模块说明的扩展点）
+#: 派生图的种类。caliber_probe、reconcile 已实现；recall 归第 4 波（见模块说明的扩展点）
 KINDS = ("caliber_probe", "reconcile", "recall")
 
 #: 不能派生的原因的机器码
@@ -129,10 +131,11 @@ class Pinned:
 
 @dataclass
 class Block:
-    """派生图里的一段：照抄（或这次执行过）的取数节点 + 一张口径卡。rename 是拷出来的节点改了名的映射（不带前缀时为空）。"""
+    """派生图里的一段：照抄（或这次执行过）的取数节点 + 一张口径卡。rename 是拷出来的节点改了名的映射（不带前缀时为空）。
+    card_id 为 None 的段没有口径卡（对账里「这次的取数」那一段只有一条查询）。"""
 
     nodes: list[dict[str, Any]]
-    card_id: str
+    card_id: str | None
     rename: dict[str, str] = field(default_factory=dict)
     #: 这一段出自哪里（记进 DerivedGraph.origin）
     source: dict[str, Any] | None = None
@@ -242,19 +245,39 @@ def _node(nid: str, ntype: str, label: str, **config: Any) -> dict[str, Any]:
     return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": label, "config": config}}
 
 
-def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | None = None) -> Block:
+def render_inputs(value: Any, inputs: Mapping[str, Any]) -> Any:
+    """配置里每一段字的 {{ input.字段 }} 按 inputs 渲染成字面值（和运行时同一个渲染器 engine/expressions.render_template）。
+    load_pinned 已经保证取数节点的模板只引用入口字段。别的值原样。"""
+    from app.engine.expressions import render_template
+
+    if isinstance(value, str):
+        return render_template(value, {"input": dict(inputs)}) if "{{" in value else value
+    if isinstance(value, dict):
+        return {k: render_inputs(v, inputs) for k, v in value.items()}
+    if isinstance(value, list):
+        return [render_inputs(v, inputs) for v in value]
+    return value
+
+
+def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | None = None,
+                  card_id: str | None = None, inputs: Mapping[str, Any] | None = None) -> Block:
     """一份口径：拷出取数节点（id、配置原样；prefix 不为空时改名为 prefix + 原 id）+ 一张 caliber_from 固定到那一版的
     口径卡（id 同原卡，带前缀时同样改名；「缺输入时」照抄原卡）。
 
     upgrade_policy：钉住的版本有了新的已发布版本时这一段怎么处置（recompute / dual / incomparable，没有缺省）。写在
     本地口径卡上，判断走和正式运行同一个 engine/governance.unresolved_caliber_upgrades；不给就不写（有新版本时那个
-    判断报「待处置」）。prefix 的改名映射要等 metrics 运行时认 caliber_from.nodes（见模块说明）。"""
+    判断报「待处置」）。带前缀时口径卡的 caliber_from 带改名映射 nodes（metrics 运行时按它改写式子，见模块说明）。
+
+    组合式问数（ledger/compose.py）另给两项：card_id 是口径卡在新图里的 id（缺省 prefix + 原卡 id）；inputs 给了的话，
+    取数节点配置里的 {{ input.字段 }} 按它渲染成字面值——拷进问数据的图里，那张图的入口没有口径的入口字段。"""
     rename = {str(n["id"]): f"{prefix}{n['id']}" for n in pinned.fetches} if prefix else {}
     nodes: list[dict[str, Any]] = []
     for original in pinned.fetches:
         node = copy.deepcopy(original)
         node["id"] = rename.get(str(node["id"]), str(node["id"]))
         node["position"] = {"x": 0, "y": 0}
+        if inputs is not None and isinstance(node.get("data"), dict):
+            node["data"]["config"] = render_inputs(node["data"].get("config") or {}, inputs)
         nodes.append(node)
     source = pinned.ref()
     if rename:
@@ -265,7 +288,7 @@ def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | Non
         config["on_missing"] = on_missing
     if upgrade_policy:
         config["upgrade_policy"] = upgrade_policy
-    card_id = f"{prefix}{pinned.node_id}"
+    card_id = card_id or f"{prefix}{pinned.node_id}"
     nodes.append(_node(card_id, "metrics", pinned.card_title, **config))
     return Block(nodes=nodes, card_id=card_id, rename=rename, source=pinned.describe())
 
@@ -278,9 +301,11 @@ def _free_id(wanted: str, taken: set[str]) -> str:
 
 
 def assemble(kind: str, blocks: Sequence[Block], *, fields: Sequence[Mapping[str, Any]] = (),
-             defaults: Mapping[str, Any] | None = None, tail: Sequence[dict[str, Any]] = ()) -> DerivedGraph:
+             defaults: Mapping[str, Any] | None = None, tail: Sequence[dict[str, Any]] = (),
+             contract: Mapping[str, Any] | None = None) -> DerivedGraph:
     """入口 → 各段（首尾相接）→ tail（对账卡、召回卡）→ 出口。出口每张口径卡（含 tail 里的 metrics 节点）一个字段，
-    取那张卡的指标清单。几段的节点 id 撞了直接报错：两份口径放进同一张图要带前缀（caliber_block 的 prefix）。"""
+    取那张卡的指标清单；contract 给了就写成出口的出具契约（对账写 metrics_from 指向对账卡，不加报告、不调模型）。几段的
+    节点 id 撞了直接报错：两份口径放进同一张图要带前缀（caliber_block 的 prefix）。"""
     if kind not in KINDS:
         raise ValueError(f"不认识的派生图种类：{kind}")
     body: list[dict[str, Any]] = [n for b in blocks for n in b.nodes] + [copy.deepcopy(n) for n in tail]
@@ -291,15 +316,18 @@ def assemble(kind: str, blocks: Sequence[Block], *, fields: Sequence[Mapping[str
     taken = set(ids)
     entry = _free_id(ENTRY_ID, taken)
     exit_ = _free_id(EXIT_ID, taken | {entry})
-    cards = [b.card_id for b in blocks] + [str(n["id"]) for n in tail if n.get("type") == "metrics"]
+    cards = [b.card_id for b in blocks if b.card_id] + [str(n["id"]) for n in tail if n.get("type") == "metrics"]
     titles = {str(n["id"]): str((n.get("data") or {}).get("label") or n["id"]) for n in body}
     outputs, seen = [], set()
     for cid in cards:
         name = _free_id(titles.get(cid, cid), seen)
         seen.add(name)
         outputs.append({"name": name, "value": f"{{{{ nodes.{cid}.text }}}}"})
+    exit_config: dict[str, Any] = {"fields": outputs}
+    if contract:
+        exit_config["contract"] = copy.deepcopy(dict(contract))
     chain = [_node(entry, "input", "入口", fields=[copy.deepcopy(dict(f)) for f in fields]), *body,
-             _node(exit_, "output", "出口", fields=outputs)]
+             _node(exit_, "output", "出口", **exit_config)]
     for i, node in enumerate(chain):
         node["position"] = {"x": i * _STEP_X, "y": 0}
     graph: dict[str, Any] = {
@@ -313,6 +341,45 @@ def assemble(kind: str, blocks: Sequence[Block], *, fields: Sequence[Mapping[str
                         entry_fields=tuple(copy.deepcopy(dict(f)) for f in fields), origin=origin)
 
 
+#: 对账图里「这次的取数」节点、对账卡、多行时按键对齐的合并查询的 id（细案 02 做法 6）
+OURS_ID = "ours_q1"
+RECONCILE_CARD = "reconcile"
+ALIGN_ID = "align"
+
+
+def reconcile_prefix(pinned: Pinned) -> str:
+    """对账图里口径那一段的前缀：口径的节点 id 和 ours_q1 / align / reconcile / 入口出口撞了才带 cal_，不撞不带。"""
+    reserved = {OURS_ID, ALIGN_ID, RECONCILE_CARD, ENTRY_ID, EXIT_ID}
+    clash = any(str(n.get("id")) in reserved for n in pinned.fetches) or pinned.node_id in reserved
+    return "cal_" if clash else ""
+
+
+def ours_block(sql: str, tool: str, *, label: str = "这次的取数") -> Block:
+    """对账里「这次的取数」：这次执行过的 SQL 原文，放进一个调用工具节点（id ours_q1）。没有口径卡。"""
+    return Block(nodes=[_node(OURS_ID, "tool", label, tool=tool, args={"sql": sql})], card_id=None,
+                 source={"kind": "executed", "node_id": OURS_ID})
+
+
+def reconcile_graph(pinned: Pinned, ours: Block, tail: Sequence[dict[str, Any]], *,
+                    inputs: Mapping[str, Any]) -> DerivedGraph:
+    """口径对账（细案 02 做法 6）：入口（口径的入口字段，缺省值是这次的参数）→ 这次的取数 → 口径的取数（模板里保留
+    {{ input.x }}，运行时按入口渲染）→ 口径卡（caliber_from 固定那一版）→ tail（多行时的对齐合并查询、对账卡）→ 出口
+    （契约 metrics_from 指向对账卡；不加报告、不调模型）。两边在同一次运行里先后查，差值在对账卡里算。
+
+    口径的节点 id 和 ours_q1 / align / reconcile 撞了的，口径那一段带前缀 cal_（改名映射照常写进 caliber_from.nodes）。
+    同样的输入永远得到同一张图。"""
+    block = caliber_block(pinned, prefix=reconcile_prefix(pinned))
+    fields = []
+    for f in pinned.entry_fields:
+        field_ = copy.deepcopy(dict(f))
+        if field_.get("name") in inputs:
+            field_["default"] = inputs[field_["name"]]
+        fields.append(field_)
+    card = next((n for n in tail if n.get("type") == "metrics" and n.get("id") == RECONCILE_CARD), None)
+    return assemble("reconcile", [ours, block], fields=fields, defaults=pinned.defaults, tail=tail,
+                    contract={"metrics_from": RECONCILE_CARD} if card is not None else None)
+
+
 def caliber_probe(pinned: Pinned, *, upgrade_policy: str | None = None) -> DerivedGraph:
     """口径探针：一份口径的取数 + 口径卡（评测口径题的期望，细案 01 做法 8）。节点 id 和原图一样，入口字段照抄。
     同样的 pinned 永远得到同一张图（确定性）。"""
@@ -320,6 +387,7 @@ def caliber_probe(pinned: Pinned, *, upgrade_policy: str | None = None) -> Deriv
                     fields=pinned.entry_fields, defaults=pinned.defaults)
 
 
-__all__ = ["Block", "DerivedGraph", "ENTRY_ID", "EXIT_ID", "GONE", "KINDS", "NOT_CARD", "NOT_REUSABLE", "NotDerivable",
-           "Pinned", "TEMPLATE", "assemble", "caliber_block", "caliber_probe", "entry_fields", "load_pinned",
+__all__ = ["ALIGN_ID", "Block", "DerivedGraph", "ENTRY_ID", "EXIT_ID", "GONE", "KINDS", "NOT_CARD", "NOT_REUSABLE",
+           "NotDerivable", "OURS_ID", "Pinned", "RECONCILE_CARD", "TEMPLATE", "assemble", "caliber_block",
+           "caliber_probe", "entry_fields", "load_pinned", "ours_block", "reconcile_graph", "reconcile_prefix", "render_inputs",
            "template_problem"]

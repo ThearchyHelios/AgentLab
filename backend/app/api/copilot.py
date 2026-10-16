@@ -117,7 +117,8 @@ async def _look_service(session: AsyncSession, payload: GenerateIn, sources: lis
     spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
     return await copilot_context.look_service(sources, spec=spec, graph=graph, kinds=kinds,
                                               answer=payload.intent == "answer", catalog_view=catalog_view,
-                                              trail={"conversation_id": getattr(payload, "conversation_id", None)})
+                                              trail={"conversation_id": getattr(payload, "conversation_id", None)},
+                                              session=session)
 
 
 NODE_REFERENCE = """\
@@ -200,7 +201,8 @@ NODE_REFERENCE = """\
   {{ nodes.报告节点id.text }}），审批卡会附上这份报告的核对概况
 - validate：JSON Schema 校验，可自动让模型修复。config: {schema, source, max_retries}
 - transform：数据整形。config: {mode: expression|template|json, expression/template, assign_to}
-- subgraph：嵌套另一个工作流。config: {workflow_id, input}
+- subgraph：嵌套另一个工作流。config: {workflow_id, workflow_version, input}：workflow_version 写固定的版本号（1、2…），
+  不写就跟随那个工作流最新的发布版本。问数据里不要拿子工作流去拼已发布的口径（子工作流里的数报告引用不到）
 - metrics：口径卡。报告里要出现的数字、以及所有派生计算（比率、增幅、占比、差值）都登记在这里。
   config: {caliber, caliber_version, metrics:[{id, name, unit, decimals, format, expression}], on_missing, assign_to}
   expression 是受限表达式（不是模板）：vars.kpi.gmv、cell(nodes.fetch, 0, 'gmv')、
@@ -817,7 +819,9 @@ def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, 
         "5. 能用 3 个节点解决就别堆 8 个"
         f"{_CHAT_USER_PROMPT if chat_user else ''}\n\n"
         f"{_STREAM_PROTOCOL}"
-        + (f"\n\n{looks.guide()}\n{copilot_context.LOOK_WHEN_PROMPT}" if looks.kinds else "")
+        # 问数据里能选用已发布口径时（next-round 02 做法 4）：协议多一段 use_caliber，「什么时候该看」换成问数据那一份
+        + (f"\n{copilot_context.USE_CALIBER_PROMPT}" if copilot_context.composing(looks) else "")
+        + (f"\n\n{looks.guide()}\n{copilot_context.look_when(looks)}" if looks.kinds else "")
     )
 
 
@@ -1700,12 +1704,16 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
         baseline = copy.deepcopy(
             (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
-        # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里
+        # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里。
+        # 问数据另看已发布口径、可以 use_caliber 选用（next-round 02 做法 4）：只给搭建者及以上——使用者的图里看得到拷进来的
+        # 取数 SQL（口径的 SQL 可能写着遮罩值），这一波不给
+        kinds = ("table", "capability", "caliber") if payload.intent == "answer" and not chat_user \
+            else ("table", "capability")
         looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
-            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view)
+            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view, kinds=kinds)
     # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
     system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user)
-    applier = GraphApplier(nodes, edges)
+    applier = GraphApplier(nodes, edges, composer=copilot_context.composer(looks))
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, looks=looks, started=started,
                      checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,
@@ -2454,6 +2462,10 @@ class FromRunIn(BaseModel):
     #: 问数据回答上点「做成应用」时带上：这次运行出自哪段对话的哪一轮，记进新工作流的来源（workflows.origin）
     conversation_id: str | None = None
     turn_id: str | None = None
+    #: 固化成口径草稿（next-round 02 做法 8，app/ledger/certify.freeze）：报告引用的查询变成固定 SQL 的取数节点，跨轮变化
+    #: 的字面量成为参数（不保留 Agent）。peers 是同一组（同一个 SQL 形状）的别的运行，认哪些字面量位置变了
+    freeze: bool = False
+    peers: list[str] = Field(default_factory=list, max_length=50)
 
 
 @router.post("/from-run")
@@ -2475,6 +2487,15 @@ async def extract_template(
 
     # 对话只是记进来源：不能用的不让记（D-d），不存在的照旧记下 id
     await _ensure_conversation_access(session, payload.conversation_id)
+    if payload.freeze:
+        # 固化成口径草稿：取数是固定的 SQL（以后比对认得出等价），不是保留 Agent 的执行路径
+        from app.ledger.certify import CertifyRefused, freeze
+
+        try:
+            return await freeze(session, payload.run_id, peers=payload.peers, name=payload.name,
+                                conversation_id=payload.conversation_id, turn_id=payload.turn_id)
+        except CertifyRefused as e:
+            raise HTTPException(e.status_code, e.message) from e
     try:
         path = await extract_run_path(session, payload.run_id)
     except PathRefused as e:

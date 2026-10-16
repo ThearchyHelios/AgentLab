@@ -9,7 +9,7 @@
 - can_read_run / can_read_artifact：运行、工件的读权限（user 角色只能读有授权的应用视图运行、自己参与的实例）；
 - ensure_role / ensure_can_publish：接口内部按请求内容判定的权限（MCP 的 stdio、受管级发布、版本退役，Q8）；
 - restricted()：这次请求是不是开登录后的 user 角色（按请求内容收窄的接口用：问数据只能发起探索运行、工件按白名单给）；
-- run_events_readable(principal, run)：运行的原始记录、事件、实时流能不能读（user 只读查询结果在工具边界遮过的）；
+- run_events_readable(principal, run)：运行的原始记录、事件、实时流能不能读（user 只读查询结果在工具边界遮过的问数据运行）；
 - ensure_conversation_access(session, conversation_id)：接受 conversation_id 的接口核对对话归属（对话按人隔离）；
 - run_scope / evidence_scope / chat_scope：main.py 挂在运行、证据、问数据几组路由上的依赖，按 run_id 判断能不能读。
   run_scope 同样管运行的 WebSocket，握手时按运行判；
@@ -213,15 +213,18 @@ async def run_events_readable(principal: Principal, run: Any) -> bool:
     """能不能读这次运行的原始记录、事件和实时流（GET /api/runs/{id}、/events、/graph，WebSocket /stream）。
 
     关登录：能。builder 及以上：这次运行它能读就能（can_read_run：别人的个人应用刷新、个人蓝图试运行读不了）。
-    user：这次运行它能读（can_read_run），而且查询结果在工具边界就遮过（masked_at_boundary）。两个条件缺一不可：
-    没在边界遮过的运行，事件里 tool.end 的预览、运行状态里是查询结果的原文，遮罩管不到——自己发起的应用实例、
-    有授权的应用视图运行经应用页和证据接口读（那两处按派生遮罩给）。实际上满足两条的就是它自己开登录后发起的
-    问数据运行；关登录时自报同名留下的老运行没在边界遮过，开了登录也读不到。"""
+    user：问数据的运行（origin_kind=chat），这次它能读（can_read_run），而且查询结果在工具边界就遮过（masked_at_boundary）。
+    三个条件缺一不可：没在边界遮过的运行，事件里 tool.end 的预览、运行状态里是查询结果的原文，遮罩管不到——自己发起的
+    应用实例、有授权的应用视图运行经应用页和证据接口读（那两处按派生遮罩给）。服务端替他派生的运行也带着边界遮罩，但图
+    不是他的助手搭的：口径对账（ledger/reconcile）的图里原样是口径取数节点的 SQL 模板（口径的 SQL 可能写着遮罩值，所以
+    问数据里使用者不看口径），同样经证据接口读（展示的 SQL 里写着的遮罩值换成「已遮罩」，同应用视图运行）。实际上满足
+    三条的就是它自己开登录后发起的问数据运行；关登录时自报同名留下的老运行没在边界遮过，开了登录也读不到。"""
     if principal.mode == "off":
         return True
     if principal.at_least("builder"):
         return await can_read_run(principal, run)
-    if run is None or not principal.username or not masked_at_boundary(run):
+    if run is None or not principal.username or getattr(run, "origin_kind", None) != "chat" \
+            or not masked_at_boundary(run):
         return False
     return await can_read_run(principal, run)
 
