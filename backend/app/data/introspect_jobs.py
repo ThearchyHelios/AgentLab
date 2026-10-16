@@ -572,6 +572,16 @@ class _IntrospectRun(runtime.JobRun):
             await self._write(_close, self.job_id, job_status, job_error, task_error)
         except Exception:  # noqa: BLE001
             logger.exception("探查任务 %s 收尾时写库出错", self.job_id)
+        await self._notify()
+
+    async def _notify(self) -> None:
+        """这次新记了「要处理」的结构变化：按源推一条 source.changed（data/source_changes.notify_after_job）。"""
+        from app.data import source_changes
+
+        async with SessionLocal() as session:
+            job = await session.get(IntrospectJob, self.job_id)
+        if job is not None:
+            await source_changes.notify_after_job(job.source_id, self.job_id)
 
     async def _run(self) -> None:
         if not await self._write(self._claim):
@@ -600,6 +610,7 @@ class _IntrospectRun(runtime.JobRun):
             await self._write(self._save_batch, source_id, schema, batch, got)
         await self._settle()
         await self._write(self._finish, source_id)
+        await self._notify()
 
     # ---------------------------------------------------------------- 库操作
 

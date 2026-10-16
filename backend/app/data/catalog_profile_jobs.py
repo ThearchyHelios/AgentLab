@@ -904,6 +904,16 @@ class _ProfileRun(runtime.JobRun):
             await self._write(_close, self.job_id, job_status, job_error, task_status, task_error)
         except Exception:  # noqa: BLE001
             logger.exception("数据剖析任务 %s 收尾时写库出错", self.job_id)
+        await self._notify()
+
+    async def _notify(self) -> None:
+        """这次取值观察新记了「要处理」的变化（撤销了已列全）：按源推一条 source.changed。"""
+        from app.data import source_changes
+
+        async with SessionLocal() as session:
+            job = await session.get(CatalogProfileJob, self.job_id)
+        if job is not None and job.scope in OBSERVING_SCOPES:
+            await source_changes.notify_after_job(job.source_id, self.job_id)
 
     def stop_text(self) -> str:
         return STOPPED_ERROR if self.stop_reason == "user" else INTERRUPTED_ERROR
@@ -966,6 +976,7 @@ class _ProfileRun(runtime.JobRun):
                 break
         await self._settle()
         await self._write(self._finish)
+        await self._notify()
 
     # ---------------------------------------------------------------- 进度回调（引擎调）
 

@@ -325,6 +325,27 @@ def triggers_recall(change: Mapping[str, Any]) -> bool:
     return kind == CODES_NEW and bool((change.get("affects") or {}).get("rules_touched"))
 
 
+async def notify_after_job(source_id: str, job_id: str) -> int:
+    """一次探查、剖析任务结束时：这次新记了还开着的「要处理」级变化，就在后台按源推一条 source.changed（不等它推完）。返回
+    这次新记了几条要处理的。出错只记日志：通知是附加的。"""
+    from app.db.base import SessionLocal
+
+    try:
+        async with SessionLocal() as session:
+            n = int((await session.execute(select(func.count()).select_from(SourceChange).where(
+                SourceChange.source_id == source_id, SourceChange.severity == "action",
+                SourceChange.status == "open",
+                func.json_extract(SourceChange.detected_by, "$.job_id") == job_id))).scalar() or 0)
+        if n:
+            from app.notify import service
+
+            service.spawn(service.notify_source_changed(source_id))
+        return n
+    except Exception:  # noqa: BLE001
+        logger.exception("任务 %s 结束后推送数据源变化的通知时出错", job_id)
+        return 0
+
+
 # ==========================================================================
 # 处理
 # ==========================================================================
@@ -487,6 +508,7 @@ __all__ = [
     "ACTIONS", "ACTION_STATUS", "CODES_NEW", "CODES_SHIFT", "COVERAGE_DROP", "ChangeFinished", "ChangeInvalid",
     "ChangeNotFound", "DATE_GAP", "DATE_STALLED", "Detected", "KINDS", "KIND_LABEL", "NewChange", "PENDING", "ROWS_DROP",
     "ROWS_JUMP", "SCHEMA", "SEVERITIES", "SEVERITY_RANK", "STATUSES", "VALUE_KINDS", "VOLUME_DROP", "affecting",
-    "change_out", "counts", "fingerprint", "handle", "list_changes", "list_for_source", "load", "record", "record_all",
+    "change_out", "counts", "fingerprint", "handle", "list_changes", "list_for_source", "load", "notify_after_job",
+    "record", "record_all",
     "resolve", "summary", "triggers_recall", "without_paths",
 ]

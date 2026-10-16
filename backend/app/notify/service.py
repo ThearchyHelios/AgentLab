@@ -357,3 +357,33 @@ async def notify_action(action_id: str, event: str) -> int:
                "subject": {"action_id": action_id, "run_id": rec.run_id, "task_id": task_id}}
     return await _push(channels, message, subject_kind="action", subject_id=action_id, event=event,
                        run_id=rec.run_id, task_id=task_id)
+
+
+async def notify_source_changed(source_id: str) -> int:
+    """数据源有要处理的变化（source.changed，03 B3 ④、目录-D9）：只推还要人看（开着、知道了还没处理）的「要处理」级变化，
+    按源汇总；消息里只有源名、各级别条数和链接，不放表名、列名、取值。探查、剖析任务结束时有新的「要处理」变化才调。
+
+    这一行的 scopes 第 4 波有了「变化」标签页才打开：现在 _channels 推不出去，这里返回 0（照实：没有界面看不了的通知不发）。"""
+    from app.data import source_changes
+    from app.db.models import DataSource
+
+    event = "source.changed"
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, source_id)
+        if row is None:
+            return 0
+        counts = await source_changes.counts(session, source_id)
+        by = counts["by_severity"]
+        if not by.get("action"):
+            return 0
+        channels = await _channels(session, event, None, [])
+        if not channels:
+            return 0
+        base = await _base_url(session)
+    lines = [("数据源", f"「{row.name}」"), ("要处理", f"{by['action']} 条"), ("提醒", f"{by.get('warning', 0)} 条"),
+             ("说明", f"{by.get('info', 0)} 条")]
+    message = {"event": event, "status": "action", "title": f"数据源「{row.name[:80]}」有 {by['action']} 个变化要处理",
+               "lines": lines, "links": [("去看看", f"{base}/data/catalog/{source_id}")] if base else [],
+               "subject": {"source_id": source_id}}
+    return await _push(channels, message, subject_kind="source", subject_id=source_id, event=event, run_id=None,
+                       task_id=None)

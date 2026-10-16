@@ -140,8 +140,9 @@ def _import_mode(row: DataSource) -> str | None:
 #: options 里由别的接口维护的项：数据源表单不显示、不提交它们，整份回写 options 时原样留着（同模型接入 extra 里的
 #: last_check）。数据目录的起草要求只经 PUT /catalog/guidance 改（api/catalog.py）：表单把认不得的项放进「高级参数」
 #: 的单行输入框，多行的要求会被压成一行
-#: 探查范围（introspect_scope）同理：只经 PUT /introspect-scope 改，表单整份回写 options 时原样留着
-_MANAGED_OPTIONS = (CATALOG_DRAFT_GUIDANCE_OPTION, source_objects.SCOPE_OPTION)
+#: 探查范围（introspect_scope）同理：只经 PUT /introspect-scope 改，表单整份回写 options 时原样留着；定时维护的步骤
+#: （catalog_maintenance）只经 PUT /maintenance 改（api/source_changes.py）
+_MANAGED_OPTIONS = (CATALOG_DRAFT_GUIDANCE_OPTION, source_objects.SCOPE_OPTION, "catalog_maintenance")
 
 
 def _shown_options(options: dict[str, Any] | None) -> dict[str, Any]:
