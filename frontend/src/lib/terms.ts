@@ -5485,6 +5485,18 @@ export const REJECTED_TEXT = {
   },
   /** 问数据：这一轮的运行被驳回结束时，补救区的那一句 */
   chatReason: '这一轮的运行被审批人驳回，已经结束。这是人的决定，不是故障；改好内容后可以重新运行。',
+  /**
+   * 被驳回的那一步自己（node.failed 带 reason=rejected）：时间线、问数据过程里这一步的副标题。步骤名就是节点名，不再写一遍
+   * 「在哪一步」；谁、备注照写，超时驳回写按设置驳回
+   */
+  step: (d: { actor?: unknown; note?: unknown; decision?: unknown }): string => {
+    const who = typeof d.actor === 'string' ? d.actor.trim() : ''
+    const note = typeof d.note === 'string' ? d.note.trim() : ''
+    if (d.decision === 'expired_reject') return '超过时限，按设置驳回'
+    return `${who ? `${who} 驳回` : '被驳回'}${note ? `：${note}` : ''}`
+  },
+  /** 画布节点卡上被驳回的那一步：一句话，悬停写原话 */
+  card: '被驳回',
 }
 
 /** 来源标签：老运行没有来源时写「来源未记录」 */

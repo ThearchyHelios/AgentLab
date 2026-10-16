@@ -34,6 +34,7 @@ import { ArtifactViewer, ResultTable } from './AssistantStream'
 import { ChallengeSummary, ClaimVerdictPending, type ClaimWait } from './ChallengeSummary'
 import { useEvidenceHost } from './evidenceHost'
 import { EvidenceProvenance } from './EvidenceProvenance'
+import { LedgerPart } from './LedgerStep'
 import { CopyChip } from './Markdown'
 import { SqlCheckList } from './SqlChecks'
 import {
@@ -85,6 +86,10 @@ import {
  * 判断，说清在等什么、给重试（ClaimVerdictPending）。取自遮罩列的输入，服务端已把值换成「已遮罩」，标签照样写「已遮罩」，
  * 输入来源里只说核对结果、不写值；遮没遮核对不了的（快照读不出来）同样不显示值，写明原因。类型都在 types.ts
  * （EvidenceDualCheck、EvidenceUnitChallenge、EvidenceInput 的 masked / mask_unverified）。
+ *
+ * 口径账本（next-round 02 做法 3、6）：数字、取值片段的出处链最上面多「口径」一步（run/LedgerStep 的 LedgerPart）——
+ * 来自口径「X」v3（受管）· 参数 · 等价已证明 / 助手选用 · 按口径正式出具；相关口径的差在哪和看差多少（口径对账）；这次的
+ * 推理。比对在封存之后做，不在封存范围内，脚注写明；比对还没出结果时写「正在比对口径」并按退避再取。
  *
  * 四种摆法：side 从右侧弹出（宽屏），drawer 从底部抽出（窄屏），inline 在 360px 的
  * 画布右栏里直接栏内展开，dock 放进页面给的一块常驻位置（记录页的「证据」页签）。
@@ -423,6 +428,13 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
       <Part title={EVIDENCE_TEXT.sentence} data-ev-sentence="">
         <Sentence unit={unit} active={seg.id} />
       </Part>
+
+      {state === 'deterministic' && (isMetric || isCell) && !docIssue && (
+        // 口径账本：出处链最上面的「口径」一步（来自口径 / 相关口径 / 这次的推理）。比对在封存之后做，这一步按运行另取
+        // （GET /runs/{id}/ledger，还在比对时按退避再取）；片段接口的 ledger 键先顶上
+        <LedgerPart runId={runId} runClass={runClass} report={report} segId={seg.id} segText={seg.text}
+                    segLedger={detail?.ledger} />
+      )}
 
       {bad && (
         <Part title={state === 'suspect' ? '标记为可疑的原因' : state === 'unverified' ? '无法核实的原因' : '无证据的原因'}

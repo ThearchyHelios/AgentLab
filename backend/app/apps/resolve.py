@@ -1738,24 +1738,36 @@ async def _timeline(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
     if run is None:
         return {"state": "empty", "steps": []}
     titles = {k: v["title"] for k, v in node_map(run.graph).items()}
-    rows = (await session.execute(select(RunEvent.type, RunEvent.node_id, RunEvent.ts).where(
+    rows = (await session.execute(select(RunEvent.type, RunEvent.node_id, RunEvent.ts, RunEvent.data).where(
         RunEvent.run_id == run.id, RunEvent.type.in_(tuple(_STEP_STATE))).order_by(RunEvent.seq))).all()
     trail = (await _trails(session, [run]))[run.id]
     steps: dict[str, dict[str, Any]] = {}
-    for etype, node_id, ts in rows:
+    #: 被驳回的那一步：node.failed 上带着 reason=rejected 和结论（engine/compiler，总方案 X9）。工具调用审批、代码执行审批
+    #: 这类驳回没开待办，以前只能落成「失败」；老运行的 node.failed 没有 reason，照旧按待办认
+    rejected: dict[str, dict[str, Any]] = {}
+    for etype, node_id, ts, data in rows:
         if not node_id:
             continue
         step = steps.setdefault(node_id, {"node": node_id, "title": titles.get(node_id, node_id), "state": "running",
                                           "started_at": datetime.fromtimestamp(ts, timezone.utc).isoformat()})
         step["state"] = _STEP_STATE[etype]
         step["at"] = datetime.fromtimestamp(ts, timezone.utc).isoformat()
+        if etype == "node.failed" and isinstance(data, dict) and data.get("reason") == "rejected":
+            rejected[node_id] = data
+        elif etype == "node.started":
+            rejected.pop(node_id, None)
     for node_id, step in steps.items():
         text = None
         record = next((a for a in reversed(trail.actions) if a.node_id == node_id), None)
         kind, decision = _decision(trail, node_id)
         pending = [t for t in trail.tasks if t.node_id == node_id and t.status == "pending"]
+        said = rejected.get(node_id) if step["state"] == "failed" else None
         if record is not None and record.state in ("sent", "unknown"):
             step["state"] = "unknown"
+        elif said is not None:
+            step["state"] = "rejected"
+            text = "未确认（被驳回）" if said.get("kind") == "action_confirm" and said.get("decision") == "reject" \
+                else _DECISION_TEXT.get(str(said.get("decision") or ""), _STEP_TEXT["rejected"])
         elif step["state"] == "waiting" and pending:
             text = WAITING_TEXT.get(pending[-1].kind)
         elif step["state"] == "failed" and kind == "action_confirm" and decision == "reject":

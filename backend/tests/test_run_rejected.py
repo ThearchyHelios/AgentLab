@@ -107,6 +107,55 @@ async def test_a_rejection_ends_the_run_as_cancelled_with_who_and_why(kind):
     assert row.manifest_hash and row.manifest_seq == cancelled.seq
 
 
+@pytest.mark.parametrize("kind", list(GATES))
+async def test_the_rejected_step_says_so_on_its_node_failed(kind):
+    """节点层照旧发 node.failed（时间线、实例进度按它收尾这一步），数据里带上 reason=rejected（和 run.cancelled 同一个字段名）、
+    哪种关卡、结论、谁、备注：画布、航迹、时间线、问数据过程据此画「被驳回」，不画成失败（05 (a)、总方案 X9）。原话照旧。"""
+    run_id = await _rejected_run(kind)
+    await _wait(run_id, ("cancelled", "failed", "succeeded"))
+    [failed] = [e for e in await _events(run_id, "node.failed") if e.node_id == "gate"]
+    data = failed.data
+    assert data["error"] == GATES[kind][1]
+    assert {k: data.get(k) for k in ("reason", "kind", "decision", "actor", "note")} == {
+        "reason": "rejected", "kind": kind, "decision": "reject", "actor": "张工", "note": "不对"}
+
+
+async def test_a_plain_node_failure_carries_no_reason():
+    """真的出错（这里是工具不存在）：node.failed 和以前一字不差，没有 reason 这个键。"""
+    bad = node("gate", "tool", label="查一下", tool="no_such_tool_here", args={})
+    run = await run_manager.start(graph=chain(START, bad, OUT), input_payload={"q": "x"})
+    final = await _wait(run.id, ("cancelled", "failed", "succeeded"))
+    assert final.status == "failed"
+    [failed] = [e for e in await _events(run.id, "node.failed") if e.node_id == "gate"]
+    assert "reason" not in failed.data and "decision" not in failed.data
+
+
+async def test_the_instance_timeline_says_rejected_without_a_task():
+    """实例进度：被驳回的那一步按 node.failed 上的 reason 画「被驳回」——工具调用审批这类没开待办的驳回，以前落成「失败」。
+    老运行（node.failed 没有 reason、也没有待办）照旧写失败。"""
+    from types import SimpleNamespace
+
+    from app.apps.resolve import _timeline
+
+    run_id = await _rejected_run("tool")
+    await _wait(run_id, ("cancelled",))
+    async with SessionLocal() as session:
+        new = await session.get(Run, run_id)
+        legacy = Run(workflow_name="老的失败", status="failed", graph=new.graph, input={}, error="出错了",
+                     error_node_id="gate")
+        session.add(legacy)
+        await session.flush()
+        session.add_all([
+            RunEvent(run_id=legacy.id, seq=1, type="node.started", node_id="gate", ts=1.0, data={}),
+            RunEvent(run_id=legacy.id, seq=2, type="node.failed", node_id="gate", ts=2.0, data={"error": "出错了"}),
+        ])
+        await session.commit()
+        steps = {s["node"]: s for s in (await _timeline(session, SimpleNamespace(instance=new)))["steps"]}
+        old = {s["node"]: s for s in (await _timeline(session, SimpleNamespace(instance=legacy)))["steps"]}
+    assert (steps["gate"]["state"], steps["gate"]["text"]) == ("rejected", "已驳回")
+    assert (old["gate"]["state"], old["gate"]["text"]) == ("failed", "失败")
+
+
 async def test_a_timeout_rejection_is_recorded_as_expired_reject():
     from app.process import tasks
 

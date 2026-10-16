@@ -39,6 +39,10 @@ import { IdentityTab } from './settings/IdentityTab'
 import { NotifyTab } from './settings/NotifyTab'
 import { AuditTab } from './settings/AuditTab'
 import { AccessKeysTab } from './settings/AccessKeysTab'
+import {
+  LedgerSection, ledgerChanged, ledgerDraftOf, ledgerErrors, ledgerLabels, ledgerPayload, type LedgerDraft,
+} from './settings/LedgerSettings'
+import { LEDGER_UI } from '../lib/termsLedger'
 import { ACCESS_KEY_TEXT } from '../lib/termsApp'
 
 // 提到模块级：tab 名同时是 URL 的最后一段，两处各写一份迟早对不上。
@@ -690,6 +694,8 @@ function PrefsTab() {
   // 核查一组（双盲复算、反方审稿、审批质询）的草稿另放一份，和上面的共用保存条；verifySaves 是存过几次，今日核查花费跟着再取
   const [verifyDraft, setVerifyDraft] = useState<VerifyDraft | null>(null)
   const [verifySaves, setVerifySaves] = useState(0)
+  // 口径账本一组（自动按口径出具、每日上限、比对时限、升版后重算几组，pages/settings/LedgerSettings）：草稿另放一份，共用保存条
+  const [ledgerDraft, setLedgerDraft] = useState<LedgerDraft | null>(null)
   const [saving, setSaving] = useState(false)
   const [savedFlash, setSavedFlash] = useState(0)
   const [saveError, setSaveError] = useState<unknown>(null)
@@ -779,9 +785,14 @@ function PrefsTab() {
   const verifyKeys = verifyChanged(verifyCur, verifySaved)
   const verifyErrs = verifyErrors(verifyCur, verifySaved)
   const verifyInvalid = Object.values(verifyErrs).some(Boolean)
-  const invalid = guardInvalid || judgeInvalid || verifyInvalid || !!appsError
+  const ledgerSaved = ledgerDraftOf(values?.ledger)
+  const ledgerCur = ledgerDraft ?? ledgerSaved
+  const ledgerKeys = values?.ledger ? ledgerChanged(ledgerCur, ledgerSaved) : []
+  const ledgerErrs = ledgerErrors(ledgerCur, ledgerSaved)
+  const ledgerInvalid = Object.values(ledgerErrs).some(Boolean)
+  const invalid = guardInvalid || judgeInvalid || verifyInvalid || ledgerInvalid || !!appsError
   const changed = (Object.keys(saved) as (keyof typeof saved)[]).filter((k) => cur[k] !== saved[k])
-  const dirty = values ? changed.length + verifyKeys.length : 0
+  const dirty = values ? changed.length + verifyKeys.length + ledgerKeys.length : 0
   // 外壳唯一的 blocker 在地址（pathname）变化时问：切标签、导航、⌘K、⌥ 数字、后退都算
   useLeaveGuard(dirty > 0, () => confirmLeave(dirty))
 
@@ -800,6 +811,11 @@ function PrefsTab() {
     setSaveError(null)
     setFieldError(null)
     setVerifyDraft({ ...verifyCur, ...patch })
+  }
+  const editLedger = (patch: Partial<LedgerDraft>) => {
+    setSaveError(null)
+    setFieldError(null)
+    setLedgerDraft({ ...ledgerCur, ...patch })
   }
 
   /**
@@ -834,6 +850,8 @@ function PrefsTab() {
       } : null
       // 核查一组同样整组写（VerifySettings 的 verifyPayload）
       const verify = verifyKeys.length ? verifyPayload(verifyCur) : null
+      // 口径账本一组同样整组写（LedgerSettings 的 ledgerPayload）
+      const ledger = ledgerKeys.length ? ledgerPayload(ledgerCur) : null
       // 起草模型一组：两项一起写，空着的存 null（跟随助手的模型）
       const catalogDraft = draftChanged ? { provider: cur.draftProvider || null, model: cur.draftModel.trim() || null } : null
       // 应用一组同样整组写：别的键（以后加的）照原样带回去
@@ -841,7 +859,7 @@ function PrefsTab() {
         ? { ...(values.apps ?? {}), on_demand_daily_limit: Number(cur.appsDaily.trim()), user_personal_apps: cur.appsPersonal,
             share_links: cur.appsShare }
         : null
-      if (runChanged || judge || verify || catalogDraft || apps) {
+      if (runChanged || judge || verify || ledger || catalogDraft || apps) {
         const run = {
           ...(values.run ?? {}),
           default_memory_scope: cur.scope,
@@ -855,6 +873,7 @@ function PrefsTab() {
         }
         const out = await api.settings.put({
           ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}), ...(verify ? { verify } : {}),
+          ...(ledger ? { ledger } : {}),
           ...(catalogDraft ? { catalog_draft: catalogDraft } : {}), ...(apps ? { apps } : {}),
         })
         setValues((v) => ({
@@ -862,6 +881,7 @@ function PrefsTab() {
           ...(runChanged ? { run: out?.run ?? run } : {}),
           ...(judge ? { judge: out?.judge ?? judge } : {}),
           ...(verify ? { verify: out?.verify ?? verify } : {}),
+          ...(ledger ? { ledger: out?.ledger ?? ledger } : {}),
           ...(catalogDraft ? { catalog_draft: out?.catalog_draft ?? catalogDraft } : {}),
           ...(apps ? { apps: out?.apps ?? apps } : {}),
         }))
@@ -871,6 +891,7 @@ function PrefsTab() {
       }
       setDraft(null)
       setVerifyDraft(null)
+      setLedgerDraft(null)
       setSavedFlash(Date.now())
     } catch (e) {
       // 署名已经存上了：留在草稿里的只剩运行默认值，条上的计数跟着变少
@@ -1183,6 +1204,8 @@ function PrefsTab() {
 
           {values.eval && <EvalSettingsSection />}
 
+          {values.ledger && <LedgerSection cur={ledgerCur} errors={ledgerErrs} onEdit={editLedger} />}
+
           {values.catalog_draft && (
             <DraftModelSection provider={cur.draftProvider} model={cur.draftModel} onEdit={edit}
                                error={fieldError?.field === 'catalog_draft.provider' ? fieldError.message : undefined} />
@@ -1247,7 +1270,7 @@ function PrefsTab() {
                     draftProvider: DRAFT_MODEL_SETTING_TEXT.provider, draftModel: DRAFT_MODEL_SETTING_TEXT.model,
                     appsDaily: APP_SETTING_TEXT.onDemandLimit, appsPersonal: APP_SETTING_TEXT.personalApps,
                     appsShare: APP_SETTING_TEXT.shareLinks,
-                  })[k]).concat(verifyLabels(verifyKeys)).join('、')}
+                  })[k]).concat(verifyLabels(verifyKeys), ledgerLabels(ledgerKeys)).join('、')}
                 </span>
               </span>
               {saveError != null && (
@@ -1258,12 +1281,13 @@ function PrefsTab() {
               )}
               <span className="flex-1" />
               <button className="btn btn-sm btn-ghost" disabled={saving}
-                      onClick={() => { setDraft(null); setVerifyDraft(null); setSaveError(null); setFieldError(null) }}>放弃</button>
+                      onClick={() => { setDraft(null); setVerifyDraft(null); setLedgerDraft(null); setSaveError(null); setFieldError(null) }}>放弃</button>
               <button className="btn btn-sm btn-primary" disabled={saving || invalid}
                       title={guardInvalid ? '护栏设置中有无效值，请修正后再保存'
                         : judgeInvalid ? '证据裁判的上限有无效值，请修正后再保存'
                         : appsError ? APP_SETTING_TEXT.onDemandLimitInvalid
-                        : verifyInvalid ? VERIFY_SETTING_TEXT.section.saveInvalid : undefined}
+                        : verifyInvalid ? VERIFY_SETTING_TEXT.section.saveInvalid
+                        : ledgerInvalid ? LEDGER_UI.settings.saveInvalid : undefined}
                       onClick={() => void save()}>
                 {saving ? <Spinner size={11} /> : <Check size={12} aria-hidden />} 保存设置
               </button>

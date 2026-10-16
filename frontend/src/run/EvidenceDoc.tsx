@@ -16,7 +16,7 @@ import {
 } from '../lib/evidence'
 import { formatNumber } from '../lib/format'
 import {
-  CHALLENGE_TEXT, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT, JUDGE_TEXT, claimTally, evidenceTally,
+  CHALLENGE_TEXT, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT, JUDGE_TEXT, LEDGER_TEXT, claimTally, evidenceTally,
   type ClaimTallyCounts,
 } from '../lib/terms'
 import { useEvidence, useVerdicts, type Slot } from '../store/evidence'
@@ -26,6 +26,10 @@ import type {
 } from '../types'
 import { EvidencePanel, type PanelMode, type PanelView } from './EvidencePanel'
 import { askAbout, type InquiryAccess } from './Inquiry'
+import { caliberOf, ledgerEnabled } from './LedgerStep'
+import { LEDGER_UI } from '../lib/termsLedger'
+import { useRunLedger } from '../store/ledger'
+import type { LedgerLabel } from '../typesLedger'
 import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type InlineStyles } from './Markdown'
 
 /**
@@ -46,6 +50,10 @@ import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type In
  * 句子走（表格里按列走到上一行 / 下一行，出了表格接着按句子走），n / N 跳到下一处 /
  * 上一处有问题的地方（无证据、可疑名称、证据相矛盾、部分有依据；证据不足的排在这些之后），回车打开证据面板，
  * Esc 关掉并留在原片段；面板开着时方向键走到哪、面板跟到哪，Tab 进面板。
+ *
+ * 口径账本（next-round 02 做法 3）：来自口径的数字后面挂一个小标记，写明受管还是已发布（悬停写是哪一份口径、怎么认的）；
+ * 相关口径的数不加标记，只在证据面板的「口径」一步里说。标签按运行另取（GET /runs/{id}/ledger，store/ledger 按退避
+ * 等比对出结果），正式运行、没有运行的文档不取。
  *
  * 长报告：事件都挂在容器上（片段只带 data-seg），块用 memo，外加
  * content-visibility: auto；超过 TEXT_CAP 的部分先折叠，跳转到折叠里的片段时自动展开。
@@ -370,6 +378,10 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   // 被反方审过的句子：句末挂标记（和裁判的判定并在一个徽标里），点开是整句面板
   const marks = useMemo(() => challengeMarks(graph, report, artifact), [graph, report, artifact])
   const model = useMemo(() => buildModel(blocks, overlay, ask, marks), [blocks, overlay, ask, marks])
+  // 来自口径的数字上的小标记：按运行取的口径账本里这份报告的标签（只画 caliber 一种）
+  const ledger = useRunLedger(runId, ledgerEnabled(runId, runClass))
+  const labels = report ? ledger?.data?.reports?.[report]?.labels : undefined
+  const caliberMarks = useMemo(() => caliberMarksOf(labels), [labels])
   const counts = useMemo(() => docTally(doc), [doc])
   const claims = useMemo(() => claimCounts(doc, overlay), [doc, overlay])
   const rootRef = useRef<HTMLDivElement>(null)
@@ -664,7 +676,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
             <DocBlock block={block} dense={dense} doc={doc} visual={visual}
                       current={b === currentBlock ? current : null}
                       active={b === activeBlock ? activeSeg : null}
-                      panelId={panelId} model={model} ask={ask} />
+                      panelId={panelId} model={model} ask={ask} calibers={caliberMarks} />
             {mode === 'inline' && b === activeBlock && panelNode}
           </Fragment>
         ))}
@@ -741,7 +753,7 @@ function useSelectionPick(root: RefObject<HTMLElement | null>, anchor: RefObject
       const start = at(range.startContainer)
       if (!inside(start) || !inside(at(range.endContainer))) { setPick(null); return }
       const frag = range.cloneContents()
-      frag.querySelectorAll('[data-inquiry-ask], .ev-tag, .ev-badge, .sr-only').forEach((n) => n.remove())
+      frag.querySelectorAll('[data-inquiry-ask], .ev-tag, .ev-badge, .ev-caliber, .sr-only').forEach((n) => n.remove())
       const quote = (frag.textContent ?? '').replace(/\s+/g, ' ').trim()
       if ([...quote].length < 2) { setPick(null); return }
       const rects = range.getClientRects()
@@ -878,8 +890,10 @@ export function ClaimTally({ claims, lead }: { claims: ClaimTallyCounts; lead: b
 /** 列表项的开头：结构片段里带着行首的 - / 1. 。列表项被分成几句时，后面几句接在同一项里 */
 const ITEM_START = /(^|\n)[ \t]*([-*+]|\d+[.)])[ \t]+$/
 
-const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, active, panelId, model, ask }: {
+const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, active, panelId, model, ask, calibers }: {
   block: EvidenceBlock
+  /** 来自口径的数字：片段 id → 小标记（口径账本） */
+  calibers?: CaliberMarks
   dense: boolean
   doc: EvidenceDocData
   /** 句末徽标从这里取：这一句眼下的判定（封存后追加的盖过文档里的） */
@@ -904,7 +918,7 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
   }
   const unit = (u: EvidenceUnit, opts?: { code?: boolean; tag?: boolean }) => (
     <UnitView key={u.id} unit={u} doc={doc} current={current} active={active} panelId={panelId}
-              code={opts?.code} tag={opts?.tag ?? true} badge={model.badge.get(badgeKey(u.id))}
+              code={opts?.code} tag={opts?.tag ?? true} badge={model.badge.get(badgeKey(u.id))} calibers={calibers}
               ask={ask && askable(u, block) ? (model.ask.has(askKey(u.id)) ? 'roving' : 'follow') : undefined} />
   )
 
@@ -970,6 +984,23 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
   }
 })
 
+/** 来自口径的数字上的小标记：片段 id → 标记上的字（级别）、悬停、读屏 */
+type CaliberMarks = Map<string, { text: string; level: string; title: string; aria: string }>
+
+function caliberMarksOf(labels: Record<string, LedgerLabel> | undefined): CaliberMarks | undefined {
+  if (!labels) return undefined
+  const out: CaliberMarks = new Map()
+  for (const [id, label] of Object.entries(labels)) {
+    if (label.kind !== 'caliber') continue
+    const how = LEDGER_TEXT.how[label.how === 'composed' ? 'composed' : 'independent']
+    const caliber = caliberOf(label)
+    const level = label.level_text || (label.level ? (LEDGER_TEXT.level as Record<string, string>)[label.level] ?? '' : '')
+    out.set(id, { text: level || LEDGER_TEXT.kind.caliber, level: label.level ?? '', title: LEDGER_UI.mark.title(caliber, how),
+                  aria: LEDGER_UI.mark.aria(caliber, how) })
+  }
+  return out.size ? out : undefined
+}
+
 /** 反方审稿的判断在句末徽标里的样子。soft 是悬停、展开时铺的浅底，醒目的那两种不铺（见 LOUD_RING） */
 interface MarkLook { icon: LucideIcon; color: string; soft: string; loud: boolean }
 
@@ -1016,9 +1047,10 @@ function ChallengeMark({ verdict, look, after }: { verdict: string; look: MarkLo
  * 一枚徽标（也是按钮），证据相矛盾（和旧的证据不支持）的整句铺浅底——字本身不画线。被反方审过的
  * 句子同样挂徽标（和判定并在一起），点开都是整句面板
  */
-function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }: {
+function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask, calibers }: {
   unit: EvidenceUnit; doc: EvidenceDocData; current: string | null; active: string | null; panelId: string
   code?: boolean; tag: boolean; badge?: Badge
+  calibers?: CaliberMarks
   /**
    * 审批质询的「质询」：roving 是这一句一个可点的都没有，「质询」本身进键盘顺序；follow 跟在这一句后面，焦点在这一句上时
    * 按 Tab 到达
@@ -1041,7 +1073,8 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }
     const meta = EVIDENCE_STATE[state]
     if (meta.alert && TAG_TEXT[state]) alerts.add(state)
     const open = active === s.id
-    return (
+    const mark = calibers?.get(s.id)
+    const button = (
       <button
         key={s.id}
         type="button"
@@ -1052,13 +1085,25 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask }
         // 实体、引文：线型和颜色照状态，另有自己的样子（引文前挂引号，见 index.css）
         data-ev-kind={segmentKind(s) ?? undefined}
         tabIndex={current === s.id ? 0 : -1}
-        aria-label={segmentLabel(s, doc)}
+        aria-label={mark ? `${segmentLabel(s, doc)}${mark.aria}` : segmentLabel(s, doc)}
         aria-expanded={open}
         aria-controls={open ? panelId : undefined}
         style={segStyle(state)}
       >
         {s.strong ? <strong className="font-semibold">{body}</strong> : body}
       </button>
+    )
+    if (!mark) return button
+    // 来自口径的数：后面挂一个小标记（受管 / 已发布），悬停写是哪一份口径、怎么认的。不进键盘顺序（读屏念在片段上）
+    return (
+      <Fragment key={s.id}>
+        {button}
+        <sup className="ev-caliber ml-px select-none whitespace-nowrap rounded-sm px-0.5 text-[9px] font-medium"
+             style={{ color: 'var(--accent)', background: 'var(--accent-soft, transparent)' }}
+             aria-hidden="true" title={mark.title} data-ev-caliber={mark.level} data-ev-caliber-of={s.id}>
+          {mark.text}
+        </sup>
+      </Fragment>
     )
   })
   const key = badge ? badgeKey(unit.id) : ''

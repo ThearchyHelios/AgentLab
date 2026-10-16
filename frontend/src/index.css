@@ -830,6 +830,15 @@
 .node-cancelled .nc-slot {
   background: var(--st-cancelled);
 }
+/* 被人驳回的那一步（node.failed 带 reason=rejected）：人的决定，不是故障。和取消同一种中性色，不画失败的红框、不抖动 */
+.nc.node-rejected {
+  --st-c: var(--st-cancelled);
+  border-color: color-mix(in srgb, var(--st-cancelled) 70%, var(--border));
+}
+.node-rejected .nc-slot {
+  width: 5px;
+  background: var(--st-cancelled);
+}
 .nc.node-suspended {
   --st-c: var(--st-suspended);
   border-color: color-mix(in srgb, var(--st-suspended) 70%, var(--border));

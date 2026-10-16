@@ -170,7 +170,7 @@ async def reconcile_answer(run_id: str, payload: ReconcileIn) -> dict[str, Any]:
             query=payload.query, workflow_id=payload.workflow_id, version=payload.version, inputs=payload.inputs,
             confirm=payload.confirm, pairs=payload.pairs), principal=current_principal())
     except ledger_reconcile.ReconcileRefused as e:
-        raise CodedHTTPException(e.status_code, e.message, e.code) from e
+        raise CodedHTTPException(e.status_code, e.message, e.code, extra=e.extra) from e
     return {"run_id": run.id, "reconciled": ledger_reconcile.reconciled_view(run)}
 
 

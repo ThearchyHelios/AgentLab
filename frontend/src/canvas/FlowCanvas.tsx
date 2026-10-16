@@ -196,6 +196,8 @@ const MINI_FILL: Partial<Record<NodeState, string>> = {
   done: 'color-mix(in srgb, var(--st-done) 70%, transparent)',
   skipped: 'var(--st-skipped)',
   cancelled: 'var(--st-cancelled)',
+  // 被驳回：人的决定，和取消同一种中性色（不画失败色）
+  rejected: 'var(--st-cancelled)',
   suspended: 'var(--st-suspended)',
   blocked: 'var(--st-blocked)',
   unreached: 'color-mix(in srgb, var(--st-unreached) 45%, transparent)',

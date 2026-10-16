@@ -11,6 +11,7 @@ import { AssistantStream, type StreamTurn, type TurnFailure } from '../run/Assis
 import { PromptBox } from '../run/Composer'
 import { decodeCopilot, decodeRun, exitLabels } from '../run/decode'
 import { catalogPatchesOf } from '../run/catalogPatch'
+import { LedgerTurn } from '../run/LedgerTurn'
 import { sourceHandles } from '../canvas/nodeDefs'
 import { isComposing, PageHeader, Skeleton, Spinner, StatusBadge, TechDetails, toast } from '../components/ui'
 import { humanizeError } from '../lib/errors'
@@ -294,10 +295,19 @@ export function ChatPage() {
         approvalsFor={(t) => <TurnExtras turnId={t.id} readOnly={!!trashed} />}
         renderTurnActions={(t) => {
           const turn = turns?.find((x) => x.id === t.id)
-          return currentId && turn && hasRemedies(turn)
-            ? <Remedies conversationId={currentId} turnId={t.id} last={t.id === lastId} onRephrase={rephrase}
-                        readOnly={!!trashed} />
-            : null
+          if (!currentId || !turn) return null
+          // 轮次底部：口径账本的摘要和动作（交付了的轮次才有：封存后在后台比对，见 run/LedgerTurn），再是补救动作
+          const ledger = turn.phase === 'done' && !!turn.run?.id && !turn.asked
+          if (!ledger && !hasRemedies(turn)) return null
+          return (
+            <>
+              {ledger && <LedgerTurn runId={turn.run!.id} runClass={turn.run!.run_class} done readOnly={!!trashed} />}
+              {hasRemedies(turn) && (
+                <Remedies conversationId={currentId} turnId={t.id} last={t.id === lastId} onRephrase={rephrase}
+                          readOnly={!!trashed} />
+              )}
+            </>
+          )
         }}
         onFollowUp={(text) => {
           // 追问是从表格里派生的一句话，点了就问；这会儿发不出去就先放进输入框

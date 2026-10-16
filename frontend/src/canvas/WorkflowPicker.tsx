@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Check, Copy, LayoutTemplate, Plus, Search, Trash2, Workflow as WorkflowIcon } from 'lucide-react'
+import { Check, Copy, Layers, LayoutTemplate, Plus, Search, Trash2, Workflow as WorkflowIcon } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
@@ -11,6 +11,9 @@ import { formatShortcut } from '../lib/keys'
 import { leavePass, registerLeaveGuard } from '../lib/leave'
 import { WORKFLOW_STATUS_LABEL, publishedLevelOf } from '../lib/terms'
 import type { GraphSpec, Workflow } from '../types'
+import { useAtLeast } from '../store/auth'
+import { LEDGER_UI } from '../lib/termsLedger'
+import { CertifyQueue } from '../pages/ledger/CertifyQueue'
 
 /** 标签的中文。后端写的是机器标记，和中文界面混排很突兀 */
 const TAG_LABEL: Record<string, string> = { extracted: '从运行提取', template: '模板' }
@@ -192,8 +195,11 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
   const [filter, setFilter] = useState<Filter>('all')
   const [cursor, setCursor] = useState(0)
   const listRef = useRef<HTMLUListElement>(null)
+  // 「可沉淀的问题」抽屉（口径账本的认证队列，搭建者及以上）：盖在列表上，返回回到列表
+  const [queue, setQueue] = useState(false)
+  const builder = useAtLeast('builder')
 
-  useEffect(() => { if (open) { setQuery(''); setCursor(0) } }, [open])
+  useEffect(() => { if (open) { setQuery(''); setCursor(0); setQueue(false) } }, [open])
 
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -267,13 +273,14 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
   }
 
   return (
-    <Modal open={open} onClose={onClose} title="工作流" width={720}
-           footer={<>
+    <Modal open={open} onClose={onClose} title={queue ? LEDGER_UI.certify.title : '工作流'} width={720}
+           footer={queue ? undefined : <>
              <span className="mr-auto self-center text-2xs text-faint">↑↓ 选择 · {formatShortcut('Enter')} 打开 · Esc 关闭</span>
              <button className="btn btn-primary" onClick={async () => { if (await createWorkflow(navigate, refresh)) onClose() }}>
                <Plus size={12} /> 新建空白工作流
              </button>
            </>}>
+      {queue ? <CertifyQueue onBack={() => setQueue(false)} onClose={onClose} beforeLeave={confirmDiscard} /> : <>
       <div className="mb-2 flex items-center gap-2">
         <div className="relative flex-1">
           <Search size={12} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
@@ -302,6 +309,12 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
             </button>
           ))}
         </div>
+        {builder && (
+          <button type="button" className="btn btn-sm shrink-0" title={LEDGER_UI.certify.openHint}
+                  onClick={() => setQueue(true)} data-certify-open="">
+            <Layers size={12} aria-hidden /> {LEDGER_UI.certify.open}
+          </button>
+        )}
       </div>
 
       {!shown.length ? (
@@ -369,6 +382,7 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
           })}
         </ul>
       )}
+      </>}
     </Modal>
   )
 }

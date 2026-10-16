@@ -93,6 +93,59 @@ async def test_an_unmatched_run_is_matched_on_demand_and_says_it_looks_back(clie
     assert body["retro_note"] == "按现在的口径回看"
 
 
+async def test_a_run_that_just_finished_and_is_about_to_be_sealed_is_pending(client, monkeypatch):
+    """runner 先发 run.finished、落库，再封存、再排上比对：页面收到 run.finished 立刻来取账本，这一下运行已经成功、还没封存。
+    这不是「不比对」，是「封存完就比」——照实答 pending（不在这里另排一次按需比对：runner 封存之后自己会排），页面按退避
+    接着取；真不比的（正式运行、失败的）照旧 ineligible。"""
+    await S.publish()
+    row = await S.explore(monkeypatch, S.EQUIVALENT, text="本周销售额 [[v:Q1.r0.销售额]]。")
+    await ledger_match.drain()
+    from app.db.models import Run
+
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        fresh = Run(workflow_name="刚跑完", status="succeeded", run_class="exploratory", origin_kind="chat", graph={},
+                    input={}, output={}, finished_at=now)
+        failed = Run(workflow_name="失败了", status="failed", run_class="exploratory", origin_kind="chat", graph={},
+                     input={}, output={}, finished_at=now)
+        session.add_all([fresh, failed])
+        await session.commit()
+        fresh_id, failed_id = fresh.id, failed.id
+    scheduled: list[str] = []
+    monkeypatch.setattr(ledger_match, "schedule", lambda run_id, **kw: scheduled.append(run_id) or True)
+    body = await ledger_of(client, fresh_id)
+    assert body["state"] == "pending" and scheduled == [], body
+    assert (await ledger_of(client, failed_id))["state"] == "ineligible"
+
+
+async def test_a_run_that_finished_long_ago_and_was_never_sealed_says_so(client, monkeypatch):
+    """「刚跑完、马上封存」只是结束后的那一会儿：成功结束了好一阵、一直没封存的（封存时出了错、封存这件事之前的老数据），
+    再答 pending 就是让页面一直转圈、等两分钟、点「再取一次」还是 pending。照实说没封存（ineligible，NOT_SEALED）；
+    结束时间没记的同样不当成刚结束。"""
+    from datetime import datetime, timedelta, timezone
+
+    from app.db.models import Run
+    from app.ledger import view as ledger_view
+
+    old = datetime.now(timezone.utc) - timedelta(seconds=ledger_view.SEAL_GRACE_S + 60)
+    async with SessionLocal() as session:
+        stale = Run(workflow_name="很早以前跑完", status="succeeded", run_class="exploratory", origin_kind="chat",
+                    graph={}, input={}, output={}, finished_at=old)
+        undated = Run(workflow_name="没记结束时间", status="succeeded", run_class="exploratory", origin_kind="chat",
+                      graph={}, input={}, output={})
+        session.add_all([stale, undated])
+        await session.commit()
+        stale_id, undated_id = stale.id, undated.id
+    scheduled: list[str] = []
+    monkeypatch.setattr(ledger_match, "schedule", lambda run_id, **kw: scheduled.append(run_id) or True)
+    for run_id in (stale_id, undated_id):
+        body = await ledger_of(client, run_id)
+        assert body["state"] == "ineligible" and body["reason"] == ledger_match.NOT_SEALED, body
+    assert scheduled == []
+
+
 async def test_runs_that_are_not_compared_say_why(client, monkeypatch):
     row = await S.explore(monkeypatch, S.EQUIVALENT, origin="api", text="本周销售额 [[v:Q1.r0.销售额]]。")
     body = await ledger_of(client, row.id)

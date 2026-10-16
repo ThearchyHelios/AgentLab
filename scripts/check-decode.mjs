@@ -2910,5 +2910,54 @@ await section('人的驳回 run.cancelled reason=rejected（05-已知遗留 (a)�
   check('老事件（没有 reason）照旧「已取消」', legacy?.title === '已取消', legacy?.title)
 })
 
+await section('被驳回的那一步：node.failed 带 reason=rejected 时画「被驳回」，不画成失败；没有 reason 的老运行照旧失败（05 (a)、X9）', async () => {
+  const trace = await import(await load('/src/run/trace.ts'))
+  const derive = await import(await load('/src/run/derive.ts'))
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: seq, data })
+  const start = [E(1, 'run.started', null, { nodes: 3 }), E(2, 'node.started', 'pay', { label: '付款' }),
+    E(3, 'human.requested', 'pay', { title: '确认发送：付款' }), E(4, 'human.resolved', 'pay', { approved: false, note: '金额不对', actor: '张工' })]
+  const rejectedFail = E(5, 'node.failed', 'pay', { error: '「付款」未确认（被驳回），没有发送：金额不对', duration_ms: 1200,
+    reason: 'rejected', kind: 'action_confirm', decision: 'reject', actor: '张工', note: '金额不对' })
+  const legacyFail = E(5, 'node.failed', 'pay', { error: '人工驳回：金额不对', duration_ms: 1200 })
+  const end = E(6, 'run.cancelled', null, { reason: 'rejected', node_id: 'pay', label: '付款', kind: 'action_confirm',
+    decision: 'reject', actor: '张工', note: '金额不对' })
+  const node = (events) => flatten(mod.decodeRun(events)).find((s) => s.kind === 'node' && s.nodeId === 'pay')
+
+  const step = node([...start, rejectedFail, end])
+  check('这一步写「被驳回」：状态 rejected，不是 failed、不是 error', step?.status === 'rejected' && step?.level !== 'error',
+    `${step?.status} / ${step?.level}`)
+  check('副标题写谁驳回、备注（步骤名就是节点名，不再写一遍）', step?.sub === '张工 驳回：金额不对', step?.sub)
+  check('原话放展开里，一字不改', step?.detail === '「付款」未确认（被驳回），没有发送：金额不对', step?.detail)
+  check('这一次执行也记成被驳回', step?.execs?.at(-1)?.status === 'rejected', step?.execs?.at(-1)?.status)
+  const expired = node([...start, { ...rejectedFail, data: { ...rejectedFail.data, decision: 'expired_reject', actor: null,
+    note: '超过时限，按设置驳回' } }, end])
+  check('超时驳回：写按设置驳回，备注不重复', expired?.sub === '超过时限，按设置驳回', expired?.sub)
+  const legacy = node([...start, legacyFail, end])
+  check('老运行（node.failed 没有 reason）照旧画失败', legacy?.status === 'failed' && legacy?.level === 'error',
+    `${legacy?.status} / ${legacy?.level}`)
+
+  // 航迹：节点状态是 rejected，不是「失败于 X」，下游是「未到达」不是「被阻断」
+  const graph = { nodes: [{ id: 'start', type: 'input' }, { id: 'pay', type: 'tool' }, { id: 'out', type: 'output' }],
+    edges: [{ source: 'start', target: 'pay' }, { source: 'pay', target: 'out' }] }
+  const fold = (events) => derive.applyDerived(events.reduce(trace.foldEvent, trace.emptyTrace()), graph)
+  // 航迹照真实的先后：停在确认上（run.interrupted）→ 人回复后恢复（run.resumed、重放的 node.started）→ 驳回
+  const real = [E(1, 'run.started', null, { nodes: 3 }), E(2, 'node.started', 'pay', { label: '付款' }),
+    E(3, 'human.requested', 'pay', { title: '确认发送：付款' }), E(4, 'run.interrupted', 'pay', { payload: { node_id: 'pay' } }),
+    E(5, 'run.resumed', null, {}), E(6, 'node.started', 'pay', { label: '付款', resumed: true }),
+    E(7, 'human.resolved', 'pay', { approved: false, note: '金额不对', actor: '张工' })]
+  const at = (e, seq) => ({ ...e, seq, ts: seq })
+  const t = fold([...real, at(rejectedFail, 8), at(end, 9)])
+  check('航迹：被驳回的节点状态是 rejected', t.nodes.pay?.state === 'rejected', t.nodes.pay?.state)
+  check('航迹：不记成失败的节点（没有「失败于 付款」）', t.failedNodeId === undefined, t.failedNodeId)
+  check('航迹：那一段也收成 rejected', t.nodes.pay?.segments?.at(-1)?.status === 'rejected', t.nodes.pay?.segments?.at(-1)?.status)
+  check('航迹：下游是「未到达」，不是「被阻断」', t.nodes.out?.state === 'unreached', t.nodes.out?.state)
+  check('航迹：原话留着（卡片悬停写得出谁、为什么）', t.nodes.pay?.error === '「付款」未确认（被驳回），没有发送：金额不对')
+  check('回放到驳回之后那一刻：投影也是 rejected', trace.project(t, 8500).nodes.pay?.state === 'rejected',
+    trace.project(t, 8500).nodes.pay?.state)
+  const old = fold([...real, at(legacyFail, 8), E(9, 'run.failed', null, { error: '人工驳回：金额不对', node_id: 'pay' })])
+  check('老运行照旧：失败、失败于付款、下游被阻断', old.nodes.pay?.state === 'failed' && old.failedNodeId === 'pay'
+    && old.nodes.out?.state === 'blocked', `${old.nodes.pay?.state} / ${old.failedNodeId} / ${old.nodes.out?.state}`)
+})
+
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')
 process.exit(failed ? 1 : 0)
