@@ -19,7 +19,7 @@ MAX_CANDIDATES 份（按工作流、版本、节点排好的先后）。
 schema 用这条查询当时冻结的表结构（表结构快照），列的中文名取同一份快照里冻结的数据目录。只读封存范围内的快照（api/evidence
 的 _sealed 读法），读不出、被改过的快照不比，记 skipped。
 
-**资源。** 每次运行限时 TIMEOUT_S（缺省 8 秒），在线程里跑，同时最多 CONCURRENCY（2）个（照 scheduler/auto_compare 的做法：
+**资源。** 每次运行限时（设置 ledger.match_timeout_s，缺省 TIMEOUT_S = 8 秒），在线程里跑，同时最多 CONCURRENCY（2）个（照 scheduler/auto_compare 的做法：
 信号量按事件循环分开，线程池两个线程）。时限按绑定逐组看：过了时限，还没比的口径记 skipped（比对超时）；整次比对卡在线程里
 过了时限再加 GRACE_S 还没回来，整次记 skipped。解析失败同样照实记 skipped 和原因。都只记日志和 skipped，不影响运行本身。
 
@@ -477,15 +477,21 @@ async def _kinds(session: Any) -> dict[str, str | None]:
     return {name: kind for name, kind in (await session.execute(select(DataSource.name, DataSource.kind))).all()}
 
 
-async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float = TIMEOUT_S) -> str | None:
+async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float | None = None) -> str | None:
     """比对一次运行，存工件、追加 ledger.matched；返回工件 id。不比对（不是探索运行、没成功、没封存、没有查询）、比对期间
-    运行换了封存时返回 None。比对本身出的问题都记成 skipped，不抛。"""
+    运行换了封存时返回 None。比对本身出的问题都记成 skipped，不抛。timeout 不给按设置（ledger.match_timeout_s）。
+
+    运行一封存就比的（trigger=sealed）比完接着看能不能按口径自动正式出具（ledger/issue.auto_issue，拍板 L1）：事后补比、
+    按需比的不自动出具——那是按现在的口径回看老答案，不该替人补发正式运行。"""
     from app.api.evidence import _sealed
+    from app.api.settings import ledger_settings
 
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if ineligible(run) is not None:
             return None
+        if timeout is None:
+            timeout = float((await ledger_settings(session))["match_timeout_s"])
     sealed = await _sealed(run_id)
     if not sealed.queries:
         return None
@@ -500,7 +506,12 @@ async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float = TI
         except TimeoutError:
             logger.warning("运行 %s 的口径比对超过 %g 秒仍未完成，记为没比完", run_id, timeout + GRACE_S)
             content = _timed_out(sealed)
-    return await store.save(run_id, content, seal=(sealed.run_manifest_seq, sealed.manifest_hash), trigger=trigger)
+    artifact = await store.save(run_id, content, seal=(sealed.run_manifest_seq, sealed.manifest_hash), trigger=trigger)
+    if artifact is not None and trigger == "sealed" and (content.get("whole") or {}).get("equivalent"):
+        from app.ledger import issue
+
+        await issue.auto_issue(run_id)
+    return artifact
 
 
 def schedule(run_id: str, *, trigger: str = "sealed") -> bool:

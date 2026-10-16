@@ -3,10 +3,15 @@
 不另建存储：ActionRecord 本身带着工作流、版本、graph_hash、能力版本、payload_hash、回执；「口径 → 应用」就是固定这一版的
 应用版本。用在发布弹窗、退役确认、版本列表三处。
 
-口径账本（docs/design/next-round/02-口径账本.md）在这里加两个只读接口：
+口径账本（docs/design/next-round/02-口径账本.md）在这里加的接口：
 - GET /api/runs/{run_id}/ledger（runs_router，和证据同一道门）：一次运行里每个数的口径标签、整题判断、每条查询的比对、能做的
-  动作（app/ledger/view.py）；
-- GET /api/ledger/stats（router，搭建者）：账本自身给出的统计 E1–E4，从比对工件、运行、审计现算（app/ledger/stats.py）。
+  动作、出具过的正式运行、对过的账（app/ledger/view.py）；
+- GET /api/ledger/stats（router，搭建者）：账本自身给出的统计 E1–E4，从比对工件、运行、审计现算（app/ledger/stats.py）；
+- POST /api/ledger/answers/{run_id}/issue（answers_router，登录即可，第 3 波）：按口径正式出具（app/ledger/issue.py，拍板
+  L1、L5：参数只从比对工件取，使用者只能按他有权使用的应用固定着的版本出具）；
+- POST /api/ledger/answers/{run_id}/reconcile（同上）：口径对账，点开才跑一次确定性派生的只读图（app/ledger/reconcile.py）；
+- GET /api/ledger/certify-queue、POST /api/ledger/certify-queue/dismiss（router，搭建者，第 3 波）：可沉淀的问题、「不是口径」
+  （app/ledger/certify.py）。这几个新接口都不放给访问密钥（auth/keys.KEY_ROUTES 不登记）。
 """
 from __future__ import annotations
 
@@ -15,6 +20,7 @@ from typing import Any
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -100,3 +106,58 @@ async def ledger_stats(since: datetime | None = Query(default=None, description=
 
     origins = [o.strip() for o in (origin or "").split(",") if o.strip()] or None
     return await compute_stats(session, since=since, until=until, origins=origins, principal=current_principal())
+
+
+class IssueIn(BaseModel):
+    """按哪份口径出具：只能选口径，参数由服务端从比对工件里取（不收客户端传的参数）。"""
+
+    workflow_id: str = Field(min_length=1, max_length=32)
+    version: int = Field(ge=1)
+
+
+@answers_router.post("/{run_id}/issue")
+async def issue_answer(run_id: str, payload: IssueIn) -> dict[str, Any]:
+    """按口径正式出具这次问数据的答案（app/ledger/issue.py）：经 launch_run 发起正式运行，来源 ledger_issue。同一运行、同一
+    口径、同一组参数只发起一次，再点交回已经发起的那一次（created 为假）。不能出具时回 409（整题不等价、版本退役、有人工
+    节点或写入、缺入口字段……）、403（权限不够：使用者只能按他有权使用的应用固定着的版本出具）、429（超过每日上限），
+    detail 写明原因。"""
+    from app.api.coded import CodedHTTPException
+    from app.api.deps import current_principal
+    from app.ledger import issue as ledger_issue
+
+    try:
+        run, created = await ledger_issue.issue(run_id, payload.workflow_id, payload.version,
+                                                principal=current_principal())
+    except ledger_issue.IssueRefused as e:
+        raise CodedHTTPException(e.status_code, e.message, e.code) from e
+    return {"run_id": run.id, "created": created, "issued": ledger_issue.issued_view(run)}
+
+
+class ReconcileIn(BaseModel):
+    """对哪条查询、和哪份相关口径对账。inputs + confirm：参数要核对时（动作里 needs_check）人核对、改过的参数；pairs：认不出
+    哪一列对哪个指标时人选的 [{ours: 这次的列, metric: 口径卡上的指标 id}]（动作里写明要不要选）。"""
+
+    query: str = Field(min_length=1, max_length=64)
+    workflow_id: str = Field(min_length=1, max_length=32)
+    version: int = Field(ge=1)
+    inputs: dict[str, Any] | None = None
+    confirm: bool = False
+    pairs: list[dict[str, Any]] | None = None
+
+
+@answers_router.post("/{run_id}/reconcile", status_code=201)
+async def reconcile_answer(run_id: str, payload: ReconcileIn) -> dict[str, Any]:
+    """口径对账（app/ledger/reconcile.py）：按那一版口径确定性派生只读图，发起一次探索运行（来源 reconcile），差值在对账卡
+    里算。参数是推断出来的、不全的要先核对（409，code ledger_reconcile_check_inputs）；认不出列怎么配的要人选（409，
+    ledger_reconcile_needs_pairs）；多行时维度是遮罩列、键不唯一照实拒绝（409）。"""
+    from app.api.coded import CodedHTTPException
+    from app.api.deps import current_principal
+    from app.ledger import reconcile as ledger_reconcile
+
+    try:
+        run = await ledger_reconcile.reconcile(run_id, ledger_reconcile.Request(
+            query=payload.query, workflow_id=payload.workflow_id, version=payload.version, inputs=payload.inputs,
+            confirm=payload.confirm, pairs=payload.pairs), principal=current_principal())
+    except ledger_reconcile.ReconcileRefused as e:
+        raise CodedHTTPException(e.status_code, e.message, e.code) from e
+    return {"run_id": run.id, "reconciled": ledger_reconcile.reconciled_view(run)}
