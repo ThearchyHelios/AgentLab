@@ -4,9 +4,9 @@
 **目标种类**（docs/design/next-round/00-总方案.md X4：定时只有一套）：target_kind 是 workflow（缺省，字段和行为一字不变）、
 eval_suite（跑一次评测题集）或 source_maintenance（维护一个数据源）。非工作流目标写 target_id，不写 workflow_id、输入模板、
 运行类别和 Webhook：核对目标交给各自的模块（scheduler/service.check_target → app/eval/scheduled、app/data/source_maintenance）；
-它们的通知走通知渠道的订阅（评测有退步、评测失败……），不走定时任务的 Webhook——Webhook 的三种事件（运行结束、运行失败、
-等待审批）说的是这一次发起的那次运行，非工作流目标没有那一次运行，配上了也收不到，所以照实拒收。接口返回带 target_kind、
-target_id、target_name（目标现在的名字，不在了用保存时记下的那一份）。
+它们的通知走通知渠道的订阅（定时评测有退步、定时评测没有评完……），不走定时任务的 Webhook——Webhook 的三种事件（运行
+结束、运行失败、等待审批）说的是这一次发起的那次运行，非工作流目标没有那一次运行，配上了也收不到，所以照实拒收。接口返回带
+target_kind、target_id、target_name（目标现在的名字，不在了用保存时记下的那一份）。
 
 形状按前后端约定（Schedule、Fire 两种对象，见 _schedule_out、_fire_outs）。Webhook 地址和签名密钥加密存放，接口
 只给主机和末 4 位（url_hint）、有没有密钥（has_secret）。请求体自己解析、自己校验：错误一律回中文 detail，表单

@@ -5642,7 +5642,7 @@ export const NOTIFY_TEXT = {
     // 个人应用提交审核有了结果（发布了或退回了），通知提交人：只对个人渠道、全局渠道有意义（服务端 notify/service.notify_review）
     'review.done': '我提交审核的应用有结果',
     'source.changed': '数据源有变化要处理', 'ledger.recall': '口径升版，答案的数变了',
-    'eval.regressed': '评测有退步', 'eval.failed': '评测失败',
+    'eval.regressed': '定时评测有退步', 'eval.failed': '定时评测没有评完',
     'task.digest': '每天的待办汇总', 'key.expiring': '访问密钥快到期',
   } as Record<string, string>,
   /** 投递记录里才有的事件：改派、升级、催办按「待办打开」的订阅推，记录里照实写是哪一种（服务端 notify/service._AS） */

@@ -5,8 +5,8 @@
   名字；工作流的定时行为一字不变（test_schedules_api.py）；
 - 到点建一次评测：定时跑 1 次，截至时间是计划触发时间，ScheduleFire.eval_run_id 指向它；上一次还没结束就 skipped_overlap；
   错过的按宽限补（同一套调度循环）；
-- 有一道题从通过变成不通过推「评测有退步」，没评完推「评测失败」：只推订阅了的全局渠道，消息里只有题集名、通过数、退步题数、
-  链接，不放期望值和答案里的数。题集名、渠道都是虚构的。
+- 有一道题从通过变成不通过推「定时评测有退步」，没评完推「定时评测没有评完」：只推订阅了的全局渠道，消息里只有题集名、
+  通过数、退步题数、链接，不放期望值和答案里的数。手动发起的评测不推（叫法照实带「定时」）。题集名、渠道都是虚构的。
 """
 from __future__ import annotations
 
@@ -187,7 +187,7 @@ async def test_a_regression_is_pushed_without_numbers(client, monkeypatch, recei
     await es.wait_eval(second.eval_run_id)
     [request] = received
     message = json.loads(request.content)
-    assert message["event"] == "eval.regressed" and message["title"] == "评测「虚构周回归」有退步"
+    assert message["event"] == "eval.regressed" and message["title"] == "定时评测「虚构周回归」有退步"
     text = message["text"]
     assert "通过：0 / 1 题" in text and "退步：1 题" in text
     for secret in ("330", "310", "gmv", "orders", "paid_date"):
@@ -221,7 +221,35 @@ async def test_an_unfinished_scheduled_evaluation_pushes_failed(client, monkeypa
     assert run.status == "partial" and run.stop_reason.startswith("连续 3 题") and len(skipped) == 1
     [request] = received
     message = json.loads(request.content)
-    assert message["event"] == "eval.failed" and message["title"] == "评测「虚构失败题集」没有评完"
+    assert message["event"] == "eval.failed" and message["title"] == "定时评测「虚构失败题集」没有评完"
     assert "通过：0 / 3 题" in message["text"]
     # 链接去那条定时任务的触发历史（设了对外访问地址才有链接）
     assert all("/schedules/" in link["url"] for link in message["links"])
+
+
+def test_the_eval_events_say_they_are_for_scheduled_evaluations():
+    """这两个事件只在定时发起的评测收尾时推（runner._conclude 认 trigger == "schedule"）：手动发起的那次人自己在看，不推。
+    叫法得照实说「定时」——只写「评测失败」，人勾上之后手动评测失败了永远收不到，界面上也没处说为什么（复核 L3）；
+    eval.failed 也不只是失败：到了上限、止损停下（partial）同样推，所以说「没有评完」。"""
+    assert notify.EVENTS["eval.regressed"].label == "定时评测有退步"
+    assert notify.EVENTS["eval.failed"].label == "定时评测没有评完"
+
+
+async def test_a_manual_evaluation_that_stops_short_pushes_nothing(client, monkeypatch, received):
+    """手动发起的评测止损停下：订阅了「定时评测没有评完」的渠道也不推（叫法说的就是定时的）。"""
+    async def drive(self):
+        self.turn.path, self.turn.copilot_failed, self.turn.reason = "build_failed", True, "助手本轮未完成"
+        return self.turn
+
+    monkeypatch.setattr(answer_mod.Driver, "drive", drive)
+    suite_id = await es.make_suite("none", cases=ASK * 4, name="虚构手动题集", budget={"max_parallel": 1})
+    await _channel(["eval.regressed", "eval.failed"])
+    started = await client.post(f"/api/evals/suites/{suite_id}/evaluations", json={})
+    assert started.status_code == 202, started.text
+    [ev] = started.json()["evaluations"]
+    await es.wait_eval(ev["id"])
+    await notify.drain()
+    async with SessionLocal() as session:
+        run = await session.get(EvalRun, ev["id"])
+    assert run.trigger == "manual" and run.status == "partial" and run.stop_reason.startswith("连续 3 题")
+    assert received == [], "手动发起的评测不推"

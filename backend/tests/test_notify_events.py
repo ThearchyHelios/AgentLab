@@ -109,7 +109,7 @@ async def test_events_endpoint_says_who_receives_each_event(client):
     rows = (await client.get("/api/notify/events")).json()
     assert [r["event"] for r in rows] == list(service.EVENTS)
     by = {r["event"]: r for r in rows}
-    assert by["eval.regressed"] == {"event": "eval.regressed", "label": "评测有退步", "scopes": ["global"]}
+    assert by["eval.regressed"] == {"event": "eval.regressed", "label": "定时评测有退步", "scopes": ["global"]}
     assert by["ledger.recall"]["scopes"] == []
     assert by["review.done"]["scopes"] == ["global", "user"]
 
@@ -143,7 +143,7 @@ async def test_scope_mismatch_is_refused_only_for_newly_ticked_events(client):
     again = await client.patch(f"/api/notify/channels/{channel_id}", json={"events": ["review.done", "run.failed"]})
     assert again.status_code == 200, again.text
     added = await client.patch(f"/api/notify/channels/{channel_id}", json={"events": ["review.done", "eval.failed"]})
-    assert added.status_code == 422 and "评测失败" in added.json()["detail"]
+    assert added.status_code == 422 and "定时评测没有评完" in added.json()["detail"]
 
 
 # --------------------------------------------------------------------------

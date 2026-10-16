@@ -72,9 +72,10 @@ EVENTS: dict[str, Event] = {
     # 口径升版后召回重算，数真变了（02 第 7 项）：答案的主人有 recall 待办；口径名、版本、链接，不放新旧值和差值
     "ledger.recall": Event("口径升版，答案的数变了", ()),
     # 定时评测有题从通过变成不通过 / 评测没跑完（01 第 15 项）：题集名、通过数、退步题数、链接；不放期望值和答案里的数。
-    # 只推全局渠道：评测是搭建者们共用的一把尺，不归哪个人（notify_eval）
-    "eval.regressed": Event("评测有退步", ("global",)),
-    "eval.failed": Event("评测失败", ("global",)),
+    # 只推全局渠道：评测是搭建者们共用的一把尺，不归哪个人（notify_eval）。只推定时发起的（手动发起的那次人自己在看），
+    # 叫法就照实带「定时」；没评完包括失败、到了上限、止损停下，所以不叫「失败」
+    "eval.regressed": Event("定时评测有退步", ("global",)),
+    "eval.failed": Event("定时评测没有评完", ("global",)),
     # 每天一条待办汇总（04 B3）：只推个人渠道；条数、最早的时限、最多 5 条（节点在图上的名字）、去待办箱的链接
     "task.digest": Event("每天的待办汇总", ()),
     # 访问密钥到期前 7 天、1 天各一次（04 B3）：个人密钥推本人，服务账号的推全局渠道；密钥名、到期日、链接
@@ -387,7 +388,7 @@ async def notify_eval(eval_run_id: str, event: str, *, passed: int, graded: int,
     lines.append(("评测", f"#{eval_run_id[:6]}"))
     links = [("查看定时任务", f"{base}/schedules/{run.schedule_id}?tab=history")] if base and run.schedule_id else []
     message = {"event": event, "status": run.status, "ok": False,
-               "title": f"评测「{name}」{'有退步' if regressed_event else '没有评完'}", "lines": lines, "links": links,
+               "title": f"定时评测「{name}」{'有退步' if regressed_event else '没有评完'}", "lines": lines, "links": links,
                "subject": {"eval_run_id": eval_run_id, "suite_id": run.suite_id, "schedule_id": run.schedule_id}}
     return await _push(channels, message, subject_kind="eval_run", subject_id=eval_run_id, event=event, run_id=None,
                        task_id=None)
