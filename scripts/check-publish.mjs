@@ -2008,7 +2008,8 @@ await section('应用平台：发布成功做成应用；已发布版本的使�
     await page.keyboard.press('Alt+KeyH')
     const sheet = page.locator('[role="dialog"][aria-label="版本历史"]')
     await sheet.waitFor()
-    check('版本列表标出已退役的版本', await sheet.locator('[data-version-retired-chip]').count() === 1)
+    // 版本列表是打开之后才取的：等列表落地再数（并行跑时，打开那一刻列表常常还是空的）
+    check('版本列表标出已退役的版本', await waitFor(page, async () => await sheet.locator('[data-version-retired-chip]').count() === 1))
     const retiredRow = sheet.locator('ol button', { hasText: 'v2' }).first()
     check('……不用点开，列表那一行就写谁退的和退役说明', await retiredRow.locator('[data-version-retired]').count() === 1
       && (await retiredRow.innerText()).includes('张工') && (await retiredRow.innerText()).includes('改按支付日统计'),
