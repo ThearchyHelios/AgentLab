@@ -30,6 +30,7 @@ from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Setting
 from app.engine import judge as judge_mod
+from app.engine import spend
 from app.engine.evidence import build_catalog, compose_doc, iter_units
 from app.engine.judge import (
     BATCH_SIZE,
@@ -503,7 +504,7 @@ async def test_unlimited_never_truncates(monkeypatch, stored):
     raw = "".join(f"第 {i} 个区域的销售额增长来自新客。[[see:m:gmv]]" for i in range(BATCH_SIZE + 5))
     doc = compose_doc(raw, catalog)
     async with SessionLocal() as session:          # 今天已经花掉很多：不限就是不限
-        session.add(Setting(key=SPEND_KEY, value={"date": judge_mod._today(), "usd": 999.0, "calls": 9}))
+        session.add(Setting(key=SPEND_KEY, value={"date": spend._today(), "usd": 999.0, "calls": 9}))
         await session.commit()
     outcome = await judge_doc(doc, catalog, spec=SPEC, budget=UNLIMITED)
     assert [len(units) for units in judge.judged] == [BATCH_SIZE, 5]
@@ -517,7 +518,8 @@ async def test_the_daily_cap_resets_the_next_day(monkeypatch, stored):
     cost = prepare(doc, catalog).cost(PRICED, prepare(doc, catalog).cands)
     budget = Budget(max_claims=None, max_cost_usd=None, timeout_s=None, daily_max_usd=cost * 1.05)
     day = {"today": "2026-09-28"}
-    monkeypatch.setattr(judge_mod, "_today", lambda: day["today"])
+    # 裁判的账和核查、评测按同一个本地日期滚动（engine/spend.py 的 Ledger）
+    monkeypatch.setattr(spend, "_today", lambda: day["today"])
 
     judge = Judge(monkeypatch)
     first = await judge_doc(doc, catalog, spec=SPEC, budget=budget)
