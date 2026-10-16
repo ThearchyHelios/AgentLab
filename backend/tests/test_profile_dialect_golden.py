@@ -69,7 +69,7 @@ def _queries(kind: str) -> list[tuple[str, str | None]]:
                                            (d.column(META["orders"], "biz_day"), True)])),
         ("date_window", d.window_value_counts_sql(orders, status, d.column(META["orders"], "paid_at"),
                                                   "2026-08-27", 21)),
-        ("day_volume", d.day_volume_sql(orders, d.column(META["orders"], "paid_at"), "2026-08-27")),
+        ("day_volume", d.day_volume_sql(orders, d.column(META["orders"], "paid_at"), "2026-08-27", "2026-10-01")),
         ("sample", d.sample_value_counts_sql(orders, status, 1, 21)),
         # 第 3 波：取值观察的最新业务日期（文字存的日期按字符串比）
         ("max_date", d.max_date_sql(orders, d.column(META["orders"], "paid_at"))),

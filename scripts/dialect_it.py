@@ -50,6 +50,9 @@ SETTINGS = ProfileSettings(enabled=True, table_max_queries=40, table_max_s=60, q
 N_ORDERS, N_EVENTS_OLD, N_EVENTS_NEW = 40, 10, 1500
 BASE = _dt.datetime(2026, 9, 1, 10, 0, 0)
 WINDOW_FROM = "2026-09-05"
+#: 按日行数的上界（观察当天，含）：WINDOW_UNTIL 在全部夹具日期之后；WINDOW_CUT 落在中间，之后的日子不进窗口
+WINDOW_UNTIL = "2026-09-30"
+WINDOW_CUT = "2026-09-07"
 
 failures: list[str] = []
 
@@ -80,6 +83,8 @@ EXPECT = {
     "pay_way": Counter(o["pay_way"] for o in ORDERS),
     "paid_at": (min(o["paid_at"] for o in VALID), max(o["paid_at"] for o in VALID)),
     "day_volume": Counter(o["paid_at"].date().isoformat() for o in IN_WINDOW),
+    "day_volume_cut": Counter(o["paid_at"].date().isoformat() for o in IN_WINDOW
+                              if o["paid_at"].date().isoformat() <= WINDOW_CUT),
     "window_status": Counter(o["status"] for o in IN_WINDOW),
 }
 
@@ -354,9 +359,13 @@ async def run_target(t: Target) -> None:
         # ---- 取值观察的新方法
         tbl = d.table(orders, "orders")
         paid_col = d.column(orders, _key(orders, "paid_at"))
-        res = await data_engine.run_query(source, d.day_volume_sql(tbl, paid_col, WINDOW_FROM))
+        res = await data_engine.run_query(source, d.day_volume_sql(tbl, paid_col, WINDOW_FROM, WINDOW_UNTIL))
         got_days = Counter({_day(row[0]): int(row[1]) for row in res.rows})
         check(got_days == EXPECT["day_volume"], f"按日行数和手算一致（无效日期不算进窗口）：{dict(got_days)}")
+        res = await data_engine.run_query(source, d.day_volume_sql(tbl, paid_col, WINDOW_FROM, WINDOW_CUT))
+        got_cut = Counter({_day(row[0]): int(row[1]) for row in res.rows})
+        check(got_cut == EXPECT["day_volume_cut"],
+              f"按日行数只数到观察当天（含当天的时分秒，之后的不算）：{dict(got_cut)}")
         status_col = d.column(orders, _key(orders, "status"))
         res = await data_engine.run_query(source, d.window_value_counts_sql(tbl, status_col, paid_col, WINDOW_FROM, 21))
         got_window = Counter({str(row[0]).rstrip(" "): int(row[1]) for row in res.rows})

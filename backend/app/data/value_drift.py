@@ -13,9 +13,17 @@
   记 info，列出变化最大的几个取值。
 - **断档**（date_stalled）：最新业务日期没前进，且这个日期离今天超过 max(2 × 以前前进的中位间隔, 3 天)；要见过至少一次
   前进才知道它多久前进一次。
-- **缺天**（date_gap）：窗口里（有数据的第一天到最后一天之间）有日子没数据，而以前同口径的窗口都没有过。
+- **缺天**（date_gap）：窗口里（有数据的第一天到最后一天之间）有日子没数据，而以前同口径的窗口都没有过。只看到观察当天
+  为止：业务日期有未来值（预约、计划类的日期，或者写错的）时，今天以后的空日子不是「没数据」，那几天本来就还没到；以前
+  那次观察也只看到它自己那天（data.until）为止，不然它窗口里未来的空日子会被当成「以前就有过缺天」，挡住这一次真缺的天。
 - **量跌**（volume_drop）：最近一个整天的行数不到它前面 28 天中位数的 30%（前 28 天至少 14 天有数据、中位数至少 20 行）。
-  最后一天和观察当天同一天（还在写入）时往前退一天。只看这一次的窗口，不需要历史。
+  最近一个整天是「有数据的最后一天」和「观察当天的前一天」里早的那个：观察当天还在写入，不是整天；业务日期有未来值时
+  有数据的最后一天在今天以后，也不能拿它退一天（那样会退到今天这个不完整的日子上）。只看这一次的窗口，不需要历史。
+- **断档**遇到未来值：最新业务日期在今天以后时离今天是负数，不会报断档（报不出、也不误报）；观察查询本身不截未来值
+  （最新业务日期照实记，目录里也照实给人看）。
+
+「今天」由调用方传进来（today）：取值观察按服务端所在时区算（data/catalog_profile_observe.local_today），业务日期是本地
+日期，用 UTC 的日期在本地凌晨会差一天。
 - **行数**（rows_drop / rows_jump）：比上一次同口径的少了 30% 以上 / 涨到 3 倍以上；依据是数据库统计的估算值时，要连续
   两次都这样（和跌、涨之前那一次比）才报。数到上限、只知道「至少多少行」的不比。
 """
@@ -177,7 +185,10 @@ def _series(data: Mapping[str, Any]) -> dict[date, int]:
     return out
 
 
-def _holes(days: Mapping[date, int]) -> list[date]:
+def _holes(days: Mapping[date, int], until: date | None = None) -> list[date]:
+    """有数据的第一天到最后一天之间没数据的日子；until 给了时只看到这一天为止（今天以后的空日子不算缺天）。"""
+    if until is not None:
+        days = {d: n for d, n in days.items() if d <= until}
     if not days:
         return []
     first, last = min(days), max(days)
@@ -190,15 +201,14 @@ def daily(current: Obs, history: Iterable[Obs], *, today: date) -> list[Finding]
     same, _note = comparable(current, history)
     days = _series(current.data)
     out: list[Finding] = []
-    holes = _holes(days)
-    if holes and same and all(not _holes(_series(h.data)) for h in same):
+    holes = _holes(days, today)
+    if holes and same and all(not _holes(_series(h.data), _day(h.data.get("until"))) for h in same):
         out.append(Finding("date_gap", "warning", before={"gaps": 0},
                            after={"gaps": len(holes), "days": [d.isoformat() for d in holes[:GAPS_SHOWN]]},
                            key=tuple(d.isoformat() for d in holes)))
     if days:
-        last = max(days)
-        if last >= today:
-            last -= timedelta(days=1)
+        # 最近一个整天：有数据的最后一天和昨天里早的那个（今天还在写入；未来的日子不是整天）
+        last = min(max(days), today - timedelta(days=1))
         base = [days.get(last - timedelta(days=i), 0) for i in range(1, VOLUME_BASELINE_DAYS + 1)]
         present = sum(1 for n in base if n > 0)
         median = statistics.median(base) if base else 0

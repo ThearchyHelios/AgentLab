@@ -8,7 +8,11 @@
 - rows：这张表的行数（剖析开头估行数那一条的结果，不另发查询）；口径 stats（数据库统计的估算值）/ count（数到上限）；
 - codes_observe：码值列的取值分布——**所有**码值列都观察，包括人工确认过、标了已列全的（目录-D6）；只读，不改含义；
 - freshness：业务日期列（已确认或已验证）的最新日期；
-- daily_volume：业务日期最近 35 天每天的行数。
+- daily_volume：业务日期最近 35 天每天的行数，数到观察当天为止（今天以后的日子不进窗口，见 SqlDialect.day_volume_sql）。
+
+**「今天」按服务端所在时区**（local_today，和待办汇总的 notify.digest_at 同一个口径）：窗口从哪天起、数到哪天、比较器的
+「今天」（最近一个整天是哪天、断档离今天几天）都用它。业务日期是本地日期，按 UTC 的日期算，东八区凌晨 0–8 点的「今天」
+还是前一天，这几样都会差一天。服务端和业务库不在一个时区时，差的那几个小时照实差着（业务库的时区探查不到）。
 
 **大表的口径**（目录-D7）：小表（行数不超过整表统计的上限）看整表（full）。大表：业务日期已确认或已验证、而且这一列打头
 有索引（探查记下的 index_first_columns）时看最近 35 天的窗口（window，走索引的范围扫描）；PostgreSQL / Oracle 没有就块采样
@@ -139,12 +143,13 @@ def sample_percent(rows: int | None, target: int) -> float | None:
     return next((p for p in SAMPLE_LADDER if p <= want), SAMPLE_LADDER[-1])
 
 
-def _today() -> date:
-    return datetime.now(timezone.utc).date()
+def local_today(now: datetime | None = None) -> date:
+    """观察用的「今天」：服务端所在时区的日期（和待办汇总的 notify.digest_at 同一个口径，见模块说明）。now 缺省是现在。"""
+    return (now or utcnow()).astimezone().date()
 
 
 def _since() -> date:
-    return _today() - timedelta(days=WINDOW_DAYS)
+    return local_today() - timedelta(days=WINDOW_DAYS)
 
 
 def _window_ok(cx: Any, meta: Mapping[str, Any], day: str | None) -> bool:
@@ -271,8 +276,9 @@ async def _dates(cx: Any, table: str, kind: str, column: str, meta: Mapping[str,
         result.observations.append(_observation("freshness", column, {"method": "full"},
                                                 {"max": str(value)[:19]}, []))
         return
-    since = _since()
-    res = await cx.run(d.day_volume_sql(t, c, since, text=text), max_rows=WINDOW_DAYS + 2)
+    today = local_today()
+    since = today - timedelta(days=WINDOW_DAYS)
+    res = await cx.run(d.day_volume_sql(t, c, since, today, text=text), max_rows=WINDOW_DAYS + 2)
     days: dict[str, int] = {}
     for row in res.rows:
         day = str(row[0])[:10] if row and row[0] is not None else ""
@@ -280,7 +286,7 @@ async def _dates(cx: Any, table: str, kind: str, column: str, meta: Mapping[str,
             days[day] = days.get(day, 0) + (cp._as_int(row[1]) or 0)
     basis = {"method": "window", "column": column, "days": WINDOW_DAYS, "since": since.isoformat()}
     result.observations.append(_observation("daily_volume", column, basis,
-                                            {"since": since.isoformat(), "until": _today().isoformat(),
+                                            {"since": since.isoformat(), "until": today.isoformat(),
                                              "days": days}, []))
 
 
@@ -396,7 +402,7 @@ async def _save_one(session: AsyncSession, source: Any, table: str, obs: Mapping
     current = vd.Obs(kind, obs["basis_key"], obs["data"], now)
     past = [vd.Obs(h.kind, h.basis_key, h.data or {}, h.at) for h in history]
     fresh = 0
-    for f in vd.compare(current, past, today=now.date(), known=known, complete=catalog.codes_complete(item)):
+    for f in vd.compare(current, past, today=local_today(now), known=known, complete=catalog.codes_complete(item)):
         after = dict(f.after) if isinstance(f.after, Mapping) else {"value": f.after}
         if f.revoke_complete:
             version = await _revoke_complete(session, source.id, table, column)

@@ -228,6 +228,49 @@ async def test_large_table_basis_window_or_first_rows_and_no_cross_basis_compare
         await drop_source(b)
 
 
+async def test_future_business_dates_stay_out_of_the_daily_window(client, tmp_path):
+    """业务日期最晚到明天、今天只写了几行：按日行数的查询只数到今天（上界，今天以后的不算），不记量跌。以前窗口只有下界，
+    明天那一天也进了窗口，比较器再退一天就退到今天这个不完整的日子上，记出一条量跌（下一轮验收）。"""
+    path = tmp_path / "ahead.db"
+    _build(path, rows=0)
+    db = sqlite3.connect(path)
+    rows = [(TODAY - timedelta(days=d)).isoformat() for d in range(1, 31) for _ in range(30)]
+    rows += [TODAY.isoformat()] * 3 + [(TODAY + timedelta(days=1)).isoformat()] * 30
+    db.executemany("INSERT INTO orders (status, paid_on, amount, secret) VALUES ('paid', ?, 1, 'x')", [(r,) for r in rows])
+    db.commit()
+    db.close()
+    sid = await _make(client, path)
+    try:
+        job_id = await _observe(sid)
+        got = {(o.kind, o.column_name): o for o in await _obs(sid)}
+        days = got[("daily_volume", "paid_on")].data["days"]
+        assert (TODAY + timedelta(days=1)).isoformat() not in days and days[TODAY.isoformat()] == 3
+        assert got[("daily_volume", "paid_on")].data["until"] == TODAY.isoformat()
+        async with SessionLocal() as session:
+            drops = list((await session.execute(select(SourceChange).where(
+                SourceChange.source_id == sid, SourceChange.kind == "volume_drop"))).scalars())
+        assert drops == [], "今天还没写完、明天的日子不是整天：不算量跌"
+        assert all(o.job_id == job_id for o in got.values())
+    finally:
+        await drop_source(sid)
+
+
+def test_observation_today_is_the_server_local_date(monkeypatch):
+    """观察用的「今天」按服务端所在时区（和待办汇总 notify.digest_at 同一个口径）：业务日期是本地日期，UTC 20 点在东八区
+    已经是第二天。"""
+    import time
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+    time.tzset()
+    try:
+        assert observe.local_today(datetime(2026, 10, 17, 20, 0, tzinfo=timezone.utc)) == date(2026, 10, 18)
+        assert observe.local_today(datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)) == date(2026, 10, 17)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
 class _FakeCx:
     """只看拼出来的 SQL：大表、业务日期没有索引。"""
 

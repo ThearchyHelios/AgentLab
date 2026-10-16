@@ -22,7 +22,7 @@ SELECT MIN(CASE WHEN paid_at >= DATE '0001-01-02' AND paid_at < DATE '9999-12-31
 -- date_window
 SELECT status, COUNT(*) AS cnt FROM sales.orders WHERE paid_at >= DATE '2026-08-27' AND paid_at < DATE '9999-12-31' AND status IS NOT NULL GROUP BY status ORDER BY cnt DESC, status LIMIT 21;
 -- day_volume
-SELECT DATE(paid_at) AS d, COUNT(*) AS n FROM sales.orders WHERE paid_at >= DATE '2026-08-27' AND paid_at < DATE '9999-12-31' GROUP BY DATE(paid_at) ORDER BY d;
+SELECT DATE(paid_at) AS d, COUNT(*) AS n FROM sales.orders WHERE paid_at >= DATE '2026-08-27' AND paid_at < DATE '2026-10-02' GROUP BY DATE(paid_at) ORDER BY d;
 -- sample
 -- （这种方言没有这类查询）
 -- max_date
