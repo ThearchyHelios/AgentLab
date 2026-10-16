@@ -178,3 +178,6 @@ export function useRunLedger(runId: string | null | undefined, enabled = true): 
   }, [on, runId, acquire, release])
   return useLedger((s) => (on && runId ? s.slots[runId] : undefined))
 }
+
+// 检查脚本（scripts/check-ledger.mjs）读写它：把一轮等待的起点挪到很早以前，不用真等两分钟就能看到「还没有结果」
+if (import.meta.env.DEV) (window as any).__ledger = useLedger

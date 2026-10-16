@@ -30,12 +30,16 @@
 //      「正在理解需求」；输入框提示回答助手的问题；刷新后照样标「助手反问」，不当成没查库的回答；
 //  15. 回答上的「做成应用」带着这次运行进蓝图（建运行起点的蓝图），不再提取工作流、跳画布的发布弹窗；
 //  16. 服务端这一轮已经自查修正过（收到 check 的结论）还没过的：不再整轮重新生成一遍，直接说没过、给补救。
+//  17. 口径账本（next-round 02）：交付了的轮次底部写「正在比对口径」，按退避再取到比对出结果、比完不再取；一行摘要
+//      （几个数来自哪份口径）、按口径正式出具和对账按钮照服务端给的动作摆；出具、对账的写请求在浏览器层拦下并核对请求体，
+//      出具过的正式运行挂在轮次下面（档位、打开运行）。
 //
 // 所有写请求都被拦在浏览器里，不碰任何库。
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
 // 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-chat.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 import { mkdirSync, readFileSync } from 'node:fs'
+import { ISSUE, RECONCILE, WHOLE, WHOLE_LABELS, ledgerOf } from './ledger-fixtures.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const CHROME = process.env.CHROME_PATH
@@ -211,12 +215,20 @@ const REJECT_CONVS = {
 const ASKBACK_CONVS = {
   askBack: conv('c0askbk', '助手反问过的会话', 1, 60 * 24 * 34),
 }
+/** 只在「口径账本」那段出现：库里存着一轮带证据的答案（evidence-doc 的周报），交付了，等着比对口径 */
+const LEDGER_CONVS = {
+  led: conv('c0ledgr', '问数据：上周的周报', 1, 60 * 24 * 32),
+}
 /** 只在「问数据的证据」那段出现：库里存着一轮带证据的答案，刷新后回运行取 _evidence */
 const ASK_CONVS = {
   askZ: conv('c0askz', '问数据：各区域销售额和最大的一单', 1, 60 * 24 * 33),
 }
 const DETAIL = {
   c0askbk: [turn('tab1', '上周销售额是多少', { answer: '销售额按下单日还是支付日算？', meta: { v: 1, asked: true } })],
+  c0ledgr: [turn('tl1', '上周的周报', {
+    answer: '（周报原文）', graph: GRAPH, run_id: 'run-led',
+    meta: { v: 1, runId: 'run-led', runClass: 'exploratory', runStatus: 'succeeded', evidence: true },
+  })],
   c0askz: [turn('tz9', '上周各区域的销售额，最大的一单是多少', {
     answer: EVQ.output.answer, graph: GRAPH, run_id: 'run-evq',
     meta: { v: 1, runId: 'run-evq', runClass: 'exploratory', runStatus: 'succeeded', evidence: true },
@@ -361,6 +373,7 @@ const EVIDENCE = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/
 const RUNS = {
   'run-evid': { status: 'succeeded', output: EVIDENCE.output, error: null },
   'run-evq': { status: 'succeeded', output: EVQ.output, error: null },
+  'run-led': { status: 'succeeded', output: EVIDENCE.output, error: null },
   'run-cancelled': { status: 'cancelled', output: {}, error: null },
   'run-failed': { status: 'failed', output: {}, error: '查询超时' },
   'run-rejected': { status: 'failed', output: {}, error: '人工驳回：数字对不上' },
@@ -419,6 +432,8 @@ const ctl = {
   extraSource: false,
   /** 列表里多摆「被驳回」那段的两个会话（REJECT_CONVS） */
   rejectConvs: false,
+  /** 列表里多摆「口径账本」那段的会话（LEDGER_CONVS） */
+  ledgerConvs: false,
 }
 /** 会话的归档 / 删除状态。各段各自 resetDb，免得上一段删掉的会话影响下一段 */
 const db = { archived: new Set(), purged: new Set() }
@@ -430,7 +445,8 @@ resetDb()
 const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : []),
   ...(ctl.guardConvs ? Object.values(GUARD_CONVS) : []), ...(ctl.askConvs ? Object.values(ASK_CONVS) : []),
   ...(ctl.askBack ? Object.values(ASKBACK_CONVS) : []),
-  ...(ctl.fixConvs ? Object.values(FIX_CONVS) : []), ...(ctl.rejectConvs ? Object.values(REJECT_CONVS) : [])]
+  ...(ctl.fixConvs ? Object.values(FIX_CONVS) : []), ...(ctl.rejectConvs ? Object.values(REJECT_CONVS) : []),
+  ...(ctl.ledgerConvs ? Object.values(LEDGER_CONVS) : [])]
   .filter((c) => !db.purged.has(c.id))
   .map((c) => ({ ...c, archived: db.archived.has(c.id) }))
 let runSeq = 0
@@ -1504,6 +1520,100 @@ for (const theme of THEMES) {
       await ctx.close()
     } finally {
       ctl.rejectConvs = false
+    }
+  })
+
+  await section('ledger', '口径账本：轮次底部「正在比对口径」→ 摘要、按口径正式出具、对账（写请求在浏览器层拦下）', async () => {
+    ctl.ledgerConvs = true
+    try {
+      const { page, ctx, errors } = await open(theme)
+      // 文档记着的运行要和成果的运行对得上（run-led），片段、证据图按这次运行答
+      await page.route(/\/api\/artifacts\//, (route) => route.fulfill({ json: { id: EVIDENCE.doc_artifact,
+        content: { ...EVIDENCE.doc, run_id: 'run-led' } } }))
+      await page.route(/\/api\/runs\/run-led\/evidence(\/.*)?(\?.*)?$/, (route) => {
+        const m = new URL(route.request().url()).pathname.match(/\/segments\/([^/]+)$/)
+        return m ? route.fulfill({ json: EVIDENCE.segments[decodeURIComponent(m[1])] ?? {} }) : route.fulfill({ json: EVIDENCE.graph })
+      })
+      // 账本：头两次答 pending（正在比对），之后比对过了：整题等价于受管口径「周报口径」v2，另有一条查询可以对账
+      const led = { gets: [], writes: [], issued: [] }
+      await page.route(/\/api\/runs\/run-led\/ledger$/, (route) => {
+        led.gets.push(Date.now())
+        if (led.gets.length <= 2) return route.fulfill({ json: { run_id: 'run-led', state: 'pending', note: '封存后比对，不在封存范围内' } })
+        return route.fulfill({ json: ledgerOf('run-led', { labels: WHOLE_LABELS, whole: WHOLE, actions: [ISSUE, RECONCILE],
+                                                            issued: led.issued }) })
+      })
+      await page.route(/\/api\/ledger\//, (route) => {
+        const req = route.request()
+        const path = new URL(req.url()).pathname
+        let body = null
+        try { body = req.postDataJSON() } catch { body = null }
+        led.writes.push({ key: `${req.method()} ${path}`, body })
+        if (req.method() === 'POST' && path === '/api/ledger/answers/run-led/issue') {
+          led.issued = [{ run_id: 'run-iss-1', status: 'succeeded', end_reason: null, workflow_id: 'wf-weekly', version: 2,
+                          tier: 'formal', tier_text: '完整出具', auto: false, created_at: iso(0) }]
+          return route.fulfill({ json: { run_id: 'run-iss-1', created: true, issued: led.issued[0] } })
+        }
+        // 对账：这一段只核对按钮发出的请求体，结果卡片在 check-ledger 里看
+        if (req.method() === 'POST' && path === '/api/ledger/answers/run-led/reconcile') {
+          return route.fulfill({ status: 409, json: { detail: '检查脚本：不真的发起对账', code: 'ledger_reconcile_refused' } })
+        }
+        return route.fulfill({ status: 409, json: { detail: '检查脚本不写库' } })
+      })
+      await goto(page, 'c0ledgr')
+      const turnBox = page.locator('[data-turn]').first()
+      const waiting = await page.locator('[data-ledger-turn="waiting"]').first().waitFor({ timeout: 8000 }).then(() => true, () => false)
+      check('交付了的轮次：比对还没出结果时写「正在比对口径」', waiting
+        && (await page.locator('[data-ledger-turn="waiting"]').first().innerText()).includes('正在比对口径'))
+      const summary = page.locator('[data-ledger-summary]').first()
+      const shown = await summary.waitFor({ timeout: 10000 }).then(() => true, () => false)
+      check('按退避再取，比对出结果后写摘要（不靠实时流）', shown && led.gets.length === 3, `${led.gets.length} 次`)
+      const gaps = led.gets.slice(1).map((t, i) => t - led.gets[i])
+      check('……隔得越来越久（退避），不是每一拍都取', gaps.length === 2 && gaps[0] >= 700 && gaps[1] >= gaps[0] - 100,
+        gaps.join('ms, ') + 'ms')
+      const text = (await summary.innerText()).replace(/\s+/g, ' ')
+      check('摘要：几个数来自哪份口径', text.includes('3 个数来自口径「周报口径」v2（受管）'), text)
+      check('整题等价：写等价于哪份口径、怎么认的', (await page.locator('[data-ledger-whole]').first().innerText())
+        .includes('整题等价于口径「周报口径」v2（受管） · 等价已证明'))
+      await page.waitForTimeout(3500)
+      check('比对过了、没有要等的：不再取', led.gets.length === 3, `${led.gets.length} 次`)
+      const issueBtn = page.locator('[data-ledger-issue-button]').first()
+      check('按服务端的动作摆「按口径正式出具」，下面写为什么不自动', await issueBtn.count() === 1
+        && (await page.locator('[data-ledger-auto-reason]').first().innerText()).includes('设置里关了自动按口径出具'))
+      check('有相关口径：摆「对账」按钮', (await page.locator('[data-ledger-turn-reconcile]').first().innerText()).includes('对账：「订单口径」v1（已发布）'))
+      check('数字上挂着来自口径的小标记', await turnBox.locator('[data-ev-caliber-of="s6"]').count() === 1)
+
+      await issueBtn.click()
+      const posted = await until(() => led.writes.some((w) => w.key === 'POST /api/ledger/answers/run-led/issue'), 5000)
+      const issueBody = led.writes.find((w) => w.key === 'POST /api/ledger/answers/run-led/issue')?.body
+      check('出具的请求只说按哪份口径（参数由服务端从比对里取）', posted
+        && JSON.stringify(issueBody) === JSON.stringify({ workflow_id: 'wf-weekly', version: 2 }), JSON.stringify(issueBody))
+      const issued = page.locator('[data-ledger-issued="run-iss-1"]').first()
+      const issuedShown = await issued.waitFor({ timeout: 6000 }).then(() => true, () => false)
+      const issuedText = issuedShown ? (await issued.innerText()).replace(/\s+/g, ' ') : ''
+      check('出具的正式运行挂在轮次下面：写档位', issuedText.includes('按口径正式出具') && issuedText.includes('「周报口径」v2（受管）')
+        && issuedText.includes('完整出具'), issuedText)
+      check('……点开去运行', await issued.locator('a[href="/runs/run-iss-1"]').count() === 1)
+      check('出具过了：不再摆出具按钮', await page.locator('[data-ledger-issue-button]').count() === 0)
+
+      await page.locator('[data-ledger-turn-reconcile]').first().click()
+      const dialog = page.locator('[data-ledger-reconcile-dialog]')
+      check('点「对账」打开对账：差在哪、核对参数', await dialog.waitFor({ timeout: 4000 }).then(() => true, () => false)
+        && (await dialog.innerText()).includes('口径只保留状态为已支付的行') && (await dialog.innerText()).includes('参数按这次的 SQL 推断，请核对'))
+      await page.locator('[data-ledger-param-input="start"]').fill('2026-09-02')
+      await page.locator('[data-ledger-reconcile-launch]').click()
+      await until(() => led.writes.some((w) => w.key === 'POST /api/ledger/answers/run-led/reconcile'), 5000)
+      const recBody = led.writes.find((w) => w.key === 'POST /api/ledger/answers/run-led/reconcile')?.body
+      check('对账的请求：哪条查询、哪份口径、核对过的参数（confirm）', recBody?.query === 'q-orders' && recBody?.workflow_id === 'wf-orders'
+        && recBody?.version === 1 && recBody?.confirm === true && recBody?.inputs?.start === '2026-09-02' && !('store' in (recBody?.inputs ?? {})),
+        JSON.stringify(recBody))
+      check('服务端拒了：照它的话写在对账框里', (await page.locator('[data-ledger-reconcile-problem]').innerText().catch(() => ''))
+        .includes('检查脚本：不真的发起对账'))
+      check('写请求只有出具、对账这两次（都在浏览器层拦下）', led.writes.length === 2, led.writes.map((w) => w.key).join(' | '))
+      await page.screenshot({ path: `${SHOTS}/ledger-${theme}.png` })
+      check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+    } finally {
+      ctl.ledgerConvs = false
     }
   })
 
