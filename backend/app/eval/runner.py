@@ -60,7 +60,7 @@ STOP_COPILOT = 3
 STOP_WINDOW = 10
 STOP_TIMEOUTS = 7
 #: 说法
-INTERRUPTED = "服务重启时评测还没做完，没有自动续跑。可以点「重试」只把没做完的题接着做"
+INTERRUPTED = "服务重启时评测还没做完，没有自动继续。可以点「重试」只把没做完的题接着做"
 STOPPED = "评测已停止"
 NOT_STARTED = "评测停下时这道题还没开评"
 LIMIT_RUN = "已到这次评测的金额上限（${limit:g}），没有再开新题"
@@ -68,7 +68,7 @@ LIMIT_DAILY = "评测今天的金额已到上限（${limit:g}），没有再开�
 STOP_COPILOT_TEXT = "连续 {n} 题助手调用失败，评测停下了：{reason}"
 STOP_TIMEOUT_TEXT = "最近 {window} 题里有 {n} 题超时，评测停下了"
 CASE_GONE = "这道题已被删除"
-TIMED_OUT = "超过每题时限（{s:g} 秒），已停止这一题正在跑的运行"
+TIMED_OUT = "超过每题时限（{s:g} 秒），已停止这一题正在执行的运行"
 #: 结束后多久做清理（在后台、不挡收尾）
 DETAILS_KIND = "eval_result"
 DETAILS_FORMAT = 1
@@ -698,7 +698,9 @@ class EvalExecution(runtime.JobRun):
         await self._settle()
 
         async def write(session: AsyncSession) -> None:
-            ids = [a.run_id for a in self.arms] or [self.job_id]
+            # 还没准备好就停下、出错的（arms 还是空的）：按 pair_id 找全几臂
+            ids = [a.run_id for a in self.arms] or list((await session.execute(select(EvalRun.id).where(
+                (EvalRun.id == self.job_id) | (EvalRun.pair_id == self.job_id)))).scalars())
             item_status = "cancelled" if status in ("cancelled", "interrupted") else "failed"
             await session.execute(update(EvalResult).where(EvalResult.eval_run_id.in_(ids),
                                                            EvalResult.status.in_(runtime.OPEN))

@@ -472,6 +472,20 @@ function runEvents(run) {
   ]
 }
 
+/**
+ * 目标不是工作流的定时任务（next-round X4：定时只有一套）：评测题集。没有工作流、输入模板、运行类别、Webhook；
+ * 立即运行发起的是一次评测（触发记录带 eval_run_id、没有 run_id）
+ */
+const S_EVAL = {
+  id: 's-eval', name: '零售题集 · 每周回归', target_kind: 'eval_suite', target_id: 'suite-retail', target_label: '评测题集',
+  target_name: '零售样例题集', target_exists: true, workflow_id: '', workflow_name: '零售样例题集', cron: '0 9 * * 1',
+  timezone: 'Asia/Shanghai', run_class: 'exploratory', input_template: {}, enabled: true, overlap: 'skip',
+  misfire_grace_s: 3600, webhook: null, next_run_at: iso(NOW + 3 * H + 5 * 60e3),
+  last_fire: fire('f-eval', { run_id: null, run_status: null, eval_run_id: 'ev1a2b3c4d5e' }),
+  description_text: '每周一 09:00（Asia/Shanghai）', created_by: '检查脚本', created_at: iso(NOW - 3 * 24 * H),
+  updated_at: iso(NOW - 24 * H), version: 2,
+}
+
 function freshState(patch = {}) {
   return {
     schedules: [structuredClone(S1), structuredClone(S2)],
@@ -792,6 +806,43 @@ await section('列表：渲染', async () => {
   const listWrites = writes(sent, /./)
   check('只读：列表渲染不发写请求', listWrites.length === 0, listWrites.map((w) => w.key).join('、'))
   await shot(page, 'list-dark')
+  check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
+})
+
+await section('列表：目标不是工作流的定时任务', async () => {
+  const state = freshState({ schedules: [structuredClone(S1), structuredClone(S_EVAL)],
+    fires: [fire('f-eval', { run_id: null, run_status: null, eval_run_id: 'ev1a2b3c4d5e' })] })
+  state.override = (method, path) => (method === 'POST' && path === '/schedules/s-eval/run'
+    ? { json: { fire: fire('f-eval2', { kind: 'manual', run_id: null, run_status: null, eval_run_id: 'ev9f8e7d6c5b' }),
+                run_id: null } }
+    : null)
+  const { page, errors } = await open('/schedules', { state })
+  const row = page.locator('[data-schedule-row="s-eval"]')
+  await row.waitFor()
+  const t = await row.innerText()
+  check('写种类「评测题集」和题集名、频率', t.includes('评测题集') && t.includes('零售样例题集') && t.includes('每周一 09:00'),
+    t.replace(/\s+/g, ' ').slice(0, 160))
+  check('不标运行类别（评测题集没有正式 / 探索之分）', !t.includes('正式运行') && !t.includes('探索运行'))
+  check('「编辑」写成「查看」', (await row.locator('[data-schedule-edit]').innerText()).includes('查看'))
+  check('工作流的那一行照旧', (await page.locator('[data-schedule-row="s-weekly"]').innerText()).includes('正式运行'))
+  await row.locator('[data-schedule-run]').click()
+  const ok = await until(async () => (await page.locator('[data-toast]').allInnerTexts()).find((x) => x.includes('已发起一次评测')) ?? null)
+  check('立即运行：说发起了一次评测（没有运行可看，不说「未能发起」）', !!ok && !ok.includes('查看运行'), ok ?? '')
+
+  await page.goto(`${WEB}/schedules/s-eval`, { waitUntil: 'networkidle' })
+  const settings = page.locator('[data-schedule-target-settings="eval_suite"]')
+  await settings.waitFor()
+  const st = await settings.innerText()
+  check('详情的设置只读地列出名称、目标、频率', st.includes('零售题集 · 每周回归') && st.includes('评测题集 · 零售样例题集')
+    && st.includes('每周一 09:00') && st.includes('1 小时'), st.replace(/\s+/g, ' ').slice(0, 200))
+  check('不出工作流的表单（选工作流、输入模板、Webhook、保存）', await page.locator('[data-schedule-save]').count() === 0)
+  check('页头的启用、立即运行、删除照常', await page.locator('[data-schedule-toggle]').count() === 1
+    && await page.locator('[data-schedules-page] [data-schedule-run]').count() === 1)
+  await page.goto(`${WEB}/schedules/s-eval?tab=history`, { waitUntil: 'networkidle' })
+  const evalFire = page.locator('[data-fire-eval="ev1a2b3c4d5e"]')
+  await evalFire.waitFor()
+  check('触发历史写评测的编号，不写「未发起运行」', (await evalFire.innerText()).includes('评测 #ev1a2b')
+    && !(await page.locator('[data-fire-id="f-eval"]').innerText()).includes('未发起运行'))
   check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
 })
 

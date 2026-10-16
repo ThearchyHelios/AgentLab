@@ -331,3 +331,51 @@ async def test_eval_settings_group_and_spend_endpoint(client):
     assert effective_budget({"daily_max_usd": 9.0}, {"daily_max_usd": 3.0})["daily_max_usd"] == 3.0
     assert effective_budget({"daily_max_usd": 1.0}, {"daily_max_usd": 3.0})["daily_max_usd"] == 1.0
     await client.put("/api/settings", json={"values": {"eval": {}}})
+
+
+async def test_a_workflow_case_runs_its_pinned_version_as_an_exploratory_run(client, monkeypatch, tmp_path):
+    """工作流题：钉住那一版的图按输入模板跑一次探索运行（来源 eval），不发正式运行、不建图、不复核。"""
+    from app.core.artifact_store import graph_hash
+    from app.db.models import Workflow, WorkflowVersion
+    from tests.fixtures import dual_check_shop as shop
+
+    name, sid = await es.make_source(tmp_path)
+    try:
+        es.use_report(monkeypatch)
+
+        def node(nid, ntype, **config):
+            return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": nid, "config": config}}
+
+        nodes = [node("start", "input", fields=[{"name": "week", "required": True}]),
+                 node("q", "tool", tool=f"db_query__{name}", args={"sql": shop.RIGHT}),
+                 node("write", "report", instructions="写周销售"),
+                 node("out", "output", fields=[{"name": "报告", "value": "{{ nodes.write.text }}"}])]
+        graph = {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}
+        async with SessionLocal() as session:
+            wf = Workflow(name="虚构周销售", graph=graph, status="published", published_version=1)
+            session.add(wf)
+            await session.flush()
+            session.add(WorkflowVersion(workflow_id=wf.id, version=1, graph=graph, graph_hash=graph_hash(graph),
+                                        level="published"))
+            await session.commit()
+            wf_id = wf.id
+        suite_id = await es.make_suite(sid, cases=[{
+            "kind": "workflow", "workflow_id": wf_id, "workflow_version": 1,
+            "input_template": {"week": "{{ schedule.last_week }}"},
+            "gold": {"kind": "sql", "datasource_id": sid, "sql": shop.RIGHT},
+            "expectations": [{"kind": "scalar", "column": "gmv"}]}])
+        [run] = await start(suite_id)
+        await es.wait_eval(run.id)
+        [item] = await results(run.id)
+        assert item.path == "ran" and item.verdict == "pass", (item.error, item.scores)
+        async with SessionLocal() as session:
+            answered = await session.get(Run, item.run_id)
+        assert answered.run_class == "exploratory" and answered.origin_kind == "eval" and answered.workflow_id is None
+        assert set(answered.input) == {"week"} and answered.input["week"].count("-W") == 1
+        # 钉住当基线、取消
+        pinned = await client.post(f"/api/evals/evaluations/{run.id}/pin", json={"pinned": True})
+        assert pinned.status_code == 200 and pinned.json()["pinned"] is True
+        assert (await client.post(f"/api/evals/evaluations/{run.id}/pin", json={"pinned": "yes"})).status_code == 422
+        assert (await client.get("/api/evals/pairs/nope")).status_code == 404
+    finally:
+        await drop_source(sid)

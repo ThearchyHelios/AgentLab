@@ -954,7 +954,7 @@ async def pin_evaluation(evaluation_id: str, request: Request, session: AsyncSes
     if not isinstance(pinned, bool):
         raise CodedHTTPException(422, "pinned 需要是 true 或 false", case_rules.CASE_INVALID, field="pinned")
     if pinned and row.status not in ("succeeded", "partial"):
-        raise CodedHTTPException(409, "只有评完了（或部分评完）的评测能钉成基线", case_rules.CASE_INVALID, field="pinned")
+        raise CodedHTTPException(409, "只有评完了（或部分评完）的评测能设为基线", case_rules.CASE_INVALID, field="pinned")
     row.pinned = pinned
     await session.commit()
     await session.refresh(row)

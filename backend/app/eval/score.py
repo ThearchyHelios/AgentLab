@@ -56,8 +56,8 @@ OUTCOME_LABEL = {"traced": "对且可追溯", "untraced": "对但没引用", "wr
 TEXT_OUTCOMES = ("covered", "partial", "missing", "unjudged")
 TEXT_LABEL = {"covered": "都答到了", "partial": "答到一部分", "missing": "没答到", "unjudged": "没有判"}
 VERDICT_LABEL = {"pass": "通过", "fail": "不通过", "ungradable": "不能评分", "skipped": "跳过"}
-PATH_LABEL = {"reply": "直接回答", "asked": "反问", "ready": "只建不跑", "build_failed": "建图失败",
-              "run_failed": "运行失败", "ran": "跑完了", "rejected": "被驳回"}
+PATH_LABEL = {"reply": "直接回答", "asked": "反问", "ready": "只建图未运行", "build_failed": "建图失败",
+              "run_failed": "运行失败", "ran": "运行完成", "rejected": "被驳回"}
 #: 期望没写容差时，引用的原值按这个相对误差比（同双盲复算的缺省）
 DEFAULT_TOLERANCE = 1e-6
 #: 量纲不同：差这几个倍数（元 / 万元、比率 / 百分数……）
@@ -495,7 +495,7 @@ def score_case(case: Mapping[str, Any], gold: Mapping[str, Any] | None, answer: 
         return CaseScore("ungradable", False, path_reason or "运行被驳回（人的决定，不算失败）", [])
     ask_only = any(e.get("kind") == "ask" for e in expectations)
     if needs_numbers and path != "ran":
-        reason = WRONG_PATH.get(path or "", "没有跑出答案")
+        reason = WRONG_PATH.get(path or "", "没有得到答案")
         if path_reason:
             reason = f"{reason}：{path_reason}"
         return CaseScore("fail", False, reason, [{"id": e["id"], "kind": e.get("kind"),

@@ -333,7 +333,7 @@ class Driver:
             waiting = await self._pending_approvals(run_id)
             await stop_run(run_id, self.ctx.actor)
             t.path = "run_failed"
-            t.reason = APPROVAL_REASON if waiting else "运行停在断点上（服务可能重启过）：评测不接着跑，已取消这次运行"
+            t.reason = APPROVAL_REASON if waiting else "运行停在断点上（服务可能重启过）：评测不继续这次运行，已取消"
             return None
         if row.status == "cancelled" and row.end_reason == END_REJECTED:
             t.path, t.reason = "rejected", "运行被驳回（人的决定，不算运行失败）"
