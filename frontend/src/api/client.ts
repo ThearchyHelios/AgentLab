@@ -689,6 +689,8 @@ export const api = {
     /** 今天（本地日期）结论句裁判花了多少：设置页放在每日上限旁边。只读，计数只有裁判自己记 */
     judgeSpend: () => get<{ date?: string; usd?: number; calls?: number; unpriced_calls?: number
                             daily_max_usd?: number | null }>('/settings/judge/spend'),
+    /** 按存着的邮件服务设置发一封测试邮件，发到管理员自己的账号邮箱（管理员；关登录、没有邮箱时 422） */
+    mailTest: () => post<{ ok: boolean; message: string }>('/settings/mail/test'),
   },
 
   // ---- 工具 ----

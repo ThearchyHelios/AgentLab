@@ -109,13 +109,16 @@ async def test_env_locks_the_setting(monkeypatch):
     async with client() as c:
         body = (await c.get("/api/settings")).json()
         assert body["public_url"] == {"value": ENV_URL, "env_locked": True}
-        assert body[NOTIFY_GROUP] == {"public_base_url": None}, "notify 一组照旧是库里存的那一份"
+        assert body[NOTIFY_GROUP]["public_base_url"] is None, "notify 一组照旧是库里存的那一份"
         r = await put_address(c, SET_URL)
         assert r.status_code == 409, r.text
         assert r.json()["code"] == "public_url_env_locked" and r.json()["field"] == "notify.public_base_url"
         assert "AGENTLAB_PUBLIC_URL" in r.json()["detail"]
         # 没改这一项（整组原样写回）不算改：不挡同一请求里别的设置
         assert (await put_address(c, None)).status_code == 200
+        # 同一组里别的项（待办汇总的时间）照常能改：环境变量只锁对外访问地址这一项
+        r = await c.put("/api/settings", json={"values": {NOTIFY_GROUP: {"digest_at": "08:15"}}})
+        assert r.status_code == 200 and r.json()[NOTIFY_GROUP]["digest_at"] == "08:15"
         # 只读的 public_url 一组写不进库
         r = await c.put("/api/settings", json={"values": {"public_url": {"value": SET_URL, "env_locked": False}}})
         assert r.status_code == 200

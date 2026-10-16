@@ -9,7 +9,7 @@
 - Referrer-Policy: strict-origin-when-cross-origin（分享页 /s 用 no-referrer：分享的 key 在地址的 # 后面，本来不随
   Referer 走，这里再收一道）；
 - Content-Security-Policy: frame-ancestors。缺省只有 'self'；AGENTLAB_FRAME_ANCESTORS 列出允许嵌整站的同站门户；分享页
-  /s 只认 AGENTLAB_EMBED_ORIGINS（分享链接第 3 波才加，路由在那时挂，头的规则先在这里定好）；
+  /s 只认 AGENTLAB_EMBED_ORIGINS（分享链接，api/shares.py；页面是前端不进外壳的那一页，由 mount_web 照常托管）；
 - 只有 frame-ancestors 是 'self' 时另加 X-Frame-Options: SAMEORIGIN，给不认 CSP 的老浏览器。XFO 写不了白名单，有白名单
   时只发 CSP：两个都发的话，只认 XFO 的老浏览器会把白名单里的门户也拦掉（认 CSP 的浏览器以 frame-ancestors 为准）。
 接口自己设过的同名头（文件下载的 nosniff）不覆盖、不重复。
@@ -18,6 +18,15 @@
 的话写错一个哈希页面就会先闪一帧深色，构建会不会产出别的内联内容也没核实。所以 mount_web（app/web.py）启动时给构建产物
 index.html 里的内联脚本算 sha256（script_policy），只在页面这一个响应上发；观察一个版本没有误报，再改成强制执行。没配
 上报地址：违规只在浏览器的控制台里看得到。接口返回的 HTML（导出的报告、可验证报告）文件里自带 meta CSP，不发它，也不动。
+
+嵌入的两种办法（04 细案 C3，只做配置和文档）：
+- 同站门户嵌整站：门户和 AgentLab 在同一个可注册域名下（portal.corp.example 和 agentlab.corp.example）时，把门户的源写进
+  AGENTLAB_FRAME_ANCESTORS。会话 cookie 是 SameSite=Lax，同站的 iframe 里会随请求带上：看的人照常登录、单点登录照常，权限
+  和直接打开一样。不另做嵌入票据；
+- 跨站嵌：嵌整站明确不支持——跨站的 iframe 里带不上 Lax 的会话 cookie，登录不了；改成 SameSite=None 会削弱整站防跨站请求
+  伪造的那一层，换来的嵌入在 Safari、Firefox 上默认仍然被拦。跨站要嵌，用分享链接（只读、必设到期、可撤销，/s 只认
+  AGENTLAB_EMBED_ORIGINS）。
+deploy/agentlab.env 的「嵌入」一节写的是同一套。
 
 HSTS 交给终结 https 的反向代理：这里不知道对外是不是 https、要不要连子域名一起管，发错了浏览器会按 max-age 记很久，
 撤不回来。

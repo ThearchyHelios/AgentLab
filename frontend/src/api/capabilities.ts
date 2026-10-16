@@ -5,7 +5,7 @@
 import type { CatalogReviewAction, CatalogSource, CatalogStatus } from '../types'
 import type {
   CapabilityEffect, CapabilityReviewOutcome, CapabilityReviewRow, CapabilityRow, EndpointRow, NotifyChannelRow,
-  NotifyEventRow,
+  NotifyEventRow, NotifyMailState,
 } from '../typesApp'
 import { del, get, patch, post, put, qs, type RequestOptions } from './http'
 
@@ -122,8 +122,10 @@ export const endpoints = {
 }
 
 export const notify = {
-  channels: () => get<{ items: NotifyChannelRow[] }>('/notify/channels'),
-  createChannel: (body: { name: string; scope: string; owner_id?: string | null; format: string; url: string;
+  /** mail：邮件服务启没启用、本人的账号邮箱（老服务端不给） */
+  channels: () => get<{ items: NotifyChannelRow[]; mail?: NotifyMailState }>('/notify/channels'),
+  /** 邮件渠道：个人的不带 url（只发到账号邮箱），全局、应用的 url 是收件地址（逗号或换行分隔，最多 20 个） */
+  createChannel: (body: { name: string; scope: string; owner_id?: string | null; format: string; url?: string;
     secret?: string | null; events: string[] }) => post<NotifyChannelRow>('/notify/channels', body),
   updateChannel: (id: string, body: Record<string, any>) => patch<NotifyChannelRow>(`/notify/channels/${encodeURIComponent(id)}`, body),
   removeChannel: (id: string) => del(`/notify/channels/${encodeURIComponent(id)}`),

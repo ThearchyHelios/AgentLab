@@ -1,6 +1,7 @@
 """通知的发送核心：四种格式、签名、发送、脱敏（从 scheduler/webhook.py 抽出，定时任务和待办、实例、动作共用一份）。
 
-四种格式：通用 JSON、飞书（文本消息）、企业微信（markdown）、钉钉（markdown）。配了签名密钥时：通用格式在请求头
+四种格式：通用 JSON、飞书（文本消息）、企业微信（markdown）、钉钉（markdown）。通知渠道另有第五种「邮件」，发送在
+notify/mail.py（SMTP，不经这里的 HTTP 推送），消息结构（Message、text_of）共用这里的。配了签名密钥时：通用格式在请求头
 里带 HMAC-SHA256 签名，飞书、钉钉按各自平台的算法签（飞书放在请求体，钉钉放在地址上）；企业微信的 key 本来就在
 地址里，没有另外的签名。入站钩子（app/process/hooks.py）验的也是通用格式这一套签名。
 
@@ -37,8 +38,11 @@ from app.db.base import utcnow
 logger = logging.getLogger(__name__)
 
 FORMATS = ("generic", "feishu", "wecom", "dingtalk")
+#: 通知渠道能选的格式：Webhook 的四种，加上邮件（notify/mail.py，04 细案 B2，第五种格式）。定时任务的 Webhook 只有前四种
+#: （它只会发 HTTP），所以邮件不进 FORMATS：scheduler/webhook 再导出的、定时任务接口校验的都是那一份
+CHANNEL_FORMATS = (*FORMATS, "email")
 #: 格式在报错里的叫法，和界面上的选项一致
-FORMAT_LABEL = {"generic": "通用", "feishu": "飞书", "wecom": "企业微信", "dingtalk": "钉钉"}
+FORMAT_LABEL = {"generic": "通用", "feishu": "飞书", "wecom": "企业微信", "dingtalk": "钉钉", "email": "邮件"}
 #: 单次请求的超时（秒）
 TIMEOUT_S = 10.0
 #: 失败后再试 3 次，每次之前等这么久（秒）。4xx（429 除外）不重试：地址或参数错了，重试也一样

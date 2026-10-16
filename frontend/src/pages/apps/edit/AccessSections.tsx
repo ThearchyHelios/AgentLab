@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
-import { KeyRound, Plus } from 'lucide-react'
+import { KeyRound, Link2, Plus } from 'lucide-react'
 import { api } from '../../../api/client'
-import type { AppHookRow, HookReceipts } from '../../../typesApp'
+import type { AppHookRow, HookReceipts, ViewShareCreated, ViewShareList, ViewShareRow } from '../../../typesApp'
 import { RecentRequests, type RecentRequestRow } from '../../../components/RecentRequests'
-import { HOOK_RECEIPT_TEXT, RECENT_REQUESTS_TEXT } from '../../../lib/termsApp'
+import { formatDateTime } from '../../../lib/format'
+import { HOOK_RECEIPT_TEXT, RECENT_REQUESTS_TEXT, SHARE_TEXT as S } from '../../../lib/termsApp'
 import {
   CopyButton, DeleteButton, EmptyState, ErrorState, Field, SectionBar, Skeleton, Spinner, confirmDialog, toast,
 } from '../../../components/ui'
@@ -20,6 +21,8 @@ import { useEditor } from './context'
  * 岗位：图里人工节点写的岗位名（assignee 的岗位）在这里绑定到人或组；绑定不进 spec，存在草稿的 bindings 里，发布时
  * 进应用版本——spec 可以导出，绑定是这一个部署自己的。人员变动只改组成员，不发新版本。
  * 授权：use / observe / manage，即时生效、写审计，不需要发新版本（A1）。关登录时所有人都是管理员，授权开登录后才生效
+ * 分享链接（04 细案 C2）：管理员开了「允许建分享链接」后，管理应用的人给发布版的一页建只读、不用登录的链接（必设到期、
+ * 最长 90 天、可撤销）；链接只在建好时显示一次。关着时不给新建，已有的照列、能撤销
  */
 
 const ROLES: GrantRole[] = ['use', 'observe', 'manage']
@@ -73,6 +76,169 @@ export function AccessSection() {
         </div>
       </section>
       <Grants />
+      <Shares />
+    </div>
+  )
+}
+
+/** 有效期的几个选项（天），按服务端的上限截 */
+const SHARE_DAYS = [1, 7, 30, 90]
+
+function Shares() {
+  const { appId, detail } = useEditor()
+  const personal = detail.scope === 'personal'
+  const pages = detail.published?.pages ?? []
+  const [list, setList] = useState<ViewShareList | null>(null)
+  const [error, setError] = useState<unknown>(null)
+  const [form, setForm] = useState<{ page: string; mode: 'latest' | 'fixed'; days: number; embed: boolean } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [made, setMade] = useState<ViewShareCreated | null>(null)
+  const load = useCallback(() => {
+    if (personal) return
+    api.apps.shares(appId).then((v) => { setList(v); setError(null) }, setError)
+  }, [appId, personal])
+  useEffect(load, [load])
+
+  if (personal) {
+    return (
+      <section data-app-shares="personal">
+        <SectionBar title={S.section} hint={S.personal} />
+      </section>
+    )
+  }
+  const create = async () => {
+    if (!form || busy) return
+    setBusy(true)
+    try {
+      const out = await api.apps.createShare(appId, {
+        page_id: form.page, mode: form.mode, embed_allowed: form.embed,
+        expires_at: new Date(Date.now() + form.days * 86_400_000).toISOString(),
+      })
+      setMade(out)
+      setForm(null)
+      load()
+    } catch (e) {
+      toast.error(e)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const revoke = async (row: ViewShareRow) => {
+    if (!(await confirmDialog({ title: S.revokeTitle(row.prefix), body: S.revokeBody, danger: true, confirmLabel: S.revoke }))) return
+    try {
+      await api.apps.revokeShare(appId, row.id)
+      toast.ok(S.revoked)
+      load()
+    } catch (e) {
+      toast.error(e)
+    }
+  }
+  const maxDays = list?.max_days ?? 90
+  const canCreate = !!list?.enabled && pages.length > 0 && detail.published_version != null
+  const hint = !list ? S.hint : !list.enabled ? (list.items.length ? S.offWithRows : S.off)
+    : detail.published_version == null ? S.unpublished : S.hint
+  return (
+    <section data-app-shares={list ? (list.enabled ? 'on' : 'off') : ''}>
+      <SectionBar title={S.section} hint={hint}>
+        {canCreate && !form && (
+          <button type="button" className="btn btn-sm" data-app-share-create=""
+                  onClick={() => { setMade(null); setForm({ page: pages[0].id, mode: 'latest', days: Math.min(30, maxDays), embed: false }) }}>
+            <Plus size={11} aria-hidden /> {S.create}
+          </button>
+        )}
+      </SectionBar>
+      {made && <ShareOnce made={made} onDismiss={() => setMade(null)} />}
+      {form && (
+        <div className="mb-3 space-y-3 rounded-lg border bg-panel px-3 py-3" data-app-share-form="">
+          <Field label={S.page} hint={S.pageHint}>
+            {(p) => (
+              <select {...p} className="field max-w-72" value={form.page} data-app-share-page=""
+                      onChange={(e) => setForm({ ...form, page: e.target.value })}>
+                {pages.map((pg) => <option key={pg.id} value={pg.id}>{pg.title || pg.id}</option>)}
+              </select>
+            )}
+          </Field>
+          <fieldset>
+            <legend className="label">{S.mode}</legend>
+            {(['latest', 'fixed'] as const).map((m) => (
+              <label key={m} className="flex items-center gap-1.5 text-xs">
+                <input type="radio" name="share-mode" checked={form.mode === m} data-app-share-mode={m}
+                       onChange={() => setForm({ ...form, mode: m })} />
+                {m === 'latest' ? S.modeLatest : S.modeFixed}
+              </label>
+            ))}
+          </fieldset>
+          <Field label={S.expires} hint={S.expiresHint(maxDays)} required>
+            {(p) => (
+              <select {...p} className="field w-32" value={form.days} data-app-share-days=""
+                      onChange={(e) => setForm({ ...form, days: Number(e.target.value) })}>
+                {SHARE_DAYS.filter((d) => d <= maxDays).map((d) => <option key={d} value={d}>{S.expiresDays(d)}</option>)}
+              </select>
+            )}
+          </Field>
+          <label className="flex items-start gap-2 text-xs">
+            <input type="checkbox" className="mt-0.5" checked={form.embed} data-app-share-embed=""
+                   onChange={(e) => setForm({ ...form, embed: e.target.checked })} />
+            <span>
+              {S.embed}
+              <span className="mt-0.5 block text-2xs leading-relaxed text-faint">{list?.embed_origins ? S.embedHint : S.embedNoOrigins}</span>
+            </span>
+          </label>
+          <div className="flex justify-end gap-2">
+            <button type="button" className="btn btn-sm" onClick={() => setForm(null)}>取消</button>
+            <button type="button" className="btn btn-sm btn-primary" disabled={busy} onClick={() => void create()} data-app-share-submit="">
+              {busy ? <Spinner size={11} /> : <Link2 size={11} aria-hidden />} {S.submit}
+            </button>
+          </div>
+        </div>
+      )}
+      {error ? <ErrorState error={error} onRetry={load} /> : !list ? <Skeleton rows={2} height={36} /> : !list.items.length ? (
+        <p className="text-2xs text-faint" data-app-shares-empty="">{S.empty}</p>
+      ) : (
+        <div className="space-y-1.5">
+          {list.items.map((row) => (
+            <div key={row.id} className="flex flex-wrap items-center gap-2 rounded-lg border bg-panel px-3 py-2 text-xs"
+                 data-app-share={row.prefix} data-app-share-state={row.state}>
+              <span className="mono">{row.prefix}…</span>
+              <span className="font-medium">{row.page_title}</span>
+              <span className="chip">{S.modeShort[row.mode] ?? row.mode}</span>
+              <span className="chip" style={row.state === 'active' ? { color: 'var(--ok)' } : { color: 'var(--st-waiting)' }}>
+                {S.state[row.state] ?? row.state}
+              </span>
+              {row.embed_allowed && <span className="chip">{S.embedded}</span>}
+              <span className="min-w-0 flex-1 truncate text-2xs text-faint">
+                {[row.expires_at ? S.until(formatDateTime(row.expires_at)) : null, S.opened(row.open_count),
+                  row.created_by_name || row.created_by ? S.by(row.created_by_name || row.created_by || '') : null]
+                  .filter(Boolean).join(' · ')}
+              </span>
+              {row.state === 'active' && (
+                <button type="button" className="btn btn-xs" onClick={() => void revoke(row)} data-app-share-revoke={row.prefix}>
+                  {S.revoke}
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
+/** 刚建好的分享链接：只显示这一次（库里只有哈希），附复制按钮；关掉就没有了 */
+function ShareOnce({ made, onDismiss }: { made: ViewShareCreated; onDismiss: () => void }) {
+  const link = made.url ?? `${window.location.origin}${made.path}`
+  return (
+    <div className="mb-3 space-y-2 rounded-lg border px-3 py-2.5" style={{ borderColor: 'var(--st-waiting)' }} role="status"
+         data-app-share-once="">
+      <div className="flex items-center gap-1.5 text-xs font-semibold"><Link2 size={12} aria-hidden /> {S.created}</div>
+      <p className="text-2xs leading-relaxed" style={{ color: 'var(--st-waiting)' }}>{S.once}</p>
+      <div className="flex items-center gap-2">
+        <code className="mono min-w-0 flex-1 break-all rounded border bg-bg px-2 py-1 text-2xs" data-app-share-link="">{link}</code>
+        <CopyButton text={link} />
+      </div>
+      <div className="flex justify-end">
+        <button type="button" className="btn btn-sm" onClick={onDismiss} data-app-share-dismiss="">{S.dismiss}</button>
+      </div>
     </div>
   )
 }

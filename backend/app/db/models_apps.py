@@ -146,3 +146,37 @@ class ApiReceipt(Base):
     status: Mapped[str] = mapped_column(String(20))
     detail: Mapped[str | None] = mapped_column(Text, default=None)
     received_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class ViewShare(Base):
+    """分享链接（docs/design/next-round/04-对外集成与触达.md C2，集成-I6）：拿到链接、不用登录就能看应用的一页（只读，
+    可以嵌进门户）。
+
+    链接写成 /s#<分享 key>：key 在 # 后面，打开页面时不发给服务器、不进访问日志和 Referer，页面读出来再放进请求头
+    X-AgentLab-Share（api/shares.py）。库里只存 key 的 sha256（key_hash）和开头一截（prefix，认是哪一条），同访问密钥。
+
+    mode：latest 始终取最近一次封存；fixed 取建分享那一刻每个视图的运行（runs：{视图 id: 运行 id}，还没有封存运行的是
+    null），解析建分享时的应用版本（app_version）。到期必填、最长 90 天；撤销、到期之后打开回 410 并写明。建、撤销写审计；
+    打开只计数（open_count、last_opened_at），不一次写一行。embed_allowed 为假时分享页不肯在别的页面的 iframe 里显示（服务端
+    在 /s 上只能按全站的嵌入白名单 AGENTLAB_EMBED_ORIGINS 发头：打开页面那一刻还不知道是哪一条分享）。"""
+
+    __tablename__ = "view_shares"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    prefix: Mapped[str] = mapped_column(String(16))
+    app_id: Mapped[str] = mapped_column(ForeignKey("apps.id", ondelete="CASCADE"), index=True)
+    page_id: Mapped[str] = mapped_column(String(100))
+    mode: Mapped[str] = mapped_column(String(20), default="latest")  # latest | fixed
+    app_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    runs: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    embed_allowed: Mapped[bool] = mapped_column(default=False)
+    created_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    #: 建分享的人当时的显示名：分享页页脚写「由 X 分享」
+    created_by_name: Mapped[str | None] = mapped_column(String(100), default=None)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    revoked_by: Mapped[str | None] = mapped_column(String(100), default=None)
+    open_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_opened_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)

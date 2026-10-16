@@ -12,6 +12,14 @@
 - instance：实例自己的那次运行。
 
 印章（截至 / 口径 / 出具档位 / 来源）由这里算；定时任务改跑了新版本而应用还钉在旧版本这类错位照实写进 notes。
+
+分享链接（docs/design/next-round/04-对外集成与触达.md C2，api/shares.py）是解析时的另一条旁路（resolve_page 的 share）：
+拿到链接、不用登录的人看到的就是使用者看到的那份遮罩视图，但只有定时出数的那部分——
+- 只解析 latest_sealed 视图（fixed 模式取建分享时存下的那几次运行 id，SharedView.runs）；按需、实例、个人应用的探索视图换成
+  写明原因的空态（SHARE_SEALED_ONLY），从不发起运行（按需视图不自动发起，因为它根本不按按需解析）；
+- 流程组件（入口按钮、表单、实例、进度、待办、会签、生效记录、记录列表）换成写明原因的说明块（SHARE_PLACEHOLDER），报告
+  组件也换成说明（正文和出处在「下载报告」里：分享页不开在线证据，那等于给匿名的人一个按运行读证据的身份）；
+- 印章照常算，界面上常显；页面缓存的键另加分享的标识。
 """
 from __future__ import annotations
 
@@ -44,6 +52,18 @@ PAGE_CACHE_SIZE = 256
 
 #: 按新口径补算的运行来源（engine/origin.py）
 BACKFILL_ORIGIN = "app_backfill"
+#: 「最近一次封存」认哪几种来源的正式运行：latest_sealed 视图、趋势、分享链接（latest，以及建 fixed 时取的那几次）、视图
+#: 数据接口、补算判断「新版本算过没有」都经 sealed_runs，这里改一处都跟上。按白名单认，以后加的来源默认不算，要算的在这里
+#: 登记（tests/test_shares.py 核对 ORIGIN_KINDS 每种都归了类）。算的：定时、手动的正式运行、应用的入口和按需视图、入站
+#: 钩子、直接调接口；加来源这一列之前的老运行（origin_kind 为空）也算。
+SEALED_ORIGINS = ("launcher", "schedule", "app_entry", "app_view", "hook", "api")
+#: 不算的，各有原因：
+#: - app_backfill：按新口径补算的是现在才算的历史期，不是「最近一次」；趋势另经 trend_runs 按它对应的输入期排进去；
+#: - ledger_issue：问数据的答案按已治理口径正式出具（docs/design/next-round/02-口径账本.md §5），参数是从某人的提问里
+#:   绑出来的。取到它，看板、趋势、分享链接就悄悄换成了那个人问的那组数；
+#: - 其余是探索运行（问数据、画布试跑、试运行、个人应用的刷新，评测、口径对账、口径召回），本来就不是正式运行。
+NOT_SEALED_ORIGINS = (BACKFILL_ORIGIN, "ledger_issue", "chat", "canvas", "trial", "personal_app", "eval", "reconcile",
+                      "recall")
 
 VIEW_REFUSED = "app_view_refused"
 DAILY_LIMIT = "app_view_daily_limit"
@@ -76,6 +96,36 @@ _PERIOD = re.compile(r"(period|week|month|quarter|year|date|day|期|周|月|季|
 _DIGIT = re.compile(r"\d")
 
 
+#: 分享链接里（share 旁路）不是定时出数的视图、流程组件、报告写什么
+SHARE_SEALED_ONLY = "分享链接只显示定时出数的视图：这一块的数要打开应用才看得到"
+SHARE_PLACEHOLDER = {
+    "entry_button": "分享链接是只读的，不能在这里发起",
+    "form": "分享链接是只读的，不能在这里换参数",
+    "instance_list": "分享链接不列实例：要看实例请打开应用",
+    "instance_header": "分享链接不显示实例：要看实例请打开应用",
+    "instance_timeline": "分享链接不显示实例进度：要看请打开应用",
+    "task_list": "分享链接不列待办：待办只给派给的人，请打开应用处理",
+    "task_form": "分享链接不显示待办：待办只给派给的人，请打开应用处理",
+    "signoffs": "分享链接不显示会签进度：要看请打开应用",
+    "action_status": "分享链接不显示写入外部系统的记录：要看请打开应用",
+    "records_list": "分享链接不列登记的记录：要看请打开应用",
+    "report": "报告正文和每个数的出处在「下载报告」里：下载的文件离线也能点开出处",
+}
+SHARE_FIXED_NEW_VIEW = "这个视图是建分享之后才加的：固定在当时那几次运行的分享链接里没有它"
+SHARE_FIXED_EMPTY = "建分享时这个视图还没有封存的运行"
+SHARE_FIXED_GONE = "建分享时固定的那次运行已经不在了"
+
+
+@dataclass(frozen=True)
+class SharedView:
+    """分享链接的解析方式（api/shares.py 建好交进来）。mode：latest 始终取最近一次封存；fixed 取 runs 里存的运行
+    （{视图 id: 运行 id，建分享时还没有封存运行的是 None}）。key 进页面缓存的键（分享的 id）。"""
+
+    mode: str
+    key: str
+    runs: dict[str, str | None] | None = None
+
+
 class ViewRefused(Exception):
     def __init__(self, status_code: int, message: str, code: str | None = None) -> None:
         super().__init__(message)
@@ -100,8 +150,8 @@ async def sealed_runs(session: AsyncSession, workflow_id: Any, version: Any, gra
     """钉住版本（同一 graph_hash）最近 n 次成功且已封存的正式运行，新的在前。
 
     sealed_now 认的是「这一次结束时封的」：失败后接着跑完、新封存还没补上的那一刻，带着的是旧封存，不算。
-    按新口径补算的运行（app_backfill）不算：它们是现在才算的历史期，「最近一次」不能取到它们；趋势另经 trend_runs
-    按它们对应的输入期排进去。"""
+    来源只认 SEALED_ORIGINS（和老运行）：按新口径补算的（app_backfill）、问数据按口径出具的（ledger_issue）都不是
+    「最近一次」，原因见 NOT_SEALED_ORIGINS。"""
     from sqlalchemy import or_
 
     from app.scheduler.auto_compare import sealed_now
@@ -110,7 +160,7 @@ async def sealed_runs(session: AsyncSession, workflow_id: Any, version: Any, gra
         return []
     query = select(Run).where(Run.workflow_id == workflow_id, Run.version == version, Run.run_class == "formal",
                               Run.status == "succeeded", Run.version_hash == graph_hash,
-                              or_(Run.origin_kind.is_(None), Run.origin_kind != BACKFILL_ORIGIN))
+                              or_(Run.origin_kind.is_(None), Run.origin_kind.in_(SEALED_ORIGINS)))
     if isinstance(origin, str) and origin.startswith("schedule:"):
         query = query.where(Run.schedule_id == origin[len("schedule:"):])
     rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc())
@@ -567,6 +617,8 @@ class _Page:
     page: dict[str, Any] = field(default_factory=dict)
     #: 蓝图的试运行（trial 旁路）：草稿里所有视图来源都解析到这次运行，流程组件也对着它
     trial: Run | None = None
+    #: 分享链接（share 旁路）：只解析定时出数的视图，流程组件换成说明
+    share: SharedView | None = None
     pins: dict[str, PinState] = field(default_factory=dict)
     sources: dict[str, Source] = field(default_factory=dict)
     problems: list[dict[str, Any]] = field(default_factory=list)
@@ -606,12 +658,15 @@ async def _backfilled(session: AsyncSession, app_id: str) -> int:
 async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, principal: Principal, role: str | None,
                        instance: Run | None = None, params: dict[str, Any] | None = None, draft: bool = False,
                        version: AppVersion | None = None, actor: str | None = None,
-                       trial: Run | None = None) -> dict[str, Any]:
+                       trial: Run | None = None, share: SharedView | None = None) -> dict[str, Any]:
     """解析一页，返回 agentlab.view/1。draft 为真时按草稿解析：不发起任何运行，视图取钉住版本已有的封存运行。
 
     trial 是蓝图的一次试运行（docs/design/normal-user-apps.md N4，只和 draft 一起用）：草稿里所有视图来源（最近封存、
     按需、本实例）都解析到这次运行，流程组件（实例进度、待办）也对着它；印章的来源写「试运行」、trial 为真、说明里写
     「这不是正式结果」；趋势只有这一个点。不改 agentlab.app/1 的视图来源，只是解析时的旁路。
+
+    share 是分享链接（见模块说明，只和发布版一起用：草稿、个人应用、试运行都不能分享）：只解析定时出数的视图，流程组件和
+    报告换成写明原因的说明，从不发起运行；out 里另给 share.runs（各视图取到的运行、有哪几份报告可下载）。
 
     个人应用（N7）没有应用版本：草稿就是在用的那一份，不按草稿预览时也解析它（version 为空）。作者隐藏了的组件（hidden）
     不下发；按草稿解析（编辑状态）时照常解析、带上 hidden，界面画成半透明。"""
@@ -625,8 +680,11 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
     if page is None:
         raise ViewRefused(404, f"应用里没有页面「{page_id}」", "app_page_not_found")
     trial = trial if draft else None
+    if share is not None and (draft or personal or version is None or instance is not None):
+        raise ViewRefused(409, "分享链接只解析已发布的共享应用", "personal.not_shareable" if personal else VIEW_REFUSED)
     ctx = _Page(app=app, spec=spec, version=None if draft else version, principal=principal, role=role,
-                instance=instance or trial, params=params or {}, draft=draft, actor=actor, page=page, trial=trial)
+                instance=instance or trial, params=params or {}, draft=draft, actor=actor, page=page, trial=trial,
+                share=share)
     ctx.pins = await load_pins(session, spec)
     # 试运行的钉住项本来就没有版本（还没发布），不是「需要升级」
     upgrade = needs_upgrade(ctx.pins) if trial is None else False
@@ -644,9 +702,10 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
            tuple((a, p.workflow.published_version if p.workflow else None, p.retired)
                  for a, p in sorted(ctx.pins.items())),
            role, principal.username, principal.role, await _mask_fingerprint(session),
-           await _backfilled(session, app.id))
+           await _backfilled(session, app.id), ("share", share.key) if share is not None else None)
+    # 分享链接里流程组件都换成了说明，页面上没有随人、随时变的东西：照样进缓存
     cacheable = (not draft and instance is None and all(s.state in ("ok", "empty") for s in ctx.sources.values())
-                 and not _dynamic(page))
+                 and (share is not None or not _dynamic(page)))
     if cacheable and key in _PAGE_CACHE:
         _PAGE_CACHE.move_to_end(key)
         return copy.deepcopy(_PAGE_CACHE[key])
@@ -654,7 +713,8 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
     # 会有（Source.message），不进 problems——进了，页面顶上挂一块「无法显示」，使用者以为应用坏了
     for source in ctx.sources.values():
         await _load(session, source)
-    for entry in spec.get("entries") or []:
+    # 分享链接里不能发起：入口的表单不下发
+    for entry in (spec.get("entries") or []) if share is None else []:
         form = resolve_form(spec, entry.get("form"))
         if form is not None and entry.get("id"):
             ctx.forms[str(entry["id"])] = form
@@ -673,12 +733,56 @@ async def resolve_page(session: AsyncSession, app: Any, *, page_id: str, princip
         "problems": ctx.problems,
         **({"trial": {"run_id": trial.id, "status": trial.status,
                       "status_text": STATUS_TEXT.get(trial.status, trial.status)}} if trial is not None else {}),
+        **({"share": {"mode": share.mode, "runs": _share_runs_out(ctx)}} if share is not None else {}),
     }
     if cacheable:
         _PAGE_CACHE[key] = copy.deepcopy(out)
         while len(_PAGE_CACHE) > PAGE_CACHE_SIZE:
             _PAGE_CACHE.popitem(last=False)
     return out
+
+
+def _share_runs_out(ctx: _Page) -> list[dict[str, Any]]:
+    """分享页上「下载报告」用：各视图取到的、成功封存的那次运行，带有哪几份没被改过的报告（节点 id）。同一次运行只列一次。"""
+    from app.api.evidence import _reports
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for vid, source in ctx.sources.items():
+        if source.state != "ok" or source.run is None or source.sealed is None or source.run.id in seen:
+            continue
+        seen.add(source.run.id)
+        reports = [r.node_id for r in _reports(source.sealed) if r.hash_ok is not False and r.doc is not None]
+        out.append({"view": vid, "run_id": source.run.id, "reports": reports,
+                    "as_of_text": (source.stamp or {}).get("as_of_text")})
+    return out
+
+
+async def share_runs(session: AsyncSession, spec: dict[str, Any], page_id: str, share: SharedView) -> dict[str, Run | None]:
+    """这条分享链接现在解析得到的运行：{视图 id: 运行}（只有这一页上定时出数的视图，取不到的是 None）。下载报告只认这几次
+    （api/shares.py），和页面上 _source 的分享旁路同一个取法。"""
+    page = page_of(spec, page_id)
+    if page is None:
+        return {}
+    ctx = _Page(app=None, spec=spec, version=None, principal=Principal(username=None, role="user", via="share"),
+                role=None, instance=None, params={}, draft=False, actor=None, page=page, share=share)
+    ctx.pins = await load_pins(session, spec)
+    out: dict[str, Run | None] = {}
+    for vid in _views_of(page):
+        if (((spec.get("views") or {}).get(vid) or {}).get("source") or {}).get("kind") != "latest_sealed":
+            continue
+        source = await _source(session, ctx, vid)
+        out[vid] = source.run if source.state == "ok" else None
+    return out
+
+
+def sealed_views(spec: dict[str, Any], page_id: str) -> list[str]:
+    """这一页上取最近封存运行（定时出数）的视图：能不能建分享链接看它（一个都没有，分享出去什么都看不到）。"""
+    page = page_of(spec, page_id)
+    if page is None:
+        return []
+    return [vid for vid in _views_of(page)
+            if (((spec.get("views") or {}).get(vid) or {}).get("source") or {}).get("kind") == "latest_sealed"]
 
 
 _DYNAMIC = frozenset({"instance_list", "task_list", "instance_header", "instance_timeline", "task_form", "signoffs",
@@ -724,6 +828,12 @@ async def _source(session: AsyncSession, ctx: _Page, vid: str) -> Source:
         return Source(id=vid, kind="", state="error", message=f"视图「{vid}」不存在")
     if ctx.trial is not None:
         return await _trial_source(session, ctx, vid, kind, src)
+    if ctx.share is not None:
+        if kind != "latest_sealed":
+            # 分享链接只显示定时出数的视图：按需视图不发起、实例和探索视图不取
+            return Source(id=vid, kind=kind, state="empty", message=SHARE_SEALED_ONLY)
+        if ctx.share.mode == "fixed":
+            return await _fixed_source(session, ctx, vid, src)
     state = ctx.pins.get(src.get("pin")) if kind != "instance" else None
     run: Run | None = None
     if kind == "instance":
@@ -753,6 +863,21 @@ async def _source(session: AsyncSession, ctx: _Page, vid: str) -> Source:
     if run.status != "succeeded":
         source.message = f"这次运行{STATUS_TEXT.get(run.status, run.status)}"
     return source
+
+
+async def _fixed_source(session: AsyncSession, ctx: _Page, vid: str, src: dict[str, Any]) -> Source:
+    """fixed 模式的分享链接：取建分享时这个视图的那次运行（还得是成功封存的正式运行），之后封存的新运行不换上来。"""
+    assert ctx.share is not None
+    runs = ctx.share.runs or {}
+    state = ctx.pins.get(src.get("pin"))
+    if vid not in runs:
+        return Source(id=vid, kind="latest_sealed", state="empty", pin=state, message=SHARE_FIXED_NEW_VIEW)
+    if runs[vid] is None:
+        return Source(id=vid, kind="latest_sealed", state="empty", pin=state, message=SHARE_FIXED_EMPTY)
+    run = await session.get(Run, runs[vid])
+    if run is None or run.status != "succeeded" or run.run_class != "formal":
+        return Source(id=vid, kind="latest_sealed", state="empty", pin=state, message=SHARE_FIXED_GONE)
+    return Source(id=vid, kind="latest_sealed", state="ok", run=run, pin=state, origin=src.get("from"))
 
 
 async def _exploratory_source(session: AsyncSession, ctx: _Page, vid: str, state: PinState) -> Source:
@@ -867,6 +992,10 @@ async def _node(session: AsyncSession, ctx: _Page, comp: dict[str, Any]) -> dict
         return None
     if comp.get("visible") and not await _visible(session, ctx, comp):
         return None
+    if ctx.share is not None and (reason := SHARE_PLACEHOLDER.get(str(comp.get("type")))):
+        # 分享链接是只读的：流程组件、报告换成一块写明原因的说明（前端照说明块画），不取实例、待办、报告正文
+        return {"id": cid, "type": "notice", "props": {"text": reason, "tone": "info"},
+                "share_placeholder": comp.get("type")}
     node: dict[str, Any] = {"id": cid, "type": comp.get("type"), "props": dict(comp.get("props") or {}),
                             **({"hidden": True} if comp.get("hidden") else {})}
     entry = BY_NAME.get(str(comp.get("type")))
@@ -1082,6 +1211,11 @@ async def _series(session: AsyncSession, ctx: _Page, source: Source, cid: str, r
     runs = await trend_runs(session, app_id, pin.pin.get("workflow_id"), pin.pin.get("version"),
                             pin.pin.get("graph_hash"), origin, n)
     segments.append((int(pin.pin.get("version")), str(pin.pin.get("graph_hash")), runs))
+    if ctx.share is not None and ctx.share.mode == "fixed" and source.run is not None:
+        # 固定在建分享那一刻的分享链接：趋势也停在那一期，之后封存的不画进来
+        cutoff = period_of(source.run)
+        segments = [(v, h, [r for r in rows if cutoff is None or (period_of(r) or cutoff) <= cutoff])
+                    for v, h, rows in segments]
     series: list[dict[str, Any]] = []
     unit = ""
     for version, _, rows in segments:

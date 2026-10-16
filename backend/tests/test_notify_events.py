@@ -32,8 +32,10 @@ URL = "https://hooks.example.com/agentlab/notify-events-5d1c"
 
 #: 本轮登记的六个（总方案 X6）
 THIS_ROUND = ("source.changed", "ledger.recall", "eval.regressed", "eval.failed", "task.digest", "key.expiring")
-#: 其中已经推送的（第 3 波：定时评测的通知只推全局渠道，notify_eval），其余还没有
-PUSHED_THIS_ROUND = {"eval.regressed": {"global"}, "eval.failed": {"global"}}
+#: 其中已经实现了推送、打开了订阅的（推给哪几条路）：定时评测的两个只推全局渠道（第 3 波 W3-c，notify_eval）；每天的待办汇总
+#: 只推个人渠道；访问密钥快到期，个人密钥推本人、服务账号的推全局渠道（第 3 波 W3-d，notify/digest.py）。其余还没有
+PUSHED_THIS_ROUND = {"eval.regressed": {"global"}, "eval.failed": {"global"},
+                     "task.digest": {"user"}, "key.expiring": {"global", "user"}}
 
 
 @pytest.fixture
@@ -57,8 +59,9 @@ def test_this_rounds_events_are_registered_once_and_not_pushed_yet():
         assert name in service.EVENTS, f"{name} 没有登记"
         assert service.EVENTS[name].label, name
         if name in PUSHED_THIS_ROUND:
-            continue
-        assert service.EVENTS[name].scopes == (), f"{name} 还没有推送：不该有人订阅得到"
+            assert set(service.EVENTS[name].scopes) == PUSHED_THIS_ROUND[name], name
+        else:
+            assert service.EVENTS[name].scopes == (), f"{name} 还没有推送：不该有人订阅得到"
     assert len({e.label for e in service.EVENTS.values()}) == len(service.EVENTS), "两个事件叫成了同一句"
     assert service.EVENT_LABEL == {k: v.label for k, v in service.EVENTS.items()}
 

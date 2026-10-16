@@ -5672,7 +5672,8 @@ export const NOTIFY_TEXT = {
   urlHint: '地址加密保存，之后只显示主机名',
   secret: '签名密钥（可选）',
   format: '格式',
-  formats: { generic: '通用 JSON', feishu: '飞书群机器人', wecom: '企业微信群机器人', dingtalk: '钉钉群机器人' } as Record<string, string>,
+  // email：邮件（第五种格式，服务端 notify/mail.py）：要先在「邮件服务」一节配好并启用
+  formats: { generic: '通用 JSON', feishu: '飞书群机器人', wecom: '企业微信群机器人', dingtalk: '钉钉群机器人', email: '邮件' } as Record<string, string>,
   scope: '范围',
   scopes: { global: '全局', app: '应用', user: '个人' } as Record<string, string>,
   events: '订阅的事件',
@@ -6146,6 +6147,9 @@ export const APP_SETTING_TEXT = {
   onDemandLimitInvalid: '请填写 0 到 100,000 之间的整数',
   personalApps: '使用者可以建个人应用',
   personalAppsHint: '开启后，使用者可以从说需求、场景模板或问数据的回答建一个只有自己看得见的应用：只读、结果遮罩，每人每天的刷新次数按上面的每日上限算；想给别人用要提交给搭建者审核发布。搭建者及以上不受这一项限制',
+  // 分享链接（服务端 apps.share_links，04 细案 C2）：默认关
+  shareLinks: '允许建分享链接',
+  shareLinksHint: '开启后，管理应用的人可以在应用编辑的「岗位与授权」里给一页建分享链接：拿到链接的人不用登录就能看（只读、只显示定时出数的视图、数据和使用者看到的一样遮过），必须设到期、最长 90 天、随时可以撤销。关掉时已有的分享链接一并打不开',
 }
 
 /**

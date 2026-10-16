@@ -7,7 +7,8 @@
 和加这一层之前一模一样。
 开登录：
 - 会话 cookie → Principal（认证过的用户名、角色、组）；没有会话是匿名（username=None），X-Actor 一律不看；
-- /api 下除了登录本身、健康检查、入站钩子，匿名一律 401。各路由的角色要求另由 main.py 的路由级依赖管，这里兜底：
+- /api 下除了登录本身、健康检查、入站钩子、分享链接的读接口（/api/shares/，只认请求头里的分享 key，api/shares.py），匿名
+  一律 401。各路由的角色要求另由 main.py 的路由级依赖管，这里兜底：
   哪个路由忘了挂依赖，也不会对没登录的人敞开；
 - 接口说明（FastAPI 自带的 /docs、/redoc、/openapi.json）和 /api 一样拦：匿名 401，不到搭建者 403。它们是 FastAPI 自己
   挂的路由，挂不上路由级依赖，所以角色也在这里判。以前只拦 /api/ 开头的，开了登录接口全貌也对匿名的人敞开；
@@ -38,6 +39,8 @@ _PUBLIC = frozenset({"/api/health", "/api/auth/me", "/api/auth/login", "/api/aut
                      "/api/auth/oidc/callback", "/api/auth/jwks", "/api/auth/bootstrap"})
 #: 只认签名、不走会话的入站钩子（也不查 CSRF：调用方是外部系统，没有浏览器的 Origin）
 _HOOKS = "/api/hooks/"
+#: 分享链接的读接口（04 细案 C2）：不用登录，接口里只认请求头 X-AgentLab-Share，会话有没有都不看。只有 GET：非 GET 照常查 CSRF
+_SHARES = "/api/shares/"
 #: FastAPI 自带的接口说明（main.py 里 FastAPI() 的缺省地址）：开登录时要搭建者
 _DOCS = ("/docs", "/redoc", "/openapi.json")
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -153,7 +156,7 @@ class AuthMiddleware:
             await send({"type": "websocket.close", "code": 1008})
             return
         if (scope["type"] == "http" and is_api and not principal.username and path not in _PUBLIC
-                and not path.startswith(_HOOKS)):
+                and not path.startswith(_HOOKS) and not path.startswith(_SHARES)):
             await _reply(send, 401, "请先登录", AUTH_REQUIRED)
             return
         if scope["type"] == "http" and _is_docs(path) and (refused := refusal(principal, "builder")) is not None:
