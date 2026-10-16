@@ -144,9 +144,12 @@ async def issued_today(session: Any) -> int:
 
 
 async def issued_runs(session: Any, run_id: str) -> list[Run]:
-    """这次运行按口径出具过的正式运行（origin.source_run 是它），新的在前。origin_kind 有索引，先按它筛再看 origin。"""
-    rows = (await session.execute(select(Run).where(Run.origin_kind == ORIGIN).order_by(Run.created_at.desc()))).scalars()
-    return [r for r in rows if isinstance(r.origin, dict) and r.origin.get("source_run") == run_id]
+    """这次运行按口径出具过的正式运行（origin.source_run 是它），新的在前。origin_kind 有索引，先按它筛再看 origin
+    （json_extract，同 auth/keys 认幂等键的写法）。"""
+    rows = (await session.execute(select(Run).where(
+        Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.source_run") == run_id)
+        .order_by(Run.created_at.desc()))).scalars()
+    return list(rows)
 
 
 def issued_view(run: Run) -> dict[str, Any]:

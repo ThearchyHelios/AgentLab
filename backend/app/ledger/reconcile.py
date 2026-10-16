@@ -131,8 +131,12 @@ def actions_of(content: dict[str, Any], names: dict[str, str], hide: Any = None)
 
 async def reconciled_runs(session: Any, run_id: str) -> list[Run]:
     """对这次运行对过的账（origin.source_run 是它），新的在前。"""
-    rows = (await session.execute(select(Run).where(Run.origin_kind == ORIGIN).order_by(Run.created_at.desc()))).scalars()
-    return [r for r in rows if isinstance(r.origin, dict) and r.origin.get("source_run") == run_id]
+    from sqlalchemy import func
+
+    rows = (await session.execute(select(Run).where(
+        Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.source_run") == run_id)
+        .order_by(Run.created_at.desc()))).scalars()
+    return list(rows)
 
 
 def reconciled_view(run: Run) -> dict[str, Any]:
