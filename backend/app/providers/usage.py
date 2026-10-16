@@ -13,9 +13,10 @@ async generator：with 块跨着 yield 的话，变量在两次 yield 之间留�
 
 **金额。** 按 providers/catalog.estimate_cost 算，和运行的 llm.end 一个口径。估不出的调用记 unpriced_calls：模型不在价格
 目录里，或者用量没报全而目录价又不是 0。估不出的不当成 0 元，调用方据此写「≥」或「金额无法估算」。用量没报全有两种：
-回复没带用量（有的网关流式不给）；读到一半就不读了——生成过程读到 done、look、ask 那一行就关掉模型的流（后面的闲话不要、
-也不再为它付钱），用量在流的末尾才报全（Anthropic 的输出 token 在最后一条，OpenAI 兼容系开了 stream_usage 也在最后），
-关掉的那一次只拿得到已经报了的部分。这一次照样计次数、计已报的 token，记成估不出，不悄悄少算。
+回复没带用量（有的网关流式不给）；读到一半就不读了——用量在流的末尾才报全（Anthropic 的输出 token 在最后一条，OpenAI
+兼容系开了 stream_usage 也在最后）。生成过程读到 done、look、ask 那一行之后照样把流读完再关（api/copilot_gen._drain），
+流末尾那一段用量收得到；只有模型在那一行之后还往下写超过 DRAIN_CHARS 字的闲话时才当场关流（不为闲话付钱），连接断了也一样，
+这一次只拿得到已经报了的部分：照样计次数、计已报的 token，记成估不出，不悄悄少算。
 
 模型名按发起调用时的参数取（invocation_params 的 model / model_name，就是接入里配的模型 id，价格目录按它查），取不到再
 看回复里的 model_name。
@@ -85,7 +86,7 @@ class Meter(BaseCallbackHandler):
                 row["unreported"] += 1
 
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        """流读到一半停了（生成过程读到 done / look / ask 就关流，或者连接断了）：LangChain 照样交来已经收到的那几段。
+        """流读到一半停了（生成过程在最后一行之后读到太多闲话就关流，或者连接断了）：LangChain 照样交来已经收到的那几段。
         有收到东西的照计一次、记已报的 token，算用量没报全；一段都没收到的（请求刚发出去就被拒了）不计。"""
         from langchain_core.outputs import ChatGenerationChunk
 

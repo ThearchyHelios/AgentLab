@@ -463,7 +463,8 @@ async def notify_source_changed(source_id: str) -> int:
 async def notify_eval(eval_run_id: str, event: str, *, passed: int, graded: int, regressed: int) -> int:
     """定时评测的通知（eval.regressed 有一道题从通过变成不通过、eval.failed 没评完：失败、到了上限、止损）。只推订阅了它的
     全局渠道。消息里只有题集名、状态、通过几题、退步几题、评测编号和链接（细案 01 做法 15、总方案 X6）：不放期望值、答案里的数、
-    题目原文。链接去发起它的那条定时任务的触发历史（评测页在第 4 波）。"""
+    题目原文。链接去这次评测的详情页（/evals/runs/{评测 id}：进度、逐题结果、和上一次比；第 4 波评测页上线之前是定时任务的
+    触发历史），退步的那几题在详情页上点得开。"""
     from app.db.models_eval import EvalRun, EvalSuite
 
     async with SessionLocal() as session:
@@ -485,7 +486,7 @@ async def notify_eval(eval_run_id: str, event: str, *, passed: int, graded: int,
     if run.arm:
         lines.append(("对照", run.arm[:40]))
     lines.append(("评测", f"#{eval_run_id[:6]}"))
-    links = [("查看定时任务", f"{base}/schedules/{run.schedule_id}?tab=history")] if base and run.schedule_id else []
+    links = [("查看评测", f"{base}/evals/runs/{eval_run_id}")] if base else []
     message = {"event": event, "status": run.status, "ok": False,
                "title": f"定时评测「{name}」{'有退步' if regressed_event else '没有评完'}", "lines": lines, "links": links,
                "subject": {"eval_run_id": eval_run_id, "suite_id": run.suite_id, "schedule_id": run.schedule_id}}

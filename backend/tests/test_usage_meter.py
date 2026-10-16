@@ -5,7 +5,10 @@
   不当成 0 元；
 - metered 只计生成过程自己的调用（含它在一步里起的任务）；调用方在两次 yield 之间做的事（发起运行）不计——运行的用量
   另有 llm.end，包进来就重复了；嵌套时内层并进外层；
-- answer_ops 末尾的 usage 记下这一轮建图的每一次调用（起草、自查修正各一次）；复核的结果带 usage。
+- answer_ops 末尾的 usage 记下这一轮建图的每一次调用（起草、自查修正各一次）；复核的结果带 usage；
+- 读到 done / look / ask 那一行之后照样把模型的流读完再关（读完只为拿到流末尾才报的用量）：输出 token 报全了、金额估得出，
+  不再是下限；模型在那一行之后还往下写一大段闲话的，读到上限就当场关流、照实记成没报全；
+- 评测的作答（app/eval/answer.Driver）记的助手用量就是问数据页收到的那条 usage：同一个口径。
 
 模型都是剧本，不调真接口；价格用目录里登记过的模型 id，名字之外都是虚构的。
 """
@@ -190,9 +193,19 @@ async def client():
         yield c
 
 
+async def _sse(client, body: dict) -> list[dict]:
+    events = []
+    async with client.stream("POST", "/api/copilot/generate-stream", json=body) as r:
+        async for line in r.aiter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    return events
+
+
 async def test_answer_ops_ends_with_the_usage_of_every_build_call(client, monkeypatch):
-    """起草、自查修正各一次。生成过程读到 done 就关流（后面的闲话不要），流末尾才报的输出 token 拿不到：这两次照样计次数、
-    计已报的输入 token，记成估不出（unpriced_calls），金额只是估得出的那部分——不悄悄少算。"""
+    """起草、自查修正各一次。读到 done 那一行之后照样把模型的流读完（模型照约定 done 就是最后一行，读完只多收流末尾那一段
+    用量）：输出 token 报全了、金额估得出，这一轮的花费不再是下限（第 1 波的遗留：以前读到 done 就关流，输出 token 一个都
+    拿不到，两次都记成估不出）。"""
     import app.api.copilot as copilot
 
     model = Scripted(model=PRICED, replies=[GRAPH, FIX], tokens=(3000, 500))
@@ -201,19 +214,96 @@ async def test_answer_ops_ends_with_the_usage_of_every_build_call(client, monkey
         return model, PRICED
 
     monkeypatch.setattr(copilot, "get_chat_model", _model)
-    events = []
-    async with client.stream("POST", "/api/copilot/generate-stream", json={"instruction": "数一数", "intent": "answer"}) as r:
-        async for line in r.aiter_lines():
-            if line.startswith("data: "):
-                events.append(json.loads(line[6:]))
+    events = await _sse(client, {"instruction": "数一数", "intent": "answer"})
     assert [e["op"] for e in events if e["op"] == "check"] and events[-2]["op"] == "final"
     spent = events[-1]
     assert spent["op"] == "usage", spent
     assert model.calls == 2, spent  # 起草一次、自查修正一次
-    assert spent["by_model"][PRICED]["calls"] == 2, spent
-    assert spent["by_model"][PRICED]["input_tokens"] == 6000 and spent["by_model"][PRICED]["output_tokens"] == 0
-    assert spent["cost_usd"] == pytest.approx(estimate_cost(PRICED, 6000, 0), abs=1e-6)
-    assert spent["unpriced_calls"] == 2, "关流前没报全的两次记成估不出"
+    row = spent["by_model"][PRICED]
+    assert row["calls"] == 2, spent
+    assert (row["input_tokens"], row["output_tokens"]) == (6000, 1000), "流末尾才报的输出 token 也收到了"
+    assert spent["unpriced_calls"] == 0, "读完了的流用量报全了，不记估不出"
+    assert spent["cost_usd"] == pytest.approx(estimate_cost(PRICED, 6000, 1000), abs=1e-6)
+
+
+async def test_a_look_line_also_waits_for_the_usage_at_the_end_of_the_stream(client, monkeypatch):
+    """读到 look 停下查看、ask 等用户回答：同样把这一次的流读完再关，查看前那一次的输出 token 不丢。"""
+    import app.api.copilot as copilot
+
+    looked = _ops({"op": "look", "kind": "table", "id": "不存在的表", "need": "看看有哪些列"})
+    model = Scripted(model=PRICED, replies=[looked, _ops({"op": "ask", "question": "要按哪一天算？"})], tokens=(1200, 80))
+
+    async def _model(*_a, **_k):
+        return model, PRICED
+
+    monkeypatch.setattr(copilot, "get_chat_model", _model)
+    events = await _sse(client, {"instruction": "看一下再问", "intent": "answer"})
+    spent = events[-1]
+    assert spent["op"] == "usage" and model.calls == 2, [e["op"] for e in events]
+    row = spent["by_model"][PRICED]
+    assert (row["input_tokens"], row["output_tokens"], row["unpriced_calls"]) == (2400, 160, 0), spent
+
+
+class Chatty(Scripted):
+    """done 那一行之后还往下写一大段闲话（不守约定），用量照样在最后一段才报。"""
+
+    chatter: int = 40
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+        lines = self._next()
+        inp, out = self.tokens
+        for i, line in enumerate(lines):
+            meta = {"input_tokens": inp, "output_tokens": 0, "total_tokens": inp} if i == 0 else None
+            yield ChatGenerationChunk(message=AIMessageChunk(content=line + "\n", **({"usage_metadata": meta} if meta
+                                                                                     else {})))
+        for _ in range(self.chatter):
+            yield ChatGenerationChunk(message=AIMessageChunk(content="这是一段写在最后一行之后、没人要的闲话。\n"))
+        yield ChatGenerationChunk(message=AIMessageChunk(content="", usage_metadata={
+            "input_tokens": 0, "output_tokens": out, "total_tokens": out}))
+
+
+async def test_chatter_after_the_last_line_is_cut_off_and_recorded_as_not_fully_reported(client, monkeypatch):
+    """读完流只为拿用量，不为闲话付钱：最后一行之后又收到超过上限的字就当场关流。这一次的用量没报全，照实记成估不出，不当成
+    报全了，也不悄悄当成 0 元。"""
+    import app.api.copilot as copilot
+    from app.api import copilot_gen
+
+    model = Chatty(model=PRICED, replies=[_ops({"op": "ask", "question": "要按哪一天算？"})], tokens=(500, 300))
+
+    async def _model(*_a, **_k):
+        return model, PRICED
+
+    monkeypatch.setattr(copilot, "get_chat_model", _model)
+    assert model.chatter * len("这是一段写在最后一行之后、没人要的闲话。\n") > copilot_gen.DRAIN_CHARS
+    events = await _sse(client, {"instruction": "按天看销售额", "intent": "answer"})
+    assert events[-1]["op"] == "usage" and model.calls == 1, [e["op"] for e in events]
+    row = events[-1]["by_model"][PRICED]
+    assert (row["calls"], row["input_tokens"], row["output_tokens"], row["unpriced_calls"]) == (1, 500, 0, 1), row
+
+
+async def test_the_eval_driver_records_the_same_usage_the_chat_page_receives(client, monkeypatch):
+    """评测的作答（app/eval/answer.Driver._generate → _take）收下的助手用量，就是问数据页经 SSE 收到的那条 usage：同一个
+    生成过程（answer_ops）、同一份计量，读完流之后两边都是报全了的数。"""
+    import app.api.copilot as copilot
+    from app.eval import answer
+
+    replies = [_ops({"op": "ask", "question": "要按哪一天算？"})]
+    model = Scripted(model=PRICED, replies=replies, tokens=(700, 90))
+
+    async def _model(*_a, **_k):
+        return model, PRICED
+
+    monkeypatch.setattr(copilot, "get_chat_model", _model)
+    chat = (await _sse(client, {"instruction": "按天看销售额", "intent": "answer"}))[-1]
+    assert chat["op"] == "usage"
+    driver = answer.Driver("按天看销售额", datasource_ids=[], ctx=answer.TurnContext(
+        suite_id="s", suite_name="虚构题集", eval_run_id="e", case_id=None, case_seq=1, actor=None))
+    ops, refused = await driver._generate("按天看销售额", None)
+    assert refused is None and any(o.get("op") == "ask" for o in ops)
+    driver._take(ops)
+    got = driver.turn.usage["assistant"]
+    assert got["by_model"] == chat["by_model"] and got["cost_usd"] == chat["cost_usd"], (got, chat)
+    assert got["by_model"][PRICED]["output_tokens"] == 90 and got["unpriced_calls"] == 0
 
 
 async def test_a_build_on_an_unpriced_model_says_it_cannot_be_priced(client, monkeypatch):
