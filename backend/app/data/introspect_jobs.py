@@ -380,7 +380,7 @@ async def _record_index_changes(session: AsyncSession, row: Any, stats: so.Refre
     真删除的表（table_removed，带影响面：目录里这张表的项、别的表指向它的关联关系、写死它的已发布模板）。出错只记日志。"""
     if not stats.removed_names and not (stats.added_names and not stats.first_build):
         return
-    from app.data import catalog_impact
+    from app.data import catalog, catalog_impact
     from app.data import schema_diff as sd
     from app.data import source_changes as sc
 
@@ -399,13 +399,15 @@ async def _record_index_changes(session: AsyncSession, row: Any, stats: so.Refre
                 SourceObject.name.in_(stats.removed_names)))).scalars()}
             tables_after = dict((row.schema_cache or {}).get("tables") or {})
             specs = await catalog_impact.published_specs(session)
+            notes = {t: e.notes for t, e in (await catalog.read_catalog(session, row.id)).items()}
             for name in stats.removed_names:
                 obj = gone.get(name)
                 version = int(obj.struct_version or 0) if obj is not None else 0
                 meta = obj.meta if obj is not None and isinstance(obj.meta, dict) else None
                 [(affects, severity)] = await catalog_impact.structure_impact(
                     session, row, name, [sd.Diff(sd.TABLE_REMOVED)], before_meta=meta,
-                    tables_after={k: v for k, v in tables_after.items() if k != name}, specs=specs)
+                    tables_after={k: v for k, v in tables_after.items() if k != name}, specs=specs,
+                    notes_by_table=notes)
                 changes.append(sc.NewChange(
                     kind=sd.TABLE_REMOVED, table=name, severity=severity, affects=affects,
                     before={"kind": obj.kind if obj is not None else "table"}, struct_version_before=version or None,
@@ -704,7 +706,7 @@ class _IntrospectRun(runtime.JobRun):
                             got: so.Reflected, old: dict[str, Any], versions: dict[str, int]) -> None:
         """这一批的结构差异（不提交）：读到的表指纹变了、又不是基线（schema_diff.is_baseline）的，逐条比出变化、算影响面；
         以前读得到、这次读不到的记 table_reflect_failed。出错只记日志，不挡探查。"""
-        from app.data import catalog_impact
+        from app.data import catalog, catalog_impact
         from app.data import schema_diff as sd
         from app.data import source_changes as sc
 
@@ -734,9 +736,12 @@ class _IntrospectRun(runtime.JobRun):
             if self._specs is None:
                 self._specs = await catalog_impact.published_specs(session)
             tables_after = {**dict((row.schema_cache or {}).get("tables") or {}), **got.tables}
+            notes = ({t: e.notes for t, e in (await catalog.read_catalog(session, source_id)).items()}
+                     if todo else {})
             for seq, name, diffs, before in todo:
                 impacts = await catalog_impact.structure_impact(session, row, name, diffs, before_meta=before,
-                                                                tables_after=tables_after, specs=self._specs)
+                                                                tables_after=tables_after, specs=self._specs,
+                                                                notes_by_table=notes)
                 after_v, before_v = versions.get(name), old[name].struct_version
                 changes = [sc.NewChange(kind=d.kind, table=name, column=d.column, severity=severity,
                                         before=_side(d, "before"), after=_side(d, "after"), affects=affects,
