@@ -214,3 +214,37 @@ async def test_users_reconcile_their_own_answers_read_only_and_masked(client, mo
     assert run.options[MASK_RESULTS_OPTION] is True and run.options[READ_ONLY_OPTION] is True
     done = await S.wait(run.id)
     assert done.status == "succeeded", done.error
+
+
+async def test_users_read_their_reconcile_runs_only_through_the_evidence(client, monkeypatch):
+    """使用者发起的对账运行带 MASK_RESULTS、记在他名下，但派生图里有口径取数节点的 SQL 模板（口径的 SQL 可能写着遮罩值，
+    所以问数据里使用者不看口径、不能 use_caliber）：运行的原始记录、事件、运行时的图（/api/runs/{id}、/events、/graph）只给
+    他自己的问数据运行，对账运行经证据接口读（那里按遮罩渲染）。"""
+    from app.tools.datasource import MASK_RESULTS_OPTION
+    from tests.fakes import auth_env
+
+    wf = await S.publish()
+    row = await S.explore(monkeypatch, S.WITH_REFUNDS, origin="chat")
+    # 当作开登录后使用者 carol 问的：问数据运行在工具边界遮
+    async with SessionLocal() as session:
+        source = await session.get(Run, row.id)
+        source.started_by, source.options = "carol", {MASK_RESULTS_OPTION: True}
+        await session.commit()
+    [action] = [a for a in (await ledger_of(client, row.id))["actions"] if a["kind"] == "reconcile"]
+    await auth_env.reset()
+    try:
+        admin = await auth_env.turn_on_local()
+        await auth_env.make_user("carol", "user")
+        assert (await admin.put("/api/auth/settings", json={"user_can_chat": True})).status_code == 200
+        carol = await auth_env.login("carol")
+        res = await carol.post(f"/api/ledger/answers/{row.id}/reconcile", json={
+            "query": action["query"], "workflow_id": wf, "version": 1, "inputs": CHECKED, "confirm": True})
+        assert res.status_code == 201, res.text
+        done = await S.wait(res.json()["run_id"])
+        assert done.status == "succeeded" and done.started_by == "carol" and done.options[MASK_RESULTS_OPTION] is True
+        for rest in ("", "/events", "/graph"):
+            assert (await carol.get(f"/api/runs/{done.id}{rest}")).status_code == 403, rest
+            assert (await carol.get(f"/api/runs/{row.id}{rest}")).status_code == 200, f"自己的问数据运行照旧：{rest}"
+        assert (await carol.get(f"/api/runs/{done.id}/evidence")).status_code == 200
+    finally:
+        await auth_env.reset()
