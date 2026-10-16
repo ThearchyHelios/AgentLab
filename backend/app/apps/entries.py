@@ -78,11 +78,14 @@ def render_title(entry: dict[str, Any], inputs: dict[str, Any]) -> str | None:
 
 
 async def start_entry(app_id: str, entry_id: str, values: dict[str, Any], principal: Any, *,
-                      origin_kind: str = "app_entry", hook: str | None = None, hook_key: str | None = None) -> Any:
+                      origin_kind: str = "app_entry", hook: str | None = None, hook_key: str | None = None,
+                      idempotency_key: str | None = None) -> Any:
     """发起一个实例，返回 Run。校验失败抛 FormRejected(errors)；应用需升级（钉住的版本已退役）时拒绝。
 
     钩子发起的（origin_kind=hook）来源里另记钩子名和这次请求的幂等键（hook_key）：处理到一半服务停了、同一个键重新
     认领时，按它找已经发起的实例（process/hooks.py），不重复发起。
+    用访问密钥发起的（docs/design/next-round/04-对外集成与触达.md A4）来源仍是 app_entry，另记 via=key、哪一把密钥、叫什么
+    （auth/keys.trace）和这次的幂等键（idempotency_key），同样在封存范围内：查得到是哪把密钥发起的，重新认领时按它找。
 
     principal.username 记成发起人（关登录时是自报的署名，调用方按 X-Actor 填好）。发起被 launch_run 拒绝时抛
     LaunchRefused，原样交给调用方。"""
@@ -132,12 +135,19 @@ async def start_entry(app_id: str, entry_id: str, values: dict[str, Any], princi
                 origin_kind=origin_kind, app_id=app.id, app_version=version.version,
                 origin={"entry": entry_id, "spec_hash": version.spec_hash, "title": title, "hook": hook,
                         "hook_key": hook_key, "actor_verified": bool(getattr(principal, "verified", False)),
-                        "auth_mode": getattr(principal, "mode", "off")})
+                        "auth_mode": getattr(principal, "mode", "off"), **_key_trace(principal),
+                        **({"idempotency_key": idempotency_key} if idempotency_key else {})})
         except BaseException:
             await files_store.release(claimed)
             raise
         await files_store.finish(claimed, run.id)
         return run
+
+
+def _key_trace(principal: Any) -> dict[str, Any]:
+    from app.auth.keys import trace
+
+    return trace(principal)
 
 
 async def _claim_files(form: dict[str, Any], values: dict[str, Any], principal: Any, app_id: str,

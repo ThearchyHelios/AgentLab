@@ -433,7 +433,7 @@ async def run_view(session: AsyncSession, *, app: Any, version: AppVersion, view
             expect_hash=state.pin.get("graph_hash"), input_payload=inputs, actor=actor, origin_kind="app_view",
             app_id=app.id, app_version=version.version,
             origin={"view": view_id, "spec_hash": version.spec_hash, "actor_verified": principal.verified,
-                    "auth_mode": principal.mode})
+                    "auth_mode": principal.mode, **_key_trace(principal)})
         ttl = source.get("ttl_s")
         if ttl is None and await reads_live(session, state.graph):
             ttl = TTL_DEFAULT
@@ -442,6 +442,109 @@ async def run_view(session: AsyncSession, *, app: Any, version: AppVersion, view
         session.add(AppViewCache(key=key, app_id=app.id, view_id=view_id, run_id=run.id, expires_at=expires))
         await session.commit()
         return run, False
+
+
+def _key_trace(principal: Any) -> dict[str, Any]:
+    """用访问密钥刷新时 run.origin 另记的：via=key、哪一把、叫什么（auth/keys.trace）。"""
+    from app.auth.keys import trace
+
+    return trace(principal)
+
+
+# --------------------------------------------------------------------------
+# 视图数据 agentlab.viewdata/1（docs/design/next-round/04-对外集成与触达.md A5）
+#
+# 给外部系统（门户、BI）拉封存的数：按应用当前发布版解析这个视图取的是哪一次封存运行，交出印章、清单哈希和这次运行封存的
+# 所有口径卡指标——原值 value、渲染好的 text、遮罩状态、证据指针。不让集成方解析页面视图模型：组件 id 和布局一改集成就坏，
+# 而且那里只有渲染好的文字。数值直接取自口径卡封存的指标（叙述层无算术），口径名和版本来自口径卡；遮罩判断和页面用的是同一个
+# 函数（_metric_value），遮住的 value 为 null、state 为 masked。查询表格不放进来：要的话按证据指针走证据接口或工件接口，
+# 那两处已经按使用者遮过。只给正式运行（最近封存、按需两种视图）；按需视图只读这组参数缓存的那次结果，不发起运行
+# --------------------------------------------------------------------------
+
+VIEWDATA_FORMAT = "agentlab.viewdata/1"
+VIEW_NOT_FOUND = "app_view_not_found"
+VIEWDATA_ON_DEMAND_EMPTY = "这组参数还没有算过：读视图数据不发起运行，请先刷新这个按需视图（访问密钥要有 apps.run）"
+VIEWDATA_KINDS = ("latest_sealed", "on_demand")
+
+
+def _ran(vid: str, kind: str, run: Run, state: PinState | None, origin: Any = None) -> Source:
+    """一次已经挑出来的运行 → 来源（同 _source 的末尾：在跑、成功、没成功）。"""
+    if run.status in _ACTIVE:
+        return Source(id=vid, kind=kind, state="running", run=run, pin=state, message=RUNNING_TEXT)
+    source = Source(id=vid, kind=kind, state="ok" if run.status == "succeeded" else "error", run=run, pin=state,
+                    origin=origin)
+    if run.status != "succeeded":
+        source.message = f"这次运行{STATUS_TEXT.get(run.status, run.status)}"
+    return source
+
+
+async def view_data(session: AsyncSession, app: Any, *, version: AppVersion, view_id: str, params: Any,
+                    principal: Principal, role: str | None) -> dict[str, Any]:
+    """一个视图的数据（agentlab.viewdata/1）。视图不存在 404；实例视图、个人应用的探索视图 409（只给正式运行）。"""
+    from app.api.evidence import _sealed_cards
+
+    spec = version.spec or {}
+    view = (spec.get("views") or {}).get(view_id)
+    if not isinstance(view, dict):
+        raise ViewRefused(404, f"应用里没有视图「{view_id}」", VIEW_NOT_FOUND)
+    src = view.get("source") or {}
+    kind = src.get("kind")
+    if kind not in VIEWDATA_KINDS:
+        raise ViewRefused(409, "视图数据只给取正式运行的视图（最近封存、按需运行）：实例视图请按实例读", VIEW_REFUSED)
+    ctx = _Page(app=app, spec=spec, version=version, principal=principal, role=role, instance=None,
+                params=params if isinstance(params, dict) else {}, draft=False, actor=None)
+    ctx.pins = await load_pins(session, spec)
+    inputs: dict[str, Any] | None = None
+    if kind == "on_demand":
+        state = ctx.pins.get(src.get("pin"))
+        if state is None:
+            source = Source(id=view_id, kind=kind, state="error", message=f"视图「{view_id}」引用的工作流版本不在应用里")
+        else:
+            form = resolve_form(spec, src.get("params")) if src.get("params") is not None else None
+            inputs = normalize_params(form, ctx.params)
+            run = await _cached(session, await cache_key(session, state, inputs))
+            source = _ran(view_id, kind, run, state) if run is not None else Source(
+                id=view_id, kind=kind, state="empty", pin=state, message=VIEWDATA_ON_DEMAND_EMPTY)
+    else:
+        source = await _source(session, ctx, view_id)
+    if source.run is not None and source.run.run_class != "formal":
+        source = Source(id=view_id, kind=kind, state="error", message="这个视图取到的不是正式运行，视图数据只给正式运行")
+    await _load(session, source)
+    metrics: list[dict[str, Any]] = []
+    if source.state == "ok" and source.sealed is not None:
+        latest: dict[str, tuple[str, dict[str, Any]]] = {}
+        for node_id, artifact, card in _sealed_cards(source.sealed):
+            latest[node_id] = (artifact, card)  # 同一张卡执行过几次（循环里）取最后一次，同页面上的绑定
+        labels = {str(n.get("id")): ((n.get("data") or {}).get("label") or n.get("id"))
+                  for n in source.sealed.graph.get("nodes") or [] if isinstance(n, dict)}
+        for node_id, (artifact, card) in latest.items():
+            for item in card.get("metrics") or []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                metric_id = str(item["id"])
+                metric, text, eid, held = await _metric_value(source, node_id, metric_id, None, (artifact, card))
+                if metric is None:
+                    continue
+                value = None if held else metric.get("value")
+                metrics.append({
+                    "node": node_id, "node_label": labels.get(node_id, node_id),
+                    "caliber": str(card.get("caliber") or "") or None,
+                    "caliber_version": str(card.get("caliber_version") or "") or None,
+                    "id": metric_id, "name": metric.get("name") or metric_id, "unit": metric.get("unit") or "",
+                    "value": value, "text": text,
+                    "state": "masked" if held else ("ok" if value is not None else "missing"),
+                    "evidence": {"run_id": source.run.id, "eid": eid, "node": node_id, "metric": metric_id}})
+    run = source.run
+    return {"format": VIEWDATA_FORMAT,
+            "app": {"id": app.id, "version": version.version},
+            "view": {"id": view_id, "kind": kind},
+            "state": source.state,
+            **({"params": inputs} if inputs is not None else {}),
+            "run_id": run.id if run is not None else None,
+            "manifest_hash": (source.sealed.manifest_hash if source.sealed is not None else None),
+            "stamp": source.stamp,
+            "metrics": metrics,
+            **({"message": source.message} if source.message else {})}
 
 
 # --------------------------------------------------------------------------
@@ -907,13 +1010,15 @@ def _card(source: Source, node_id: str) -> tuple[str, dict[str, Any]] | None:
     return found[-1] if found else None
 
 
-async def _metric_value(source: Source, node_id: str, metric_id: str, conv: Any
+async def _metric_value(source: Source, node_id: str, metric_id: str, conv: Any,
+                        found: tuple[str, dict[str, Any]] | None = None
                         ) -> tuple[dict[str, Any] | None, str, str | None, str | None]:
-    """(指标, 渲染出来的字, 证据 eid, 不给值时写的字)。"""
+    """(指标, 渲染出来的字, 证据 eid, 不给值时写的字)。found 是已经取出来的 (工件, 指标集)，不给就按节点取最后一次的。"""
     from app.api.evidence import MASKED, _metric_in, _metric_masks
     from app.engine.evidence import MISSING, RenderError, make_eid, render_metric
 
-    found = _card(source, node_id)
+    if found is None:
+        found = _card(source, node_id)
     if found is None:
         return None, MISSING, None, None
     artifact, card = found

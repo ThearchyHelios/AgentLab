@@ -70,7 +70,8 @@ async def user_of(session: AsyncSession, token: str) -> Any | None:
     if now - row.last_seen_at > timedelta(hours=settings.auth_session_idle_hours):
         return None
     user = await session.get(User, row.user_id)
-    if user is None or user.disabled:
+    # 服务账号不能登录（只持有访问密钥，auth/keys.py）：它没有口令，这里再守一道——万一有会话指向它也认不出来
+    if user is None or user.disabled or user.kind == "service":
         return None
     if now - row.last_seen_at > _TOUCH_EVERY:
         row.last_seen_at = now

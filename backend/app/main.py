@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -27,6 +27,7 @@ from app.api import (
 )
 from app.api.coded import CodedHTTPException, coded_handler
 from app.api.deps import chat_scope, evidence_scope, private_run_scope, require_role, role_by_method, run_scope
+from app.auth.keys import key_gate
 from app.auth.middleware import AuthMiddleware
 from app.core.config import settings
 from app.db.base import init_db
@@ -190,11 +191,14 @@ async def _platform_startup() -> None:
         logger.exception("能力登记同步失败，服务照常启动")
 
 
+# 访问密钥的门禁（app/auth/keys.py 的 key_gate，docs/design/next-round/04-对外集成与触达.md A2）挂在全站一次：每个路由都先过它，
+# 按访问密钥认出来的请求只放行 KEY_ROUTES 里的接口；别的认法（会话、关登录、钩子）一律放过，由各组路由自己的依赖判
 app = FastAPI(
     title="AgentLab",
     description="可视化 Agent 编排实验台",
     version="0.1.0",
     lifespan=lifespan,
+    dependencies=[Depends(key_gate)],
 )
 
 # 身份（app/auth/middleware.py）：按请求认出是谁、核对 CSRF。加在 CORS 之前，CORS 就在它外面一层：

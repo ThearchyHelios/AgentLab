@@ -35,6 +35,7 @@ import json
 import logging
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,13 +45,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import SessionLocal, utcnow
 from app.db.models import AppHook, HookReceipt, Task
+from app.process import receipts
 
 logger = logging.getLogger(__name__)
 
 #: 签名时间窗（秒）
 WINDOW_S = 300
 #: 回执停在 processing 超过这么久（秒），同一个幂等键可以重新认领：处理一次请求用不了这么久，多半是中途服务停了
-STALE_S = 600
+STALE_S = receipts.STALE_S
+#: 钩子的收件记录：按 (钩子, 幂等键) 去重的状态机（process/receipts.py，访问密钥的发起也用它）
+_BOOK = receipts.Book(HookReceipt, "hook_id", stale_s=STALE_S)
 #: 「这个签名认了哪个幂等键」的记录也放在回执表里（idem_key 是这个前缀加时间戳和签名，detail 是认的幂等键）：同一个
 #: 唯一约束管两件事，不另起表；过了两个时间窗就删
 SIGNATURE_PREFIX = "sig:"
@@ -116,7 +120,11 @@ async def receive(hook_id: str, headers: Any, body: bytes) -> dict[str, Any]:
         declared = await published_declaration(session, hook.app_id, hook.name)
     if not secret:
         raise HookRejected("钩子的密钥无法解密（加密密钥可能已更换），请在应用里重新生成钩子", status_code=409)
-    verify(secret, headers, body)
+    try:
+        verify(secret, headers, body)
+    except HookRejected:
+        _signature_failed(hook.id)
+        raise
     # 验过签名才说「发布版里没有它」：没验签的请求不该探出应用里声明了哪些钩子
     if declared is None:
         raise HookRejected("应用当前的发布版本里没有声明这个钩子，不接收请求", status_code=404)
@@ -203,40 +211,17 @@ async def _bind_signature(hook_id: str, ts: str, signature: str, idem_key: str) 
 
 async def _claim(hook_id: str, idem_key: str) -> tuple[dict[str, Any] | None, bool]:
     """按 (钩子, 幂等键) 认领这一次，交回 (上次的结果, 是不是重新认领了一条停在处理中的)。处理成功过的交回上次的结果
-    （duplicate: true）；被拒过的重新认领；正在处理的 409，停在处理中超过 STALE_S 的重新认领（条件 UPDATE，并发的两次
-    只有一次认领得到）。"""
-    from datetime import timedelta
-
-    async with SessionLocal() as session:
-        session.add(HookReceipt(hook_id=hook_id, idem_key=idem_key, status="processing"))
-        try:
-            await session.commit()
-            return None, False
-        except IntegrityError:
-            await session.rollback()
-        row = await session.scalar(select(HookReceipt).where(HookReceipt.hook_id == hook_id,
-                                                             HookReceipt.idem_key == idem_key))
-        if row.status == "accepted":
-            return {"status": "accepted", "duplicate": True, "run_id": row.run_id, "task_id": row.task_id}, False
-        stale = row.status == "processing" and row.received_at < utcnow() - timedelta(seconds=STALE_S)
-        if row.status == "rejected" or stale:
-            again = await session.execute(update(HookReceipt).where(
-                HookReceipt.id == row.id, HookReceipt.status == row.status,
-                HookReceipt.received_at == row.received_at)
-                .values(status="processing", detail=None, received_at=utcnow()))
-            await session.commit()
-            if again.rowcount == 1:
-                return None, stale
-    raise HookRejected("同一个幂等键的请求正在处理，请稍后再查", status_code=409)
+    （duplicate: true）；被拒过的重新认领；正在处理的 409，停在处理中超过 STALE_S 的重新认领。状态机和访问密钥的发起
+    共用（process/receipts.py）。"""
+    try:
+        return await _BOOK.claim(hook_id, idem_key)
+    except receipts.ReceiptBusy:
+        raise HookRejected("同一个幂等键的请求正在处理，请稍后再查", status_code=409) from None
 
 
 async def _finish(hook_id: str, idem_key: str, *, status: str, detail: str | None = None,
                   run_id: str | None = None, task_id: str | None = None) -> None:
-    async with SessionLocal() as session:
-        await session.execute(update(HookReceipt).where(HookReceipt.hook_id == hook_id,
-                                                        HookReceipt.idem_key == idem_key)
-                              .values(status=status, detail=detail, run_id=run_id, task_id=task_id))
-        await session.commit()
+    await _BOOK.finish(hook_id, idem_key, status=status, detail=detail, run_id=run_id, task_id=task_id)
 
 
 def _caller(hook: AppHook) -> Any:
@@ -244,7 +229,7 @@ def _caller(hook: AppHook) -> Any:
     from app.api.deps import Principal, auth_mode
 
     return Principal(username=None, role="admin", display_name=f"外部系统（{hook.name}）", verified=True,
-                     mode=auth_mode())
+                     mode=auth_mode(), via="hook")
 
 
 async def _start(hook: AppHook, request: HookRequest, entry: Any, *, reclaimed: bool = False) -> dict[str, Any]:
@@ -379,3 +364,53 @@ async def delete_hook(session: AsyncSession, app_id: str, name: str) -> bool:
     for row in rows:
         await session.delete(row)
     return bool(rows)
+
+
+# --------------------------------------------------------------------------
+# 收件记录（给 GET /api/apps/{id}/hooks/{name}/receipts 用，docs/design/next-round/04-对外集成与触达.md A6）
+#
+# 外部系统说「我发过了」，管理应用的人要查得到收到没有、为什么被拒。验过签名的请求在 hook_receipts 里本来就有一行；
+# 验签失败的不落库（匿名的人能拿它把库刷满），只在进程里按钩子记最近一小时的次数，界面上写「近 1 小时验签失败 N 次」。
+# 单进程部署（同登录失败退避），重启清零
+# --------------------------------------------------------------------------
+
+#: 验签失败按多长时间算（秒）
+SIGNATURE_WINDOW_S = 3600
+#: 一个钩子最多记多少次失败的时间：被刷的时候只要知道「很多」，不用无限长
+_FAILURES_MAX = 10_000
+#: 钩子 id → 验签失败的时刻（time.monotonic）
+_SIGNATURE_FAILURES: dict[str, deque[float]] = {}
+#: 一页收件记录最多几条
+RECEIPTS_MAX = 100
+
+
+def _signature_failed(hook_id: str) -> None:
+    times = _SIGNATURE_FAILURES.setdefault(hook_id, deque(maxlen=_FAILURES_MAX))
+    times.append(time.monotonic())
+
+
+def signature_failures(hook_ids: list[str]) -> int:
+    """这几个钩子（同名多出来的行一起算）最近一小时验签失败了几次。顺带丢掉窗口外的。"""
+    floor = time.monotonic() - SIGNATURE_WINDOW_S
+    total = 0
+    for hook_id in hook_ids:
+        times = _SIGNATURE_FAILURES.get(hook_id)
+        while times and times[0] < floor:
+            times.popleft()
+        total += len(times or ())
+    return total
+
+
+async def recent_receipts(session: AsyncSession, app_id: str, name: str,
+                          limit: int = RECEIPTS_MAX) -> dict[str, Any]:
+    """这个名字的钩子最近收到的请求（新的在前）：幂等键、状态（处理中 / 已接受 / 被拒）、时间、发起的实例或解决的待办、
+    被拒的原因；另给近 1 小时验签失败的次数。防换键重放的签名记录（status=signature）不是一次请求，不列。"""
+    ids = list((await session.execute(select(AppHook.id).where(AppHook.app_id == app_id, AppHook.name == name)))
+               .scalars())
+    rows = list((await session.execute(
+        select(HookReceipt).where(HookReceipt.hook_id.in_(ids or [""]), HookReceipt.status != "signature")
+        .order_by(HookReceipt.received_at.desc()).limit(max(1, min(limit, RECEIPTS_MAX))))).scalars())
+    return {"items": [{"idem_key": r.idem_key, "status": r.status,
+                       "received_at": r.received_at.isoformat() if r.received_at else None,
+                       "run_id": r.run_id, "task_id": r.task_id, "detail": r.detail} for r in rows],
+            "signature_failures": signature_failures(ids), "window_s": SIGNATURE_WINDOW_S}
