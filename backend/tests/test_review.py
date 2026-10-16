@@ -95,6 +95,22 @@ def test_node_and_run_failures_are_broken():
     assert all(s.severity == rv.BROKEN for s in signals)
 
 
+def test_a_rejected_node_is_a_human_decision_not_a_fault():
+    """被驳回的那一步节点层照旧发 node.failed，数据里带 reason=rejected（总方案 X9、05 (a)）：复核不能把它说成「执行失败」，
+    更不能当成「重跑一次大概率能好」——重跑只会把同一件事再问一遍人。没有 reason 的老运行照旧按失败算。"""
+    signals = rv.scan([
+        ev(EventType.NODE_STARTED, node_id="gate", label="把关"),
+        ev(EventType.NODE_FAILED, node_id="gate", error="人工驳回：不对", reason="rejected", kind="approve",
+           decision="reject"),
+    ], OK_OUTPUT)
+    [signal] = signals
+    assert signal.kind == "node_rejected" and signal.severity == rv.DEGRADED
+    assert signal.detail == "节点「把关」被驳回：人工驳回：不对" and "失败" not in signal.detail
+    assert not rv.should_retry(signals)
+    legacy = rv.scan([ev(EventType.NODE_FAILED, node_id="gate", error="人工驳回：不对")], OK_OUTPUT)
+    assert [s.kind for s in legacy] == ["node_failed"] and rv.should_retry(legacy)
+
+
 def test_warn_classified_by_code_not_by_message():
     """分类挂在 code 上。消息是给人读的，随时会改。"""
     assert rv.scan([warn("agent 用满了 8 步还没给出结论。", "step_limit")], OK_OUTPUT)[0] \
