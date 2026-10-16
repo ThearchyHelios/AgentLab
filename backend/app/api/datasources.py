@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import health
 from app.api.coded import PROFILE_SETTINGS_INVALID, CodedHTTPException
-from app.api.deps import signer_of
+from app.api.deps import signer_of, signer_verified
 from app.core.errors import AUTH, NETWORK, TIMEOUT, classify, explain, raw
 from app.core.config import settings
 from app.core.crypto import encrypt, mask
@@ -1104,7 +1104,8 @@ async def purge_raw(
     if imp.raw_state == "purged":
         raise CodedHTTPException(409, "这次导入的原件已经清除", "raw_already_purged")
     try:
-        purged = await table_versions.purge_import_raw(session, imp, reason=reason, signed_by=signed_by)
+        purged = await table_versions.purge_import_raw(session, imp, reason=reason, signed_by=signed_by,
+                                                       signer_verified=signer_verified())
     except table_versions.StoreUnavailable as e:
         raise CodedHTTPException(503, str(e), "store_unavailable") from e
     deleted, others = purged.deleted, purged.others

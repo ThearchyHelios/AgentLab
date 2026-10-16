@@ -105,6 +105,15 @@ def signer_of(given: Any, header: str | None, limit: int = 100) -> str | None:
     return decode_actor(header)
 
 
+def signer_verified() -> bool:
+    """signer_of 记下的署名是不是认证过的身份：开了登录、这次请求的身份认证过时为真；关登录时署名是自报的，为假。
+
+    导入清单、累积快照清单、作废记录、清除原件记录的「是否认证」记这个（docs/design/next-round/05-已知遗留.md (c)），
+    和审计表、待办派单、run.origin 的 verified 同一个口径。证据要在生成那一刻定下：调用方和 signed_by 一起往下传。"""
+    principal = _principal.get()
+    return principal is not None and principal.mode != "off" and bool(principal.verified)
+
+
 def current_principal() -> Principal:
     """这次请求的完整身份。关登录时：等同 admin、未认证，username 是中间件按 X-Actor 解出的自报署名；中间件没写
     （不在请求里，比如测试直接调函数、启动时的整理、调度循环）时同样等同 admin、未认证，username 为空。"""
