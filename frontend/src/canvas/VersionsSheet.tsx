@@ -12,6 +12,7 @@ import { formatDateTime, formatTime } from '../lib/format'
 import { CATALOG_DRIFT_TEXT, VERSION_USAGE_TEXT, WORKFLOW_STATUS_LABEL, publishedLevelOf } from '../lib/terms'
 import { useAtLeast } from '../store/auth'
 import { RetiredNote, VersionUsageLine, retireBlocked, retireVersion, useVersionUsage } from './versionUsage'
+import { RecallBatches } from './RecallPanel'
 import { hintOf } from './shortcuts'
 import { newAppPath } from '../pages/apps/shared'
 import type { Edge } from '@xyflow/react'
@@ -240,7 +241,8 @@ function VersionPreview({ version, target, diff, lock, onRestore }: {
 const DIFF_COLOR = { add: 'var(--ok)', del: 'var(--err)', mod: 'var(--warn)' } as const
 
 /**
- * 发布过的版本：被哪些应用固定、生效记录和正式运行各有多少（L4），做成应用，以及退役（A1）。草稿版本都没有，不画。
+ * 发布过的版本：被哪些应用固定、生效记录和正式运行各有多少（L4），问数回答、导出、召回（next-round 02 做法 8），口径升到
+ * 这一版之后的召回批次，做成应用，以及退役（A1）。草稿版本都没有，不画。
  * 退役之后这一版不能再发起正式运行，也不能再做成应用（应用只能固定已发布且未退役的版本）；固定它的应用标「需升级」，
  * 进行中的实例照常走完。退役的人、时间和说明写在列表那一行上，这里不再重复
  */
@@ -261,6 +263,8 @@ function VersionLifecycle({ workflowId, version, current, onRetired }: {
       <div className="mt-1">
         {usage ? <VersionUsageLine usage={usage} /> : <span className="text-faint">…</span>}
       </div>
+      {/* 口径升到这一版之后的召回批次：每组的结论、「另有 M 组未重算」、接着算（next-round 02 做法 7） */}
+      <RecallBatches workflowId={workflowId} version={version.version} />
       {!version.retired_at && (
         <>
           {builder && (

@@ -2075,6 +2075,151 @@ await section('应用平台：发布成功做成应用；已发布版本的使�
   }
 })
 
+// 口径召回（next-round 02 做法 7、8）：发布弹窗按这一版预告召回的规模（旧版本被谁用过、预计自动重算几组、超出上限几组、
+// 不能重算的原因），版本用量加问数回答、导出、召回；版本历史里看口径升到这一版之后的召回批次（每组的结论），「另有 M 组未
+// 重算」能手动接着算。预告、批次、接着算全在浏览器层伪造，写请求拦下核对
+const PREVIEW = { workflow_id: 'pf-hard', version: 3, limit: 50, caliber: true, problem: null, groups: 60, recomputable: 58,
+  not_recomputable: 2, already: 0, will_recompute: 50, over_limit: 8, truncated: false,
+  versions: [{ version: 2, answers: 3, exports: 1, schedules: 1, apps: 2, formal: 4, pinned: 0, truncated: false }],
+  reasons: [{ reason: '新版 v3 的入口要的参数这一组里没有或不合规：「区域」必填', groups: 2 }] }
+const BATCHES = { workflow_id: 'pf-lib', workflow_name: '__publish_check_lib__', version: 4, limit: 50, batch_size: 50,
+  problem: null, caliber: true, truncated: false, remaining: 1, can_continue: true,
+  counts: { changed: 1, unchanged: 1, failed: 1, running: 0, pending: 1, not_recomputable: 1 },
+  groups: [
+    { id: '3-a', from_version: 3, to_version: 4, binding: [{ field: 'week', value: '2026-W38' }],
+      uses: [{ kind: 'answer', kind_text: '问数回答', count: 2 }], latest: '2026-10-01T02:00:00Z', state: 'changed',
+      run_id: 'rc-a', batch: 'auto', tasks: 2, changed_metrics: ['销售额'] },
+    { id: '3-b', from_version: 3, to_version: 4, binding: [{ field: 'week', value: '2026-W37' }],
+      uses: [{ kind: 'schedule', kind_text: '定时任务', count: 1 }], latest: '2026-09-24T02:00:00Z', state: 'unchanged',
+      run_id: 'rc-b', batch: 'auto', tasks: 0, changed_metrics: [] },
+    { id: '3-c', from_version: 3, to_version: 4, binding: [], uses: [{ kind: 'formal', kind_text: '正式运行', count: 1 }],
+      latest: '2026-09-20T02:00:00Z', state: 'failed', reason: '重算失败：数据源「shop」已停用', run_id: 'rc-c', batch: 'auto' },
+    { id: '2-d', from_version: 2, to_version: 4, binding: [{ field: 'week', value: '2026-W30' }],
+      uses: [{ kind: 'answer', kind_text: '问数回答', count: 1 }], latest: '2026-08-01T02:00:00Z', state: 'not_recomputable',
+      reason: '新版 v4 的入口要的参数这一组里没有或不合规：「区域」必填' },
+    { id: '3-e', from_version: 3, to_version: 4, binding: [{ field: 'week', value: '2026-W20' }],
+      uses: [{ kind: 'answer', kind_text: '问数回答', count: 1 }], latest: '2026-07-01T02:00:00Z', state: 'pending' },
+  ] }
+
+await section('口径召回：发布弹窗预告召回规模、版本用量加问数回答和召回', async () => {
+  const usage = { apps: [], effects: 0, formal_runs: 4, answers: 5, exports: 2, schedules: 1,
+    recall: { groups: 1, changed: 1, recalled_from: 0 } }
+  for (const variant of ['over', 'zero', 'none', 'not-caliber']) {
+    const { page, errors } = await open({ id: 'pf-hard' })
+    const asked = []
+    const body = variant === 'over' ? PREVIEW : variant === 'zero' ? { ...PREVIEW, limit: 0, will_recompute: 0, over_limit: 58 }
+      : variant === 'none' ? { ...PREVIEW, groups: 0, recomputable: 0, not_recomputable: 0, will_recompute: 0, over_limit: 0,
+        versions: [], reasons: [] }
+      : { ...PREVIEW, caliber: false, groups: 0, recomputable: 0, not_recomputable: 0, will_recompute: 0, over_limit: 0,
+        versions: [], reasons: [] }
+    await page.route(/\/api\/workflows\/pf-hard\/recall-preview(\?.*)?$/, (route) => {
+      asked.push(new URL(route.request().url()).search)
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
+    })
+    await page.route(/\/api\/ledger\/workflow-versions\/.+$/, (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(usage) }))
+    await openDialog(page)
+    const row = dialog(page).locator('[data-publish-recall]')
+    if (variant === 'not-caliber') {
+      await waitFor(page, async () => asked.length > 0)
+      await page.waitForTimeout(300)
+      check('旧版本里没有口径、也没有用过的答案：不画召回那一行', await row.count() === 0)
+      continue
+    }
+    check(`预告（${variant}）：按要发布的这一版问（version=3）`, await waitFor(page, async () => asked.length > 0)
+      && asked[0].includes('version=3'), asked.join(','))
+    await waitFor(page, async () => (await row.getAttribute('data-publish-recall').catch(() => '')) !== 'loading')
+    const text = await row.innerText().catch(() => '')
+    if (variant === 'over') {
+      check('写旧版本被谁用过', text.includes('旧版本被 3 次问数回答、1 次导出、1 个定时任务、2 个应用、4 次正式运行用过'), text)
+      check('写去重后几组、发布后自动重算几组', text.includes('按参数去重共 60 组，发布后自动重算 50 组')
+        && await row.locator('[data-publish-recall-will="50"]').count() === 1, text)
+      check('超出上限的写明可以手动接着算', (await row.locator('[data-publish-recall-over="8"]').innerText())
+        .includes('另有 8 组超出每次 50 组的上限'))
+      check('不能重算的写几组和原因', (await row.locator('[data-publish-recall-unrecomputable="2"]').innerText())
+        .includes('「区域」必填'))
+      check('写明重算只运行口径的数据部分、不调用模型', text.includes('不调用模型'), text)
+      const line = await dialog(page).locator('[data-publish-usage] [data-version-usage-ledger]').innerText().catch(() => '')
+      check('使用情况加上问数回答、导出、召回', line.includes('问数回答 5 次') && line.includes('导出 2 次')
+        && line.includes('召回 1 组（数变了 1 组）'), line)
+      await shoot(page, 'publish-recall-preview', dialog(page))
+    } else if (variant === 'zero') {
+      check('上限是 0：写明发布后不自动重算、只列出受影响的答案', await row.locator('[data-publish-recall-zero]').count() === 1
+        && await row.locator('[data-publish-recall-over]').count() === 0, text)
+    } else {
+      check('是口径但旧版本没被用过：写不需要召回', await row.getAttribute('data-publish-recall') === 'none'
+        && text.includes('不需要召回'), text)
+    }
+    check(`没有运行时报错（${variant}）`, errors.length === 0, errors.join(' | '))
+  }
+})
+
+await section('口径召回：版本历史看召回批次、另有 M 组未重算、接着算', async () => {
+  const { page, errors } = await open({ id: 'pf-lib' })
+  const versions = [4, 3, 2].map((n) => ({ id: `v${n}`, version: n, note: '', created_at: '2026-09-26T02:00:00Z',
+    published: n === 4, level: 'published', retired_at: null, retired_by: null }))
+  await page.route(/\/api\/workflows\/pf-lib\/versions(\/\d+)?$/, (route) => {
+    const v = Number(new URL(route.request().url()).pathname.split('/')[5])
+    const body = v ? { ...versions.find((x) => x.version === v), workflow_id: 'pf-lib', graph: FAKES['pf-lib'].graph, graph_hash: 'x' } : versions
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
+  })
+  await page.route(/\/api\/ledger\/workflow-versions\/.+$/, (route) => route.fulfill({ status: 200, contentType: 'application/json',
+    body: JSON.stringify({ apps: [], effects: 0, formal_runs: 3, answers: 4, exports: 0, schedules: 1,
+      recall: { groups: 4, changed: 1, recalled_from: 0 } }) }))
+  const continued = []
+  await page.route(/\/api\/ledger\/recall\/pf-lib\/(\d+)(\/continue)?$/, (route) => {
+    const req = route.request()
+    const v = Number(new URL(req.url()).pathname.split('/')[5])
+    if (v !== 4) return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...BATCHES, version: v,
+      groups: [], remaining: 0, can_continue: false, counts: { changed: 0, unchanged: 0, failed: 0, running: 0, pending: 0,
+        not_recomputable: 0 } }) })
+    if (req.method() === 'POST') {
+      continued.push(new URL(req.url()).pathname)
+      const groups = BATCHES.groups.map((g) => (g.state === 'pending' ? { ...g, state: 'running', run_id: 'rc-e', batch: 'manual' } : g))
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...BATCHES, groups, remaining: 0,
+        can_continue: false, launched: ['rc-e'], counts: { ...BATCHES.counts, pending: 0, running: 1 } }) })
+    }
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(BATCHES) })
+  })
+  await page.evaluate(() => document.activeElement?.blur?.())
+  await page.keyboard.press('Alt+KeyH')
+  const sheet = page.locator('[role="dialog"][aria-label="版本历史"]')
+  await sheet.waitFor()
+  await waitFor(page, async () => await sheet.locator('ol button', { hasText: 'v4' }).count() > 0)
+  await sheet.locator('ol button', { hasText: 'v4' }).first().click()
+  const box = sheet.locator('[data-version-recall="5"]')
+  check('展开 v4：列出口径升到这一版之后的召回批次', await waitFor(page, async () => await box.count() === 1))
+  const summary = await box.locator('[data-version-recall-summary]').innerText().catch(() => '')
+  check('……一句总的：数变了、没变、重算失败、无法重算各几组', summary === '数变了 1 组，没变 1 组，重算失败 1 组，无法重算 1 组', summary)
+  const state = async (id) => (await box.locator(`[data-version-recall-group="${id}"] .chip`).first().innerText().catch(() => ''))
+  check('每组写结论', await state('3-a') === '数变了' && await state('3-b') === '没变' && await state('3-c') === '重算失败'
+    && await state('2-d') === '无法重算' && await state('3-e') === '未重算')
+  check('数变了的写变了的指标、开了几条待办，能看召回运行', (await box.locator('[data-version-recall-group="3-a"]').innerText())
+    .includes('变了的指标：销售额') && (await box.locator('[data-version-recall-group="3-a"]').innerText()).includes('开了 2 条待办')
+    && (await box.locator('[data-version-recall-run="rc-a"]').getAttribute('href')) === '/runs/rc-a')
+  check('无法重算照实写原因', (await box.locator('[data-version-recall-group="2-d"] [data-version-recall-reason]').innerText())
+    === '无法重算：新版 v4 的入口要的参数这一组里没有或不合规：「区域」必填')
+  check('重算失败写原因', (await box.locator('[data-version-recall-group="3-c"] [data-version-recall-reason]').innerText())
+    .includes('数据源「shop」已停用'))
+  const usageLine = await sheet.locator('[data-version-lifecycle="4"] [data-version-usage-ledger]').innerText().catch(() => '')
+  check('版本用量加上问数回答、召回', usageLine.includes('问数回答 4 次') && usageLine.includes('召回 4 组（数变了 1 组）'), usageLine)
+  check('另有 1 组未重算', (await box.locator('[data-version-recall-remaining="1"]').innerText()).includes('另有 1 组未重算'))
+  const go = box.locator('[data-version-recall-continue]')
+  check('给「接着算」，写每次几组', (await go.innerText()).includes('接着算（每次 50 组）'))
+  await shoot(page, 'versions-recall', sheet)
+  await go.click()
+  check('接着算：POST /api/ledger/recall/pf-lib/4/continue', await waitFor(page, async () => continued.length === 1)
+    && continued[0] === '/api/ledger/recall/pf-lib/4/continue', continued.join(','))
+  check('……之后照服务端交回的批次画：没有未重算的、刚发起的那组正在重算', await waitFor(page, async () =>
+    await box.locator('[data-version-recall-remaining]').count() === 0 && await state('3-e') === '正在重算'))
+  check('……提示已发起几组', await page.getByText('已发起 1 组召回').first().waitFor({ timeout: 3000 }).then(() => true, () => false))
+  await sheet.locator('ol button', { hasText: 'v3' }).first().click()
+  await sheet.locator('[data-version-lifecycle="3"]').waitFor()
+  await page.waitForTimeout(300)
+  check('没有召回过的版本不画召回那一块', await sheet.locator('[data-version-lifecycle="3"] [data-version-recall]').count() === 0)
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
 // 开了登录：发布记的是登录的人（服务端写 published_by，不看署名），不给署名框、不说「未署名」；受管级只给管理员，
 // 搭建者那一档当场置灰、写明原因，不等点了发布才被拒（V1-21、V1-22）。受管工作流的新版本不论哪一档都只有管理员能发：
 // 降成「已发布」会让此后的正式运行不再过治理门禁，和以受管级发布同一级（Q8，服务端同样拦）——搭建者两档都锁住

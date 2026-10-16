@@ -520,10 +520,13 @@ export interface InstanceRow {
 
 /**
  * 待办的种类。review 是个人应用提交审核（docs/design/normal-user-apps.md N7）：不挂在运行的中断上，同意不在待办上点——
- * 处理人取一份共享副本、走发布单（发布单做完这条自动记为已发布），不发布就退回（decision=reject）；payload 见 ReviewTaskPayload
+ * 处理人取一份共享副本、走发布单（发布单做完这条自动记为已发布），不发布就退回（decision=reject）；payload 见 ReviewTaskPayload。
+ * recall 是口径召回（docs/design/next-round/02-口径账本.md 做法 7）：口径升版后答案的数变了（「按新版重新出具」decision=reissue、
+ * 「知道了」decision=ack），或者答案依据的目录、表结构变了（只有「知道了」）；payload 见 typesRecall.ts 的 RecallTaskPayload
  */
 export type TaskKind =
   | 'approve' | 'input' | 'edit' | 'tool' | 'code' | 'dual_check' | 'action_confirm' | 'reconcile' | 'signal' | 'review'
+  | 'recall'
 export type TaskStatus = 'pending' | 'resolving' | 'resolved' | 'cancelled' | 'expired'
 export type TaskPolicy = { kind: 'any' } | { kind: 'all' } | { kind: 'quorum'; m: number }
 
@@ -627,7 +630,8 @@ export interface ReviewTaskPayload {
 }
 
 export interface TaskRespond {
-  decision: 'approve' | 'reject' | 'submit' | 'confirmed' | 'not_applied_resend' | 'not_applied_abandon'
+  /** reissue / ack 只给口径召回（recall）：按新版重新出具、知道了 */
+  decision: 'approve' | 'reject' | 'submit' | 'confirmed' | 'not_applied_resend' | 'not_applied_abandon' | 'reissue' | 'ack'
   values?: Record<string, any>
   note?: string
   /** 动作确认：确认卡上显示的哈希，原样带回 */

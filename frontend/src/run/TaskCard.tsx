@@ -10,6 +10,8 @@
  * - 等外部系统（signal）：说明由入站钩子完成，不在这里处理；
  * - 审核个人应用（review，docs/design/normal-user-apps.md N7）：同意不在这里点，处理人取一份共享副本、在副本上试运行和
  *   走发布单（发布单做完这条待办自动记为已发布）；不发布就退回。
+ * - 口径召回（recall，docs/design/next-round/02-口径账本.md 做法 7）：旧口径、新口径、两版之差和原答案当时的值都点得开，
+ *   「按新版重新出具」「知道了」（run/RecallTask.tsx）。
  *
  * 不碰画布的 store：恢复之后谁去重新接事件流、刷新哪张列表，由调用方在 onResolved 里决定。会签时一个人的回复记下了、
  * 还没凑齐（resolved 为假），照样回调——调用方据此刷新卡片。
@@ -21,8 +23,8 @@ import { useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import {
-  Ban, Check, CheckCheck, Clock, Code, Copy, ExternalLink, Hand, Keyboard, PenLine, Send, SearchCheck, TriangleAlert,
-  UserCheck, Webhook, Wrench,
+  Ban, Check, CheckCheck, Clock, Code, Copy, ExternalLink, Hand, History, Keyboard, PenLine, Send, SearchCheck,
+  TriangleAlert, UserCheck, Webhook, Wrench,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../api/client'
@@ -38,6 +40,7 @@ import {
   TASK_TEXT, TOOL_TRUST_TEXT, TRIAL_TEXT, runName,
 } from '../lib/terms'
 import { REVIEW_TASK_TEXT } from '../lib/termsApp'
+import { RECALL_TEXT } from '../lib/termsRecall'
 import { blueprintPath } from '../pages/blueprints/shared'
 import type { Approval, ApprovalReport } from '../types'
 import type {
@@ -48,6 +51,7 @@ import { ApprovalReports, ApprovalRunClass } from './ApprovalReport'
 import { ChallengeSummary } from './ChallengeSummary'
 import { DualCheckApproval } from './DualCheckApproval'
 import { useInquiryBusy } from './Inquiry'
+import { RecallTask } from './RecallTask'
 
 export interface TaskCardProps {
   task: Task
@@ -73,7 +77,7 @@ export interface TaskCardProps {
 
 const KIND_ICON: Record<TaskKind, typeof Hand> = {
   approve: Hand, input: Keyboard, edit: PenLine, tool: Wrench, code: Code, dual_check: Hand,
-  action_confirm: Send, reconcile: SearchCheck, signal: Webhook, review: UserCheck,
+  action_confirm: Send, reconcile: SearchCheck, signal: Webhook, review: UserCheck, recall: History,
 }
 
 /** 一天没人处理就用琥珀色写等了多久，同审批卡 */
@@ -215,6 +219,11 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
       {kind === 'review' && (
         <Review task={task} canAct={canAct} busy={busy} note={note} setNote={setNote}
                 onReject={() => void respond({ decision: 'reject' }, REVIEW_TASK_TEXT.rejected)} />
+      )}
+      {kind === 'recall' && (
+        <RecallTask task={task} canAct={canAct} busy={busy}
+                    onRespond={(decision) => void respond({ decision },
+                      decision === 'reissue' ? RECALL_TEXT.task.doneReissue : RECALL_TEXT.task.doneAck)} />
       )}
 
       {showForm && (

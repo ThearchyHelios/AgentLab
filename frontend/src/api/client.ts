@@ -27,6 +27,7 @@ import { whatif } from './whatif'
 import { reportExport } from './reportExport'
 // 应用平台：各自的接口文件，这里只挂上去
 import { apps, ledger } from './apps'
+import { recall } from './recall'
 import { actions, tasks } from './tasks'
 import { auth, identity } from './auth'
 import { accessKeys } from './accessKeys'
@@ -957,6 +958,8 @@ export const api = {
   // ---- 应用平台（typesApp.ts 是接口约定） ----
   apps,
   ledger,
+  // 口径召回（下一轮第 4 波）
+  recall,
   tasks,
   actions,
   auth,

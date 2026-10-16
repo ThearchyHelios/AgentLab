@@ -4,11 +4,13 @@ import { api } from '../api/client'
 import { confirmDialog, promptDialog, toast } from '../components/ui'
 import { formatDateTime } from '../lib/format'
 import { VERSION_USAGE_TEXT as T } from '../lib/terms'
+import { RECALL_TEXT } from '../lib/termsRecall'
 
 /*
  * 工作流版本的使用情况与退役（A1、L4）：发布弹窗、版本历史、退役确认三处共用。
  *
- * 使用情况取账本的只读接口（/api/ledger/workflow-versions/{wf}/{v}）：被哪些应用固定、生效记录数、正式运行数。
+ * 使用情况取账本的只读接口（/api/ledger/workflow-versions/{wf}/{v}）：被哪些应用固定、生效记录数、正式运行数；口径账本另加
+ * 问数回答、导出、定时任务、召回（next-round 02 做法 8，老服务端不给就不写）。
  * 退役只给管理员（Q8）；关登录时所有人等同管理员。当前发布版不能退役，服务端回 409，这里先不给按钮
  */
 
@@ -27,8 +29,19 @@ export function useVersionUsage(workflowId: string, version: number | null, epoc
   return usage
 }
 
-/** 「被 2 个应用固定：报销审批、周报看板 · 生效记录 3 条 · 正式运行 14 次」，应用名可点开编辑 */
+/**
+ * 「被 2 个应用固定：报销审批、周报看板 · 生效记录 3 条 · 正式运行 14 次 · 问数回答 5 次 · 导出 2 次 · 召回 3 组（数变了
+ * 1 组）」，应用名可点开编辑。账本另加的几项老服务端不给就不写；召回两头都是 0 的不写
+ */
 export function VersionUsageLine({ usage }: { usage: VersionUsage }) {
+  const U = RECALL_TEXT.usage
+  const extra = [
+    usage.answers != null ? U.answers(usage.answers) : null,
+    usage.exports != null ? U.exports(usage.exports) : null,
+    usage.schedules ? U.schedules(usage.schedules) : null,
+    usage.recall?.groups ? U.recall(usage.recall.groups, usage.recall.changed) : null,
+    usage.recall?.recalled_from ? U.recalledFrom(usage.recall.recalled_from) : null,
+  ].filter((x): x is string => !!x)
   return (
     <span className="text-dim" data-version-usage="">
       {T.apps(usage.apps.length)}
@@ -47,6 +60,7 @@ export function VersionUsageLine({ usage }: { usage: VersionUsage }) {
         </>
       )}
       <span className="text-faint"> · {T.effects(usage.effects)} · {T.formalRuns(usage.formal_runs)}</span>
+      {extra.length > 0 && <span className="text-faint" data-version-usage-ledger=""> · {extra.join(' · ')}</span>}
     </span>
   )
 }

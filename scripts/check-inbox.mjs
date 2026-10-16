@@ -17,6 +17,10 @@
 //   - 审核个人应用（kind=review，payload 同服务端 blueprints/personal.review_payload）：写提交人（显示名）、目的、说明；没有
 //     「同意」——「取副本，去发布」调 POST /api/blueprints/{id}/copy 后进副本蓝图；取过的给「打开我的副本」（只认自己取的那
 //     一份，别人取的不算）；「退回」可以写原因，走待办接口 decision=reject。
+//   - 口径召回（kind=recall，payload 同服务端 ledger/recall.task_payload，next-round 02 做法 7）：旧口径、新口径、两版之差
+//     一行一个指标，每个数点得开出处（召回卡的指标链）；每个答案当时的值也点得开（正式运行的口径卡、问数回答的查询快照）；
+//     问数回答链回那段对话；「按新版重新出具」decision=reissue、「知道了」decision=ack；服务端说不能重新出具时按钮停用、
+//     写原因；使用者看到的遮罩值写「已遮罩」、点不开；目录有变那一种只有「知道了」，列出变了的目录项和新出现的问题。
 //
 // 接口全部在浏览器层答掉（/api/tasks/**），数据是这里虚构的；写请求记在探针里。
 //
@@ -133,6 +137,53 @@ const TASKS = {
         { id: 'bp_daily_other', owner: 'lisi', status: 'drafting', app_id: null },
         { id: 'bp_daily_mine', owner: '审批人甲', status: 'trialed', app_id: null }] },
     people: { zhangsan: '张三' },
+  },
+  // 口径召回：口径升到 v2，这一组答案的数变了（payload 同服务端 ledger/recall.task_payload）
+  recall: {
+    ...base, id: 'recall', kind: 'recall', title: '口径「周销售」升到 v2，答案的数变了', node_id: null, app_id: null,
+    app_name: null, app_version: null, workflow_name: '口径召回：周销售 v1 → v2', run_id: 'rc_1',
+    assignments: [assignment('rc1', '审批人甲', 'pending', null, { source: 'recall' })],
+    payload: { kind: 'recall', reason: 'caliber', recall_run: 'rc_1', workflow_id: 'wf_week', workflow_name: '周销售',
+      from_version: 1, to_version: 2,
+      binding: [{ field: 'end', value: '2026-09-08', masked: false }, { field: 'start', value: '2026-09-01', masked: false }],
+      metrics: [{ k: 0, name: '销售额', unit: '元', changed: true, card: 'card', metric: 'gmv',
+        old: { value: 170.5, text: '170.50元', masked: false, metric: 'old_0' },
+        new: { value: 208.5, text: '208.50元', masked: false, metric: 'new_0' },
+        diff: { value: 38, text: '38.00元', masked: false, metric: 'diff_0' } }],
+      answers: [
+        { kind: 'answer', kind_text: '问数回答', run_id: 'run_ans_1', version: 1, conversation_id: 'conv_1', turn_id: 'turn_1',
+          at: ago(86400_000), original: [{ k: 0, value: 170.5, text: '170.50元', masked: false, query: 'snap_1', column: '销售额' }] },
+        { kind: 'schedule', kind_text: '定时任务', run_id: 'run_fm_1', version: 1, schedule_id: 'sch_1', at: ago(3 * 86400_000),
+          original: [{ k: 0, value: 165, text: '165.00元', masked: false, node: 'card', metric: 'gmv' }] },
+      ],
+      actions: [{ decision: 'reissue', available: true }, { decision: 'ack', available: true }] },
+  },
+  // 使用者看的：遮罩值写「已遮罩」、点不开；没有被他能用的应用固定，服务端说不能重新出具
+  recallUser: {
+    ...base, id: 'recallUser', kind: 'recall', title: '口径「客户分层」升到 v3，答案的数变了', node_id: null, app_id: null,
+    app_name: null, app_version: null, workflow_name: '口径召回：客户分层 v2 → v3', run_id: 'rc_2',
+    assignments: [assignment('rc2', 'zhangsan', 'pending', null, { source: 'recall' })],
+    payload: { kind: 'recall', reason: 'caliber', recall_run: 'rc_2', workflow_id: 'wf_tier', workflow_name: '客户分层',
+      from_version: 2, to_version: 3, binding: [{ field: 'phone', value: null, masked: true }],
+      metrics: [{ k: 0, name: '消费额', unit: '元', changed: true, card: 'card', metric: 'spend',
+        old: { value: null, text: '已遮罩', masked: true, metric: 'old_0' },
+        new: { value: 90, text: '90元', masked: false, metric: 'new_0' },
+        diff: { value: null, text: '已遮罩', masked: true, metric: 'diff_0' } }],
+      answers: [{ kind: 'answer', kind_text: '问数回答', run_id: 'run_ans_2', version: 2, conversation_id: 'conv_2',
+        original: [{ k: 0, value: null, text: null, masked: false, missing: '原答案里没有单独的这个数' }] }],
+      actions: [{ decision: 'reissue', available: false,
+        reason: '这份口径没有被你能使用的应用固定，不能由你按口径出具，请搭建者出具' }, { decision: 'ack', available: true }] },
+  },
+  // 答案依据的目录有变、按新目录检查出了新的错误级问题：只有「知道了」
+  recallCatalog: {
+    ...base, id: 'recallCatalog', kind: 'recall', title: '答案依据的数据目录有变：按新目录检查出了新的问题', node_id: null,
+    app_id: null, app_name: null, app_version: null, workflow_name: '', run_id: 'run_ans_3',
+    assignments: [assignment('rc3', '审批人甲', 'pending', null, { source: 'recall' })],
+    payload: { kind: 'recall', reason: 'catalog', recall_run: 'run_ans_3',
+      basis: { kind: 'catalog', source: 'shop', table: 'orders', new_errors: 1,
+        items: [{ path: 'columns.amount.measure', label: '列 amount 的度量类型', change: 'changed' }],
+        checks: [{ code: 'stock_summed', message: '对存量列 amount 求和，分组里没有业务日期' }] },
+      actions: [{ decision: 'ack', available: true }] },
   },
   // 补充输入里选复核人（选人控件）：使用者按这条待办的候选池选
   pick: {
@@ -403,6 +454,89 @@ await section('审核个人应用：取副本去发布、打开我的副本、�
   check('退回不取副本', !s3.writes.some((w) => w.path.endsWith('/copy')))
 })
 
+await section('口径召回：三个值和差值、原答案当时的值、两个动作', async () => {
+  const state = { writes: [] }
+  const page = await open(state)
+  const asked = []
+  page.on('request', (r) => { if (r.url().includes('/api/')) asked.push(new URL(r.url()).pathname) })
+  await page.goto(`${WEB}/apps/inbox/recall`)
+  const box = page.locator('[data-task-recall="caliber"]')
+  await box.waitFor({ timeout: 15000 })
+  check('写明口径从 v1 升到 v2、同一份数据上两版各算一次', (await box.innerText()).includes('口径「周销售」从 v1 升到了 v2')
+    && (await box.innerText()).includes('同一份数据'), (await box.innerText()).slice(0, 80))
+  check('这一组的参数', (await box.locator('[data-recall-binding-field="start"]').innerText()) === 'start=2026-09-01')
+  const row = box.locator('[data-recall-metric="gmv"]')
+  check('旧口径、新口径、两版之差一行，标「变了」', await row.getAttribute('data-changed') === 'true'
+    && (await row.locator('[data-recall-cell="old"]').innerText()) === '170.50元'
+    && (await row.locator('[data-recall-cell="new"]').innerText()) === '208.50元'
+    && (await row.locator('[data-recall-cell="diff"]').innerText()) === '38.00元', (await row.innerText()).replace(/\s+/g, ' '))
+  const head = await box.locator('[data-recall-metrics] thead').innerText()
+  check('表头写旧口径 v1、新口径 v2、两版之差', head.includes('旧口径 v1') && head.includes('新口径 v2') && head.includes('两版之差'), head)
+  check('两个答案各一行，写原答案当时的值', await box.locator('[data-recall-answer]').count() === 2
+    && (await box.locator('[data-recall-answer="run_ans_1"] [data-recall-original="0"]').innerText()) === '170.50元'
+    && (await box.locator('[data-recall-answer="run_fm_1"] [data-recall-original="0"]').innerText()) === '165.00元')
+  check('问数回答链回那段对话', (await box.locator('[data-recall-answer="run_ans_1"] [data-recall-answer-link="chat"]')
+    .getAttribute('href')) === '/chat/conv_1')
+  check('正式运行（搭建者）链到记录页', (await box.locator('[data-recall-answer="run_fm_1"] [data-recall-answer-link="run"]')
+    .getAttribute('href')) === '/runs/run_fm_1')
+  const wait = (part) => page.waitForRequest((r) => r.url().includes(part), { timeout: 5000 }).then(() => true, () => false)
+  let hit = wait('/api/runs/rc_1/evidence/metrics/recall/diff_0')
+  await row.locator('[data-recall-cell="diff"]').click()
+  check('点差值：取召回卡上这个指标的出处链', await hit, asked.slice(-3).join(' , '))
+  await page.keyboard.press('Escape')
+  hit = wait('/api/runs/run_fm_1/evidence/metrics/card/gmv')
+  await box.locator('[data-recall-answer="run_fm_1"] [data-recall-original="0"]').click()
+  check('点定时任务那次当时的值：取那次正式运行口径卡的指标链', await hit, asked.slice(-3).join(' , '))
+  await page.keyboard.press('Escape')
+  hit = wait('snap_1')
+  await box.locator('[data-recall-answer="run_ans_1"] [data-recall-original="0"]').click()
+  check('点问数回答当时的值：打开那条查询快照', await hit, asked.slice(-3).join(' , '))
+  await page.keyboard.press('Escape')
+  await page.locator('[data-recall-reissue]').click()
+  await page.waitForTimeout(300)
+  const sent = state.writes.find((w) => w.path === '/api/tasks/recall/respond')
+  check('「按新版重新出具」走待办接口，decision 是 reissue', sent?.body?.decision === 'reissue', JSON.stringify(sent?.body))
+  check('……提示已按新版发起正式出具', await page.getByText('已按新版发起正式出具').first().waitFor({ timeout: 3000 }).then(() => true, () => false))
+  check('不给审批那一套按钮', await page.locator('[data-task-approve], [data-task-reject]').count() === 0)
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+
+  const s2 = { writes: [] }
+  const p2 = await open(s2)
+  await p2.goto(`${WEB}/apps/inbox/recall`)
+  await p2.locator('[data-recall-ack]').waitFor({ timeout: 15000 })
+  await p2.locator('[data-recall-ack]').click()
+  await p2.waitForTimeout(300)
+  check('「知道了」decision 是 ack', s2.writes.find((w) => w.path === '/api/tasks/recall/respond')?.body?.decision === 'ack',
+    JSON.stringify(s2.writes))
+})
+
+await section('口径召回：使用者看到的遮罩值、不能重新出具的原因；目录有变那一种', async () => {
+  const state = { writes: [], me: { mode: 'local', username: 'zhangsan', display_name: '张三', role: 'user', groups: [], verified: true } }
+  const page = await open(state)
+  await page.goto(`${WEB}/apps/inbox/recallUser`)
+  const box = page.locator('[data-task-recall="caliber"]')
+  await box.waitFor({ timeout: 15000 })
+  const row = box.locator('[data-recall-metric="spend"]')
+  check('遮罩值写「已遮罩」、点不开', (await row.locator('[data-recall-cell="old"]').innerText()) === '已遮罩'
+    && await row.locator('[data-recall-cell="old"]').isDisabled() && (await row.locator('[data-recall-cell="new"]').innerText()) === '90元')
+  check('参数里的遮罩值同样遮住', (await box.locator('[data-recall-binding-field="phone"]').innerText()) === 'phone=已遮罩')
+  check('原答案里没有单独这个数：写「—」不给链接', (await box.locator('[data-recall-answer="run_ans_2"]').innerText()).includes('—')
+    && await box.locator('[data-recall-answer="run_ans_2"] [data-recall-original]').count() === 0)
+  check('不能重新出具：按钮停用，写服务端给的原因', await page.locator('[data-recall-reissue]').isDisabled()
+    && (await page.locator('[data-recall-reissue-reason]').innerText()).includes('请搭建者出具'))
+  check('使用者不给记录页的链接', await box.locator('[data-recall-answer-link="run"]').count() === 0)
+
+  const p2 = await open({ writes: [] })
+  await p2.goto(`${WEB}/apps/inbox/recallCatalog`)
+  const basis = p2.locator('[data-recall-basis="catalog"]')
+  await basis.waitFor({ timeout: 15000 })
+  const text = await basis.innerText()
+  check('目录有变：写变了的目录项和新出现的问题', text.includes('列 amount 的度量类型（改了）') && text.includes('新出现的错误级问题 1 条')
+    && text.includes('分组里没有业务日期'), text.replace(/\s+/g, ' '))
+  check('……只有「知道了」', await p2.locator('[data-recall-ack]').count() === 1 && await p2.locator('[data-recall-reissue]').count() === 0)
+  check('没有未捕获的运行时错误', page.errors.length === 0 && p2.errors.length === 0, page.errors[0] ?? p2.errors[0] ?? '')
+})
+
 await section('待办箱：列表和徽标', async () => {
   const page = await open({ writes: [] })
   await page.goto(`${WEB}/apps?tab=inbox`)
@@ -410,6 +544,8 @@ await section('待办箱：列表和徽标', async () => {
   check('每条待办一行，链到详情', (await page.locator('[data-inbox-task]').count()) === Object.keys(TASKS).length)
   check('审核个人应用的一行写种类「审核个人应用」', (await page.locator('[data-inbox-task="review"]').innerText()).includes('审核个人应用')
     && (await page.locator('[data-inbox-task="review"]').getAttribute('data-task-kind')) === 'review')
+  check('口径召回的一行写种类「口径召回」', (await page.locator('[data-inbox-task="recall"]').innerText()).includes('口径召回')
+    && (await page.locator('[data-inbox-task="recall"]').getAttribute('data-task-kind')) === 'recall')
   check('「应用」导航上的徽标数应用里的待办', (await page.locator('[data-apps-badge]').innerText()).trim() === String(Object.keys(TASKS).length))
   check('页签上带数', /\d/.test(await page.getByRole('tab', { name: /待办/ }).innerText()))
 })
