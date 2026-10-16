@@ -304,3 +304,32 @@ async def test_ledger_settings_have_defaults_and_refuse_bad_values(client):
                                                                         "match_timeout_s": 3}}})
     assert ok.status_code == 200 and ok.json()["ledger"] == {"auto_issue": False, "issue_daily_limit": 5,
                                                              "match_timeout_s": 3}
+
+
+async def test_auto_issue_goes_by_the_askers_permissions_when_login_is_on(monkeypatch):
+    """开登录时自动出具按这次运行的发起人判（拍板 L5）：使用者没有应用授权就不自动出具，有了才出具；账号不在了的按使用者算。"""
+    from app.db.models import User
+    from app.db.models_apps import App, AppGrant, AppVersion
+
+    monkeypatch.setattr("app.auth.current_mode", lambda: "local")
+    await set_ledger(auto_issue=False)
+    wf = await S.publish()
+    row = await equivalent_run(monkeypatch)
+    await set_ledger(auto_issue=True)
+    async with SessionLocal() as session:
+        session.add(User(username=f"erin_{row.id[:6]}", role="user", password_hash="x"))
+        (await session.get(Run, row.id)).started_by = f"erin_{row.id[:6]}"
+        await session.commit()
+    assert await ledger_issue.auto_issue(row.id) is None and await issued(row.id) == []
+
+    async with SessionLocal() as session:
+        board = App(name="周销售看板", published_version=1, created_by="bob")
+        session.add(board)
+        await session.flush()
+        session.add(AppVersion(app_id=board.id, version=1, spec={}, spec_hash="x",
+                               pins=[{"alias": "week", "workflow_id": wf, "version": 1}]))
+        session.add(AppGrant(app_id=board.id, principal_kind="user", principal=f"erin_{row.id[:6]}", role="use"))
+        await session.commit()
+    launched = await ledger_issue.auto_issue(row.id)
+    [formal] = await settle(row.id)
+    assert launched == formal.id and formal.started_by == f"erin_{row.id[:6]}" and formal.origin["auto"] is True
