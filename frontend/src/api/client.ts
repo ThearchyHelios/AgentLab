@@ -25,6 +25,7 @@ import { inquiry } from './inquiry'
 import { schedules } from './schedules'
 // 评测（下一轮第 4 波）：接口在 api/evals.ts，这里只挂上去
 import { evals } from './evals'
+import { sourceChanges } from './sourceChanges'
 import { whatif } from './whatif'
 import { reportExport } from './reportExport'
 // 应用平台：各自的接口文件，这里只挂上去
@@ -955,6 +956,8 @@ export const api = {
   schedules,
   // 评测：题集、题目、发起与结果、对比与 A/B、目录快照、口径命中与重复度
   evals,
+  // 数据源的变化、取值观察、定时维护的步骤、后台任务条（下一轮第 4 波，typesSource.ts 是接口约定）
+  sourceChanges,
   compare,
   bundle,
   inquiry,

@@ -1,8 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, BookMarked, ChevronRight, Database, EyeOff, FileSpreadsheet, History, Info, KeyRound, Layers, Lock, Plug, Plus,
-  RefreshCw, ScanSearch, Search, Table2, Upload, X,
+  AlertOctagon, AlertTriangle, BookMarked, CalendarClock, ChevronRight, Database, EyeOff, FileSpreadsheet, History, Info, KeyRound, Layers,
+  Lock, Plug, Plus, RefreshCw, ScanSearch, Search, Table2, Upload, X,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api, uploadDecision } from '../api/client'
@@ -23,9 +23,11 @@ import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } fro
 import type { HealthRecord } from '../lib/health'
 import { workflowList, workflowsMentioning } from '../lib/mentions'
 import {
-  CATALOG_TEXT, INTROSPECT_SCOPE_TEXT, INTROSPECT_TEXT, MASK_BOUNDARY_TEXT, PROFILE_TEXT, RAW_STATE_LABEL, RECIPE_ORIGIN_LABEL,
-  RECIPE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT, VERSIONS_TEXT,
+  CATALOG_TEXT, INTROSPECT_SCOPE_TEXT, INTROSPECT_TEXT, MAINTENANCE_TEXT, MASK_BOUNDARY_TEXT, PROFILE_TEXT, RAW_STATE_LABEL,
+  RECIPE_ORIGIN_LABEL, RECIPE_TEXT, SOURCE_ANCHOR_TEXT, SOURCE_BADGE_TEXT, UPLOAD_CONVERSION_LABEL, UPLOAD_SHAPE_LABEL, UPLOAD_TEXT,
+  VERSIONS_TEXT,
 } from '../lib/terms'
+import { parseSourceAnchor, sourceAnchor, sourceCardId } from '../lib/sourceAnchor'
 import { useLoginOn } from '../store/auth'
 import { useRunClock } from '../run/useRunClock'
 import { focusProfileField, ProfileSettingsDialog, ProfileSettingsSection } from './catalog/ProfileSettings'
@@ -36,6 +38,8 @@ import {
 import type { ProfileForm } from './catalog/profile'
 import { ImportWizard } from './import/ImportWizard'
 import { IntrospectScopeDialog } from './IntrospectScopeDialog'
+import { MaintenanceChip, SourceMaintenanceDialog } from './SourceMaintenanceDialog'
+import type { SourceUpkeep } from '../typesSource'
 import type { WizardEntry } from './import/ImportWizard'
 import { VersionsDialog } from './import/VersionsDialog'
 
@@ -81,6 +85,7 @@ const syncCatalog = () => void useCatalog.getState().reload('datasources')
 
 export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
   const navigate = useNavigate()
+  const location = useLocation()
   const [rows, setRows] = useState<any[] | null>(null)
   const [kinds, setKinds] = useState<any[]>([])
   const [loadError, setLoadError] = useState<unknown>(null)
@@ -89,8 +94,15 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
   /** 按配方导入的向导（首次、上传新一期、修改配方、继续未完成的导入） */
   const [wizard, setWizard] = useState<WizardEntry | null>(null)
   const [kick, setKick] = useState<{ id: string; seq: number } | null>(null)
+  /** 从别处链过来要打开定时维护的那张卡片（#source-<id>&maintenance，见 lib/sourceAnchor）；seq 让同一张卡片能再开一次 */
+  const [arrival, setArrival] = useState<{ id: string; seq: number } | null>(null)
+  /** 各源要处理的变化条数（角标）和定时维护（next-round 03 B3、B4）：一次取齐；取不到只是少了角标，不挡列表 */
+  const [upkeep, setUpkeep] = useState<Map<string, SourceUpkeep>>(() => new Map())
   const loadSeq = useRef(0)
   const hasRows = useRef(false)
+  const loadUpkeep = () => {
+    api.sourceChanges.upkeep().then((r) => setUpkeep(new Map(r.items.map((i) => [i.source_id, i]))), () => {})
+  }
 
   // 首次加载才画骨架；之后的刷新保留列表、不卸载——展开的表清单、滚动位置、
   // 卡片上的忙碌态都长在卡片上，以前整页换成 Spinner，这些全丢，还跳回顶部
@@ -109,8 +121,28 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
       else setLoadError(e)
     }
   }
-  useEffect(() => { void load() }, [])
-  useOnReconnect(load)
+  useEffect(() => { void load(); loadUpkeep() }, [])
+  useOnReconnect(() => { void load(); loadUpkeep() })
+  // 从别处链过来指名一张卡片（lib/sourceAnchor：目录页后台任务条上探查的「查看」、定时任务页上维护定时的「去数据源页设置」）：
+  // 列表载入后滚过去；带 &maintenance 的再打开它的「定时维护」，标记用过就从地址里去掉（刷新不再弹）。指名的源已经不在了
+  // （维护定时比数据源活得久）照实说一句，不然只是落在列表顶上、什么也没发生。每个地址只处理一次：列表之后每次增删改都会变
+  const arrived = useRef('')
+  useEffect(() => {
+    const anchor = parseSourceAnchor(location.hash)
+    if (!rows || !anchor || arrived.current === location.hash) return
+    arrived.current = location.hash
+    const row = rows.find((r) => r.id === anchor.id)
+    if (!row) {
+      toast.info(SOURCE_ANCHOR_TEXT.missing)
+      return
+    }
+    document.getElementById(sourceCardId(row.id))?.scrollIntoView({ block: 'center' })
+    if (!anchor.open) return
+    if (anchor.open === 'maintenance') setArrival({ id: row.id, seq: Date.now() })
+    const plain = sourceAnchor(row.id)
+    arrived.current = plain
+    navigate({ pathname: location.pathname, search: location.search, hash: plain }, { replace: true })
+  }, [rows, location.hash])
 
   const upsert = (row: any) => setRows((rs) => {
     if (!rs) return [row]
@@ -198,6 +230,9 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
               // 版本页里清除原件之后服务端不返回数据源，卡片上的原件状态靠重新取列表
               onReload={() => void load()}
               kick={kick && kick.id === row.id ? kick.seq : 0}
+              openMaintenance={arrival && arrival.id === row.id ? arrival.seq : 0}
+              upkeep={upkeep.get(row.id) ?? null}
+              onUpkeep={loadUpkeep}
             />
           ))}
         </div>
@@ -271,8 +306,13 @@ export function DataSourcesTab({ view = 'databases' }: { view?: DataView }) {
 /** 结构同步超过这么久就提示可能过期：库表会变，Copilot 照旧表写 SQL 只会报错 */
 const STALE_SCHEMA_MS = 7 * 24 * 3600_000
 
-function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onRecipeReupload, onRedraft, onResume, onReload, kick }: {
+function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onRecipeReupload, onRedraft, onResume, onReload, kick,
+  openMaintenance = 0, upkeep = null, onUpkeep }: {
   row: any; meta?: any
+  /** 要处理的变化条数、定时维护（GET /api/datasources/upkeep）；取不到为 null */
+  upkeep?: SourceUpkeep | null
+  /** 定时维护存过了：重取角标和维护 */
+  onUpkeep?: () => void
   onChange: (row: any) => void
   /** 重新取整个列表（版本页里的写操作没有返回数据源时用） */
   onReload: () => void
@@ -285,6 +325,8 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
   onResume: () => void
   /** 非 0 时自动点一次「探查结构」（新建后 toast 上的按钮） */
   kick: number
+  /** 非 0 时打开一次「定时维护」（从别处链过来，#source-<id>&maintenance）；这张卡片不做定时维护时不理 */
+  openMaintenance?: number
 }) {
   const healthKey = `datasource:${row.id}`
   // 后端记着上次测的结果：换了浏览器、清了缓存也还在。本机刚测过的更新就用本机的
@@ -324,6 +366,14 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
   const [job, setJob] = useState<IntrospectJob | IntrospectJobBrief | null>(row.introspect_job ?? null)
   const [stopping, setStopping] = useState(false)
   const [scoping, setScoping] = useState(false)
+  const [maintaining, setMaintaining] = useState(false)
+  /** 要处理的变化条数（数据源卡片的角标，next-round 03 B3 ③） */
+  const actionChanges = upkeep?.changes.by_severity.action ?? 0
+  /** 定时维护只给手工登记的库：上传表格、记录表的结构随版本或表单走 */
+  const maintainable = (row.origin ?? 'manual') === 'manual'
+  useEffect(() => {
+    if (openMaintenance && maintainable && !uploaded) setMaintaining(true)
+  }, [openMaintenance])
   const jobActive = !!job && (job.status === 'queued' || job.status === 'running')
   useEffect(() => {
     const next = row.introspect_job ?? null
@@ -530,7 +580,7 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
   const failed = record && !record.ok && !checkingSince
 
   return (
-    <article className="rounded-lg border bg-panel" data-source={row.name}>
+    <article className="rounded-lg border bg-panel" data-source={row.name} id={sourceCardId(row.id)}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3 pt-2.5">
         {uploaded
           ? <FileSpreadsheet size={14} className={row.enabled ? 'text-dim' : 'text-faint'} aria-hidden />
@@ -544,6 +594,14 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
               <AlertTriangle size={10} aria-hidden /> 可写
             </span>}
         {!row.enabled && <span className="chip" title="助手和 Agent 均无法访问该数据源">已停用</span>}
+        {actionChanges > 0 && (
+          // 要处理的变化：点开到数据目录的「变化」视图（读屏写全：哪个源、几条、点了去哪）
+          <button type="button" className="chip tnum hover:border-[var(--err)]" onClick={() => navigate(`/data/catalog/${encodeURIComponent(row.id)}?view=changes`)}
+                  aria-label={SOURCE_BADGE_TEXT.aria(row.name, actionChanges)} title={SOURCE_BADGE_TEXT.hint} data-source-changes={actionChanges}
+                  style={{ color: 'var(--err)', borderColor: 'color-mix(in srgb, var(--err) 45%, transparent)' }}>
+            <AlertOctagon size={10} aria-hidden /> {SOURCE_BADGE_TEXT.chip(actionChanges)}
+          </button>
+        )}
         <span className="flex-1" />
         <HealthPill record={record} checkingSince={checkingSince} />
         <div className="flex items-center gap-1">
@@ -571,6 +629,12 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
             <button className="btn btn-sm btn-ghost" onClick={() => setScoping(true)} title={INTROSPECT_SCOPE_TEXT.openHint}
                     data-introspect-scope-open="">
               <Layers size={11} aria-hidden /> <span className="hidden sm:inline">{INTROSPECT_SCOPE_TEXT.open}</span>
+            </button>
+          )}
+          {!uploaded && maintainable && (
+            <button className="btn btn-sm btn-ghost" onClick={() => setMaintaining(true)} title={MAINTENANCE_TEXT.openHint}
+                    aria-label={MAINTENANCE_TEXT.open} data-maintenance-open="">
+              <CalendarClock size={11} aria-hidden /> <span className="hidden sm:inline">{MAINTENANCE_TEXT.open}</span>
             </button>
           )}
           {row.open_staging && (
@@ -638,8 +702,12 @@ function SourceCard({ row, meta, onChange, onRemoved, onEdit, onReupload, onReci
             {PROFILE_TEXT.open}
           </button>
         )}
+        {maintainable && !uploaded && upkeep && <MaintenanceChip maintenance={upkeep.maintenance} />}
         {!!row.tools?.length && <span className="mono">{row.tools.join(' · ')}</span>}
       </div>
+      {maintaining && (
+        <SourceMaintenanceDialog source={row} onClose={() => setMaintaining(false)} onSaved={() => onUpkeep?.()} />
+      )}
       {scoping && (
         <IntrospectScopeDialog source={row} onClose={() => setScoping(false)} onSaved={onReload}
                                onRun={() => void introspect()} />

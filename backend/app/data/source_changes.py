@@ -538,3 +538,84 @@ __all__ = [
     "record", "record_all",
     "resolve", "summary", "triggers_recall", "without_paths",
 ]
+
+
+# ==========================================================================
+# 给界面的（第 4 波 W4-d：审阅页「变化」标签页、数据源列表的角标）
+# ==========================================================================
+
+#: 处理过的：解决了的、标为误报的（「变化」标签页的「处理过的」）
+HANDLED = ("resolved", "dismissed")
+#: 重新起草有用的结构变化：新表、列和键变了（起草按新的结构重写这张表的推断项；人工确认过的项照旧不动）
+_REDRAFT_KINDS = frozenset({sd.TABLE_ADDED, sd.COLUMN_ADDED, sd.COLUMN_REMOVED, sd.COLUMN_TYPE, sd.COLUMN_NULLABLE,
+                            sd.KEY, sd.FK, sd.COMMENT})
+#: 这张表现在不在表结构里、或者说的是整个源的：起草、剖析都无从做起
+_NO_TABLE_KINDS = frozenset({sd.TABLE_REMOVED, sd.TABLE_LEFT_SCOPE, sd.TABLE_REFLECT_FAILED, sd.SCOPE})
+NOT_IN_SCHEMA = "表结构里已经没有这张表，先重新探查结构"
+NO_CATALOG_ITEMS = "影响面里没有目录项，不需要清理"
+
+
+def available_actions(row: Any, *, in_schema: bool, profile_enabled: bool, profile_reason: str | None = None,
+                      ) -> list[dict[str, Any]]:
+    """这条变化现在能做哪几个处理动作（「变化」标签页照它画按钮，界面不自己判）：[{action, ok, reason}]，按 ACTIONS 的顺序。
+
+    已经处理过的（resolved / dismissed）一个都不给。只列对这种变化有意义的动作：加入码值只给「出现了新码值」，重新起草只给
+    新表和列、键的变化，重新剖析给说的是一张还在的表的变化（注释变了除外）；清理目录项只在影响面里有目录项时能点。前置核对
+    和 handle 一致；建任务时才知道的（起草模型、同源正忙）不在这里判，点了照实 422。ok 为假时 reason 写为什么做不了。"""
+    if row.status in HANDLED:
+        return []
+    kind = row.kind
+    has_table = bool(row.table_name) and kind not in _NO_TABLE_KINDS
+    out: list[dict[str, Any]] = []
+
+    def put(action: str, reason: str | None = None) -> None:
+        out.append({"action": action, "ok": reason is None, "reason": reason})
+
+    if (row.affects or {}).get("catalog"):
+        put("clean_catalog", None if _catalog_paths(row) else NO_CATALOG_ITEMS)
+    if kind == CODES_NEW and row.column_name:
+        put("add_codes")
+    if has_table and kind in _REDRAFT_KINDS:
+        put("redraft", None if in_schema else NOT_IN_SCHEMA)
+    if has_table and kind != sd.COMMENT:
+        reason = None if in_schema else NOT_IN_SCHEMA
+        if reason is None and not profile_enabled:
+            reason = profile_reason or "这个数据源未开启数据剖析"
+        put("reprofile", reason)
+    if row.status == "open":
+        put("acknowledge")
+    put("dismiss")
+    return out
+
+
+async def counts_by_source(session: AsyncSession, source_ids: Iterable[str] | None = None) -> dict[str, dict[str, Any]]:
+    """各源还要人看的变化（同 counts 的形状），一条查询取齐（数据源列表的角标）。没有变化的源不在里面。"""
+    query = select(SourceChange.source_id, SourceChange.status, SourceChange.severity, func.count()).where(
+        SourceChange.status.in_(PENDING)).group_by(SourceChange.source_id, SourceChange.status, SourceChange.severity)
+    if source_ids is not None:
+        query = query.where(SourceChange.source_id.in_(list(source_ids)))
+    out: dict[str, dict[str, Any]] = {}
+    for source_id, status, severity, n in (await session.execute(query)).all():
+        one = out.setdefault(source_id, {"pending": 0, "open": 0, "by_severity": dict.fromkeys(SEVERITIES, 0)})
+        one["by_severity"][severity] = one["by_severity"].get(severity, 0) + n
+        one["pending"] += n
+        if status == "open":
+            one["open"] += n
+    return out
+
+
+async def list_handled(session: AsyncSession, source_id: str, *, kinds: Iterable[str] | None = None,
+                       table: str | None = None, limit: int = 100, offset: int = 0) -> tuple[list[SourceChange], int]:
+    """处理过的变化（解决了的、标为误报的），最近测到的在前：处理过的不再按要不要先处理排。返回 (这一页, 一共几条)。"""
+    filt = [SourceChange.source_id == source_id, SourceChange.status.in_(HANDLED)]
+    if kinds:
+        filt.append(SourceChange.kind.in_(list(kinds)))
+    if table:
+        filt.append(SourceChange.table_name == table)
+    total = int((await session.execute(select(func.count()).select_from(SourceChange).where(*filt))).scalar() or 0)
+    rows = list((await session.execute(select(SourceChange).where(*filt).order_by(SourceChange.seq.desc())
+                                       .offset(offset).limit(limit))).scalars())
+    return rows, total
+
+
+__all__ += ["HANDLED", "available_actions", "counts_by_source", "list_handled"]

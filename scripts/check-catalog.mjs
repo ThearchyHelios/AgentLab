@@ -636,6 +636,11 @@ function catalogHandlers(state, replies = {}) {
   }
   return [
     [/^GET \/datasources$/, (route) => json(state.sources)(route)],
+    // 数据源的变化、取值观察、后台任务条（next-round 第 4 波）：这里没有，给空的（不放行到服务端去查一个假的源）
+    [/^GET \/datasources\/check-cat-[a-z]+\/changes$/, json({ items: [], total: 0, counts: { pending: 0, open: 0, by_severity: { action: 0, warning: 0, info: 0 } } })],
+    [/^GET \/datasources\/check-cat-[a-z]+\/observations$/, json({ table: '', series: [] })],
+    [/^GET \/datasources\/check-cat-[a-z]+\/background-jobs$/, json({ items: [] })],
+    [/^GET \/datasources\/upkeep$/, json({ items: [] })],
     // 卡片展开时取的表清单（导入表格的源默认展开）
     [/^GET \/datasources\/check-cat-[a-z]+\/schema$/, (route, { key }) =>
       json({ tables: state.tables[parts(key)[2]].filter((t) => !t.missing).map((t) => t.name), summary: '', synced_at: T0 })(route)],
@@ -1169,20 +1174,23 @@ await section('数据目录 · 起草：停止、后台继续与再打开', asyn
   runJob(job)
   check('……轮到它了：「正在起草…」', await until(async () => (await draftText(page, '[data-draft-title]')) === '正在起草…'), await draftText(page, '[data-draft-title]'))
 
-  // 关掉对话框：任务不停，目录页上方显示进度
+  // 关掉对话框：任务不停，进度在页头下方的后台任务条上（只有这一处，05 (g)）；页头的「起草」只换图标，读屏写状态、不写数字
   await page.locator('[data-draft-hide]').click()
   check('「在后台继续」：对话框关上，没有发停止', await until(async () => (await draftBox(page).count()) === 0) && count(sent, /\/cancel$/) === 0)
-  const strip = page.locator('[data-catalog-draft-progress]')
-  check('……目录页上方显示一条进度', await until(async () => (await strip.count()) === 1) && (await strip.innerText()).includes('已完成 0 / 20 张表'),
+  const strip = page.locator('[data-catalog-job-strip] [data-catalog-job="draft"]')
+  check('……后台任务条上写「起草 0/20」', await until(async () => (await strip.count()) === 1) && (await strip.innerText()).includes('起草 0/20'),
     await strip.innerText({ timeout: 500 }).catch(() => ''))
+  const draftHead = page.locator('[data-catalog-draft-head]')
+  check('……进度只在任务条上一处：页头的「起草」读屏写「起草（进行中）」，不写数字', (await draftHead.getAttribute('aria-label')) === '起草（进行中）'
+        && !/\d/.test(await draftHead.innerText()), await draftHead.getAttribute('aria-label'))
   settle(state, job, 'visits', { added: 2 })
   settle(state, job, 'orders', { added: 1 })
-  check('……进度跟着任务走', await until(async () => (await strip.getAttribute('data-catalog-draft-progress', { timeout: 500 }).catch(() => '')) === '2/20'),
-    await strip.getAttribute('data-catalog-draft-progress', { timeout: 500 }).catch(() => ''))
+  check('……进度跟着任务走', await until(async () => (await strip.getAttribute('data-progress', { timeout: 500 }).catch(() => '')) === '2/20'),
+    await strip.getAttribute('data-progress', { timeout: 500 }).catch(() => ''))
   check('……进度条读屏可读', (await strip.locator('[role="progressbar"]').getAttribute('aria-valuenow').catch(() => '')) === '2')
   await shot(page, 'catalog-draft-strip')
-  // 点开回到对话框：直接是进行中的那个任务
-  await strip.locator('[data-catalog-draft-open]').click()
+  // 点「查看」回到对话框：直接是进行中的那个任务
+  await strip.locator('[data-catalog-job-open]').click()
   check('点开：回到对话框，直接显示进行中的任务', await until(async () => (await draftPhase(page)) === 'running')
         && (await draftText(page, '[data-draft-progress]')) === '已完成 2 / 20 张表', await draftText(page, '[data-draft-progress]'))
   // 停止：调停止接口；服务端马上取消进行中的模型调用，只等手上那张表写完（停止接口等它收尾才答）。这期间写「正在停止」，
@@ -1214,7 +1222,7 @@ await section('数据目录 · 起草：停止、后台继续与再打开', asyn
   check('按 Esc 关掉对话框也不停任务', await until(async () => (await draftBox(page).count()) === 0)
         && count(sent, new RegExp(`^POST .*draft-jobs/${job3.id}/cancel$`)) === 0)
   await goto(page, `/data/catalog/${S1}`)
-  check('重新载入页面：清单带着进行中的任务，上方照样显示进度', await until(async () => (await page.locator('[data-catalog-draft-progress]').count()) === 1))
+  check('重新载入页面：清单带着进行中的任务，任务条上照样显示进度', await until(async () => (await page.locator('[data-catalog-job="draft"]').count()) === 1))
   await page.locator('[data-catalog-draft]').first().click()
   check('……点「起草」直接显示进行中的任务，不是重新选范围', await until(async () => (await draftPhase(page)) === 'running')
         && await draftBox(page).locator('[data-draft-scope]').count() === 0)
@@ -1225,7 +1233,7 @@ await section('数据目录 · 起草：停止、后台继续与再打开', asyn
   const toastBox = page.locator('[data-toast]').filter({ hasText: '起草完成' })
   check('关着对话框时结束：提示「数据目录起草完成」，带「查看结果」', await until(async () => (await toastBox.count()) > 0),
     await page.locator('[data-toast]').allInnerTexts().then((t) => t.join(' | ')).catch(() => ''))
-  check('……上方的进度收起', (await page.locator('[data-catalog-draft-progress]').count()) === 0)
+  check('……任务条收起', (await page.locator('[data-catalog-job-strip]').count()) === 0)
   await toastBox.getByRole('button', { name: '查看结果' }).click()
   check('……点「查看结果」打开这一次的结果', await until(async () => (await draftPhase(page)) === 'done')
         && (await draftText(page, '[data-draft-title]')) === '起草完成', await draftText(page, '[data-draft-title]'))
@@ -1407,17 +1415,17 @@ await section('数据目录 · 起草：接连没写出来的提醒、超时与�
     await draftText(page, '[data-draft-part-columns]'))
   await shot(page, 'catalog-draft-notice')
 
-  // 关掉对话框：上方的进度也带着提醒；好转后服务端清掉提醒，两处都收起
+  // 关掉对话框：任务条上起草那一行也带着提醒（写全文：窄屏、触屏没有悬停）；好转后服务端清掉提醒，两处都收起
   await page.locator('[data-draft-hide]').click()
-  const strip = page.locator('[data-catalog-draft-progress]')
-  const stripNotice = strip.locator('[data-catalog-draft-notice]')
-  check('在后台继续：上方的进度也带着提醒（全文在悬停里）', await until(async () => (await stripNotice.count()) === 1)
-        && (await stripNotice.getAttribute('title')) === DRAFT_NOTICE && (await stripNotice.innerText()).length > 0,
-    await stripNotice.getAttribute('title', { timeout: 500 }).catch(() => ''))
+  const strip = page.locator('[data-catalog-job-strip] [data-catalog-job="draft"]')
+  const stripNotice = strip.locator('[data-catalog-job-notice]')
+  check('在后台继续：任务条上起草那一行带着提醒，写全文', await until(async () => (await stripNotice.count()) === 1)
+        && (await stripNotice.innerText()).replace(/\s+/g, ' ').trim() === DRAFT_NOTICE,
+    await stripNotice.innerText({ timeout: 500 }).catch(() => ''))
   await shot(page, 'catalog-draft-strip-notice')
   job.notice = null
-  check('……好转后服务端清掉提醒：上方的进度不再带着', await until(async () => (await stripNotice.count()) === 0))
-  await strip.locator('[data-catalog-draft-open]').click()
+  check('……好转后服务端清掉提醒：任务条上不再带着', await until(async () => (await stripNotice.count()) === 0))
+  await strip.locator('[data-catalog-job-open]').click()
   check('……点开对话框：提醒也不再显示，超时和没写出来的次数照旧', await until(async () => (await draftPhase(page)) === 'running')
         && await notice.count() === 0 && (await usageLine()).includes('其中超时 3 次'), await usageLine())
 
@@ -2474,12 +2482,12 @@ await section('数据目录 · 窄屏', async () => {
     && await draftBox(page).locator('[data-draft-task-blank-sample]').isVisible().catch(() => false), JSON.stringify(runFit))
   await shot(page, 'catalog-narrow-draft')
   await page.locator('[data-draft-hide]').click()
-  await until(async () => (await page.locator('[data-catalog-draft-progress]').count()) === 1)
-  check('……上方的起草进度（带着提醒）不撑宽页面', await overflow() <= 1 && !!(await page.locator('[data-catalog-draft-progress]').boundingBox())
-        && (await page.locator('[data-catalog-draft-progress]').boundingBox()).width <= 390
-        && await page.locator('[data-catalog-draft-notice]').count() === 1, String(await overflow()))
+  await until(async () => (await page.locator('[data-catalog-job="draft"]').count()) === 1)
+  check('……后台任务条（带着提醒）看得见、不撑宽页面', await overflow() <= 1 && !!(await page.locator('[data-catalog-job-strip]').boundingBox())
+        && (await page.locator('[data-catalog-job-strip]').boundingBox()).width <= 390 && await page.locator('[data-catalog-job="draft"]').isVisible()
+        && await page.locator('[data-catalog-job="draft"] [data-catalog-job-notice]').count() === 1, String(await overflow()))
   stopJob(narrowJob)
-  await until(async () => (await page.locator('[data-catalog-draft-progress]').count()) === 0)
+  await until(async () => (await page.locator('[data-catalog-job-strip]').count()) === 0)
   // 宽屏照旧是表格（表头在，列表格 860px 起，框里横向滚动）
   await page.setViewportSize({ width: 1440, height: 900 })
   await openDetail(page, S1, 'visits')
