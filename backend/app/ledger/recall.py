@@ -13,8 +13,10 @@
   metrics_from 指向召回卡；不加报告、不调模型）。两版在同一次运行里查同一份数据，差值只反映口径；数据随时间的变化另外拿
   原答案当时的值对照着说（task_payload 的 original）。
 - 不能重算的照实记「无法重算：原因」，不发起：口径的数据部分不能复用（derive.NotDerivable）、新版里没有这张口径卡、两版
-  没有同名的指标、新版入口要的参数这一组里没有或不合规（compose.check_inputs 同一套校验）、新版的图里有人工节点或会写外部
-  系统（apps/backfill.graph_side_effect，和按新口径补算、按口径出具同一个判断：替人重跑不代人做这些事）。
+  没有同名的指标、新版入口要的参数这一组里没有或不合规（compose.check_inputs 同一套校验）、新版的图里会写外部系统
+  （apps/backfill.graph_external_write，和按新口径补算、按口径出具同一个判断）。新版图里别处有人工节点、按流程使用不安全的
+  照样重算：召回图只有两版的取数和口径卡，碰不到它们（口径卡上游的人工节点 derive 已经认作数据部分不能复用）；「按新版
+  重新出具」走完整的正式运行，仍按 graph_side_effect 全套拒绝（ledger/issue.check_target）。
 - 上限：每次发布最多自动重算 ledger.recall_limit 组（设置，缺省 50；0 表示不自动重算，只列出受影响的答案）。超出的写
   「另有 M 组未重算」，在版本历史里点「接着算」手动接着发起下一批（每批同样的组数，上限是 0 时按缺省值）。
 - **计划从已有的召回运行重算**（照 apps/backfill 的写法，不建任务表）：一组算没算过，看有没有 origin 指向（W、V、N、
@@ -25,13 +27,14 @@
   不同就是数变了。数变了：给这一组答案的主人开 recall 待办（挂在召回运行上；开登录时每个主人一条，只列他的答案；关登录时
   一条派给任何人），推 ledger.recall 通知。数没变：只记账——在每个原答案的运行上追加 ledger.recalled（「已按 vN 核对，
   不影响」）。召回运行自己也追加一条 ledger.recalled 记结论（只记变没变、几个答案、几条待办，不记数），它同时是「收过尾」的
-  记号。召回运行没成功的照实记重算失败。
+  记号。召回运行没成功的、成功了却读不出召回卡（或缺了某个比较的旧值、新值）的照实记重算失败，原答案一个不动。
 
 **二、目录事实被驳回或修改**（只管影响数字的那一组：有效记录条件、去重、业务日期、关联、业务主键、度量类型，同
 data/catalog_review.FIELD_GROUP 的 facts）：审阅写入之后（data/catalog 的审阅、人工编辑、保存提案，catalog_review 的批量审阅）
 在后台找出查过这张表、而且查询快照冻结的目录里看得到这一项的探索运行，追加 ledger.basis_changed（kind=catalog），界面标
 「依据有变」；对这些运行执行过的 SQL 按新目录跑一遍 SQL 检查（data/sqlcheck，纯计算），比冻结目录下多出错误级问题的才开
-一条 recall 待办（reason=catalog，只有「知道了」）通知答案的主人（拍板 L7：不自动重问）。
+一条 recall 待办（reason=catalog，只有「知道了」）通知答案的主人（拍板 L7：不自动重问）。同一个数据源排着做、批量审阅的几张表
+合成一遍（catalog_pass）：查询快照按数据源在库里筛、凑够就停，冻结的表结构快照（大库的能有几 MB）同一份只读一次。
 
 **三、表结构变动**：消费 data/source_changes（list_changes(since_seq) 按 seq 游标拉，游标记在设置表里；探查、剖析任务结束、
 处理变化改了目录时触发）。只看 triggers_recall 认的：表或列被删、列的类型变了标「依据的表结构已变」（kind=structure）；
@@ -41,7 +44,11 @@ data/catalog_review.FIELD_GROUP 的 facts）：审阅写入之后（data/catalog
 recall 待办（reason=structure）通知发布人。
 
 **通知**：ledger.recall 只推口径升版、数真变了的那一种待办（消息照 notify/service 的规矩：标题、状态、条数、链接，不放
-新旧值和差值）；目录和表结构的两种待办照别的待办推 task.opened。
+新旧值和差值）；目录和表结构的两种待办照别的待办推 task.opened。全局渠道按一批待办（一次召回开给几个主人的那几条，
+batch_of_key）只推一次，个人渠道每个主人各一条（notify/service.notify_recall）。
+
+**答案上的标记**（answer_marks）：账本接口 GET /api/runs/{id}/ledger 的 recall——已按 vN 核对、依据有变、看的这个人手上说的
+是这个答案的 recall 待办，给问数据的轮次和证据面板「口径」一步。
 
 **自动的那几样**（发布后自动那一批、探查剖析之后拉表结构变化、启动时接着做）和调度循环同一个开关（automatic，
 AGENTLAB_SCHEDULER）：它们是在后台替人查业务库，测试、拷来的数据目录（检查脚本）不做；关着时版本历史里照样列出受影响的
@@ -95,6 +102,11 @@ NEW_INPUTS = "新版 v{version} 的入口要的参数这一组里没有或不合
 NEW_GONE = "新版本不存在，可能已被删除"
 LAUNCH_REFUSED = "没能发起召回运行：{reason}"
 RUN_FAILED = "重算失败：{reason}"
+#: 召回运行成功了，召回卡（或其中某个比较的旧值、新值）却读不出来：照实算重算失败，不当成数没变
+CARD_UNREADABLE = "读不出召回卡"
+#: 这一版已经不是当前发布版：不再接着算（新版本的召回本来就覆盖更早的所有版本，同 resume 只接着做当前发布版）
+SUPERSEDED = "已有更新的发布版 v{latest}，召回在 v{latest} 那一版接着看"
+NOT_CURRENT = "v{version} 已不是当前发布版，召回不再接着算"
 #: 收尾
 CHANGED_TITLE = "口径「{name}」升到 v{version}，答案的数变了"
 CATALOG_TITLE = "答案依据的数据目录有变：按新目录检查出了新的问题"
@@ -152,6 +164,8 @@ class Plan:
     workflow_id: str
     workflow_name: str
     new_version: int
+    #: 工作流现在的发布版（不是 new_version 的不再接着算，见 stale）
+    published_version: int | None = None
     groups: list[Group] = field(default_factory=list)
     #: 每个旧版本的口径卡对、旧版本自己的问题（不是口径、数据部分不能复用……）
     pairs: dict[int, list[Pair]] = field(default_factory=dict)
@@ -164,6 +178,15 @@ class Plan:
     def todo(self) -> list[Group]:
         """还没算、能算的组（按最近一次用到的先后）。"""
         return [g for g in self.groups if g.run is None and g.problem is None]
+
+    def stale(self) -> str | None:
+        """这一版已经不是当前发布版时不再发起（手动接着算也不）的原因：之后又发布了更新的版本，新版本的召回覆盖更早的所有
+        版本（同 resume 只接着做当前发布版），再按这一版开「口径升到 vN」的待办只是添乱。是当前发布版为 None。"""
+        if self.published_version == self.new_version:
+            return None
+        if self.published_version is not None and self.published_version > self.new_version:
+            return SUPERSEDED.format(latest=self.published_version)
+        return NOT_CURRENT.format(version=self.new_version)
 
 
 def _aware(moment: datetime | None) -> datetime | None:
@@ -212,19 +235,20 @@ async def recall_runs(session: Any, workflow_id: str, new_version: int | None = 
 async def build_plan(session: Any, workflow_id: str, new_version: int) -> Plan:
     """W 升到 N 的召回计划（见模块说明）。只读，不发起。"""
     from app.apps import versions as app_versions
-    from app.apps.backfill import graph_side_effect
+    from app.apps.backfill import graph_external_write
     from app.ledger import compose, derive
 
     workflow = await session.get(Workflow, workflow_id)
     plan = Plan(workflow_id=workflow_id, workflow_name=workflow.name if workflow is not None else "",
-                new_version=int(new_version))
+                new_version=int(new_version),
+                published_version=workflow.published_version if workflow is not None else None)
     new_row = await app_versions.version_row(session, workflow_id, int(new_version)) if workflow else None
     if new_row is None:
         plan.problem = NEW_GONE
         return plan
     found = await ledger_uses.find_uses(session, workflow_id, below=int(new_version))
     plan.found = found
-    side = await graph_side_effect(session, new_row.graph, level=new_row.level)
+    side = await graph_external_write(session, new_row.graph)
     for version in found.versions():
         old_row = await app_versions.version_row(session, workflow_id, version)
         cards = source_cards(old_row.graph if old_row is not None else None)
@@ -405,7 +429,7 @@ async def launch(workflow_id: str, new_version: int, *, batch: str = "auto", act
         async with SessionLocal() as session:
             plan = await build_plan(session, workflow_id, int(new_version))
             limit = int((await ledger_settings(session))["recall_limit"])
-        if plan.problem is not None:
+        if plan.problem is not None or plan.stale() is not None:
             return []
         if batch == "auto":
             size = max(0, limit - plan.auto_launched)
@@ -496,7 +520,8 @@ def _group_state(group: Group) -> tuple[str, str | None]:
 
 async def batches(session: Any, workflow_id: str, version: int) -> dict[str, Any]:
     """版本历史里「这一版的召回」：每组的结论（数变了 / 没变 / 无法重算：原因 / 重算失败 / 还在算 / 未重算），「另有 M 组
-    未重算」和能不能接着算。接口只给搭建者（api/ledger 的 router）：参数原样给，同他在召回运行的输入里读到的一样；使用者
+    未重算」和能不能接着算（还有没算的组却不能接着算时 continue_reason 写为什么：之后又发布了更新的版本……）。
+    接口只给搭建者（api/ledger 的 router）：参数原样给，同他在召回运行的输入里读到的一样；使用者
     看的是 recall 待办（task_payload，按遮罩换过）。"""
     from app.api.settings import LEDGER_DEFAULTS, ledger_settings
 
@@ -526,10 +551,11 @@ async def batches(session: Any, workflow_id: str, version: int) -> dict[str, Any
                       "latest": group.latest.isoformat() if group.latest else None,
                       "state": state, **({"reason": reason} if reason else {}), **extra})
     pending = counts["pending"]
+    why_not = (plan.problem or plan.stale()) if pending > 0 else None
     return {"workflow_id": workflow_id, "workflow_name": plan.workflow_name, "version": int(version), "limit": limit,
             "batch_size": limit or int(LEDGER_DEFAULTS["recall_limit"]), "problem": plan.problem,
             "caliber": bool(plan.pairs) or bool(plan.groups), "counts": counts, "groups": items,
-            "remaining": pending, "can_continue": pending > 0 and plan.problem is None,
+            "remaining": pending, "can_continue": pending > 0 and why_not is None, "continue_reason": why_not,
             "truncated": bool(plan.found and plan.found.truncated)}
 
 
@@ -644,7 +670,14 @@ async def settle(run_id: str) -> str | None:
             await _mark(run_id, {**base, "outcome": "failed", "changed": None,
                                  "error": str(run.error or "运行没有成功结束")[:300]})
             return "failed"
-        results = compare(origin.get("metrics") or [], await card_values(run_id))
+        meta = origin.get("metrics") or []
+        values = await card_values(run_id)
+        # 读不出召回卡、少了哪个比较的旧值或新值：两边都是空，按渲染比会被当成「没变」，给每个原答案盖上「已核对，不影响」
+        # ——照实记重算失败，原答案一个不动（收过尾就不再核对，盖错了收不回来）
+        if not meta or any(f"{side}_{m.get('k')}" not in values for m in meta for side in ("old", "new")):
+            await _mark(run_id, {**base, "outcome": "failed", "changed": None, "error": CARD_UNREADABLE})
+            return "failed"
+        results = compare(meta, values)
         changed = any(r["changed"] for r in results)
         answers = list(dict.fromkeys(str(u.get("run_id")) for u in origin.get("uses") or [] if u.get("run_id")))
         tasks: list[str] = []
@@ -736,6 +769,13 @@ def _owner_of_key(key: str) -> tuple[str, str]:
     """correlation_key 的最后两段是派给谁（见 correlation）。"""
     parts = (key or "").split(":")
     return (parts[-2], parts[-1]) if len(parts) >= 4 else ("anyone", "")
+
+
+def batch_of_key(key: str) -> str:
+    """correlation_key 去掉派给谁的那两段：同一次召回（同一个来由、同一次运行、同一条依据）给各个主人开的那一批待办是同一个
+    值。全局渠道按它只推一次（notify/service.notify_recall）。"""
+    parts = (key or "").split(":")
+    return ":".join(parts[:-2]) if len(parts) >= 4 else key or ""
 
 
 async def task_payload(session: Any, task: Any, principal: Any) -> dict[str, Any]:
@@ -897,6 +937,72 @@ def _cell(item: Mapping[str, Any], value: Any, text: Any, hide: Any, *, missing:
 
 
 # ==========================================================================
+# 答案上的召回标记（账本接口 GET /api/runs/{id}/ledger 的 recall，ledger/view.run_view）
+# ==========================================================================
+
+
+async def answer_marks(session: Any, run_id: str, principal: Any) -> dict[str, Any]:
+    """一个答案（探索运行、正式运行）身上的召回标记，给问数据的轮次和证据面板「口径」一步（细案做法 7：界面标「依据有变」、
+    「已按 vN 核对，不影响」）：
+
+    - checked：数没变、追加在这次运行上的 ledger.recalled（role=answer）——按哪份口径、从哪一版核对到哪一版、哪次召回、什么时候；
+    - basis：ledger.basis_changed——哪一种依据（目录事实、表结构、取值、处理时改了目录）、几项、按新目录新出现几条错误级问题、
+      什么时候；
+    - tasks：看的这个人手上还没处理的、说的是这个答案的 recall 待办（数变了的那种挂在召回运行上，列着这个答案；目录有变的
+      挂在这次运行上），界面链到待办箱。
+
+    不放数（新旧值、差值只在待办里给，按遮罩换过），不放表名、取值。"""
+    from app.process.tasks import Task, _assignments, handles
+
+    checked: list[dict[str, Any]] = []
+    basis: list[dict[str, Any]] = []
+    rows = (await session.execute(select(RunEvent.type, RunEvent.data, RunEvent.ts).where(
+        RunEvent.run_id == run_id, RunEvent.type.in_((EventType.LEDGER_RECALLED, EventType.LEDGER_BASIS_CHANGED)))
+        .order_by(RunEvent.seq))).all()
+    def at(ts: Any) -> str | None:
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds") \
+            if isinstance(ts, (int, float)) else None
+
+    workflows: set[str] = set()
+    for etype, data, ts in rows:
+        data = data if isinstance(data, dict) else {}
+        if etype == EventType.LEDGER_RECALLED and data.get("role") == "answer":
+            checked.append({k: data.get(k) for k in ("workflow_id", "from_version", "to_version", "recall_run")}
+                           | {"changed": bool(data.get("changed")), "at": at(ts)})
+            workflows.add(str(data.get("workflow_id") or ""))
+        elif etype == EventType.LEDGER_BASIS_CHANGED:
+            items = data.get("items")
+            basis.append({"kind": data.get("kind"), "items": len(items) if isinstance(items, list) else 0,
+                          "new_errors": int(data.get("new_errors") or 0), "at": at(ts)})
+    names = dict((await session.execute(select(Workflow.id, Workflow.name).where(
+        Workflow.id.in_(sorted(w for w in workflows if w))))).all()) if workflows - {""} else {}
+    for item in checked:
+        item["workflow_name"] = names.get(str(item.get("workflow_id") or ""))
+    # 说的是这个答案、还没处理的 recall 待办：挂在这次运行上的（目录有变），和召回运行 origin.uses 里列着它的（数变了）。
+    # 运行 id 是 32 位十六进制，在 uses 的 JSON 文字里找子串不会误中，找到的再逐条核对
+    candidates = (await session.execute(
+        select(Task, Run.origin).join(Run, Run.id == Task.run_id)
+        .where(Task.kind == TASK_KIND, Task.status == "pending",
+               (Task.run_id == run_id) | ((Run.origin_kind == ORIGIN)
+                                          & (func.instr(func.json_extract(Run.origin, "$.uses"), run_id) > 0)))
+        .order_by(Task.created_at, Task.id))).all()
+    mine = await _assignments(session, [t.id for t, _ in candidates])
+    tasks: list[dict[str, Any]] = []
+    for task, origin in candidates:
+        key = task.correlation_key or ""
+        reason = key.split(":", 1)[0] if key.split(":", 1)[0] in REASONS else "caliber"
+        if task.run_id != run_id:
+            origin = origin if isinstance(origin, dict) else {}
+            if not any(u.get("run_id") == run_id for u in _uses_of(origin, _owner_of_key(key))):
+                continue
+        if not handles(mine.get(task.id, []), principal):
+            continue
+        tasks.append({"id": task.id, "reason": reason,
+                      **({"to_version": (origin or {}).get("to_version")} if reason == "caliber" else {})})
+    return {"checked": checked, "basis": basis, "tasks": tasks}
+
+
+# ==========================================================================
 # 「按新版重新出具」「知道了」
 # ==========================================================================
 
@@ -999,51 +1105,85 @@ def fact_changes(before: Mapping[str, Any] | None, after: Mapping[str, Any] | No
     return out
 
 
-async def _explore_snapshots(session: Any, source: Any, table: str, *, before: datetime | None = None
-                             ) -> list[tuple[str, str]]:
-    """查过 source 这张表的探索运行（计入统计的、成功封存的）和那条查询快照：[(运行, 快照)]，新的在前，最多 BASIS_MAX_RUNS
-    次运行。表名按 name_key 比，表已经不在表结构里也认（表被删了正要找用过它的）。"""
+#: 查询快照一页取几行（按运行结束时间从新到旧翻，每张表凑够 BASIS_MAX_RUNS 次运行就不再往下翻）
+SNAPSHOT_PAGE = 500
+
+
+async def _explore_snapshots(session: Any, source: Any, tables: Iterable[str], *, before: datetime | None = None
+                             ) -> dict[str, list[tuple[str, str]]]:
+    """查过 source 这几张表的探索运行（计入统计的、成功封存的）和那几条查询快照：{表: [(运行, 快照)]}，新的在前，每张表最多
+    BASIS_MAX_RUNS 次运行。表名按 name_key 比，表已经不在表结构里也认（表被删了正要找用过它的）。
+
+    数据源在库里就筛掉（引用的 meta 里记着源 id 和源名，query_snapshot_meta）：部署久了查询快照有几万条，别的源的不该读回来；
+    按运行结束时间、运行 id 排序分页翻（同一次运行的几条挨在一起），每张表都凑够了就停。表名不在库里筛：meta 里的表名是
+    SQL 里写的样子（带 schema 前缀、大小写不一），按 name_key 比只能在这里做。"""
+    from sqlalchemy import or_
+
     from app.data.catalog import QUERY_SNAPSHOT_KIND
     from app.data.names import name_key
     from app.db.models import Artifact
     from app.engine.origin import counted_runs
 
-    want = name_key(table)
+    want: dict[str, list[str]] = {}
+    for t in dict.fromkeys(tables):
+        want.setdefault(name_key(t), []).append(t)
+    out: dict[str, list[tuple[str, str]]] = {t: [] for names in want.values() for t in names}
+    runs: dict[str, set[str]] = {t: set() for t in out}
     stmt = (select(Artifact.id, Artifact.meta, Run.id, Run.finished_at).join(Run, Run.id == Artifact.run_id)
             .where(Artifact.kind == QUERY_SNAPSHOT_KIND, Run.run_class == "exploratory", Run.status == "succeeded",
-                   Run.manifest_hash.is_not(None), counted_runs()).order_by(Run.finished_at.desc()))
-    out: list[tuple[str, str]] = []
-    runs: set[str] = set()
+                   Run.manifest_hash.is_not(None), counted_runs(),
+                   or_(func.json_extract(Artifact.meta, "$.source_id") == source.id,
+                       func.json_extract(Artifact.meta, "$.source") == source.name))
+            .order_by(Run.finished_at.desc(), Run.id, Artifact.id))
     cut = _aware(before)
-    for artifact, meta, run_id, finished in (await session.execute(stmt)).all():
-        if cut is not None and (_aware(finished) is None or _aware(finished) > cut):
-            continue
-        meta = meta if isinstance(meta, dict) else {}
-        if meta.get("source_id") != source.id and meta.get("source") != source.name:
-            continue
-        if not any(name_key(str(t).rsplit(".", 1)[-1]) == want for t in meta.get("tables") or []):
-            continue
-        if run_id not in runs and len(runs) >= BASIS_MAX_RUNS:
-            continue
-        runs.add(run_id)
-        out.append((run_id, artifact))
+    offset = 0
+    last_run: str | None = None
+    while want:
+        page = (await session.execute(stmt.limit(SNAPSHOT_PAGE).offset(offset))).all()
+        offset += len(page)
+        for artifact, meta, run_id, finished in page:
+            if run_id != last_run and all(len(seen) >= BASIS_MAX_RUNS for seen in runs.values()):
+                return out
+            last_run = run_id
+            if cut is not None and (_aware(finished) is None or _aware(finished) > cut):
+                continue
+            meta = meta if isinstance(meta, dict) else {}
+            if meta.get("source_id") != source.id and meta.get("source") != source.name:
+                continue
+            hit = {name_key(str(t).rsplit(".", 1)[-1]) for t in meta.get("tables") or []}
+            for table in (t for key in hit & want.keys() for t in want[key]):
+                if run_id not in runs[table] and len(runs[table]) >= BASIS_MAX_RUNS:
+                    continue
+                runs[table].add(run_id)
+                # 翻页之间进来了新的运行，偏移会错开一两行：同一条不收两次
+                if (run_id, artifact) not in out[table]:
+                    out[table].append((run_id, artifact))
+        if len(page) < SNAPSHOT_PAGE:
+            break
     return out
 
 
-def _frozen_of(snapshot_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """查询快照 → (快照内容, 它当时冻结的表结构快照)。读不出为 None。"""
+def _frozen_of(snapshot_id: str, cache: dict[str, Any] | None = None
+               ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """查询快照 → (快照内容, 它当时冻结的表结构快照)。读不出为 None。cache 是这一遍里读过的工件（{工件 id: 内容}）：工件按内容
+    寻址、不会变，几十次运行冻结的常常是同一份表结构快照（大库的能有几 MB），同一遍里只读一次。"""
     from app.core.artifact_store import load
 
-    try:
-        snap = load(snapshot_id)
-    except ValueError:
-        return None, None
+    def read(artifact_id: str) -> Any:
+        if cache is not None and artifact_id in cache:
+            return cache[artifact_id]
+        try:
+            content = load(artifact_id)
+        except ValueError:
+            content = None
+        if cache is not None:
+            cache[artifact_id] = content
+        return content
+
+    snap = read(snapshot_id)
     if not isinstance(snap, dict):
         return None, None
-    try:
-        schema = load(str(snap.get("schema_artifact") or "")) if snap.get("schema_artifact") else None
-    except ValueError:
-        schema = None
+    schema = read(str(snap["schema_artifact"])) if snap.get("schema_artifact") else None
     return snap, schema if isinstance(schema, dict) else None
 
 
@@ -1096,28 +1236,77 @@ async def _answer_owner(session: Any, run_id: str) -> list[tuple[str, str]]:
     return use.owners
 
 
+@dataclass
+class CatalogEdit:
+    """一张表这一次影响数字的改动（目录审阅写入、新码值、处理变化时改了目录）：catalog_changed 一遍里可以有好几张表。"""
+
+    table: str
+    changes: Sequence[Mapping[str, Any]]
+    catalog_version: int | None = None
+    kind: str = "catalog"
+    change_id: str | None = None
+
+
 async def catalog_changed(source_id: str, table: str, changes: Sequence[Mapping[str, Any]], *,
                           catalog_version: int | None, kind: str = "catalog", change_id: str | None = None) -> int:
     """目录里这张表影响数字的几项被驳回或改了（见模块说明二）：冻结目录里看得到其中某项的探索运行追加 ledger.basis_changed；
-    按新目录多出错误级问题的开 recall 待办（reason=catalog）。返回标了几次运行。"""
+    按新目录多出错误级问题的开 recall 待办（reason=catalog）。返回标了几次运行。同一个数据源的排着做（_catalog_lock）。"""
+    return await catalog_pass(source_id, [CatalogEdit(table=table, changes=changes, catalog_version=catalog_version,
+                                                      kind=kind, change_id=change_id)])
+
+
+#: 同一个数据源的目录核对排着做：{事件循环: {数据源: 锁}}。批量审阅几十张表、几个人同时审阅，每一遍都要翻查询快照、读冻结
+#: 的表结构快照，同时跑几十遍会把单进程的服务拖住
+_catalog_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]]" = \
+    weakref.WeakKeyDictionary()
+
+
+def _catalog_lock(source_id: str) -> asyncio.Lock:
+    return _catalog_locks.setdefault(asyncio.get_running_loop(), {}).setdefault(source_id, asyncio.Lock())
+
+
+async def catalog_pass(source_id: str, edits: Sequence[CatalogEdit]) -> int:
+    """一遍核对同一个数据源的几张表（catalog_changed、审阅之后排着的那一批）：查询快照只翻一次，冻结的表结构快照同一份只读
+    一次。返回标了几次运行。"""
+    async with _catalog_lock(source_id):
+        return await _catalog_pass(source_id, edits)
+
+
+async def _catalog_pass(source_id: str, edits: Sequence[CatalogEdit]) -> int:
     from app.data import catalog
     from app.db.models import DataSource
 
-    paths = [str(c.get("path")) for c in changes if c.get("path")]
-    if not paths and kind == "catalog":
+    # 目录审阅那一种得有改了的项（路径）才核对；新码值、处理时改了目录的没有逐项路径，照样核对
+    edits = [e for e in edits if e.kind != "catalog" or any(c.get("path") for c in e.changes)]
+    if not edits:
         return 0
     async with SessionLocal() as session:
         source = await session.get(DataSource, source_id)
         if source is None:
             return 0
-        found = await _explore_snapshots(session, source, table)
+        found = await _explore_snapshots(session, source, list(dict.fromkeys(e.table for e in edits)))
         current = {t: e.notes for t, e in (await catalog.read_catalog(session, source_id)).items()}
-    by_run: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
-    for run_id, snapshot in found:
-        snap, frozen = await asyncio.to_thread(_frozen_of, snapshot)
-        if snap is None or frozen is None:
-            continue
-        by_run.setdefault(run_id, []).append((snap, frozen))
+    cache: dict[str, Any] = {}
+    marked = 0
+    for edit in edits:
+        by_run: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        for run_id, snapshot in found.get(edit.table) or []:
+            snap, frozen = await asyncio.to_thread(_frozen_of, snapshot, cache)
+            if snap is None or frozen is None:
+                continue
+            by_run.setdefault(run_id, []).append((snap, frozen))
+        marked += await _mark_catalog(source, edit, by_run, current)
+    return marked
+
+
+async def _mark_catalog(source: Any, edit: CatalogEdit,
+                        by_run: Mapping[str, list[tuple[dict[str, Any], dict[str, Any]]]],
+                        current: Mapping[str, Mapping[str, Any]]) -> int:
+    """一张表的这次改动：冻结目录里看得到改动项的运行追加 ledger.basis_changed，按新目录多出错误级问题的开待办。"""
+    from app.engine.run_append import append_events
+
+    table, changes = edit.table, edit.changes
+    paths = [str(c.get("path")) for c in changes if c.get("path")]
     marked = 0
     labels = {str(c.get("path")): c for c in changes}
     for run_id, items in by_run.items():
@@ -1128,17 +1317,15 @@ async def catalog_changed(source_id: str, table: str, changes: Sequence[Mapping[
         for snap, frozen in items:
             if isinstance(snap.get("sql"), str):
                 errors += new_errors(snap["sql"], frozen, current, source.kind)
-        match = {"kind": kind, "source_id": source_id, "table": table,
-                 **({"catalog_version": catalog_version} if catalog_version is not None else {}),
-                 **({"change": change_id} if change_id else {})}
+        match = {"kind": edit.kind, "source_id": source.id, "table": table,
+                 **({"catalog_version": edit.catalog_version} if edit.catalog_version is not None else {}),
+                 **({"change": edit.change_id} if edit.change_id else {})}
         async with SessionLocal() as session:
             if await _basis_marked(session, run_id, match):
                 continue
         data = {**match, "source": source.name,
                 "items": [{"path": p, "label": labels.get(p, {}).get("label"), "change": labels.get(p, {}).get("change")}
                           for p in seen], "new_errors": len(errors), "checks": errors[:10]}
-        from app.engine.run_append import append_events
-
         written = await append_events(run_id, [(EventType.LEDGER_BASIS_CHANGED, None, data)], require="sealed")
         if not written:
             continue
@@ -1159,18 +1346,46 @@ async def _open_basis_task(run_id: str, seq: int) -> list[str]:
     return await open_tasks(run, reason="catalog", owners=owners, title=CATALOG_TITLE, extra=str(seq))
 
 
+#: 审阅之后排着的目录改动：{事件循环: {数据源: [CatalogEdit]}}。一个数据源一个后台任务（_drain_catalog），批量审阅逐表写完
+#: 逐表调 after_review，这期间（不让出事件循环）进来的几张表合成一遍做；做的时候又进来的，做完这一遍接着做
+_catalog_queues: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, list[CatalogEdit]]]" = \
+    weakref.WeakKeyDictionary()
+
+
 def after_review(source_id: str, table: str, before: Mapping[str, Any] | None, after: Mapping[str, Any] | None,
                  version: int | None) -> int:
-    """审阅写入之后（data/catalog、catalog_review 调）：有影响数字的项被驳回或改了，在后台标依据有变。返回改了几项。
-    出错只记日志：审阅已经写进去了。"""
+    """审阅写入之后（data/catalog、catalog_review 调）：有影响数字的项被驳回或改了，排进这个数据源的后台任务标依据有变（同一个
+    数据源的几张表合成一遍）。返回改了几项。出错只记日志：审阅已经写进去了。"""
     try:
         changes = fact_changes(before, after)
         if changes:
-            spawn(catalog_changed(source_id, table, changes, catalog_version=version))
+            queues = _catalog_queues.setdefault(asyncio.get_running_loop(), {})
+            edit = CatalogEdit(table=table, changes=changes, catalog_version=version)
+            if source_id in queues:
+                queues[source_id].append(edit)
+            else:
+                queues[source_id] = [edit]
+                spawn(_drain_catalog(source_id))
         return len(changes)
     except Exception:  # noqa: BLE001 - 辅助步骤
         logger.exception("审阅写入后排队标依据有变时出错（%s · %s）", source_id, table)
         return 0
+
+
+async def _drain_catalog(source_id: str) -> None:
+    """一个数据源排着的目录改动一遍一遍做完。一遍出错只记日志，接着做后面排进来的。"""
+    queues = _catalog_queues.setdefault(asyncio.get_running_loop(), {})
+    try:
+        while edits := queues.get(source_id):
+            queues[source_id] = []
+            try:
+                await catalog_pass(source_id, edits)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 辅助步骤
+                logger.exception("审阅之后标依据有变时出错（%s）", source_id)
+    finally:
+        queues.pop(source_id, None)
 
 
 # ==========================================================================
@@ -1222,7 +1437,8 @@ async def _mark_structure(change: Mapping[str, Any]) -> int:
             return 0
         detected = change.get("detected_at")
         at = datetime.fromisoformat(detected) if isinstance(detected, str) else None
-        found = await _explore_snapshots(session, source, str(change["table"]), before=at)
+        table = str(change["table"])
+        found = (await _explore_snapshots(session, source, [table], before=at)).get(table) or []
     marked = 0
     for run_id in dict.fromkeys(r for r, _ in found):
         match = {"kind": "structure", "change": change.get("id")}
@@ -1459,9 +1675,10 @@ async def shutdown() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-__all__ = ["BASIS_KINDS", "BATCHES", "CURSOR_KEY", "OUTCOMES", "ORIGIN", "REASONS", "TASK_KIND", "Group", "Pair", "Plan",
-           "RecallRefused", "after_publish", "after_review", "automatic", "basis_kind", "batches", "build_graph", "build_plan",
-           "card_values", "catalog_changed", "compare", "consume_source_changes", "drain", "fact_changes", "launch",
-           "new_errors", "normalize", "open_tasks", "original_values", "outcome_of", "preview", "process_change",
-           "recall_card", "recall_runs", "reissue", "reissue_action", "resume", "schedule_settle", "settle", "shutdown",
+__all__ = ["BASIS_KINDS", "BATCHES", "CURSOR_KEY", "OUTCOMES", "ORIGIN", "REASONS", "TASK_KIND", "CatalogEdit",
+           "Group", "Pair", "Plan", "RecallRefused", "after_publish", "after_review", "answer_marks", "automatic",
+           "basis_kind", "batch_of_key", "batches", "build_graph", "build_plan", "card_values", "catalog_changed",
+           "catalog_pass", "compare", "consume_source_changes", "drain", "fact_changes", "launch", "new_errors",
+           "normalize", "open_tasks", "original_values", "outcome_of", "preview", "process_change", "recall_card",
+           "recall_runs", "reissue", "reissue_action", "resume", "schedule_settle", "settle", "shutdown",
            "source_cards", "spawn", "start_resume", "task_payload", "version_recall_counts"]

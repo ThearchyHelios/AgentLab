@@ -7,7 +7,8 @@
 - 召回运行：派生图里新旧两版的取数和口径卡各一份（前缀不撞），召回卡里算两版之差；同一份数据上两版各算一次；
 - 收尾：数变了才开 recall 待办（挂在召回运行上，旧值、新值、差值、原答案当时的值都给），推 ledger.recall，消息里没有数；
   数没变的在原答案上记 ledger.recalled（已按 vN 核对，不影响），不开待办；
-- 不能重算的照实记：新版入口要的参数这一组里没有、图里有人工节点（有副作用）；
+- 不能重算的照实记：新版入口要的参数这一组里没有、图里会写外部系统；图里别处有人工节点的照样重算（召回图碰不到它），
+  只是「按新版重新出具」不代人审批；
 - 待办「按新版重新出具」走按口径出具同一套判法、「知道了」；
 - 目录里影响数字的一项被改了：冻结目录里看得到它的答案标「依据有变」，按新目录多出错误级问题的才开待办；
 - 表结构变了：用过这张表的答案标「依据的表结构已变」，口径试算算不出来才开待办；
@@ -146,6 +147,32 @@ async def test_limit_continue_and_idempotent_replanning(monkeypatch):
     assert await recall.launch(wf, 2, batch="manual") == []
 
 
+async def test_superseded_version_offers_no_continue(client, monkeypatch):
+    """v2 自动算了一批、还剩几组没算，接着又发布了 v3：v2 那一版不再给「接着算」（v3 的召回覆盖更早的所有版本，同启动时
+    接着做只认当前发布版），写明去 v3 那一版看；手动点也照样拒绝，不再开「口径升到 v2」的待办。"""
+    await ledger_settings(auto_issue=False, issue_daily_limit=100_000, recall_limit=1)
+    wf = await S.publish()
+    await answer(monkeypatch)
+    await answer(monkeypatch, "2026-09-08", "2026-09-15")
+    await publish_v2(wf)
+    assert len(await run_recall(wf)) == 1
+    async with SessionLocal() as session:
+        view = await recall.batches(session, wf, 2)
+    assert view["remaining"] == 1 and view["can_continue"] is True and view["continue_reason"] is None
+    await S.publish(graph=S.caliber_graph(WITH_REFUNDED), version=3, workflow_id=wf)
+    async with SessionLocal() as session:
+        view = await recall.batches(session, wf, 2)
+    assert view["remaining"] == 1 and view["can_continue"] is False
+    assert view["continue_reason"] == "已有更新的发布版 v3，召回在 v3 那一版接着看"
+    res = await client.post(f"/api/ledger/recall/{wf}/2/continue")
+    assert res.status_code == 409 and res.json()["detail"] == view["continue_reason"], res.text
+    assert await recall.launch(wf, 2, batch="manual") == [], "直接调也不再发起"
+    async with SessionLocal() as session:
+        assert len(await recall.recall_runs(session, wf, 2)) == 1
+        current = await recall.batches(session, wf, 3)
+    assert current["can_continue"] is True and current["continue_reason"] is None
+
+
 async def test_zero_limit_lists_but_does_not_recompute(monkeypatch):
     await ledger_settings(auto_issue=False, issue_daily_limit=100_000, recall_limit=0)
     wf = await S.publish()
@@ -189,6 +216,9 @@ async def test_changed_numbers_open_a_recall_task_with_all_three_values(client, 
     assert await events(a1.id, EventType.LEDGER_RECALLED) == [], "数变了的不在原答案上记「不影响」"
     [task] = await recall_tasks(done.id)
     assert task.title == "口径「周销售」升到 v2，答案的数变了"
+    # 问数据的轮次、证据面板读的账本接口：这个答案有一条没处理的召回待办（界面链到待办箱），没有「已核对」
+    marks = (await client.get(f"/api/runs/{a1.id}/ledger")).json()["recall"]
+    assert marks == {"checked": [], "basis": [], "tasks": [{"id": task.id, "reason": "caliber", "to_version": 2}]}
     res = await client.get(f"/api/tasks/{task.id}")
     assert res.status_code == 200, res.text
     payload = res.json()["payload"]
@@ -220,9 +250,41 @@ async def test_unchanged_numbers_are_only_booked_on_the_answer(monkeypatch):
     [booked] = await events(a1.id, EventType.LEDGER_RECALLED)
     assert booked == {"role": "answer", "changed": False, "recall_run": done.id, "workflow_id": wf,
                       "from_version": 1, "to_version": 2, "post_seal": True}
+    # 账本接口带上「已按 v2 核对，不影响」：问数据的轮次、证据面板不用再去翻运行时间线
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        marks = (await c.get(f"/api/runs/{a1.id}/ledger")).json()["recall"]
+    [checked] = marks["checked"]
+    assert {k: checked[k] for k in ("workflow_id", "workflow_name", "from_version", "to_version", "changed",
+                                     "recall_run")} == {"workflow_id": wf, "workflow_name": "周销售", "from_version": 1,
+                                                        "to_version": 2, "changed": False, "recall_run": done.id}
+    assert checked["at"] and marks["basis"] == [] and marks["tasks"] == []
     # 再收一次尾不会重复记
     assert await recall.settle(done.id) is None
     assert len(await events(a1.id, EventType.LEDGER_RECALLED)) == 1
+
+
+@pytest.mark.parametrize("values", [{}, {"old_0": {"value": 1, "rendered": "1.00元"}}], ids=["none", "half"])
+async def test_unreadable_recall_card_is_a_failure_not_unchanged(monkeypatch, values):
+    """召回运行成功了、召回卡却读不出来（封存里找不到 recall 节点、读不出封存，或少了某个比较的旧值 / 新值）：照实记重算
+    失败，不当成「数没变」去给原答案盖「已核对，不影响」，也不开待办。"""
+    wf = await S.publish()
+    a1 = await answer(monkeypatch)
+    await publish_v2(wf)
+
+    async def unreadable(run_id):
+        return dict(values)
+
+    monkeypatch.setattr(recall, "card_values", unreadable)
+    [done] = await run_recall(wf)
+    assert done.status == "succeeded", done.error
+    [settled] = [d for d in await events(done.id, EventType.LEDGER_RECALLED) if d.get("role") == "recall"]
+    assert settled["outcome"] == "failed" and settled["changed"] is None and settled["error"] == "读不出召回卡"
+    assert await events(a1.id, EventType.LEDGER_RECALLED) == [], "读不出的不在原答案上记「不影响」"
+    assert await recall_tasks(done.id) == []
+    async with SessionLocal() as session:
+        view = await recall.batches(session, wf, 2)
+    [group] = view["groups"]
+    assert group["state"] == "failed" and group["reason"] == "重算失败：读不出召回卡"
 
 
 async def test_incompatible_entry_and_side_effects_are_not_recomputed(monkeypatch):
@@ -240,14 +302,59 @@ async def test_incompatible_entry_and_side_effects_are_not_recomputed(monkeypatc
     assert view["counts"]["not_recomputable"] == 1 and view["groups"][0]["reason"] == group.problem
     assert view["can_continue"] is False
 
-    wf2 = await S.publish(name="周销售（要审批）")
+
+
+async def test_human_node_elsewhere_still_recomputes_but_reissue_refuses(client, monkeypatch):
+    """新版图里在口径卡下游有审批（取数 → 口径卡 → 报告 → 人工确认 → 出口）：召回图只有两版的取数和口径卡，人工节点碰不到，
+    照样重算、数变了照样开待办（做法 7 不重算的只有三种：缺入口字段、数据部分不能复用、会写外部系统）；「按新版重新出具」
+    走完整的正式运行，仍然不代人审批，照实写不能出具。"""
+    wf = await S.publish(name="周销售（要审批）")
     await answer(monkeypatch)
     human = S.caliber_graph(WITH_REFUNDED)
-    human["nodes"].insert(3, S.node("ok", "human", mode="approve", title="确认"))
-    await S.publish(graph=human, version=2, workflow_id=wf2)
+    human["nodes"].insert(4, S.node("ok", "human", mode="approve", title="确认"))
+    human["edges"] = [{"source": a["id"], "target": b["id"]} for a, b in zip(human["nodes"], human["nodes"][1:])]
+    await S.publish(graph=human, version=2, workflow_id=wf)
     async with SessionLocal() as session:
-        plan = await recall.build_plan(session, wf2, 2)
-    assert plan.groups and all("人工节点" in (g.problem or "") for g in plan.groups)
+        plan = await recall.build_plan(session, wf, 2)
+    assert plan.groups and all(g.problem is None for g in plan.groups), [g.problem for g in plan.groups]
+    assert plan.version_problem == {}
+    [done] = await run_recall(wf)
+    assert done.status == "succeeded", done.error
+    assert not [n for n in done.graph["nodes"] if n["type"] == "human"], "召回图里没有人工节点"
+    [task] = await recall_tasks(done.id)
+    payload = (await client.get(f"/api/tasks/{task.id}")).json()["payload"]
+    reissue = next(a for a in payload["actions"] if a["decision"] == "reissue")
+    assert reissue["available"] is False and "人工节点" in reissue["reason"], reissue
+    res = await client.post(f"/api/tasks/{task.id}/respond", json={"decision": "reissue"})
+    assert res.status_code == 409 and "人工节点" in res.json()["detail"], res.text
+
+
+async def test_writing_to_an_external_system_is_not_recomputed(monkeypatch):
+    """新版图里调用工具节点绑的能力会写外部系统（capabilities.registry.writes_externally，同按新口径补算、按口径出具）：
+    照实记「无法重算」，不发起。"""
+    from types import SimpleNamespace
+
+    from app.capabilities import registry
+
+    wf = await S.publish()
+    await answer(monkeypatch)
+    graph = S.caliber_graph(WITH_REFUNDED)
+    graph["nodes"].insert(4, S.node("pay", "tool", tool="erp_pay", args={}))
+    graph["edges"] = [{"source": a["id"], "target": b["id"]} for a, b in zip(graph["nodes"], graph["nodes"][1:])]
+    await publish_v2(wf, graph=graph)
+    real = registry.get_capability
+
+    async def get_capability(session, name):
+        if name == "erp_pay":
+            return SimpleNamespace(name=name, effect="write", effect_system="write", endpoint_id=None)
+        return await real(session, name)
+
+    monkeypatch.setattr(registry, "get_capability", get_capability)
+    async with SessionLocal() as session:
+        plan = await recall.build_plan(session, wf, 2)
+    assert plan.groups and all("会写外部系统（erp_pay）" in (g.problem or "") for g in plan.groups), \
+        [g.problem for g in plan.groups]
+    assert await recall.launch(wf, 2) == []
 
 
 async def test_plan_from_formal_runs_and_exporters_as_owners(monkeypatch):
@@ -362,6 +469,74 @@ async def test_recall_notification_has_no_numbers(monkeypatch):
     assert "周销售" in mine[0]["title"] and "v2" in mine[0]["title"]
 
 
+async def test_recall_pushes_the_shared_channel_once_per_recall_run(monkeypatch):
+    """开登录时一组答案有几个主人就开几条待办，但全局渠道（团队群）按召回运行只收一条（答案、待办都按这次召回汇总，链到
+    待办箱）；订阅了 task.opened 的全局渠道也不再按每条待办各推一次。每个主人自己的个人渠道各收他那一条。"""
+    from app.core.crypto import encrypt
+    from app.db.models import NotifyChannel, User
+    from app.notify import service
+
+    sent: list[dict] = []
+
+    async def capture(channel, message):
+        sent.append({"channel": channel.name, **message})
+        from app.notify.core import Outcome
+
+        return Outcome(True, 200, 1, None)
+
+    monkeypatch.setattr("app.notify.send", capture)
+    wf = await S.publish()
+    first = await answer(monkeypatch)
+    second = await answer(monkeypatch)                       # 同一周：同一组，两个主人
+    made: list[str] = []
+    async with SessionLocal() as session:
+        for name, run_id in (("analyst_a", first.id), ("analyst_b", second.id)):
+            user = User(username=name, role="user")
+            session.add(user)
+            await session.flush()
+            (await session.get(Run, run_id)).started_by = name
+            channel = NotifyChannel(name=f"个人-{name}", scope="user", owner_id=user.id, format="generic",
+                                    url=encrypt(f"https://hooks.example.com/{name}"), events=["ledger.recall"])
+            session.add(channel)
+            await session.flush()
+            made.append(channel.id)
+        for name, events_ in (("团队-召回", ["ledger.recall", "task.opened"]), ("团队-待办", ["task.opened"])):
+            channel = NotifyChannel(name=name, scope="global", url=encrypt("https://hooks.example.com/team"),
+                                    events=events_)
+            session.add(channel)
+            await session.flush()
+            made.append(channel.id)
+        await session.commit()
+    monkeypatch.setenv("AGENTLAB_AUTH_MODE", "local")
+    try:
+        await publish_v2(wf)
+        [done] = await run_recall(wf)
+        await service.drain()
+    finally:
+        async with SessionLocal() as session:
+            for channel_id in made:
+                await session.delete(await session.get(NotifyChannel, channel_id))
+            await session.commit()
+    tasks = await recall_tasks(done.id)
+    assert len(tasks) == 2, "每个主人一条待办"
+    team = [m for m in sent if m["channel"] == "团队-召回"]
+    assert [m["event"] for m in team] == ["ledger.recall"], [m["event"] for m in team]
+    lines = dict(team[0]["lines"])
+    assert lines["答案"] == "2 个" and lines["待办"] == "2 条", lines
+    assert [label for label, _ in team[0]["links"]] == ["去待办箱"] or team[0]["links"] == []
+    assert [m["event"] for m in sent if m["channel"] == "团队-待办"] == ["task.opened"], "只订阅了新待办的团队渠道也只收一条"
+    for name in ("analyst_a", "analyst_b"):
+        mine = [m for m in sent if m["channel"] == f"个人-{name}"]
+        assert [m["event"] for m in mine] == ["ledger.recall"] and dict(mine[0]["lines"])["答案"] == "1 个", mine
+    # 账本接口里的召回待办只列看的这个人手上的：第一个答案的主人看得到自己那条，另一个主人看不到
+    from app.api.deps import Principal
+
+    async with SessionLocal() as session:
+        own = await recall.answer_marks(session, first.id, Principal(username="analyst_a", role="user", mode="local"))
+        other = await recall.answer_marks(session, first.id, Principal(username="analyst_b", role="user", mode="local"))
+    assert len(own["tasks"]) == 1 and own["tasks"][0]["reason"] == "caliber" and other["tasks"] == []
+
+
 # --------------------------------------------------------------------------
 # 目录事实被改、表结构变了
 # --------------------------------------------------------------------------
@@ -411,6 +586,13 @@ async def test_catalog_fact_change_marks_answers_and_notifies_only_on_new_errors
     assert await events(unrelated.id, EventType.LEDGER_BASIS_CHANGED) == [], "没查过这张表的不标"
     [task] = await recall_tasks(row.id)
     assert task.correlation_key.startswith("catalog:")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        marks = (await c.get(f"/api/runs/{row.id}/ledger")).json()["recall"]
+        quiet = (await c.get(f"/api/runs/{unrelated.id}/ledger")).json()["recall"]
+    [basis] = marks["basis"]
+    assert {k: basis[k] for k in ("kind", "items", "new_errors")} == {"kind": "catalog", "items": 1, "new_errors": 1}
+    assert basis["at"] and marks["tasks"] == [{"id": task.id, "reason": "catalog"}] and marks["checked"] == []
+    assert quiet == {"checked": [], "basis": [], "tasks": []}
     async with SessionLocal() as session:
         from app.api.deps import Principal
 
@@ -425,6 +607,89 @@ async def test_catalog_fact_change_marks_answers_and_notifies_only_on_new_errors
                                       if_version=entry.version, actor="tester")
     await recall.drain()
     assert len(await events(row.id, EventType.LEDGER_BASIS_CHANGED)) == 1
+
+
+async def test_catalog_edits_on_one_source_share_one_pass(engine_up, monkeypatch):
+    """批量审阅一口气改了同一个数据源的几张表：只在后台做一遍（同一个数据源排着做，几张表合在一次里查），查询快照按数据源
+    在库里筛，冻结的表结构快照（大库的能有几 MB）同一份只读一次。"""
+    from collections import Counter
+
+    from app.core import artifact_store
+    from app.data import catalog
+
+    source_id = await S.set_source(engine_up)
+    await _catalog(source_id, {"business_date": _item({"column": "paid_at"}),
+                               "columns": {"amount": {"measure": _item("flow")}}})
+    async with SessionLocal() as session:
+        await catalog.write_entry(session, source_id, "stores", {"valid_filter": _item("id > 0")}, if_version=0,
+                                  actor="tester")
+    week1 = await answer(monkeypatch)
+    week2 = await answer(monkeypatch, "2026-09-08", "2026-09-15")
+    shops = await S.explore(monkeypatch, S.ELSEWHERE, text="门店 [[v:Q1.r0.n]] 家。", origin="chat")
+    scans: list[list[str]] = []
+    loads: list[str] = []
+    real_scan, real_load = recall._explore_snapshots, artifact_store.load
+
+    async def scan(session, source, tables, **kw):
+        scans.append(sorted(tables))
+        return await real_scan(session, source, tables, **kw)
+
+    def load(artifact_id):
+        loads.append(artifact_id)
+        return real_load(artifact_id)
+
+    monkeypatch.setattr(recall, "_explore_snapshots", scan)
+    monkeypatch.setattr(artifact_store, "load", load)
+    async with SessionLocal() as session:
+        orders = await catalog.read_entry(session, source_id, "orders")
+        stores = await catalog.read_entry(session, source_id, "stores")
+    rejected = {**orders.notes, "business_date": {**orders.notes["business_date"], "status": "rejected"}}
+    # 批量审阅逐表写完逐表调审阅之后的钩子（catalog.after_review → recall.after_review），中间不让出事件循环
+    assert recall.after_review(source_id, "orders", orders.notes, rejected, orders.version + 1) == 1
+    assert recall.after_review(source_id, "stores", stores.notes,
+                               {"valid_filter": {**stores.notes["valid_filter"], "status": "rejected"}},
+                               stores.version + 1) == 1
+    await recall.drain()
+    assert scans == [["orders", "stores"]], "同一个数据源的几张表合成一遍"
+    for run in (week1, week2):
+        [marked] = await events(run.id, EventType.LEDGER_BASIS_CHANGED)
+        assert marked["table"] == "orders" and marked["items"][0]["path"] == "business_date"
+    [marked] = await events(shops.id, EventType.LEDGER_BASIS_CHANGED)
+    assert marked["table"] == "stores" and marked["items"][0]["path"] == "valid_filter"
+    schemas = set()
+    for snapshot in {a for a in loads}:
+        content = real_load(snapshot)
+        if isinstance(content, dict) and content.get("schema_artifact"):
+            schemas.add(content["schema_artifact"])
+    assert schemas and all(Counter(loads)[sid] == 1 for sid in schemas), Counter(loads)
+
+
+async def test_snapshot_scan_pages_newest_first_and_stops_when_full(engine_up, monkeypatch):
+    """翻查询快照：只取这个数据源的、新的在前，每张表凑够 BASIS_MAX_RUNS 次运行就不再往下翻。"""
+    from app.db.models import DataSource
+
+    source_id = await S.set_source(engine_up)
+    runs = [await answer(monkeypatch, f"2026-09-0{d}", "2026-09-08") for d in (1, 2, 3)]
+    pages: list[int] = []
+    monkeypatch.setattr(recall, "BASIS_MAX_RUNS", 2)
+    monkeypatch.setattr(recall, "SNAPSHOT_PAGE", 1)
+    async with SessionLocal() as session:
+        source = await session.get(DataSource, source_id)
+        real_execute = session.execute
+
+        async def counted(stmt, *args, **kwargs):
+            pages.append(1)
+            return await real_execute(stmt, *args, **kwargs)
+
+        monkeypatch.setattr(session, "execute", counted)
+        found = await recall._explore_snapshots(session, source, ["ORDERS"])
+        read = len(pages)
+        other = DataSource(id="elsewhere", name="elsewhere")
+        nothing = await recall._explore_snapshots(session, other, ["orders"])
+    assert [r for r, _ in found["ORDERS"]] == [runs[2].id, runs[1].id], "新的在前、凑够两次运行就停"
+    # 一页一行：第三页读到第三次运行时两次已经凑够，停下，不再翻第四页
+    assert read == 3, f"凑够了不再往下翻（翻了 {read} 页）"
+    assert nothing == {"orders": []}, "别的数据源的快照不读回来"
 
 
 def test_fact_changes_only_counts_items_that_affect_numbers():

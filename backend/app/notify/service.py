@@ -347,7 +347,12 @@ async def notify_recall(task_id: str, users: list[str]) -> int:
     自己的个人渠道；然后照别的待办推 task.opened（已经推过 ledger.recall 的渠道不再推，同一个渠道只推一次）。目录、表结构变了
     的那两种只推 task.opened。
 
-    消息照模块说明的规矩（X6）：口径名（搭建时起的工作流名）、新旧版本号、这条待办列了几个答案、召回编号、去处理的链接；不放
+    全局渠道按这一批待办只推一次（同一次召回运行、同一个来由开的那几条，recall.batch_of_key）：开登录时一组答案有几个主人就
+    开几条待办，团队群却只该收到一条——只在这一批里最早开的那条（开出时间、id 排序，几条并发推也认同一条）上推全局渠道，
+    答案、待办按这一批汇总，链到待办箱（各人在那里看到派给自己的那条）；别的几条连 task.opened 也不再推全局渠道。个人渠道
+    照旧每个主人各一条，只数他的答案、链到他的那条待办。
+
+    消息照模块说明的规矩（X6）：口径名（搭建时起的工作流名）、新旧版本号、几个答案（几条待办）、召回编号、去处理的链接；不放
     旧口径的值、新口径的值、差值和原答案的值。返回推了几个渠道。"""
     from app.ledger import recall
 
@@ -361,26 +366,51 @@ async def notify_recall(task_id: str, users: list[str]) -> int:
         if task is None:
             return 0
         run = await session.get(Run, task.run_id)
-        reason = (task.correlation_key or "").split(":", 1)[0]
+        key = task.correlation_key or ""
+        reason = key.split(":", 1)[0]
+        batch = recall.batch_of_key(key)
+        siblings = [t for t, k in (await session.execute(
+            select(Task.id, Task.correlation_key).where(Task.run_id == task.run_id, Task.kind == recall.TASK_KIND)
+            .order_by(Task.created_at, Task.id))).all() if recall.batch_of_key(k or "") == batch]
+        first = not siblings or siblings[0] == task_id
         channels = await _channels(session, event, run, users) if reason == "caliber" else []
+        # 不是这一批最早的那条：全局渠道已经（或正由那一条）推过了，这条只推个人渠道，task.opened 也跳过全局渠道
+        shared = [] if first else list((await session.execute(select(NotifyChannel.id).where(
+            NotifyChannel.scope == "global"))).scalars())
+        channels = [c for c in channels if first or c.scope != "global"]
         origin = run.origin if run is not None and isinstance(run.origin, dict) else {}
         name = str(await session.scalar(select(Workflow.name).where(Workflow.id == origin.get("workflow_id")))
                    or "") if origin.get("workflow_id") else ""
         base = await _base_url(session) if channels else None
     pushed = 0
     if channels:
-        answers = len(recall._uses_of(origin, recall._owner_of_key(task.correlation_key or "")))
-        lines = [("状态", "待处理"), ("口径", f"「{name[:80]}」"),
-                 ("版本", f"v{origin.get('from_version')} → v{origin.get('to_version')}"), ("答案", f"{answers} 个"),
-                 ("召回", f"#{task.run_id[:6]}")]
-        message = {"event": event, "status": "pending", "ok": False,
-                   "title": recall.CHANGED_TITLE.format(name=name[:80] or "口径", version=origin.get("to_version")),
-                   "lines": lines, "links": [("去处理", f"{base}/apps/inbox/{task_id}")] if base else [],
-                   "subject": {"task_id": task_id, "run_id": task.run_id, "workflow_id": origin.get("workflow_id")}}
-        pushed = await _push(channels, message, subject_kind="task", subject_id=task_id, event=event,
-                             run_id=task.run_id, task_id=task_id)
+        head = [("状态", "待处理"), ("口径", f"「{name[:80]}」"),
+                ("版本", f"v{origin.get('from_version')} → v{origin.get('to_version')}")]
+        tail = [("召回", f"#{task.run_id[:6]}")]
+        mine = len(recall._uses_of(origin, recall._owner_of_key(key)))
+        everyone = len(recall._uses_of(origin, ("anyone", "")))
+
+        def message(answers: int, tasks: int, link: tuple[str, str] | None) -> dict[str, Any]:
+            return {"event": event, "status": "pending", "ok": False,
+                    "title": recall.CHANGED_TITLE.format(name=name[:80] or "口径", version=origin.get("to_version")),
+                    "lines": [*head, ("答案", f"{answers} 个"), *([("待办", f"{tasks} 条")] if tasks > 1 else []), *tail],
+                    "links": [link] if base and link else [],
+                    "subject": {"task_id": task_id, "run_id": task.run_id, "workflow_id": origin.get("workflow_id")}}
+
+        own = ("去处理", f"{base}/apps/inbox/{task_id}")
+        group = [c for c in channels if c.scope == "global"]
+        if group:
+            # 这一批只有这一条（关登录时派给任何人）就链到它；几条的链到待办箱，各人看派给自己的那条
+            many = len(siblings) > 1
+            pushed += await _push(group, message(everyone, len(siblings), ("去待办箱", f"{base}/apps?tab=inbox")
+                                                 if many else own),
+                                  subject_kind="task", subject_id=task_id, event=event, run_id=task.run_id,
+                                  task_id=task_id)
+        if personal := [c for c in channels if c.scope != "global"]:
+            pushed += await _push(personal, message(mine, 1, own), subject_kind="task", subject_id=task_id,
+                                  event=event, run_id=task.run_id, task_id=task_id)
     return pushed + await notify_task(task_id, "task.opened", users=users,
-                                      exclude=frozenset(c.id for c in channels))
+                                      exclude=frozenset(c.id for c in channels) | frozenset(shared))
 
 
 async def notify_run(run_id: str, event: str) -> int:

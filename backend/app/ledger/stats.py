@@ -11,8 +11,8 @@
   的查询里各自的比率；证明等价的绑定是在哪一级配上的；没证明的原因（不可比、参数绑不上、配上了但不等价）；不等价的差异类型
   分布（time / filter / aggregate / join / other / parse，每份口径的差异每类只计一次）；逐个数的标签各几个、整题等价几次。
 - E2 对账：对账运行（origin=reconcile，第 3 波起由 ledger/reconcile 发起）发起、完成、失败各几次，对过账的答案几个，其中参数
-  经人核对过的、对照的指标由人选的各几次；相关口径的差异说明里兜底说明的占比。「说明有用 / 看不懂」的反馈要等对账面板
-  （第 4 波）记成对账运行上的封存后事件，这之前照实写没有数据。
+  经人核对过的、对照的指标由人选的各几次；相关口径的差异说明里兜底说明的占比；对账结果上「说明有用 / 看不懂」的反馈
+  （第 4 波，ledger/feedback：对账运行上的封存后事件 ledger.feedback，每人只算最后一次）各几个、有用的比率。
 - E3 重复度：问数据运行里执行过的查询按（数据源、normalize_sql 文本）分组，出现在 ≥ REPEAT_RUNS 次运行、来自 ≥ REPEAT_CONVERSATIONS
   段对话的算重复的形状，给出这样的形状几个、有重复形状的运行占几成；问题聚类（app/chat/questions：全站唯一的聚类，只取问题
   原文、不含 history、排除系统派生的运行）里 ≥ REPEAT_RUNS 个问题的类占几成。认证队列的转化（第 3 波，ledger/certify）：固化成
@@ -42,8 +42,6 @@ ASPECT_GROUP = {"time": "time", "time_range": "time", "filter": "filter", "aggre
                 "group_by": "aggregate", "join": "join", "tables": "join", "parse": "parse"}
 DIFF_GROUPS = ("time", "filter", "aggregate", "join", "other", "parse")
 STATUSES = ("proven", "composed", "related", "none", "skipped")
-#: 没有数据时的说法（这一块的功能还没做）
-NOT_YET_RECONCILE = "对账面板的反馈在第 4 波接上，目前没有数据"
 #: 聚类最多取几个问题（同治理接口的上限）
 QUESTION_LIMIT = 500
 
@@ -154,8 +152,11 @@ async def _e2(session: Any, contents: list[dict[str, Any]], **scope: Any) -> dic
             stmt = stmt.where(Run.created_at >= scope["since"])
         if scope.get("until") is not None:
             stmt = stmt.where(Run.created_at < scope["until"])
+    from app.ledger import feedback as ledger_feedback
+
     by_status = {s: int(n) for s, n in (await session.execute(stmt.group_by(Run.status))).all()}
     origins = [o for (o,) in (await session.execute(stmt.with_only_columns(Run.origin))).all() if isinstance(o, dict)]
+    reconcile_ids = [r for (r,) in (await session.execute(stmt.with_only_columns(Run.id))).all()]
     answers = {o.get("source_run") for o in origins if o.get("source_run")}
     explained = fallback = 0
     for content in contents:
@@ -170,7 +171,7 @@ async def _e2(session: Any, contents: list[dict[str, Any]], **scope: Any) -> dic
             "pairs_chosen": sum(1 for o in origins if o.get("pairs_chosen")),
             "explained": explained, "fallback": fallback,
             "fallback_rate": _ratio(fallback, explained),
-            "feedback": {"available": False, "note": NOT_YET_RECONCILE}}
+            "feedback": await ledger_feedback.counts(session, reconcile_ids)}
 
 
 #: 查询快照 → (数据源, 形状)。工件按内容寻址、不会变，记下来不会过期

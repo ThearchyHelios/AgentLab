@@ -102,6 +102,10 @@ class EventType(StrEnum):
     # structure 用到的表或列被删、列的类型变了；values 触及有效记录条件的新码值；catalog_edit 处理变化时改了目录。带数据源、
     # 表、哪几项（路径和叫法），按新目录跑 SQL 检查新出现的错误级问题条数。同上，封存之后追加，不进封存范围
     LEDGER_BASIS_CHANGED = "ledger.basis_changed"
+    # 对账结果上的「说明有用 / 看不懂」（02 做法 10 的 E2，ledger/feedback）：追加在对账运行（origin_kind=reconcile）上，
+    # {verdict: useful | unclear, by, verified, source_run}。同一个人改主意再记一条，统计只算他最后一次。同上，封存之后
+    # 追加，是批注不是证据
+    LEDGER_FEEDBACK = "ledger.feedback"
 
     # 应用平台（docs/design/app-platform-and-look.md §3.11）
     # 运行来源：发起时写进 launch_run 的 notes，在封存范围内（engine/origin.py）

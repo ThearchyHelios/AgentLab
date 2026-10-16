@@ -1197,6 +1197,10 @@ def _summary(etype: str, data: Any) -> str:
         items = data.get("items")
         count = len(items) if isinstance(items, list) else 0
         return f"依据的{kind or '东西'}有变" + (f"（{count} 项）" if count else "")
+    if etype == EventType.LEDGER_FEEDBACK:
+        # 对账结果上的反馈（next-round 02 做法 10）：只说是哪一种，不带谁给的
+        verdict = {"useful": "说明有用", "unclear": "看不懂"}.get(str(data.get("verdict") or ""))
+        return f"反馈：{verdict}" if verdict else "对账说明的反馈"
     if etype == EventType.LOG and isinstance(data.get("message"), str):
         return _clip(data["message"])
     return ""
