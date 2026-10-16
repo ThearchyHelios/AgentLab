@@ -245,6 +245,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("schedules", "target_kind", "VARCHAR(20) DEFAULT 'workflow'"),
     ("schedules", "target_id", "VARCHAR(32)"),
     ("schedule_fires", "eval_run_id", "VARCHAR(32)"),
+    # 第 2 波：服务账号（users.kind）；剖析上传表格源时的快照
+    ("users", "kind", "VARCHAR(20) DEFAULT 'person'"),
+    ("catalog_profile_tasks", "snapshot_id", "VARCHAR(32)"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。
@@ -259,6 +262,8 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
     ("ix_runs_wf_ver_status", "runs", ("workflow_id", "version", "status")),
     ("ix_conversations_app_id", "conversations", "app_id"),
     ("ix_conversations_created_by", "conversations", "created_by"),
+    # 口径账本按种类反查工件（kind=caliber_match，next-round 02 做法 2）
+    ("ix_artifacts_kind", "artifacts", "kind"),
 ]
 
 

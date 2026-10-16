@@ -28,6 +28,8 @@ class User(Base, TimestampMixin):
     display_name: Mapped[str] = mapped_column(String(100), default="")
     email: Mapped[str | None] = mapped_column(String(200), default=None)
     role: Mapped[str] = mapped_column(String(20), default="user")
+    # person 人；service 服务账号（next-round 04 A1）：管理员建，没有口令、不能登录，只持有访问密钥
+    kind: Mapped[str] = mapped_column(String(20), default="person")
     # local 模式：hashlib.scrypt 的结果（含盐和参数）；OIDC 用户为空
     password_hash: Mapped[str | None] = mapped_column(Text, default=None)
     oidc_issuer: Mapped[str | None] = mapped_column(String(300), default=None)

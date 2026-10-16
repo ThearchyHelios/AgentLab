@@ -18,6 +18,8 @@ from app.api import (
     actions as actions_api, apps as apps_api, auth as auth_api, capabilities as capabilities_api, hooks as hooks_api,
     identity as identity_api, ledger as ledger_api, notify as notify_api, tasks as tasks_api,
 )
+# 下一轮第 2 波（docs/design/next-round）：评测、访问密钥
+from app.api import access_keys as access_keys_api, evals as evals_api
 # 普通用户建应用（docs/design/normal-user-apps.md §3.10）：蓝图、模板、文件、个人应用。权限在接口里按蓝图的范围和拥有者判
 from app.api import (
     blueprints as blueprints_api, copilot_blueprint, files as files_api, personal as personal_api,
@@ -214,6 +216,8 @@ for router, guard in (
     (bundle.router, [*_BUILDER, private_run_scope]),
     (inquiry.router, [*_BUILDER, private_run_scope]),
     (whatif.router, [*_BUILDER, private_run_scope]),
+    # 口径账本按运行读的接口（/api/runs/{run_id}/ledger…）：和证据同一道门
+    (ledger_api.runs_router, [evidence_scope]),
     (runs.router, [run_scope]),
     (runs.approvals_router, _BUILDER),
     (evidence.router, [evidence_scope]),
@@ -262,6 +266,9 @@ for router, guard in (
     (hooks_api.router, []),
     (notify_api.router, _USER),
     (ledger_api.router, _BUILDER),
+    # 下一轮第 2 波：评测只给搭建者；访问密钥登录即可，接口里再按本人 / 管理员判
+    (evals_api.router, _BUILDER),
+    (access_keys_api.router, _USER),
 ):
     app.include_router(router, dependencies=guard)
 

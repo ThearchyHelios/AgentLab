@@ -521,6 +521,8 @@ class CatalogProfileTask(Base):
     version: Mapped[int] = mapped_column(Integer, default=0)
     # 整张表的原因：表结构里没有、视图、空表、没有可剖析的项、写入一直冲突、停止 / 中断 / 止损
     error: Mapped[str | None] = mapped_column(Text, default=None)
+    # 剖析上传表格源时那一刻的快照（数据库源为空）：上传表格换了版本之后，旧版本的剖析事实不再交给 look（next-round 遗留 e）
+    snapshot_id: Mapped[str | None] = mapped_column(String(32), default=None)
     started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
 
@@ -1081,3 +1083,6 @@ from app.db.models_process import (  # noqa: E402,F401
 from app.db.models_blueprints import (  # noqa: E402,F401
     Blueprint, BlueprintEvent, PublishPlan, RecordsTable, StoredFile,
 )
+# 下一轮第 2 波（docs/design/next-round）：数据源对象索引与后台探查（models_sources）、评测（models_eval）。整模块导入，
+# 各自的模型类由那两个文件自己登记，这里不逐个列名
+from app.db import models_eval, models_sources  # noqa: E402,F401

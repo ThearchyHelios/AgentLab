@@ -16,6 +16,9 @@ from app.db.models import Workflow
 from app.db.models_process import ActionRecord
 
 router = APIRouter(prefix="/api/ledger", tags=["ledger"])
+#: 口径账本里按运行读的那几个（一个答案里每个数的口径标签等，docs/design/next-round/02-口径账本.md）：挂在
+#: /api/runs/{run_id}/ledger… 下，和证据接口同一道门（main.py 挂 evidence_scope：使用者只读、而且要能读这次运行）
+runs_router = APIRouter(prefix="/api/runs", tags=["ledger"])
 
 
 @router.get("/workflow-versions/{workflow_id}/{version}")
