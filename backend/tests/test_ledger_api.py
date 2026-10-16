@@ -102,11 +102,14 @@ async def test_a_run_that_just_finished_and_is_about_to_be_sealed_is_pending(cli
     await ledger_match.drain()
     from app.db.models import Run
 
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
     async with SessionLocal() as session:
         fresh = Run(workflow_name="刚跑完", status="succeeded", run_class="exploratory", origin_kind="chat", graph={},
-                    input={}, output={})
+                    input={}, output={}, finished_at=now)
         failed = Run(workflow_name="失败了", status="failed", run_class="exploratory", origin_kind="chat", graph={},
-                     input={}, output={})
+                     input={}, output={}, finished_at=now)
         session.add_all([fresh, failed])
         await session.commit()
         fresh_id, failed_id = fresh.id, failed.id
@@ -115,6 +118,32 @@ async def test_a_run_that_just_finished_and_is_about_to_be_sealed_is_pending(cli
     body = await ledger_of(client, fresh_id)
     assert body["state"] == "pending" and scheduled == [], body
     assert (await ledger_of(client, failed_id))["state"] == "ineligible"
+
+
+async def test_a_run_that_finished_long_ago_and_was_never_sealed_says_so(client, monkeypatch):
+    """「刚跑完、马上封存」只是结束后的那一会儿：成功结束了好一阵、一直没封存的（封存时出了错、封存这件事之前的老数据），
+    再答 pending 就是让页面一直转圈、等两分钟、点「再取一次」还是 pending。照实说没封存（ineligible，NOT_SEALED）；
+    结束时间没记的同样不当成刚结束。"""
+    from datetime import datetime, timedelta, timezone
+
+    from app.db.models import Run
+    from app.ledger import view as ledger_view
+
+    old = datetime.now(timezone.utc) - timedelta(seconds=ledger_view.SEAL_GRACE_S + 60)
+    async with SessionLocal() as session:
+        stale = Run(workflow_name="很早以前跑完", status="succeeded", run_class="exploratory", origin_kind="chat",
+                    graph={}, input={}, output={}, finished_at=old)
+        undated = Run(workflow_name="没记结束时间", status="succeeded", run_class="exploratory", origin_kind="chat",
+                      graph={}, input={}, output={})
+        session.add_all([stale, undated])
+        await session.commit()
+        stale_id, undated_id = stale.id, undated.id
+    scheduled: list[str] = []
+    monkeypatch.setattr(ledger_match, "schedule", lambda run_id, **kw: scheduled.append(run_id) or True)
+    for run_id in (stale_id, undated_id):
+        body = await ledger_of(client, run_id)
+        assert body["state"] == "ineligible" and body["reason"] == ledger_match.NOT_SEALED, body
+    assert scheduled == []
 
 
 async def test_runs_that_are_not_compared_say_why(client, monkeypatch):

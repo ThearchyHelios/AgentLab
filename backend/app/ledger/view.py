@@ -10,6 +10,7 @@ issued 是这次运行按口径出具过的正式运行，reconciled 是对过�
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -22,6 +23,10 @@ from app.ledger import store
 
 #: state：matched 比对过；pending 已排队按需比对；ineligible 这次运行不比对（reason 写为什么）；unreadable 比对记录读不出
 STATES = ("matched", "pending", "ineligible", "unreadable")
+
+#: 成功结束、还没封存的运行，结束后这么多秒内答 pending（runner 落库之后马上封存，正常是几秒）。过了还没封存的是封存出了错、
+#: 或者是封存之前的老数据：再答 pending，页面就一直转圈、等满两分钟（store/ledger.ts 的等待上限）再取还是 pending——照实说没封存
+SEAL_GRACE_S = 120
 
 
 class _Hide:
@@ -92,14 +97,20 @@ def _labels_view(content: dict[str, Any], hider: _Hide, names: dict[str, str]) -
 
 def _stamp(recorded: store.Recorded) -> dict[str, Any]:
     """比对的来历：哪份工件、哪一版算法、谁触发的、什么时候追加的；事后补比的写明按现在的口径回看。"""
-    from datetime import datetime, timezone
-
     at = datetime.fromtimestamp(recorded.ts, timezone.utc).isoformat(timespec="seconds") \
         if isinstance(recorded.ts, (int, float)) else None
     return {"artifact": recorded.artifact, "algo": recorded.algo, "trigger": recorded.trigger, "retro": recorded.retro,
             "matched_at": at, "post_seal": True, "note": ledger_labels.POST_SEAL_NOTE,
             **({"retro_note": ledger_labels.CERTIFIED_NOTE if recorded.trigger == "certified"
                 else ledger_labels.RETRO_NOTE} if recorded.retro else {})}
+
+
+def _just_finished(finished_at: datetime | None) -> bool:
+    """运行是不是刚结束（SEAL_GRACE_S 以内）。没记结束时间的不算；库里读回 naive 的按 UTC 算（同 db/base.UTCDateTime）。"""
+    if finished_at is None:
+        return False
+    at = finished_at if finished_at.tzinfo is not None else finished_at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - at).total_seconds() <= SEAL_GRACE_S
 
 
 async def run_view(run_id: str) -> dict[str, Any]:
@@ -117,9 +128,10 @@ async def run_view(run_id: str) -> dict[str, Any]:
     if recorded is None:
         why = ledger_match.ineligible(run)
         if why == ledger_match.NOT_SEALED and run.status == "succeeded" \
-                and ledger_match.wanted(run.run_class, run.origin_kind):
+                and ledger_match.wanted(run.run_class, run.origin_kind) and _just_finished(run.finished_at):
             # runner 先发 run.finished、落库，再封存、再排上比对（engine/runner._finalize）：页面收到 run.finished 立刻来取，
-            # 这一下还没封存。这不是「不比对」，是封存完就比——照实答 pending，页面按退避接着取；这里不另排按需比对
+            # 这一下还没封存。这不是「不比对」，是封存完就比——照实答 pending，页面按退避接着取；这里不另排按需比对。
+            # 只限刚结束的那一会儿（SEAL_GRACE_S），早就结束、一直没封存的照实答 ineligible
             return {**base, "state": "pending"}
         sealed = await _sealed(run_id) if why is None else None
         if sealed is not None and not sealed.queries:
