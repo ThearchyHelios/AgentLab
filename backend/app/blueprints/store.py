@@ -183,7 +183,7 @@ async def apply_ops_and_save(session: AsyncSession, blueprint: Any, ops: list[di
         try:
             op = await _verified_reuse(session, raw)
             before = _at(spec, op.get("path"))
-            spec = apply_bp_op(spec, op, source=source)
+            spec = apply_bp_op(spec, op, source=source, graph=blueprint.graph)
         except BpRefused as e:
             if not partial:
                 raise
@@ -313,7 +313,7 @@ def blueprint_issues_of(blueprint: Any) -> list[dict[str, Any]]:
     from app.plain import with_plain
 
     spec = blueprint.spec or {}
-    issues = blueprint_issues(spec, for_="personal" if blueprint.scope == "personal" else "publish")
+    issues = blueprint_issues(spec, for_="personal" if blueprint.scope == "personal" else "publish", graph=blueprint.graph)
     for joint_id, state in (blueprint.joints or {}).items():
         if isinstance(state, dict) and state.get("status") in ("pending", "refused"):
             issues.append({"code": "tpl.joint_unfilled" if state["status"] == "pending" else "tpl.joint_refused",
@@ -375,11 +375,19 @@ async def blueprint_view(session: AsyncSession, blueprint: Any) -> dict[str, Any
     return blueprint_out(blueprint, extra=await data_source_issues(session, blueprint))
 
 
+def _derived_people(blueprint: Any) -> list[dict[str, Any]]:
+    from app.blueprints.templates import freeform
+    from app.blueprints.templates._common import with_graph
+
+    return freeform.people_rows(with_graph(blueprint.spec or {}, blueprint.graph))
+
+
 def blueprint_out(blueprint: Any, *, issues: bool = True, extra: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """一张蓝图交给前端的样子（frontend/src/typesBlueprint.ts 的 Blueprint）。关节只给状态和模板声明的说法、类型、分组
     （JointState：status、by、note、label、kind、group），不给填的值（值在图上看）。reconciler_needed：写回卡片上要不要
-    摆「结果不明时谁去核实」（目标能力没登记查询，templates/_common.needs_reconciler），界面不自己判。"""
-    from app.blueprints.templates._common import needs_reconciler
+    摆「结果不明时谁去核实」（目标能力没登记查询，templates/_common.needs_reconciler），界面不自己判。derived_people：自由形
+    按导入的图列出的「谁来做」（templates/freeform.people_rows，05-已知遗留 (d)），别的模板为空。"""
+    from app.blueprints.templates._common import is_freeform, needs_reconciler, with_graph
 
     joints = {jid: {k: v for k, v in state.items() if k in ("status", "by", "note", "label", "kind", "group")}
               for jid, state in (blueprint.joints or {}).items() if isinstance(state, dict)}
@@ -389,7 +397,9 @@ def blueprint_out(blueprint: Any, *, issues: bool = True, extra: list[dict[str, 
         "template_version": blueprint.template_version, "source": blueprint.source or {},
         "conversation_id": blueprint.conversation_id, "workflow_id": blueprint.workflow_id, "app_id": blueprint.app_id,
         "last_trial_run_id": blueprint.last_trial_run_id, "graph_hash": blueprint.graph_hash, "joints": joints,
-        "copied_from": blueprint.copied_from, "reconciler_needed": needs_reconciler(blueprint.spec or {}),
+        "copied_from": blueprint.copied_from,
+        "reconciler_needed": needs_reconciler(with_graph(blueprint.spec or {}, blueprint.graph)),
+        "derived_people": _derived_people(blueprint) if is_freeform(blueprint.spec or {}) else None,
         "created_at": blueprint.created_at.isoformat() if blueprint.created_at else None,
         "updated_at": blueprint.updated_at.isoformat() if blueprint.updated_at else None,
     }

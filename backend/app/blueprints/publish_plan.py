@@ -75,6 +75,8 @@ TRIAL_REJECTED = "plan.trial_rejected"
 TRIAL_DIFFERS = "plan.trial_differs"
 #: 蓝图检查：写回的结果不明时没人核实（blueprints/ops.blueprint_issues）
 RECONCILER_UNBOUND = "bp.reconciler_unbound"
+#: 蓝图检查：「谁来做」有一步还没定由谁处理；自由形的带着 slot（哪个岗位，核实人是 apps/derive.RECONCILER）
+PEOPLE_UNBOUND = "bp.people_unbound"
 ADMIN_REQUIRED = "plan.admin_required"
 DOWNGRADE_ADMIN = "plan.downgrade_admin"
 PREFLIGHT = "plan.preflight"
@@ -239,8 +241,10 @@ async def _simulated_pins(session: AsyncSession, spec: dict[str, Any], target: _
 def bindings_of(bp: Blueprint) -> dict[str, Any]:
     """岗位绑定：「谁来做」卡片上写了具体的人或组的，按模板定的岗位名绑上（templates/_common.bindings_of）。"""
     from app.blueprints.templates._common import bindings_of as from_cards
+    from app.blueprints.templates._common import with_graph
 
-    return from_cards(bp.spec or {})
+    # 带上蓝图存的图：自由形的核实人要不要绑按导入的图算（05-已知遗留 (d)）
+    return from_cards(with_graph(bp.spec or {}, bp.graph))
 
 
 def grant_items(bp: Blueprint) -> list[tuple[str, str, str]]:
@@ -354,6 +358,14 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
 
         issues = [i for i in issues if i.get("code") != "app.reconciler_unbound"
                   and not (i.get("code") == "app.slot_unbound" and i.get("path") == f"slots.{RECONCILER}")]
+    if unbound := {str(i["slot"]) for i in out if i.get("code") == PEOPLE_UNBOUND and i.get("slot")}:
+        # 自由形的「谁来做」：岗位、核实人没绑，蓝图检查已经指到卡片上那一行（bp.people_unbound 带着 slot），应用检查说的是
+        # 同一件事，不再重复列（同上面核实岗位的办法）
+        from app.apps.derive import RECONCILER
+
+        issues = [i for i in issues if not (i.get("code") == "app.slot_unbound"
+                                            and str(i.get("path") or "").removeprefix("slots.") in unbound)
+                  and not (i.get("code") == "app.reconciler_unbound" and RECONCILER in unbound)]
     out += [{**i, "source": "app"} for i in issues]
     # 授权：给的人和组要在名录里（同授权接口）
     _, problem = await grants_problem(session, grant_items(bp))

@@ -293,7 +293,7 @@ async def blueprint_stream(payload: BlueprintStreamIn, session: AsyncSession = D
     system = "\n\n".join(part for part in (
         BLUEPRINT_SYSTEM_PROMPT, _templates_text(personal=personal), await looks.overview(), BLUEPRINT_PROTOCOL_PROMPT,
         looks.guide(), BLUEPRINT_LOOK_WHEN_PROMPT) if part)
-    missing = [i for i in blueprint_issues(spec, for_="trial") if i["level"] == "error"]
+    missing = [i for i in blueprint_issues(spec, for_="trial", graph=row.graph) if i["level"] == "error"]
     human = copilot._with_history(BLUEPRINT_REQUEST_PROMPT.format(
         spec=json.dumps(spec, ensure_ascii=False), instruction=instruction,
         issues=BLUEPRINT_ISSUES_PROMPT.format(lines="\n".join(f"- {i['path']} {i['message']}" for i in missing))

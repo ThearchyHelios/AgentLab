@@ -198,7 +198,7 @@ def instantiate(blueprint: dict[str, Any], *, filled: dict[str, Any] | None = No
     spec = _spec_of(blueprint)
     ref = spec.get("template") or {}
     template = get_template(str(ref.get("id") or ""))
-    problems = [i for i in blueprint_issues(spec, for_="trial") if i["level"] == "error"]
+    problems = [i for i in blueprint_issues(spec, for_="trial", graph=graph) if i["level"] == "error"]
     if template is None:
         from app.apps.spec import empty_spec
 

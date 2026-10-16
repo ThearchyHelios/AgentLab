@@ -520,8 +520,47 @@ def _container(spec: dict[str, Any], tokens: list[str]) -> tuple[dict[str, Any],
     raise BpRefused(f"不能改这个位置：/{'/'.join(tokens)}")
 
 
-def _set(spec: dict[str, Any], tokens: list[str], value: Any, source: str) -> None:
+def is_freeform(spec: dict[str, Any]) -> bool:
+    from app.blueprints.templates._common import is_freeform as imports_graph
+
+    return imports_graph(spec)
+
+
+#: 自由形的「谁来做」只定由谁做（05-已知遗留 (d)、遗留-Q5）
+FREEFORM_PEOPLE_ONLY_WHO = "自由形蓝图的「谁来做」只定每一步由谁做；会签、时限、超时、加减步骤在画布上改"
+FREEFORM_PEOPLE_USER = "「谁来做」要由你来定：派活给谁是人的决定，助手不替你选"
+
+
+def _freeform_who(spec: dict[str, Any], tokens: list[str], value: Any, source: str, graph: Any) -> None:
+    """自由形的 /people/<i>/who：i 是按导入的图列出的第几个岗位（freeform.people_rows 的岗位行，界面照那一份的 path 写），
+    绑定存进 spec.people[]（id 就是岗位名、只有 who）。只收人和组：岗位、发起人在图上已经写定了。"""
+    from app.blueprints.templates import freeform
+    from app.blueprints.templates._common import with_graph
+
+    if len(tokens) != 3 or tokens[2] != "who":
+        raise BpRefused(FREEFORM_PEOPLE_ONLY_WHO, code="bp.template_mismatch")
+    if source != "user":
+        raise BpRefused(FREEFORM_PEOPLE_USER)
+    if graph is None:
+        raise BpRefused("这张蓝图还没有导入的图，没法按图定谁来做")
+    rows = [r for r in freeform.people_rows(with_graph(spec, graph)) if r["kind"] == "slot"]
+    slot = rows[_index(tokens[1], len(rows))]["slot"]
+    checked = _checked("people", "who", value, spec)
+    if checked and any(p["kind"] not in ("user", "group") for p in checked):
+        raise BpRefused("这里只选人或组：岗位、发起人在图上已经定了")
+    entries = spec.setdefault("people", [])
+    entry = next((e for e in entries if e.get("id") == slot), None)
+    if entry is None:
+        entry = {"id": slot}
+        entries.append(entry)
+    entry["who"] = _item(checked, source)
+
+
+def _set(spec: dict[str, Any], tokens: list[str], value: Any, source: str, graph: Any = None) -> None:
     card = tokens[0]
+    if card == "people" and is_freeform(spec):
+        _freeform_who(spec, tokens, value, source, graph)
+        return
     if card == "access":
         if len(tokens) != 2 or tokens[1] not in ACCESS_KINDS:
             raise BpRefused("「谁能看」只有使用、查看全部、管理三档")
@@ -577,6 +616,8 @@ def _set(spec: dict[str, Any], tokens: list[str], value: Any, source: str) -> No
 
 def _add(spec: dict[str, Any], tokens: list[str], value: Any, source: str) -> None:
     card = tokens[0]
+    if card == "people" and is_freeform(spec):
+        raise BpRefused(FREEFORM_PEOPLE_ONLY_WHO, code="bp.template_mismatch")
     if card == "access":
         if len(tokens) not in (2, 3) or tokens[1] not in ACCESS_KINDS:
             raise BpRefused("「谁能看」只有使用、查看全部、管理三档")
@@ -598,8 +639,13 @@ def _add(spec: dict[str, Any], tokens: list[str], value: Any, source: str) -> No
     entries.insert(at, _new_entry(card, value, source, spec))
 
 
-def _remove(spec: dict[str, Any], tokens: list[str], source: str) -> None:
+def _remove(spec: dict[str, Any], tokens: list[str], source: str, graph: Any = None) -> None:
     card = tokens[0]
+    if card == "people" and is_freeform(spec):
+        if len(tokens) != 3:
+            raise BpRefused(FREEFORM_PEOPLE_ONLY_WHO, code="bp.template_mismatch")
+        _freeform_who(spec, tokens, None, source, graph)
+        return
     if card == "access":
         if len(tokens) != 3 or tokens[1] not in ACCESS_KINDS:
             raise BpRefused("「谁能看」要写明删哪一档的第几个")
@@ -655,8 +701,9 @@ def _template(spec: dict[str, Any], op: BpOp, source: str) -> None:
     prefill(template.id, spec)
 
 
-def apply_bp_op(spec: dict[str, Any], op: dict[str, Any], *, source: str) -> dict[str, Any]:
-    """把一个 bp_* 操作落到蓝图上，交回新的蓝图（不改入参）。source 是 user / assistant。不合规时抛 BpRefused。"""
+def apply_bp_op(spec: dict[str, Any], op: dict[str, Any], *, source: str, graph: Any = None) -> dict[str, Any]:
+    """把一个 bp_* 操作落到蓝图上，交回新的蓝图（不改入参）。source 是 user / assistant。不合规时抛 BpRefused。
+    graph 是蓝图存的图：自由形的「谁来做」按它列岗位（没给时那张卡片改不了）。"""
     if source not in BP_SOURCES:
         raise BpRefused(f"操作的来源只能是用户或助手，当前为「{source}」")
     if not isinstance(op, dict) or op.get("op") not in BP_OPS:
@@ -677,11 +724,11 @@ def apply_bp_op(spec: dict[str, Any], op: dict[str, Any], *, source: str) -> dic
         if source != "user" and (only := next((k for k in USER_ONLY if tuple(tokens[:len(k)]) == k), None)):
             raise BpRefused(_USER_ONLY_TEXT[only[-1]])
         if parsed.op == "bp_set":
-            _set(out, tokens, parsed.value, source)
+            _set(out, tokens, parsed.value, source, graph)
         elif parsed.op == "bp_add":
             _add(out, tokens, parsed.value, source)
         else:
-            _remove(out, tokens, source)
+            _remove(out, tokens, source, graph)
     try:
         return parse_blueprint(out).model_dump(mode="json", by_alias=True)
     except ValidationError as e:
@@ -708,9 +755,9 @@ def _value(item: Any) -> Any:
     return item.get("value") if isinstance(item, dict) else None
 
 
-def blueprint_issues(spec: dict[str, Any], *, for_: str) -> list[dict[str, Any]]:
+def blueprint_issues(spec: dict[str, Any], *, for_: str, graph: Any = None) -> list[dict[str, Any]]:
     """蓝图检查（§3.13 bp.*）：for_ = trial（缺项挡试运行）/ publish（待确认项挡发布）/ personal。
-    每条 {code, level, path, message}。"""
+    每条 {code, level, path, message}。graph 是蓝图存的图：自由形的「谁来做」按它查（没给时不查这一张）。"""
     from app.blueprints.templates import get_template
 
     if for_ not in ISSUE_PURPOSES:
@@ -743,7 +790,10 @@ def blueprint_issues(spec: dict[str, Any], *, for_: str) -> list[dict[str, Any]]
         _data_issues(spec, "data" in required, add)
     if "cadence" in required and _value(spec.get("cadence")) is None:
         add("bp.missing", "/cadence", "「多久更新」还没定：每天、每周还是每月，几点，统计哪一期")
-    if "people" in used:
+    if "people" in used and template.imports_graph:
+        if graph is not None and for_ != "personal":
+            out += _freeform_people_issues(spec, graph, publish)
+    elif "people" in used:
         _people_issues(spec, "people" in required, publish, add)
     if "fields" in used:
         _field_issues(spec, "fields" in required, add)
@@ -834,6 +884,32 @@ def _people_issues(spec: dict[str, Any], required: bool, publish: bool, add: Cal
             elif threshold["op"] not in ("==", "!=") and threshold["field"] not in numeric:
                 add("bp.template_mismatch", f"/people/{i}/threshold",
                     f"「{label}」的条件拿「{threshold['field']}」比大小，它要是数字字段")
+
+
+def _freeform_people_issues(spec: dict[str, Any], graph: Any, publish: bool) -> list[dict[str, Any]]:
+    """自由形的「谁来做」（freeform.people_rows）：岗位、核实人没绑的报 bp.people_unbound（试运行 warning：待办派给试运行的
+    人自己；发布 error），路径就是那一行的 path，带上 slot（发布单据此去掉同一件事的 app.slot_unbound / app.reconciler_unbound）。
+    图里已经没有的岗位、卡片上还留着绑定的，照实提醒（warning），不静默删掉。"""
+    from app.blueprints.templates import freeform
+    from app.blueprints.templates._common import with_graph
+
+    out: list[dict[str, Any]] = []
+    level = "error" if publish else "warning"
+    rows = freeform.people_rows(with_graph(spec, graph))
+    for row in rows:
+        if row["kind"] not in ("slot", "reconciler") or row["who"]:
+            continue
+        message = (f"{row['label']}还没定：{row['detail']}，写入外部系统的结果不明时要有人去目标系统里核实"
+                   if row["kind"] == "reconciler" else f"{row['label']}还没定谁来处理（{row['detail']}）")
+        out.append({"code": "bp.people_unbound", "level": level, "path": row["path"], "message": message,
+                    "slot": row["slot"]})
+    known = {r["slot"] for r in rows if r["kind"] == "slot"}
+    for step in spec.get("people") or []:
+        slot = str(step.get("id") or "")
+        if slot and slot not in known and _value(step.get("who")):
+            out.append({"code": "bp.template_mismatch", "level": "warning", "path": "/people",
+                        "message": f"岗位「{slot}」在导入的图里已经没有了：卡片上留着的这条绑定不会生效"})
+    return out
 
 
 def _field_issues(spec: dict[str, Any], required: bool, add: Callable[..., None]) -> None:

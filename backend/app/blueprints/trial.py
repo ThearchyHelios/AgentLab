@@ -147,7 +147,7 @@ async def materialize(session: AsyncSession, bp: Blueprint, *, principal: Princi
     digest = graph_hash(graph or {})
     app_spec = _draft_pins(result.app_spec, bp, digest)
     # 实例化交回的是挡路的 error；蓝图检查里的提醒（模板版本旧了之类）另外带上
-    warnings = [i for i in blueprint_issues(bp.spec or {}, for_="trial") if i.get("level") != "error"]
+    warnings = [i for i in blueprint_issues(bp.spec or {}, for_="trial", graph=bp.graph) if i.get("level") != "error"]
     problems = [with_plain(p) for p in [*result.problems, *warnings]]
     bp.graph, bp.graph_hash, bp.joints = graph, digest, result.joints
     bp.updated_by = principal.username if principal else bp.updated_by
