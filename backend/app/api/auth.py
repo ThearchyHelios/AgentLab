@@ -25,7 +25,6 @@ from app.auth import oidc, sessions
 from app.auth.audit import record
 from app.auth.passwords import hash_password, password_problem, verify_password
 from app.core import crypto
-from app.core.config import settings
 from app.db.base import get_session
 from app.db.models import Setting, User
 
@@ -113,7 +112,10 @@ async def logout(request: Request, session: AsyncSession = Depends(get_session))
 
 
 def _redirect_uri(request: Request) -> str:
-    base = settings.public_url.rstrip("/") or str(request.base_url).rstrip("/")
+    """回调地址：对外访问地址（环境变量优先，其次设置，core/public_url.py），都没有按请求自己的地址拼。"""
+    from app.core.public_url import public_base_url
+
+    base = public_base_url() or str(request.base_url).rstrip("/")
     return f"{base}/api/auth/oidc/callback"
 
 

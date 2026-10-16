@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 from http.cookies import SimpleCookie
 from typing import Any
-from urllib.parse import urlsplit
 
 from app.core.config import settings
 
@@ -50,10 +49,12 @@ def _cookie(headers: dict[str, str], name: str) -> str | None:
 
 
 def _origin_ok(origin: str, headers: dict[str, str], scope: dict[str, Any]) -> bool:
+    from app.core.public_url import origin_of, public_base_url
+
     allowed = {o.rstrip("/") for o in settings.cors_origins}
-    if settings.public_url:
-        parts = urlsplit(settings.public_url)
-        allowed.add(f"{parts.scheme}://{parts.netloc}")
+    # 对外访问地址（环境变量或设置里的那一项，core/public_url.py）：反向代理后面请求的 Host 不一定是它
+    if address := public_base_url():
+        allowed.add(origin_of(address))
     host = headers.get("x-forwarded-host") or headers.get("host")
     if host:
         scheme = headers.get("x-forwarded-proto") or scope.get("scheme") or "http"

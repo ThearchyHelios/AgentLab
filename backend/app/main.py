@@ -146,16 +146,20 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 async def _platform_startup() -> None:
-    """应用平台的启动整理（BE-1）：登录设置读进缓存；自定义工具请求头、MCP env 和请求头里的存量明文加密一遍（幂等）；
-    存量的内网 MCP 服务改为绑定登记端点（只在升级后第一次启动时做）；能力登记同步一次。后三样出错只记日志：最坏是登记
-    暂时不全，不该让服务起不来。"""
+    """应用平台的启动整理（BE-1）：登录设置、对外访问地址读进缓存；自定义工具请求头、MCP env 和请求头里的存量明文加密
+    一遍（幂等）；存量的内网 MCP 服务改为绑定登记端点（只在升级后第一次启动时做）；能力登记同步一次。后三样出错只记
+    日志：最坏是登记暂时不全，不该让服务起不来。"""
     from app.auth import current_mode, load_settings
     from app.capabilities import registry as capability_registry
     from app.capabilities.secrets import seal_existing
+    from app.core import public_url
     from app.db.base import SessionLocal
 
     await load_settings(force=True)
     logger.info("登录方式：%s", current_mode())
+    # 对外访问地址（core/public_url.py）同样读进缓存：中间件核对来源时不查库
+    if address := await public_url.refresh():
+        logger.info("对外访问地址：%s（%s）", address, "环境变量" if public_url.env_locked() else "设置")
     try:
         if sealed := await seal_existing():
             logger.info("已加密 %d 处存量的明文密钥（自定义工具请求头、MCP 环境变量和请求头）", sealed)

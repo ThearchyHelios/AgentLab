@@ -29,6 +29,9 @@ CATALOG_DRAFT_BUSY = "catalog_draft_busy"
 CATALOG_DRAFT_MODEL_UNAVAILABLE = "catalog_draft_model_unavailable"
 CATALOG_DRAFT_FINISHED = "catalog_draft_finished"
 
+#: 设置（api/settings.py）：对外访问地址由环境变量 AGENTLAB_PUBLIC_URL 指定时，设置里那一项不能改成别的值（409）
+PUBLIC_URL_ENV_LOCKED = "public_url_env_locked"
+
 
 class CodedHTTPException(HTTPException):
     """field：出错的是哪一项（表单据此把报错落到那一格）。可选，没有就不出现在返回里。"""

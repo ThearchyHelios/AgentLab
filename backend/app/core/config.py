@@ -64,8 +64,9 @@ class Settings(BaseSettings):
     auth_session_max_days: int = 7
     # 会话 cookie 带不带 Secure。不设时按请求本身是不是 https 定：本机 http 开发照常能登录
     auth_cookie_secure: bool | None = None
-    # 对外的访问地址（反向代理后面时填，如 https://agentlab.example.com）。OIDC 的回调地址按它拼；
-    # 不设时按请求的 Host 拼
+    # 对外的访问地址（反向代理后面时填，如 https://agentlab.example.com）。全站只认一个（core/public_url.py）：
+    # 设了它，设置里的「对外访问地址」就不生效、不能改；通知和 Webhook 的链接、OIDC 的回调、来源核对都按它拼。
+    # 不设时用设置里的那一项，再没有就按请求的 Host 拼（通知里不附链接）
     public_url: str = ""
 
     # --- 安全响应头（app/web_security.py）---
@@ -145,6 +146,19 @@ class Settings(BaseSettings):
                 return json.loads(text)
             return [part.strip() for part in text.split(",") if part.strip()]
         return value
+
+    @field_validator("public_url")
+    @classmethod
+    def _valid_public_url(cls, value: str) -> str:
+        # 写错了启动时就报出来：以前拼出 agentlab.example.com/api/auth/oidc/callback 这样的回调，到登录时才发现
+        from app.core.public_url import ENV_NAME, normalize, url_problem
+
+        if not value.strip():
+            return ""
+        if problem := url_problem(value):
+            what = "不能带 ? 或 # 之后的部分" if problem == "suffix" else "需要是 http:// 或 https:// 开头的完整地址"
+            raise ValueError(f"{ENV_NAME}={value!r} {what}，例如 https://agentlab.example.com")
+        return normalize(value) or ""
 
     @field_validator("frame_ancestors", "embed_origins")
     @classmethod
