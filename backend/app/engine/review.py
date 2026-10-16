@@ -219,6 +219,13 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             else:
                 add("tool_error", f"工具 {tool} 调用失败：{err}", BROKEN)
 
+        elif etype == EventType.NODE_FAILED and data.get("reason") == "rejected":
+            # 人的驳回（engine/compiler 给被驳回的那一步的 node.failed 带 reason=rejected，总方案 X9）：不是故障，不说「执行
+            # 失败」；也不进 RETRYABLE——重跑只会把同一件事再问一遍人。答案没走完是缺口，记 DEGRADED（没有成果时
+            # empty_output 另按 BROKEN 说）
+            err = str(data.get("error") or "").strip()[:200]
+            add("node_rejected", f"节点「{titles.get(node_id) or node_id}」被驳回：{err}", DEGRADED)
+
         elif etype == EventType.NODE_FAILED:
             err = str(data.get("error") or "").strip()[:200]
             add("node_failed", f"节点「{titles.get(node_id) or node_id}」执行失败：{err}", BROKEN)

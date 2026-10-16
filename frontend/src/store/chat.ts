@@ -355,8 +355,10 @@ const EMPTY: ChatTurn[] = []
 /** 落库成果的上限。只是防跑飞，不是显示上限 */
 const ANSWER_CAP = 20_000
 
-/** 等复核的上限。超了就先把原答案交出去，说明后补不了就算了 */
+/** 等复核的上限。超了就先把原答案交出去，说明后补不了就算了（复核这一次的用量晚到了照记，见 settle） */
 const REVIEW_TIMEOUT_MS = 25_000
+/** 实际等多久：开发期检查脚本可以调短它（window.__chatReviewWait），不用真等 25 秒 */
+let reviewWaitMs = REVIEW_TIMEOUT_MS
 
 /**
  * 旧版本落库时答案被切在这个长度：run.finished 事件里的 output 按字典每个值
@@ -1212,6 +1214,8 @@ export const useChat = create<ChatState>((set, get) => ({
 
 if (import.meta.env.DEV) {
   ;(window as any).__chat = useChat
+  // 检查脚本用：把等复核的上限调短（毫秒），量「复核晚于上限时用量照记」
+  ;(window as any).__chatReviewWait = (ms: number) => { reviewWaitMs = ms }
 }
 
 /** 定点更新某个会话里的某一轮。认的是 turn id，所以切走看别的会话也不受影响 */
@@ -1919,14 +1923,26 @@ async function settle(
   void flow.save({ status: 'done', answer: answerText(output) })
 
   let result: ReviewResult | null = null
+  const reviewing = api.copilot.review({ run_id: runId, question, attempt: opts.attempt ?? 0 })
+  let late = false
   try {
     // 复核慢到一定程度就不等了。它是补一层说明，不该反过来把答案扣住不放——
     // 干净的运行后端 15ms 就返回，会走到这个上限的都是真叫了模型的那些
     result = await Promise.race([
-      api.copilot.review({ run_id: runId, question, attempt: opts.attempt ?? 0 }),
-      new Promise<null>((r) => setTimeout(() => r(null), REVIEW_TIMEOUT_MS)),
+      reviewing,
+      new Promise<null>((r) => setTimeout(() => { late = true; r(null) }, reviewWaitMs)),
     ])
   } catch { /* 复核用不了就按原样交付，下面照常走 */ }
+  if (late && !result) {
+    // 没等到复核：答案照原样交付（下面照常收尾）。复核那一次照样调了模型、花了钱：它晚到时把用量记进这一轮、再落一次库，
+    // 这一轮的花费才照实是助手 + 运行 + 复核（不再改答案：说明晚到了就不补）
+    void reviewing.then((r) => {
+      if (!r?.usage || !flow.alive()) return
+      const spent = r.usage
+      patch((t) => ({ usage: { ...(t.usage ?? t.meta?.usage), review: addUsage((t.usage ?? t.meta?.usage)?.review, spent) } }))
+      void flow.persist()
+    }, () => { /* 复核失败了就没有用量可记 */ })
+  }
   // 复核期间用户点了停止或者重试：这一轮已经不归这次运行管了
   if (!flow.alive()) return
 

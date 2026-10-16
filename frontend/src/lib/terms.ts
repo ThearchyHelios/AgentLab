@@ -2611,19 +2611,7 @@ export const CATALOG_DRAFT_TEXT = {
     ? `+${formatNumber(added)}${updated ? ` · 改 ${formatNumber(updated)}` : ''}` : ''),
   taskAddedHint: (added: number, updated: number, removed: number) =>
     `新增 ${formatNumber(added)} 项、更新 ${formatNumber(updated)} 项${removed ? `、删除 ${formatNumber(removed)} 项` : ''}`,
-  // ---- 目录页上方的进度、结束提示
-  strip: (done: number, total: number) => `正在起草：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表`,
-  stripQueued: (total: number) => `起草任务排队中，共 ${formatNumber(total)} 张表`,
-  stripQueuedProfile: (total: number) => `起草任务排在剖析任务后面，剖析结束后自动开始（共 ${formatNumber(total)} 张表）`,
-  stripQueuedIntrospect: (total: number) => `起草任务排在探查任务后面，探查结束后自动开始（共 ${formatNumber(total)} 张表）`,
-  /** 页头的进度入口：进行中写「起草 3/20」，排队写「起草 排队中」 */
-  headerRunning: (done: number, total: number) => `起草 ${formatNumber(done)}/${formatNumber(total)}`,
-  headerQueued: '起草 排队中',
-  headerRunningHint: (done: number, total: number) => `起草进行中：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，点击查看进度`,
-  headerQueuedHint: '起草任务排队中，点击查看',
-  headerQueuedProfile: '起草任务排在剖析任务后面，剖析结束后自动开始，点击查看',
-  headerQueuedIntrospect: '起草任务排在探查任务后面，探查结束后自动开始，点击查看',
-  stripOpen: '查看进度',
+  // ---- 结束提示（进行中、排队中的进度在目录页的后台任务条，见 termsSource.ts）
   toast: {
     succeeded: (summary: string) => `数据目录起草完成：${summary}`,
     partial: (n: number) => `数据目录起草完成，${formatNumber(n)} 张表未写全`,
@@ -3034,13 +3022,6 @@ export const PROFILE_TEXT = {
   action: '数据剖析',
   actionHint: '对业务库发只读查询：核实推断的关联关系、取码值候选、提议业务日期',
   profileSelected: (n: number) => `剖析所选（${formatNumber(n)}）`,
-  /** 页头的进度入口：进行中写「剖析 12/40」，排队写「剖析 排队中」 */
-  headerRunning: (done: number, total: number) => `剖析 ${formatNumber(done)}/${formatNumber(total)}`,
-  headerQueued: '剖析 排队中',
-  headerRunningHint: (done: number, total: number) => `数据剖析进行中：已完成 ${formatNumber(done)} / ${formatNumber(total)} 张表，点击查看进度`,
-  headerQueuedHint: '剖析任务排队中，点击查看',
-  headerQueuedDraft: '剖析任务排在起草任务后面，起草结束后自动开始，点击查看',
-  headerQueuedIntrospect: '剖析任务排在探查任务后面，探查结束后自动开始，点击查看',
 
   // ---- 开始前：范围、预算
   title: '数据剖析',
@@ -3921,17 +3902,61 @@ export const SCHEDULE_TEXT = {
   targetGone: (name: string) => `${name}（已不存在）`,
   view: '查看',
   viewLabel: (name: string) => `查看定时任务「${name}」`,
-  /** 非工作流目标的设置是只读的：启用、暂停、立即运行、触发历史照常可用 */
+  /**
+   * 数据源维护的定时：建和改在数据源页的「定时维护」里（next-round 03 B4，维护要做哪几步跟着数据源走），这里只读地列出；启用、
+   * 暂停、立即运行、触发历史照常可用
+   */
   targetSettingsTitle: '设置',
-  targetSettingsNote: (kind: string) => `这个定时任务的目标是${kind}：可以启用、暂停、立即运行和查看触发历史；名称、频率和目标在这里只能查看，不能修改`,
+  maintenanceNote: '这个定时任务是数据源的定时维护：要做哪几步、频率和时段在数据源页的「定时维护」里设置，这里只能查看。启用、暂停、立即运行和触发历史照常可用',
+  toDataSource: '去数据源页设置',
   targetField: '目标',
   graceField: '补发宽限',
+  /** 新建时先选定时什么：工作流（发起运行）还是评测题集（评一次） */
+  targetKindLabel: '定时什么',
+  targetKindHint: {
+    workflow: '按周期发起工作流运行',
+    eval_suite: '按周期评一次题集（按题集的默认变体、每题 1 次），有退步、没评完时推给订阅了的通知渠道',
+    source_maintenance: '数据源的定时维护在数据源页设置',
+  } as Record<import('../types').ScheduleTargetKind, string>,
+  suite: '评测题集',
+  suitePlaceholder: '选择题集',
+  suitesLoading: '正在读取题集…',
+  suitesEmpty: '还没有题集，请先在评测页新建',
+  toEvals: '去评测',
+  /** 目标是评测题集：表单上方那一句 */
+  evalTargetNote: '目标是评测题集：到点按题集的默认变体评一次（每题 1 次）；上一次评测还没结束就跳过这一次。消息只推订阅了「定时评测有退步」「定时评测没有评完」的全局通知渠道，不推 Webhook',
+  openSuite: '打开题集',
+  /** 触发历史里那一次评测：点了去评测详情 */
+  evalFireTitle: '打开这一次评测',
 
   // ---- 立即运行的结果
   /** 目标是评测题集：发起的是一次评测，没有运行可看 */
   evalStarted: '已发起一次评测',
   /** 触发历史里评测题集那一次：评测的编号 */
   evalFire: (short: string) => `评测 #${short}`,
+  /**
+   * 数据源维护的一次触发：建的是探查、剖析任务，没有运行。和数据源页「定时维护」的「最近一次」同一个写法（步骤的叫法同服务端
+   * source_maintenance.STEP_LABEL）
+   */
+  maintenanceStep: { introspect: '探查结构', profile_needed: '剖析需要的表', observe: '取值观察' } as Record<
+    import('../types').ScheduleMaintenanceStep, string>,
+  maintenanceJobKind: { introspect: '探查任务', profile: '剖析任务' } as Record<'introspect' | 'profile', string>,
+  maintenanceJobs: '建了任务',
+  maintenanceJob: (step: string, kind: string, id: string, tables: number | null) =>
+    `${step}：${kind} #${id.slice(0, 6)}${tables != null ? `（${formatNumber(tables)} 张表）` : ''}`,
+  maintenanceJobTitle: {
+    introspect: '去数据源页看这个数据源的探查结果',
+    profile: '去数据目录看这个剖析任务的进度和结果',
+  } as Record<'introspect' | 'profile', string>,
+  maintenanceSkipped: (step: string, reason: string) => `${step}没有执行：${reason}`,
+  /** 维护没有建任务（发起失败、跳过）：不写「未发起运行」，维护本来就不发起运行 */
+  maintenanceNoJobs: '没有建任务',
+  /** 刚触发、任务还在建（服务端按已发起给，任务还没记上） */
+  maintenanceLaunching: '正在建维护任务',
+  maintenanceStarted: '已开始维护',
+  maintenanceBusy: '上一次维护（或别的探查、剖析）还没做完，这一次已跳过',
+  maintenanceFailed: (reason: string | null) => (reason ? `没有开始维护：${reason}` : '没有开始维护'),
+  maintenanceStartedHint: '已建好这一次维护的任务',
   runStarted: '已发起运行',
   runSkipped: '上一次运行尚未结束，本次已按重叠策略跳过',
   runFailed: (reason: string | null) => (reason ? `未能发起运行：${reason}` : '未能发起运行'),
@@ -4173,6 +4198,8 @@ export const SCHEDULE_TEXT = {
     notPublished: '这个工作流还没有发布版本，正式运行需要已发布的版本。请先发布，或改用探索运行',
     inputsMissing: (names: string) => `必填输入「${names}」还没有填写`,
     inputsUnknown: (names: string) => `输入「${names}」对不上工作流的输入字段，请移除`,
+    /** 非工作流目标（评测题集）没选目标 */
+    target: (kind: string) => `请选择要定时的${kind}`,
   },
   /** 「还需处理」里各项的叫法 */
   problemField: {
@@ -5439,6 +5466,18 @@ export const REJECTED_TEXT = {
   },
   /** 问数据：这一轮的运行被驳回结束时，补救区的那一句 */
   chatReason: '这一轮的运行被审批人驳回，已经结束。这是人的决定，不是故障；改好内容后可以重新运行。',
+  /**
+   * 被驳回的那一步自己（node.failed 带 reason=rejected）：时间线、问数据过程里这一步的副标题。步骤名就是节点名，不再写一遍
+   * 「在哪一步」；谁、备注照写，超时驳回写按设置驳回
+   */
+  step: (d: { actor?: unknown; note?: unknown; decision?: unknown }): string => {
+    const who = typeof d.actor === 'string' ? d.actor.trim() : ''
+    const note = typeof d.note === 'string' ? d.note.trim() : ''
+    if (d.decision === 'expired_reject') return '超过时限，按设置驳回'
+    return `${who ? `${who} 驳回` : '被驳回'}${note ? `：${note}` : ''}`
+  },
+  /** 画布节点卡上被驳回的那一步：一句话，悬停写原话 */
+  card: '被驳回',
 }
 
 /** 来源标签：老运行没有来源时写「来源未记录」 */
@@ -6278,3 +6317,5 @@ export const CAPABILITY_REVIEW_TEXT: typeof CATALOG_REVIEW_TEXT = {
 // 应用平台使用面的文案（FE-5 维护）。调用方照旧从 lib/terms 导入
 export * from './termsApp'
 export * from './termsBlueprint'
+// 数据源的变化、定时维护、后台任务条（下一轮第 4 波 W4-d）
+export * from './termsSource'

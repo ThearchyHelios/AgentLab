@@ -83,6 +83,7 @@ const ORDER = [
   'catalog',         // 数据目录：表清单、起草、单项审阅、批量确认、编辑即确认、409
   'catalog-loop',    // 数据目录闭环：表助手、审阅队列、导出导入、防错事实的说明
   'catalog-profile', // 数据剖析：逐表的后台任务、表清单的剖析一列、表详情的一节、剖析设置
+  'catalog-changes', // 数据源的变化：审阅页「变化」标签页、数据源角标、表详情的「结构与取值变化」、定时维护、后台任务条
   // 复核套件与导出
   'schedules',       // 定时任务
   'compare',         // 运行对比
@@ -92,6 +93,9 @@ const ORDER = [
   'bundle',          // 可验证报告
   'whatif',          // 数字推演
   'report-export',   // 报告导出：自包含 HTML、不执行脚本读得到正文、点开数字看出处
+  // 评测与口径账本（docs/design/next-round 01、02）
+  'evals',           // 评测：题集、加题、发起与进度、结果表、对比与 A/B、口径命中与重复度
+  'ledger',          // 口径账本：证据里的「口径」一步、轮次摘要与出具 / 对账、对账视图、认证队列
   // 应用平台（docs/design/app-platform-and-look.md §4.5）。check-auth 不在这里：它要另起一套开着本地账号登录的服务，
   // 由编排者单独跑（关登录时的这些检查照常在这里跑）
   'apps',            // 应用页、印章、点数字看出处、入口校验、实例页
@@ -119,6 +123,8 @@ const ESTIMATE = {
   apps: 60, inbox: 45, 'app-editor': 45, capabilities: 30, 'access-keys': 30, share: 30,
   // 普通用户建应用：还没实测，按同类页面估
   blueprint: 90, personal: 45, records: 30, files: 30,
+  // 下一轮第 4 波：2026-10-16 两套服务、八道并行时的实测
+  'catalog-changes': 43, evals: 33, ledger: 31,
 }
 // 最慢的两项按段拆成几份。用的是它们自己的段过滤：最后一份用 *_SKIP 兜住「其余全部」，以后新加的段
 // 不用改这里也跑得到（拆出去的那几份要是一段都没对上，那一份会报「一项都没跑」）。

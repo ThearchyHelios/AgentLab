@@ -91,7 +91,7 @@ export function replayTraceCached(trace: Trace, at: number, graph: GraphLike): T
     }
     const state = p?.state ?? 'idle'
     // 人工审批的通过 / 驳回只记在节点上，不在段上：它结束了就用节点上的
-    const finished = state === 'done' || state === 'failed'
+    const finished = state === 'done' || state === 'failed' || state === 'rejected'
     const decided = taken.length ? taken : finished ? n.taken ?? [] : []
     nodes[id] = {
       ...n, state, count: p?.count ?? 0, iteration: p?.iteration, taken: decided,

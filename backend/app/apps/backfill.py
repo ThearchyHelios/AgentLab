@@ -120,7 +120,6 @@ async def graph_side_effect(session: AsyncSession, graph_json: Any, *, level: st
     判断沿用应用检查对流程钉住项的那一套（apps/lint._lint_process）：人工节点、写外部系统的能力
     （capabilities.registry.writes_externally，和运行时、发布检查同一个判断）、process.* 问题（子工作流先读好，
     process.human_in_subgraph 才查得到）。level 是那一版发布时的级别（门禁按它查），没有按 published。"""
-    from app.capabilities.registry import effective_effect, get_capability, writes_externally
     from app.engine.governance import publish_issues
     from app.engine.lint_process import load_subgraphs, with_subgraphs
     from app.engine.schema import GraphSpec, NodeType
@@ -131,6 +130,34 @@ async def graph_side_effect(session: AsyncSession, graph_json: Any, *, level: st
         return "的图无法解析"
     if humans := [n.title for n in graph.nodes if n.type == NodeType.HUMAN]:
         return f"里有人工节点「{'、'.join(humans[:3])}」"
+    if reason := await _external_write(session, graph):
+        return reason
+    with with_subgraphs(await load_subgraphs(session, graph)):
+        issues = publish_issues(graph, level=level or "published")
+    if process := [i for i in issues if (i.code or "").startswith("process.")]:
+        return f"按流程使用不安全：{process[0].message.rstrip('。')}"
+    return None
+
+
+async def graph_external_write(session: AsyncSession, graph_json: Any) -> str | None:
+    """一张图里有没有调用工具节点会写外部系统（graph_side_effect 里的那一条）：有的交回一句原因，没有返回 None。
+
+    口径召回（ledger/recall）只用这一条：召回图是从口径卡往上派生的取数和口径卡，图里别处的人工节点、按流程使用的问题
+    碰不到它（细案做法 7 不重算的只有缺入口字段、数据部分不能复用、会写外部系统三种）；替人整张图重跑的补算、按口径出具
+    仍然走 graph_side_effect 全套。"""
+    from app.engine.schema import GraphSpec
+
+    try:
+        graph = GraphSpec.model_validate(graph_json)
+    except ValueError:
+        return "的图无法解析"
+    return await _external_write(session, graph)
+
+
+async def _external_write(session: AsyncSession, graph: Any) -> str | None:
+    from app.capabilities.registry import effective_effect, get_capability, writes_externally
+    from app.engine.schema import NodeType
+
     for node in graph.nodes:
         name = node.config.get("tool") if node.type == NodeType.TOOL else None
         if not isinstance(name, str) or not name:
@@ -138,10 +165,6 @@ async def graph_side_effect(session: AsyncSession, graph_json: Any, *, level: st
         cap = await get_capability(session, name)
         if cap is not None and writes_externally(cap.name, effective_effect(cap), cap.endpoint_id):
             return f"的「{node.title}」会写外部系统（{name}）"
-    with with_subgraphs(await load_subgraphs(session, graph)):
-        issues = publish_issues(graph, level=level or "published")
-    if process := [i for i in issues if (i.code or "").startswith("process.")]:
-        return f"按流程使用不安全：{process[0].message.rstrip('。')}"
     return None
 
 

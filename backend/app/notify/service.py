@@ -35,7 +35,9 @@ from typing import Any
 from sqlalchemy import select
 
 from app.db.base import SessionLocal, utcnow
-from app.db.models import App, AppVersion, NotifyChannel, NotifyDelivery, Run, Setting, Task, TaskAssignment, User
+from app.db.models import (
+    App, AppVersion, NotifyChannel, NotifyDelivery, Run, Setting, Task, TaskAssignment, User, Workflow,
+)
 from app.notify.core import Message, Outcome, host_of
 
 logger = logging.getLogger(__name__)
@@ -68,9 +70,10 @@ EVENTS: dict[str, Event] = {
     "review.done": Event("我提交审核的应用有结果", ("global", "user")),
     # ---- 本轮登记的（总方案 X6）：scopes 为空的还没有推送；实现推送的那一块只改自己这一行的 scopes，消息照模块说明的规矩 ----
     # 数据源有要处理的结构 / 取值变化（03 B3）：只推 severity 为 action 的，按源汇总；源名、各级别条数、链接
-    "source.changed": Event("数据源有变化要处理", ()),
-    # 口径升版后召回重算，数真变了（02 第 7 项）：答案的主人有 recall 待办；口径名、版本、链接，不放新旧值和差值
-    "ledger.recall": Event("口径升版，答案的数变了", ()),
+    "source.changed": Event("数据源有变化要处理", ("global",)),
+    # 口径升版后召回重算，数真变了（02 第 7 项，notify_recall）：答案的主人有 recall 待办；推全局渠道和答案主人自己的个人
+    # 渠道（召回运行不归哪个应用）。口径名、版本、几个答案、链接，不放新旧值和差值
+    "ledger.recall": Event("口径升版，答案的数变了", ("global", "user")),
     # 定时评测有题从通过变成不通过 / 评测没跑完（01 第 15 项）：题集名、通过数、退步题数、链接；不放期望值和答案里的数。
     # 只推全局渠道：评测是搭建者们共用的一把尺，不归哪个人（notify_eval）。只推定时发起的（手动发起的那次人自己在看），
     # 叫法就照实带「定时」；没评完包括失败、到了上限、止损停下，所以不叫「失败」
@@ -103,7 +106,7 @@ _TASK_HEAD = {"task.opened": "新的待办", "task.reassigned": "待办已改派
               "task.reminded": "待办催办"}
 _KIND_TEXT = {"approve": "审批", "input": "补充输入", "edit": "编辑稿件", "tool": "工具调用审批", "code": "代码执行审批",
               "dual_check": "双盲复算裁决", "action_confirm": "确认写入外部系统", "reconcile": "核实写入结果",
-              "signal": "等外部系统回调", "review": "审核个人应用"}
+              "signal": "等外部系统回调", "review": "审核个人应用", "recall": "口径召回"}
 _ENV_TEXT = {"prod": "生产环境", "test": "测试环境", "simulated": "演练"}
 
 _background: set[asyncio.Task[Any]] = set()
@@ -302,8 +305,9 @@ async def ensure_assignee_mail(users: list[str]) -> int:
         return made
 
 
-async def notify_task(task_id: str, event: str, *, users: list[str]) -> int:
+async def notify_task(task_id: str, event: str, *, users: list[str], exclude: frozenset[str] = frozenset()) -> int:
     """待办的通知（task.opened / reassigned / escalated / reminded）。users 是这次要通知到的人（派给的用户名）。返回推了几个渠道。
+    exclude 是这一次已经推过别的事件的渠道（口径召回先推了 ledger.recall 的，notify_recall），同一个渠道只推一次。
 
     管理员开了「默认发邮件给待办处理人」时，先给还没有个人邮件渠道的处理人建一个（ensure_assignee_mail），这一条就推得到。"""
     try:
@@ -315,7 +319,7 @@ async def notify_task(task_id: str, event: str, *, users: list[str]) -> int:
         if task is None:
             return 0
         run = await session.get(Run, task.run_id)
-        channels = await _channels(session, event, run, users)
+        channels = [c for c in await _channels(session, event, run, users) if c.id not in exclude]
         if not channels:
             return 0
         base = await _base_url(session)
@@ -336,6 +340,77 @@ async def notify_task(task_id: str, event: str, *, users: list[str]) -> int:
                "subject": {"task_id": task_id, "run_id": task.run_id, "app_id": task.app_id}}
     return await _push(channels, message, subject_kind="task", subject_id=task_id, event=event, run_id=task.run_id,
                        task_id=task_id)
+
+
+async def notify_recall(task_id: str, users: list[str]) -> int:
+    """口径召回的待办开出来了（app/ledger/recall）：口径升版、数真变了的那一种推 ledger.recall——订阅了它的全局渠道、答案主人
+    自己的个人渠道；然后照别的待办推 task.opened（已经推过 ledger.recall 的渠道不再推，同一个渠道只推一次）。目录、表结构变了
+    的那两种只推 task.opened。
+
+    全局渠道按这一批待办只推一次（同一次召回运行、同一个来由开的那几条，recall.batch_of_key）：开登录时一组答案有几个主人就
+    开几条待办，团队群却只该收到一条——只在这一批里最早开的那条（开出时间、id 排序，几条并发推也认同一条）上推全局渠道，
+    答案、待办按这一批汇总，链到待办箱（各人在那里看到派给自己的那条）；别的几条连 task.opened 也不再推全局渠道。个人渠道
+    照旧每个主人各一条，只数他的答案、链到他的那条待办。
+
+    消息照模块说明的规矩（X6）：口径名（搭建时起的工作流名）、新旧版本号、几个答案（几条待办）、召回编号、去处理的链接；不放
+    旧口径的值、新口径的值、差值和原答案的值。返回推了几个渠道。"""
+    from app.ledger import recall
+
+    try:
+        await ensure_assignee_mail(users)
+    except Exception:  # noqa: BLE001 - 自动建渠道出错不挡这条待办的通知
+        logger.exception("给待办 %s 的处理人自动建邮件渠道失败", task_id)
+    event = "ledger.recall"
+    async with SessionLocal() as session:
+        task = await session.get(Task, task_id)
+        if task is None:
+            return 0
+        run = await session.get(Run, task.run_id)
+        key = task.correlation_key or ""
+        reason = key.split(":", 1)[0]
+        batch = recall.batch_of_key(key)
+        siblings = [t for t, k in (await session.execute(
+            select(Task.id, Task.correlation_key).where(Task.run_id == task.run_id, Task.kind == recall.TASK_KIND)
+            .order_by(Task.created_at, Task.id))).all() if recall.batch_of_key(k or "") == batch]
+        first = not siblings or siblings[0] == task_id
+        channels = await _channels(session, event, run, users) if reason == "caliber" else []
+        # 不是这一批最早的那条：全局渠道已经（或正由那一条）推过了，这条只推个人渠道，task.opened 也跳过全局渠道
+        shared = [] if first else list((await session.execute(select(NotifyChannel.id).where(
+            NotifyChannel.scope == "global"))).scalars())
+        channels = [c for c in channels if first or c.scope != "global"]
+        origin = run.origin if run is not None and isinstance(run.origin, dict) else {}
+        name = str(await session.scalar(select(Workflow.name).where(Workflow.id == origin.get("workflow_id")))
+                   or "") if origin.get("workflow_id") else ""
+        base = await _base_url(session) if channels else None
+    pushed = 0
+    if channels:
+        head = [("状态", "待处理"), ("口径", f"「{name[:80]}」"),
+                ("版本", f"v{origin.get('from_version')} → v{origin.get('to_version')}")]
+        tail = [("召回", f"#{task.run_id[:6]}")]
+        mine = len(recall._uses_of(origin, recall._owner_of_key(key)))
+        everyone = len(recall._uses_of(origin, ("anyone", "")))
+
+        def message(answers: int, tasks: int, link: tuple[str, str] | None) -> dict[str, Any]:
+            return {"event": event, "status": "pending", "ok": False,
+                    "title": recall.CHANGED_TITLE.format(name=name[:80] or "口径", version=origin.get("to_version")),
+                    "lines": [*head, ("答案", f"{answers} 个"), *([("待办", f"{tasks} 条")] if tasks > 1 else []), *tail],
+                    "links": [link] if base and link else [],
+                    "subject": {"task_id": task_id, "run_id": task.run_id, "workflow_id": origin.get("workflow_id")}}
+
+        own = ("去处理", f"{base}/apps/inbox/{task_id}")
+        group = [c for c in channels if c.scope == "global"]
+        if group:
+            # 这一批只有这一条（关登录时派给任何人）就链到它；几条的链到待办箱，各人看派给自己的那条
+            many = len(siblings) > 1
+            pushed += await _push(group, message(everyone, len(siblings), ("去待办箱", f"{base}/apps?tab=inbox")
+                                                 if many else own),
+                                  subject_kind="task", subject_id=task_id, event=event, run_id=task.run_id,
+                                  task_id=task_id)
+        if personal := [c for c in channels if c.scope != "global"]:
+            pushed += await _push(personal, message(mine, 1, own), subject_kind="task", subject_id=task_id,
+                                  event=event, run_id=task.run_id, task_id=task_id)
+    return pushed + await notify_task(task_id, "task.opened", users=users,
+                                      exclude=frozenset(c.id for c in channels) | frozenset(shared))
 
 
 async def notify_run(run_id: str, event: str) -> int:
@@ -434,7 +509,7 @@ async def notify_source_changed(source_id: str) -> int:
     """数据源有要处理的变化（source.changed，03 B3 ④、目录-D9）：只推还要人看（开着、知道了还没处理）的「要处理」级变化，
     按源汇总；消息里只有源名、各级别条数和链接，不放表名、列名、取值。探查、剖析任务结束时有新的「要处理」变化才调。
 
-    这一行的 scopes 第 4 波有了「变化」标签页才打开：现在 _channels 推不出去，这里返回 0（照实：没有界面看不了的通知不发）。"""
+    只推全局渠道（按源汇总，不归哪个人）；链接落到数据目录页的「变化」标签页（第 4 波 W4-d 有了这个标签页才打开订阅）。"""
     from app.data import source_changes
     from app.db.models import DataSource
 
@@ -454,7 +529,7 @@ async def notify_source_changed(source_id: str) -> int:
     lines = [("数据源", f"「{row.name}」"), ("要处理", f"{by['action']} 条"), ("提醒", f"{by.get('warning', 0)} 条"),
              ("说明", f"{by.get('info', 0)} 条")]
     message = {"event": event, "status": "action", "title": f"数据源「{row.name[:80]}」有 {by['action']} 个变化要处理",
-               "lines": lines, "links": [("去看看", f"{base}/data/catalog/{source_id}")] if base else [],
+               "lines": lines, "links": [("去看看", f"{base}/data/catalog/{source_id}?view=changes")] if base else [],
                "subject": {"source_id": source_id}}
     return await _push(channels, message, subject_kind="source", subject_id=source_id, event=event, run_id=None,
                        task_id=None)
@@ -463,7 +538,8 @@ async def notify_source_changed(source_id: str) -> int:
 async def notify_eval(eval_run_id: str, event: str, *, passed: int, graded: int, regressed: int) -> int:
     """定时评测的通知（eval.regressed 有一道题从通过变成不通过、eval.failed 没评完：失败、到了上限、止损）。只推订阅了它的
     全局渠道。消息里只有题集名、状态、通过几题、退步几题、评测编号和链接（细案 01 做法 15、总方案 X6）：不放期望值、答案里的数、
-    题目原文。链接去发起它的那条定时任务的触发历史（评测页在第 4 波）。"""
+    题目原文。链接去这次评测的详情页（/evals/runs/{评测 id}：进度、逐题结果、和上一次比；第 4 波评测页上线之前是定时任务的
+    触发历史），退步的那几题在详情页上点得开。"""
     from app.db.models_eval import EvalRun, EvalSuite
 
     async with SessionLocal() as session:
@@ -485,7 +561,7 @@ async def notify_eval(eval_run_id: str, event: str, *, passed: int, graded: int,
     if run.arm:
         lines.append(("对照", run.arm[:40]))
     lines.append(("评测", f"#{eval_run_id[:6]}"))
-    links = [("查看定时任务", f"{base}/schedules/{run.schedule_id}?tab=history")] if base and run.schedule_id else []
+    links = [("查看评测", f"{base}/evals/runs/{eval_run_id}")] if base else []
     message = {"event": event, "status": run.status, "ok": False,
                "title": f"定时评测「{name}」{'有退步' if regressed_event else '没有评完'}", "lines": lines, "links": links,
                "subject": {"eval_run_id": eval_run_id, "suite_id": run.suite_id, "schedule_id": run.schedule_id}}

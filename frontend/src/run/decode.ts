@@ -12,6 +12,7 @@ import {
   evidenceTally, issuanceLabel, nodeTypeLabel,
 } from '../lib/terms'
 import { catalogPatchOf, patchBeforeText, patchValueText, patchWhere } from './catalogPatch'
+import { LEDGER_FEEDBACK_TEXT, RECALL_TEXT } from '../lib/termsRecall'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
 import { isSqlCheckCode, sortSqlChecks, sqlCheckOf, sqlChecksOf, sqlCheckWhere, sqlRuleLabel } from '../lib/sqlcheck'
 
@@ -93,7 +94,8 @@ export type StepKind =
  * suspended：服务重启时还在跑的步骤，断点还在，可以接着跑。
  * skipped：skip_if 成立、这一步没有执行。和"根本没轮到"是两回事，得留痕。
  */
-export type StepStatus = 'running' | 'done' | 'failed' | 'waiting' | 'cancelled' | 'suspended' | 'skipped'
+/** rejected：这一步被人驳回（node.failed 带 reason=rejected）。人的决定，不是失败：不画红、不算出错 */
+export type StepStatus = 'running' | 'done' | 'failed' | 'waiting' | 'cancelled' | 'suspended' | 'skipped' | 'rejected'
 
 /** 节点的某一次执行。循环体、轮询类节点一次运行里会执行几十上百次 */
 export interface Exec {
@@ -394,7 +396,7 @@ export function decodePhase(events: RunEvent[], final?: RunFinal): RunPhase {
 
 const STEP_OF: Partial<Record<NodeState, StepStatus>> = {
   done: 'done', failed: 'failed', waiting: 'waiting', cancelled: 'cancelled',
-  suspended: 'suspended', running: 'running', skipped: 'skipped',
+  suspended: 'suspended', running: 'running', skipped: 'skipped', rejected: 'rejected',
 }
 const stepStatusOf = (state: NodeState): StepStatus => STEP_OF[state] ?? 'done'
 
@@ -2018,10 +2020,31 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
       }
 
       case 'node.failed': {
-        // 节点失败时还在进行中的那次调用就是出错的那次，跟节点一起算失败，不留给清扫写成已取消
-        closeLlm(nodeId, 'failed', at)
         const step = nodeId ? nodeSteps.get(nodeId) : undefined
         const ms = num(d.duration_ms)
+        if (d.reason === 'rejected') {
+          // 人的驳回（服务端给被驳回的那一步的 node.failed 带 reason=rejected，总方案 X9）：这一步写「被驳回」，副标题写谁、
+          // 备注，原话放展开里；不画红、不当成出错（老运行的 node.failed 没有 reason，照旧按失败画）
+          closeLlm(nodeId, 'cancelled', at)
+          const sub = REJECTED_TEXT.step(d)
+          if (step) {
+            const cur = execOf(nodeId)
+            if (cur) { cur.status = 'rejected'; if (ms != null) cur.ms = ms }
+            step.status = 'rejected'
+            step.level = undefined
+            step.sub = sub
+            step.detail = String(d.error ?? '')
+            step.ms = ms
+            step.meta = dur(ms)
+          } else {
+            push({ id: `nr-${seq}`, seq, kind: 'lifecycle', status: 'rejected', title: REJECTED_TEXT.title, sub,
+                   ...(d.error ? { detail: String(d.error) } : {}), nodeId }, nodeId)
+          }
+          trackTeam(event)
+          break
+        }
+        // 节点失败时还在进行中的那次调用就是出错的那次，跟节点一起算失败，不留给清扫写成已取消
+        closeLlm(nodeId, 'failed', at)
         // detail 是原始异常：给排查用，不给人读，折起来
         const raw = typeof d.detail === 'string' && d.detail ? d.detail : undefined
         if (step) {
@@ -2414,6 +2437,61 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           title: LEDGER_TEXT.timeline(counts),
           sub: [LEDGER_TEXT.sub, d.trigger === 'certified' ? LEDGER_TEXT.certified : retro ? LEDGER_TEXT.retro : '']
             .filter(Boolean).join(' · '),
+        })
+        break
+      }
+
+      case 'ledger.recalled': {
+        // 口径召回（next-round 02 做法 7）：封存之后追加。原答案上的是「已按 vN 核对，不影响」；召回运行自己身上的是收尾的
+        // 结论（数变没变、开了几条待办）；表结构变了之后的口径试算是 probe。事件里不带数
+        const R = RECALL_TEXT.timeline
+        const to = typeof d.to_version === 'number' ? d.to_version : null
+        const from = typeof d.from_version === 'number' ? d.from_version : null
+        const tasks = Array.isArray(d.tasks) ? d.tasks.length : 0
+        const failed = d.outcome === 'failed'
+        const title = d.role === 'answer' ? R.answer(to)
+          : d.probe ? (failed ? R.probeFailed : R.probeOk)
+          : failed ? R.recallFailed : d.changed === true ? R.recallChanged(from, to)
+          : d.changed === false ? R.recallSame(from, to) : R.generic
+        out.push({
+          id: `lr-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_recalled',
+          level: failed || (d.role !== 'answer' && d.changed) ? 'warn' : 'info',
+          title, sub: R.sub,
+          ...(tasks ? { meta: R.tasks(tasks) } : {}),
+          ...(failed && typeof d.error === 'string' && d.error ? { detail: d.error } : {}),
+        })
+        break
+      }
+
+      case 'ledger.feedback': {
+        // 对账结果上的「说明有用 / 看不懂」（next-round 02 做法 10，服务端 ledger/feedback）：记在对账运行上、封存之后追加。
+        // 同一个人改主意会再记一条（统计只算最后一次），时间线照实一条一行
+        const F = LEDGER_FEEDBACK_TEXT
+        const verdict = typeof d.verdict === 'string' ? d.verdict : undefined
+        out.push({
+          id: `lf-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_feedback', level: 'info',
+          title: verdict && F.verdict[verdict] ? F.title(verdict, typeof d.by === 'string' ? d.by : null) : F.generic,
+          sub: F.sub,
+        })
+        break
+      }
+
+      case 'ledger.basis_changed': {
+        // 答案依据的东西变了（目录事实被驳回或修改、表结构变了、新码值）：封存之后追加，标「依据有变」。按新目录多出错误级
+        // 问题的写几条（服务端已经开了待办）
+        const R = RECALL_TEXT.timeline
+        const items = Array.isArray(d.items) ? d.items : []
+        const labels = items.map((i: any) => (i && typeof i.label === 'string' ? i.label : '')).filter(Boolean)
+        const errors = typeof d.new_errors === 'number' ? d.new_errors : 0
+        const where = [d.source, d.table].filter((x) => typeof x === 'string' && x).join(' · ')
+        out.push({
+          id: `lb-${seq}`, seq, kind: 'note', status: 'done', code: 'ledger_basis_changed',
+          level: errors > 0 || d.kind === 'structure' ? 'warn' : 'info',
+          title: R.basis[String(d.kind)] ?? R.basisGeneric,
+          sub: R.sub,
+          ...(where ? { meta: where } : {}),
+          ...(labels.length || errors ? { detail: [labels.length ? R.basisItems(labels) : '', errors ? R.newErrors(errors) : '']
+            .filter(Boolean).join('\n') } : {}),
         })
         break
       }

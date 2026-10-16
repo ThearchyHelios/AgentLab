@@ -1508,6 +1508,60 @@ await section('exits', async () => {
   }
 })
 
+// ---------------------------------------------------------------- 被驳回的那一步
+
+await section('rejected', async () => {
+  // 驳回是人的决定，不是故障（05 (a)、总方案 X9）：被驳回的那一步节点层仍发 node.failed，但带 reason=rejected。画布上它画成
+  // 「被驳回」——中性色、停止的剪影，不是失败的三角、红框、抖动；下游是「未到达」，不是「被阻断」；运行胶囊的计数写被驳回。
+  // 没有 reason 的老运行照旧画失败
+  console.log('\n=== 被驳回的那一步 ===')
+  const REJECT_TAIL = [
+    [3, 'human.resolved', 'human', { approved: false, note: '数字对不上', actor: '李工' }],
+    [0.05, 'run.resumed', null, { actor: '李工' }],
+    [0.05, 'node.started', 'human', { resumed: true }],
+    [0.1, 'node.failed', 'human', { duration_ms: 40, error: '人工驳回：数字对不上', reason: 'rejected', kind: 'approve',
+      decision: 'reject', actor: '李工', note: '数字对不上' }],
+    [0.05, 'run.cancelled', null, { reason: 'rejected', node_id: 'human', label: '班长审批', kind: 'approve', decision: 'reject',
+      actor: '李工', note: '数字对不上', timing: { wall_ms: 60000, active_ms: 40000, wait_ms: 20000 } }],
+  ]
+  const REJECTED = script([...HEAD, ...TEAM_ROUND0, ...TEAM_DONE, ...LOOP_DONE, ...TO_GATE, ...REJECT_TAIL])
+  const LEGACY = script([...HEAD, ...TEAM_ROUND0, ...TEAM_DONE, ...LOOP_DONE, ...TO_GATE,
+    ...REJECT_TAIL.slice(0, 3),
+    [0.1, 'node.failed', 'human', { duration_ms: 40, error: '人工驳回：数字对不上' }],
+    [0.05, 'run.failed', null, { error: '人工驳回：数字对不上', node_id: 'human', timing: { wall_ms: 60000, active_ms: 40000, wait_ms: 20000 } }]])
+  const { browser, page, errors } = await open({ theme: 'dark' })
+  await setLod(page, 'full')
+  await feed(page, REJECTED(Date.now()))
+  await page.waitForTimeout(400)
+  const all = await cards(page)
+  check('被驳回的那一步：卡片状态是 rejected', all.human?.state === 'rejected', all.human?.state)
+  check('……剪影是停止（和取消同一个），不是失败的三角', all.human?.shape === 'stop', all.human?.shape)
+  check('……槽里写「被驳回」和原话的第一句', /被驳回/.test(all.human?.text ?? '') && /数字对不上/.test(all.human?.text ?? ''),
+    JSON.stringify(all.human?.text))
+  check('……不写「失败」', !/失败/.test(all.human?.text ?? ''), JSON.stringify(all.human?.text))
+  const look = await page.evaluate(() => {
+    const card = document.querySelector('.react-flow__node[data-id="human"] .nc')
+    const note = card?.querySelector('.nc-tele-note')
+    return { failedClass: card?.classList.contains('node-failed'), rejectedClass: card?.classList.contains('node-rejected'),
+      noteTitle: note?.getAttribute('title') ?? '' }
+  })
+  check('……不挂失败的红框（node-failed），挂 node-rejected', !look.failedClass && look.rejectedClass, JSON.stringify(look))
+  check('……悬停写原话（谁驳回、为什么）', look.noteTitle.includes('数字对不上'), look.noteTitle)
+  check('下游是「未到达」，不是「被阻断」', all.out?.state === 'unreached', all.out?.state)
+  const failedId = await page.evaluate(() => window.__studio.getState().trace.failedNodeId ?? null)
+  check('航迹里没有「失败的节点」', failedId === null, String(failedId))
+  check('运行收成 cancelled（不是 failed）', await page.evaluate(() => window.__studio.getState().runPhase) === 'cancelled')
+  shots.push(await shot(page, 'dark-rejected'))
+
+  await feed(page, LEGACY(Date.now()))
+  await page.waitForTimeout(400)
+  const old = await cards(page)
+  check('老运行（node.failed 没有 reason）照旧画失败、下游被阻断', old.human?.state === 'failed' && old.out?.state === 'blocked',
+    `${old.human?.state} / ${old.out?.state}`)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
+  await browser.close()
+})
+
 // ---------------------------------------------------------------- 关掉动效
 
 await section('reduced', async () => {

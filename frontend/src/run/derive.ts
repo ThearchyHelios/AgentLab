@@ -224,7 +224,7 @@ export function heldEdgesOf(trace: Trace, graph: GraphLike): string[] {
   return out
 }
 
-const STARTED = new Set<NodeState>(['running', 'waiting', 'done', 'failed', 'skipped', 'cancelled', 'suspended'])
+const STARTED = new Set<NodeState>(['running', 'waiting', 'done', 'failed', 'skipped', 'cancelled', 'suspended', 'rejected'])
 
 /**
  * 这次运行实际走过的边：源放行过这条出口（循环里任何一轮都算），目标也确实开跑过。

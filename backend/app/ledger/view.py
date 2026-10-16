@@ -6,10 +6,15 @@ ledger 键、报告导出的片段面板，三处读同一份比对工件、按�
 
 界面层不放逻辑：标签、整题判断、能做的动作都由这里给。actions（第 3 波）：整题等价时按那份口径正式出具（能不能、能不能
 自动、不能的原因，ledger/issue.plan_issue，按看的这个人的权限判）；有相关口径的查询看差多少（口径对账，ledger/reconcile）。
-issued 是这次运行按口径出具过的正式运行，reconciled 是对过的账（各自的运行、状态）。
+issued 是这次运行按口径出具过的正式运行，reconciled 是对过的账（各自的运行、状态，第 4 波起带上结果上的「说明有用 /
+看不懂」：看的这个人给过的、各几个，ledger/feedback）。
+
+recall（第 4 波，ledger/recall.answer_marks）：这个答案身上的召回标记——「已按 vN 核对，不影响」（checked）、依据有变
+（basis）、看的这个人手上说的是它的 recall 待办（tasks）。几种状态都带：没比对过、不比对的答案照样可能被标依据有变。
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -22,6 +27,10 @@ from app.ledger import store
 
 #: state：matched 比对过；pending 已排队按需比对；ineligible 这次运行不比对（reason 写为什么）；unreadable 比对记录读不出
 STATES = ("matched", "pending", "ineligible", "unreadable")
+
+#: 成功结束、还没封存的运行，结束后这么多秒内答 pending（runner 落库之后马上封存，正常是几秒）。过了还没封存的是封存出了错、
+#: 或者是封存之前的老数据：再答 pending，页面就一直转圈、等满两分钟（store/ledger.ts 的等待上限）再取还是 pending——照实说没封存
+SEAL_GRACE_S = 120
 
 
 class _Hide:
@@ -92,8 +101,6 @@ def _labels_view(content: dict[str, Any], hider: _Hide, names: dict[str, str]) -
 
 def _stamp(recorded: store.Recorded) -> dict[str, Any]:
     """比对的来历：哪份工件、哪一版算法、谁触发的、什么时候追加的；事后补比的写明按现在的口径回看。"""
-    from datetime import datetime, timezone
-
     at = datetime.fromtimestamp(recorded.ts, timezone.utc).isoformat(timespec="seconds") \
         if isinstance(recorded.ts, (int, float)) else None
     return {"artifact": recorded.artifact, "algo": recorded.algo, "trigger": recorded.trigger, "retro": recorded.retro,
@@ -102,20 +109,39 @@ def _stamp(recorded: store.Recorded) -> dict[str, Any]:
                 else ledger_labels.RETRO_NOTE} if recorded.retro else {})}
 
 
+def _just_finished(finished_at: datetime | None) -> bool:
+    """运行是不是刚结束（SEAL_GRACE_S 以内）。没记结束时间的不算；库里读回 naive 的按 UTC 算（同 db/base.UTCDateTime）。"""
+    if finished_at is None:
+        return False
+    at = finished_at if finished_at.tzinfo is not None else finished_at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - at).total_seconds() <= SEAL_GRACE_S
+
+
 async def run_view(run_id: str) -> dict[str, Any]:
     """GET /api/runs/{run_id}/ledger 的答复：标签、整题判断、每条查询的比对、能做的动作。没比对过、能比的运行这时排上按需比对
     （trigger=on_demand），答复 state=pending；不比的照实说为什么。"""
     from app.api.coded import CodedHTTPException
     from app.api.evidence import RUN_NOT_FOUND, _sealed
 
+    from app.api.deps import current_principal
+    from app.ledger.recall import answer_marks
+
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
-    if run is None:
-        raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND)
-    base: dict[str, Any] = {"run_id": run_id, "note": ledger_labels.POST_SEAL_NOTE}
+        if run is None:
+            raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND)
+        principal = current_principal()
+        marks = await answer_marks(session, run_id, principal)
+    base: dict[str, Any] = {"run_id": run_id, "note": ledger_labels.POST_SEAL_NOTE, "recall": marks}
     recorded = await store.latest(run_id)
     if recorded is None:
         why = ledger_match.ineligible(run)
+        if why == ledger_match.NOT_SEALED and run.status == "succeeded" \
+                and ledger_match.wanted(run.run_class, run.origin_kind) and _just_finished(run.finished_at):
+            # runner 先发 run.finished、落库，再封存、再排上比对（engine/runner._finalize）：页面收到 run.finished 立刻来取，
+            # 这一下还没封存。这不是「不比对」，是封存完就比——照实答 pending，页面按退避接着取；这里不另排按需比对。
+            # 只限刚结束的那一会儿（SEAL_GRACE_S），早就结束、一直没封存的照实答 ineligible
+            return {**base, "state": "pending"}
         sealed = await _sealed(run_id) if why is None else None
         if sealed is not None and not sealed.queries:
             why = ledger_match.NO_QUERIES
@@ -125,7 +151,7 @@ async def run_view(run_id: str) -> dict[str, Any]:
         return {**base, "state": "pending"}
     if recorded.content is None:
         return {**base, "state": "unreadable", "reason": recorded.problem, **_stamp(recorded)}
-    from app.api.deps import current_principal
+    from app.ledger import feedback as ledger_feedback
     from app.ledger import issue as ledger_issue
     from app.ledger import reconcile as ledger_reconcile
 
@@ -133,12 +159,14 @@ async def run_view(run_id: str) -> dict[str, Any]:
     sealed = await _sealed(run_id)
     hider = await _hider(sealed)
     names = await _names(_workflow_ids(content))
-    principal = current_principal()
     plans = await ledger_issue.plans_for(run_id, content, principal=principal, hide=hider.hide,
                                          artifact=recorded.artifact, retro=recorded.retro)
     async with SessionLocal() as session:
         issued = [ledger_issue.issued_view(r) for r in await ledger_issue.issued_runs(session, run_id)]
         reconciled = [ledger_reconcile.reconciled_view(r) for r in await ledger_reconcile.reconciled_runs(session, run_id)]
+        # 对账结果上的「说明有用 / 看不懂」（ledger/feedback）：看的这个人给过哪一个、各几个
+        votes = await ledger_feedback.feedback_of(session, [r["run_id"] for r in reconciled], principal)
+        reconciled = [{**r, "feedback": votes[r["run_id"]]} for r in reconciled]
     return {
         **base, "state": "matched", **_stamp(recorded),
         "calibers": [{**{k: c.get(k) for k in ("caliber", "workflow_id", "version", "level", "graph_hash")},

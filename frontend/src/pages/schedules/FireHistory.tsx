@@ -7,13 +7,15 @@ import { formatDateTime, parseServerTime, shortId } from '../../lib/format'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type { Schedule, ScheduleFire, ScheduleFireCompare } from '../../types'
 import { comparePath, type CompareVia } from '../runs/compare/entry'
-import { FireKindChip, FireStatusChip, ZonedTime } from './parts'
+import { maintenanceJobPath, maintenanceStepText } from './model'
+import { FireKindChip, FireStatusChip, ZonedTime, targetKindOf } from './parts'
 
 const PAGE = 20
 
 /**
  * 触发历史：每次触发一行，新的在前，20 条一页、「加载更多」往后接。计划时间按定时任务的时区写；跳过、发起失败
- * 写原因；发起了的链到那次运行、写运行现在的状态；运行成功结束后服务端和同一任务上一次成功的运行比过的，另给
+ * 写原因；发起了的链到那次运行、写运行现在的状态（目标是评测题集的链到那次评测；目标是数据源维护的没有运行，逐个列出建了的
+ * 探查、剖析任务和没执行的步骤，见 MaintenanceFire）；运行成功结束后服务端和同一任务上一次成功的运行比过的，另给
  * 「与上一次对比」（基准不是紧挨着的上一次时写「与上一次成功的运行对比」）；发出去的通知逐条写结果。refreshKey 变了
  * （立即运行之后）从头重取。
  *
@@ -96,7 +98,7 @@ export function FireHistory({ schedule, refreshKey, latest, onNewest }: {
     body = (
       <div data-fire-list="">
         <ul className="overflow-hidden rounded-lg border bg-panel">
-          {items.map((f) => <FireRow key={f.id} fire={f} tz={schedule.timezone} now={now} />)}
+          {items.map((f) => <FireRow key={f.id} fire={f} schedule={schedule} now={now} />)}
         </ul>
         <div className="flex items-center justify-center gap-2 px-3 py-3 text-2xs text-faint">
           <span className="tnum">{T.shown(items.length)}</span>
@@ -126,8 +128,14 @@ export function FireHistory({ schedule, refreshKey, latest, onNewest }: {
   )
 }
 
-function FireRow({ fire: f, tz, now }: { fire: ScheduleFire; tz: string; now: number }) {
+function FireRow({ fire: f, schedule, now }: { fire: ScheduleFire; schedule: Schedule; now: number }) {
   const at = parseServerTime(f.fire_at)
+  const tz = schedule.timezone
+  const maintenance = targetKindOf(schedule) === 'source_maintenance'
+  const jobs = maintenance ? f.inputs?.jobs ?? [] : []
+  const skipped = maintenance ? f.inputs?.skipped ?? [] : []
+  // 维护有没执行的步骤时，服务端记的原因就是这几步的原因连成一句：逐步列出来，不再重复写一遍
+  const reason = skipped.length ? null : f.reason
   return (
     <li className="border-b px-3 py-2.5 last:border-b-0" data-fire-id={f.id} data-fire-status={f.status} data-fire-kind={f.kind}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
@@ -144,13 +152,27 @@ function FireRow({ fire: f, tz, now }: { fire: ScheduleFire; tz: string; now: nu
             <ChevronRight size={11} aria-hidden />
           </Link>
         ) : f.eval_run_id ? (
-          // 目标是评测题集：这一次发起的是一次评测（评测页在后续版本），这里只写编号
-          <span className="shrink-0 text-2xs text-dim" data-fire-eval={f.eval_run_id}>{T.evalFire(f.eval_run_id.slice(0, 6))}</span>
+          // 目标是评测题集：这一次发起的是一次评测，链到评测详情（进度、逐题结果、和上一次比）
+          <Link to={`/evals/runs/${encodeURIComponent(f.eval_run_id)}`} title={T.evalFireTitle} data-fire-eval={f.eval_run_id}
+                className="inline-flex shrink-0 items-center gap-1.5 text-2xs text-dim hover:text-fg hover:underline">
+            {T.evalFire(f.eval_run_id.slice(0, 6))}
+            <ChevronRight size={11} aria-hidden />
+          </Link>
+        ) : maintenance ? (
+          // 目标是数据源维护：建的是任务、不是运行。建了的在下面逐个列出；没建任务照实说（刚触发时任务还在建）
+          !jobs.length && (
+            <span className="shrink-0 text-2xs text-faint" data-fire-maintenance-none="">
+              {f.status === 'started' ? T.maintenanceLaunching : T.maintenanceNoJobs}
+            </span>
+          )
         ) : <span className="shrink-0 text-2xs text-faint">{T.noRun}</span>}
       </div>
-      {f.reason && (
+      {maintenance && (jobs.length > 0 || skipped.length > 0) && (
+        <MaintenanceFire sourceId={schedule.target_id ?? ''} jobs={jobs} skipped={skipped} />
+      )}
+      {reason && (
         <div className="mt-1 text-2xs leading-relaxed text-dim">
-          <span className="text-faint">{T.reason}：</span>{f.reason}
+          <span className="text-faint">{T.reason}：</span>{reason}
         </div>
       )}
       {f.notified?.length > 0 && (
@@ -165,6 +187,41 @@ function FireRow({ fire: f, tz, now }: { fire: ScheduleFire; tz: string; now: nu
         </div>
       )}
     </li>
+  )
+}
+
+/**
+ * 数据源维护的一次触发建了什么（触发记录的 inputs，和数据源页「定时维护」的「最近一次」同一份、同一个写法）：每个探查、剖析
+ * 任务一行，链到能看它的地方——探查到数据源页那张卡片（探查的进度和结果都在卡片上），剖析到数据目录里那个任务的进度和结果；
+ * 没执行的步骤逐条写原因
+ */
+function MaintenanceFire({ sourceId, jobs, skipped }: {
+  sourceId: string
+  jobs: NonNullable<NonNullable<ScheduleFire['inputs']>['jobs']>
+  skipped: NonNullable<NonNullable<ScheduleFire['inputs']>['skipped']>
+}) {
+  return (
+    <div className="mt-1 space-y-0.5 text-2xs leading-relaxed" data-fire-maintenance="">
+      {jobs.length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+          <span className="text-faint">{T.maintenanceJobs}</span>
+          {jobs.map((j) => (
+            <Link key={j.id} to={maintenanceJobPath(sourceId, j)} title={T.maintenanceJobTitle[j.kind]}
+                  className="inline-flex items-center gap-0.5 text-dim hover:text-fg hover:underline"
+                  data-fire-job={j.id} data-fire-job-kind={j.kind}>
+              <span className="mono">{T.maintenanceJob(maintenanceStepText(j.step), T.maintenanceJobKind[j.kind] ?? j.kind, j.id,
+                j.tables ?? null)}</span>
+              <ChevronRight size={11} aria-hidden />
+            </Link>
+          ))}
+        </div>
+      )}
+      {skipped.map((k) => (
+        <div key={k.step} className="text-[var(--warn)]" data-fire-skipped={k.step}>
+          {T.maintenanceSkipped(maintenanceStepText(k.step), k.reason)}
+        </div>
+      ))}
+    </div>
   )
 }
 

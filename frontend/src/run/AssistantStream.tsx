@@ -1007,8 +1007,9 @@ const LIST_HEAD = 20
 /** 点名的那一行等展开之后再找，最多等这么多帧 */
 const REVEAL_TRIES = 4
 
+/** 长列表折起来时照样露出来的行：出了问题的、还在进行的、被驳回的（运行停在这一步，不能收进「前面的 N 条」） */
 const notable = (s: Step): boolean =>
-  s.status === 'failed' || s.status === 'running' || s.status === 'waiting'
+  s.status === 'failed' || s.status === 'running' || s.status === 'waiting' || s.status === 'rejected'
   || s.level === 'error' || s.level === 'warn'
 
 function StepList({ steps, depth, turnMs, fold = false }: {
@@ -1050,8 +1051,11 @@ function StepList({ steps, depth, turnMs, fold = false }: {
   )
 }
 
-/** 状态有自己剪影的就画剪影（全站同一套），其余的画这一步是什么 */
-const BADGED = new Set(['running', 'waiting', 'failed', 'cancelled', 'suspended', 'skipped'])
+/**
+ * 状态有自己剪影的就画剪影（全站同一套），其余的画这一步是什么。rejected（这一步被人驳回，node.failed 带 reason=rejected）
+ * 画停止的剪影：不进来的话它落到下面「顶层节点画完成」那一支，被驳回的那一步成了一个绿勾
+ */
+const BADGED = new Set(['running', 'waiting', 'failed', 'cancelled', 'suspended', 'skipped', 'rejected'])
 
 function StepRow({ step, depth, turnMs }: { step: Step; depth: number; turnMs?: number }) {
   if (depth === 0 && step.kind === 'lifecycle' && step.stage !== 'plan') return <PhaseMark step={step} />
@@ -1094,10 +1098,13 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
   // 失败要压过 kind：一条 lifecycle 跑挂了还画成打勾的"完成"图标，是把失败说成了成功
   const failed = status === 'failed' || step.level === 'error'
   const running = status === 'running'
+  // 被驳回是人的决定，不是故障：不画红、不画完成的绿，用中性的次一级字色（比取消、跳过的淡色重一档——运行就停在这一步）
+  const rejected = status === 'rejected'
   const top = depth === 0 && (step.kind === 'node' || step.kind === 'lifecycle')
   const color = failed ? 'var(--st-failed)'
     : status === 'waiting' ? 'var(--st-waiting)'
     : step.level === 'warn' ? 'var(--st-waiting)'
+    : rejected ? 'var(--text-dim)'
     : status === 'skipped' || status === 'cancelled' ? 'var(--text-faint)'
     : status === 'suspended' ? 'var(--st-suspended, var(--warn))'
     : running ? 'var(--st-running)'
@@ -1160,8 +1167,9 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
             // 副标题平时是淡色斜体的旁白（这次调用前在想什么、为什么跳过）；出了事的行
             // 它说的是为什么，用正体、跟着行的颜色，别让最要紧的那句成了最淡的字
             <span className={clsx('block truncate text-2xs leading-snug',
-                    failed || step.level === 'warn' ? 'not-italic' : 'italic text-faint')}
-                  style={failed ? { color: 'var(--st-failed)' } : step.level === 'warn' ? { color: 'var(--text-dim)' } : undefined}
+                    failed || rejected || step.level === 'warn' ? 'not-italic' : 'italic text-faint')}
+                  style={failed ? { color: 'var(--st-failed)' }
+                    : rejected || step.level === 'warn' ? { color: 'var(--text-dim)' } : undefined}
                   title={sub}>
               {sub}
             </span>
@@ -1238,6 +1246,13 @@ function StepMeta({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
       {/* 「开始运行」那一行的秒表和轮次头部的是同一个数，不重复 */}
       {running && step.startedAt != null && step.kind !== 'lifecycle'
         ? <LiveClock since={step.startedAt} label={reduced ? '进行中' : undefined} limitS={step.limitS} />
+        : step.status === 'rejected'
+          // 被驳回的那一步带着耗时（node.failed 的 duration_ms）：只写耗时的话停止的方块和取消分不开，状态和耗时都写
+          ? (
+            <span className={clsx('tnum mt-[1px] shrink-0 text-dim', dense ? 'text-[10px]' : 'text-2xs')} data-step-stopped="rejected">
+              {STOPPED.rejected}{step.meta && <span className="mono"> · {step.meta}</span>}
+            </span>
+          )
         : (step.meta || STOPPED[step.status ?? '']) && !(running && step.startedAt != null) && (
           <span className={clsx('tnum mt-[1px] shrink-0 text-dim', dense ? 'text-[10px]' : 'text-2xs',
             step.meta && 'mono')}>
@@ -1253,6 +1268,7 @@ function StepMeta({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
 const STOPPED: Record<string, string> = {
   cancelled: statusLabel('cancelled', { short: true }),
   suspended: statusLabel('suspended', { short: true }),
+  rejected: statusLabel('rejected', { short: true }),
 }
 
 /**

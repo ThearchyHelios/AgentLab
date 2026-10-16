@@ -612,6 +612,8 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
   if (n?.takenHandle && (state === 'done' || state === 'failed')) rows.push(['出口', <span className="mono">{n.takenHandle}</span>])
   if (n?.reason) rows.push(['理由', n.reason])
   if (state === 'skipped' && n?.skippedReason) rows.push(['跳过', n.skippedReason])
+  // 被人驳回的那一步（node.failed 带 reason=rejected）：写原话（谁驳回、为什么），不按失败去讲原因和处理建议
+  if (state === 'rejected' && n?.error) rows.push([REJECTED_TEXT.title, n.error])
   // 卡片说的是游标那一刻所在的那一次执行（和画布卡片同一个划分）：循环上一轮、接着跑之前
   // 的事不挂到这一次干净的执行上；回放到更早的一次时，也不因为后面还有一件就看不到这一次的
   const since = execStart(n, at, facts)

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { Check } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
+import { FreqPicker } from '../../components/FreqPicker'
 import { Field, Notice, Skeleton, Spinner, confirmDialog, toast, useRadioGroup } from '../../components/ui'
 import { errorMessage } from '../../lib/errors'
 import { parseServerTime } from '../../lib/format'
@@ -11,9 +12,8 @@ import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import { useCatalog, useCatalogListState } from '../../store/catalog'
 import type { Schedule, SchedulePreview, ScheduleRunClass, ScheduleVariable, Workflow } from '../../types'
 import {
-  FREQ_PRESETS, GRACE_OPTIONS, HOUR_STEPS, WEEKDAY_ORDER, createBody, cronOf, formOf, formProblems, formatZoned, freqProblem,
-  graceLabel, graphFields, patchBody, rebaseForm, serverFieldValue, templateOf, timezoneOptions, type Freq, type FormField,
-  type FreqPreset, type InputField, type ScheduleForm,
+  GRACE_OPTIONS, createBody, cronOf, formOf, formProblems, formatZoned, freqProblem, graceLabel, graphFields, patchBody,
+  rebaseForm, serverFieldValue, templateOf, type Freq, type FormField, type InputField, type ScheduleForm,
 } from './model'
 import { isUnsupported } from './parts'
 import { WebhookFields } from './WebhookFields'
@@ -180,9 +180,9 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
                          onPick={pickWorkflow} onBlur={() => touch('workflow')} />
         </section>
 
-        <FreqSection form={form} setFreq={setFreq} setTimezone={(timezone) => set({ timezone })}
-                     freqError={freqProblem(form.freq) ?? previewSays('cron') ?? serverError(['cron'])}
-                     tzError={previewSays('timezone') ?? serverError(['timezone'])} />
+        <FreqPicker freq={form.freq} timezone={form.timezone} setFreq={setFreq} setTimezone={(timezone) => set({ timezone })}
+                    freqError={freqProblem(form.freq) ?? previewSays('cron') ?? serverError(['cron'])}
+                    tzError={previewSays('timezone') ?? serverError(['timezone'])} />
       </div>
 
       <aside className="min-w-0 lg:col-start-2 lg:row-span-2 lg:row-start-1">
@@ -275,124 +275,11 @@ function WorkflowField({ form, workflows, state, workflow, base, error, onPick, 
 // 频率与时区
 // ---------------------------------------------------------------------------
 
-function FreqSection({ form, setFreq, setTimezone, freqError, tzError }: {
-  form: ScheduleForm
-  setFreq: (patch: Partial<Freq>) => void
-  setTimezone: (tz: string) => void
-  freqError?: string
-  tzError?: string
-}) {
-  const f = form.freq
-  const pick = (preset: FreqPreset) => {
-    if (preset === f.preset) return
-    // 切到自定义：带上当前预设生成的 cron，在它的基础上改
-    if (preset === 'custom') setFreq({ preset, cron: cronOf(f) || f.cron })
-    else setFreq({ preset })
-  }
-  const radio = useRadioGroup(FREQ_PRESETS, f.preset, pick)
-  const errId = 'schedule-freq-error'
-  // 说明接到出问题的那一项上：每周一天都没选时是星期那一组，否则是这个预设主要的输入框
-  const weekdayError = !!freqError && f.preset === 'weekly' && !f.weekdays.length
-  const errorProps = (primary: boolean) => (primary && freqError && !weekdayError
-    ? { 'aria-invalid': true as const, 'aria-describedby': errId } : {})
-  const zones = useMemo(() => timezoneOptions(form.timezone), [form.timezone])
-  const timeInput = (
-    <Field label={T.time} htmlFor="schedule-time">
-      <input id="schedule-time" type="time" step={60} className="field w-32" value={f.time} required
-             onChange={(e) => setFreq({ time: e.target.value })} data-freq-time="" {...errorProps(true)} />
-    </Field>
-  )
-
-  return (
-    <section className="space-y-3 rounded-lg border bg-panel p-3.5" aria-labelledby="schedule-freq-title">
-      <h2 id="schedule-freq-title" className="text-xs font-semibold">{T.freq}</h2>
-      <div role="radiogroup" aria-labelledby="schedule-freq-title" className="flex flex-wrap gap-1">
-        {FREQ_PRESETS.map((p) => (
-          <button key={p} type="button" {...radio(p)} onClick={() => pick(p)} data-freq-preset={p}
-                  className={clsx('rounded-md border px-2.5 py-1 text-xs transition-colors',
-                    f.preset === p ? 'border-[var(--accent)] bg-accent-soft text-fg' : 'text-dim hover:bg-hover')}>
-            {T.preset[p]}
-          </button>
-        ))}
-      </div>
-
-      <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
-        {f.preset === 'weekly' && (
-          <div className="min-w-0">
-            <div className="label" id="schedule-weekdays">{T.weekdays}</div>
-            <div role="group" aria-labelledby="schedule-weekdays" aria-describedby={weekdayError ? errId : undefined}
-                 className="flex flex-wrap gap-1">
-              {WEEKDAY_ORDER.map((d) => {
-                const on = f.weekdays.includes(d)
-                return (
-                  <button key={d} type="button" aria-pressed={on} data-weekday={d}
-                          onClick={() => setFreq({ weekdays: on ? f.weekdays.filter((x) => x !== d) : [...f.weekdays, d] })}
-                          className={clsx('h-7 min-w-9 rounded-md border px-1.5 text-xs transition-colors',
-                            on ? 'border-[var(--accent)] bg-accent-soft text-fg' : 'text-dim hover:bg-hover')}>
-                    {T.weekdayShort[d]}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-        )}
-        {f.preset === 'monthly' && (
-          <Field label={T.monthday} htmlFor="schedule-monthday" hint={f.monthday > 28 ? T.monthdayHint : undefined}>
-            <select id="schedule-monthday" className="field w-24" value={f.monthday} data-freq-monthday=""
-                    aria-describedby={f.monthday > 28 ? 'schedule-monthday-hint' : undefined}
-                    onChange={(e) => setFreq({ monthday: Number(e.target.value) })}>
-              {Array.from({ length: 31 }, (_, i) => i + 1).map((d) => <option key={d} value={d}>{T.monthdayOption(d)}</option>)}
-            </select>
-          </Field>
-        )}
-        {(f.preset === 'daily' || f.preset === 'weekly' || f.preset === 'monthly') && timeInput}
-        {f.preset === 'hourly' && (
-          <>
-            <Field label={T.everyHours} htmlFor="schedule-every">
-              <select id="schedule-every" className="field w-32" value={f.everyHours} data-freq-every=""
-                      onChange={(e) => setFreq({ everyHours: Number(e.target.value) })}>
-                {HOUR_STEPS.map((n) => <option key={n} value={n}>{T.everyHoursOption(n)}</option>)}
-              </select>
-            </Field>
-            <Field label={T.minute} htmlFor="schedule-minute">
-              <input id="schedule-minute" type="number" min={0} max={59} step={1} className="field w-20" data-freq-minute=""
-                     value={Number.isFinite(f.minute) ? f.minute : ''} {...errorProps(true)}
-                     onChange={(e) => setFreq({ minute: e.target.value === '' ? Number.NaN : Number(e.target.value) })} />
-            </Field>
-          </>
-        )}
-        {f.preset === 'custom' && (
-          <Field label={T.cron} htmlFor="schedule-cron" hint={freqError ? undefined : T.cronHint} className="min-w-0 flex-1 basis-56">
-            <input id="schedule-cron" className="field mono" value={f.cron} placeholder="0 9 * * 1-5" autoComplete="off" spellCheck={false}
-                   onChange={(e) => setFreq({ cron: e.target.value })} data-freq-cron=""
-                   {...(freqError ? errorProps(true) : { 'aria-describedby': 'schedule-cron-hint' })} />
-          </Field>
-        )}
-      </div>
-      {f.preset === 'hourly' && !freqError && (
-        <p className="text-2xs leading-relaxed text-faint">{T.hourlyHint(f.everyHours, f.minute)}</p>
-      )}
-      {freqError && (
-        <div id={errId} className="text-2xs leading-relaxed text-[var(--err)]" role="alert" data-freq-error="">{freqError}</div>
-      )}
-
-      <Field label={T.timezone} htmlFor="schedule-timezone" hint={T.timezoneHint} error={tzError}>
-        <select id="schedule-timezone" className="field" value={form.timezone} data-timezone=""
-                aria-invalid={!!tzError || undefined}
-                aria-describedby={tzError ? 'schedule-timezone-error' : 'schedule-timezone-hint'}
-                onChange={(e) => setTimezone(e.target.value)}>
-          {zones.map((z) => <option key={z.tz} value={z.tz}>{z.label}</option>)}
-        </select>
-      </Field>
-    </section>
-  )
-}
-
 // ---------------------------------------------------------------------------
 // 预览
 // ---------------------------------------------------------------------------
 
-type PreviewState =
+export type PreviewState =
   | { status: 'idle' }
   | { status: 'loading'; data?: SchedulePreview; timezone?: string }
   | { status: 'ok'; data: SchedulePreview; timezone: string }
@@ -406,7 +293,7 @@ const PREVIEW_DEBOUNCE_MS = 400
  * 接下来 5 次触发和渲染出的输入（服务端算，前端不自己解析 cron）。改动中保留上一次的结果并标「正在计算」；
  * 非法时清掉上一次的时间，只留服务端的说明，免得人照着旧的时间以为新的频率没问题
  */
-function usePreview(cron: string, timezone: string, template: Record<string, string>, workflowId: string): PreviewState {
+export function usePreview(cron: string, timezone: string, template: Record<string, string>, workflowId: string): PreviewState {
   const [state, setState] = useState<PreviewState>({ status: 'idle' })
   const key = JSON.stringify([cron, timezone, Object.entries(template).sort(([a], [b]) => a.localeCompare(b)), workflowId])
   useEffect(() => {
@@ -442,7 +329,7 @@ function usePreview(cron: string, timezone: string, template: Record<string, str
   return state
 }
 
-function PreviewBox({ preview }: { preview: PreviewState }) {
+export function PreviewBox({ preview }: { preview: PreviewState }) {
   const data = preview.status === 'ok' || preview.status === 'loading' ? preview.data : undefined
   const tz = preview.status === 'ok' || preview.status === 'loading' ? preview.timezone : undefined
   return (

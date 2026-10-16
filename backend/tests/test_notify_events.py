@@ -34,8 +34,17 @@ URL = "https://hooks.example.com/agentlab/notify-events-5d1c"
 THIS_ROUND = ("source.changed", "ledger.recall", "eval.regressed", "eval.failed", "task.digest", "key.expiring")
 #: 其中已经实现了推送、打开了订阅的（推给哪几条路）：定时评测的两个只推全局渠道（第 3 波 W3-c，notify_eval）；每天的待办汇总
 #: 只推个人渠道；访问密钥快到期，个人密钥推本人、服务账号的推全局渠道（第 3 波 W3-d，notify/digest.py）。其余还没有
-PUSHED_THIS_ROUND = {"eval.regressed": {"global"}, "eval.failed": {"global"},
-                     "task.digest": {"user"}, "key.expiring": {"global", "user"}}
+PUSHED_THIS_ROUND = {
+    "eval.regressed": {"global"},
+    "eval.failed": {"global"},
+    "task.digest": {"user"},
+    "key.expiring": {"global", "user"},
+    # 第 4 波 W4-d：数据源有变化要处理，按源汇总、只推全局渠道（notify_source_changed）；链接落到「变化」标签页
+    "source.changed": {"global"},
+    # （两行之间隔一行不动的，两个包各改各的、合并不撞）
+    # 第 4 波 W4-a：口径召回数真变了的待办推全局渠道和答案主人自己的个人渠道（notify_recall）
+    "ledger.recall": {"global", "user"},
+}
 
 
 @pytest.fixture
@@ -113,19 +122,24 @@ async def test_events_endpoint_says_who_receives_each_event(client):
     assert [r["event"] for r in rows] == list(service.EVENTS)
     by = {r["event"]: r for r in rows}
     assert by["eval.regressed"] == {"event": "eval.regressed", "label": "定时评测有退步", "scopes": ["global"]}
-    assert by["ledger.recall"]["scopes"] == []
+    assert by["ledger.recall"]["scopes"] == ["global", "user"]
     assert by["review.done"]["scopes"] == ["global", "user"]
 
 
-async def test_events_not_pushed_yet_cannot_be_subscribed(client):
+#: 登记了、还没有推送的演示事件（第 4 波之后本轮的六个都推了，用它守「不收订阅、不列」这条规矩）
+UNPUSHED = "demo.unpushed"
+
+
+async def test_events_not_pushed_yet_cannot_be_subscribed(client, monkeypatch):
+    monkeypatch.setitem(service.EVENTS, UNPUSHED, service.Event("还没推送的演示事件", ()))
     resp = await client.post("/api/notify/channels", json={
-        "name": "事件登记-评测", "url": URL, "events": ["task.opened", "ledger.recall"]})
+        "name": "事件登记-评测", "url": URL, "events": ["task.opened", UNPUSHED]})
     assert resp.status_code == 422, resp.text
     detail = resp.json()["detail"]
-    assert "口径升版，答案的数变了" in detail and "还没有推送" in detail
+    assert "还没推送的演示事件" in detail and "还没有推送" in detail
     unknown = await client.post("/api/notify/channels", json={"name": "事件登记-未知", "url": URL, "events": ["nope"]})
     assert unknown.status_code == 422
-    assert "口径升版，答案的数变了" not in unknown.json()["detail"], "可选的里面不列还没有推送的"
+    assert "还没推送的演示事件" not in unknown.json()["detail"], "可选的里面不列还没有推送的"
     assert "待办打开" in unknown.json()["detail"]
 
 
@@ -156,16 +170,17 @@ async def test_scope_mismatch_is_refused_only_for_newly_ticked_events(client):
 
 async def test_channels_only_walk_the_paths_the_event_is_registered_for(monkeypatch):
     monkeypatch.setitem(service.EVENTS, "demo.personal", service.Event("只推个人的演示事件", ("user",)))
+    monkeypatch.setitem(service.EVENTS, UNPUSHED, service.Event("还没推送的演示事件", ()))
     async with SessionLocal() as session:
         row = NotifyChannel(name="事件登记-全局", scope="global", url=encrypt(URL),
-                            events=["demo.personal", "task.opened", "ledger.recall"])
+                            events=["demo.personal", "task.opened", UNPUSHED])
         session.add(row)
         await session.commit()
         try:
             ids = lambda found: [c.id for c in found]  # noqa: E731
             assert row.id not in ids(await service._channels(session, "demo.personal", None, [])), "全局渠道这条路没登记"
             assert row.id in ids(await service._channels(session, "task.opened", None, []))
-            assert await service._channels(session, "ledger.recall", None, []) == [], "还没有推送的：谁都不推"
+            assert await service._channels(session, UNPUSHED, None, []) == [], "还没有推送的：谁都不推"
             with pytest.raises(ValueError, match="没有登记"):
                 await service._channels(session, "demo.unregistered", None, [])
         finally:

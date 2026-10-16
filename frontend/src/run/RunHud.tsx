@@ -458,7 +458,7 @@ function Cells({ cells, onPick }: { cells: RunGlance['cells']; onPick: (id: stri
 }
 
 const COUNT_ORDER: NodeState[] = [
-  'running', 'waiting', 'failed', 'suspended', 'done', 'queued', 'blocked', 'unreached', 'skipped', 'cancelled',
+  'running', 'waiting', 'failed', 'rejected', 'suspended', 'done', 'queued', 'blocked', 'unreached', 'skipped', 'cancelled',
 ]
 
 // -------------------------------------------------------------------------

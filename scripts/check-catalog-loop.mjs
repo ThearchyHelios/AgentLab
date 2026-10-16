@@ -216,7 +216,8 @@ const manual = (id, name, count, options = {}) => ({
   ...blank, id, name, origin: 'manual', database: `/tmp/check/${name}.db`, table_count: count, tools: [`db_query__${name}`],
   schema_synced_at: T0, options,
 })
-const PROFILE_ON = { catalog_profile: { enabled: true, max_queries: 60, query_timeout_s: 10, sample_size: 2000, max_scan_rows: 100000, max_total_s: 120 } }
+// 剖析设置照现在的键（每张表的两项预算，和 check-catalog-profile 的 DEFAULTS 一致）；整次的旧键不再用（05 (g)）
+const PROFILE_ON = { catalog_profile: { enabled: true, table_max_queries: 40, table_max_s: 60, query_timeout_s: 10, sample_size: 2000, max_scan_rows: 100000 } }
 const SOURCES = [manual(S1, NAME1, 5), manual(S2, NAME2, 2, PROFILE_ON)]
 const NAMES = SOURCES.map((s) => s.name)
 
@@ -356,6 +357,11 @@ function loopHandlers(state, replies = {}) {
   }
   return [
     [/^GET \/datasources$/, (route) => json(state.sources)(route)],
+    // 数据源的变化、取值观察、后台任务条（next-round 第 4 波）：这里没有，给空的（不放行到服务端去查一个假的源）
+    [/^GET \/datasources\/check-loop-[a-z]+\/changes$/, json({ items: [], total: 0, counts: { pending: 0, open: 0, by_severity: { action: 0, warning: 0, info: 0 } } })],
+    [/^GET \/datasources\/check-loop-[a-z]+\/observations$/, json({ table: '', series: [] })],
+    [/^GET \/datasources\/check-loop-[a-z]+\/background-jobs$/, json({ items: [] })],
+    [/^GET \/datasources\/upkeep$/, json({ items: [] })],
     [/^GET \/datasources\/check-loop-[a-z]+\/catalog$/, (route, { key }) => json(listOf(state, parts(key)[2]))(route)],
     [/^GET \/datasources\/check-loop-[a-z]+\/catalog\/draft-jobs\/(active|latest)$/, json({ job: null })],
     // 某一次起草任务：表助手开场从中取起草时记下的留空列名。只认 state.jobs 里有的，别的 404（同服务端：任务不在了）

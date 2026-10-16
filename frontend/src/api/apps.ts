@@ -10,6 +10,7 @@ import type {
   ViewShareRow,
 } from '../typesApp'
 import type { ConversationDetail, EvidenceSegmentDetail } from '../types'
+import type { VersionRecallCounts } from '../typesRecall'
 import { del, get, patch, post, put, qs, request, type RequestOptions } from './http'
 
 const at = (id: string) => `/apps/${encodeURIComponent(id)}`
@@ -105,8 +106,12 @@ type AssistantConversation =
 const assistantInflight = new Map<string, Promise<AssistantConversation>>()
 
 export const ledger = {
-  /** 一个工作流版本被哪些应用钉住、生效记录数、正式运行数 */
+  /**
+   * 一个工作流版本被哪些应用固定、生效记录数、正式运行数；口径账本另加的（第 4 波，老服务端不给）：被几次问数回答用过、
+   * 导出过几次、定时任务几个、召回（以这一版为新版本召回过几组、其中数变了几组，作为旧版本被召回过几组）
+   */
   version: (workflowId: string, version: number) =>
-    get<{ apps: { app_id: string; name: string; app_version: number }[]; effects: number; formal_runs: number }>(
+    get<{ apps: { app_id: string; name: string; app_version: number }[]; effects: number; formal_runs: number
+      answers?: number; exports?: number; schedules?: number; recall?: VersionRecallCounts }>(
       `/ledger/workflow-versions/${encodeURIComponent(workflowId)}/${version}`),
 }

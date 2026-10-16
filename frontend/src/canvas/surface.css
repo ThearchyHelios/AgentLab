@@ -1443,6 +1443,8 @@
   background: color-mix(in srgb, var(--st-failed) 45%, transparent);
 }
 .tl-s-cancelled { --c: var(--st-cancelled); }
+/* 被驳回的那一段：人的决定，和取消同一种中性色 */
+.tl-s-rejected { --c: var(--st-cancelled); }
 .tl-s-suspended { --c: var(--st-suspended); }
 .tl-s-waiting { --c: var(--st-waiting); }
 .tl-s-waited { --c: var(--st-waiting); opacity: 0.8; }

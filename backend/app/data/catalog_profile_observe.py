@@ -516,3 +516,87 @@ async def observed_facts(session: AsyncSession, source_id: str,
 __all__ = ["KIND_LABEL", "OBSERVE_CODES_MAX", "OBSERVE_EVERY_H", "OBSERVE_KINDS", "OBSERVER", "SAMPLE_LADDER",
            "WINDOW_DAYS", "basis_key", "basis_text", "code_columns", "coverage_drops", "execute", "last_observed", "observe_reason",
            "observed_facts", "plan_observations", "record_coverage_drops", "sample_percent", "save"]
+
+
+# ==========================================================================
+# 给人看的（第 4 波 W4-d：表详情「结构与取值变化」一节、变化的依据）
+# ==========================================================================
+
+#: 表详情里每种观察给最近几次
+RECENT_SHOWN = 6
+
+
+def key_text(key: str | None) -> str | None:
+    """口径的规范写法（basis_key）→ 说法：变化记录里只存了规范写法，依据的口径照它写。认不出的为 None。"""
+    text = str(key or "")
+    head, _, rest = text.partition(":")
+    if head == "window":
+        column, _, days = rest.rpartition(":")
+        return basis_text({"method": "window", "column": column, "days": days}) if column and days else None
+    if head == "sample":
+        try:
+            return basis_text({"method": "sample", "percent": float(rest)})
+        except ValueError:
+            return None
+    if head == "first_rows" and rest:
+        return basis_text({"method": "first_rows", "rows": rest})
+    if text in ("full", "stats", "count"):
+        return basis_text({"method": text})
+    return None
+
+
+def _shown(kind: str, data: Mapping[str, Any]) -> dict[str, Any]:
+    """一次观察给界面的样子：码值按行数从多到少、带占比；按日行数按日期排成列表；其余原样。数都由这里算，界面只照写。"""
+    if kind == "codes_observe":
+        pairs = [(str(p[0]), int(p[1])) for p in data.get("values") or []
+                 if isinstance(p, (list, tuple)) and len(p) == 2 and isinstance(p[1], (int, float))]
+        rows = int(data.get("rows") or sum(n for _, n in pairs))
+        pairs.sort(key=lambda p: (-p[1], p[0]))
+        return {"values": [[c, n, round(n / rows, 4) if rows else 0.0] for c, n in pairs], "rows": rows,
+                "truncated": bool(data.get("truncated"))}
+    if kind == "daily_volume":
+        days = data.get("days") if isinstance(data.get("days"), Mapping) else {}
+        counts = {str(d)[:10]: int(n) for d, n in days.items() if isinstance(n, (int, float))}
+        # 窗口里没数据的日子补 0：只列有数据的日子，断了的那几天在图上就看不出来
+        try:
+            first, last = date.fromisoformat(str(data.get("since"))[:10]), date.fromisoformat(str(data.get("until"))[:10])
+        except ValueError:
+            first = last = None
+        if first and last and 0 <= (last - first).days <= WINDOW_DAYS + 7:
+            for i in range((last - first).days + 1):
+                counts.setdefault((first + timedelta(days=i)).isoformat(), 0)
+        series = sorted(counts.items())
+        return {"since": data.get("since"), "until": data.get("until"), "days": [list(p) for p in series],
+                "total": sum(n for _, n in series), "days_with_data": sum(1 for _, n in series if n > 0)}
+    if kind == "freshness":
+        return {"max": data.get("max")}
+    return {"rows": data.get("rows"), "at_least": bool(data.get("at_least")), "method": data.get("method")}
+
+
+async def recent(session: AsyncSession, source_id: str, table: str, *, masked: set[str],
+                 per: int = RECENT_SHOWN) -> list[dict[str, Any]]:
+    """这张表最近几次观察：按（种类、列）分组，种类按 OBSERVE_KINDS 的顺序、同种按列名；每组最近 per 次，新的在前：
+    [{kind, column, points: [{at, basis_key, basis_text, data}], basis_changed}]。basis_changed：这几次的口径不全相同（口径不同
+    不比，界面照实说）。遮罩在读的这一刻再核（look D6 的同一个道理）：观察时还没遮、现在被遮罩的列整组不给。"""
+    rows = (await session.execute(select(TableObservation).where(
+        TableObservation.source_id == source_id, TableObservation.table_name == table)
+        .order_by(TableObservation.at.desc(), TableObservation.id.desc()))).scalars()
+    groups: dict[tuple[str, str], list[TableObservation]] = {}
+    for r in rows:
+        if r.kind not in OBSERVE_KINDS or (r.column_name and r.column_name.lower() in masked):
+            continue
+        group = groups.setdefault((r.kind, r.column_name or ""), [])
+        if len(group) < per:
+            group.append(r)
+    order = {k: i for i, k in enumerate(OBSERVE_KINDS)}
+    out: list[dict[str, Any]] = []
+    for (kind, column), group in sorted(groups.items(), key=lambda kv: (order[kv[0][0]], kv[0][1])):
+        out.append({"kind": kind, "column": column,
+                    "points": [{"at": r.at.isoformat() if r.at else None, "basis_key": r.basis_key,
+                                "basis_text": basis_text(r.basis or {}), "data": _shown(kind, r.data or {})}
+                               for r in group],
+                    "basis_changed": len({r.basis_key for r in group}) > 1})
+    return out
+
+
+__all__ += ["RECENT_SHOWN", "key_text", "recent"]

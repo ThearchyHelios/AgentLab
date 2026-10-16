@@ -1506,7 +1506,8 @@ export interface UpgradeResult {
 /** 单个节点在一次运行中的实时状态，驱动画布上的高亮。 */
 export interface NodeRuntime {
   /** cancelled / suspended 是终态清扫时收的：运行被取消或服务重启时还没跑完的节点 */
-  status: 'idle' | 'running' | 'done' | 'failed' | 'waiting' | 'skipped' | 'cancelled' | 'suspended'
+  /** rejected：这一步被人驳回（node.failed 带 reason=rejected，run/trace 的 NodeState 同名） */
+  status: 'idle' | 'running' | 'done' | 'failed' | 'waiting' | 'skipped' | 'cancelled' | 'suspended' | 'rejected'
   durationMs?: number
   preview?: any
   error?: string
@@ -2526,6 +2527,13 @@ export interface EvidenceSegmentDetail {
   redacted?: { columns?: string[] }
   /** 可疑实体：最接近的已知名字（最多 3 个），给「是不是想写…」 */
   closest?: (string | { alias?: string; name?: string; table?: string; kind?: string })[]
+  /**
+   * 口径账本（next-round 02 做法 3）：这个数的口径标签和比对的来历。封存后比对，没比对过的运行、不是数的片段没有这个键
+   * （老运行的返回一字不差）。形状见 typesLedger.ts
+   */
+  ledger?: import('./typesLedger').SegmentLedger
+  /** 指标接口（/evidence/metrics/{node}/{metric}）给的展示值：遮罩的写「已遮罩」 */
+  rendered?: string
 }
 
 // -------------------------------------------------------------------------
@@ -3867,6 +3875,20 @@ export interface ScheduleFireCompare {
 }
 
 /** 一次触发（触发历史的一行） */
+/** 数据源定时维护的步骤（app/data/source_maintenance.STEPS） */
+export type ScheduleMaintenanceStep = 'introspect' | 'profile_needed' | 'observe'
+
+/**
+ * 数据源维护的一次触发建了什么（app/data/source_maintenance 记在触发上的 inputs）：要做的步骤、建了的探查 / 剖析任务（step 是
+ * 这个任务做的那几步，剖析、观察合成一个任务时写成 profile_needed+observe）、没执行的步骤和原因。和数据源页「定时维护」的
+ * 「最近一次」读的是同一份
+ */
+export interface ScheduleMaintenanceInputs {
+  steps?: ScheduleMaintenanceStep[]
+  jobs?: { step: string; kind: 'introspect' | 'profile'; id: string; tables?: number; scope?: string }[]
+  skipped?: { step: ScheduleMaintenanceStep; reason: string }[]
+}
+
 export interface ScheduleFire {
   id: string
   /** 计划触发的时间；手动运行是按下的那一刻 */
@@ -3880,6 +3902,8 @@ export interface ScheduleFire {
   reason: string | null
   /** 目标是评测题集时这一次触发建的那次评测（没有 run_id）；老服务端不给 */
   eval_run_id?: string | null
+  /** 目标是数据源维护时这一次建了哪些任务、哪几步没执行和原因（触发记录的 inputs）；别的目标为 null，老服务端不给 */
+  inputs?: ScheduleMaintenanceInputs | null
   notified: ScheduleFireNotice[]
   /**
    * 和同一定时任务上一次成功的运行的对比。运行没有成功结束、没有可比的、还没算、比不了、任何一边又在执行（不在终态）
@@ -3948,6 +3972,22 @@ export interface ScheduleCreate {
   overlap: 'skip'
   misfire_grace_s: number
   webhook: ScheduleWebhookIn | null
+}
+
+/**
+ * POST /api/schedules 建非工作流目标（评测题集、数据源维护，总方案 X4）的请求体：写 target_kind、target_id，不写工作流、
+ * 输入模板和 Webhook（服务端回 422，field 是那一项）；运行类别不用。改的时候照样用 SchedulePatch（只带 name、cron、timezone、
+ * enabled、misfire_grace_s 这几项）
+ */
+export interface ScheduleTargetCreate {
+  name: string
+  target_kind: Exclude<ScheduleTargetKind, 'workflow'>
+  target_id: string
+  cron: string
+  timezone: string
+  enabled: boolean
+  overlap: 'skip'
+  misfire_grace_s: number
 }
 
 /** PATCH /api/schedules/{id} 的请求体：只带改了的字段，外加读到的版本 */

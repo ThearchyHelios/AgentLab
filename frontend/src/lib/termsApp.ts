@@ -77,6 +77,7 @@ export const TASK_KIND_LABEL: Record<TaskKind, string> = {
   reconcile: '核实结果',
   signal: '等待外部系统',
   review: '审核个人应用',
+  recall: '口径召回',
 }
 
 export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {

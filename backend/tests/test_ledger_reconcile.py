@@ -248,3 +248,35 @@ async def test_users_read_their_reconcile_runs_only_through_the_evidence(client,
         assert (await carol.get(f"/api/runs/{done.id}/evidence")).status_code == 200
     finally:
         await auth_env.reset()
+
+
+async def test_the_reconcile_view_gives_the_panel_what_it_draws(client, monkeypatch):
+    """界面层不放逻辑（W4-c 账本前端）：「看差多少」那一项带上口径的入口字段（核对参数的表单照它画：哪几项、必填、有没有
+    缺省值）；认不出列怎么配时 409 另带可选的列和口径卡上的指标（选对照的那一步照它画）；对过的账列出对账卡和每一组的
+    这次 / 口径 / 差值 / 相对差是哪几个指标（三个数各自点得开，界面不按命名规则去拼指标 id）。"""
+    wf = await S.publish(graph=S.caliber_graph(expression="cell(nodes.fetch, 0, 'gmv') * 1"))
+    row = await S.explore(monkeypatch, S.WITH_REFUNDS)
+    [action] = [a for a in (await ledger_of(client, row.id))["actions"] if a["kind"] == "reconcile"]
+    assert action["fields"] == [{"name": "start", "required": True, "has_default": False},
+                                {"name": "end", "required": True, "has_default": False},
+                                {"name": "store", "required": False, "has_default": True}]
+    body = {"query": action["query"], "workflow_id": wf, "version": 1, "inputs": CHECKED, "confirm": True}
+    res = await client.post(f"/api/ledger/answers/{row.id}/reconcile", json=body)
+    assert res.status_code == 409 and res.json()["code"] == ledger_reconcile.NEEDS_PAIRS
+    assert res.json()["options"] == {"columns": ["gmv"], "metrics": [{"id": "gmv", "name": "销售额", "unit": "元"}]}
+    done = await reconcile(client, row.id, {**body, "pairs": [{"ours": "gmv", "metric": "gmv"}]})
+    [listed] = (await ledger_of(client, row.id))["reconciled"]
+    assert listed["run_id"] == done.id and listed["card"] == "reconcile"
+    assert listed["groups"] == [{"label": "销售额", "ours": "ours_0", "caliber": "cal_0", "diff": "diff_0", "rel": "rel_0"}]
+
+
+async def test_multi_row_reconcile_groups_carry_the_row_labels(client, monkeypatch):
+    wf = await S.publish(graph=S.caliber_graph(BY_REGION))
+    row = await S.explore(monkeypatch, BY_REGION_ALL, text="东区 [[v:Q1.r0.gmv]]，西区 [[v:Q1.r1.gmv]]。")
+    [action] = [a for a in (await ledger_of(client, row.id))["actions"] if a["kind"] == "reconcile"]
+    await reconcile(client, row.id, {"query": action["query"], "workflow_id": wf, "version": 1, "inputs": CHECKED,
+                                     "confirm": True})
+    [listed] = (await ledger_of(client, row.id))["reconciled"]
+    assert [g["label"] for g in listed["groups"]] == ["区域=east · gmv", "区域=west · gmv"]
+    assert listed["groups"][1] == {"label": "区域=west · gmv", "ours": "ours_1_0", "caliber": "cal_1_0", "diff": "diff_1_0",
+                                   "rel": "rel_1_0"}

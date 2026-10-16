@@ -171,9 +171,12 @@ def _wrap(
         elapsed = int((time.perf_counter() - started) * 1000)
         message = _describe(last_error)
         # node_id 要带上：前端靠它把出错的节点从"转圈"收敛成"失败"。
-        # error 是给人看的那句，原始异常放 detail，排查的人照样拿得到
+        # error 是给人看的那句，原始异常放 detail，排查的人照样拿得到。
+        # 被驳回的这一步照旧发 node.failed（时间线、实例进度按它收尾这一步），另带 reason=rejected（和 run.cancelled 同一个
+        # 字段名）、哪种关卡、结论、谁、备注：画布、航迹、时间线、问数据过程、复核规则、实例进度都按这一个字段认「被驳回」，
+        # 不再画成失败、也不再各自去猜报错原文（总方案 X9）。真的出错的 node.failed 一字不变，没有这几个键
         ctx.emit(EventType.NODE_FAILED, error=message, duration_ms=elapsed, node_id=node.id,
-                 detail=_detail(last_error))
+                 detail=_detail(last_error), **_rejected(last_error))
 
         # 容错模式：记下错误继续往下走，而不是让整张图挂掉。驳回不算错误，不走这里（见上）
         if node.config.get("on_error") == "continue" and not isinstance(last_error, NodeRejected):
@@ -202,6 +205,15 @@ def _describe(error: BaseException | None) -> str:
     if isinstance(error, NodeError):
         return str(error)
     return f"执行出错：{describe_exception(error)}"
+
+
+def _rejected(error: BaseException | None) -> dict[str, Any]:
+    """被人驳回的那一步，node.failed 上多带的几个键（同 runner.rejected_data 的说法，节点 id、名字事件本身就有）；
+    别的失败为空。"""
+    if not isinstance(error, NodeRejected):
+        return {}
+    return {"reason": "rejected", "kind": error.kind, "decision": error.decision, "actor": error.actor,
+            "note": error.note}
 
 
 def _detail(error: BaseException | None) -> str | None:

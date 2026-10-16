@@ -23,13 +23,19 @@ import { bundle, dispositionName } from './bundle'
 import { compare } from './compare'
 import { inquiry } from './inquiry'
 import { schedules } from './schedules'
+// 评测（下一轮第 4 波）：接口在 api/evals.ts，这里只挂上去
+import { evals } from './evals'
+import { sourceChanges } from './sourceChanges'
 import { whatif } from './whatif'
 import { reportExport } from './reportExport'
 // 应用平台：各自的接口文件，这里只挂上去
 import { apps, ledger } from './apps'
+import { recall } from './recall'
 import { actions, tasks } from './tasks'
 import { auth, identity } from './auth'
 import { accessKeys } from './accessKeys'
+// 口径账本（下一轮第 4 波 W4-c）：问数据答案的口径标签、按口径出具、对账、可沉淀的问题
+import { caliberLedger } from './caliberLedger'
 import { capabilities, endpoints, notify } from './capabilities'
 // 普通用户建应用（typesBlueprint.ts 是接口约定）
 import { blueprints, files, personal, templates } from './blueprints'
@@ -948,6 +954,10 @@ export const api = {
 
   // ---- 复核套件：各功能的接口在自己的文件里（api/<名字>.ts），这里只挂上去 ----
   schedules,
+  // 评测：题集、题目、发起与结果、对比与 A/B、目录快照、口径命中与重复度
+  evals,
+  // 数据源的变化、取值观察、定时维护的步骤、后台任务条（下一轮第 4 波，typesSource.ts 是接口约定）
+  sourceChanges,
   compare,
   bundle,
   inquiry,
@@ -957,12 +967,16 @@ export const api = {
   // ---- 应用平台（typesApp.ts 是接口约定） ----
   apps,
   ledger,
+  // 口径召回（下一轮第 4 波）
+  recall,
   tasks,
   actions,
   auth,
   identity,
   // 访问密钥与服务账号（下一轮第 2 波）
   accessKeys,
+  // 口径账本：答案里每个数的口径标签、按口径正式出具、口径对账、可沉淀的问题（typesLedger.ts 是接口约定）
+  caliberLedger,
   capabilities,
   endpoints,
   notify,

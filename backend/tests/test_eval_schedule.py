@@ -73,6 +73,34 @@ def received(monkeypatch):
     return got
 
 
+async def _public_url(url: str):
+    """临时设对外访问地址（通知里的链接按它拼），交回复原的函数：别的测试不受影响。"""
+    from app.core import public_url
+    from app.db.models import Setting
+
+    async with SessionLocal() as session:
+        row = await session.get(Setting, "notify")
+        before = dict(row.value or {}) if row is not None else None
+        if row is None:
+            session.add(Setting(key="notify", value={"public_base_url": url}))
+        else:
+            row.value = {**(row.value or {}), "public_base_url": url}
+        await session.commit()
+        await public_url.refresh(session)
+
+    async def restore() -> None:
+        async with SessionLocal() as session:
+            row = await session.get(Setting, "notify")
+            if before is None and row is not None:
+                await session.delete(row)
+            elif row is not None:
+                row.value = before
+            await session.commit()
+            await public_url.refresh(session)
+
+    return restore
+
+
 def stub(monkeypatch, *, delay: float = 0.0, path: str = "asked"):
     async def drive(self):
         await asyncio.sleep(delay)
@@ -212,8 +240,12 @@ async def test_an_unfinished_scheduled_evaluation_pushes_failed(client, monkeypa
     suite_id = await es.make_suite("none", cases=ASK * 4, name="虚构失败题集", budget={"max_parallel": 1})
     body = await _schedule(client, suite_id)
     await _channel(["eval.failed"])
-    fire = await service.fire_once(body["id"], utcnow().replace(microsecond=0), "manual")
-    await es.wait_eval(fire.eval_run_id)
+    restore = await _public_url("https://agentlab.example.com")
+    try:
+        fire = await service.fire_once(body["id"], utcnow().replace(microsecond=0), "manual")
+        await es.wait_eval(fire.eval_run_id)
+    finally:
+        await restore()
     async with SessionLocal() as session:
         run = await session.get(EvalRun, fire.eval_run_id)
         skipped = (await session.execute(select(EvalResult).where(
@@ -223,8 +255,9 @@ async def test_an_unfinished_scheduled_evaluation_pushes_failed(client, monkeypa
     message = json.loads(request.content)
     assert message["event"] == "eval.failed" and message["title"] == "定时评测「虚构失败题集」没有评完"
     assert "通过：0 / 3 题" in message["text"]
-    # 链接去那条定时任务的触发历史（设了对外访问地址才有链接）
-    assert all("/schedules/" in link["url"] for link in message["links"])
+    # 链接去这次评测的详情页（第 4 波评测页上线之前去定时任务的触发历史）；设了对外访问地址才有链接
+    assert [link["url"] for link in message["links"]] == [f"https://agentlab.example.com/evals/runs/{fire.eval_run_id}"], \
+        message["links"]
 
 
 def test_the_eval_events_say_they_are_for_scheduled_evaluations():

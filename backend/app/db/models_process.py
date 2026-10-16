@@ -17,9 +17,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base, TimestampMixin, UTCDateTime, new_id, utcnow
 
 #: 待办的种类。人工节点三种 + 现有的几种中断 + 动作确认、核实、等外部系统 + 个人应用提交审核（review，
-#: docs/design/normal-user-apps.md N7，app/process/tasks.REVIEW_KIND）
+#: docs/design/normal-user-apps.md N7，app/process/tasks.REVIEW_KIND）+ 口径召回（recall，docs/design/next-round/02-口径账本.md
+#: 做法 7：口径升版后答案的数变了、答案依据的目录或表结构变了；挂在召回运行或答案的运行上，没有 Approval，app/ledger/recall）
 TASK_KINDS = ("approve", "input", "edit", "tool", "code", "dual_check", "action_confirm", "reconcile", "signal",
-              "review")
+              "review", "recall")
 #: pending 等人；resolving 已凑齐、正在恢复运行（条件 UPDATE 抢到的那个请求负责）；resolved / cancelled / expired 终态
 TASK_STATUSES = ("pending", "resolving", "resolved", "cancelled", "expired")
 #: 动作状态。simulated：探索运行里端点没有 test 环境时的演练，不发送

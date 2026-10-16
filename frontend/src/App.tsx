@@ -19,6 +19,8 @@ import { ToolsPage } from './pages/ToolsPage'
 import { KnowledgePage } from './pages/KnowledgePage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SchedulesPage } from './pages/schedules/SchedulesPage'
+// 评测（下一轮第 4 波，评测-D8）：顶级导航，搭建者以上可见
+import { EvalsPage } from './pages/evals/EvalsPage'
 import { NotFound } from './pages/NotFound'
 // 应用平台：使用面（FE-5）、搭建面的应用编辑（FE-6）
 import { AppsHome } from './pages/apps/AppsHome'
@@ -188,6 +190,10 @@ function Shell() {
               <Route path="/knowledge/:tab/:id" element={<KnowledgePage />} />
               <Route path="/schedules" element={<SchedulesPage />} />
               <Route path="/schedules/:id" element={<SchedulesPage />} />
+              {/* 评测：/evals 题集列表，/evals/signals、/evals/snapshots 两个页签，/evals/suites/:id 题集，/evals/runs/:id 一次评测 */}
+              <Route path="/evals" element={<EvalsPage />} />
+              <Route path="/evals/:section" element={<EvalsPage />} />
+              <Route path="/evals/:section/:id" element={<EvalsPage />} />
               {/* 应用：固定路径（inbox）写在 /apps/:appId 前面，读的人一眼看出它不是应用 id */}
               <Route path="/apps" element={<AppsHome />} />
               {/* 要在 /apps/:appId 之前：create 不是应用 id */}
@@ -347,10 +353,11 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
   const live = studio.startsWith('run') || chat === 'run'
 
   const pages = usePages()
-  // 整条导航约 640px 高（九个导航项），窗口再矮，最底下的遥测点和署名就被切掉、够不着。
-  // 矮窗口（521–660px）按高度收紧到 500px 左右（导航项 36px），≤520px 再收一档到 460px 左右（导航项 32px、
-  // 图标和字之间只留 2px），而不是让导航滚动：导航一旦 overflow，挂在右侧的悬停提示和遥测浮层也会被
-  // 一起裁掉。加导航项时在 600px、520px、480px 高的窗口里量一遍（check-shell 的「窗口高 …px」）
+  // 整条导航约 690px 高（十个导航项），窗口再矮，最底下的遥测点和署名就被切掉、够不着。
+  // 矮窗口（521–660px）按高度收紧到 540px 左右（导航项 36px），≤520px 再收一档到 470px 左右（导航项 30px、
+  // 图标和字之间只留 2px：17px 图标 + 2px + 11px 字正好放下），而不是让导航滚动：导航一旦 overflow，挂在右侧的
+  // 悬停提示和遥测浮层也会被一起裁掉。加导航项时在 600px、520px、480px 高的窗口里量一遍（check-shell 的「窗口高 …px」）。
+  // 第十项「评测」加进来时量过：≤520px 那档还是 32px 的话，480px 高的窗口里遥测点超出视口 12px，所以收到 30px
   return (
     <nav aria-label="主导航" className="relative z-30 flex w-16 shrink-0 flex-col border-r bg-panel">
       <Link
@@ -375,8 +382,8 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
               className={({ isActive }) => clsx(
                 'group relative flex h-12 w-full flex-col items-center justify-center gap-1 rounded-md text-2xs leading-none outline-none',
                 // 两档的高度不能叠在同一个窗口高度上：同时命中时后出的那条赢，而 Tailwind 把 660 那条排在后面，
-                // ≤520px 的 32px 就一直没生效（九项在 480px 高的窗口里放不下）。所以 36px 那档只管 521–660px
-                '[@media(min-height:521px)_and_(max-height:660px)]:h-9 [@media(max-height:520px)]:h-8 [@media(max-height:520px)]:gap-0.5',
+                // ≤520px 的那一档就一直没生效（九项在 480px 高的窗口里放不下）。所以 36px 那档只管 521–660px
+                '[@media(min-height:521px)_and_(max-height:660px)]:h-9 [@media(max-height:520px)]:h-[30px] [@media(max-height:520px)]:gap-0.5',
                 'transition-colors focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
                 isActive ? 'bg-hover font-medium text-fg' : 'text-dim hover:bg-hover hover:text-fg',
               )}
@@ -1222,7 +1229,10 @@ function watchTasks(go: Go): () => void {
           title: `${TASK_NOTIFY_TEXT.title}${t.title || TASK_NOTIFY_TEXT.untitled}`,
           body: [owner, t.node_label].filter(Boolean).join(' · ') || undefined,
           tag: `task:${t.id}`,
-          onClick: () => go(t.app_id ? `/apps/inbox/${encodeURIComponent(t.id)}` : `/runs/${t.run_id}`),
+          // 应用里的待办、口径召回（挂在召回运行上，记录页里没有这张卡）、使用者（进不了记录页）都去待办页；
+          // 搭建者的别的待办去那次运行
+          onClick: () => go(t.app_id || t.kind === 'recall' || !builder
+            ? `/apps/inbox/${encodeURIComponent(t.id)}` : `/runs/${t.run_id}`),
         })
       }
     } catch {

@@ -205,6 +205,43 @@ await section('纯函数：表单 ⇄ 请求体', async () => {
     && m.freqProblem({ ...m.DEFAULT_FREQ, preset: 'daily', time: '' }) === '请填写时间')
 })
 
+await section('纯函数：非工作流目标（评测题集）的表单 ⇄ 请求体', async () => {
+  const m = await import(await load('/src/pages/schedules/model.ts'))
+  check('新建时能选的只有工作流和评测题集（数据源维护在数据源页建）', JSON.stringify(m.CREATABLE_TARGETS) === '["workflow","eval_suite"]')
+  const fresh = m.targetFormOf(null, { targetKind: 'eval_suite', targetId: 'suite-retail' }, 'Asia/Shanghai')
+  check('带着题集过来：目标种类、题集都填上', fresh.targetKind === 'eval_suite' && fresh.targetId === 'suite-retail' && fresh.enabled)
+  const body = m.targetCreateBody({ ...fresh, name: ' 每周回归 ', freq: { ...m.DEFAULT_FREQ, preset: 'weekly', weekdays: [1], time: '09:00' } })
+  check('建题集目标的请求体：目标种类和 id、cron、时区，不带工作流、输入模板、运行类别和 Webhook',
+    JSON.stringify(Object.keys(body).sort()) === JSON.stringify(['cron', 'enabled', 'misfire_grace_s', 'name', 'overlap', 'target_id', 'target_kind', 'timezone'])
+      && body.name === '每周回归' && body.cron === '0 9 * * 1' && body.target_kind === 'eval_suite', JSON.stringify(body))
+  const saved = { id: 's-eval', name: '每周回归', target_kind: 'eval_suite', target_id: 'suite-retail', cron: '0 9 * * 1', timezone: 'Asia/Shanghai',
+    enabled: true, misfire_grace_s: 3600 }
+  const base = m.targetFormOf(saved)
+  check('什么都没改：不发请求', m.targetPatchBody(base, base) === null)
+  const patch = m.targetPatchBody({ ...base, name: '每天回归', freq: { ...base.freq, preset: 'daily' }, misfireGraceS: 300 }, base)
+  check('改名称、频率、补发宽限：只交这三项（目标、启用不在表单里改）', JSON.stringify(patch) === JSON.stringify({ name: '每天回归', cron: '0 9 * * *', misfire_grace_s: 300 }),
+    JSON.stringify(patch))
+  const probs = m.targetProblems({ ...m.targetFormOf(null), freq: { ...m.DEFAULT_FREQ, preset: 'weekly', weekdays: [] } })
+  check('问题：缺名称、缺题集、频率不完整', probs.name === '请填写名称' && probs.target === '请选择要定时的评测题集' && probs.freq === '至少选择一天',
+    JSON.stringify(probs))
+})
+
+await section('纯函数：数据源维护链到哪里、建了什么怎么写', async () => {
+  const m = await import(await load('/src/pages/schedules/model.ts'))
+  check('数据源卡片：数据源页认的 #source-<id>（id 编码）', m.sourceCardPath('ds-shop') === '/data/databases#source-ds-shop'
+    && m.sourceCardPath('ds 1/2') === '/data/databases#source-ds%201%2F2')
+  check('剖析任务：目录页认的 ?pjob=', m.profileJobPath('ds-shop', 'pj-1') === '/data/catalog/ds-shop?pjob=pj-1')
+  check('探查任务链到卡片、剖析任务链到目录', m.maintenanceJobPath('ds-shop', { kind: 'introspect', id: 'ij-1' }) === '/data/databases#source-ds-shop'
+    && m.maintenanceJobPath('ds-shop', { kind: 'profile', id: 'pj-1' }) === '/data/catalog/ds-shop?pjob=pj-1')
+  check('步骤照服务端的叫法写，合成的一个任务写成「a、b」，认不出的照原样',
+    m.maintenanceStepText('introspect') === '探查结构' && m.maintenanceStepText('profile_needed+observe') === '剖析需要的表、取值观察'
+      && m.maintenanceStepText('later_step') === 'later_step')
+  const sum = m.maintenanceSummary({ jobs: [{ step: 'introspect', kind: 'introspect', id: 'ij1a2b3c4d', tables: 1200 }],
+    skipped: [{ step: 'observe', reason: '没有开启数据剖析' }] })
+  check('立即运行的详情：一个任务一行、没执行的一行', sum === '探查结构：探查任务 #ij1a2b（1,200 张表）\n取值观察没有执行：没有开启数据剖析', sum)
+  check('什么都没有：空串', m.maintenanceSummary(null) === '' && m.maintenanceSummary({}) === '')
+})
+
 await section('纯函数：服务端会拒的组合、保存回来怎么接、测试结果', async () => {
   const m = await import(await load('/src/pages/schedules/model.ts'))
   const fields = [{ name: 'date', required: true }, { name: 'region', required: true, default: '华东' }, { name: 'note' },
@@ -486,6 +523,42 @@ const S_EVAL = {
   updated_at: iso(NOW - 24 * H), version: 2,
 }
 
+/** 数据源维护的定时（next-round 03 B4）：建和改在数据源页，这里只读 */
+const S_MAINT = {
+  ...S_EVAL, id: 's-maint', name: '门店库 · 定时维护', target_kind: 'source_maintenance', target_id: 'ds-shop', target_label: '数据源维护',
+  target_name: '门店库', workflow_name: '门店库', cron: '0 2 * * *', description_text: '每天 02:00（Asia/Shanghai）',
+  last_fire: null, version: 5,
+}
+/**
+ * 数据源维护的触发记录（触发记录的 inputs：建了哪些任务、哪几步没执行，app/data/source_maintenance）：维护没有运行。
+ * fm1 探查、剖析各建一个；fm2 剖析没开，只建了探查，另两步没执行（服务端记的原因就是这两步的原因连成一句）；fm3 上一次的
+ * 探查还没做完、跳过；fm4 数据源不在了、没有建任务
+ */
+const MAINT_JOBS = [
+  { step: 'introspect', kind: 'introspect', id: 'ij1a2b3c4d5e', tables: 12 },
+  { step: 'profile_needed+observe', kind: 'profile', id: 'pj9f8e7d6c5b', scope: 'maintenance', tables: 3 },
+]
+const STEPS3 = ['introspect', 'profile_needed', 'observe']
+const NOT_PROFILED = '这个数据源没有开启数据剖析'
+function maintFires() {
+  const m = { run_id: null, run_status: null }
+  return [
+    fire('fm1', { ...m, kind: 'manual', inputs: { steps: STEPS3, jobs: MAINT_JOBS, skipped: [] } }),
+    fire('fm2', { ...m, fire_at: iso(NOW - 2 * 24 * H), created_at: iso(NOW - 2 * 24 * H),
+      reason: `剖析需要的表没有执行：${NOT_PROFILED}；取值观察没有执行：${NOT_PROFILED}`,
+      inputs: { steps: STEPS3, jobs: [MAINT_JOBS[0]], skipped: [{ step: 'profile_needed', reason: NOT_PROFILED }, { step: 'observe', reason: NOT_PROFILED }] } }),
+    fire('fm3', { ...m, status: 'skipped_overlap', fire_at: iso(NOW - 3 * 24 * H), created_at: iso(NOW - 3 * 24 * H),
+      reason: '数据源「门店库」上一次的维护（或别的探查、剖析）还没做完：正在探查结构，这次触发已跳过', inputs: { steps: STEPS3 } }),
+    fire('fm4', { ...m, status: 'failed_to_start', fire_at: iso(NOW - 4 * 24 * H), created_at: iso(NOW - 4 * 24 * H),
+      reason: '数据源不存在，可能已被删除', inputs: {} }),
+  ]
+}
+/** 评测题集（新建评测题集的定时任务时选） */
+const SUITES = [
+  { id: 'suite-retail', name: '零售样例题集', description: '虚构零售库上的几道问法', archived: false },
+  { id: 'suite-stock', name: '库存问法', description: '', archived: false },
+]
+
 function freshState(patch = {}) {
   return {
     schedules: [structuredClone(S1), structuredClone(S2)],
@@ -564,6 +637,14 @@ async function reply(state, method, path, url, body) {
   if (method === 'GET' && path === '/schedules') return { json: { items: state.schedules } }
   if (method === 'POST' && path === '/schedules/preview') return previewReply(body, state)
   if (method === 'GET' && path === '/schedules/variables') return { json: VARIABLES }
+  if (method === 'POST' && path === '/schedules' && body?.target_kind && body.target_kind !== 'workflow') {
+    const suite = SUITES.find((x) => x.id === body.target_id)
+    const made = { ...S_EVAL, ...body, id: 's-new-eval', target_label: '评测题集', target_name: suite?.name ?? '', target_exists: true,
+      workflow_id: '', workflow_name: suite?.name ?? '', run_class: 'exploratory', input_template: {}, webhook: null, last_fire: null,
+      next_run_at: body.enabled ? iso(nextMonday9()) : null, description_text: '每周一 09:00（Asia/Shanghai）', version: 1 }
+    state.schedules = [made, ...state.schedules]
+    return { status: 201, json: made }
+  }
   if (method === 'POST' && path === '/schedules') {
     const id = 's-new'
     const s = {
@@ -611,6 +692,7 @@ async function reply(state, method, path, url, body) {
     }
     if (method === 'POST' && rest === '/webhook/test') return { json: state.webhookTest ?? WEBHOOK_TEST_OK }
   }
+  if (method === 'GET' && path === '/evals/suites') return { json: { suites: SUITES } }
   if (method === 'GET' && path === '/workflows') return { json: WORKFLOWS }
   if (method === 'GET' && path === '/workflows/wf-weekly/versions/3') return { json: VERSION3 }
   if (method === 'GET' && path === '/settings') return { json: await settingsOf(state) }
@@ -823,19 +905,19 @@ await section('列表：目标不是工作流的定时任务', async () => {
   check('写种类「评测题集」和题集名、频率', t.includes('评测题集') && t.includes('零售样例题集') && t.includes('每周一 09:00'),
     t.replace(/\s+/g, ' ').slice(0, 160))
   check('不标运行类别（评测题集没有正式 / 探索之分）', !t.includes('正式运行') && !t.includes('探索运行'))
-  check('「编辑」写成「查看」', (await row.locator('[data-schedule-edit]').innerText()).includes('查看'))
+  check('评测题集的定时在这里改得了：写「编辑」', (await row.locator('[data-schedule-edit]').innerText()).includes('编辑'))
   check('工作流的那一行照旧', (await page.locator('[data-schedule-row="s-weekly"]').innerText()).includes('正式运行'))
   await row.locator('[data-schedule-run]').click()
   const ok = await until(async () => (await page.locator('[data-toast]').allInnerTexts()).find((x) => x.includes('已发起一次评测')) ?? null)
   check('立即运行：说发起了一次评测（没有运行可看，不说「未能发起」）', !!ok && !ok.includes('查看运行'), ok ?? '')
 
   await page.goto(`${WEB}/schedules/s-eval`, { waitUntil: 'networkidle' })
-  const settings = page.locator('[data-schedule-target-settings="eval_suite"]')
+  const settings = page.locator('[data-schedule-target-form="eval_suite"]')
   await settings.waitFor()
-  const st = await settings.innerText()
-  check('详情的设置只读地列出名称、目标、频率', st.includes('零售题集 · 每周回归') && st.includes('评测题集 · 零售样例题集')
-    && st.includes('每周一 09:00') && st.includes('1 小时'), st.replace(/\s+/g, ' ').slice(0, 200))
-  check('不出工作流的表单（选工作流、输入模板、Webhook、保存）', await page.locator('[data-schedule-save]').count() === 0)
+  check('详情的设置：名称、频率可改，题集链到评测页', await page.locator('[data-field="name"]').inputValue() === '零售题集 · 每周回归'
+    && await page.locator('[data-schedule-suite="suite-retail"] a').getAttribute('href') === '/evals/suites/suite-retail')
+  check('不出工作流那几样（选工作流、运行类别、输入模板、Webhook）', await page.locator('[data-webhook-section]').count() === 0
+    && await page.locator('#schedule-workflow').count() === 0)
   check('页头的启用、立即运行、删除照常', await page.locator('[data-schedule-toggle]').count() === 1
     && await page.locator('[data-schedules-page] [data-schedule-run]').count() === 1)
   await page.goto(`${WEB}/schedules/s-eval?tab=history`, { waitUntil: 'networkidle' })
@@ -843,6 +925,110 @@ await section('列表：目标不是工作流的定时任务', async () => {
   await evalFire.waitFor()
   check('触发历史写评测的编号，不写「未发起运行」', (await evalFire.innerText()).includes('评测 #ev1a2b')
     && !(await page.locator('[data-fire-id="f-eval"]').innerText()).includes('未发起运行'))
+  check('评测的编号链到那一次评测的详情', (await evalFire.getAttribute('href')) === '/evals/runs/ev1a2b3c4d5e')
+  check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
+})
+
+await section('目标种类：新建评测题集的定时、改名称和频率、数据源维护只读', async () => {
+  const state = freshState({ schedules: [structuredClone(S1), structuredClone(S_EVAL), structuredClone(S_MAINT)] })
+  const { page, sent, errors } = await open('/schedules/new', { state })
+  const kinds = page.locator('[data-schedule-target-kinds] [data-schedule-target-kind-pick]')
+  await kinds.first().waitFor()
+  check('新建时先选定时什么：只有工作流和评测题集（数据源维护在数据源页建）',
+    (await kinds.evaluateAll((els) => els.map((el) => el.getAttribute('data-schedule-target-kind-pick')))).join(',') === 'workflow,eval_suite')
+  check('缺省是工作流：照旧是工作流的表单', await page.locator('#schedule-workflow').count() === 1)
+  await page.locator('[data-schedule-target-kind-pick="eval_suite"]').click()
+  await page.locator('[data-schedule-target-form="eval_suite"]').waitFor()
+  check('换成评测题集：没有工作流、运行类别、输入、Webhook，写明通知走通知渠道', await page.locator('#schedule-workflow').count() === 0
+    && await page.locator('[data-webhook-section]').count() === 0 && (await text(page, '[data-schedule-eval-note]')).includes('不推 Webhook'))
+  await page.locator('[data-schedule-suite-pick]').selectOption('suite-stock')
+  check('选了题集：名称替人填上题集名', await page.locator('[data-field="name"]').inputValue() === '库存问法')
+  await page.locator('[data-freq-preset="weekly"]').click()
+  await until(async () => await page.locator('[data-schedule-preview][data-status="ok"]').count() === 1)
+  await page.locator('[data-schedule-save]').click()
+  const created = await until(() => writes(sent, /^POST \/schedules$/)[0] ?? null)
+  check('建评测题集的定时：交目标种类和题集，不带工作流、输入模板、运行类别、Webhook', created?.body?.target_kind === 'eval_suite'
+    && created.body.target_id === 'suite-stock' && created.body.name === '库存问法' && !('workflow_id' in created.body)
+    && !('webhook' in created.body) && !('input_template' in created.body) && !('run_class' in created.body), JSON.stringify(created?.body))
+  check('建好进它的详情页', await until(() => new URL(page.url()).pathname === '/schedules/s-new-eval'))
+
+  await page.goto(`${WEB}/schedules/new?target_kind=eval_suite&target_id=suite-retail`, { waitUntil: 'networkidle' })
+  await page.locator('[data-schedule-target-form="eval_suite"]').waitFor()
+  check('评测页「设定时」带过来的题集：直接落到评测题集、题集选好、名称填好',
+    await page.locator('[data-schedule-suite-pick]').inputValue() === 'suite-retail' && await until(async () => (await page.locator('[data-field="name"]').inputValue()) === '零售样例题集'))
+
+  await page.goto(`${WEB}/schedules/s-eval`, { waitUntil: 'networkidle' })
+  await page.locator('[data-schedule-target-form="eval_suite"]').waitFor()
+  await page.locator('[data-field="name"]').fill('零售题集 · 每天回归')
+  await page.locator('[data-freq-preset="daily"]').click()
+  await until(async () => !(await page.locator('[data-schedule-save]').isDisabled()))
+  await page.locator('[data-schedule-save]').click()
+  const patched = await until(() => writes(sent, /^PATCH \/schedules\/s-eval$/)[0] ?? null)
+  check('改评测题集的定时：只交名称、频率和读到的版本', JSON.stringify(patched?.body) === JSON.stringify({ name: '零售题集 · 每天回归', cron: '0 9 * * *', version: 2 }),
+    JSON.stringify(patched?.body))
+
+  await page.goto(`${WEB}/schedules`, { waitUntil: 'networkidle' })
+  const maint = page.locator('[data-schedule-row="s-maint"]')
+  await maint.waitFor()
+  check('列表：数据源维护标种类，写「查看」', (await maint.innerText()).includes('数据源维护')
+    && (await maint.locator('[data-schedule-edit]').innerText()).includes('查看'))
+  await page.goto(`${WEB}/schedules/s-maint`, { waitUntil: 'networkidle' })
+  const ro = page.locator('[data-schedule-target-settings="source_maintenance"]')
+  await ro.waitFor()
+  check('数据源维护的详情只读，写明在数据源页设置，链到数据源页', (await ro.innerText()).includes('在数据源页')
+    && (await ro.locator('[data-schedule-to-source]').getAttribute('href')) === '/data/databases#source-ds-shop'
+    && await page.locator('[data-schedule-save]').count() === 0)
+  check('页头的启用、立即运行照常', await page.locator('[data-schedule-toggle]').count() === 1
+    && await page.locator('[data-schedules-page] [data-schedule-run]').count() === 1)
+  check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
+})
+
+await section('数据源维护的触发历史：列出建了的任务和没执行的步骤，不写「未发起运行」', async () => {
+  const state = freshState({ schedules: [structuredClone(S1), { ...structuredClone(S_MAINT), last_fire: maintFires()[0] }], fires: maintFires() })
+  const { page, errors } = await open('/schedules/s-maint?tab=history', { state })
+  await page.locator('[data-fire-id="fm4"]').waitFor()
+  const row = (id) => page.locator(`[data-fire-id="${id}"]`)
+  const all = await page.locator('[data-fire-list]').innerText()
+  check('没有一行写「未发起运行」（维护本来就不发起运行）', !all.includes('未发起运行'), all.replace(/\s+/g, ' ').slice(0, 200))
+  const jobs = row('fm1').locator('[data-fire-job]')
+  check('建了两个任务就列两个：步骤、任务种类、编号、表数', await jobs.count() === 2
+    && (await jobs.nth(0).innerText()).includes('探查结构：探查任务 #ij1a2b（12 张表）')
+    && (await jobs.nth(1).innerText()).includes('剖析需要的表、取值观察：剖析任务 #pj9f8e（3 张表）'),
+    (await jobs.allInnerTexts()).join(' ｜ '))
+  check('探查任务链到数据源页那张卡片（#source-<id>，同数据源页认的约定）',
+    await row('fm1').locator('[data-fire-job-kind="introspect"]').getAttribute('href') === '/data/databases#source-ds-shop')
+  check('剖析任务链到数据目录里那个任务的进度（?pjob=，同「定时维护」的「最近一次」）',
+    await row('fm1').locator('[data-fire-job-kind="profile"]').getAttribute('href') === '/data/catalog/ds-shop?pjob=pj9f8e7d6c5b')
+  check('建了任务的那一行不另写「没有建任务」', await row('fm1').locator('[data-fire-maintenance-none]').count() === 0)
+  const skipped = row('fm2').locator('[data-fire-skipped]')
+  check('没执行的步骤逐条写原因', await skipped.count() === 2
+    && (await skipped.nth(0).innerText()).includes(`剖析需要的表没有执行：${NOT_PROFILED}`)
+    && (await skipped.nth(1).innerText()).includes(`取值观察没有执行：${NOT_PROFILED}`), (await skipped.allInnerTexts()).join(' ｜ '))
+  check('……服务端连成一句的原因不再重复写一遍', !(await row('fm2').innerText()).includes('原因：'))
+  check('只建了探查的那一次照样列出探查任务', await row('fm2').locator('[data-fire-job]').count() === 1)
+  check('跳过的那一次：写「没有建任务」和原因', (await row('fm3').locator('[data-fire-maintenance-none]').innerText()).includes('没有建任务')
+    && (await row('fm3').innerText()).includes('还没做完：正在探查结构'))
+  check('数据源不在了的那一次：写「没有建任务」和原因', (await row('fm4').locator('[data-fire-maintenance-none]').innerText()).includes('没有建任务')
+    && (await row('fm4').innerText()).includes('数据源不存在'))
+  await shot(page, 'maintenance-history')
+
+  // 立即运行：建的是任务，说开始维护、详情写建了什么；不说「未能发起」
+  state.override = (method, path) => (method === 'POST' && path === '/schedules/s-maint/run'
+    ? { json: { fire: fire('fm-now', { kind: 'manual', run_id: null, run_status: null, inputs: { steps: STEPS3, jobs: MAINT_JOBS, skipped: [] } }), run_id: null } }
+    : null)
+  await page.locator('[data-schedules-page] [data-schedule-run]').click()
+  const started = page.locator('[data-toast]', { hasText: '已开始维护' })
+  await started.first().waitFor()
+  const detail = (await started.first().locator('details').textContent().catch(() => '')) ?? ''
+  check('立即运行一次维护：说已开始维护，详情写建了哪几个任务', detail.includes('探查结构：探查任务 #ij1a2b') && detail.includes('剖析任务 #pj9f8e'), detail)
+  check('……不说「未能发起」', !(await page.locator('[data-toast]').allInnerTexts()).some((t) => t.includes('未能发起')))
+  state.override = (method, path) => (method === 'POST' && path === '/schedules/s-maint/run'
+    ? { json: { fire: fire('fm-busy', { kind: 'manual', status: 'skipped_overlap', run_id: null, run_status: null,
+      reason: '数据源「门店库」上一次的维护（或别的探查、剖析）还没做完：正在剖析，这次触发已跳过', inputs: { steps: STEPS3 } }), run_id: null } }
+    : null)
+  await page.locator('[data-schedules-page] [data-schedule-run]').click()
+  const busy = await until(async () => (await page.locator('[data-toast]').allInnerTexts()).find((t) => t.includes('上一次维护')) ?? null)
+  check('上一次维护还没做完：照实说跳过了，不说「上一次运行」', !!busy && !busy.includes('上一次运行'), busy ?? '')
   check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
 })
 

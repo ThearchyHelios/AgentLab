@@ -65,6 +65,8 @@
     'human.requested': '请求人工审批', 'human.resolved': '人工审批结果', 'approval.inquiry': '审批质询',
     'issuance': '出具判定', 'caliber.upgrade': '口径卡升版处置', 'catalog.drift': '数据目录变化',
     'schema.drift': '表结构变化', 'report.checked': '报告自查', 'evidence.judged': '按需裁判', 'file.extracted': '读入附件',
+    'ledger.matched': '比对已发布口径', 'ledger.recalled': '口径召回核对', 'ledger.basis_changed': '答案的依据有变',
+    'ledger.feedback': '对账说明的反馈',
     'log': '日志', 'usage': '用量',
   }
   const T = {

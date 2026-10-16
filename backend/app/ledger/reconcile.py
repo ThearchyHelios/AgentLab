@@ -77,11 +77,16 @@ ROWS_CALIBER_COLUMNS = "认不出口径取数的结果列，按位置对不上"
 
 
 class ReconcileRefused(Exception):
-    def __init__(self, status_code: int, message: str, code: str = REFUSED) -> None:
+    """不能对账。extra 是给界面的几样（并进 409 的返回体）：认不出列怎么配时的 options（可选的列、口径卡上的指标），界面
+    照它画「选要对照的指标」那一步，不自己去猜有哪些列。"""
+
+    def __init__(self, status_code: int, message: str, code: str = REFUSED, *,
+                 extra: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.code = code
+        self.extra = dict(extra or {})
 
 
 # ==========================================================================
@@ -106,7 +111,8 @@ def _needs_check(cand: dict[str, Any], fields: list[dict[str, Any]], hide: Any) 
 
 def actions_of(content: dict[str, Any], names: dict[str, str], hide: Any = None) -> list[dict[str, Any]]:
     """比对工件里每条有相关口径的查询、每份相关口径一项「看差多少」：{kind: reconcile, query, workflow_id, version, node_id,
-    needs_check, check_reason?, binding（遮过的）}。界面据此摆按钮、要不要先核对参数。"""
+    needs_check, check_reason?, binding（遮过的）, fields}。界面据此摆按钮、要不要先核对参数；fields 是那一版口径的入口字段
+    （名字、必填、有没有缺省值，比对工件里记的那一份），核对参数的表单照它画（缺的参数也写得出是哪一项）。"""
     from app.ledger.labels import LEVEL_TEXT, binding_view
 
     hide = hide or (lambda _value: False)
@@ -124,7 +130,10 @@ def actions_of(content: dict[str, Any], names: dict[str, str], hide: Any = None)
                     "node_id": cand.get("node_id"), "workflow_name": names.get(str(cand.get("workflow_id") or "")),
                     "level_text": LEVEL_TEXT.get(str(cand.get("level") or ""), ""),
                     "needs_check": why is not None, "binding": binding_view(cand.get("binding"), hide),
-                    "fallback": bool((cand.get("diff") or {}).get("fallback"))}
+                    "fallback": bool((cand.get("diff") or {}).get("fallback")),
+                    "fields": [{"name": str(f.get("name")), "required": bool(f.get("required")),
+                                "has_default": bool(f.get("has_default"))}
+                               for f in fields.get(cand.get("caliber")) or [] if f.get("name")]}
             if why is not None:
                 item["check_reason"] = why
             out.append(item)
@@ -141,11 +150,45 @@ async def reconciled_runs(session: Any, run_id: str) -> list[Run]:
     return list(rows)
 
 
+#: 对账卡上一组对照的四个指标：id 的前缀（tail_nodes 的 _four）和名字的后缀
+_FOUR = (("ours", "这次"), ("caliber", "口径"), ("diff", "差值"), ("rel", "相对差"))
+_PREFIX = {"ours": "ours_", "caliber": "cal_", "diff": "diff_", "rel": "rel_"}
+
+
+def reconcile_groups(graph: Any) -> list[dict[str, str]]:
+    """对账运行的图里，对账卡上的每一组对照：{label, ours, caliber, diff, rel}（后四个是指标 id）。按卡上的先后；名字
+    是「<这一组的说法> · 这次」那样写的，label 去掉后缀。认不出的（不是派生的对账图）为空。"""
+    from app.ledger.derive import RECONCILE_CARD
+
+    nodes = (graph or {}).get("nodes") if isinstance(graph, dict) else None
+    card = next((n for n in nodes or [] if isinstance(n, dict) and n.get("id") == RECONCILE_CARD
+                 and n.get("type") == "metrics"), None)
+    metrics = (((card or {}).get("data") or {}).get("config") or {}).get("metrics") or []
+    by_id = {str(m.get("id")): m for m in metrics if isinstance(m, dict) and m.get("id")}
+    out: list[dict[str, str]] = []
+    for mid, metric in by_id.items():
+        if not mid.startswith(_PREFIX["ours"]):
+            continue
+        n = mid[len(_PREFIX["ours"]):]
+        ids = {role: f"{_PREFIX[role]}{n}" for role, _ in _FOUR}
+        if not all(i in by_id for i in ids.values()):
+            continue
+        name = str(metric.get("name") or "")
+        label = name[:-len(" · 这次")] if name.endswith(" · 这次") else name
+        out.append({"label": label, **ids})
+    return out
+
+
 def reconciled_view(run: Run) -> dict[str, Any]:
+    """GET 账本 reconciled 里的一项：哪一次对账运行、状态、对的哪条查询和哪份口径、参数从哪来；card 和 groups 是对账卡和
+    每一组对照的四个指标（界面按 /evidence/metrics/{card}/{指标} 取值、点开出处，不按命名规则自己拼）。"""
+    from app.ledger.derive import RECONCILE_CARD
+
     origin = run.origin if isinstance(run.origin, dict) else {}
     return {"run_id": run.id, "status": run.status, "query": origin.get("query"), "caliber": origin.get("caliber"),
             "workflow_id": origin.get("workflow_id"), "version": origin.get("version"),
             "inputs_from": origin.get("inputs_from"), "rows": origin.get("rows"),
+            "card": RECONCILE_CARD, "groups": reconcile_groups(run.graph),
             "created_at": run.created_at.isoformat() if run.created_at else None}
 
 
@@ -294,11 +337,16 @@ def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str
 
     by_id = {str(m.get("id")): (i, m) for i, m in enumerate(metrics)}
     multi = len(ours_rows) > 1
+    # 要人选对照时给界面的选项：这次结果里是数、没遮罩的列，口径卡上的指标（id、名字、单位）
+    numeric = [c for i, c in enumerate(ours_columns) if c.lower() not in hidden and _numeric(ours_rows, i)]
+    options = {"options": {"columns": numeric,
+                           "metrics": [{"id": str(m.get("id")), "name": str(m.get("name") or m.get("id")),
+                                        "unit": str(m.get("unit") or "")} for m in metrics if m.get("id")]}}
     if multi:
         return _plan_rows(ours_columns, ours_rows, hidden, caliber_columns, referenced, check_column)
     if chosen is not None:
         if not isinstance(chosen, list) or not chosen or not all(isinstance(p, dict) for p in chosen):
-            raise ReconcileRefused(422, PAIRS_SHAPE, NEEDS_PAIRS)
+            raise ReconcileRefused(422, PAIRS_SHAPE, NEEDS_PAIRS, extra=options)
         pairs = []
         for item in chosen:
             ours, metric = str(item.get("ours") or ""), str(item.get("metric") or "")
@@ -310,7 +358,7 @@ def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str
                               unit=str(m.get("unit") or ""), decimals=m.get("decimals")))
         return Plan(pairs=pairs)
     if fallback:
-        raise ReconcileRefused(409, PAIRS_FALLBACK, NEEDS_PAIRS)
+        raise ReconcileRefused(409, PAIRS_FALLBACK, NEEDS_PAIRS, extra=options)
     pairs = []
     if caliber_columns is not None and len(caliber_columns) == len(ours_columns):
         for index, m in enumerate(metrics):
@@ -323,7 +371,7 @@ def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str
             pairs.append(Pair(ours=ours, metric=str(m.get("id")), index=index, name=str(m.get("name") or m.get("id")),
                               unit=str(m.get("unit") or ""), decimals=m.get("decimals")))
     if not pairs:
-        raise ReconcileRefused(409, PAIRS_NONE, NEEDS_PAIRS)
+        raise ReconcileRefused(409, PAIRS_NONE, NEEDS_PAIRS, extra=options)
     return Plan(pairs=pairs)
 
 
@@ -521,4 +569,4 @@ def build(pinned: Any, *, sql: str, tool: str, plan: Plan, inputs: dict[str, Any
 
 __all__ = ["CHECK_INPUTS", "MAX_COLUMNS", "MAX_ROWS", "NEEDS_PAIRS", "ORIGIN", "REFUSED", "Pair", "Plan",
            "ReconcileRefused", "Request", "actions_of", "align_sql", "build", "plan_pairs", "reconcile",
-           "reconciled_runs", "reconciled_view", "tail_nodes"]
+           "reconcile_groups", "reconciled_runs", "reconciled_view", "tail_nodes"]
