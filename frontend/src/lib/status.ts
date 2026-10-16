@@ -183,10 +183,11 @@ export function statusLabel(status: string | null | undefined, opts?: StatusOpts
 /**
  * 运行列表的状态筛选用：按显示顺序排好的运行状态。
  * 这是显示用的码，不能直接当查询参数——waiting / held 在后端都是 interrupted，
- * 查询前用 serverStatusOf 换回去。
+ * rejected 在后端是 cancelled（+ end_reason=rejected），查询前用 serverStatusOf 换回去。
+ * 被驳回单独一项、紧跟在已取消后面：不在这里的码，分段、计数、搜索词表里都没有它，被驳回的运行只剩「全部」里看得到
  */
 export const RUN_STATUS_ORDER: StatusCode[] = [
-  'running', 'waiting', 'held', 'failed', 'succeeded', 'cancelled', 'queued',
+  'running', 'waiting', 'held', 'failed', 'succeeded', 'cancelled', 'rejected', 'queued',
 ]
 
 /**
@@ -194,7 +195,7 @@ export const RUN_STATUS_ORDER: StatusCode[] = [
  *
  * waiting、held、suspended 在后端都是 interrupted：按它查回来的是两种混在一起，
  * 要再用 resolveStatus(run.status, {pendingApproval: hasPendingApproval(approvals,
- * run.id)}) 在前端分开。节点才有的状态（idle / skipped / blocked / unreached）
+ * run.id)}) 在前端分开。rejected 同理查 cancelled，回来按 end_reason 分开（被驳回 / 手动停止）。节点才有的状态（idle / skipped / blocked / unreached）
  * 不是运行状态，返回 null。
  */
 export function serverStatusOf(code: StatusCode): RunStatus | null {

@@ -127,8 +127,11 @@ export function useRunList(filters: ListFilters, enabled: boolean): RunList {
 // 计数
 // -------------------------------------------------------------------------
 
-/** 数的是"需要看一眼"的几类；已完成不数——它是常态，数字只会分散注意力 */
-const COUNTED: StatusCode[] = ['running', 'queued', 'waiting', 'held', 'failed', 'cancelled']
+/**
+ * 数的是"需要看一眼"的几类；已完成不数——它是常态，数字只会分散注意力。被驳回以前记成失败、算在「失败」里，现在单独
+ * 一类，不数就哪个计数里都没有它
+ */
+const COUNTED: StatusCode[] = ['running', 'queued', 'waiting', 'held', 'failed', 'cancelled', 'rejected']
 const COUNT_LIMIT = 200
 
 export interface StatusCounts {

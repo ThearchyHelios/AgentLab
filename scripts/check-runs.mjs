@@ -2441,6 +2441,85 @@ await section('生效记录面板', async () => {
   fakes.delete('GET /api/actions')
 })
 
+await section('被驳回：分段、计数、搜索、详情都找得到（05-已知遗留 (a)）', async () => {
+  // 人的驳回结束在 cancelled + end_reason=rejected，显示码是 rejected。以前它记成失败，算在「失败」里；只在显示上分出来、
+  // 分段和计数里没有它的话，点「已取消」被筛掉、搜「驳回」认不出，被驳回的运行只剩「全部」里看得到
+  if (!base) { check('沙箱里有一条成功的运行', false); return }
+  const t = Date.now() / 1000 - 3600
+  const at = (sec) => new Date(sec * 1000).toISOString()
+  const ended = (id, status, endReason, error, back) => ({ ...base, id, status, end_reason: endReason, error,
+    error_node_id: status === 'failed' || endReason === 'rejected' ? 'gate' : null, workflow_id: null,
+    created_at: at(t - back), started_at: at(t - back), finished_at: at(t - back + 6), usage: { wall_ms: 6000, active_ms: 6000, wait_ms: 0 } })
+  const REJ = 'fake0rej0rejected'
+  const rows = [
+    ended(REJ, 'cancelled', 'rejected', '「付款」未确认（被驳回），没有发送：金额不对', 0),
+    ended('fake0rej0stopped', 'cancelled', 'stopped', '用户取消', 60),
+    ended('fake0rej0failed', 'failed', null, '查询超时', 120),
+  ]
+  fakes.set('GET /api/runs', (url) => {
+    const want = (url.searchParams.get('status') ?? '').split(',').filter(Boolean)
+    return { status: 200, json: want.length ? rows.filter((r) => want.includes(r.status)) : rows }
+  })
+  const graph = { nodes: [
+    { id: 'start', type: 'input', position: { x: 0, y: 0 }, data: { label: '输入', config: {} } },
+    { id: 'gate', type: 'human', position: { x: 200, y: 0 }, data: { label: '付款', config: { mode: 'approve', stop_on_reject: true } } },
+  ], edges: [{ source: 'start', target: 'gate' }] }
+  fakes.set(`GET /api/runs/${REJ}`, () => ({ status: 200, json: rows[0] }))
+  fakes.set(`GET /api/runs/${REJ}/graph`, () => ({ status: 200, json: { graph, workflow_id: null, version: null } }))
+  fakes.set(`GET /api/runs/${REJ}/events`, () => ({ status: 200, json: [
+    { seq: 1, type: 'run.started', node_id: null, ts: t, data: { nodes: 2 } },
+    { seq: 2, type: 'node.started', node_id: 'start', ts: t + 0.1, data: {} },
+    { seq: 3, type: 'node.finished', node_id: 'start', ts: t + 0.2, data: { duration_ms: 100 } },
+    { seq: 4, type: 'node.started', node_id: 'gate', ts: t + 0.3, data: {} },
+    { seq: 5, type: 'node.failed', node_id: 'gate', ts: t + 5.9, data: { error: rows[0].error } },
+    { seq: 6, type: 'run.cancelled', node_id: null, ts: t + 6, data: { reason: 'rejected', node_id: 'gate', label: '付款',
+      kind: 'approve', decision: 'reject', actor: '张工', note: '金额不对', timing: { wall_ms: 6000, active_ms: 6000, wait_ms: 0 } } },
+  ] }))
+  try {
+    await page.goto(`${WEB}/runs`, { waitUntil: 'networkidle' })
+    await page.waitForTimeout(300)
+    const seg = page.locator('[data-segment=rejected]')
+    check('「全部」的分段里有「被驳回」', await seg.count() === 1 && (await seg.innerText()).includes('被驳回'))
+    check('计数里有被驳回的那一条', (await seg.locator('.tnum').innerText().catch(() => '')) === '1',
+      await seg.innerText().catch(() => ''))
+    check('「已取消」的计数不含被驳回的', (await page.locator('[data-segment=cancelled] .tnum').innerText().catch(() => '')) === '1')
+    check('「失败」的计数不含被驳回的', (await page.locator('[data-segment=failed] .tnum').innerText().catch(() => '')) === '1')
+    const row = page.locator(`[data-runs-list] [data-run-id="${REJ}"]`)
+    check('列表行写「被驳回」和原话，状态码是 rejected', await row.getAttribute('data-status') === 'rejected'
+      && (await row.innerText()).includes('被驳回'), (await row.innerText().catch(() => '')).replace(/\n/g, ' / '))
+    check('缩略条收在和已取消同一个结束标记上', await row.locator('[data-shape-end=cancelled]').count() === 1)
+
+    await listAfter(() => seg.click(), (p) => p.get('status') === 'cancelled')
+    check('点「被驳回」：查 cancelled、只留被驳回的', (await ids()).join(',') === REJ, (await ids()).join(','))
+    check('分段写进地址 ?status=rejected', new URL(page.url()).searchParams.get('status') === 'rejected')
+    // 两段查的都是 cancelled：先回「全部」，不然这一次不会重查
+    await listAfter(() => page.locator('[data-segment=all]').click(), (p) => !p.get('status'))
+    await listAfter(() => page.locator('[data-segment=cancelled]').click(), (p) => p.get('status') === 'cancelled')
+    check('点「已取消」：只留手动停止的', (await ids()).join(',') === 'fake0rej0stopped', (await ids()).join(','))
+    await page.locator('[data-segment=all]').click()
+    await settle()
+    for (const word of ['驳回', '被驳回']) {
+      await search(word, (p) => p.get('status') === 'cancelled')
+      check(`搜「${word}」按状态筛出被驳回的`, (await ids()).join(',') === REJ
+        && (await page.locator('[data-runs-hint]').innerText()).includes(word), (await ids()).join(','))
+      await search('', (p) => !p.get('status'))
+    }
+    await page.locator('[role=tab][data-tab=failed]').click()
+    await settle()
+    check('「失败」页签里没有被驳回的（不是故障）', (await ids()).join(',') === 'fake0rej0failed', (await ids()).join(','))
+
+    await page.goto(`${WEB}/runs/${REJ}`, { waitUntil: 'networkidle' })
+    await page.locator('[data-run-detail]').waitFor()
+    await page.waitForTimeout(400)
+    check('详情的显示码是 rejected', await page.locator('[data-run-detail]').getAttribute('data-run-code') === 'rejected')
+    const tele = (await page.locator('[data-run-telemetry]').innerText()).replace(/\n/g, ' / ')
+    check('状态格写「被驳回」，副标题写谁在哪一步驳回、备注', tele.includes('被驳回') && tele.includes('张工 驳回了「付款」：金额不对')
+      && !tele.includes('已取消'), tele.slice(0, 160))
+  } finally {
+    for (const k of ['GET /api/runs', `GET /api/runs/${REJ}`, `GET /api/runs/${REJ}/graph`, `GET /api/runs/${REJ}/events`]) fakes.delete(k)
+  }
+})
+
 await section('收尾', async () => {
   // 提取模板之后会跳进画布：画布一打开就拿图去做校验、变量分析，这两个是带图的只读 POST
   // （同样被探针拦下，不落库）。赶上它们发出来之前就离开了画布的话就没有
