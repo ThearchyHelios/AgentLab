@@ -16,7 +16,8 @@ cell(nodes.X, 0, '列')、X 是查库的调用工具节点（look/calibers.card_
 模板只引用入口字段（{{ input.字段 }}）——引用 vars.、nodes.、模板函数（file_text……）的，拷出来就拿不到同样的值，照实
 拒收、给原因（NotDerivable）。工作流、版本、节点不在了也照实说。
 
-**这一波实现的**：caliber_probe —— 一份口径的取数 + 口径卡（评测口径题的期望）。
+**已实现的**：caliber_probe —— 一份口径的取数 + 口径卡（评测口径题的期望）；reconcile —— 口径对账（第 3 波，
+reconcile_graph）；组合式问数用的 caliber_block(card_id, inputs)（第 3 波）。
 
 **扩展点**（第 3 波的账本按这里扩，不另写生成器）：
 - 口径对账（02 做法 6）：assemble("reconcile", [ours, caliber_block(pinned)], tail=[对账卡])。ours 是「这次的取数」
@@ -24,9 +25,10 @@ cell(nodes.X, 0, '列')、X 是查库的调用工具节点（look/calibers.card_
   相对差，式子引用 cell(nodes.ours_q1, 0, '列') 和口径卡的指标，on_missing=null），出口的契约写 metrics_from。
 - 口径召回（02 做法 7）：assemble("recall", [caliber_block(old, prefix="old_"), caliber_block(new, prefix="new_")],
   tail=[召回卡])。同一张图里放两份口径，取数节点 id 会撞：caliber_block 带 prefix 时把拷出来的节点改名，口径卡的
-  caliber_from 带上改名映射 nodes={原 id: 新 id}。**运行时认这个映射是 02 做法 4（metrics._pinned_caliber 按 AST 改写
-  式子里的 cell(nodes.X…) 和 nodes.X），归第 3 波的账本包**；在那之前带前缀的段跑起来口径卡取不到输入（缺输入，照实
-  失败，不会算错），这一波只有不带前缀的 caliber_probe 有调用方。
+  caliber_from 带上改名映射 nodes={原 id: 新 id}，运行时 metrics._pinned_caliber 按语法树改写式子里的 cell(nodes.X…)
+  和 nodes.X（第 3 波起）。
+- 组合式问数（02 做法 4，ledger/compose.py）：不经 assemble（拷进的是问数据那张图），只用 caliber_block(prefix=…,
+  card_id=…, inputs=…)：取数节点改名、模板按助手给的参数渲染成字面 SQL，口径卡带改名映射。
 - 新的派生种类登记进 KINDS，入口字段、出口、首尾相接都走 assemble，不在调用方拼节点。
 
 派生图都是探索运行（正式运行只从已发布未退役的版本发起）；来源（origin_kind）由调用方定：评测 eval、对账 reconcile、
@@ -42,7 +44,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-#: 派生图的种类。这一波实现 caliber_probe；reconcile、recall 归第 3 波的账本（见模块说明的扩展点）
+#: 派生图的种类。caliber_probe、reconcile 已实现；recall 归第 4 波（见模块说明的扩展点）
 KINDS = ("caliber_probe", "reconcile", "recall")
 
 #: 不能派生的原因的机器码
@@ -242,19 +244,39 @@ def _node(nid: str, ntype: str, label: str, **config: Any) -> dict[str, Any]:
     return {"id": nid, "type": ntype, "position": {"x": 0, "y": 0}, "data": {"label": label, "config": config}}
 
 
-def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | None = None) -> Block:
+def render_inputs(value: Any, inputs: Mapping[str, Any]) -> Any:
+    """配置里每一段字的 {{ input.字段 }} 按 inputs 渲染成字面值（和运行时同一个渲染器 engine/expressions.render_template）。
+    load_pinned 已经保证取数节点的模板只引用入口字段。别的值原样。"""
+    from app.engine.expressions import render_template
+
+    if isinstance(value, str):
+        return render_template(value, {"input": dict(inputs)}) if "{{" in value else value
+    if isinstance(value, dict):
+        return {k: render_inputs(v, inputs) for k, v in value.items()}
+    if isinstance(value, list):
+        return [render_inputs(v, inputs) for v in value]
+    return value
+
+
+def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | None = None,
+                  card_id: str | None = None, inputs: Mapping[str, Any] | None = None) -> Block:
     """一份口径：拷出取数节点（id、配置原样；prefix 不为空时改名为 prefix + 原 id）+ 一张 caliber_from 固定到那一版的
     口径卡（id 同原卡，带前缀时同样改名；「缺输入时」照抄原卡）。
 
     upgrade_policy：钉住的版本有了新的已发布版本时这一段怎么处置（recompute / dual / incomparable，没有缺省）。写在
     本地口径卡上，判断走和正式运行同一个 engine/governance.unresolved_caliber_upgrades；不给就不写（有新版本时那个
-    判断报「待处置」）。prefix 的改名映射要等 metrics 运行时认 caliber_from.nodes（见模块说明）。"""
+    判断报「待处置」）。带前缀时口径卡的 caliber_from 带改名映射 nodes（metrics 运行时按它改写式子，见模块说明）。
+
+    组合式问数（ledger/compose.py）另给两项：card_id 是口径卡在新图里的 id（缺省 prefix + 原卡 id）；inputs 给了的话，
+    取数节点配置里的 {{ input.字段 }} 按它渲染成字面值——拷进问数据的图里，那张图的入口没有口径的入口字段。"""
     rename = {str(n["id"]): f"{prefix}{n['id']}" for n in pinned.fetches} if prefix else {}
     nodes: list[dict[str, Any]] = []
     for original in pinned.fetches:
         node = copy.deepcopy(original)
         node["id"] = rename.get(str(node["id"]), str(node["id"]))
         node["position"] = {"x": 0, "y": 0}
+        if inputs is not None and isinstance(node.get("data"), dict):
+            node["data"]["config"] = render_inputs(node["data"].get("config") or {}, inputs)
         nodes.append(node)
     source = pinned.ref()
     if rename:
@@ -265,7 +287,7 @@ def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | Non
         config["on_missing"] = on_missing
     if upgrade_policy:
         config["upgrade_policy"] = upgrade_policy
-    card_id = f"{prefix}{pinned.node_id}"
+    card_id = card_id or f"{prefix}{pinned.node_id}"
     nodes.append(_node(card_id, "metrics", pinned.card_title, **config))
     return Block(nodes=nodes, card_id=card_id, rename=rename, source=pinned.describe())
 

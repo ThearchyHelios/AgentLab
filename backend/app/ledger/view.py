@@ -73,6 +73,8 @@ def _query_view(query: dict[str, Any], hider: _Hide, names: dict[str, str]) -> d
     for cand in query.get("candidates") or []:
         item = ledger_labels.related_view(cand, hide=hider.hide, shown=hider.shown, names=names)
         item["status"] = cand.get("status")
+        if cand.get("how"):
+            item["how"] = cand["how"]
         if cand.get("columns") is not None:
             item["columns"] = cand["columns"]
         cands.append(item)

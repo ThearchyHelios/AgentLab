@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { ApiError, api, streamCopilot, streamRun } from '../api/client'
 import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
 import { copilotContext, copilotLook, decodeRun, looksOf } from '../run/decode'
-import { CHAT_BLUEPRINT_TEXT, LOOK_TEXT, REJECTED_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, LEDGER_TEXT, LOOK_TEXT, REJECTED_TEXT } from '../lib/terms'
 import type { LookEvent } from '../typesApp'
 import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
 import { guardReview, hasEvidence } from '../lib/evidence'
@@ -1491,6 +1491,10 @@ function plan(flow: Flow, args: PlanArgs) {
             phase: 'building',
             status: `正在生成工作流…（${t.ops.filter((o) => o.op === 'add_node').length} 步）`,
           }))
+          break
+        case 'use_caliber':
+          // 助手选用了一份已发布口径（取数节点和口径卡由服务端生成，过程里那一行由 decodeCopilot 写）
+          patch(() => ({ phase: 'building', status: LEDGER_TEXT.use.status }))
           break
         case 'done':
           patch(() => ({ explanation: op.explanation ?? '' }))

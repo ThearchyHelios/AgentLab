@@ -3577,6 +3577,25 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
                 .join('\n') })
         break
       }
+      case 'use_caliber': {
+        // 问数据的助手选用已发布口径（服务端 ledger/compose.py）：取数节点和口径卡由服务端按那一版生成，不另转 add_node，
+        // 这里一行说清选用了哪一版、生成了几个节点；拒收的照实写原因（原因同样交回了模型去改）
+        const r = op.result && typeof op.result === 'object' ? op.result : null
+        if (r?.status === 'ok') {
+          nodeCount += num(r.nodes) ?? 0
+          const metrics = Array.isArray(r.metrics) ? r.metrics.map((m: any) => String(m?.name ?? m?.id ?? '')).filter(Boolean) : []
+          add({ id: `uc-${i}`, seq: i, kind: 'node', status: 'done', code: 'use_caliber',
+                title: clip(LEDGER_TEXT.use.title(String(r.workflow_name ?? r.workflow_id ?? ''), num(r.version) ?? null,
+                                                  String(r.level_text ?? ''))),
+                detail: LEDGER_TEXT.use.detail(Array.isArray(r.fetches) ? r.fetches.length : 0, String(r.card ?? r.card_id ?? ''),
+                                               metrics.join('、')),
+                ...(r.card_id ? { nodeId: String(r.card_id) } : {}) })
+        } else if (r?.status === 'refused') {
+          add({ id: `uc-${i}`, seq: i, kind: 'note', status: 'done', level: 'warn', code: 'use_caliber_refused',
+                title: LEDGER_TEXT.use.refused, detail: String(r.reason ?? '') || undefined })
+        }
+        break
+      }
       case 'plan':
         add({ id: `cp-${i}`, seq: i, kind: 'note', status: 'done',
               title: clip(String(op.summary ?? '已完成规划'), 120) })

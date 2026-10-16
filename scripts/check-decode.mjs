@@ -1858,6 +1858,32 @@ await section('口径账本：封存后比对已发布口径（ledger.matched）
   check('不改相位：运行照旧是结束了', phase.phase === 'succeeded', phase.phase)
 })
 
+await section('口径账本：问数据的助手选用已发布口径（use_caliber 操作）', async () => {
+  // next-round 02 做法 4：取数节点和口径卡由服务端按那一版生成（ledger/compose.py），不另转 add_node。过程里一行说清选用了
+  // 哪一版、生成了几个节点；拒收的照实写原因（同样交回了模型去改）
+  const ok = { op: 'use_caliber', id: 'c1', workflow_id: 'wf-week', version: 3, metrics: ['gmv'], inputs: { start: '2026-09-01' },
+    result: { status: 'ok', workflow_id: 'wf-week', workflow_name: '周销售', version: 3, level: 'governed', level_text: '受管',
+              card: '周销售卡', card_id: 'c1', fetches: ['c1_fetch'], metrics: [{ id: 'gmv', name: '销售额' }], nodes: 2 } }
+  const steps = mod.decodeCopilot([
+    { op: 'plan', summary: '选用周销售口径' },
+    { op: 'add_node', node: { id: 'start', type: 'input', label: '入口', config: {} } },
+    ok,
+    { op: 'add_node', node: { id: 'write', type: 'report', label: '写答案', config: {} } },
+    { op: 'done', explanation: '按口径回答' },
+  ], { context: 'chat' })
+  const row = steps.find((s) => s.code === 'use_caliber')
+  check('一行：选用了哪一版、级别', row?.title === '选用口径「周销售」 v3（受管）' && row?.kind === 'node' && row?.status === 'done', row?.title)
+  check('展开：生成了几个取数节点、哪张口径卡、用到哪几个指标',
+    row?.detail === '按这一版生成取数节点 1 个和口径卡「周销售卡」，用到的指标：销售额', row?.detail)
+  check('节点数算进「新增几个步骤」（入口、报告各 1，选用的 2）',
+    steps.find((s) => s.id.startsWith('cd-'))?.title === '工作流已搭建完成，新增 4 个步骤', steps.find((s) => s.id.startsWith('cd-'))?.title)
+  const refused = mod.decodeCopilot([{ op: 'use_caliber', id: 'c2', result: { status: 'refused', reason: '请填写「end」' } }])
+    .find((s) => s.code === 'use_caliber_refused')
+  check('拒收的：提醒一行，写服务端给的原因', refused?.title === '没有选用口径' && refused?.detail === '请填写「end」'
+    && refused?.level === 'warn', `${refused?.title} / ${refused?.detail}`)
+  check('没带结果（老服务端、形状不对）：不出行、不报错', mod.decodeCopilot([{ op: 'use_caliber', id: 'c1' }, { op: 'use_caliber', result: 'x' }]).length === 0)
+})
+
 await section('术语', async () => {
   // 没起名的节点退到类型名，类型名跟全站同一张表
   const h = mod.decodeRun([{ seq: 1, type: 'node.started', node_id: 'h', ts: 1, data: { node_type: 'human', label: 'h' } }])

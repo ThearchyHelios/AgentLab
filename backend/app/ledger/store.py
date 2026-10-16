@@ -28,8 +28,10 @@ from app.db.models import Run, RunEvent
 #: 工件的种类和内容格式
 KIND = "caliber_match"
 FORMAT = "agentlab.caliber_match/1"
-#: 比对算法的版本：绑定、证明、标签的规则改了就加一，界面和统计据此分得清是哪一版算法比的
-ALGO = "1"
+#: 比对算法的版本：绑定、证明、标签的规则改了就加一，界面和统计据此分得清是哪一版算法比的。
+#: 2（第 3 波）：认出助手选用的口径（查询 composed、标签 how=composed），指标的标签记它取自哪几条查询（queries，认证队列
+#: 认「被报告引用的查询」用）
+ALGO = "2"
 #: 触发方式（见模块说明）
 TRIGGERS = ("sealed", "backfill", "on_demand")
 
