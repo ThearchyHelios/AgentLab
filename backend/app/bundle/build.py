@@ -1177,6 +1177,13 @@ def _summary(etype: str, data: Any) -> str:
     if etype == EventType.APPROVAL_INQUIRY:
         question = data.get("question")
         return f"质询：{_clip(question)}" if isinstance(question, str) and question.strip() else "审批质询"
+    if etype == EventType.LEDGER_MATCHED:
+        # 口径账本的比对（next-round 02）：只说各种状态几条，不带绑定和差异
+        counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
+        parts = [f"{counts[k]} 条{label}" for k, label in (("proven", "等价已证明"), ("related", "有相关口径"),
+                                                          ("none", "没有相关口径"), ("skipped", "没有比完"))
+                 if isinstance(counts.get(k), int) and counts[k]]
+        return "封存后比对已发布口径" + (f"：{'、'.join(parts)}" if parts else "")
     if etype == EventType.LOG and isinstance(data.get("message"), str):
         return _clip(data["message"])
     return ""

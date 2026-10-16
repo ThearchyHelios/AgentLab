@@ -27,10 +27,22 @@ router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 #: POST /api/runs 声明了客户端不能声明的来源（422）
 ORIGIN_NOT_ALLOWED = "origin_not_allowed"
+#: origin_ref（问数据的运行属于哪段对话、哪一轮）只在来源是问数据时收；对话不存在、这一轮不属于这段对话（422）
+ORIGIN_REF_NOT_ALLOWED = "origin_ref_not_allowed"
+ORIGIN_REF_INVALID = "origin_ref_invalid"
 #: 删除被拒：这次运行写过外部系统（有演练以外的生效记录，409）
 RUN_HAS_EFFECTS = "run_has_effects"
 
 
+
+
+class OriginRef(BaseModel):
+    """问数据的运行属于哪段对话、哪一轮（next-round 02 做法 9）。服务端核对对话这个人用不用得了、这一轮是不是这段对话的，
+    写进 Run.origin 和封存的 run.origin 事件：运行和轮次之间从此有一条封存的链接（召回找答案的主人、统计按对话数重复都靠它），
+    不再只靠前端写的 meta.runId。"""
+
+    conversation_id: str = Field(min_length=1, max_length=32)
+    turn_id: str = Field(min_length=1, max_length=32)
 
 
 class StartRunIn(BaseModel):
@@ -46,6 +58,8 @@ class StartRunIn(BaseModel):
     #: 运行来源（engine/origin.py）：客户端只能声明 chat / canvas / launcher / api，不传按 api 记。
     #: 应用、钩子、定时任务发起的来源只能由服务端写
     origin: str | None = None
+    #: 来源是问数据时，这次运行属于哪段对话、哪一轮（OriginRef）。别的来源带它回 422
+    origin_ref: OriginRef | None = None
 
 
 class RunOut(BaseModel):
@@ -105,6 +119,10 @@ async def start_run(
         # 应用入口、钩子、定时任务的来源由服务端写：客户端能声明的话，谁都能把一次画布试跑说成应用发起的
         raise CodedHTTPException(422, "运行来源只能是问数据、画布上的试运行、正式运行（手动）或接口，应用、外部系统和定时任务"
                                       "发起的运行由服务端记录来源", ORIGIN_NOT_ALLOWED, field="origin")
+    if payload.origin_ref is not None and origin != "chat":
+        raise CodedHTTPException(422, "只有问数据的运行能写明属于哪段对话、哪一轮", ORIGIN_REF_NOT_ALLOWED,
+                                 field="origin_ref")
+    origin_data = await _origin_ref(session, payload.origin_ref) if payload.origin_ref is not None else None
     options = None
     actor = actor_of(x_actor)
     memory_scope = payload.memory_scope
@@ -136,10 +154,26 @@ async def start_run(
             version=payload.version,
             actor=actor,
             origin_kind=origin,
+            origin=origin_data,
             options=options,
         )
     except LaunchRefused as e:
         raise _refused(e) from e
+
+
+async def _origin_ref(session: AsyncSession, ref: OriginRef) -> dict[str, str]:
+    """核对 origin_ref：对话这个人用不用得了（不能用的 403，规则同助手接口的 ensure_conversation_access）、对话在不在、这一轮
+    是不是这段对话的。核对过的才写进运行来源：客户端不能把一次运行挂到别人的对话、别的轮次上。"""
+    from app.api.deps import ensure_conversation_access
+    from app.db.models import ConversationTurn
+
+    conversation = await ensure_conversation_access(session, ref.conversation_id)
+    if conversation is None:
+        raise CodedHTTPException(422, "运行要挂的对话不存在，可能已被删除", ORIGIN_REF_INVALID, field="origin_ref")
+    turn = await session.get(ConversationTurn, ref.turn_id)
+    if turn is None or turn.conversation_id != conversation.id:
+        raise CodedHTTPException(422, "运行要挂的这一轮不属于这段对话", ORIGIN_REF_INVALID, field="origin_ref")
+    return {"conversation_id": conversation.id, "turn_id": turn.id}
 
 
 def _refused(e: LaunchRefused) -> HTTPException:

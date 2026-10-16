@@ -130,9 +130,18 @@ class RunManager:
         for run_id, last_seq in queued:
             bus.set_seq(run_id, last_seq or 0)
             await self._emit(run_id, EventType.RUN_FAILED, data={"error": QUEUED_AT_RESTART})
+        # 口径账本：最近几天封存了、一次都没比过的探索运行，在后台补比一次（ledger/match.py）。只读工件和版本表，不查业务库、
+        # 不调模型；和调度循环同一个开关，拷来的数据目录、测试不补
+        from app.ledger import match as ledger_match
+
+        ledger_match.start_backfill()
 
     async def shutdown(self) -> None:
         self._closing = True
+        # 后台的口径比对先停：没做完的不记，下次启动补比会再比
+        from app.ledger import match as ledger_match
+
+        await ledger_match.shutdown()
         # 只等还没结束的：结束了的没什么可等，而且它可能属于另一个事件循环，
         # gather 会直接抛 "future belongs to a different loop"
         pending = [t for t in self._tasks.values() if not t.done()]
@@ -991,10 +1000,14 @@ class RunManager:
         # 每次都读到 running 和空的 output
         event: RunEventModel | None = None
         app_id: str | None = None
+        #: 收尾之后要不要放到后台比对口径（ledger/match.py）：只看探索运行
+        run_class: str | None = None
+        origin_kind: str | None = None
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
             if run:
                 app_id = run.app_id
+                run_class, origin_kind = run.run_class, run.origin_kind
                 timing = await _timing(session, run, elapsed_ms, now)
                 events_usage = await _usage_of_events(session, run_id)
                 inquiry = events_usage.pop("inquiry", None)
@@ -1064,6 +1077,13 @@ class RunManager:
             from app.notify.service import notify_run, spawn
 
             spawn(notify_run(run_id, "run.failed" if status == "failed" else "run.finished"))
+        if status == "succeeded":
+            # 口径账本（docs/design/next-round/02-口径账本.md 做法 2）：探索运行成功结束、封存完，拿这次执行的 SQL 和已发布口径
+            # 比对。和通知同一个位置、同样放到后台：比对是 CPU 活，在线程里限时限并发，不拖着收尾；结果追加在封存之后
+            from app.ledger import match as ledger_match
+
+            if ledger_match.wanted(run_class, origin_kind):
+                ledger_match.schedule(run_id)
 
     async def _seal(self, run_id: str) -> None:
         """对到此为止的全部事件算清单哈希，记下封到了哪一条。"""

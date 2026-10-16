@@ -317,6 +317,7 @@ def build_report(
     notes: Mapping[str, str],
     nodes: Mapping[str, Mapping[str, Any]],
     exported_at: str,
+    ledger: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """页面里的数据（report-data）。
 
@@ -329,8 +330,10 @@ def build_report(
     - refs：片段 id → 引用键（点开这个片段看哪条链）
     - notes：片段 id → 为什么是现在这个状态（api/evidence._note）
     - nodes：节点 id → {label, type}
+    - ledger：口径账本给这份报告的标签（app/ledger/view.report_labels，已按遮罩给）：{labels: {片段 id: 标签}, note, retro, …}。
+      面板最上面多「口径」一步，写明「封存后比对，不在封存范围内」。没比对过的运行不给，数据块里就没有这个键（和以前一字不差）
     """
-    return {
+    out = {
         "schema": SCHEMA,
         "meta": {
             "run_id": run.get("id"), "workflow_id": run.get("workflow_id"),
@@ -347,6 +350,9 @@ def build_report(
         "refs": dict(refs),
         "notes": dict(notes),
     }
+    if ledger:
+        out["ledger"] = {k: v for k, v in ledger.items() if k in ("labels", "note", "retro", "retro_note", "algo")}
+    return out
 
 
 def _iso(value: Any) -> str | None:
