@@ -1773,7 +1773,7 @@ function UploadDecisionBody({ decision, choices, headerRow, sheetNoun, onRecipe 
         </div>
       )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border bg-bg px-2.5 py-2" data-shape-recipe>
-        <p className="min-w-0 flex-1 text-xs leading-relaxed text-dim">{onRecipe ? UPLOAD_TEXT.shapeRecipe : UPLOAD_TEXT.shapeRecipeCsv}</p>
+        <p className="min-w-0 flex-1 text-xs leading-relaxed text-dim">{UPLOAD_TEXT.shapeRecipe}</p>
         {onRecipe && (
           <button type="button" className="btn btn-sm btn-primary shrink-0" onClick={onRecipe} data-shape-recipe-start>
             <Layers size={12} aria-hidden /> {RECIPE_TEXT.entry}
@@ -2098,7 +2098,7 @@ function TableUploader({ initialName, taken, sqliteTaken, onClose, onImported, o
         )}
       >
         <UploadDecisionBody decision={decision} choices={choices} headerRow={headerRow} sheetNoun={sheetNoun}
-                            onRecipe={file && sheetNoun === '工作表' ? () => onRecipe(file, name, description) : undefined} />
+                            onRecipe={file ? () => onRecipe(file, name, description) : undefined} />
       </Modal>
     )
   }

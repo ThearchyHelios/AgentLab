@@ -579,18 +579,48 @@ def _undated(note: str) -> str:
     return _PROFILE_NOTE_DAY.sub("数据剖析", note, count=1)
 
 
+#: 剖析备注改过的说法：(升级前的写法, 现在的写法)。大表看的是按存储顺序的前 N 行（多半是最老的数据）、关系取的是
+#: 数据库先给出的那几个键值，都不是随机抽样，说法改成照实的（data/catalog_profile.py 的 _relation_note、码值的
+#: 「统计范围」、FILTER_SAMPLED）。只换这几处固定的句式，换完和现在的写法一字不差才算同一句
+_LEGACY_PROFILE_WORDING = (
+    (re.compile(r"抽样覆盖率 (?=\S+?，可能不是这条关系)"), "覆盖率 "),
+    (re.compile(r"子表抽样 (?=\d+ 个不同键值)"), "子表取了 "),
+    (re.compile(r"（只看前 (?=\d+ 行）)"), "（按存储顺序只看前 "),
+    (re.compile(r"按前 (?=[\d,]+ 行统计)"), "按存储顺序取前 "),
+)
+#: 起草时核对有效行过滤写进备注的那句（catalog_profile.FILTER_SAMPLED / FILTER_SAMPLED_EDGE）：接在模型给的依据后面，
+#: 整段不以「数据剖析：」开头，只换这一句
+_LEGACY_FILTER_WORDING = re.compile(r"剖析核对：按前 (?=[\d,]+ 行统计)")
+
+
+def _current_wording(note: str) -> str:
+    """剖析备注里升级前的说法换成现在的写法（_LEGACY_PROFILE_WORDING）。只用来比较，不改写目录里存着的备注。"""
+    for pattern, now in _LEGACY_PROFILE_WORDING:
+        note = pattern.sub(now, note)
+    return note
+
+
 def same_profile_note(a: Any, b: Any) -> bool:
     """两段备注是否相同；数据剖析写的备注只差开头的日期（升级前每次都写当天的日期），或者一段带日期、一段是不带
-    日期的新写法，也算相同。
+    日期的新写法，或者只差改过的几处说法（_LEGACY_PROFILE_WORDING：「抽样覆盖率」→「覆盖率」之类），也算相同。
 
     隔天重跑、数据没变，结论一字不差、只有日期变了：要是这也算「变了」，目录就升一个版本，发布时记下的目录版本
-    对不上，之后每次正式运行都提醒「目录有变化」。升级后第一次重新剖析也是一样：结论没变，只是新写法不带日期。
+    对不上，之后每次正式运行都提醒「目录有变化」。升级后第一次重新剖析也是一样：结论没变，只是新写法不带日期、
+    措辞改了。算相同时保留旧的那段（目录不动），旧说法要等结论真的变了、重写备注时才换掉。
+
+    起草写的备注（有效行过滤）里接着的剖析核对那句同理，只认那一句的旧说法（_LEGACY_FILTER_WORDING）。
     """
     if a == b:
         return True
-    if not (is_profile_note(a) and is_profile_note(b)):
+    if not (isinstance(a, str) and isinstance(b, str)):
         return False
-    return _undated(a) == _undated(b)
+    profile_a, profile_b = is_profile_note(a), is_profile_note(b)
+    if profile_a and profile_b:
+        return _current_wording(_undated(a)) == _current_wording(_undated(b))
+    if profile_a or profile_b:
+        return False
+    return (_LEGACY_FILTER_WORDING.sub("剖析核对：按存储顺序取前 ", a)
+            == _LEGACY_FILTER_WORDING.sub("剖析核对：按存储顺序取前 ", b))
 
 
 def _same_core(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
@@ -1378,14 +1408,17 @@ _DATE_WORDS = frozenset({"date", "time", "day", "dt", "ts", "timestamp", "dateti
 _TEXT_TYPES = ("CHAR", "TEXT", "STRING", "CLOB")
 
 
-def is_date_column(name: str, type_name: str | None) -> bool:
+def is_date_column(name: str, type_name: str | None, *, enum_values: Any = None) -> bool:
     """日期类列：类型是日期、时间戳（DATE、DATETIME、TIMESTAMP……）；或者类型是文字（或者不知道类型）、名字像日期
-    （SQLite 的日期常存成文字）。只有时刻的 TIME、整数存的时间戳不算：取值不是日期。
+    （SQLite 的日期常存成文字）。只有时刻的 TIME、整数存的时间戳不算：取值不是日期。有取值列表的（MySQL 的 ENUM /
+    SET、探查记下 enum_values 的 PostgreSQL 枚举）不算：PG 的枚举编译出来是类型名本身，update_reason 里也有「DATE」。
 
     数据剖析（表里只有一个日期类列时提议它作业务日期）和 SQL 检查（按业务日期以外的时间列统计）共用这一个判断。
     以前两边各写一套：剖析认的「唯一日期列」，SQL 检查可能认为还有别的时间列，反过来也一样，两边对不上。
     """
-    t = (type_name or "").upper()
+    t = _type_words(type_name)
+    if enum_values or _MYSQL_ENUM.match(t) or "INTERVAL" in t:
+        return False
     if "DATE" in t or "TIMESTAMP" in t:
         return True
     if t and not any(k in t for k in _TEXT_TYPES):
@@ -1420,10 +1453,40 @@ def _name_index(tables: Mapping[str, Any]) -> dict[tuple[str, str], set[str]]:
     return index
 
 
+#: 类型写法里带引号的部分（ENUM('int','date') 的取值）：认类型时去掉，取值里的词不能让一列变成数字或时间
+_QUOTED_IN_TYPE = re.compile(r"'(?:[^']|'')*'")
+
+
+def _type_words(type_name: str | None) -> str:
+    """认类型用的写法：大写、去掉引号里的取值。探查存的是按方言编译的完整写法（ENUM('paid','refund')、
+    VARCHAR2(20 CHAR)、TIMESTAMP WITH TIME ZONE），不再是 SQLAlchemy 的通用写法。"""
+    return _QUOTED_IN_TYPE.sub("''", (type_name or "").upper()).strip()
+
+
+#: MySQL 的 ENUM / SET 编译出来的写法：ENUM('a','b')、SET('x','y')，只认带括号的。PostgreSQL 的枚举编译出来是类型名本身，
+#: setup_status、enum_kind 这种以 set、enum 开头的名字不能按前缀认成 MySQL 的 SET / ENUM——PG 的枚举一律靠探查记下的
+#: enum_values 认（column_family）
+_MYSQL_ENUM = re.compile(r"^(ENUM|SET)\s*\(")
+
+
+def _mysql_enum_kind(type_name: str | None) -> str | None:
+    """类型写法是 MySQL 的 ENUM(…) / SET(…) 时返回 "ENUM" / "SET"，否则 None。"""
+    m = _MYSQL_ENUM.match(_type_words(type_name))
+    return m.group(1) if m else None
+
+
 def _type_family(type_name: str | None) -> str | None:
-    """列类型的大类：数字、文字、时间；认不出来返回 None（不据此排除）。"""
-    t = (type_name or "").upper()
+    """列类型的大类：数字、文字、时间；认不出来返回 None（不据此排除）。
+
+    认的是按方言编译的完整写法：MySQL 的 ENUM / SET 是文字（取值列表里的词不算），Oracle 的 INTERVAL DAY TO SECOND
+    是时长、不算数字（以前按子串「INT」认成了数字）。PostgreSQL 的枚举编译出来是类型名本身，只看类型认不出来，
+    要看列上的取值列表（column_family）。"""
+    t = _type_words(type_name)
     if not t:
+        return None
+    if _MYSQL_ENUM.match(t):
+        return "text"
+    if "INTERVAL" in t:
         return None
     if any(k in t for k in ("CHAR", "TEXT", "CLOB", "STRING", "UUID")):
         return "text"
@@ -1432,6 +1495,16 @@ def _type_family(type_name: str | None) -> str | None:
     if any(k in t for k in ("DATE", "TIME")):
         return "time"
     return None
+
+
+def column_family(col: Mapping[str, Any] | None) -> str | None:
+    """表结构里一列的类型大类：有取值列表（探查记下的 enum_values：MySQL 的 ENUM / SET、PostgreSQL 的枚举）的是
+    文字，其余按类型写法认（_type_family）。"""
+    if not isinstance(col, Mapping):
+        return None
+    if col.get("enum_values"):
+        return "text"
+    return _type_family(col.get("type"))
 
 
 def _id_stem(column: str) -> str | None:
@@ -1489,8 +1562,8 @@ def infer_name_relations(schema_cache: Mapping[str, Any] | None, table: str, *,
         pk = list(target_meta.get("primary_key") or [])
         if len(pk) != 1:
             continue
-        pk_type = next((c.get("type") for c in target_meta.get("columns") or [] if c.get("name") == pk[0]), None)
-        mine, theirs = _type_family(col.get("type")), _type_family(pk_type)
+        pk_col = next((c for c in target_meta.get("columns") or [] if c.get("name") == pk[0]), None)
+        mine, theirs = column_family(col), column_family(pk_col)
         if mine and theirs and mine != theirs:
             continue
         out.append(_relation(table, [name], target, pk, "name", cardinality=_cardinality(meta, [name])))

@@ -40,7 +40,7 @@ def test_settings_default_off_and_parse_leniently():
     ({"table_max_s": 9}, "每张表时长上限"),
     ({"table_max_s": 601}, "每张表时长上限"),
     ({"query_timeout_s": 61}, "单条查询时限"),
-    ({"sample_size": 5}, "抽样键值数"),
+    ({"sample_size": 5}, "核对键值数"),
     ({"max_scan_rows": -1}, "整表统计行数上限"),
     ({"enabled": "true"}, "开启数据剖析"),
     ({"table_max_queries": True}, "每张表最多查询数"),
@@ -143,8 +143,16 @@ def test_profile_sql_passes_readonly_guard_on_every_dialect(kind):
             d.unique_check_sql(tbl, col),
             d.value_counts_sql(tbl, col, 21, scan_cap=None),
             d.value_counts_sql(tbl, col, 21, scan_cap=100_000),
-            d.min_max_sql(tbl, [col]),
+            d.min_max_sql(tbl, [(col, False)]),
+            d.min_max_sql(tbl, [(col, True)]),
+            d.day_volume_sql(tbl, col, "2026-08-01"),
+            d.window_value_counts_sql(tbl, col, col, "2026-08-01", 21),
         ]
+        sampled = d.sample_value_counts_sql(tbl, col, 1, 21)
+        if kind in ("postgresql", "oracle"):
+            sqls.append(sampled)
+        else:
+            assert sampled is None             # MySQL、SQLite 没有块采样
     for sql in sqls:
         assert guard.check(sql, readonly=True, dialect=kind) == sql, sql
 

@@ -177,7 +177,8 @@ class Pipeline:
     recipe_sha256: Callable[[Recipe], str]
     canonical: Callable[[Recipe], dict[str, Any]]
     apply_patch: Callable[[dict[str, Any], list[dict[str, Any]]], dict[str, Any]]
-    scan: Callable[[bytes], WorkbookScan]
+    #: (原件, 文件名) → 扫描结果。文件名定按 CSV 读还是按工作簿读（csv_grid.scan_any）
+    scan: Callable[[bytes, str], WorkbookScan]
     scan_to_json: Callable[[WorkbookScan], dict[str, Any]]
     scan_from_json: Callable[[dict[str, Any]], WorkbookScan]
     read_grid: Callable[..., Grid]
@@ -225,7 +226,7 @@ class Pipeline:
 def default_pipeline() -> Pipeline:
     """接上真模块。函数体里惰性导入：这些模块（openpyxl、执行器、起草器）导入不便宜，接口模块加载时不必付。"""
     from app.data import (
-        recipe, recipe_accumulate, recipe_ai, recipe_checks, recipe_compare, recipe_confirm, recipe_diff,
+        csv_grid, recipe, recipe_accumulate, recipe_ai, recipe_checks, recipe_compare, recipe_confirm, recipe_diff,
         recipe_engine, recipe_fixes, recipe_notes, recipe_select, recipe_suggest, xlsx_cells, xlsx_scan,
     )
 
@@ -234,7 +235,8 @@ def default_pipeline() -> Pipeline:
         recipe_sha256=recipe.recipe_sha256,
         canonical=recipe.canonical_recipe,
         apply_patch=recipe.apply_patch,
-        scan=xlsx_scan.scan,
+        # CSV / TSV 也走配方：csv_grid 适配成一张「工作表」，其余照旧交给 xlsx_scan（Excel 期 5）
+        scan=csv_grid.scan_any,
         scan_to_json=xlsx_scan.scan_to_json,
         scan_from_json=xlsx_scan.scan_from_json,
         read_grid=xlsx_cells.read_grid,
@@ -473,7 +475,7 @@ def _open_book(p: Pipeline, raw: bytes, scan: WorkbookScan) -> _Book:
 
 def _book_of(p: Pipeline, snap: _Snap) -> _Book:
     raw = _read_raw(snap.raw_sha256)
-    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw)
+    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw, snap.file_name)
     return _open_book(p, raw, scan)
 
 
@@ -771,7 +773,7 @@ class _Staged:
 
 def _stage_work(p: Pipeline, raw: bytes, filename: str) -> _Staged:
     """首次导入（或切换）的暂存：扫描、网格预览、规则起草（带干跑）、对草稿做一次静态校验。"""
-    scan = p.scan(raw)
+    scan = p.scan(raw, filename)
     book = _open_book(p, raw, scan)
     dry = _Capture(_dry_fn(p, book, filename, {}))
     d = p.draft(scan, book.grids, filename, validate=lambda data, f, o: p.validate(data, facts=f, origin=o),
@@ -859,7 +861,7 @@ async def stage_upload(session: AsyncSession, *, raw: bytes, filename: str, name
 def _replay_work(p: Pipeline, raw: bytes, current: dict[str, Any], filename: str, snap: _Snap,
                  *, evaluate: bool) -> tuple[_Staged, _Eval | None]:
     """上传新一期 / 修改配方：扫描（或取存下的扫描）、按现行配方的写法取系统发现，修改配方时再评估一遍。"""
-    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw)
+    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw, filename)
     book = _open_book(p, raw, scan)
     facts = p.detect_facts(book.grids, scan, recipe=current)
     staged = _Staged(scan_json=p.scan_to_json(scan), previews=[p.preview(g) for g in book.grids.values()],
@@ -1859,7 +1861,7 @@ def _trial_work(p: Pipeline, snap: _Snap, work: dict[str, Any], facts: DraftFact
     if parsed is None or problems:
         return _TrialRun(parsed=parsed, problems=list(problems))
     raw = _read_raw(snap.raw_sha256)
-    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw)
+    scan = p.scan_from_json(snap.scan) if snap.scan else p.scan(raw, snap.file_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     # 先写 .tmp- 再改名：半成品归启动清理（_sweep_tmp）管，发布、回收不会把半个库当成试运行库
     tmp = path.parent / f"{path.name}{raw_store.TMP_MARK}{secrets.token_hex(6)}"

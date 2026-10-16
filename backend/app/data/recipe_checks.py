@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterable
 
 from app.data.engine import open_checked_sqlite
 from app.data.recipe_types import (
+    SUBTOTAL_KEY,
     CheckResult,
     ColumnOut,
     CrosstabBlock,
@@ -34,6 +35,7 @@ from app.data.recipe_types import (
     Recipe,
     SumEq,
     derive_tables,
+    list_period_columns,
 )
 
 #: 无法核对的原因（契约 CheckResult.reasons 的键）的固定顺序：细节、说明都按这个顺序列
@@ -71,22 +73,31 @@ class CheckPlan:
     k: dict[str, str] = field(default_factory=dict)
     #: derived 分段键 → G 编号（只给有公式格的 derived 段）
     g: dict[str, str] = field(default_factory=dict)
-    #: 列表块键 → T 编号（每个有合计行的列表块一条）
+    #: 列表块键 → T 编号（每个有合计行的列表块一条）；期 5：块键 + SUBTOTAL_KEY → 这个块的小计核对（一条）
     t: dict[str, str] = field(default_factory=dict)
     items: dict[str, list[DerivedItem]] = field(default_factory=dict)
 
 
 def _recipe_keys(recipe: Recipe) -> tuple[list[str], list[str]]:
-    """配方里 derived 分段键、带合计行的列表块键，按配方里的先后。"""
+    """配方里 derived 分段键、带合计行的列表块键，按配方里的先后。期 5：带小计的列表块另有一个键（块键 +
+    SUBTOTAL_KEY），排在这个块的合计行后面：同一块的小计和合计各编一个 T，结论分开写。"""
     derived: list[str] = []
     totals: list[str] = []
     for sheet in recipe.sheets:
         for block in sheet.blocks:
             if isinstance(block, CrosstabBlock):
                 derived += [s.id for s in block.segments if isinstance(s, DerivedSegment)]
-            elif block.rows.total_row is not None:
+                continue
+            if block.rows.total_row is not None:
                 totals.append(block.id)
+            if block.rows.subtotals is not None:
+                totals.append(f"{block.id}{SUBTOTAL_KEY}")
     return derived, totals
+
+
+def is_subtotal_key(key: str) -> bool:
+    """T 编号的键是不是一个块的小计核对（期 5）。"""
+    return key.endswith(SUBTOTAL_KEY)
 
 
 def _ordered(recipe_keys: list[str], items: list[DerivedItem]) -> list[str]:
@@ -570,6 +581,25 @@ def _check_pk(sql: _Sql, cid: str, title: str, table: str, grain: list[str]) -> 
 # ---------------------------------------------------------------- 入口
 
 
+def _check_period_rows(sql: _Sql, cid: str, title: str, table: str, column: str, period: Any,
+                       lineage: dict[str, dict[str, list[list[Any]]]]) -> CheckResult:
+    """期 5：列表按日期列分期（ListPeriod.column、check=within_context）时，每行的这一列都落在本期统计期内。
+    日期为空的行也算不在：看不出它属于哪一期。不在的行按期累积会混进别的期（统计期互不重叠的前提就破了），
+    所以是结构类、不能写理由接受。统计期没定下来（要人录入）时不会走到这里：那时不建库。"""
+    if period is None or not period.start or not period.end:
+        raise _Broken("本期没有统计期，无法核对每行的日期")
+    q = (f"SELECT rowid FROM {_q(table)} WHERE {_q(column)} IS NULL OR {_q(column)} < ? OR {_q(column)} > ? "
+         "ORDER BY rowid")
+    params = [period.start, period.end]
+    bad = [r[0] for r in sql.all(q, params)]
+    total = sql.one(f"SELECT COUNT(*) FROM {_q(table)}")[0]
+    cells = [c for rowid in bad[:_DETAIL_MAX] if (c := lineage_cell(lineage, table, column, rowid))]
+    details = [f"有 {len(bad)} 行的「{column}」为空或不在 {period.start} 至 {period.end} 之内"] if bad else []
+    return CheckResult(id=cid, kind="period_rows", title=title, status="mismatch" if bad else "passed",
+                       category="structure", checked=int(total), failed=len(bad), sql=q, params=params,
+                       details=details, cells=cells)
+
+
 def _axis_names(recipe: Recipe) -> dict[str, str]:
     """derived 分段键 → 所在交叉表块的轴列名（K 的铺满判定不按日期分）。"""
     out: dict[str, str] = {}
@@ -629,7 +659,9 @@ def run_checks(db_path: str, extraction: Extraction, recipe: Recipe) -> list[Che
         jobs.append((cid, "formula_refs", f"合计公式引用（分段「{seg}」）",
                      lambda t, seg=seg, cid=cid: _check_g(sql, cid, t, plan.items[seg])))
     for block, cid in plan.t.items():
-        jobs.append((cid, "column_sum", f"合计行按列求和（块「{block}」）",
+        title = (f"小计行按各组明细求和（块「{block.removesuffix(SUBTOTAL_KEY)}」）" if is_subtotal_key(block)
+                 else f"合计行按列求和（块「{block}」）")
+        jobs.append((cid, "column_sum", title,
                      lambda t, block=block, cid=cid: _check_t(sql, cid, t, plan.items[block], full_calc)))
     for rel in recipe.relations:
         if isinstance(rel, SumEq):
@@ -646,6 +678,12 @@ def run_checks(db_path: str, extraction: Extraction, recipe: Recipe) -> list[Che
     for i, table in enumerate([t for t in tables if grains.get(t)], 1):
         jobs.append((f"P{i}", "pk_unique", f"主键唯一：「{table}」",
                      lambda t, table=table, i=i: _check_pk(sql, f"P{i}", t, table, grains[table])))
+    period = extraction.period
+    dated = [(t, spec[1]) for t, spec in list_period_columns(recipe).items() if spec[0] == "column" and t in tables]
+    for i, (table, column) in enumerate(dated, 1):
+        jobs.append((f"D{i}", "period_rows", f"「{table}」每行的「{column}」都在本期统计期内",
+                     lambda t, table=table, column=column, i=i: _check_period_rows(
+                         sql, f"D{i}", t, table, column, period, extraction.lineage)))
     try:
         return list(extraction.context_checks) + [_guarded(sql, *job) for job in jobs]
     finally:

@@ -780,6 +780,10 @@ export function ProfileTaskBody({ detail: d, mode, filled = {}, focusAfter = nul
             <StatusChip status={date.status} className="mr-1.5 align-middle" />
             {PT.dateProposal(date.column)}
             <span className="tnum text-dim">，{PT.dateSpan(date.min.slice(0, 19), date.max.slice(0, 19))}</span>
+            {(() => {
+              const invalid = d.date_ranges.find((r) => r.column === date.column)?.invalid
+              return invalid ? <span className="tnum text-dim">，{PT.dateInvalid(invalid)}</span> : null
+            })()}
           </li>
         </Group>
       )}
@@ -788,6 +792,7 @@ export function ProfileTaskBody({ detail: d, mode, filled = {}, focusAfter = nul
           {d.date_ranges.map((r) => (
             <li key={r.column} className="tnum text-xs text-dim" data-profile-date-range={r.column}>
               <span className="mono text-fg">{r.column}</span>：{PT.dateSpan(r.min.slice(0, 19), r.max.slice(0, 19))}
+              {r.invalid ? `，${PT.dateInvalid(r.invalid)}` : null}
             </li>
           ))}
         </Group>

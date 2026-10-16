@@ -216,6 +216,9 @@ class WorkbookScan:
     tables: list[TableScan] = field(default_factory=list)
     #: 定义名称 → 原文。工作表级的名称记作「工作表名!名称」，免得同名互相覆盖
     defined_names: dict[str, str] = field(default_factory=dict)
+    #: 原件的格式：xlsx，或者 csv（csv_grid.scan 适配出来的一张「工作表」，读取层据 SheetScan.path 从 CSV 里读）。
+    #: 老暂存区的扫描结果里没有这个键，按 xlsx 读
+    format: str = "xlsx"
 
     def sheet(self, name: str) -> SheetScan | None:
         return next((s for s in self.sheets if s.name == name), None)
@@ -1090,4 +1093,5 @@ def scan_from_json(data: dict[str, Any]) -> WorkbookScan:
     for t in tables:
         t.columns = list(t.columns)
     return WorkbookScan(sheets=sheets, full_calc_on_load=bool(data.get("full_calc_on_load")), tables=tables,
-                        defined_names=dict(data.get("defined_names") or {}))
+                        defined_names=dict(data.get("defined_names") or {}),
+                        format=str(data.get("format") or "xlsx"))

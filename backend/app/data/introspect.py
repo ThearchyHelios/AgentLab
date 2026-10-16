@@ -165,6 +165,89 @@ def _unique_groups(constraints: list[dict[str, Any]], indexes: list[dict[str, An
     return groups
 
 
+def _storage_type(col_type: Any) -> Any:
+    """PostgreSQL 的域（DOMAIN）换成它底下的类型（域套域的一路往下找）；别的类型原样返回。"""
+    from sqlalchemy.dialects.postgresql import DOMAIN
+
+    seen = 0
+    while isinstance(col_type, DOMAIN) and getattr(col_type, "data_type", None) is not None and seen < 8:
+        col_type, seen = col_type.data_type, seen + 1
+    return col_type
+
+
+def type_text(col_type: Any, dialect: Any) -> str:
+    """反射到的列类型 → 存进表结构的写法：按这个数据源的方言编译的完整写法（VARCHAR2(20 CHAR)、NUMBER(10, 0)、
+    ENUM('paid','refund')、TIMESTAMP WITH TIME ZONE），编译不了的退回 str()。PostgreSQL 的域（DOMAIN）记它底下的类型：
+    域编译出来只是域名（settlement_amount），看不出是数字还是文字，名字里的词（set、UPDATE 里的 DATE）还会让类型大类、
+    日期列、码值候选认错；模型照着写 SQL 也要知道它存的是什么。
+
+    以前存的是 str(类型)，即 SQLAlchemy 的通用写法：Oracle 的 VARCHAR2、NUMBER 丢了长度和精度，MySQL 的 ENUM 丢了
+    取值列表，PostgreSQL 的 TIMESTAMP 丢了时区。类型写不全，表结构前后比对就看不出类型变了，ENUM 状态列也进不了
+    码值候选。这一改会让新探查的表结构快照哈希变化（提示词里的类型写法变长），旧运行封存的快照不受影响。"""
+    if col_type is None:
+        return ""
+    col_type = _storage_type(col_type)
+    try:
+        compiled = str(col_type.compile(dialect=dialect))
+    except Exception:  # noqa: BLE001 - 编译不了（NullType 等）就用通用写法，不让一列拖垮整次探查
+        return str(col_type)
+    if getattr(dialect, "name", "") == "oracle" and compiled.startswith("VARCHAR("):
+        # SQLAlchemy 把 Oracle 的 VARCHAR2 反射成通用的 VARCHAR，按 Oracle 方言编译出来是 VARCHAR(10 CHAR)（容器集成
+        # 测试实测）。Oracle 的数据字典里只有 VARCHAR2（建表写 VARCHAR 也存成 VARCHAR2），照数据字典写
+        compiled = "VARCHAR2" + compiled[len("VARCHAR"):]
+    return compiled
+
+
+def _enum_values(col_type: Any) -> list[str] | None:
+    """ENUM（MySQL、PostgreSQL 的枚举，都是 sqltypes.Enum 的子类）的取值列表，MySQL SET 的成员列表；别的类型 None。
+    套在域（DOMAIN）里的枚举也算（同 type_text）。"""
+    from sqlalchemy.dialects.mysql import SET
+    from sqlalchemy.types import Enum
+
+    col_type = _storage_type(col_type)
+    if isinstance(col_type, Enum):
+        values = list(col_type.enums or [])
+    elif isinstance(col_type, SET):
+        values = list(col_type.values or [])
+    else:
+        return None
+    return [str(v) for v in values]
+
+
+def _forced_quote(name: Any) -> bool:
+    """名字必须原样加引号：Oracle 反射回来的全小写对象（建表时写了 "visits"）是 quoted_name(quote=True)。
+    它存进 JSON 就成了普通字符串，剖析拼 SQL 时不加引号，Oracle 把它转成大写 VISITS，查的是另一个不存在的对象。"""
+    return getattr(name, "quote", None) is True
+
+
+def column_entry(col: Mapping[str, Any], dialect: Any) -> dict[str, Any]:
+    """反射到的一列 → 表结构里的一列：名字、按方言编译的类型、可空、注释；ENUM / SET 另记取值列表（enum_values），
+    要强制加引号的名字另记 quote_name。只在有的时候写这两个键：其余列和以前一字不差。"""
+    entry: dict[str, Any] = {
+        "name": str(col["name"]),
+        "type": type_text(col.get("type"), dialect),
+        "nullable": bool(col.get("nullable", True)),
+        "comment": col.get("comment") or None,
+    }
+    values = _enum_values(col.get("type"))
+    if values:
+        entry["enum_values"] = values
+    if _forced_quote(col.get("name")):
+        entry["quote_name"] = True
+    return entry
+
+
+def index_first_columns(indexes: list[dict[str, Any]], pk: list[str]) -> list[str]:
+    """哪些列打头有索引：各索引（含主键）的第一列，去重、按名字排序。取值观察看大表的最新业务日期、按日行数时，
+    只在业务日期列打头有索引时才发窗口查询（按它走索引，不扫全表）。表达式索引（列名是 None）不算。"""
+    first = {str(pk[0])} if pk else set()
+    for ix in indexes:
+        cols = ix.get("column_names") or []
+        if cols and cols[0] is not None:
+            first.add(str(cols[0]))
+    return sorted(first)
+
+
 async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any]:
     """探查整个库的结构，结果直接存进 DataSource.schema_cache。
 
@@ -266,24 +349,20 @@ async def introspect(source: Any, *, schema: str | None = None) -> dict[str, Any
                 # 只读账号名下没有这些对象，全靠跨 schema 授权
                 "qualified": f"{target_schema}.{name}" if target_schema else name,
                 "schema": target_schema,
-                "columns": [
-                    {
-                        "name": c["name"],
-                        "type": str(c.get("type") or ""),
-                        "nullable": bool(c.get("nullable", True)),
-                        "comment": c.get("comment") or None,
-                    }
-                    for c in columns
-                ],
+                "columns": [column_entry(c, sync_conn.dialect) for c in columns],
                 "primary_key": pk,
                 "comment": comment,
                 "is_view": name in views,
             }
+            if _forced_quote(name):
+                tables[name]["quote_name"] = True
             if name in fk_ok:
                 tables[name]["foreign_keys"] = _foreign_keys(fk_by.get(key) or [], target_schema, default_schema)
             if name in uq_ok:
                 tables[name]["unique"] = _unique_groups(uq_by.get(key) or [],
                                                         (ix_by.get(key) or []) if name in ix_ok else [], pk)
+            if name in ix_ok:
+                tables[name]["index_first_columns"] = index_first_columns(ix_by.get(key) or [], pk)
         payload: dict[str, Any] = {"tables": tables, "truncated": truncated,
                                    "total": len(names) + len(views)}
         if failures and not tables:
@@ -471,6 +550,10 @@ def describe_table(source: Any, table: str, *, catalog: Mapping[str, Mapping[str
             marks.append("非空")
         if col.get("comment"):
             marks.append(col["comment"])
+        values = col.get("enum_values")
+        if values and "(" not in str(col.get("type") or ""):
+            # PostgreSQL 的枚举类型写法只有类型名（order_status）：取值列表另外写出来，模型才知道能写哪些值
+            marks.append("取值：" + "、".join(str(v) for v in values[:30]) + ("…" if len(values) > 30 else ""))
         suffix = f"  {'、'.join(marks)}" if marks else ""
         lines.append(f"  {col['name']}  {col['type']}{suffix}")
     if catalog:

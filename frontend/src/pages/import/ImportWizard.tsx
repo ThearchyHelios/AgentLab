@@ -55,7 +55,8 @@ const NAME_RE = /^[a-z][a-z0-9_]{0,40}$/
 /** 提交时遇到这些：试运行库已被消耗、作废或被改过，回到配方步骤重新试运行（期 3 加了并集、各期被改过的两种） */
 const RERUN_CODES = new Set(['trial_required', 'trial_tampered', 'base_changed', 'name_taken', 'union_tampered', 'part_tampered'])
 /** 选择框收的扩展名，与 RECIPE_TEXT.pickFormats 的说法一致 */
-const PICK_ACCEPT = '.xlsx,.xlsm'
+// CSV / TSV 也走配方（服务端 csv_grid 把它适配成一张「工作表」，名字固定为 CSV）
+const PICK_ACCEPT = '.xlsx,.xlsm,.csv,.tsv'
 const ENDED = new Set(['committed', 'discarded', 'expired'])
 
 /** 文件名里的两个日期（「月报导出_2026-09-01_2026-09-30.xlsx」）：只作统计期录入框的建议，服务端会再核对 */

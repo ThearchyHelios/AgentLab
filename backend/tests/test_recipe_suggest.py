@@ -951,7 +951,7 @@ def test_list_subtotal_rows_in_middle_fail():
     assert [f for f in d.failures if "像合计行" in f] == [
         "工作表「门店」：第 4 行像合计行（B 列「小计」），但合计字样不在第一列，无法按合计行核对",
         "工作表「门店」：第 7 行像合计行（B 列「小计」），但合计字样不在第一列，无法按合计行核对"]
-    # 小计写在第一列、但下面还有明细：不是末尾的合计行，整块照样收进来，不另报「数据区外的数字」
+    # 期 5：小计写在第一列、下面还有明细：提议成穿插的小计（不进数据，按上一行小计之后的明细核对），不再记失败
     wb2 = Workbook()
     ws2 = wb2.active
     ws2.title = "门店"
@@ -960,10 +960,21 @@ def test_list_subtotal_rows_in_middle_fail():
         ws2.append(row)
     sc2, grids2 = build(wb2)
     d2 = S.draft(sc2, grids2, "x.xlsx", validate=ok_validate())
-    assert not d2.complete
-    assert d2.failures == ["工作表「门店」：第 4 行像合计行（A 列「小计」），但不在列表末尾，无法确定它汇总的是哪几行"]
+    assert d2.complete and d2.failures == []
     block = d2.recipe["sheets"][0]["blocks"][0]
     assert block["rows"]["total_row"]["pick"] == "合计"
+    assert block["rows"]["subtotals"] == {"label_column": "门店", "pick": "小计", "scope": "since_previous",
+                                         "group_column": None, "keep_as": None}
+    # 字样不一样（「小计」「合计」都夹在中间）：分不清，照旧记失败
+    wb3 = Workbook()
+    ws3 = wb3.active
+    ws3.title = "门店"
+    for row in [["门店", "金额"], ["门店一", 100], ["小计", 100], ["门店二", 200], ["合计", 200], ["门店三", 150],
+                ["总计", 450]]:
+        ws3.append(row)
+    sc3, grids3 = build(wb3)
+    d3 = S.draft(sc3, grids3, "x.xlsx", validate=ok_validate())
+    assert not d3.complete and any("不在列表末尾" in f for f in d3.failures)
     # 末尾第一列的合计行照旧改作核对，不算失败（test_list_total_row_is_verified_and_kept）
 
 
