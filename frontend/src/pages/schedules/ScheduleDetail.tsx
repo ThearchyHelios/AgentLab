@@ -8,7 +8,11 @@ import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import { useOnReconnect } from '../../store/catalog'
 import type { Schedule, ScheduleFire } from '../../types'
 import { FireHistory } from './FireHistory'
-import { EnableSwitch, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled } from './parts'
+import {
+  EnableSwitch, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled, targetKindOf,
+  targetText,
+} from './parts'
+import { graceLabel } from './model'
 import { ScheduleEditor } from './ScheduleEditor'
 
 const BACK = (
@@ -234,7 +238,12 @@ export function ScheduleDetailPage({ id }: { id: string }) {
           <Tabs tabs={[{ key: 'settings', label: T.tabs.settings }, { key: 'history', label: T.tabs.history }]}
                 active={tab} onChange={pickTab} label={T.title} idPrefix="schedule" />
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {settingsSeen && (
+            {settingsSeen && targetKindOf(schedule) !== 'workflow' && (
+              <div role="tabpanel" id="schedule-panel-settings" aria-labelledby="schedule-tab-settings" hidden={tab !== 'settings'}>
+                <TargetSettings schedule={schedule} />
+              </div>
+            )}
+            {settingsSeen && targetKindOf(schedule) === 'workflow' && (
               <div role="tabpanel" id="schedule-panel-settings" aria-labelledby="schedule-tab-settings" hidden={tab !== 'settings'}>
                 <ScheduleEditor
                   key={resetKey}
@@ -258,6 +267,34 @@ export function ScheduleDetailPage({ id }: { id: string }) {
           </div>
         </>
       ))}
+    </div>
+  )
+}
+
+/**
+ * 目标不是工作流的定时任务（评测题集、数据源维护）的设置：只读地列出名称、目标、频率、时区、补发宽限。工作流那张表单
+ * （选工作流、运行类别、输入模板、Webhook）对它们不适用；页头的启用开关、立即运行、删除和触发历史照常可用
+ */
+function TargetSettings({ schedule }: { schedule: Schedule }) {
+  const kind = targetKindOf(schedule)
+  const rows: [string, string][] = [
+    [T.name, schedule.name],
+    [T.targetField, `${T.targetKind[kind]} · ${targetText(schedule)}`],
+    [T.freq, schedule.description_text],
+    [T.timezone, schedule.timezone],
+    [T.graceField, graceLabel(schedule.misfire_grace_s)],
+  ]
+  return (
+    <div className="mx-auto max-w-3xl space-y-3 p-4" data-schedule-target-settings={kind}>
+      <p className="text-xs text-dim">{T.targetSettingsNote(T.targetKind[kind])}</p>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 rounded-lg border bg-panel p-3 text-xs">
+        {rows.map(([label, value]) => (
+          <div key={label} className="contents">
+            <dt className="text-faint">{label}</dt>
+            <dd className="min-w-0 break-words text-fg">{value}</dd>
+          </div>
+        ))}
+      </dl>
     </div>
   )
 }

@@ -3830,6 +3830,11 @@ export type ScheduleEvent = 'finished' | 'failed' | 'awaiting_approval'
 export type ScheduleFireKind = 'scheduled' | 'manual' | 'misfire'
 /** 触发的结局：发起了运行、上一次还没结束而跳过、错过时间超出宽限而跳过、发起时被拒 */
 export type ScheduleFireStatus = 'started' | 'skipped_overlap' | 'skipped_misfire' | 'failed_to_start'
+/**
+ * 定时的目标种类（next-round X4：定时只有一套）：工作流、评测题集、数据源维护。非工作流目标没有工作流、输入模板、运行类别
+ * 和 Webhook（backend/app/api/schedules.py）
+ */
+export type ScheduleTargetKind = 'workflow' | 'eval_suite' | 'source_maintenance'
 
 /** 读出来的 Webhook 设置。完整地址服务端加密保存、不再返回，只露主机和末 4 位 */
 export interface ScheduleWebhook {
@@ -3873,6 +3878,8 @@ export interface ScheduleFire {
   run_status: RunStatus | null
   /** 跳过、发起失败的原因（中文） */
   reason: string | null
+  /** 目标是评测题集时这一次触发建的那次评测（没有 run_id）；老服务端不给 */
+  eval_run_id?: string | null
   notified: ScheduleFireNotice[]
   /**
    * 和同一定时任务上一次成功的运行的对比。运行没有成功结束、没有可比的、还没算、比不了、任何一边又在执行（不在终态）
@@ -3885,6 +3892,13 @@ export interface ScheduleFire {
 export interface Schedule {
   id: string
   name: string
+  /** 目标：种类、id、种类的叫法、目标现在的名字（不在了是保存时记下的）、还在不在。老服务端不给（都是工作流） */
+  target_kind?: ScheduleTargetKind
+  target_id?: string
+  target_label?: string
+  target_name?: string
+  target_exists?: boolean
+  /** 非工作流目标存空串 */
   workflow_id: string
   workflow_name: string
   /** 五段 cron：分 时 日 月 星期 */

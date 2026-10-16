@@ -30,8 +30,10 @@ from app.notify import service
 TERMS_TS = Path(__file__).resolve().parents[2] / "frontend" / "src" / "lib" / "terms.ts"
 URL = "https://hooks.example.com/agentlab/notify-events-5d1c"
 
-#: 本轮登记的六个（总方案 X6）：都还没有推送
+#: 本轮登记的六个（总方案 X6）
 THIS_ROUND = ("source.changed", "ledger.recall", "eval.regressed", "eval.failed", "task.digest", "key.expiring")
+#: 其中已经推送的（第 3 波：定时评测的通知只推全局渠道，notify_eval），其余还没有
+PUSHED_THIS_ROUND = {"eval.regressed": {"global"}, "eval.failed": {"global"}}
 
 
 @pytest.fixture
@@ -54,6 +56,8 @@ def test_this_rounds_events_are_registered_once_and_not_pushed_yet():
     for name in THIS_ROUND:
         assert name in service.EVENTS, f"{name} 没有登记"
         assert service.EVENTS[name].label, name
+        if name in PUSHED_THIS_ROUND:
+            continue
         assert service.EVENTS[name].scopes == (), f"{name} 还没有推送：不该有人订阅得到"
     assert len({e.label for e in service.EVENTS.values()}) == len(service.EVENTS), "两个事件叫成了同一句"
     assert service.EVENT_LABEL == {k: v.label for k, v in service.EVENTS.items()}
@@ -66,6 +70,7 @@ def test_events_that_are_pushed_today_keep_their_audience():
         "task.opened": every, "run.finished": every, "run.failed": every, "action.unknown": every,
         # 发给提交人自己（和订阅了它的全局渠道），不归哪个应用
         "review.done": {"global", "user"},
+        **PUSHED_THIS_ROUND,
     }
     for event in service.EVENTS.values():
         assert set(event.scopes) <= every
@@ -104,19 +109,20 @@ async def test_events_endpoint_says_who_receives_each_event(client):
     rows = (await client.get("/api/notify/events")).json()
     assert [r["event"] for r in rows] == list(service.EVENTS)
     by = {r["event"]: r for r in rows}
-    assert by["eval.regressed"] == {"event": "eval.regressed", "label": "评测有退步", "scopes": []}
+    assert by["eval.regressed"] == {"event": "eval.regressed", "label": "定时评测有退步", "scopes": ["global"]}
+    assert by["ledger.recall"]["scopes"] == []
     assert by["review.done"]["scopes"] == ["global", "user"]
 
 
 async def test_events_not_pushed_yet_cannot_be_subscribed(client):
     resp = await client.post("/api/notify/channels", json={
-        "name": "事件登记-评测", "url": URL, "events": ["task.opened", "eval.regressed"]})
+        "name": "事件登记-评测", "url": URL, "events": ["task.opened", "ledger.recall"]})
     assert resp.status_code == 422, resp.text
     detail = resp.json()["detail"]
-    assert "评测有退步" in detail and "还没有推送" in detail
+    assert "口径升版，答案的数变了" in detail and "还没有推送" in detail
     unknown = await client.post("/api/notify/channels", json={"name": "事件登记-未知", "url": URL, "events": ["nope"]})
     assert unknown.status_code == 422
-    assert "评测有退步" not in unknown.json()["detail"], "可选的里面不列还没有推送的"
+    assert "口径升版，答案的数变了" not in unknown.json()["detail"], "可选的里面不列还没有推送的"
     assert "待办打开" in unknown.json()["detail"]
 
 
@@ -137,7 +143,7 @@ async def test_scope_mismatch_is_refused_only_for_newly_ticked_events(client):
     again = await client.patch(f"/api/notify/channels/{channel_id}", json={"events": ["review.done", "run.failed"]})
     assert again.status_code == 200, again.text
     added = await client.patch(f"/api/notify/channels/{channel_id}", json={"events": ["review.done", "eval.failed"]})
-    assert added.status_code == 422 and "评测失败" in added.json()["detail"]
+    assert added.status_code == 422 and "定时评测没有评完" in added.json()["detail"]
 
 
 # --------------------------------------------------------------------------
@@ -149,14 +155,14 @@ async def test_channels_only_walk_the_paths_the_event_is_registered_for(monkeypa
     monkeypatch.setitem(service.EVENTS, "demo.personal", service.Event("只推个人的演示事件", ("user",)))
     async with SessionLocal() as session:
         row = NotifyChannel(name="事件登记-全局", scope="global", url=encrypt(URL),
-                            events=["demo.personal", "task.opened", "eval.failed"])
+                            events=["demo.personal", "task.opened", "ledger.recall"])
         session.add(row)
         await session.commit()
         try:
             ids = lambda found: [c.id for c in found]  # noqa: E731
             assert row.id not in ids(await service._channels(session, "demo.personal", None, [])), "全局渠道这条路没登记"
             assert row.id in ids(await service._channels(session, "task.opened", None, []))
-            assert await service._channels(session, "eval.failed", None, []) == [], "还没有推送的：谁都不推"
+            assert await service._channels(session, "ledger.recall", None, []) == [], "还没有推送的：谁都不推"
             with pytest.raises(ValueError, match="没有登记"):
                 await service._channels(session, "demo.unregistered", None, [])
         finally:

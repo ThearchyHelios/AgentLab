@@ -6,9 +6,9 @@ scheduler/service.py 的一处封装里：workflow 目标的 target_id 同 workf
 
 - 存量任务（target_kind 是缺省的 workflow、target_id 为空）照旧按 workflow_id 发起，行为一字不变；
 - 建任务、改工作流都经同一处封装写目标，两列对得上；
-- fire_once 按目标种类分派。这一波只实现 workflow，别的种类照实记「未能发起」并写明原因，不发起运行、不悄悄当成
-  工作流去跑空串；
-- 接口这一波不暴露新种类（接口返回的形状不变，测试见 test_schedules_api.py 的 SCHEDULE_KEYS）。
+- fire_once 按目标种类分派：评测题集、数据源维护交给各自的模块（目标不在的照实记「未能发起」并写明原因，不发起运行、
+  不悄悄当成工作流去跑空串；评测题集的发起见 test_eval_schedule.py）；
+- 接口返回带 target_kind / target_id / 目标名（测试见 test_schedules_api.py 的 SCHEDULE_KEYS）。
 
 工作流、任务名都是虚构的。
 """
@@ -92,7 +92,8 @@ async def test_creating_and_retargeting_through_the_api_write_both_columns():
             "input_template": {"stat_date": "{{ schedule.yesterday }}"}})
         assert made.status_code == 201, made.text
         body = made.json()
-        assert "target_kind" not in body and "target_id" not in body, "这一波接口不暴露新种类"
+        assert (body["target_kind"], body["target_id"]) == ("workflow", wf_a)
+        assert body["target_name"] == body["workflow_name"] and body["target_label"] == "工作流"
         async with SessionLocal() as session:
             row = await session.get(Schedule, body["id"])
             assert (row.target_kind, row.target_id, row.workflow_id) == ("workflow", wf_a, wf_a)
@@ -118,7 +119,7 @@ async def test_a_legacy_schedule_still_fires_its_workflow():
         assert run.workflow_id == wf and run.input == {"stat_date": "2026-10-04"}
 
 
-async def test_a_target_kind_this_wave_cannot_fire_is_recorded_not_run():
+async def test_a_missing_eval_suite_is_recorded_not_run():
     async with SessionLocal() as session:
         row = Schedule(name="题集回归", cron="0 9 * * *", timezone="Asia/Shanghai",
                        **service.target_columns("eval_suite", "suite-x"), next_run_at=NINE)
@@ -128,7 +129,7 @@ async def test_a_target_kind_this_wave_cannot_fire_is_recorded_not_run():
         runs_before = await session.scalar(select(func.count()).select_from(Run))
     fire = await service.fire_once(schedule_id, NINE, "manual")
     assert fire is not None and fire.status == "failed_to_start" and fire.run_id is None
-    assert fire.reason == service.TARGET_UNSUPPORTED.format(kind=service.TARGET_LABEL["eval_suite"])
+    assert fire.reason == "评测题集不存在，可能已被删除"
     async with SessionLocal() as session:
         assert await session.scalar(select(func.count()).select_from(Run)) == runs_before, "不能发起任何运行"
         assert await session.scalar(select(func.count()).select_from(ScheduleFire)

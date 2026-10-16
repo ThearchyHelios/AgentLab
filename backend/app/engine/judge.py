@@ -35,7 +35,9 @@ import logging
 import math
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -1040,6 +1042,27 @@ async def daily_spend() -> dict[str, Any]:
     return await _LEDGER.daily()
 
 
+#: 这一次裁判记在哪本每日账上、按哪个每日上限：缺省（None）是裁判自己那本和裁判设置的每日上限。评测打开结论裁判时
+#: 走的是按需裁判同一条路（app/eval/judging.py），花费却要记在评测那本账上（细案 01 做法 11、17：评测单独记账）——
+#: 记在裁判这本上，评测一跑，当天别的报告就因为到了上限而降档。上下文变量，只管这一段调用
+_CHARGE_TO: ContextVar[tuple[spend.Ledger, float | None] | None] = ContextVar("judge_charge_to", default=None)
+
+
+@contextmanager
+def charged_to(ledger: spend.Ledger, daily_max_usd: float | None) -> Iterator[None]:
+    """这一段里的裁判调用记在 ledger 上、每日上限按 daily_max_usd（None 是不限）。"""
+    token = _CHARGE_TO.set((ledger, daily_max_usd))
+    try:
+        yield
+    finally:
+        _CHARGE_TO.reset(token)
+
+
+def _charging(budget: Budget) -> tuple[spend.Ledger, float | None]:
+    """这一次记哪本账、按哪个每日上限（见 _CHARGE_TO）。"""
+    return _CHARGE_TO.get() or (_LEDGER, budget.daily_max_usd)
+
+
 # --------------------------------------------------------------------------
 # 调用
 # --------------------------------------------------------------------------
@@ -1245,6 +1268,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
     spent = 0.0
     width = 1
     cut_limit: int | None = None        # 被截断的那次调用的额度：judge_truncated 日志照它写
+    ledger, daily_cap = _charging(budget)
     while pending:
         remaining = None if budget.timeout_s is None else budget.timeout_s - (time.monotonic() - started)
         if remaining is not None and remaining <= 0:
@@ -1260,8 +1284,8 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
                 caps = []
                 if budget.max_cost_usd is not None:
                     caps.append((budget.max_cost_usd - spent - reserved, "max_cost_usd"))
-                if budget.daily_max_usd is not None:
-                    caps.append((budget.daily_max_usd - (await daily_spend())["usd"], "daily_max_usd"))
+                if daily_cap is not None:
+                    caps.append((daily_cap - (await ledger.daily())["usd"], "daily_max_usd"))
                 if caps:
                     cap, binding = min(caps, key=lambda x: x[0])
                     trimmed = False
@@ -1277,7 +1301,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
                         pending = pending[:len(batch)]
             pending = pending[len(batch):]
             charged = cost or 0.0
-            day = await _LEDGER.charge(charged, limit=budget.daily_max_usd if priced else None, priced=priced)
+            day = await ledger.charge(charged, limit=daily_cap if priced else None, priced=priced)
             if day is None:          # 估算之后、记账之前别的裁判先花掉了今天剩下的钱
                 stop([*batch, *pending], "daily_max_usd")
                 pending = []
@@ -1312,7 +1336,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
             inp, out = sum(t["input_tokens"] for t in tokens), sum(t["output_tokens"] for t in tokens)
             # 回复没带用量（有的网关不给、调用超时）就按估算记：宁可多记，不能让每日上限漏掉
             actual = (pricing.estimate_cost(model_id, inp, out) if inp or out else charged) if priced else 0.0
-            await _LEDGER.settle(day, actual - charged)
+            await ledger.settle(day, actual - charged)
             spent += actual
             usage["input_tokens"] += inp
             usage["output_tokens"] += out

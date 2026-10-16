@@ -774,6 +774,76 @@ async def ledger_settings(session: AsyncSession) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# 评测：并发、每题时限、单次和每日金额上限、保留几次、结论裁判的缺省（docs/design/next-round/01-效果度量与回归评测.md 做法 17）
+# --------------------------------------------------------------------------
+
+#: 设置里 eval 这一组（评测-D9 拍板的缺省：同时 2 题、每题 900 秒、单次评测 2 美元、评测每日 5 美元）。前四项是全站的预算
+#: 缺省，题集上改过的项盖过它（app/eval/suites.effective_budget）；评测每日的金额上限是评测那本账（engine/spend.eval_spend，
+#: 单独记账，不挤占裁判、核查的额度）的上限，题集只能往下收。keep_runs：每个题集保留最近几次评测的明细（钉住的基线、A/B
+#: 引用的那一对另外留着，总表永久保留，app/eval/cleanup.py）。judge：发起评测时变体里没写的话，结论裁判开不开（缺省关：
+#: 裁判按句数花钱）。搭建者只读，管理员写（整个设置接口的规矩）
+EVAL_GROUP = "eval"
+EVAL_SPEND = "eval_spend"
+EVAL_DEFAULTS: dict[str, Any] = {"max_parallel": 2, "per_case_timeout_s": 900, "per_run_max_usd": 2.0,
+                                 "daily_max_usd": 5.0, "keep_runs": 20, "judge": False}
+EVAL_SETTING_LABEL = {"max_parallel": "评测 · 同时评几道题", "per_case_timeout_s": "评测 · 每题时限（秒）",
+                      "per_run_max_usd": "评测 · 单次评测的金额上限（美元）", "daily_max_usd": "评测 · 每日金额上限（美元）",
+                      "keep_runs": "评测 · 每个题集保留最近几次的明细", "judge": "评测 · 缺省打开结论裁判"}
+#: 保留的次数：至少 1（最近一次总要能和下一次比），最多 1000
+EVAL_KEEP_MAX = 1000
+
+
+def _eval_item_problem(key: str, item: Any) -> str | None:
+    from app.eval.suites import BUDGET_RULES
+
+    label = EVAL_SETTING_LABEL[key]
+    if key == "judge":
+        return None if isinstance(item, bool) else f"「{label}」只能是开或关，当前为「{item}」"
+    if key == "keep_runs":
+        ok = isinstance(item, int) and not isinstance(item, bool) and 1 <= item <= EVAL_KEEP_MAX
+        return None if ok else f"「{label}」需要是 1 到 {EVAL_KEEP_MAX} 之间的整数，当前为「{item}」"
+    _, kind, low, high = BUDGET_RULES[key]
+    ok = not isinstance(item, bool) and isinstance(item, (int, float)) and math.isfinite(item) \
+        and (kind is float or isinstance(item, int)) and low <= item <= high
+    unit = "整数" if kind is int else "数"
+    return None if ok else f"「{label}」需要是 {low:g} 到 {high:g} 之间的{unit}，当前为「{item}」"
+
+
+def eval_problem(value: Any) -> str | None:
+    """设置页写进来的 eval 这一组有什么问题，没问题返回 None。"""
+    if not isinstance(value, dict):
+        return f"「评测」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key, item in value.items():
+        if key not in EVAL_DEFAULTS:
+            return (f"「评测」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{EVAL_SETTING_LABEL[k]}」" for k in EVAL_DEFAULTS))
+        if problem := _eval_item_problem(key, item):
+            return problem
+    merged = eval_values(value)
+    if merged["per_run_max_usd"] > merged["daily_max_usd"]:
+        return (f"「{EVAL_SETTING_LABEL['per_run_max_usd']}」不能高于「{EVAL_SETTING_LABEL['daily_max_usd']}」，"
+                f"当前为 {merged['per_run_max_usd']:g} 和 {merged['daily_max_usd']:g}")
+    return None
+
+
+def eval_values(stored: Any) -> dict[str, Any]:
+    """库里存的（或刚写进来的）eval 一组 → 补齐默认；存坏了的项按默认。"""
+    stored = stored if isinstance(stored, dict) else {}
+    out = dict(EVAL_DEFAULTS)
+    for key in EVAL_DEFAULTS:
+        if key in stored and _eval_item_problem(key, stored[key]) is None:
+            value = stored[key]
+            out[key] = float(value) if key in ("per_run_max_usd", "daily_max_usd") else value
+    return out
+
+
+async def eval_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 eval 一组，没存过的补默认。发起评测、清理评测从这里读。"""
+    row = await session.get(Setting, EVAL_GROUP)
+    return eval_values(row.value if row else None)
+
+
+# --------------------------------------------------------------------------
 # 用户设置
 # --------------------------------------------------------------------------
 
@@ -820,6 +890,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     APPS_GROUP: apps_values(None),
     # 口径账本：自动按口径正式出具的开关、每日上限，口径比对的时限
     LEDGER_GROUP: ledger_values(None),
+    # 评测：预算的全站缺省（题集上可以改）、保留几次明细、结论裁判的缺省开关
+    EVAL_GROUP: eval_values(None),
 }
 
 
@@ -872,6 +944,7 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     # 裁判、核查的每日计数是引擎记的账，不是用户设置：设置页整组回写时带着一份旧的，会把今天的花费清零
     stored.pop(JUDGE_SPEND, None)
     stored.pop(VERIFY_SPEND, None)
+    stored.pop(EVAL_SPEND, None)
     for key in _hidden_groups():
         stored.pop(key, None)
     merged = {k: {**v, **(stored.get(k) or {})} for k, v in DEFAULT_SETTINGS.items()}
@@ -883,6 +956,7 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     merged[CATALOG_DRAFT_GROUP] = catalog_draft_values(stored.get(CATALOG_DRAFT_GROUP))
     merged[APPS_GROUP] = apps_values(stored.get(APPS_GROUP))
     merged[LEDGER_GROUP] = ledger_values(stored.get(LEDGER_GROUP))
+    merged[EVAL_GROUP] = eval_values(stored.get(EVAL_GROUP))
     for key, value in stored.items():
         merged.setdefault(key, value)
     return merged
@@ -986,10 +1060,14 @@ async def put_settings(
         if problem := ledger_problem(payload.values[LEDGER_GROUP]):
             raise HTTPException(422, problem)
         payload.values[LEDGER_GROUP] = ledger_values(payload.values[LEDGER_GROUP])
+    if EVAL_GROUP in payload.values:
+        if problem := eval_problem(payload.values[EVAL_GROUP]):
+            raise HTTPException(422, problem)
+        payload.values[EVAL_GROUP] = eval_values(payload.values[EVAL_GROUP])
     if found := await _provider_problem(session, payload.values):
         raise CodedHTTPException(422, found[1], PROVIDER_INVALID, field=found[0])
     for key, value in payload.values.items():
-        if key in (TRUST_KEY, "limits", PUBLIC_URL_GROUP, JUDGE_SPEND, VERIFY_SPEND, *_hidden_groups()):
+        if key in (TRUST_KEY, "limits", PUBLIC_URL_GROUP, JUDGE_SPEND, VERIFY_SPEND, EVAL_SPEND, *_hidden_groups()):
             # 信任三档只走 PUT /api/tools/trust：设置页整组回写时带着一份旧的，
             # 会把刚在工具页改的档位冲掉。limits 是环境变量定的、public_url 是算出来的，写进库也不生效。
             # 裁判、核查的每日计数是引擎记的账，只有引擎自己写。登录设置只经 /api/auth/settings 改（_hidden_groups）
@@ -1023,6 +1101,16 @@ async def get_verify_spend(session: AsyncSession = Depends(get_session)) -> dict
     形状同 /settings/judge/spend：{date, usd, calls, unpriced_calls, daily_max_usd}，daily_max_usd 为 null 表示不限。
     """
     return {**await verify_daily_spend(), "daily_max_usd": (await verify_settings(session))["daily_max_usd"]}
+
+
+@router.get("/settings/eval/spend")
+async def get_eval_spend(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """今天（本地日期）评测花了多少（评测那本账，engine/spend.eval_spend），放在评测的每日上限旁边。只读：计数只有评测
+    自己记。形状同 /settings/judge/spend：{date, usd, calls, unpriced_calls, daily_max_usd}。calls 是今天开评的题数（每题
+    开评前预留一次）。"""
+    from app.engine.spend import eval_spend
+
+    return {**await eval_spend.daily(), "daily_max_usd": (await eval_settings(session))["daily_max_usd"]}
 
 
 @router.get("/system")

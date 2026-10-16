@@ -115,6 +115,43 @@ def read_bytes(artifact_id: str, *, verify: bool = True) -> bytes | None:
     return data
 
 
+async def forget(ids: Any) -> list[str]:
+    """回收工件文件：这几个 id 里，引用表（artifacts）里**一条引用都不剩**的，删掉文件；还有引用的一个不动。返回删掉了
+    哪几个（docs/design/next-round/01-效果度量与回归评测.md 做法 16）。
+
+    为什么按引用数、不按调用方说的：工件按内容寻址，同样的内容只存一份——评测的一次运行和用户的一次运行查到同一份结果、
+    冻结了同一份表结构，文件就是同一个。调用方先删自己那几行引用（删运行时它名下的引用行），再把这些 id 交给这里；别的
+    运行、目录快照、对比结果还引用着的文件照留。put_json 每写一个工件都记一行引用，所以「没有引用」就是没人要了。
+
+    先查引用再删文件，两步之间同一份内容又被写一次（put_json 先写文件、后记引用）的话会删掉一个刚有人要的文件：单进程部署，
+    回收在评测清理的后台任务里串行做，和写入撞上的窗口极小；真撞上了，读的一方照实报「工件不在」（load 返回 None），不会
+    读到错的内容。"""
+    from sqlalchemy import select
+
+    from app.db.base import SessionLocal
+    from app.db.models import Artifact
+
+    wanted = sorted({i for i in ids or () if isinstance(i, str) and i and i.isalnum()})
+    if not wanted:
+        return []
+    async with SessionLocal() as session:
+        kept: set[str] = set()
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            kept |= set((await session.execute(select(Artifact.id).where(Artifact.id.in_(chunk)))).scalars())
+    removed: list[str] = []
+    for artifact_id in wanted:
+        if artifact_id in kept:
+            continue
+        path = _path_of(artifact_id)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        removed.append(artifact_id)
+    return removed
+
+
 def manifest_hash(rows: list[tuple[int, str, str | None, dict[str, Any]]]) -> str:
     """把一次运行的全部事件压成一个清单哈希。
 

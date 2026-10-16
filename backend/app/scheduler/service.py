@@ -5,7 +5,8 @@
 发起，这一条不会在定时任务这边被绕过。
 
 **定时的目标**（docs/design/next-round/00-总方案.md X4：定时只有一套）：一个定时任务指向一个目标——工作流、评测题集
-（第 3 波）或数据源维护（第 3 波）。认领、补跑、重叠跳过、触发记录、通知都只有这一套，fire_once 按目标种类分派。
+（app/eval/scheduled.py）或数据源维护（app/data/source_maintenance.py）。认领、补跑、重叠跳过、触发记录、通知都只有这一套，
+fire_once 按目标种类分派；建任务、改目标时核对目标也按种类交给各自的模块（check_target）。
 老表的 workflow_id 是非空约束，只加不改的迁移放宽不了：目标不是工作流时它存空串。这条规矩只在 target_of /
 target_columns 这一处，别处读写目标都经它们，不直接碰这两列。
 """
@@ -69,7 +70,7 @@ INTERRUPTED_REASON = "服务在发起运行前停止，这次触发没有发起�
 GENERIC_REASON = "发起运行时出错，详细信息见服务日志"
 
 
-#: 定时的目标种类（Schedule.target_kind），顺序即以后界面上的顺序。这一波 fire_once 只会发起 workflow
+#: 定时的目标种类（Schedule.target_kind），顺序即界面上的顺序。workflow 由本模块发起，另两种交给各自的模块（_TARGET_MODULES）
 TARGET_KINDS = ("workflow", "eval_suite", "source_maintenance")
 TARGET_LABEL = {"workflow": "工作流", "eval_suite": "评测题集", "source_maintenance": "数据源维护"}
 #: 目标种类这个版本还发起不了（库里有别的版本建的任务、手改过库）：照实记「未能发起」，不当成工作流去跑
@@ -101,6 +102,29 @@ def target_handler(kind: str) -> Any | None:
 
     module = _TARGET_MODULES.get(kind)
     return importlib.import_module(module) if module else None
+
+
+async def check_target(session: Any, kind: str, target_id: str) -> str | None:
+    """建任务、改目标时核对一个非工作流目标（存在、可用）：交给这种目标的模块（check_target）。不合规返回给人看的一句。
+    工作流目标由接口自己核对（api/schedules._check_workflow：还要对照入口字段）。"""
+    handler = target_handler(kind)
+    if handler is None:
+        return f"不认识的定时目标种类：{kind}"
+    return await handler.check_target(session, target_id)
+
+
+async def target_name(session: Any, kind: str, target_id: str) -> str | None:
+    """非工作流目标现在叫什么（题集名、数据源名），给接口和定时页列表显示；不在了为 None。模块里有 target_name 就用它，
+    数据源维护的目标直接读数据源名。"""
+    handler = target_handler(kind)
+    if handler is not None and hasattr(handler, "target_name"):
+        return await handler.target_name(session, target_id)
+    if kind == "source_maintenance":
+        from app.db.models import DataSource
+
+        source = await session.get(DataSource, target_id)
+        return source.name if source is not None else None
+    return None
 
 
 async def record_fire(schedule_id: str, fire_at: datetime, kind: str, status: str, reason: str | None,
@@ -348,7 +372,8 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
     """处理一次触发，返回记下的触发记录。同一 (任务, fire_at, kind) 已经有记录（两拍撞在一起、立即运行连点两下）
     时不再发起，返回已有的那一条；任务不存在返回 None。
 
-    按目标种类分派（target_of）：这一波只有工作流（_fire_workflow），别的种类记 failed_to_start、写明原因，不发起。
+    按目标种类分派（target_of）：工作流在这里发起（_fire_workflow），评测题集、数据源维护交给各自模块的 fire（同样持着
+    launch_lock，触发记录用 record_fire 写）；不认识的种类记 failed_to_start、写明原因，不发起。
     """
     async with launch_lock():
         async with SessionLocal() as session:

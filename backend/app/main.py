@@ -118,6 +118,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await introspect_jobs.startup()
     except Exception:  # noqa: BLE001
         logger.exception("探查任务的启动整理失败，服务照常启动")
+    # 评测（next-round 01 做法 6、9）：上次没做完的评测、影子起草同一个规矩——标中断（没做完的题记停止），不自动续跑：
+    # 拷来的数据目录启动时不能替人去调模型、查业务库。界面上点「重试」只把没做完的题接着做
+    from app.eval import runner as eval_runner, snapshots as eval_snapshots
+
+    try:
+        await eval_snapshots.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("影子起草的启动整理失败，服务照常启动")
+    try:
+        await eval_runner.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("评测任务的启动整理失败，服务照常启动")
 
     await run_manager.setup()
     # 流程：存量的待审批补建待办（派给任何人，幂等）；上次进程没了时已发出、没拿到结果的写入收成结果未知、安排核实
@@ -151,6 +163,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await catalog_jobs.manager.shutdown()
         await catalog_profile_jobs.manager.shutdown()
         await introspect_jobs.manager.shutdown()
+        # 评测要在运行之前停：它停下时会取消自己发起的作答、算期望的运行，再标中断
+        await eval_runner.shutdown()
+        await eval_snapshots.manager.shutdown()
         await run_manager.shutdown()
         from app.sandbox.manager import sandbox_manager
 

@@ -3914,7 +3914,24 @@ export const SCHEDULE_TEXT = {
   /** 启用开关遇到版本不符（409）：服务端那句是写给表单保存的，开关用这句，原话放进详情 */
   toggleConflict: (name: string) => `「${name}」已在别处被修改，已重新载入最新状态，请确认后再切换`,
 
+  // ---- 目标（定时只有一套：目标可以是工作流、评测题集或数据源维护）
+  targetKind: { workflow: '工作流', eval_suite: '评测题集', source_maintenance: '数据源维护' } as Record<
+    import('../types').ScheduleTargetKind, string>,
+  /** 目标已经不在了：名字是保存时记下的 */
+  targetGone: (name: string) => `${name}（已不存在）`,
+  view: '查看',
+  viewLabel: (name: string) => `查看定时任务「${name}」`,
+  /** 非工作流目标的设置是只读的：启用、暂停、立即运行、触发历史照常可用 */
+  targetSettingsTitle: '设置',
+  targetSettingsNote: (kind: string) => `这个定时任务的目标是${kind}：可以启用、暂停、立即运行和查看触发历史；名称、频率和目标在这里只能查看，不能修改`,
+  targetField: '目标',
+  graceField: '补发宽限',
+
   // ---- 立即运行的结果
+  /** 目标是评测题集：发起的是一次评测，没有运行可看 */
+  evalStarted: '已发起一次评测',
+  /** 触发历史里评测题集那一次：评测的编号 */
+  evalFire: (short: string) => `评测 #${short}`,
   runStarted: '已发起运行',
   runSkipped: '上一次运行尚未结束，本次已按重叠策略跳过',
   runFailed: (reason: string | null) => (reason ? `未能发起运行：${reason}` : '未能发起运行'),
@@ -5669,7 +5686,7 @@ export const NOTIFY_TEXT = {
     // 个人应用提交审核有了结果（发布了或退回了），通知提交人：只对个人渠道、全局渠道有意义（服务端 notify/service.notify_review）
     'review.done': '我提交审核的应用有结果',
     'source.changed': '数据源有变化要处理', 'ledger.recall': '口径升版，答案的数变了',
-    'eval.regressed': '评测有退步', 'eval.failed': '评测失败',
+    'eval.regressed': '定时评测有退步', 'eval.failed': '定时评测没有评完',
     'task.digest': '每天的待办汇总', 'key.expiring': '访问密钥快到期',
   } as Record<string, string>,
   /** 投递记录里才有的事件：改派、升级、催办按「待办打开」的订阅推，记录里照实写是哪一种（服务端 notify/service._AS） */

@@ -8,7 +8,10 @@ import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type { Schedule } from '../../types'
 import { ClassChip } from '../runs/parts'
 import { ScheduleCreatePage, ScheduleDetailPage } from './ScheduleDetail'
-import { EnableSwitch, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled } from './parts'
+import {
+  EnableSwitch, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled, targetKindOf,
+  targetText,
+} from './parts'
 
 /**
  * 定时任务：按设定的周期自动发起工作流运行。
@@ -145,13 +148,17 @@ function ScheduleListPage() {
 }
 
 /**
- * 一行：名字（链到详情）、工作流和频率；下次运行、上次触发；右边启用开关、立即运行、编辑、删除。
- * 窄屏上右边的按钮整组折到下一行，不挤名字
+ * 一行：名字（链到详情）、目标和频率；下次运行、上次触发；右边启用开关、立即运行、编辑、删除。
+ * 窄屏上右边的按钮整组折到下一行，不挤名字。目标不是工作流的（评测题集、数据源维护）标出种类、不标运行类别，
+ * 「编辑」写「查看」：这类定时的设置在这里只读
  */
 function ScheduleRow({ s, now, busy, onToggle, onRun, onDelete }: {
   s: Schedule; now: number; busy?: 'toggle' | 'run' | 'delete'
   onToggle: (enabled: boolean) => void; onRun: () => void; onDelete: () => void
 }) {
+  const kind = targetKindOf(s)
+  const workflow = kind === 'workflow'
+  const target = targetText(s)
   return (
     <li className="rounded-lg border bg-panel px-3 py-2.5" data-schedule-row={s.id} data-enabled={String(s.enabled)}>
       <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
@@ -161,11 +168,13 @@ function ScheduleRow({ s, now, busy, onToggle, onRun, onDelete }: {
                   className="min-w-0 truncate text-sm font-medium text-fg hover:underline">
               {s.name}
             </Link>
-            <ClassChip runClass={s.run_class} />
+            {workflow
+              ? <ClassChip runClass={s.run_class} />
+              : <span className="chip shrink-0" data-schedule-target-kind={kind}>{T.targetKind[kind]}</span>}
             {!s.enabled && <span className="chip shrink-0" data-schedule-paused="">{T.pausedChip}</span>}
           </div>
-          <div className="mt-0.5 truncate text-xs text-dim" title={`${s.workflow_name} · ${s.description_text}`} data-schedule-desc="">
-            {s.workflow_name}<span className="text-faint"> · </span>{s.description_text}
+          <div className="mt-0.5 truncate text-xs text-dim" title={`${target} · ${s.description_text}`} data-schedule-desc="">
+            {target}<span className="text-faint"> · </span>{s.description_text}
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1">
@@ -174,9 +183,9 @@ function ScheduleRow({ s, now, busy, onToggle, onRun, onDelete }: {
                   title={T.runNowLabel(s.name)} data-schedule-run="">
             {busy === 'run' ? <Spinner size={11} /> : <Play size={11} aria-hidden />} {T.runNow}
           </button>
-          <Link to={`/schedules/${encodeURIComponent(s.id)}`} className="btn btn-sm btn-ghost" aria-label={T.editLabel(s.name)}
-                data-schedule-edit="">
-            {T.edit}
+          <Link to={`/schedules/${encodeURIComponent(s.id)}`} className="btn btn-sm btn-ghost"
+                aria-label={workflow ? T.editLabel(s.name) : T.viewLabel(s.name)} data-schedule-edit="">
+            {workflow ? T.edit : T.view}
           </Link>
           <IconButton label={T.deleteLabel(s.name)} onClick={onDelete} disabled={!!busy} data-schedule-delete=""
                       className="text-faint hover:bg-st-failed/10 hover:text-[var(--err)]" icon={<Trash2 size={12} />} />

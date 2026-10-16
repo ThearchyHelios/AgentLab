@@ -97,7 +97,8 @@ export function FireStatusChip({ fire }: { fire: ScheduleFire }) {
   return (
     <span
       className="chip shrink-0"
-      title={fire.reason || T.fireStatusHint[fire.status] || undefined}
+      title={fire.reason || (fire.eval_run_id && fire.status === 'started' ? T.evalStarted : T.fireStatusHint[fire.status])
+        || undefined}
       data-fire-status-chip={fire.status}
       style={{
         color,
@@ -180,6 +181,9 @@ export async function runNow(s: Schedule, navigate: (to: string) => void): Promi
     const runId = r.run_id ?? r.fire?.run_id ?? null
     if (runId) {
       toast.ok(T.runStarted, { action: { label: T.openRun, onClick: () => navigate(`/runs/${encodeURIComponent(runId)}`) } })
+    } else if (r.fire?.status === 'started' && r.fire.eval_run_id) {
+      // 目标是评测题集：发起的是一次评测，没有一次运行可看
+      toast.ok(T.evalStarted)
     } else if (r.fire?.status === 'skipped_overlap' || r.fire?.status === 'skipped_misfire') {
       toast.warn(r.fire.status === 'skipped_overlap' ? T.runSkipped : T.fireStatus.skipped_misfire,
         r.fire.reason ? { detail: r.fire.reason } : undefined)
@@ -208,6 +212,15 @@ export async function removeSchedule(s: Schedule): Promise<boolean> {
     toast.error(e)
     return false
   }
+}
+
+/** 定时任务的目标种类：老服务端不给的都是工作流 */
+export const targetKindOf = (s: Schedule) => s.target_kind ?? 'workflow'
+
+/** 目标的名字（不在了标出来）：工作流用 workflow_name，别的种类用 target_name */
+export function targetText(s: Schedule): string {
+  const name = (targetKindOf(s) === 'workflow' ? s.workflow_name : s.target_name ?? s.workflow_name) || s.target_id || ''
+  return s.target_exists === false ? T.targetGone(name) : name
 }
 
 /** 老服务端没有定时任务接口：404 且没有机读码（有码的 404 是服务端自己说的「不存在」） */
