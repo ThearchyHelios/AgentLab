@@ -230,6 +230,22 @@ async def test_consecutive_assistant_failures_stop_the_evaluation(monkeypatch):
     assert row.stop_reason.startswith("连续 3 题助手调用失败") and "502" in row.stop_reason
 
 
+async def test_too_many_timeouts_stop_the_evaluation(monkeypatch):
+    async def drive(self):
+        self.turn.path, self.turn.timed_out, self.turn.reason = "build_failed", True, "超过每题时限"
+        return self.turn
+
+    monkeypatch.setattr(answer_mod.Driver, "drive", drive)
+    suite_id = await es.make_suite("none", cases=ask_cases(9), budget={"max_parallel": 1})
+    [run] = await start(suite_id)
+    await es.wait_eval(run.id)
+    row = await get(run.id)
+    statuses = [r.status for r in await results(run.id)]
+    assert statuses == ["ok"] * runner.STOP_TIMEOUTS + ["skipped"] * (9 - runner.STOP_TIMEOUTS)
+    assert row.stop_reason == runner.STOP_TIMEOUT_TEXT.format(window=runner.STOP_WINDOW, n=runner.STOP_TIMEOUTS)
+    assert row.summary["not_run"] == 9 - runner.STOP_TIMEOUTS
+
+
 async def test_a_case_over_its_time_limit_stops_its_run(monkeypatch):
     stopped: list[str | None] = []
 
