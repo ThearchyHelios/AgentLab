@@ -125,10 +125,18 @@ def _names(items: list[str]) -> str:
 
 def _slot_contexts(pinned: Pinned) -> dict[str, set[str]]:
     """取数 SQL 模板里每个入口字段写在哪：{字段: {quoted / bare / comment}}。认不出的抛 ComposeRefused。"""
+    return slot_contexts(pinned.fetches)
+
+
+def slot_contexts(nodes: Any, *, strict: bool = True) -> dict[str, set[str]]:
+    """几个调用工具节点的 args.sql 里每个入口字段写在哪（见 _slot_contexts）。按口径正式出具（ledger/issue）也按它查参数：
+    strict=False 时认不出写法的那条（引用了运行时的变量）跳过，不抛——那张图里别的节点怎么写不归出具管。"""
     from app.data.sql_semantics import _NotComparable, _template_slots
 
     out: dict[str, set[str]] = {}
-    for node in pinned.fetches:
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
         args = ((node.get("data") or {}).get("config") or {}).get("args")
         sql = args.get("sql") if isinstance(args, dict) else None
         if not isinstance(sql, str):
@@ -136,6 +144,8 @@ def _slot_contexts(pinned: Pinned) -> dict[str, set[str]]:
         try:
             spans, _ = _template_slots(sql)
         except _NotComparable as e:
+            if not strict:
+                continue
             raise ComposeRefused(TEMPLATE_UNREADABLE.format(reason=str(e))) from None
         for _, _, slot in spans:
             out.setdefault(slot.field, set()).add(slot.context)
@@ -239,4 +249,6 @@ class Composer:
 
 
 __all__ = ["OP", "REFUSED", "ComposeRefused", "Composed", "Composer", "Option", "check_inputs", "instantiate",
-           "signature"]
+           "signature", "slot_contexts", "value_problem"]
+
+value_problem = _value_problem

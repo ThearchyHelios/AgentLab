@@ -333,3 +333,21 @@ async def test_auto_issue_goes_by_the_askers_permissions_when_login_is_on(monkey
     launched = await ledger_issue.auto_issue(row.id)
     [formal] = await settle(row.id)
     assert launched == formal.id and formal.started_by == f"erin_{row.id[:6]}" and formal.origin["auto"] is True
+
+
+async def test_binding_values_that_would_break_the_sql_are_not_filled_in(client, monkeypatch):
+    """绑定出来的值要渲染进口径的 SQL 模板：写在引号里的值带着引号（这次的 SQL 里写的是转义过的 ''，绑定照原样取出）就不代填
+    出具——和组合时校验助手给的参数是同一个判断，宁可少出具。"""
+    template = "SELECT SUM(amount) AS gmv FROM orders WHERE status = '{{ input.status }}'"
+    graph = S.caliber_graph(template)
+    graph["nodes"][0]["data"]["config"]["fields"] = [{"name": "status", "required": True}]
+    wf = await S.publish(graph=graph, level="published")
+    two_writers(monkeypatch, "本周销售额 [[v:Q1.r0.gmv]]。")
+    run = await run_manager.start(graph=S.explore_graph("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'pa''id'"),
+                                  input_payload={}, origin_kind="canvas")
+    row = await S.wait(run.id)
+    await ledger_match.drain()
+    whole = (await ledger_match.store.latest(row.id)).content["whole"]
+    assert whole["equivalent"] is True and whole["binding"] == {"status": "pa''id"}
+    res = await client.post(f"/api/ledger/answers/{row.id}/issue", json={"workflow_id": wf, "version": 1})
+    assert res.status_code == 409 and "不能有引号" in res.json()["detail"] and "不代填出具" in res.json()["detail"]

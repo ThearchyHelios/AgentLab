@@ -35,7 +35,6 @@ from typing import Any
 
 from sqlalchemy import select
 
-from app.db.base import SessionLocal
 from app.db.models import Run
 
 logger = logging.getLogger(__name__)

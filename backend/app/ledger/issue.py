@@ -251,6 +251,13 @@ async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | No
     plan.inputs = values
     if errors := validate_form(input_schema(fields), values):
         return plan.refuse(INPUTS.format(problems="；".join(e["message"] for e in errors)))
+    # 参数运行时要渲染进口径的 SQL 模板：写在引号里的不能带引号、裸写的只能是数（ledger/compose 同一个判断）
+    from app.ledger.compose import slot_contexts, value_problem
+
+    contexts = slot_contexts([n for n in (row.graph or {}).get("nodes") or [] if n.get("type") == "tool"],
+                             strict=False)
+    if problem := next((p for k, v in values.items() if (p := value_problem(k, v, contexts.get(k, set())))), None):
+        return plan.refuse(f"{problem}，不代填出具")
     if principal.mode != "off" and not principal.at_least("builder"):
         plan.granted_by_app = await _granting_app(session, principal, workflow_id, int(version))
         if plan.granted_by_app is None:
