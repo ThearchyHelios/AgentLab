@@ -165,15 +165,28 @@ def _unique_groups(constraints: list[dict[str, Any]], indexes: list[dict[str, An
     return groups
 
 
+def _storage_type(col_type: Any) -> Any:
+    """PostgreSQL 的域（DOMAIN）换成它底下的类型（域套域的一路往下找）；别的类型原样返回。"""
+    from sqlalchemy.dialects.postgresql import DOMAIN
+
+    seen = 0
+    while isinstance(col_type, DOMAIN) and getattr(col_type, "data_type", None) is not None and seen < 8:
+        col_type, seen = col_type.data_type, seen + 1
+    return col_type
+
+
 def type_text(col_type: Any, dialect: Any) -> str:
     """反射到的列类型 → 存进表结构的写法：按这个数据源的方言编译的完整写法（VARCHAR2(20 CHAR)、NUMBER(10, 0)、
-    ENUM('paid','refund')、TIMESTAMP WITH TIME ZONE），编译不了的退回 str()。
+    ENUM('paid','refund')、TIMESTAMP WITH TIME ZONE），编译不了的退回 str()。PostgreSQL 的域（DOMAIN）记它底下的类型：
+    域编译出来只是域名（settlement_amount），看不出是数字还是文字，名字里的词（set、UPDATE 里的 DATE）还会让类型大类、
+    日期列、码值候选认错；模型照着写 SQL 也要知道它存的是什么。
 
     以前存的是 str(类型)，即 SQLAlchemy 的通用写法：Oracle 的 VARCHAR2、NUMBER 丢了长度和精度，MySQL 的 ENUM 丢了
     取值列表，PostgreSQL 的 TIMESTAMP 丢了时区。类型写不全，表结构前后比对就看不出类型变了，ENUM 状态列也进不了
     码值候选。这一改会让新探查的表结构快照哈希变化（提示词里的类型写法变长），旧运行封存的快照不受影响。"""
     if col_type is None:
         return ""
+    col_type = _storage_type(col_type)
     try:
         compiled = str(col_type.compile(dialect=dialect))
     except Exception:  # noqa: BLE001 - 编译不了（NullType 等）就用通用写法，不让一列拖垮整次探查
@@ -186,10 +199,12 @@ def type_text(col_type: Any, dialect: Any) -> str:
 
 
 def _enum_values(col_type: Any) -> list[str] | None:
-    """ENUM（MySQL、PostgreSQL 的枚举，都是 sqltypes.Enum 的子类）的取值列表，MySQL SET 的成员列表；别的类型 None。"""
+    """ENUM（MySQL、PostgreSQL 的枚举，都是 sqltypes.Enum 的子类）的取值列表，MySQL SET 的成员列表；别的类型 None。
+    套在域（DOMAIN）里的枚举也算（同 type_text）。"""
     from sqlalchemy.dialects.mysql import SET
     from sqlalchemy.types import Enum
 
+    col_type = _storage_type(col_type)
     if isinstance(col_type, Enum):
         values = list(col_type.enums or [])
     elif isinstance(col_type, SET):

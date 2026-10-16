@@ -1293,8 +1293,9 @@ INVALID_DATES = "零日期 0000-00-00、0001-01-01、9999-12-31 这类占位日�
 
 
 def _is_enum(type_name: str | None, enum_values: Any = None) -> bool:
-    """取值列表有限的列：MySQL 的 ENUM / SET（类型写法以它们开头），或者探查记了取值列表（PostgreSQL 的枚举）。"""
-    return bool(enum_values) or catalog._type_words(type_name).startswith(("ENUM", "SET"))
+    """取值列表有限的列：MySQL 的 ENUM(…) / SET(…)，或者探查记了取值列表（PostgreSQL 的枚举：类型写法只是类型名，
+    setup_status 这种以 set 开头的名字不算 SET，见 catalog._MYSQL_ENUM）。"""
+    return bool(enum_values) or catalog._mysql_enum_kind(type_name) is not None
 
 
 def _code_type_ok(type_name: str | None, enum_values: Any = None) -> bool:
@@ -1407,7 +1408,7 @@ async def _check_codes(cx: _TableCx, table: str, column: str, out: _TableOutcome
     spread = "、".join(f"{k}（{_share(n, rows)}）" for k, n in values)
     extra: list[str] = []
     # ENUM 的取值列表（SET 的是成员，取值是成员的组合，不算）：这次没出现的也是可能的取值
-    is_set = catalog._type_words(col_meta.get("type")).startswith("SET")
+    is_set = catalog._mysql_enum_kind(col_meta.get("type")) == "SET"
     declared = [] if is_set else [str(v) for v in col_meta.get("enum_values") or []]
     unseen = [v for v in declared if v not in counts]
     if unseen:
@@ -1424,7 +1425,7 @@ async def _check_codes(cx: _TableCx, table: str, column: str, out: _TableOutcome
 
 def _is_date_column(col: dict[str, Any]) -> bool:
     """日期类列（catalog.is_date_column：和 SQL 检查认时间列是同一个判断）。"""
-    return catalog.is_date_column(str(col.get("name") or ""), col.get("type"))
+    return catalog.is_date_column(str(col.get("name") or ""), col.get("type"), enum_values=col.get("enum_values"))
 
 
 async def _check_dates(cx: _TableCx, table: str, columns: list[str], total: int, out: _TableOutcome,

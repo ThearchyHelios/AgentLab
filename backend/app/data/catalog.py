@@ -1388,15 +1388,16 @@ _DATE_WORDS = frozenset({"date", "time", "day", "dt", "ts", "timestamp", "dateti
 _TEXT_TYPES = ("CHAR", "TEXT", "STRING", "CLOB")
 
 
-def is_date_column(name: str, type_name: str | None) -> bool:
+def is_date_column(name: str, type_name: str | None, *, enum_values: Any = None) -> bool:
     """日期类列：类型是日期、时间戳（DATE、DATETIME、TIMESTAMP……）；或者类型是文字（或者不知道类型）、名字像日期
-    （SQLite 的日期常存成文字）。只有时刻的 TIME、整数存的时间戳不算：取值不是日期。
+    （SQLite 的日期常存成文字）。只有时刻的 TIME、整数存的时间戳不算：取值不是日期。有取值列表的（MySQL 的 ENUM /
+    SET、探查记下 enum_values 的 PostgreSQL 枚举）不算：PG 的枚举编译出来是类型名本身，update_reason 里也有「DATE」。
 
     数据剖析（表里只有一个日期类列时提议它作业务日期）和 SQL 检查（按业务日期以外的时间列统计）共用这一个判断。
     以前两边各写一套：剖析认的「唯一日期列」，SQL 检查可能认为还有别的时间列，反过来也一样，两边对不上。
     """
     t = _type_words(type_name)
-    if t.startswith(("ENUM", "SET")) or "INTERVAL" in t:
+    if enum_values or _MYSQL_ENUM.match(t) or "INTERVAL" in t:
         return False
     if "DATE" in t or "TIMESTAMP" in t:
         return True
@@ -1442,6 +1443,18 @@ def _type_words(type_name: str | None) -> str:
     return _QUOTED_IN_TYPE.sub("''", (type_name or "").upper()).strip()
 
 
+#: MySQL 的 ENUM / SET 编译出来的写法：ENUM('a','b')、SET('x','y')，只认带括号的。PostgreSQL 的枚举编译出来是类型名本身，
+#: setup_status、enum_kind 这种以 set、enum 开头的名字不能按前缀认成 MySQL 的 SET / ENUM——PG 的枚举一律靠探查记下的
+#: enum_values 认（column_family）
+_MYSQL_ENUM = re.compile(r"^(ENUM|SET)\s*\(")
+
+
+def _mysql_enum_kind(type_name: str | None) -> str | None:
+    """类型写法是 MySQL 的 ENUM(…) / SET(…) 时返回 "ENUM" / "SET"，否则 None。"""
+    m = _MYSQL_ENUM.match(_type_words(type_name))
+    return m.group(1) if m else None
+
+
 def _type_family(type_name: str | None) -> str | None:
     """列类型的大类：数字、文字、时间；认不出来返回 None（不据此排除）。
 
@@ -1451,7 +1464,7 @@ def _type_family(type_name: str | None) -> str | None:
     t = _type_words(type_name)
     if not t:
         return None
-    if t.startswith(("ENUM", "SET")):
+    if _MYSQL_ENUM.match(t):
         return "text"
     if "INTERVAL" in t:
         return None

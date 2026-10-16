@@ -15,7 +15,7 @@ import datetime as _dt
 from typing import Any
 
 import pytest
-from sqlalchemy import VARCHAR
+from sqlalchemy import VARCHAR, Date, Numeric
 from sqlalchemy.dialects import mysql, oracle, postgresql, sqlite
 from sqlalchemy.sql.elements import quoted_name
 
@@ -64,6 +64,56 @@ def test_enum_values_never_make_a_date_column():
     assert not catalog.is_date_column("gap", "INTERVAL DAY(2) TO SECOND(6)")
 
 
+# PostgreSQL 的枚举、域编译出来是类型名本身：名字以 set、enum 开头不能被当成 MySQL 的 SET / ENUM，PG 的枚举一律靠
+# 探查记下的 enum_values 认
+@pytest.mark.parametrize("type_name, family", [
+    ("setup_status", None),
+    ("settlement_amount", None),
+    ("enum_kind", None),
+    ("SET ('a','b')", "text"),
+    ("enum('paid')", "text"),
+])
+def test_only_mysql_enum_and_set_spellings_are_enum(type_name, family):
+    assert catalog._type_family(type_name) == family
+    assert catalog_profile._is_enum(type_name) is (family == "text")
+
+
+def test_postgres_type_names_starting_with_set_or_enum():
+    # 带取值列表的 PG 枚举：是码值候选、是文字，但不是 MySQL 的 SET
+    assert catalog_profile._is_enum("setup_status", ["draft", "done"])
+    assert catalog.column_family({"name": "stage", "type": "setup_status", "enum_values": ["draft"]}) == "text"
+    # 名字以 set 开头的数值域：不是文字、不是码值候选
+    assert not catalog_profile._code_type_ok("settlement_amount")
+    # 名字以 set 开头的日期域：照样是日期列
+    assert catalog.is_date_column("settled_on", "settlement_date")
+    # 枚举的类型名里碰巧有 DATE（UPDATE 里的）：有取值列表就不是日期列
+    assert not catalog.is_date_column("reason", "update_reason", enum_values=["manual", "sync"])
+    assert not catalog_profile._is_date_column({"name": "reason", "type": "update_reason",
+                                                "enum_values": ["manual", "sync"]})
+
+
+def test_postgres_enum_named_like_set_keeps_its_unseen_values():
+    """PG 枚举 setup_status 不是 MySQL 的 SET：列定义里这次没出现的取值也写进码值（含义待填）。"""
+    settings = ProfileSettings(enabled=True)
+    source = type("S", (), {"id": "s1", "name": "shop", "kind": "postgresql", "options": {}})()
+    tables = {"jobs": {"columns": [{"name": "stage", "type": "setup_status",
+                                    "enum_values": ["draft", "running", "done"]}]}}
+    job = catalog_profile.ProfileContext(source=source, settings=settings, dialect=SqlDialect("postgresql"),
+                                         runner=None, tables=tables, masked=set())
+    job.sizes["jobs"] = TableSize(10, "count")
+    result = catalog_profile.TableResult(table="jobs")
+    cx = catalog_profile._TableCx(job, "jobs", result, catalog_profile.TableHooks())
+
+    async def run(sql: str, **_kw: Any) -> QueryResult:
+        return QueryResult(columns=["v", "n"], rows=[["draft", 6], ["done", 4]], row_count=2, truncated=False,
+                           elapsed_ms=1, sql=sql)
+    cx.run = run  # type: ignore[method-assign]
+    out = catalog_profile._TableOutcome()
+    asyncio.run(catalog_profile._check_codes(cx, "jobs", "stage", out, result))
+    [codes] = out.codes
+    assert codes.declared == ["running"] and "列定义里另有 1 个取值" in codes.note
+
+
 @pytest.mark.parametrize("col, ok", [
     ({"type": "VARCHAR2(20 CHAR)"}, True),
     ({"type": "VARCHAR2(200 CHAR)"}, False),
@@ -100,6 +150,9 @@ def test_enum_columns_are_code_candidates_whatever_their_name():
     (oracle.dialect(), VARCHAR(10), "VARCHAR2(10 CHAR)"),
     (oracle.dialect(), oracle.NUMBER(10, 0), "NUMBER(10, 0)"),
     (postgresql.dialect(), postgresql.ENUM("a", "b", name="order_status"), "order_status"),
+    # PG 的域编译出来只是域名，名字里的词（set、UPDATE 里的 DATE）会让它被认错：记它底下的类型
+    (postgresql.dialect(), postgresql.DOMAIN("settlement_amount", Numeric(12, 2)), "NUMERIC(12, 2)"),
+    (postgresql.dialect(), postgresql.DOMAIN("update_day", postgresql.DOMAIN("biz_day", Date())), "DATE"),
     (sqlite.dialect(), sqlite.DATETIME(), "DATETIME"),
 ])
 def test_reflected_type_is_compiled_for_the_dialect(dialect, col_type, text):
@@ -123,6 +176,13 @@ def test_column_entry_records_enum_values_and_oracle_quoted_names():
     assert plain["enum_values"] == ["a", "b"] and "quote_name" not in plain
     members = introspect.column_entry({"name": "tags", "type": mysql.SET("x", "y")}, mysql.dialect())
     assert members["enum_values"] == ["x", "y"] and members["type"] == "SET('x','y')"
+
+
+def test_domain_over_an_enum_keeps_the_enum_values():
+    status = postgresql.ENUM("draft", "done", name="setup_status")
+    entry = introspect.column_entry({"name": "stage", "type": postgresql.DOMAIN("stage_kind", status)},
+                                    postgresql.dialect())
+    assert entry["type"] == "setup_status" and entry["enum_values"] == ["draft", "done"]
 
 
 def test_index_first_columns_are_recorded():
