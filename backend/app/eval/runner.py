@@ -216,9 +216,11 @@ async def start(session: AsyncSession, suite: EvalSuite, variants: Sequence[Mapp
                                        case_hash=case.case_hash, repeat=repeat, arm=run.arm, status="pending"))
         runs.append(run)
     await session.commit()
+    # 提交之后立刻交给后台（中间不 await）：别的请求读到「排队中」时它已经在这个进程里跑着，不会被当成服务重启留下的
+    # 而标中断（reconcile_stale）
+    manager.start(leader_id)
     for run in runs:
         await session.refresh(run)
-    manager.start(leader_id)
     return runs
 
 

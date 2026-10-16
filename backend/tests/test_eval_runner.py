@@ -395,3 +395,43 @@ async def test_a_workflow_case_runs_its_pinned_version_as_an_exploratory_run(cli
         assert (await client.get("/api/evals/pairs/nope")).status_code == 404
     finally:
         await drop_source(sid)
+
+
+async def test_a_review_asking_for_a_retry_rebuilds_on_the_same_graph(monkeypatch, tmp_path):
+    """复核给了 retry_instruction（chat/turn 的规则判过可以重来）：带着这次运行的图、照那句话重来一次，两次运行都记在这一题
+    名下、用量都算这一题的；第二次复核不再要重来就收尾。"""
+    import app.api.copilot as copilot
+
+    name, sid = await es.make_source(tmp_path)
+    try:
+        model = es.Copilot(name)
+        es.use_copilot(monkeypatch, model)
+        es.use_report(monkeypatch)
+        reviews: list[int] = []
+        real = copilot.review_of_run
+
+        async def review(session, run, *, question, provider=None, model=None, always=False, attempt=0):
+            reviews.append(attempt)
+            out = await real(session, run, question=question, provider=provider, model=model, always=always,
+                             attempt=attempt)
+            if attempt == 0:
+                out.update(verdict="annotated", severity="broken", retry=True,
+                           retry_instruction="这个工作流上一次运行没有成功：步数用满了。改完继续回答原来的问题")
+            return out
+
+        monkeypatch.setattr(copilot, "review_of_run", review)
+        suite_id = await es.make_suite(sid)
+        [run] = await start(suite_id)
+        await es.wait_eval(run.id)
+        [item] = await results(run.id)
+        assert reviews == [0, 1], "第一次复核要重来，第二次（attempt=1）不再要"
+        assert item.path == "ran" and item.verdict == "pass", item.error
+        retry_call = next(c for c in model.calls if "步数用满了" in str(c[-1][1]) or "步数用满了" in str(c[1][1]))
+        assert "这是当前的工作流" in str(retry_call[1][1]), "带着原图交回去改"
+        async with SessionLocal() as session:
+            answers = (await session.execute(select(Run.id).where(Run.origin_kind == "eval"))).scalars().all()
+            mine = [r for r in answers if (await session.get(Run, r)).origin.get("eval_run_id") == run.id
+                    and (await session.get(Run, r)).origin.get("role") == "answer"]
+        assert len(mine) == 2 and item.run_id in mine
+    finally:
+        await drop_source(sid)
