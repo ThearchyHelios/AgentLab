@@ -414,6 +414,7 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
                         </p>
                       ))}
                       {r.sql_match?.reason && <p className="text-faint">{r.sql_match.reason}</p>}
+                      <ResultDetail evaluationId={id} resultId={r.id} />
                       <div className="flex flex-wrap gap-2">
                         {r.run_id && <Link className="btn btn-sm" to={`/runs/${encodeURIComponent(r.run_id)}`} data-eval-result-run="">{T.run.openRun}</Link>}
                         {r.gold_run_ids.slice(0, 2).map((g) => (
@@ -428,6 +429,31 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
           })}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+/** 一题的明细（GET …/results/{id} 的明细工件）：这一轮作答的经过（重来了几次、原因）和读出来的答案原文。明细清理了的不显示 */
+function ResultDetail({ evaluationId, resultId }: { evaluationId: string; resultId: string }) {
+  const [details, setDetails] = useState<Record<string, any> | null | undefined>(undefined)
+  useEffect(() => {
+    api.evals.result(evaluationId, resultId).then((r) => setDetails(r.details ?? null), () => setDetails(null))
+  }, [evaluationId, resultId])
+  if (details === undefined) return <Spinner size={11} />
+  if (!details) return null
+  const turn = details.turn ?? {}
+  const answer = String(details.answer?.text ?? turn.reply ?? '').trim()
+  const R = T.results
+  return (
+    <div className="space-y-1" data-eval-result-details="">
+      {(turn.attempts ?? 0) > 0 && <p className="text-faint">{R.attempts(turn.attempts)}</p>}
+      {turn.reason && <p className="text-dim"><span className="text-faint">{R.turnReason}：</span>{turn.reason}</p>}
+      {answer && (
+        <details>
+          <summary className="cursor-pointer text-2xs text-dim">{R.answer}</summary>
+          <p className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words text-dim">{answer}</p>
+        </details>
+      )}
     </div>
   )
 }

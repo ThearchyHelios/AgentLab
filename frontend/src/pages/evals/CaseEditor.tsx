@@ -10,7 +10,7 @@ import { EVAL_TEXT } from '../../lib/termsEval'
 import { useCatalog } from '../../store/catalog'
 import type { Run } from '../../types'
 import type {
-  EvalCaliber, EvalCase, EvalCaseBody, EvalExpectation, EvalGold, EvalPreview, EvalRunQuery, EvalSuite, EvalTrial,
+  EvalCaliber, EvalCase, EvalCaseBody, EvalCaseKind, EvalExpectation, EvalGold, EvalPreview, EvalRunQuery, EvalSuite, EvalTrial,
 } from '../../typesEval'
 import { graphFields, type InputField } from '../schedules/model'
 import { cellText, expectationText, goldValueText } from './parts'
@@ -69,6 +69,11 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
   // 从运行认定
   const [runId, setRunId] = useState('')
   const [queryId, setQueryId] = useState('')
+  // 题目种类：问数据题（问法交给助手作答）或工作流题（固定一个已发布版本，按输入跑一次，考的是这一版本身）
+  const [caseKind, setCaseKind] = useState<EvalCaseKind>('ask')
+  const [workflowId, setWorkflowId] = useState('')
+  const [workflowVersion, setWorkflowVersion] = useState<number | null>(null)
+  const [workflowInputs, setWorkflowInputs] = useState<Record<string, string>>({})
   // 试算、保存
   const [trial, setTrial] = useState<EvalTrial | null>(null)
   const [trialing, setTrialing] = useState(false)
@@ -101,6 +106,10 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
     setInputs(c?.gold?.kind === 'caliber' ? { ...(c.gold.inputs ?? {}) } : {})
     setRunId(c?.gold?.kind === 'from_run' ? c.gold.run_id ?? '' : '')
     setQueryId(c?.gold?.kind === 'from_run' ? c.gold.query ?? '' : '')
+    setCaseKind(c?.kind ?? 'ask')
+    setWorkflowId(c?.workflow_id ?? '')
+    setWorkflowVersion(c?.workflow_version ?? null)
+    setWorkflowInputs({ ...(c?.input_template ?? {}) })
     setTrial(null)
     setError(null)
   }, [open, editing?.id, editing?.version, initialQuestion])
@@ -144,7 +153,13 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
       tags: tags.split(/[,，、\n]/).map((t) => t.trim()).filter(Boolean),
     }
     if (!fixedFromRun) out.gold = gold()
-    if (!editing) out.kind = 'ask'
+    const workflow = caseKind === 'workflow' && (mode === 'sql' || mode === 'caliber')
+    if (!editing) out.kind = workflow ? 'workflow' : 'ask'
+    if (workflow) {
+      out.workflow_id = workflowId
+      out.workflow_version = workflowVersion
+      out.input_template = Object.fromEntries(Object.entries(workflowInputs).filter(([, v]) => v.trim() !== ''))
+    }
     return out
   }
 
@@ -215,12 +230,16 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
 
   const fieldError = (...fields: string[]) => (error && error.field && fields.some((f) => error.field === f || error.field!.startsWith(`${f}.`))
     ? error.message : undefined)
-  const generalError = error && !(error.field && ['question', 'gold.sql', 'gold.datasource_id', 'gold.inputs', 'query', 'tags']
+  const generalError = error && !(error.field && ['question', 'gold.sql', 'gold.datasource_id', 'gold.inputs', 'query', 'tags',
+    'workflow_id', 'workflow_version', 'input_template']
     .some((f) => error.field === f || error.field!.startsWith(`${f}.`))) ? error.message : null
   const needsMain = mode !== 'special'
+  /** 工作流题只配「写 SQL 定期望」「选口径」两种：反问是助手的事，工作流不会反问；从运行认定只认问数据运行里的查询 */
+  const workflowCase = caseKind === 'workflow' && (mode === 'sql' || mode === 'caliber')
   // 关掉之前要不要先问：新建时填了东西、编辑时改了要试算的那几样
   const dirty = editing ? changed() : !!(question.trim() || sql.trim() || main || points.trim() || runId)
   const ready = (!needsMain || !!main) && (mode !== 'from_run' || fixedFromRun || (!!runId && !!queryId))
+    && (!workflowCase || (!!workflowId && !!workflowVersion))
     && (mode !== 'caliber' || !!caliber) && (!(mode === 'sql' || (mode === 'special' && special === 'none')) || (!!sourceId && !!sql.trim()))
 
   return (
@@ -256,8 +275,16 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
           <p className="mt-1 text-2xs leading-relaxed text-faint">{T.modeHint[mode]}</p>
         </div>
 
-        <Field label={T.question} htmlFor="eval-case-question" hint={T.questionHint} error={fieldError('question')}
-               required={mode !== 'from_run'}>
+        {(mode === 'sql' || mode === 'caliber') && (
+          <CaseKindPart kind={caseKind} setKind={setCaseKind} disabled={!!editing} workflowId={workflowId}
+                        setWorkflowId={(v) => { setWorkflowId(v); setWorkflowInputs({}) }} version={workflowVersion}
+                        setVersion={setWorkflowVersion} inputs={workflowInputs} setInputs={setWorkflowInputs}
+                        error={fieldError('workflow_id', 'workflow_version', 'input_template')} />
+        )}
+
+        <Field label={workflowCase ? T.workflowQuestion : T.question} htmlFor="eval-case-question"
+               hint={workflowCase ? T.workflowQuestionHint : T.questionHint} error={fieldError('question')}
+               required={mode !== 'from_run' && !workflowCase}>
           <textarea id="eval-case-question" className="field min-h-16" value={question} maxLength={2000}
                     placeholder={T.questionPlaceholder} onChange={(e) => setQuestion(e.target.value)} data-eval-case-question="" />
         </Field>
@@ -339,6 +366,72 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
         {generalError && <Notice tone="err" attr={{ 'data-eval-case-error': error?.field ?? '' }}>{generalError}</Notice>}
       </div>
     </Modal>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 题目种类：问数据题 / 工作流题
+// ---------------------------------------------------------------------------
+
+/**
+ * 工作流题：固定一个工作流的已发布版本（服务端核对已发布、未退役），按输入模板跑一次探索运行，考的是这一版本身（不建图、
+ * 不复核）。输入模板按那一版入口节点的字段填，可以写时间变量
+ */
+function CaseKindPart({ kind, setKind, disabled, workflowId, setWorkflowId, version, setVersion, inputs, setInputs, error }: {
+  kind: EvalCaseKind; setKind: (k: EvalCaseKind) => void; disabled: boolean; workflowId: string; setWorkflowId: (v: string) => void
+  version: number | null; setVersion: (v: number | null) => void; inputs: Record<string, string>
+  setInputs: (v: Record<string, string>) => void; error?: string
+}) {
+  const workflows = useCatalog((s) => s.workflows)
+  const published = workflows.filter((w) => w.published_version)
+  const [fields, setFields] = useState<InputField[] | null>(null)
+  useEffect(() => {
+    if (kind !== 'workflow' || !workflowId || !version) { setFields(null); return }
+    setFields(null)
+    api.workflows.version(workflowId, version).then((v) => setFields(graphFields(v.graph)), () => setFields([]))
+  }, [kind, workflowId, version])
+  return (
+    <div className="space-y-2" data-eval-case-kind={kind}>
+      <div className="label">{T.caseKind}</div>
+      <div className="flex flex-wrap gap-3 text-xs">
+        {(['ask', 'workflow'] as const).map((k) => (
+          <label key={k} className="flex items-center gap-1.5">
+            <input type="radio" name="eval-case-kind" checked={kind === k} disabled={disabled} onChange={() => setKind(k)}
+                   data-eval-case-kind-pick={k} />
+            {EVAL_TEXT.caseRow.kind[k]}
+          </label>
+        ))}
+      </div>
+      <p className="text-2xs leading-relaxed text-faint">{T.caseKindHint[kind]}</p>
+      {kind === 'workflow' && (
+        <div className="grid gap-3 rounded-md border p-2.5 sm:grid-cols-[minmax(0,1fr)_8rem]">
+          <Field label={T.workflow} htmlFor="eval-case-workflow" required>
+            <select id="eval-case-workflow" className="field" value={workflowId} disabled={disabled} data-eval-case-workflow=""
+                    onChange={(e) => {
+                      const w = published.find((x) => x.id === e.target.value)
+                      setWorkflowId(e.target.value)
+                      setVersion(w?.published_version ?? null)
+                    }}>
+              <option value="">{published.length ? T.workflowPlaceholder : T.workflowNone}</option>
+              {published.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
+            </select>
+          </Field>
+          <Field label={T.workflowVersion} htmlFor="eval-case-workflow-version" required>
+            <input id="eval-case-workflow-version" className="field tnum" inputMode="numeric" value={version ?? ''} disabled={disabled}
+                   onChange={(e) => setVersion(e.target.value.trim() ? Number(e.target.value) : null)} />
+          </Field>
+          {fields === null && workflowId && version && <p className="text-2xs text-dim sm:col-span-2"><Spinner size={10} /> {T.caliberInputsLoading}</p>}
+          {fields?.map((f) => (
+            <Field key={f.name} label={f.name} htmlFor={`eval-case-input-${f.name}`} required={!!f.required} hint={f.description}
+                   className="sm:col-span-2">
+              <input id={`eval-case-input-${f.name}`} className="field mono text-xs" value={inputs[f.name] ?? ''}
+                     onChange={(e) => setInputs({ ...inputs, [f.name]: e.target.value })} data-eval-case-input={f.name} />
+            </Field>
+          ))}
+          {error && <p className="text-2xs text-[var(--err)] sm:col-span-2" role="alert">{error}</p>}
+        </div>
+      )}
+    </div>
   )
 }
 

@@ -231,6 +231,9 @@ const EVAL_RUN = { id: 'run-eval-ans', workflow_id: null, workflow_name: '评测
   origin_kind: 'eval', origin: { suite_id: 'suite-a', eval_run_id: 'ev-1', case_id: 'case-2', role: 'answer', repeat: 0 }, schedule_id: null,
   created_at: iso(NOW - 90 * 60e3), started_at: iso(NOW - 90 * 60e3), finished_at: iso(NOW - 89 * 60e3) }
 const RUN_GRAPH = { nodes: [{ id: 'out', type: 'output', position: { x: 0, y: 0 }, data: { label: '成果', config: {} } }], edges: [] }
+/** 已发布的工作流（工作流题要固定一个已发布版本） */
+const WF_WEEK = { id: 'wf-week', name: '周销售', description: '', graph: VERSION_WEEK.graph, tags: [], version: 4, is_template: false,
+  status: 'published', published_version: 3, published_level: 'governed', created_at: iso(NOW - 30 * 24 * H), updated_at: iso(NOW - 24 * H) }
 const BUILDER = { mode: 'local', username: 'jiang', display_name: '检查员甲', role: 'builder', groups: [], verified: true }
 const USER = { mode: 'local', username: 'li', display_name: '使用者乙', role: 'user', groups: [], verified: true }
 
@@ -370,6 +373,14 @@ function reply(state, method, path, url, body) {
       return { json: ev }
     }
   }
+  m = path.match(/^\/evals\/evaluations\/([^/]+)\/results\/([^/]+)$/)
+  if (method === 'GET' && m) {
+    const r = RESULTS.find((x) => x.id === m[2])
+    return r ? { json: { ...r, details: { turn: { attempts: 1, reason: null, reply: null }, answer: { text: `答案原文：上周销售额 ${r.scores[0]?.got ?? ''} 元` } } } }
+      : { status: 404, json: { detail: '这一题的结果不存在' } }
+  }
+  if (method === 'POST' && path === '/evals/suites/suite-a/cleanup') { write(); return { json: { runs: 2, results: 6, deleted_runs: 8, files: 3 } } }
+  if (method === 'GET' && path === '/workflows') return { json: [WF_WEEK] }
   if (method === 'GET' && path === '/evals/pairs/ev-pa') return { json: PAIR }
   if (method === 'GET' && path === '/evals/calibers') return { json: { calibers: CALIBERS } }
   if (method === 'GET' && path === '/workflows/wf-week/versions/3') return { json: VERSION_WEEK }
@@ -565,6 +576,10 @@ await section('题集详情：题目表、口径升版处置、启用开关、�
   await page.locator('[data-eval-runs]').count()
   await page.getByRole('tab', { name: '评测记录' }).click()
   check('评测记录：历次评测链到详情', await page.locator('[data-eval-run-row="ev-1"]').getAttribute('href') === '/evals/runs/ev-1')
+  await page.locator('[data-eval-suite-cleanup]').click()
+  await page.locator('[role="dialog"]').getByRole('button', { name: '清理更早的明细' }).click()
+  check('清理更早的明细：先确认、再发一次，提示清了几次', await until(() => writes(state, /cleanup$/).length === 1)
+    && await until(async () => (await page.locator('[data-toast]').allInnerTexts()).some((x) => x.includes('已清理 2 次评测的明细'))))
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
 })
 
@@ -652,6 +667,20 @@ await section('加题：选口径、从运行认定、期望反问', async () =>
   const ask = lastWrite(state, /^POST \/evals\/suites\/suite-b\/cases$/)?.body
   check('期望反问：期望只有「反问」，不带期望答案的来源', JSON.stringify(ask?.expectations) === JSON.stringify([{ kind: 'ask' }]) && ask?.gold === null,
     JSON.stringify(ask))
+  await page.locator('[data-eval-add-case]').click()
+  await page.locator('[data-eval-case-kind-pick="workflow"]').check()
+  await page.locator('[data-eval-case-workflow]').selectOption('wf-week')
+  await page.locator('[data-eval-case-input="week"]').fill('{{ schedule.last_week_start }}')
+  await page.locator('[data-eval-case-source]').selectOption('ds-shop')
+  await page.locator('[data-eval-case-sql]').fill('SELECT region AS 地区, SUM(amount) AS gmv FROM orders GROUP BY region')
+  await page.locator('[data-eval-case-preview]').click()
+  await page.locator('[data-eval-preview-cell="0:gmv"]').click()
+  await page.locator('[data-eval-case-save]').click()
+  await until(() => writes(state, /^POST \/evals\/suites\/suite-b\/cases$/).length === 3)
+  const wf = lastWrite(state, /^POST \/evals\/suites\/suite-b\/cases$/)?.body
+  check('工作流题：固定已发布的 v3、按入口字段填输入模板，期望照样由 SQL 算', wf?.kind === 'workflow' && wf.workflow_id === 'wf-week'
+    && wf.workflow_version === 3 && wf.input_template?.week === '{{ schedule.last_week_start }}' && wf.gold?.kind === 'sql',
+    JSON.stringify(wf))
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
 })
 
@@ -744,6 +773,9 @@ await section('逐题结果、和上一次比、A/B 配对表', async () => {
   check('逐题：结论、期望和答案里的数、SQL 差在哪', t2.includes('不通过') && t2.includes('330') && t2.includes('310') && t2.includes('时间口径'), t2)
   check('一题的花费照服务端加好的写', (await page.locator('[data-eval-result="r-1"]').innerText()).includes('$0.014'))
   check('点开去运行详情', await page.locator('[data-eval-result-detail="r-2"] [data-eval-result-run]').getAttribute('href') === '/runs/run-answer-2')
+  await page.locator('[data-eval-result-details]').waitFor()
+  check('展开的明细写作答的经过和答案原文（明细工件）', (await text(page, '[data-eval-result-details]')).includes('自动重来了 1 次')
+    && (await page.locator('[data-eval-result-details] details').count()) === 1)
 
   await page.getByRole('tab', { name: '和上一次比' }).click()
   await page.locator('[data-eval-transitions]').waitFor()

@@ -11,7 +11,7 @@ import { formatDateTime, formatTime } from '../../lib/format'
 import { timezoneOptions } from '../../lib/freq'
 import { leavePass } from '../../lib/leave'
 import { EVAL_TEXT, pct, rateText } from '../../lib/termsEval'
-import { useOnReconnect } from '../../store/catalog'
+import { useCatalog, useOnReconnect } from '../../store/catalog'
 import type {
   EvalCase, EvalRun, EvalSnapshot, EvalSuiteDetail, EvalTrial, EvalUpgradePolicy, EvalUpgradeState, EvalVariant,
 } from '../../typesEval'
@@ -110,6 +110,14 @@ export function SuiteDetail({ id }: { id: string }) {
     await api.evals.removeSuite(suite.id)
     toast.ok(T.suite.deleted(suite.name))
     navigate('/evals', leavePass({ replace: true }))
+  })
+  const cleanup = () => act('cleanup', async () => {
+    if (!suite) return
+    if (!(await confirmDialog({ title: T.suite.cleanupTitle(suite.name), consequences: T.suite.cleanupConsequences,
+      confirmLabel: T.suite.cleanup, danger: true }))) return
+    const r = await api.evals.cleanup(suite.id) as { runs?: number; files?: number }
+    toast.ok(T.suite.cleaned(Number(r.runs ?? 0), Number(r.files ?? 0)))
+    await load()
   })
   const toggleCase = (c: EvalCase, enabled: boolean) => act(`toggle:${c.id}`, async () => {
     if (!suite) return
@@ -210,7 +218,14 @@ export function SuiteDetail({ id }: { id: string }) {
               )}
             </div>
             <div role="tabpanel" id="eval-suite-panel-runs" aria-labelledby="eval-suite-tab-runs" hidden={tab !== 'runs'}
-                 className="mx-auto max-w-6xl p-4">
+                 className="mx-auto max-w-6xl space-y-3 p-4">
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <span className="text-2xs text-faint">{T.suite.cleanupHint}</span>
+                <button type="button" className="btn btn-sm" onClick={() => void cleanup()} disabled={!!busy || !runs?.length}
+                        data-eval-suite-cleanup="">
+                  {busy === 'cleanup' && <Spinner size={11} />} {T.suite.cleanup}
+                </button>
+              </div>
               <RunList runs={runs ?? []} />
             </div>
           </div>
@@ -242,6 +257,8 @@ function CaseRow({ c, busy, trial, archivedSuite, focused, onEdit, onToggle, onT
 }) {
   const last = c.trial
   const pending = !!c.upgrade?.pending
+  const workflows = useCatalog((s) => s.workflows)
+  const workflowName = (id: string | null) => workflows.find((w) => w.id === id)?.name ?? id ?? ''
   return (
     <li className={clsx('rounded-lg border bg-panel px-3 py-2.5', (!c.enabled || c.archived) && 'opacity-75',
       focused && 'border-[var(--accent)]')} data-eval-case={c.id} data-eval-case-focused={focused ? '' : undefined}
@@ -257,6 +274,9 @@ function CaseRow({ c, busy, trial, archivedSuite, focused, onEdit, onToggle, onT
           </div>
           <div className="mt-1 break-words text-sm" data-eval-case-text="">{c.question || '—'}</div>
           <div className="mt-1 text-2xs text-dim">
+            {c.kind === 'workflow' && (
+              <span data-eval-case-workflow={c.workflow_id ?? ''}>{T.caseRow.workflow(workflowName(c.workflow_id), c.workflow_version)} · </span>
+            )}
             <span title={T.caseRow.goldSource}>{goldText(c)}</span>
             {c.datasources.length > 0 && <span className="text-faint"> · {T.caseRow.datasources}：{c.datasources.map((d) => d.name ?? d.id).join('、')}</span>}
           </div>
