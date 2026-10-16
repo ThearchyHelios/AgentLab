@@ -694,9 +694,10 @@ async def _update_target_schedule(session: AsyncSession, row: Schedule, body: di
     if result.rowcount != 1:
         await session.rollback()
         raise HTTPException(409, "这个定时任务刚被别人修改过，请刷新后再保存")
+    schedule_id = row.id
     await session.commit()
     session.expire_all()
-    return await _schedule_out(session, await _get(session, row.id))
+    return await _schedule_out(session, await _get(session, schedule_id))
 
 
 async def retime(session: AsyncSession, row: Schedule, body: dict[str, Any]) -> Schedule:

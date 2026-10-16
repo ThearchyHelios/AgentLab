@@ -87,6 +87,13 @@ async def test_catalog_contribution_pair_end_to_end(client, monkeypatch, source)
     assert summary["accuracy"]["passed"] == 1 and summary["traced_accuracy"]["passed"] == 1
     assert summary["accuracy"]["ci"] is not None and summary["e1"]["passed"] == 1
 
+    # 开评时拍了一份当前目录（不占数据源的队），上传表格版本和表结构哈希前后各记一次
+    async with SessionLocal() as session:
+        ev = await session.get(EvalRun, live["id"])
+    assert ev.catalog_snapshot and ev.fingerprint["catalog"].startswith("live:")
+    assert ev.fingerprint["sources_before"] == ev.fingerprint["sources_after"]
+    assert ev.fingerprint["sources_changed"] == [] and ev.fingerprint["prompt"]
+
     # 评测运行：来源 eval、不进使用统计、名字写题集和题号
     async with SessionLocal() as session:
         run = await session.get(Run, right.run_id)
@@ -120,3 +127,40 @@ async def test_comparing_with_the_previous_run_finds_the_regression(client, monk
     assert item["transition"] == "regressed" and item["cause"] == "method", item
     assert "catalog" in {d["key"] for d in compared["fingerprint_diff"]}, compared["fingerprint_diff"]
     assert shop.RIGHT != shop.BY_ORDER_DATE
+
+
+async def test_judge_on_charges_the_eval_ledger_and_text_points_stay_apart(client, monkeypatch, source):
+    from langchain_core.messages import AIMessage
+
+    from app.engine import judge
+    from app.engine.spend import eval_spend
+    from app.eval.judging import POINTS_SYSTEM_PROMPT
+    from app.providers import mock_model
+
+    es.use_copilot(monkeypatch, es.Copilot(source["name"]))
+
+    def decide(self, messages):
+        text = "\n".join(str(m.content) for m in messages)
+        if POINTS_SYSTEM_PROMPT[:20] in text:
+            return AIMessage(content='[{"point": 1, "verdict": "covered", "reason": "说了按支付日"}]')
+        return AIMessage(content=es.REPORT)
+
+    monkeypatch.setattr(mock_model.MockChatModel, "_decide", decide)
+    case = es.paid_case(source["id"])
+    case["expectations"].append({"kind": "text", "points": ["说明按支付日统计"]})
+    suite_id = await es.make_suite(source["id"], cases=[case])
+    judge_before = await judge.judge_spend.daily()
+    ledger_before = (await eval_spend.daily())["calls"]
+    [ev] = (await client.post(f"/api/evals/suites/{suite_id}/evaluations",
+                              json={"variant": {"judge": True}})).json()["evaluations"]
+    await es.wait_eval(ev["id"])
+    [item] = await _results(ev["id"])
+    assert item.verdict == "pass", item.error
+    text = next(s for s in item.scores if s["kind"] == "text")
+    assert text["outcome"] == "covered" and text["required"] is False, "文字要点单列"
+    assert item.judge["claims"]["calls"] >= 1, "走了按需裁判那条路"
+    assert set(item.judge["claims"]["counts"]) == {"supported", "partial", "contradicted", "insufficient", "unjudged"}
+    assert await judge.judge_spend.daily() == judge_before, "裁判的花费记在评测那本账上"
+    assert (await eval_spend.daily())["calls"] > ledger_before
+    got = (await client.get(f"/api/evals/evaluations/{ev['id']}")).json()
+    assert got["summary"]["judge"]["on"] is True and got["summary"]["text"] == {"covered": 1}

@@ -510,6 +510,9 @@ def score_case(case: Mapping[str, Any], gold: Mapping[str, Any] | None, answer: 
     verdict, traced, reason = _verdict(scores)
     if ask_only and path != "asked":
         verdict, traced, reason = "fail", False, "期望反问（问法含糊），助手却没有反问"
+        if path in ("build_failed", "run_failed"):
+            # 没走到能不能反问那一步（建图、运行失败、超时）：照实写是哪一步、为什么
+            reason = WRONG_PATH[path] + (f"：{path_reason}" if path_reason else "")
     by_version = []
     for extra in sets[1:]:
         more = _expectation_scores(expectations, (extra or {}).get("values") or {}, answer, path, judgement, cache)
