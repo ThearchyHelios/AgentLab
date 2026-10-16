@@ -27,6 +27,9 @@ from app.data.names import canon
 from app.data.recipe_checks import date_columns, plan_checks, split_coord
 from app.data.recipe_parsers import UNITS
 from app.data.recipe_types import (
+    LIST_PERIOD_END,
+    LIST_PERIOD_START,
+    SUBTOTAL_KEY,
     Acceptance,
     CheckResult,
     ColumnOut,
@@ -46,6 +49,7 @@ from app.data.recipe_types import (
     TableNote,
     UnionNotePart,
     derive_tables,
+    list_period_columns,
     prose_problems,
     render_prose,
 )
@@ -134,6 +138,13 @@ NOTE_TEXT = {
     "ignored_rows_union": "部分期的原表另有按配方忽略的行，内容见证据面板",
     "ignored_cells_union": "部分期的原表另有按配方忽略的单元格，内容见证据面板",
     "dim_values_vary": "各期的 {dim} 取值不完全相同：跨期比较前请先确认两期都有的取值",
+    # ---- 期 5：列表按期累积、穿插的小计。列表可以累积以后，空行之后的文字行也要有并集说法
+    "rows_after_stop_union": "部分期的原表在空行之后另有未导入的文字行，内容见证据面板",
+    "subtotal_kept": "原表穿插的小计在 {table}，不要与本表相加",
+    "subtotal_not_kept": "原表穿插的小计行未导入本表",
+    "list_subtotal_passed": "原表穿插的小计行的值，已按各组明细求和核对一致：不要与 {base} 相加，也不要彼此相加",
+    "list_subtotal_unverified": "原表穿插的小计行的值，按原表保存的值存储。本期部分小计未能核对：不要与 {base} 相加，"
+                                "也不要彼此相加",
 }
 
 #: 列说明的片段模板
@@ -148,6 +159,9 @@ COLUMN_TEXT = {
     "col_partial_periods": "部分期没有这一列的数据，为空值",
     "col_absent": "当前版本的数据中没有这一列，为空值",
     "col_retired": "这一列自某一期起不再导入，此后各期为空值",
+    # ---- 期 5：列表按期累积时由系统加的统计期起止两列（ListPeriod.synthesize）。不含数字（说明不许报数）
+    "period_start": "本期统计期的第一天，取自表内的统计期或人工录入的统计期，格式 YYYY-MM-DD",
+    "period_end": "本期统计期的最后一天，取自表内的统计期或人工录入的统计期，格式 YYYY-MM-DD",
 }
 
 #: 「逐日 / 逐行」「个别日期 / 个别行」：粒度只有一列日期时按日说，否则按行说
@@ -161,7 +175,7 @@ _K_REASON = {r: f"total_k_{r}" for r in ("uncached", "blank", "null_detail", "ti
 _T_REASON = {r: f"list_total_{r}" for r in ("uncached", "blank", "null_detail", "tiling", "hidden")}
 #: 允许出现「一致」的模板：只在对应的 K / T 通过时才会选用
 CONSISTENT_KEYS = frozenset({"total_k_passed", "total_k_passed_g_unverifiable", "list_total_passed",
-                             "list_total_passed_partial"})
+                             "list_total_passed_partial", "list_subtotal_passed"})
 
 
 def _tok(kind: str, name: str) -> str:
@@ -202,6 +216,8 @@ class _Writers:
     lists: list[ListBlock] = field(default_factory=list)
     #: 把合计行另存进本表的列表块
     list_totals: list[ListBlock] = field(default_factory=list)
+    #: 期 5：把穿插的小计另存进本表的列表块
+    list_subtotals: list[ListBlock] = field(default_factory=list)
 
     def add_sheet(self, sheet: SheetRecipe) -> None:
         if all(s is not sheet for s in self.sheets):
@@ -242,6 +258,9 @@ def _writers(recipe: Recipe) -> dict[str, _Writers]:
                 total = block.rows.total_row
                 if total is not None and total.keep_as:
                     w(total.keep_as, sheet).list_totals.append(block)
+                sub = block.rows.subtotals
+                if sub is not None and sub.keep_as:
+                    w(sub.keep_as, sheet).list_subtotals.append(block)
     return out
 
 
@@ -395,6 +414,15 @@ def _base_total_fragments(w: _Writers) -> list[NoteFragment]:
         b.rows.total_row is not None and not b.rows.total_row.keep_as for b in w.lists)
     if dropped:
         out.append(NoteFragment("total_not_kept", None, NOTE_TEXT["total_not_kept"]))
+    # 期 5：穿插的小计行不在本表里：另存在哪，或者没导入
+    for b in w.lists:
+        sub = b.rows.subtotals
+        if sub is None:
+            continue
+        if sub.keep_as:
+            _add_unique(out, _frag("subtotal_kept", sub.keep_as, NOTE_TEXT["subtotal_kept"].format(table=_tab(sub.keep_as))))
+        elif all(f.key != "subtotal_not_kept" for f in out):
+            out.append(NoteFragment("subtotal_not_kept", None, NOTE_TEXT["subtotal_not_kept"]))
     return out
 
 
@@ -450,6 +478,13 @@ def _kept_total_fragments(ctx: _Ctx, table: str, w: _Writers) -> list[NoteFragme
         else:
             frag = _frag(key, table, NOTE_TEXT[key].format(base=_tab(block.table)))
         _add_unique(out, frag)
+    for block in w.list_subtotals:
+        # 期 5：另存的小计：T 通过才说「核对一致」，没核对上的（无法核对）照实说部分未能核对；不一致的整份拒收
+        t = ctx.check(table, ctx.plan.t.get(f"{block.id}{SUBTOTAL_KEY}"), f"块「{block.id}」的小计行")
+        if t is None or _blocking(t):
+            continue
+        key = "list_subtotal_passed" if t.status == "passed" else "list_subtotal_unverified"
+        _add_unique(out, _frag(key, table, NOTE_TEXT[key].format(base=_tab(block.table))))
     return out
 
 
@@ -653,10 +688,17 @@ def _date_key(ctx: _Ctx, w: _Writers, table: str, col: ColumnOut) -> str | None:
     return None
 
 
+def _period_column_key(col: ColumnOut) -> str | None:
+    """期 5：系统加的统计期起止两列（role=period）用哪条列说明。"""
+    if col.role != "period":
+        return None
+    return "period_start" if col.name == LIST_PERIOD_START else "period_end" if col.name == LIST_PERIOD_END else None
+
+
 def _null_eligible(ctx: _Ctx, w: _Writers, table: str, col: ColumnOut) -> bool:
     """这一列要不要考虑空值说明：值列；主键不会是空值；表内合计表的空值已由表说明（未能核对）交代。"""
     value_col = col.role in ("measure", "value") and col.type in ("INTEGER", "REAL")
-    is_total = bool(w.kept_from or w.list_totals)
+    is_total = bool(w.kept_from or w.list_totals or w.list_subtotals)
     return value_col and not is_total and col.name not in set(ctx.grains.get(table, []))
 
 
@@ -668,6 +710,8 @@ def _column_templates(ctx: _Ctx, table: str, null_counts: Mapping[str, Mapping[s
         frags: list[str] = []
         if (date := _date_key(ctx, w, table, col)) is not None:
             frags.append(COLUMN_TEXT[date])
+        if (period := _period_column_key(col)) is not None:
+            frags.append(COLUMN_TEXT[period])
         if col.unit:
             frags.append(COLUMN_TEXT["unit"].format(unit=_tok("单位", col.unit)))
         has_nulls = counts is None or counts.get(col.name, 0) > 0
@@ -793,22 +837,27 @@ _FAMILY: dict[str, str] = {
     "hidden_excluded": "hidden_excluded", "hidden_included": "hidden_included",
     "ignored_columns": "ignored_columns", "ignored_rows": "ignored_rows", "ignored_cells": "ignored_cells",
     "rows_after_stop": "rows_after_stop",
+    "subtotal_kept": "subtotal_kept", "subtotal_not_kept": "subtotal_not_kept",
+    "list_subtotal_passed": "list_total", "list_subtotal_unverified": "list_total",
     "period_conflict_accepted": "period_conflict", "period_conflict_pending": "period_conflict",
     "period_human": "period_human", "outside_digits": "outside_digits",
     "note": "note",
 }
 #: 合并后的拼接顺序（与 _table_fragments 一致；累积特有的几句排在用户写的表说明之前）
-_FAMILY_ORDER = ("grain", "sum_eq", "not_comparable", "hour_range", "const", "total_kept", "total_not_kept", "total_k",
-                 "list_total", "total_overlap", "hidden_excluded", "hidden_included", "ignored_columns",
+_FAMILY_ORDER = ("grain", "sum_eq", "not_comparable", "hour_range", "const", "total_kept", "total_not_kept",
+                 "subtotal_kept", "subtotal_not_kept", "total_k", "list_total", "total_overlap", "hidden_excluded", "hidden_included", "ignored_columns",
                  "ignored_rows", "ignored_cells", "rows_after_stop", "period_conflict", "period_human",
                  "outside_digits", "union", "note")
 #: 与核对结论无关、只描述表结构的片段族：用目标配方那一期的；只在早期出现的 subject（退役的表、另存表）用
 #: 最后一个含它的那一期的
-_STRUCTURAL = frozenset({"grain", "hour_range", "const", "total_kept", "total_not_kept", "total_overlap", "note"})
+_STRUCTURAL = frozenset({"grain", "hour_range", "const", "total_kept", "total_not_kept", "total_overlap", "note",
+                         "subtotal_kept", "subtotal_not_kept"})
 #: 「任一期出现就写」的片段族 → 并集里的说法
 _ANY_UNION = {"hidden_excluded": "hidden_excluded_union", "hidden_included": "hidden_included_union",
               "ignored_columns": "ignored_columns_union", "ignored_rows": "ignored_rows_union",
-              "ignored_cells": "ignored_cells_union", "outside_digits": "outside_digits_union"}
+              "ignored_cells": "ignored_cells_union", "outside_digits": "outside_digits_union",
+              # 期 5：列表可以按期累积了，空行之后的文字行任一期有就写
+              "rows_after_stop": "rows_after_stop_union"}
 _K_PASSED = frozenset({"total_k_passed", "total_k_passed_g_unverifiable"})
 
 
@@ -943,20 +992,26 @@ def _merge_group(table: str, family: str, subject: str | None, group: dict[int, 
     if family == "period_human":
         key = "period_human_all" if len(present) == len(having) else "period_human_union"
         return NoteFragment(key, subject, NOTE_TEXT[key])
-    # list_total、rows_after_stop 只有列表才有，而列表不能按期累积（P3-SPEC 2.2）；不认识的片段族同样没有并集说法。
+    # list_total 只在列表的合计行、小计行另存的表上，这种表不能按期累积（accumulate_blockers）；不认识的片段族同样
+    # 没有并集说法。
     # 记 problems（不能保存），绝不沿用某一期的单期说法。消息给人看，不露片段族的键名
     problems.append(f"表「{table}」：{_UNMERGEABLE.get(family, '有一段说明')}不能按期合并，无法生成说明")
     return None
 
 
 #: 没有并集说法的片段族 → 给人看的叫法（problems 里不露键名）
-_UNMERGEABLE = {"list_total": "列表合计行的核对结论", "rows_after_stop": "列表空行之后的文字行"}
+_UNMERGEABLE = {"list_total": "列表合计行、小计行的核对结论"}
 
 
 def _axis_column(recipe: Recipe, table: str) -> str | None:
+    """各期按哪一列区分（说明里「请按 {col} 筛选」）：交叉表的日期轴；期 5 起列表按 period 绑定的日期列，或者
+    系统加的统计期起那一列。"""
     tables, _ = derive_tables(recipe)
     axes = [c.name for c in tables.get(table, []) if c.role == "axis"]
-    return axes[0] if len(axes) == 1 else None
+    if len(axes) == 1:
+        return axes[0]
+    spec = list_period_columns(recipe).get(table)
+    return spec[1] if spec else None
 
 
 def _union_table_fragments(table: str, having: list[int], parts: list[_UPart], ref: int, target: Recipe,
@@ -1037,6 +1092,8 @@ def _union_column_templates(table: str, columns: list[ColumnOut], having: list[i
             frags.append(COLUMN_TEXT["date_year_from_period"])
         elif "date" in dates or (not with_col and col.role == "axis"):
             frags.append(COLUMN_TEXT["date"])
+        if (period := _period_column_key(col)) is not None:
+            frags.append(COLUMN_TEXT[period])
         if target_cols is not None and col.name in target_cols:
             unit = target_cols[col.name].unit
         elif with_col:

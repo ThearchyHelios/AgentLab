@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from app.data import tabular
+from app.data import csv_grid, tabular
 from app.data.recipe_types import Grid, GridCell
 from app.data.xlsx_scan import SheetScan, UnsupportedTable, WorkbookScan, _broken, cell_ref, parse_ref
 
@@ -70,6 +70,13 @@ class Workbooks:
         self.raw = raw
         self._values: Any = None
         self._formulas: Any = None
+        self._csv: Any = None
+
+    def csv(self) -> Any:
+        """CSV 原件解析好的记录（csv_grid.CsvTable），第一次要读时才解析，同一次执行里复用。"""
+        if self._csv is None:
+            self._csv = csv_grid.parse(self.raw)
+        return self._csv
 
     def values(self) -> Any:
         if self._values is None:
@@ -126,6 +133,10 @@ def sheet_rows(books: Workbooks, sheet: SheetScan, *, min_row: int, max_row: int
     行数和每行的宽度都一样。文件内容写坏了（见 _READ_ERRORS）抛 UnsupportedTable，日志只记异常类型。
     """
     try:
+        if sheet.path == csv_grid.CSV_PATH:
+            # CSV 适配出来的「工作表」：从解析好的记录里取，口径同下（只给非空格、整行为空的不给）
+            yield from csv_grid.rows(books.csv(), min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col)
+            return
         yield from _sheet_rows(books, sheet, min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col)
     except UnsupportedTable:
         raise

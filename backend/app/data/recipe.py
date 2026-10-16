@@ -43,6 +43,9 @@ from app.data.recipe_parsers import (
     text_label,
 )
 from app.data.recipe_types import (
+    LIST_PERIOD_END,
+    LIST_PERIOD_START,
+    LIST_SUBTOTAL_DIM,
     LIST_TOTAL_DIM,
     ColumnOut,
     CrosstabBlock,
@@ -271,6 +274,8 @@ _FIELD_LABEL = {
     "parts": "组成列", "claims": "认领", "a": "一方", "b": "另一方", "reason": "理由",
     "ignore_rows": "按行标签忽略的行", "ignore_columns": "按表头忽略的列", "ignore_outside": "按同一行文字忽略的数字",
     "label": "标签", "anchor": "同一行的文字",
+    "subtotals": "小计行", "scope": "小计管哪些明细", "group_column": "分组的列", "period": "每行属于哪一期",
+    "column": "日期列", "check": "核对方式", "synthesize": "加统计期列",
 }
 
 
@@ -608,15 +613,25 @@ class _Checker:
         for si, bi, block in self.lists:
             base = ("sheets", si, "blocks", bi)
             cols = [(c.name, base + ("columns", n, "name")) for n, c in enumerate(block.columns)]
+            if block.period is not None and block.period.synthesize:
+                # 期 5：加上的统计期起止两列也是这张表的列，和表头推出的列名不能撞
+                pp = base + ("period", "synthesize")
+                cols += [(LIST_PERIOD_START, pp), (LIST_PERIOD_END, pp)]
             out.append(_Writer(block.table, base + ("table",), "data", cols, origin=_pointer(base)))
+            numeric = [(c.name, base + ("columns", n, "name")) for n, c in enumerate(block.columns) if c.type in _NUMERIC]
             total = block.rows.total_row
             if total is not None and total.keep_as:
                 tp = base + ("rows", "total_row", "keep_as")
-                tcols = [(LIST_TOTAL_DIM, tp)]
-                tcols += [(c.name, base + ("columns", n, "name"))
-                          for n, c in enumerate(block.columns) if c.type in _NUMERIC]
-                out.append(_Writer(total.keep_as, tp, "reported_total", tcols,
+                out.append(_Writer(total.keep_as, tp, "reported_total", [(LIST_TOTAL_DIM, tp)] + numeric,
                                    origin=_pointer(base + ("rows", "total_row"))))
+            sub = block.rows.subtotals
+            if sub is not None and sub.keep_as:
+                sp = base + ("rows", "subtotals", "keep_as")
+                scols = [(LIST_SUBTOTAL_DIM, sp)]
+                if sub.scope == "group_column" and sub.group_column:
+                    scols.append((sub.group_column, base + ("rows", "subtotals", "group_column")))
+                out.append(_Writer(sub.keep_as, sp, "reported_total", scols + numeric,
+                                   origin=_pointer(base + ("rows", "subtotals"))))
         return out
 
     # ---- 8. 名字 ----
@@ -680,6 +695,10 @@ class _Checker:
             if sheet.context:
                 continue
             for bi, block in enumerate(sheet.blocks):
+                if isinstance(block, ListBlock) and block.period is not None:
+                    # 期 5：每行属于哪一期要拿统计期来核对（按日期列）或填进去（加起止两列）
+                    self.add(("sheets", si, "blocks", bi, "period"), "covers_without_context",
+                             "要按统计期核对或填写每一行的统计期，但这个工作表没有配置统计期")
                 if not isinstance(block, CrosstabBlock):
                     continue
                 ap = ("sheets", si, "blocks", bi, "axis")
@@ -873,6 +892,10 @@ class _Checker:
             if total is not None and any(ch.isdigit() for ch in total.pick):
                 self.add(("sheets", si, "blocks", bi, "rows", "total_row", "pick"), "period_literal",
                          f"合计行的开头词「{total.pick}」不能含数字（配方里不能写死年份或期次）")
+            sub = block.rows.subtotals
+            if sub is not None and any(ch.isdigit() for ch in sub.pick):
+                self.add(("sheets", si, "blocks", bi, "rows", "subtotals", "pick"), "period_literal",
+                         f"小计行的开头词「{sub.pick}」不能含数字（配方里不能写死年份或期次）")
 
     # ---- 4、9、13. 单位：键是本表列名，值在词表里，与原表标签、表头里的单位一致 ----
 
@@ -902,10 +925,13 @@ class _Checker:
                     self.unit_against(seg.keep_as.table, seg.keep_as.value, target.locate.title, "分段标题")
         for _si, _bi, block in self.lists:
             total = block.rows.total_row
+            sub = block.rows.subtotals
             for c in block.columns:
                 self.unit_against(block.table, c.name, c.header, "表头")
                 if total is not None and total.keep_as and c.type in _NUMERIC:
                     self.unit_against(total.keep_as, c.name, c.header, "表头")
+                if sub is not None and sub.keep_as and c.type in _NUMERIC:
+                    self.unit_against(sub.keep_as, c.name, c.header, "表头")
 
     def after_target(self, si: int, bi: int, seg: DerivedSegment) -> DimensionSegment | None:
         """合计分段紧跟的那个 dimension 分段（同一块里按 id 找）；找不到或不是 dimension 段时已报 derived_after_invalid。"""
@@ -998,6 +1024,8 @@ class _Checker:
             if total is not None and total.label_column not in names:
                 self.add(base + ("rows", "total_row", "label_column"), "column_unknown",
                          f"合计标签所在的列「{total.label_column}」不在这个列表的列里{self._near(total.label_column, names)}")
+            self.check_subtotals(base, block, names)
+            self.check_list_period(base, block, names)
             seen: dict[str, str] = {}
             for n, c in enumerate(block.columns):
                 key = match_key(c.header)
@@ -1005,6 +1033,50 @@ class _Checker:
                     self.add(base + ("columns", n, "header"), "label_duplicate",
                              f"表头「{c.header}」与「{seen[key]}」是同一个表头")
                 seen.setdefault(key, c.header)
+
+    def check_subtotals(self, base: tuple[Any, ...], block: ListBlock, names: list[str]) -> None:
+        """期 5：小计行的标签列、分组列要是这个列表的列；按组小计要给分组列；小计和合计的开头词不能互为前缀
+        （「合计」「合计小计」：一行就分不清是小计还是合计）。"""
+        sub = block.rows.subtotals
+        if sub is None:
+            return
+        sp = base + ("rows", "subtotals")
+        if sub.label_column not in names:
+            self.add(sp + ("label_column",), "column_unknown",
+                     f"小计标签所在的列「{sub.label_column}」不在这个列表的列里{self._near(sub.label_column, names)}")
+        if sub.scope == "group_column":
+            if not sub.group_column:
+                self.add(sp + ("group_column",), "subtotal_group_missing", "按组小计时要指明按哪一列分组")
+            elif sub.group_column not in names:
+                self.add(sp + ("group_column",), "column_unknown",
+                         f"小计分组的列「{sub.group_column}」不在这个列表的列里{self._near(sub.group_column, names)}")
+        elif sub.group_column:
+            self.add(sp + ("group_column",), "subtotal_group_missing",
+                     "小计管「上一行小计之后的全部明细」时不按列分组，请去掉分组的列，或改为按组小计")
+        total = block.rows.total_row
+        if total is not None:
+            a, b = match_key(sub.pick), match_key(total.pick)
+            if a.startswith(b) or b.startswith(a):
+                self.add(sp + ("pick",), "subtotal_pick_conflict",
+                         f"小计行的开头词「{sub.pick}」和合计行的「{total.pick}」一个是另一个的开头，分不清是小计还是合计")
+
+    def check_list_period(self, base: tuple[Any, ...], block: ListBlock, names: list[str]) -> None:
+        """期 5：每行属于哪一期，按日期列核对和加起止两列只能二选一；按日期列时那一列要是这个列表的日期列。"""
+        period = block.period
+        if period is None:
+            return
+        pp = base + ("period",)
+        if (period.column is None) == (period.synthesize is None):
+            self.add(pp, "list_period_invalid", "每一行属于哪一期只能二选一：按一个日期列核对，或加统计期起止两列")
+            return
+        if period.column is not None:
+            col = next((c for c in block.columns if c.name == period.column), None)
+            if col is None:
+                self.add(pp + ("column",), "column_unknown",
+                         f"核对统计期的列「{period.column}」不在这个列表的列里{self._near(period.column, names)}")
+            elif col.type != "DATE":
+                self.add(pp + ("column",), "list_period_invalid",
+                         f"核对统计期的列「{period.column}」的类型要是日期")
 
     # ---- 期 3：忽略规则、表头上方的标题（P3-SPEC 9.2） ----
 

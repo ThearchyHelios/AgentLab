@@ -315,7 +315,7 @@ def test_accumulate_mode_follows_eligibility():
     probs = run(lr, facts=None)
     assert [(p.code, p.path) for p in probs] == [("accumulate_unkeyed", "/tables/0"),
                                                 ("accumulate_unkeyed", "/tables/1")]
-    assert "列表形态的表目前只支持每期替换" in probs[0].message
+    assert "没有指定每一行属于哪一期" in probs[0].message
     # 同一份配方每期替换时不报
     lr["mode"] = "replace"
     assert run(lr, facts=None) == []

@@ -532,7 +532,8 @@ def test_problems_for_inconsistent_inputs():
 
 
 def test_list_tables_cannot_be_merged_and_are_problems():
-    """列表不能按期累积（P3-SPEC 2.2）：真把两期列表并起来，列表合计没有并集说法，记 problems，绝不沿用单期说法。"""
+    """列表合计行另存的表不能按期累积（accumulate_blockers）：真把两期这样的列表并起来，列表合计没有并集说法，记
+    problems，绝不沿用单期说法。"""
     data = deepcopy(LIST_RECIPE)
 
     def lpart(span):
@@ -544,7 +545,7 @@ def test_list_tables_cannot_be_merged_and_are_problems():
     tgt = Recipe.model_validate(data)
     notes = build_union_notes(tgt, [lpart(AUG), lpart(SEP)], union_tables=derive_tables(tgt)[0], null_counts=None,
                               part_null_counts=None, added=[], retired=[], label_sets=[], gaps=False)
-    assert any("列表合计行的核对结论不能按期合并" in p for p in notes.problems)
+    assert any("列表合计行、小计行的核对结论不能按期合并" in p for p in notes.problems)
     assert not any("list_total" in p for p in notes.problems)          # 不露键名
     assert "一致" not in notes.tables["销售_表内合计"].comment
 

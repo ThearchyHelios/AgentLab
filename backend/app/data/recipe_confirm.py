@@ -43,7 +43,7 @@ from app.data.recipe_diff import (
 )
 from app.data.recipe_parsers import UNITS, match_key, period_residue, split_unit_suffix
 from app.data.recipe_types import (
-    ConfirmItem, CrosstabBlock, DerivedSegment, Dismissed, ListBlock, MeasuresSegment, NotComparable, Recipe,
+    LIST_PERIOD_END, LIST_PERIOD_START, SUBTOTAL_KEY, ConfirmItem, CrosstabBlock, DerivedSegment, Dismissed, ListBlock, MeasuresSegment, NotComparable, Recipe,
     SheetRecipe, SumEq, derive_tables,
 )
 
@@ -523,6 +523,12 @@ def _signatures(recipe: Recipe, sheet_name: Callable[[SheetRecipe], str]) -> dic
                 total = block.rows.total_row
                 out[f"total_row:{block.id}"] = _sig(
                     None if total is None else (total.label_column, total.pick, total.keep_as))
+                # 期 5：穿插的小计、每行属于哪一期
+                subt = block.rows.subtotals
+                out[f"subtotals:{block.id}"] = _sig(
+                    None if subt is None else (subt.label_column, subt.pick, subt.scope, subt.group_column, subt.keep_as))
+                period = block.period
+                out[f"list_period:{block.id}"] = _sig(None if period is None else (period.column, period.synthesize))
     for r in recipe.relations:
         if isinstance(r, SumEq):
             out[f"relation:{r.id}"] = _sig("sum_eq", r.table, r.total, sorted(r.parts))
@@ -1058,6 +1064,25 @@ def _recipe_items(bag: _Bag, recipe: Recipe, ex: dict[str, Any], facts: Any, *, 
             detail = (f"按明细核对的列：{'、'.join(nums)}；其余列合计行里的内容不核对" if nums
                       else "这个块没有数字列，合计行里的内容不核对")
             bag.add(f"total_row:{b.id}", f"{prefix}改作核对{keep}", detail)
+    for b in lists:
+        # 期 5：穿插在明细中间的小计行：不进数据，按各组明细核对。要人确认：这几行从此不在本表里
+        subt = b.rows.subtotals
+        if subt is not None:
+            rows = rows_text(derived_rows.get(f"{b.id}{SUBTOTAL_KEY}"))
+            prefix = f"「{b.id}」中间的小计行" + (f"（{rows}）" if rows else "")
+            keep = f"，原值另存表「{subt.keep_as}」" if subt.keep_as else "，原值不另存"
+            scope = ("每行小计核对上一行小计之后的全部明细" if subt.scope == "since_previous"
+                     else f"每行小计核对紧挨在它上面、「{subt.group_column}」相同的那几行明细")
+            nums = [c.name for c in b.columns if c.type in ("INTEGER", "REAL")]
+            detail = f"{scope}；按明细核对的列：{'、'.join(nums)}" if nums else f"{scope}；这个块没有数字列，不核对"
+            bag.add(f"subtotals:{b.id}", f"{prefix}改作核对、不进数据{keep}", detail)
+        period = b.period
+        if period is not None and period.column:
+            bag.add(f"list_period:{b.id}", f"「{b.id}」每一行的「{period.column}」都要在本期统计期内",
+                    "按期累积时各期的行按这一列区分；有一行不在本期统计期内（或为空），这一期整份拒收")
+        elif period is not None and period.synthesize:
+            bag.add(f"list_period:{b.id}", f"「{b.id}」每一行加上本期统计期的起、止两列",
+                    f"列名「{LIST_PERIOD_START}」「{LIST_PERIOD_END}」，取自表内的统计期或人工录入的统计期")
 
     # 年份取自统计期：表头是日期格时年份来自格子本身，不算
     forms: dict[str, set[str]] = {}

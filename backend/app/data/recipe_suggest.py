@@ -12,6 +12,11 @@ validate）和执行器干跑（注入的 dry_run），再由人逐条确认之�
 哪些是区域外文字、哪些格没有去处）直接用执行器的结论：同一件事只有执行器一套判法，这里自己定位只是没有
 干跑时的近似。
 
+**期 5（下一轮 03 细案 E）。** 有 Excel 表格对象（插入 → 表格）的工作表优先按表格对象出列表块（_lists_from_tables：
+表头、列范围、汇总行都是表格对象给的，锚点仍按表头文字）；夹在明细中间、第一列以同一个合计字样开头的行提议成
+穿插的小计（_settle_subtotals），不再一律记起草失败；每个列表都问一道「每期怎么更新」（q_list_period），选按期
+累积时同时绑定每一行属于哪一期（按日期列核对，或加统计期起止两列）。
+
 **问题的 effects 怎么写。** 每个选项是一组 JSON Patch，路径按传进来的配方写；接口层从 answers_base 起、按
 问题顺序重放全部回答（P2-SPEC 7.2）。因此：
 - 关系的两个选项都用整条 replace（「登记」写回完整的 sum_eq / not_comparable，「不登记」写 dismissed），
@@ -63,7 +68,7 @@ from app.data.recipe_types import (
     derive_tables,
 )
 from app.data.tabular import DATE_HEADER_MIN, EXCEL_ERRORS
-from app.data.xlsx_scan import WorkbookScan, cell_ref, col_letter, parse_ref
+from app.data.xlsx_scan import TableScan, WorkbookScan, cell_ref, col_letter, parse_ref
 
 logger = logging.getLogger(__name__)
 
@@ -612,8 +617,15 @@ class _ListPlan:
     #: 按数据行收进来并记起草失败
     adjacent: list[tuple[int, list[int]]] = field(default_factory=list)
     #: 不在末尾第一列的合计字样：(行, 列)。第一列在中间或最上面、或者落在别的列上，都无法按合计行核对，
-    #: 记起草失败；不记就会把合计当明细导入，求和翻倍（H2）
+    #: 记起草失败；不记就会把合计当明细导入，求和翻倍（H2）。期 5：第一列里同一个字样的穿插行先记进 subtotal_rows，
+    #: 收完整块再判能不能提议成小计（_settle_subtotals）；判不了的才回到这里
     stray_totals: list[tuple[int, int]] = field(default_factory=list)
+    #: 期 5：穿插在明细中间、第一列以合计字样开头的行（不进 rows）和它们的字样；能提议成小计时 subtotal_word 非空
+    subtotal_rows: list[int] = field(default_factory=list)
+    subtotal_words: list[str] = field(default_factory=list)
+    subtotal_word: str | None = None
+    #: 期 5：按 Excel 的表格对象起草的（xlsx_scan.TableScan 的名字）：表名优先用它，卡片里写明
+    table_object: str | None = None
     # 命名阶段填
     id: str = ""
     table: str = ""
@@ -808,13 +820,44 @@ def _scan_block(grid: Grid, plan: _ListPlan, bottom: int) -> None:
         if word is not None and plan.rows and not _more_rows(grid, r, plan, bottom, types):
             plan.total_row, plan.total_word = r, word
             break
+        others = [(r, c) for c, cell in zip(cols[1:], cells[1:])
+                  if cell is not None and _total_word(cell.value) is not None]
+        plan.stray_totals.extend(others)
+        if word is not None and plan.rows and not others:
+            # 期 5：夹在明细中间的合计字样，先当小计候选：不进数据行，收完整块再判（_settle_subtotals）
+            plan.subtotal_rows.append(r)
+            plan.subtotal_words.append(word)
+            r += 1
+            continue
         if word is not None:
             plan.stray_totals.append((r, cols[0]))
-        plan.stray_totals.extend((r, c) for c, cell in zip(cols[1:], cells[1:])
-                                 if cell is not None and _total_word(cell.value) is not None)
         plan.rows.append(r)
         acc.add(r)
         r += 1
+    _settle_subtotals(grid, plan)
+
+
+def _settle_subtotals(grid: Grid, plan: _ListPlan) -> None:
+    """期 5：夹在明细中间的合计字样能不能提议成小计（ListRows.subtotals，规则起草不再把它们记成失败）。
+
+    能的条件：都在第一列、是同一个字样，每一行至少有一格数（没有数的小计核对不了）。末尾那一行和它们字样相同时
+    （表以最后一组的小计结束，没有总计），它也是小计，不是合计行。不能的（字样不同、有一行没有数）照旧记进
+    stray_totals（起草失败，交给人或 AI），这些行回到数据行里——和期 4 的结果一样。"""
+    if not plan.subtotal_rows:
+        return
+    words = set(plan.subtotal_words)
+    numeric = [c for c in plan.cols[1:] if any(_value_num(grid.get(r, c)) is not None for r in plan.rows)]
+    ok = len(words) == 1 and all(any(_value_num(grid.get(r, c)) is not None for c in numeric)
+                                 for r in plan.subtotal_rows)
+    if ok:
+        plan.subtotal_word = next(iter(words))
+        if plan.total_row is not None and plan.total_word == plan.subtotal_word:
+            plan.subtotal_rows.append(plan.total_row)
+            plan.total_row = plan.total_word = None
+        return
+    plan.stray_totals.extend((r, plan.cols[0]) for r in plan.subtotal_rows)
+    plan.rows = sorted(set(plan.rows) | set(plan.subtotal_rows))
+    plan.subtotal_rows, plan.subtotal_words = [], []
 
 
 def _list_failures(sheet: str, grid: Grid, plan: _ListPlan) -> list[_Failure]:
@@ -898,7 +941,8 @@ def _analyze_lists(grid: Grid) -> _Lists:
             _finish_block(grid, plan)
             out.failures.extend(_list_failures(grid.sheet, grid, plan))
             out.blocks.append(plan)
-        end = max((p.total_row or (p.rows[-1] if p.rows else p.header_rows[-1])) for p in made)
+        end = max(max([p.total_row or 0, *p.subtotal_rows, p.rows[-1] if p.rows else p.header_rows[-1]])
+                  for p in made)
         while r_idx < len(rows) and rows[r_idx] <= end:
             r_idx += 1
     return out
@@ -945,7 +989,7 @@ def _finish_block(grid: Grid, plan: _ListPlan) -> None:
             break
         if cells:
             break
-    last = plan.total_row or rows[-1]
+    last = max([plan.total_row or 0, rows[-1], *plan.subtotal_rows])
     for r in range(plan.header_rows[0], last + 1):
         for c in cols:
             if grid.get(r, c) is not None or r in plan.header_rows:
@@ -975,15 +1019,77 @@ class _Sheet:
     hidden_cols: list[int] = field(default_factory=list)
 
 
-def _analyze_sheet(grid: Grid, sid: str) -> _Sheet:
+def _lists_from_tables(grid: Grid, objects: list[TableScan]) -> _Lists | None:
+    """期 5：按 Excel 的表格对象（插入 → 表格）起草列表块。表格对象明确给出了表头行、列范围、数据行和汇总行，比按
+    「像不像表头」猜可靠：数字格空着的行不会被当成表头，紧挨着的两张表也分得开。
+
+    出来的块和按规则猜的一样只记文字：锚点仍按表头文字（不记坐标，下一期表格挪了位置照样认得出），汇总行按第一列
+    的文字映射成合计行（total_row），夹在中间的合计字样按小计提议（_settle_subtotals）。表格对象的 ref 写坏了、
+    没有表头行时返回 None，退回按规则猜。"""
+    out = _Lists(sheet=grid.sheet)
+    spans = sorted(((t.span(), t) for t in objects), key=lambda x: (x[0] or (0, 0, 0, 0))[:2])
+    for span, t in spans:
+        if span is None or t.header_row_count < 1:
+            return None
+        r1, c1, r2, c2 = span
+        hrows = list(range(r1, r1 + t.header_row_count))
+        cols = list(range(c1, c2 + 1))
+        texts = _header_texts(grid, hrows, cols)
+        if set(texts) != set(cols):
+            blank = [col_letter(c) for c in cols if c not in texts]
+            msg = (f"工作表「{grid.sheet}」：表格「{t.name}」的表头有空着的列（{'、'.join(blank)} 列），"
+                   "按列表导入要每一列都有表头文字")
+            out.failures.append(_Failure(msg, msg))
+            continue
+        plan = _ListPlan(header_rows=hrows, cols=cols, headers={c: texts[c] for c in cols}, table_object=t.name)
+        last_data = r2 - max(t.totals_row_count, 0)
+        rows = [r for r in grid.row_numbers() if hrows[-1] < r <= last_data and any(grid.get(r, c) is not None
+                                                                                      for c in cols)]
+        prev = hrows[-1]
+        for r in rows:
+            if r > prev + 1:
+                plan.skip_blank = True
+                plan.skipped.extend(range(prev + 1, r))
+            prev = r
+            word = _total_word(_label_of(grid.get(r, c1)))
+            if word is not None and plan.rows:
+                plan.subtotal_rows.append(r)
+                plan.subtotal_words.append(word)
+                continue
+            plan.rows.append(r)
+        if not plan.rows:
+            msg = f"工作表「{grid.sheet}」：表格「{t.name}」的表头下面没有数据行"
+            out.failures.append(_Failure(msg, msg))
+            continue
+        if t.totals_row_count > 0:
+            tr = last_data + 1
+            label = _label_of(grid.get(tr, c1))
+            word = _total_word(label) or (label if label and len(label) <= 12 and not any(
+                ch.isdigit() for ch in label) else None)
+            if word is not None:
+                plan.total_row, plan.total_word = tr, word
+            else:
+                why = ("起草只读了表格前面的部分，没读到汇总行" if grid.truncated and tr > max(grid.row_numbers())
+                       else "汇总行的第一列没有可用作合计标签的文字（不能含数字、不超过 12 个字）")
+                msg = f"工作表「{grid.sheet}」：表格「{t.name}」的汇总行（第 {tr} 行）无法按合计行核对：{why}"
+                out.failures.append(_Failure(msg, msg))
+        _settle_subtotals(grid, plan)
+        _finish_block(grid, plan)
+        out.failures.extend(_list_failures(grid.sheet, grid, plan))
+        out.blocks.append(plan)
+    return out
+
+
+def _analyze_sheet(grid: Grid, sid: str, objects: list[TableScan] | None = None) -> _Sheet:
     sh = _Sheet(sheet=grid.sheet, sid=sid)
     axis = _axis_row(grid)
+    from_objects = _lists_from_tables(grid, objects) if objects and axis is None else None
     if axis is not None:
         sh.cross = _analyze_crosstab(grid, *axis)
         sh.region = set(sh.cross.region)
         sh.failures.extend(sh.cross.failures)
     else:
-        sh.lists = _analyze_lists(grid)
+        sh.lists = from_objects if from_objects is not None else _analyze_lists(grid)
         sh.failures.extend(sh.lists.failures)
         for b in sh.lists.blocks:
             sh.region |= b.region
@@ -1111,7 +1217,8 @@ def _measure_column(label: str, pos: int) -> tuple[str, str | None, str | None]:
 def _analyze(scan: WorkbookScan, grids: dict[str, Grid]) -> _Analysis:
     visible = _visible_grids(scan, grids)
     hidden = [s.name for s in scan.sheets if s.state != "visible"]
-    sheets = [_analyze_sheet(g, f"s{i + 1}") for i, g in enumerate(visible)]
+    sheets = [_analyze_sheet(g, f"s{i + 1}", [t for t in scan.tables if t.sheet == g.sheet])
+              for i, g in enumerate(visible)]
     failures = [f for sh in sheets for f in sh.failures]
 
     tables_used: set[str] = set()
@@ -1266,7 +1373,9 @@ def list_block(sheet: str, b: _ListPlan, *, block_id: str, tables_used: set[str]
     合计表名撞了已用的名字时照起草器的老行为：不另建表定义，keep_as 仍写这个名字（交给静态校验报）。"""
     b.id = block_id
     if table is None:
-        title = b.title if b.title and not any(ch.isdigit() for ch in b.title) else None
+        # 期 5：按表格对象起草的，表名优先用表格对象的名字（不含数字时；Excel 默认的「表1」不用）
+        named = b.table_object if b.table_object and not any(ch.isdigit() for ch in b.table_object) else None
+        title = named or (b.title if b.title and not any(ch.isdigit() for ch in b.title) else None)
         want = _ENUM_PREFIX.sub("", P.split_unit_suffix(title)[0]) if title else sheet
         n_fallback = len(tables_used) + 1
         b.table = _unique(to_sql_name(want, fallback=f"表{n_fallback}") if want else f"表{n_fallback}", tables_used)
@@ -1293,6 +1402,11 @@ def list_block(sheet: str, b: _ListPlan, *, block_id: str, tables_used: set[str]
             total_spec = {"name": keep, "grain": ["合计项"], "kind": "reported_total", "units": num_units, "note": ""}
         b.keep_table = keep
         total = {"label_column": b.names[b.cols[0]], "pick": b.total_word, "keep_as": keep}
+    subtotals = None
+    if b.subtotal_word is not None:
+        # 期 5：穿插的小计只核对、不另存（另存的小计表不能按期累积，要另存由人在配方面板里打开）
+        subtotals = {"label_column": b.names[b.cols[0]], "pick": b.subtotal_word, "scope": "since_previous",
+                     "group_column": None, "keep_as": None}
     grain = [b.names[b.grain_col]] if b.grain_col is not None else []
     main = {"name": b.table, "grain": grain, "kind": "data", "units": dict(b.units), "note": ""}
     fill = bool(b.merged_fill) and all(r2 > r1 and c1 == c2 and b.types.get(c1) == "TEXT"
@@ -1300,7 +1414,8 @@ def list_block(sheet: str, b: _ListPlan, *, block_id: str, tables_used: set[str]
     block = {
         "id": b.id, "layout": "list", "table": b.table, "header_rows": len(b.header_rows),
         "after_title": None, "columns": cols_out, "extra_columns": "reject",
-        "rows": {"blank_rows": "skip" if b.skip_blank else "stop", "total_row": total},
+        "rows": {"blank_rows": "skip" if b.skip_blank else "stop", "total_row": total,
+                 **({"subtotals": subtotals} if subtotals is not None else {})},
         "values": {"placeholders": [{"text": e[0], "meaning": "无数据"} for e in b.placeholders.values()],
                    "blank": "null", "text_number": "reject", "formula": "accept_cached"},
         "merged_data": "fill" if fill else "reject",
@@ -1797,6 +1912,8 @@ class _ListLoc:
     rows: list[int]
     total_row: int | None
     region: set[tuple[int, int]] = field(default_factory=set)
+    #: 期 5：穿插的小计行
+    subtotal_rows: list[int] = field(default_factory=list)
 
 
 def _find_grid(name: str, grids: dict[str, Grid]) -> Grid | None:
@@ -1943,19 +2060,26 @@ def _locate_list(block: ListBlock, grid: Grid, taken: set[int]) -> _ListLoc | No
     bottom = _bottom(grid)
     rr = r + 1
     pick = P.match_key(block.rows.total_row.pick) if block.rows.total_row else None
+    sub_pick = P.match_key(block.rows.subtotals.pick) if block.rows.subtotals else None
+    subs: list[int] = []
     while rr <= bottom:
         if all(grid.get(rr, c) is None for c in cols):
             if block.rows.blank_rows == "skip":
                 rr += 1
                 continue
             break
-        if pick and P.match_key(_label_of(grid.get(rr, cols[0])) or "").startswith(pick):
+        label = P.match_key(_label_of(grid.get(rr, cols[0])) or "")
+        if pick and label.startswith(pick):
             total = rr
             break
+        if sub_pick and label.startswith(sub_pick):
+            subs.append(rr)
+            rr += 1
+            continue
         rows.append(rr)
         rr += 1
-    loc = _ListLoc(hrows, cols, rows, total)
-    for row in [*hrows, *rows, *([total] if total else [])]:
+    loc = _ListLoc(hrows, cols, rows, total, subtotal_rows=subs)
+    for row in [*hrows, *rows, *subs, *([total] if total else [])]:
         loc.region.update((row, c) for c in cols)
     return loc
 
@@ -2130,6 +2254,9 @@ def questions_for(recipe: dict[str, Any], facts: DraftFacts, grids: dict[str, Gr
     if ext is not None and ext.sheets.skipped_hidden:
         for nm in _dedupe([item.get("sheet", "") for item in ext.sheets.skipped_hidden]):
             cards.append(_hidden_sheet_card(nm))
+    # 期 5：列表每期怎么更新的问题排在其余问题之后、q_mode 之前：它只和按期累积有关，不该顶掉期 2 起排在前面的问题
+    questions = ([q for q in questions if not q.id.startswith("q_list_period:")]
+                 + [q for q in questions if q.id.startswith("q_list_period:")])
     blockers = accumulate_blockers(parsed)
     cards.append(_mode_card(blockers))
     if not blockers:
@@ -2543,7 +2670,55 @@ def _list_cards(si: int, bi: int, sheet: Any, block: ListBlock, loc: _ListLoc | 
         reason += f"，原值另存表「{total.keep_as}」" if total.keep_as else "，只核对不另存"
         cells = _coords(name, [(loc.total_row, loc.cols[0])]) if loc is not None and loc.total_row else []
         cards.append(Card(f"total_row:{block.id}", f"{where}是合计行，改作核对", reason, cells))
+    subt = block.rows.subtotals
+    if subt is not None:
+        rows = loc.subtotal_rows if loc is not None else []
+        where = _rows_text(rows) if rows else f"「{subt.pick}」开头的行"
+        scope = ("上一行小计之后的全部明细" if subt.scope == "since_previous"
+                 else f"紧挨在它上面、「{subt.group_column}」相同的那几行明细")
+        reason = f"每行小计按列求和与{scope}核对，小计行不进数据"
+        reason += f"，原值另存表「{subt.keep_as}」" if subt.keep_as else "，只核对不另存"
+        cells = _coords(name, [(r, loc.cols[0]) for r in rows]) if loc is not None else []
+        cards.append(Card(f"subtotals:{block.id}", f"{where}是穿插的小计行，改作核对", reason, cells))
+    q = _list_period_question(si, bi, sheet, block, recipe)
+    questions.append(q)
+    cards.append(Card(f"list_period:{block.id}", "这份明细每期怎么更新",
+                      "每期替换：当前版本只含最新一期。按期累积：每期一份明细加进当前版本、可以跨期查询，要说明每一行"
+                      "属于哪一期——选一个日期列，核对每行都在本期统计期内；明细里没有能代表统计期的日期列时，"
+                      "选「每行加上本期统计期的起止两列」", [], q.id))
     return cards, questions
+
+
+def _list_period_question(si: int, bi: int, sheet: Any, block: ListBlock, recipe: dict[str, Any]) -> Question:
+    """期 5：列表每期怎么更新、按期累积时每一行属于哪一期（ListBlock.period），一道题定：每期替换（不绑定）；按期
+    累积并按某个日期列核对（每个日期列一个选项）；按期累积并给每行加统计期起止两列。后两种同时把导入模式改成按期
+    累积，所在工作表没配统计期的一并加上统计期（回执里统计期取自表内，没有就请人录入）。
+
+    为什么不分成「先绑定、再问 q_mode」两道题：问题集合按起草的草稿生成、回答时不变（recipe_imports.answer），
+    列表的草稿还没绑定统计期，不符合按期累积的资格，q_mode 根本不会出现。几个列表各答各的：有的选累积、有的选替换
+    时，静态校验照实报出没绑定的那个列表不能累积。"""
+    base = ["sheets", si, "blocks", bi, "period"]
+    context = [] if sheet.context else _add_ops(recipe, ["sheets", si, "context"], [
+        {"id": "统计期", "kind": "period", "parser": "cn_date_range", "prefer_prefix": None, "cross_check": "filename"}])
+    mode = _add_ops(recipe, ["mode"], "accumulate")
+    # 「每期替换」排第一个：它就是草稿本来的样子（期 4 起各处取第一个选项的地方都不会因此改了配方）
+    options: list[dict[str, Any]] = [{"value": "none", "label": "每期替换", "needs_reason": False}]
+    effects: dict[str, list[dict[str, Any]]] = {"none": _add_ops(recipe, base, None)}
+    for c in block.columns:
+        if c.type != "DATE":
+            continue
+        value = f"column:{c.name}"
+        options.append({"value": value, "label": f"按期累积，按「{c.name}」核对每行都在本期统计期内",
+                        "needs_reason": False})
+        effects[value] = context + mode + _add_ops(recipe, base, {"column": c.name, "check": "within_context",
+                                                                 "synthesize": None})
+    options.append({"value": "synthesize", "label": "按期累积，每行加上本期统计期的起止两列", "needs_reason": False})
+    effects["synthesize"] = context + mode + _add_ops(recipe, base, {"column": None, "check": "within_context",
+                                                                    "synthesize": "统计期"})
+    current = block.period
+    default = ("synthesize" if current is not None and current.synthesize else
+               f"column:{current.column}" if current is not None and current.column else "none")
+    return Question(f"q_list_period:{block.id}", f"列表「{block.id}」每期怎么更新", options, default, effects)
 
 
 # ==========================================================================

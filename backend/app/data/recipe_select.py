@@ -427,6 +427,21 @@ def _bottom_box(ctx: _Ctx, plan: Any, first: int) -> bool:
         ctx.fail("selection_bottom_not_anchorable",
                  f"框里只有表头和合计行（第 {last} 行），没有数据行：请把框扩大到数据所在的行")
         return False
+    # 期 5：框里夹在中间、第一列以合计字样开头、下面紧接着还有同一张表的明细的行（起草器 _scan_block 的同一条
+    # 规则），照起草器提议成小计（_settle_subtotals）；提议不成的照旧报错
+    mid = [r for r in data[1:] if S._total_word(S._label_of(grid.get(r, c1))) is not None]
+    rest = [r for r in data if r not in mid]
+    if mid and rest and not any(grid.get(r, c) is not None and S._total_word(grid.get(r, c).value) is not None
+                                for r in data for c in range(c1 + 1, c2 + 1)):
+        trial = S._ListPlan(header_rows=plan.header_rows, cols=plan.cols, headers=plan.headers, rows=rest,
+                            subtotal_rows=list(mid),
+                            subtotal_words=[S._total_word(S._label_of(grid.get(r, c1))) or "" for r in mid])
+        types = S._types_of(grid, rest, plan.cols)
+        if all(S._more_rows(grid, r, trial, S._bottom(grid), types) for r in mid):
+            S._settle_subtotals(grid, trial)
+        if trial.subtotal_word is not None:
+            plan.subtotal_rows, plan.subtotal_word = trial.subtotal_rows, trial.subtotal_word
+            data = [r for r in data if r not in mid]
     if not _no_stray_totals(ctx, data, c1, c2):
         return False
     bottom = S._bottom(grid)

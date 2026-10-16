@@ -2162,8 +2162,9 @@ await section('数据 · 表格：按配方导入', async () => {
   await dropZone.waitFor({ timeout: 4000 }).catch(() => {})
   const pickHint = await dropZone.innerText().catch(() => '')
   const accept = await dropZone.locator('input[type="file"]').getAttribute('accept').catch(() => '')
-  check('选文件区写「拖入文件」，提示的格式与选择框收的一致（.xlsx、.xlsm）', pickHint.includes('拖入文件')
-        && accept === '.xlsx,.xlsm' && pickHint.includes('.xlsx') && pickHint.includes('.xlsm'), `${pickHint} | ${accept}`)
+  check('选文件区写「拖入文件」，提示的格式与选择框收的一致（.xlsx、.xlsm、CSV / TSV）', pickHint.includes('拖入文件')
+        && accept === '.xlsx,.xlsm,.csv,.tsv' && pickHint.includes('.xlsx') && pickHint.includes('.xlsm')
+        && pickHint.includes('CSV'), `${pickHint} | ${accept}`)
   const dropFile = async (name) => {
     const dt = await page.evaluateHandle((n) => {
       const d = new DataTransfer()
@@ -2174,9 +2175,9 @@ await section('数据 · 表格：按配方导入', async () => {
     await dropZone.dispatchEvent('drop', { dataTransfer: dt })
     await page.waitForTimeout(200)
   }
-  await dropFile('drop_flow.csv')
-  check('……拖进来的不是 Excel：不选中，说明只支持 .xlsx、.xlsm', await dropZone.locator('[data-wizard-file]').count() === 0
-        && (await page.locator('body').innerText()).includes('不是 Excel 文件'))
+  await dropFile('drop_flow.pdf')
+  check('……拖进来的不是 Excel 或 CSV：不选中，说明支持哪几种', await dropZone.locator('[data-wizard-file]').count() === 0
+        && (await page.locator('body').innerText()).includes('不是 Excel 或 CSV 文件'))
   await dropFile('drop_flow.xlsx')
   check('……拖进来的文件被选中，名字取自文件名', (await dropZone.locator('[data-wizard-file]').innerText().catch(() => '')).includes('drop_flow.xlsx')
         && (await dialog(page).locator('[data-wizard-name]').inputValue().catch(() => '')) === 'drop_flow')

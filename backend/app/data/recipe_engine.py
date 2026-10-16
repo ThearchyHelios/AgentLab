@@ -39,6 +39,14 @@ pk_duplicate 同时出现）。块级的定位失败（找不到日期表头、�
   个矩形。
 - 回执里的「排除的行」rows_excluded（H2：排除的行要写进回执）：隐藏行、列表跳过的空行、按规则忽略的行、
   停止之后没导入的文字行、只核对不另存的合计行。
+
+**期 5（下一轮 03 细案 E）又加了两件事，同样没用新字段的配方写出的库逐字节不变：**
+- 列表中间穿插的小计（ListRows.subtotals）：小计行不进数据，每个数字格一条合计格，按它所管的那组明细（上一行小计
+  之后的全部明细，或紧挨在上面、分组列相同的那几行）交给核对模块用 SQL 求和比对；整行记进排除的行（subtotal）。
+- 列表按期累积时由系统加的统计期起止两列（ListPeriod.synthesize）：列表在统计期定下来之前就抽完了，这两格先放
+  占位，统计期定下来以后写库时换成真值（_Sink.fill_period）；按日期列分期的（ListPeriod.column）由核对模块的 D
+  核对查每行都在本期统计期内。
+CSV 原件经 csv_grid 适配成一张「工作表」，这里照常按网格或逐行流读（xlsx_cells 按 SheetScan.path 分派）。
 """
 from __future__ import annotations
 
@@ -64,10 +72,10 @@ from app.data.recipe_parsers import (
     period_residue, text_label, thousands_number,
 )
 from app.data.recipe_types import (
-    AxisOut, CanonEntry, CheckResult, ColumnOut, ContextSpec, CrosstabBlock, DerivedItem, DimensionSegment,
-    ExcludedRows, Extraction, Grid, GridCell, LedgerSheet, ListBlock, MeasuresSegment, OutsideText,
+    SUBTOTAL_KEY, AxisOut, CanonEntry, CheckResult, ColumnOut, ContextSpec, CrosstabBlock, DerivedItem,
+    DimensionSegment, ExcludedRows, Extraction, Grid, GridCell, LedgerSheet, ListBlock, MeasuresSegment, OutsideText,
     PeriodInput, PeriodOut, Problem, Recipe, RegionMark, SegmentLabels, SheetRecipe, TableOut, TableSpec,
-    derive_tables,
+    derive_tables, list_period_columns,
 )
 from app.data.xlsx_scan import MAX_MERGED, SheetScan, WorkbookScan, cell_ref, col_letter
 
@@ -101,7 +109,7 @@ PROBLEM_CODES: dict[str, str] = {
     # 列表定位
     "header_not_found": "structure", "header_ambiguous": "structure", "column_missing": "structure",
     "column_extra": "structure", "rows_after_stop": "confirm", "total_row_missing": "structure",
-    "total_row_blank": "structure", "list_empty": "confirm",
+    "total_row_blank": "structure", "list_empty": "confirm", "subtotal_blank": "structure",
     # 值
     "value_not_integer": "structure", "value_text_number": "structure", "value_blank": "structure",
     "value_error": "structure", "value_not_number": "structure", "value_not_date": "structure",
@@ -143,7 +151,7 @@ PLACEHOLDER_TEXTS_MAX = 8
 PLACEHOLDER_TEXT_LEN = 8
 #: 排除的行在回执里的顺序（同一工作表内按原因、块、锚点、首行排）
 _EXCLUDED_ORDER = ("hidden_excluded", "blank_skipped", "ignored_rows", "ignored_outside", "after_stop",
-                   "total_not_kept")
+                   "total_not_kept", "subtotal")
 #: 公式区域展开的上限：更大的区域不可能全落在基表里，直接判「引用了基表之外的格」
 REF_CELLS_MAX = 200_000
 
@@ -613,11 +621,18 @@ class _Problems:
 class _Sink:
     """一张表的行：主键去重、计数、溯源、批量写库（有库时）。rowid 就是插入序号（新库、1 起）。"""
 
-    def __init__(self, eng: _Engine, name: str, cols: list[ColumnOut], spec: TableSpec | None) -> None:
+    def __init__(self, eng: _Engine, name: str, cols: list[ColumnOut], spec: TableSpec | None,
+                 synth: tuple[str, str] | None = None) -> None:
         self.eng = eng
         self.name = name
         self.cols = cols
         names = [c.name for c in cols]
+        #: 期 5：由系统加的统计期起止两列（ListPeriod.synthesize）在一行里的位置。列表是在统计期定下来之前抽完的，
+        #: 这两格先放占位（_PERIOD_START / _PERIOD_END），统计期定下来以后（fill_period）写库时换成真值；在那之前
+        #: 不分批写库（flush 等着），整张表留在内存里
+        self.synth_idx = (names.index(synth[0]), names.index(synth[1])) \
+            if synth and synth[0] in names and synth[1] in names else None
+        self.period: tuple[str | None, str | None] | None = None
         self.grain = [g for g in (spec.grain if spec else []) if g in names]
         self.grain_idx = [names.index(g) for g in self.grain]
         self.check_pk = bool(self.grain_idx) and not eng.partial
@@ -682,9 +697,22 @@ class _Sink:
         self.eng.problems.issue("value_blank", sheet, f"工作表「{sheet}」的表「{self.name}」的主键列{_quoted(names)}",
                                 coords, text=_PK_NULL, group="pk_null")
 
-    def flush(self) -> None:
+    def fill_period(self, start: str | None, end: str | None) -> None:
+        """统计期定下来了：加的统计期起止两列从此写真值（start、end 是 YYYY-MM-DD）。"""
+        self.period = (start, end)
+
+    def flush(self, *, final: bool = False) -> None:
+        if self.synth_idx is not None and self.period is None and not final:
+            return              # 统计期还没定：加的两列还是占位，先不写
         if self.buffer and self.eng.conn is not None:
-            self.eng.conn.executemany(self.insert_sql, self.buffer)
+            rows = self.buffer
+            if self.synth_idx is not None:
+                a, b = self.synth_idx
+                start, end = self.period or (None, None)
+                fill = {a: start, b: end}
+                rows = [tuple(fill.get(i, v) if v is _PERIOD_START or v is _PERIOD_END else v
+                              for i, v in enumerate(row)) for row in rows]
+            self.eng.conn.executemany(self.insert_sql, rows)
         self.buffer.clear()
 
 
@@ -695,6 +723,12 @@ class _Sink:
 _FAIL = object()
 #: 列表数据区里不能填充的合并单元格覆盖的空格（已经报了 merged_in_values）
 _MERGED = object()
+#: 期 5：加的统计期起止两列在统计期定下来之前的占位（_Sink.fill_period）。主键判重时它们和自己相等：
+#: 同一期的行统计期都一样，判重只看其余的主键列，结论不变
+_PERIOD_START = object()
+_PERIOD_END = object()
+#: 小计按组时「还没有组」
+_NO_GROUP = object()
 
 
 # --------------------------------------------------------------------------
@@ -1625,6 +1659,22 @@ class _ListRun:
         self.ignore_keys = {k for rule in block.ignore_columns if (k := match_key(rule.header))}
         total = block.rows.total_row
         self.total_idx = next((i for i, c in enumerate(self.cols) if total and c.name == total.label_column), None)
+        # 期 5：穿插的小计行（ListRows.subtotals）。sub_first：上一行小计（或表头）之后第一行明细的 rowid；按组小计
+        # 时 run_first / run_value 是紧挨在上面、分组列取值相同的那一段明细的首个 rowid 和取值。sub_rows：小计所在的
+        # 行 → 它管的明细的 rowid（合计行的公式引用了小计格时，按它换算回明细）
+        self.sub = block.rows.subtotals
+        sub = self.sub
+        self.sub_idx = next((i for i, c in enumerate(self.cols) if sub and c.name == sub.label_column), None)
+        self.sub_key = match_key(sub.pick) if sub else ""
+        self.group_idx = next((i for i, c in enumerate(self.cols)
+                               if sub and sub.scope == "group_column" and c.name == sub.group_column), None)
+        self.sub_first: int | None = None
+        self.run_first: int | None = None
+        self.run_value: Any = _NO_GROUP
+        self.sub_hidden = False
+        self.sub_rows: dict[int, list[int]] = {}
+        #: 期 5：加统计期起止两列（ListPeriod.synthesize）：每行末尾两格占位，统计期定下来以后由 _Sink 换成真值
+        self.synth = block.period is not None and block.period.synthesize is not None
 
     # ---------------- 喂入 ----------------
 
@@ -2001,6 +2051,7 @@ class _ListRun:
         fills = self._merges_at(r, inb)
         if self.sh.hidden_row(r):
             self.hidden_seen = True
+            self.sub_hidden = True
             if self.sh.sr.hidden.rows == "exclude":
                 self.excluded_rows.add(r)
                 self.sh.layout(r, self.layout_hidden)
@@ -2011,6 +2062,11 @@ class _ListRun:
             pick = match_key(block.rows.total_row.pick)  # type: ignore[union-attr]
             if label is not None and match_key(_text(label.value)).startswith(pick):
                 self._total_row(r, inb, cells, label)
+                return
+        if self.sub_idx is not None:
+            label = inb.get(self.colmap.get(self.sub_idx, -1))
+            if label is not None and match_key(_text(label.value)).startswith(self.sub_key):
+                self._subtotal_row(r, inb, cells, label)
                 return
         self._record(r, inb, cells, fills)
 
@@ -2073,6 +2129,8 @@ class _ListRun:
                 v = None
             values.append(v)
             lineage.append((col.name, r, c))
+        if self.synth:
+            values += [_PERIOD_START, _PERIOD_END]
         ignored = self.ignored
         claims = {c: ("ignored_column" if c in ignored else "value") for c in inb}
         self.sh.layout(r, self.layout_data)
@@ -2084,6 +2142,12 @@ class _ListRun:
                 if self.rowid_first is None:
                     self.rowid_first = rowid
                 self.rowid_last = rowid
+                if self.sub_first is None:
+                    self.sub_first = rowid
+                if self.group_idx is not None:
+                    group = values[self.group_idx]
+                    if self.run_value is _NO_GROUP or group != self.run_value:
+                        self.run_first, self.run_value = rowid, group
         self.emit(r, cells, claims, True)
 
     def _total_row(self, r: int, inb: dict[int, GridCell], cells: list[tuple[int, GridCell]],
@@ -2142,7 +2206,67 @@ class _ListRun:
         self.stop = ("total", r)
         self.emit(r, cells, claims, True)
 
-    def _ref_lookup(self, rc: tuple[int, int]) -> str | int:
+    def _subtotal_row(self, r: int, inb: dict[int, GridCell], cells: list[tuple[int, GridCell]],
+                      label: GridCell) -> None:
+        """期 5：穿插在明细中间的一行小计。不进数据：标签格和数字格的去向是 total_label / total_value（同合计行），
+        每个数字格一条合计格（DerivedItem，kind=column_sum，分段键是块 id + SUBTOTAL_KEY），核对模块按它所管的那组
+        明细（rowid 闭区间）用 SQL 逐列求和比对，执行器不做加法（H1）；整行记进排除的行（reason=subtotal）。配了
+        keep_as 的另存一行（小计项、按组时的分组取值、各数字列）。
+
+        它管哪几行：since_previous 是上一行小计（或表头）之后的全部明细；group_column 是其中紧挨在它上面、分组列
+        取值相同的那一段。一行明细都没有时区间为空，核对判「无法核对」（合计行之上没有明细行）。数字格全空的小计
+        没有一列能核对，报 subtotal_blank（结构类）：不报的话这一行就悄悄没了核对。"""
+        eng, sh, block, sub = self.eng, self.sh, self.block, self.sub
+        assert sub is not None
+        claims = {c: ("ignored_column" if c in self.ignored else "total_label") for c in inb}
+        label_raw = _text(label.value)
+        first = self.sub_first
+        if sub.scope == "group_column" and first is not None and self.run_first is not None:
+            first = max(first, self.run_first)
+        last = self.rowid_last if first is not None else None
+        numeric = [(i, col) for i, col in enumerate(self.cols) if col.type in ("INTEGER", "REAL")]
+        if numeric and not any(self.colmap[i] in inb for i, _ in numeric):
+            coord = sh.coord(r, self.colmap[self.sub_idx])  # type: ignore[index]
+            where = f"{self.where}：小计行（{coord.split('!')[-1]}）的数字格全部为空"
+            eng.problems.add(
+                "subtotal_blank",
+                f"{where}，无法按这一组明细核对。请在文件中补上小计后重新上传；原表不再有小计时，在配方面板的"
+                "「小计行」中取消「有小计行」",
+                f"{where}，无法核对", [coord], sheet=sh.name)
+        key = f"{block.id}{SUBTOTAL_KEY}"
+        keep_values: list[Any] = []
+        for i, col in numeric:
+            c = self.colmap[i]
+            cell = inb.get(c)
+            if cell is None:
+                keep_values.append(None)
+                continue
+            claims[c] = "total_value"
+            got = eng.convert_number(cell, col.type, block.values, sh.name, f"{self.where}的小计行", r, c,
+                                     data_area=False)
+            keep_values.append(got)
+            item = DerivedItem(
+                kind="column_sum", segment=key, sheet=sh.name, cell=sh.coord(r, c), label_raw=label_raw,
+                label=canon(label_raw), value=None if got is _FAIL else got, is_formula=cell.formula is not None,
+                formula=cell.formula, base_table=block.table, base_value=col.name, rowid_first=first,
+                rowid_last=last, hidden_in_range=self.sub_hidden, keep_table=sub.keep_as)
+            if item.is_formula:
+                eng.resolve_refs(item, cell.formula or "", self._ref_lookup)
+            eng.ex.derived.append(item)
+        if sub.keep_as and sub.keep_as in eng.sinks:
+            ks = eng.sinks[sub.keep_as]
+            ks.sources.append(f"{sh.sr.id}/{block.id}")
+            group = [None if self.run_value is _NO_GROUP else self.run_value] if self.group_idx is not None else []
+            lin = [(col.name, r, self.colmap[i]) for i, col in numeric]
+            ks.add([canon(label_raw), *group, *keep_values], sheet=sh.name,
+                   at=(r, self.colmap[self.sub_idx]), cells=lin, fails=True)  # type: ignore[index]
+        n = sum(1 for role in claims.values() if role in ("total_label", "total_value"))
+        sh.exclude("subtotal", r, r, n, block=block.id, anchor=sub.pick)
+        self.sub_rows[r] = list(range(first, last + 1)) if first is not None and last is not None else []
+        self.sub_first, self.run_first, self.run_value, self.sub_hidden = None, None, _NO_GROUP, False
+        self.emit(r, cells, claims, True)
+
+    def _ref_lookup(self, rc: tuple[int, int]) -> str | int | list[int]:
         r, c = rc
         if self.c1 <= c <= self.c2:
             rowid = self.row_rowid.get(r)
@@ -2150,6 +2274,9 @@ class _ListRun:
                 return rowid
             if r in self.excluded_rows:
                 return "hidden"
+            if r in self.sub_rows:
+                # 合计行的公式引用了小计格（=C5+C9）：小计格代表它管的那组明细
+                return self.sub_rows[r]
         return "outside"
 
 
@@ -2343,7 +2470,8 @@ class _Engine:
                 self.canon_log[key] = CanonEntry(table, col.name, text, stored, 1, _coord(sheet, r, c))
         return stored
 
-    def resolve_refs(self, item: DerivedItem, formula: str, lookup: Callable[[tuple[int, int]], str | int]) -> None:
+    def resolve_refs(self, item: DerivedItem, formula: str,
+                     lookup: Callable[[tuple[int, int]], str | int | list[int]]) -> None:
         """合计公式的引用经溯源：全在基表 → ref_rowids；有隐藏行或分类汇总函数 → hidden；
         有不在基表的 → outside；形状认不出 → unrecognized。执行器不做加法（H1）。"""
         shape = formula_refs(formula)
@@ -2357,7 +2485,9 @@ class _Engine:
         outside = not cells
         for rc in cells:
             hit = lookup(rc)
-            if isinstance(hit, int):
+            if isinstance(hit, list):
+                rowids.extend(hit)       # 期 5：引用了小计格，换算成它管的明细
+            elif isinstance(hit, int):
                 rowids.append(hit)
             elif hit == "hidden":
                 hidden = True
@@ -2607,8 +2737,9 @@ class _Engine:
             self.ex.problems = self.problems.finish(set())
             return self.ex
         self.cols = cols
+        synth = {t: (spec[1], spec[2]) for t, spec in list_period_columns(self.recipe).items() if spec[0] == "synthesize"}
         for name, cs in cols.items():
-            self.sinks[name] = _Sink(self, name, cs, self.specs.get(name))
+            self.sinks[name] = _Sink(self, name, cs, self.specs.get(name), synth.get(name))
         if self.db_path is not None:
             _remove_db(self.db_path)
             self.conn = _open_sqlite(self.db_path, readonly=False)
@@ -2622,6 +2753,11 @@ class _Engine:
             crosstabs.extend(self._phase1(sh))
         t2 = time.perf_counter()
         period, period_reported, _ = self._period()
+        if self.ex.period is not None:
+            # 期 5：列表加的统计期起止两列现在才有值（列表在统计期定下来之前就抽完了）
+            for sink in self.sinks.values():
+                if sink.synth_idx is not None:
+                    sink.fill_period(self.ex.period.start, self.ex.period.end)
         for ct in crosstabs:
             ct.complete_axis(period, period_reported)
             ct.extract()
@@ -2650,7 +2786,7 @@ class _Engine:
                 _remove_db(self.db_path)  # type: ignore[arg-type]
             else:
                 for sink in self.sinks.values():
-                    sink.flush()
+                    sink.flush(final=True)
                 self.conn.execute("COMMIT")
                 self.conn.close()
                 self.conn = None
@@ -2748,7 +2884,9 @@ class _Engine:
             sh.failed = True
             return []
         b = s.bounds
-        if b is not None and not self.partial and b.area > tabular.SPARSE_FACTOR * max(s.nonempty, tabular.SPARSE_FLOOR):
+        # 稀疏判定挡的是 Excel 里误输入、残留格式撑大的已用区域；CSV 的每一格都是写出来的，空字段多只是数据稀疏
+        if b is not None and not self.partial and self.scan.format != "csv" \
+                and b.area > tabular.SPARSE_FACTOR * max(s.nonempty, tabular.SPARSE_FLOOR):
             far = "、".join(list(dict.fromkeys(s.far_cells))[:3])
             msg = (f"工作表「{sh.name}」的已用区域 {b.a1()} 共 {b.area:,} 个单元格，但只有 {s.nonempty:,} 个单元格有内容；"
                    f"远处的单元格（如 {far}）可能是误输入或残留格式。请在 Excel 中删除这些单元格后重新上传")

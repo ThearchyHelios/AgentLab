@@ -1231,8 +1231,6 @@ export const UPLOAD_TEXT = {
   shapeTitle: '该表格不是一行一条记录的明细表',
   shapeLead: '检测到以下结构，默认不导入：',
   shapeRecipe: '这类表格可以按配方导入：指定表头、分段和合计行的处理方式，试运行核对、逐条确认后再启用。',
-  /** CSV 没有配方这条路（配方只认 Excel 的工作表结构） */
-  shapeRecipeCsv: '按配方导入目前只支持 Excel（.xlsx）文件：可另存为 .xlsx 后再按配方导入。',
   shapeHeader: (row: number) => `如果表头不在第 ${row} 行，请取消后修改表头行号，再重新上传。`,
   /** 结构问题之外，预告的混合列：选按原样导入以后还要再选一次 */
   shapeMixedLead: '另外，以下各列以数字为主，但混有非数字的值。选择按原样导入后，还需要选择这些值的处理方式：',
@@ -1500,9 +1498,9 @@ export const RECIPE_TEXT = {
   descriptionLabel: '说明（供助手参考）',
   pickDrop: '拖入文件，或点击选择',
   /** 与选择框的 accept 一致 */
-  pickFormats: '支持 Excel（.xlsx、.xlsm）',
+  pickFormats: '支持 Excel（.xlsx、.xlsm）和 CSV / TSV',
   pickAria: '选择表格文件',
-  pickWrongType: (name: string) => `「${name}」不是 Excel 文件：按配方导入只支持 .xlsx、.xlsm`,
+  pickWrongType: (name: string) => `「${name}」不是 Excel 或 CSV 文件：按配方导入支持 .xlsx、.xlsm、.csv、.tsv`,
   cancelUpload: '取消上传',
   cancel: '取消',
   close: '关闭',
@@ -1637,6 +1635,18 @@ export const RECIPE_TEXT = {
   totalLabelColumn: '合计标签所在的列',
   totalPick: '合计行以此开头',
   totalKeep: '原表合计另存为表（留空则只核对）',
+  // 期 5：穿插的小计行（ListRows.subtotals）、列表每期怎么更新（ListBlock.period）
+  subtotals: '小计行',
+  subtotalsOn: '有小计行',
+  subtotalsHint: '夹在明细中间的小计不进数据，按它所管的那组明细逐列求和核对',
+  subtotalLabelColumn: '小计标签所在的列',
+  subtotalPick: '小计行以此开头',
+  subtotalScope: '一行小计管哪些明细',
+  subtotalGroupColumn: '按哪一列分组',
+  subtotalKeep: '原表小计另存为表（留空则只核对）',
+  listPeriod: '按期累积时每一行属于哪一期',
+  listPeriodColumn: '按哪个日期列核对',
+  listPeriodHint: '列表要按期累积，每一行都要说得出属于哪一期；所在工作表要配置统计期（表内没有时，每期试运行时录入）。导入模式另在「导入模式」中选',
   hiddenRows: '隐藏行',
   hiddenCols: '隐藏列',
   fallback: '工作表改名时',
@@ -1994,6 +2004,7 @@ export const RECEIPT_BLOCK_TEXT = {
     ignored_outside: '按配方忽略了区域外数字的行',
     after_stop: '列表结束之后的文字行',
     total_not_kept: '只核对、不另存的合计行',
+    subtotal: '穿插的小计行（核对后不进数据）',
   } as Record<string, string>,
   excludedOther: '其他原因',
   excludedTitle: '排除的行',
@@ -2107,6 +2118,8 @@ export const RECIPE_CHOICE_LABEL = {
   colType: { TEXT: '文字', INTEGER: '整数', REAL: '小数', DATE: '日期' } as Record<string, string>,
   colStore: { '': '默认', canonical: '规范写法', raw: '原文' } as Record<string, string>,
   axisChecks: { contiguous: '逐日连续', covers_context: '恰好覆盖统计期' } as Record<string, string>,
+  subtotalScope: { since_previous: '上一行小计之后的全部明细', group_column: '紧挨在上面、分组列取值相同的明细' } as Record<string, string>,
+  listPeriod: { none: '不区分（只能每期替换）', column: '按日期列核对每行都在本期统计期内', synthesize: '每行加上本期统计期的起止两列' } as Record<string, string>,
 }
 
 // ===========================================================================

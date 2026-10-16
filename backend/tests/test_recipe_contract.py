@@ -370,10 +370,12 @@ def test_accumulate_blockers_reference_recipe_is_eligible():
 
 def test_accumulate_blockers_list_shape_is_unkeyed():
     data = json.loads(json.dumps(C01_LIKE))
-    data["sheets"][0]["context"] = [{}]                     # 即使配了统计期，列表写入的表也不能累积
+    data["sheets"][0]["context"] = [{}]                     # 配了统计期，列表却没说每一行属于哪一期：不能累积
     got = T.accumulate_blockers(T.Recipe.model_validate(data))
     assert [(p.code, p.path) for p in got] == [("accumulate_unkeyed", "/tables/0"), ("accumulate_unkeyed", "/tables/1")]
-    assert all("列表形态的表目前只支持每期替换" in p.message for p in got)
+    assert "没有指定每一行属于哪一期" in got[0].message
+    # 合计行另存的表：各期的合计项相同，主键分不开各期（期 5 列表可以累积以后仍然不行）
+    assert "合计行、小计行另存的表不能按期累积" in got[1].message
     assert "「月报」" in got[0].message and "「月报_表内合计」" in got[1].message
     # c01 的草稿本来就没有统计期：两条都报，统计期那条在前（起草卡片取第一条的人话）
     got = T.accumulate_blockers(T.Recipe.model_validate(C01_LIKE))
@@ -479,7 +481,8 @@ def test_closed_value_sets():
     assert {"union_rows", "union_pk", "union_period"} <= set(_literal(T.CheckResult, "kind"))
     assert "ignored" in typing.get_args(T.Role) and "ignored_column" in typing.get_args(T.Role)
     assert typing.get_args(T.ExcludedReason) == (
-        "hidden_excluded", "blank_skipped", "ignored_rows", "ignored_outside", "after_stop", "total_not_kept")
+        "hidden_excluded", "blank_skipped", "ignored_rows", "ignored_outside", "after_stop", "total_not_kept",
+        "subtotal")
     assert _literal(T.FixAnchor, "kind") == ("problem", "recipe_problem", "sheet_renamed")
     assert _literal(T.Anchor, "kind") == (
         "header", "row_label", "section_title", "total_word", "axis", "after_title", "outside_text")

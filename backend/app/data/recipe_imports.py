@@ -225,7 +225,7 @@ class Pipeline:
 def default_pipeline() -> Pipeline:
     """接上真模块。函数体里惰性导入：这些模块（openpyxl、执行器、起草器）导入不便宜，接口模块加载时不必付。"""
     from app.data import (
-        recipe, recipe_accumulate, recipe_ai, recipe_checks, recipe_compare, recipe_confirm, recipe_diff,
+        csv_grid, recipe, recipe_accumulate, recipe_ai, recipe_checks, recipe_compare, recipe_confirm, recipe_diff,
         recipe_engine, recipe_fixes, recipe_notes, recipe_select, recipe_suggest, xlsx_cells, xlsx_scan,
     )
 
@@ -234,7 +234,8 @@ def default_pipeline() -> Pipeline:
         recipe_sha256=recipe.recipe_sha256,
         canonical=recipe.canonical_recipe,
         apply_patch=recipe.apply_patch,
-        scan=xlsx_scan.scan,
+        # CSV / TSV 也走配方：csv_grid 适配成一张「工作表」，其余照旧交给 xlsx_scan（Excel 期 5）
+        scan=csv_grid.scan_any,
         scan_to_json=xlsx_scan.scan_to_json,
         scan_from_json=xlsx_scan.scan_from_json,
         read_grid=xlsx_cells.read_grid,

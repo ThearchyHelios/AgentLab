@@ -943,6 +943,7 @@ export interface PriorAcceptance {
 /** 排除的行的原因（契约 ExcludedRows.reason） */
 export type ExcludedReason =
   | 'hidden_excluded' | 'blank_skipped' | 'ignored_rows' | 'ignored_outside' | 'after_stop' | 'total_not_kept'
+  | 'subtotal'
   | (string & {})
 
 /** 回执里的「排除的行」（契约 ExcludedRows）。按表头忽略的列不在这里（记在回执的 ignored_columns） */
