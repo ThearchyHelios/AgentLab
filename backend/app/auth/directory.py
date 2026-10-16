@@ -119,14 +119,14 @@ POOL_SLOT = "slot:"
 def pool_problem(value: Any) -> str | None:
     """x-principal 的写法对不对：只能是 {pool: app | group:<组> | slot:<岗位>}。没问题为 None。"""
     if not isinstance(value, dict) or set(value) != {"pool"} or not isinstance(value.get("pool"), str):
-        return "的候选范围只能写 {\"pool\": \"app\"}、{\"pool\": \"group:组名\"} 或 {\"pool\": \"slot:岗位\"}"
+        return "的候选范围只能写成 {\"pool\": \"app\"}、{\"pool\": \"group:<组名>\"} 或 {\"pool\": \"slot:<岗位>\"}"
     pool = value["pool"].strip()
     if pool == POOL_APP:
         return None
     for prefix in (POOL_GROUP, POOL_SLOT):
         if pool.startswith(prefix) and pool[len(prefix):].strip():
             return None
-    return "的候选范围只能是 app（能用这个应用的人）、group:组名 或 slot:岗位"
+    return "的候选范围只能是 app（能用这个应用的人）、group:<组名> 或 slot:<岗位>"
 
 
 def pool_of(field: Any) -> str:

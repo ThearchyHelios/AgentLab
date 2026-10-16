@@ -2,7 +2,7 @@
  * 身份的接口（/api/auth、/api/users、/api/groups、/api/audit），挂在 api.auth / api.identity 上。形状见 typesApp.ts。
  * 开登录时：没登录的请求回 401（前端跳 /login），角色不够回 403。关登录时 /me 恒为 mode='off'。
  */
-import type { AuditRow, AuthMode, Directory, GroupRow, Principal, Role, UserRow } from '../typesApp'
+import type { AuditRow, AuthMode, CandidateSource, Candidates, Directory, GroupRow, Principal, Role, UserRow } from '../typesApp'
 import { del, get, patch, post, put, qs, type RequestOptions } from './http'
 
 export const auth = {
@@ -29,6 +29,9 @@ export const identity = {
   groups: () => get<{ items: GroupRow[] }>('/groups'),
   /** 选人用的名录：搭建者及以上只读（/users、/groups 只给管理员） */
   directory: () => get<Directory>('/directory'),
+  /** 使用者选人的候选：按用途给的池，只有名字（任何登录的人都能调；用不了那个应用的 403）。q 按开头筛 */
+  candidates: (source: CandidateSource, q?: string, limit = 20) =>
+    get<Candidates>(`/directory/candidates${qs({ ...source, q: q || undefined, limit })}`),
   createGroup: (body: { name: string; label?: string }) => post<GroupRow>('/groups', body),
   setMembers: (id: string, members: string[]) => put<GroupRow>(`/groups/${encodeURIComponent(id)}/members`, { members }),
   deleteGroup: (id: string) => del(`/groups/${encodeURIComponent(id)}`),

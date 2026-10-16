@@ -368,6 +368,10 @@ export const PRINCIPAL_TEXT = {
   /** 已选的那一项不在名录里、或已停用：标在标签上 */
   missingTag: '名录里没有',
   disabledTag: '已停用',
+  /** 使用者选人：候选按这件事能选的人给（服务端 auth/directory 的候选池，05-已知遗留 (b)） */
+  notCandidate: (name: string) => `「${name}」不在可选的人里，请从候选中选择`,
+  typeToSearch: '能选的人较多：输入名字的开头查找',
+  truncated: '只列出了一部分：多输入几个字缩小范围',
 }
 
 /** 身份：登录、账户菜单、角色（§4.4 AUTH_TEXT） */
@@ -443,6 +447,15 @@ export const SIGNER_TEXT = {
   /** 确认框里那一行（数据导入的启用、回滚、移除、清除原件） */
   signedIn: (name: string) => `登录身份：${name}`,
   record: '记入留痕',
+}
+
+/**
+ * 个人渠道（设置 → 通知，范围是「仅自己」）里实例结束的两个事件：只推自己发起、而且是登录身份发起的实例（服务端
+ * notify/service.notify_run，04-对外集成与触达 B1）。以前叫「实例完成 / 失败」，勾了却永远收不到
+ */
+export const NOTIFY_PERSONAL_EVENT_LABEL: Record<string, string> = {
+  'run.finished': '我发起的实例完成',
+  'run.failed': '我发起的实例失败',
 }
 
 /** 发布弹窗按角色收起的档位（Q8：受管级发布只给管理员，服务端 api/workflows 同样拒） */
