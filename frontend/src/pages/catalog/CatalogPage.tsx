@@ -13,6 +13,7 @@ import { EmptyState, ErrorState, PageHeader, Skeleton, Spinner, rovingTarget, to
 import { useCatalog, useDatasources, useOnReconnect } from '../../store/catalog'
 import { errorMessage } from '../../lib/errors'
 import { formatNumber } from '../../lib/format'
+import { sourceAnchor } from '../../lib/sourceAnchor'
 import {
   CATALOG_DRAFT_TEXT as DT, CATALOG_REVIEW_TEXT as RT, CATALOG_TEXT as CT, CATALOG_TRANSFER_TEXT as XT, JOB_STRIP_TEXT as JT,
   PROFILE_TEXT as PT, SCHEMA_PARTIAL_TEXT as SPT, SOURCE_CHANGE_TEXT as GT,
@@ -382,7 +383,7 @@ export function CatalogPage() {
       total: profileStrip.total, waiting_for: profileStrip.waiting_for ?? null, position: null, notice: profileNotice } : null,
   }), [sourceJobs.items, stripJob, stripNotice, profileStrip, profileNotice])
   const openStripItem = useCallback((item: StripItem) => {
-    if (item.kind === 'introspect') navigate(`${back}#source-${encodeURIComponent(sourceId)}`)
+    if (item.kind === 'introspect') navigate(`${back}${sourceAnchor(sourceId)}`)
     else openJob(item.kind, item.id)
   }, [navigate, back, sourceId, openJob])
 

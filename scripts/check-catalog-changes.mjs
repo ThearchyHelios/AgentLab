@@ -685,6 +685,49 @@ await section('定时维护：缺省关、建一条维护定时、改频率和�
     [...blocked(sent).map((s) => s.key), ...natives, ...errors].join(' | '))
 })
 
+// 指名一张卡片的地址全站只有一种写法：/data/databases#source-<id>，带 &maintenance 时打开它的「定时维护」（复核 W4R-04：定时
+// 任务页上维护定时的「去数据源页设置」以前链的是 ?source=<id>，数据源页不认，落在列表顶上）
+await section('链到一张卡片：#source-<id> 滚过去，带 &maintenance 打开定时维护', async () => {
+  const state = freshState()
+  // 前面垫几张别的库，指名的那张落在第一屏下面：不滚过去就看不见
+  const fillers = 'abcdefghij'.split('').map((x) => ({ ...state.sources[0], id: `check-chg-fill${x}`, name: `zzchgfill${x}`,
+    database: `/tmp/check/zzchgfill${x}.db`, tools: [`db_query__zzchgfill${x}`] }))
+  state.sources = [...fillers, ...state.sources]
+  const inView = (page, id) => page.locator(`[id="source-${id}"]`).evaluate((el) => {
+    const r = el.getBoundingClientRect()
+    return r.top >= 0 && r.bottom <= window.innerHeight
+  }).catch(() => false)
+  // 从别的页链过来：先离开本页再进，免得只换 # 的同页跳转
+  const land = async (page, path) => { await page.goto('about:blank'); await goto(page, path) }
+  const { page, sent, errors, natives } = await open('/data/databases', { handlers: handlers(state), viewport: { width: 1280, height: 720 } })
+  await page.locator(`[data-source="${NAME1}"]`).waitFor()
+  check('（对照）不带地址落在列表顶上：那张卡片在第一屏下面', !(await inView(page, S1)))
+  const dlg = page.locator('[data-maintenance-dialog]')
+  await land(page, `/data/databases#source-${S1}&maintenance`)
+  check('带 &maintenance：打开那张卡片的「定时维护」', await until(async () => (await dlg.count()) === 1)
+        && (await textOf(page.getByRole('dialog'))).includes(`「${NAME1}」的定时维护`), await textOf(page.getByRole('dialog')))
+  check('……卡片滚到眼前', await until(() => inView(page, S1)))
+  check('……用过的 &maintenance 从地址里去掉，只留 #source-<id>', await until(async () => new URL(page.url()).hash === `#source-${S1}`), page.url())
+  await page.keyboard.press('Escape')
+  await until(async () => (await dlg.count()) === 0)
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.locator(`[data-source="${NAME1}"]`).waitFor()
+  await page.waitForTimeout(500)
+  check('刷新：只滚过去，不再打开定时维护', await until(() => inView(page, S1)) && await dlg.count() === 0)
+  await land(page, '/data/databases#source-check-chg-gone&maintenance')
+  check('指名的数据源不在了：照实说，不打开对话框', await until(async () => (await page.locator('[data-toast]')
+    .filter({ hasText: '没找到这个数据源，可能已经删除' }).count()) === 1) && await dlg.count() === 0)
+  await land(page, `/data/tables#source-${S2}&maintenance`)
+  await page.locator(`[data-source="${NAME2}"]`).waitFor()
+  await page.waitForTimeout(500)
+  check('导入表格的源不做定时维护：只滚过去，不打开对话框', await dlg.count() === 0
+        && await until(async () => new URL(page.url()).hash === `#source-${S2}`), page.url())
+  // 对话框打开时会算一次频率的说法（POST /schedules/preview，纯计算），不算写
+  const saved = writes(sent, /./).filter((s) => s.key !== 'POST /schedules/preview')
+  check('只是打开、没有保存：没有写请求、没有原生对话框、没有运行时报错', saved.length === 0 && blocked(sent).length === 0 && natives.length === 0
+        && errors.length === 0, [...saved.map((s) => s.key), ...blocked(sent).map((s) => s.key), ...natives, ...errors].join(' | '))
+})
+
 await section('后台任务条：按服务端的先后，页头只做入口', async () => {
   const state = freshState()
   state.jobs = clone(JOBS_A)

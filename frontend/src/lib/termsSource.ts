@@ -166,6 +166,11 @@ export const SOURCE_BADGE_TEXT = {
   hint: '探查结构、取值观察测到的变化里要处理的条数，点开到数据目录的「变化」处理',
 }
 
+/** 从别处链到数据源页上的一张卡片（lib/sourceAnchor 的 #source-<id>），那个数据源已经不在了 */
+export const SOURCE_ANCHOR_TEXT = {
+  missing: '没找到这个数据源，可能已经删除',
+}
+
 /** 表详情的「结构与取值变化」一节 */
 export const TABLE_CHANGES_TEXT = {
   title: '结构与取值变化',
