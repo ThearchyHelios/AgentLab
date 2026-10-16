@@ -120,7 +120,10 @@ async def _owner_emails(rows: list[NotifyChannel]) -> dict[str, str | None]:
 @router.get("/channels")
 async def list_channels() -> dict[str, Any]:
     """{items, mail}：形状同前端的接口约定（frontend/src/api/capabilities.ts）。mail 是邮件服务启没启用、本人的账号邮箱
-    （关登录时没有账号，为 null）：设置页据此列不列「邮件」格式、个人邮件渠道发到哪。"""
+    （关登录时没有账号，为 null）：设置页据此列不列「邮件」格式、个人邮件渠道发到哪。
+
+    全局、应用渠道对谁都列（应用的通知里要挑渠道），但邮件渠道的收件地址只给改得了它的人（同 _can_edit：关登录时谁都能改，
+    开了登录要搭建者以上），别人只拿到条数（channel_out 的 recipients）。"""
     from app.db.models import User
 
     principal = current_principal()
@@ -133,7 +136,8 @@ async def list_channels() -> dict[str, Any]:
         cfg = await mail.load_config(session)
         mine = await session.get(User, principal.user_id) if principal.mode != "off" and principal.user_id else None
     emails = await _owner_emails(rows)
-    return {"items": [channel_out(r, emails.get(r.owner_id or "")) for r in rows],
+    editor = principal.mode == "off" or principal.at_least("builder")
+    return {"items": [channel_out(r, emails.get(r.owner_id or ""), recipients=editor) for r in rows],
             "mail": {"enabled": cfg.enabled, "account_email": (mine.email or None) if mine is not None else None}}
 
 

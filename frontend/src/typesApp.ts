@@ -734,9 +734,11 @@ export interface NotifyChannelRow {
   enabled: boolean
   /**
    * 邮件渠道发给谁：个人渠道是拥有者的账号邮箱（没有邮箱是空的，发不出去），全局、应用的是填的那几个收件地址。
-   * Webhook 渠道没有这一项
+   * Webhook 渠道没有这一项。全局、应用的邮件渠道只给改得了它的人（开了登录要搭建者以上），别人拿到的是 mail_count
    */
   mail_to?: string[]
+  /** 全局、应用的邮件渠道给改不了它的人列出时：只有收件地址的个数，没有地址（设置页的通知只给使用者列个人渠道，用不上） */
+  mail_count?: number
 }
 
 /**

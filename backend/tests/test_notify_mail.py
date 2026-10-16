@@ -334,6 +334,38 @@ async def test_personal_mail_channel_takes_no_address(smtp):
         await auth_env.reset()
 
 
+async def test_users_listing_channels_do_not_get_global_recipients(smtp):
+    """使用者列渠道照样看得到全局、应用渠道（应用的通知里要挑一个，只用名字和 id），但邮件渠道的收件地址只给能改它的人
+    （搭建者以上）：只给条数，不给地址。Webhook 只给主机名，邮件地址不能比它多露（复核 L2）。"""
+    from tests.fakes import auth_env
+
+    await configure()
+    await auth_env.reset()
+    try:
+        await auth_env.turn_on_local()
+        await auth_env.make_user("mail-uma", "user", email="uma@example.com")
+        await auth_env.make_user("mail-bo", "builder")
+        everyone = "finance-lead@example.com, ops@example.com"
+        made = await channel("global", to=everyone)
+        await channel("app", to="team@example.com")
+        uma = await auth_env.login("mail-uma")
+        mine = await uma.post("/api/notify/channels", json={"name": "我的邮件", "scope": "user", "format": "email",
+                                                            "events": ["task.opened"]})
+        assert mine.status_code == 201, mine.text
+        listed = (await uma.get("/api/notify/channels")).json()["items"]
+        by = {row["scope"]: row for row in listed}
+        assert set(by) == {"global", "app", "user"}, "全局、应用渠道照样列（应用的通知里要挑）"
+        assert "finance-lead" not in json.dumps(listed) and "team@" not in json.dumps(listed), "收件地址不给使用者"
+        assert "mail_to" not in by["global"] and by["global"]["mail_count"] == 2
+        assert "mail_to" not in by["app"] and by["app"]["mail_count"] == 1
+        assert by["user"]["mail_to"] == ["uma@example.com"], "自己的个人渠道照常写发到哪"
+        bo = await auth_env.login("mail-bo")
+        shown = {row["id"]: row for row in (await bo.get("/api/notify/channels")).json()["items"]}
+        assert shown[made.id]["mail_to"] == ["finance-lead@example.com", "ops@example.com"], "能改的人看得到，改地址要整份重填"
+    finally:
+        await auth_env.reset()
+
+
 # --------------------------------------------------------------------------
 # 设置
 # --------------------------------------------------------------------------

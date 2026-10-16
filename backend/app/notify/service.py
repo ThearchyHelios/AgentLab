@@ -134,11 +134,13 @@ async def personal_url_problem(url: str) -> str | None:
     return None
 
 
-def channel_out(row: NotifyChannel, owner_email: str | None = None) -> dict[str, Any]:
+def channel_out(row: NotifyChannel, owner_email: str | None = None, *, recipients: bool = True) -> dict[str, Any]:
     """渠道的接口形状（typesApp.ts 的 NotifyChannelRow）：地址只回主机名，密钥只说配没配。
 
     邮件渠道（notify/mail.py）没有主机名：mail_to 是发给谁——个人渠道是拥有者的账号邮箱（owner_email，没有邮箱是空的），
-    全局、应用的是填的那几个收件地址（搭建者以上才看得到这些渠道，改地址时要整份重填，所以照原样给）。"""
+    全局、应用的是填的那几个收件地址：改地址时要整份重填，所以给能改它的人照原样给。recipients 为假（调用方判定看的人改不了
+    全局、应用的渠道，api/notify.list_channels）时不给地址、只给条数 mail_count：渠道列表对使用者照样列全局、应用渠道（应用
+    的通知里要挑一个，只用名字和 id），Webhook 只给主机名，邮件的收件地址不能比它多露一层。"""
     from app.core.crypto import decrypt
 
     url = decrypt(row.url) or ""
@@ -149,7 +151,11 @@ def channel_out(row: NotifyChannel, owner_email: str | None = None) -> dict[str,
         if row.scope == "user":
             out["mail_to"] = [owner_email] if owner_email else []
         else:
-            out["mail_to"] = [p.strip() for p in url.split(",") if p.strip()]
+            to = [p.strip() for p in url.split(",") if p.strip()]
+            if recipients:
+                out["mail_to"] = to
+            else:
+                out["mail_count"] = len(to)
     return out
 
 
