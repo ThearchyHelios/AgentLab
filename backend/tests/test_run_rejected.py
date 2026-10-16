@@ -212,3 +212,28 @@ async def test_a_run_still_queued_at_restart_gets_its_run_failed_event():
     assert row.status == "failed" and row.started_at is None and row.finished_at is None
     [failed] = await _events(run_id, "run.failed")
     assert failed.seq == 3 and failed.data == {"error": row.error}
+
+
+@pytest.mark.parametrize("kind", list(GATES))
+@pytest.mark.parametrize("tolerance", [{"on_error": "continue"}, {"retries": 1, "retry_backoff": 0.01}])
+async def test_a_rejection_is_neither_retried_nor_swallowed_by_on_error(kind, tolerance):
+    """「失败重试」「出错时继续」是给故障准备的。驳回是人的决定：重试只会把同一件事再问一遍人，on_error=continue 会把
+    驳回吞掉、接着往下走、最后以 succeeded 结束——通知、定时推送、发布单都看不到这次驳回（总方案 X9）。"""
+    gate, said = GATES[kind]
+    gate = {**gate, "data": {**gate["data"], "config": {**gate["data"]["config"], **tolerance}}}
+    run = await run_manager.start(graph=chain(START, gate, OUT), input_payload={"q": "x"})
+    await _wait(run.id, ("interrupted",))
+    await run_manager.wait_idle(run.id)
+    await run_manager.resume(run.id, {"approved": False, "note": "不对"}, actor="张工")
+    final = await _wait(run.id, ("cancelled", "failed", "succeeded", "interrupted"))
+    if final.status == "interrupted":
+        # 重试会再问一遍人：又停在同一个关卡上
+        await run_manager.wait_idle(run.id)
+        final = await _wait(run.id, ("cancelled", "failed", "succeeded", "interrupted"))
+    assert (final.status, final.end_reason) == ("cancelled", "rejected"), (final.status, final.error)
+    assert final.error == said and final.error_node_id == "gate"
+    events = await _events(run.id)
+    assert not [e for e in events if e.type == "log" and (e.data or {}).get("code") == "node_retry"], "驳回不该重试"
+    assert not [e for e in events if e.type == "node.finished" and e.node_id == "out"], "驳回之后不该接着往下走"
+    # 节点这一步照旧留一条 node.failed（实例进度、时间线按它收尾这一步），只有一条
+    assert len([e for e in events if e.type == "node.failed" and e.node_id == "gate"]) == 1

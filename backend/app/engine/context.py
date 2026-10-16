@@ -119,7 +119,8 @@ class NodeRejected(NodeError):
     驳回过的试运行说成「试运行失败了」，记录页还给「继续运行」——接着跑只会读到同一个驳回答复、再停一次。现在 runner
     单独接住它，收成 cancelled + end_reason=rejected，run.cancelled 带上在哪一步、谁、结论和备注，消费方都读这一个字段。
 
-    是 NodeError 的子类：节点失败的那一套（node.failed、on_error=continue）照旧认它；原话（str）照旧写给人看，
+    是 NodeError 的子类：节点这一步照旧记 node.failed（时间线、实例进度按它收尾）；但不重试、不被 on_error=continue
+    接住（engine/compiler._execute：那两项是给故障准备的，驳回被吞掉运行就以 succeeded 结束了）。原话（str）照旧写给人看，
     Run.error 和以前一字不差。kind 见 REJECTION_KINDS；decision 是 reject 或 expired_reject（同待办的结论）。"""
 
     def __init__(self, node_id: str, message: str, *, kind: str, decision: str = "reject",
