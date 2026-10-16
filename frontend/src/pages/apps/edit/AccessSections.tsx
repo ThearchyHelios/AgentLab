@@ -8,7 +8,7 @@ import {
 import { PrincipalPicker, type Principal as Picked } from '../../../components/PrincipalPicker'
 import { APP_EDITOR_TEXT as T, GRANT_ROLE_HINT, GRANT_ROLE_LABEL, NOTIFY_TEXT } from '../../../lib/terms'
 import { useLoginOn } from '../../../store/auth'
-import type { AppGrant, GrantRole, NotifyChannelRow } from '../../../typesApp'
+import type { AppGrant, GrantRole, NotifyChannelRow, NotifyEventRow } from '../../../typesApp'
 import { applyAppOp } from './appOps'
 import { useEditor } from './context'
 
@@ -343,9 +343,16 @@ export function NotifySection() {
   const { draft, setDraft } = useEditor()
   const [channels, setChannels] = useState<NotifyChannelRow[] | null>(null)
   useEffect(() => { api.notify.channels().then(({ items }) => setChannels(items)).catch(() => setChannels([])) }, [])
+  const [registry, setRegistry] = useState<NotifyEventRow[] | null>(null)
+  const [registryFailed, setRegistryFailed] = useState(false)
+  useEffect(() => { api.notify.events().then(setRegistry).catch(() => setRegistryFailed(true)) }, [])
   const set = (notify: typeof draft.notify) => setDraft((s) => ({ ...s, notify }))
-  // 「我提交审核的应用有结果」是发给提交人的，不归哪个应用：应用的通知里不列
-  const events = Object.keys(NOTIFY_TEXT.eventLabel).filter((e) => e !== 'review.done')
+  // 应用能订阅哪些由服务端说（notify/service.EVENTS 推给「应用的订阅」这条路的）：「我提交审核的应用有结果」发给提交人、
+  // 登记了还没推送的都不列。这条订阅里已经勾着的照样列出来（以前界面列过、其实推不到的也在内），看得到、能取消
+  const appEvents = new Set((registry ?? []).filter((r) => r.scopes.includes('app')).map((r) => r.event))
+  const known = Object.keys(NOTIFY_TEXT.eventLabel)
+  const eventsOf = (subscribed: string[]) => [...known.filter((e) => appEvents.has(e) || subscribed.includes(e)),
+                                               ...subscribed.filter((e) => !known.includes(e))]
   return (
     <div className="mx-auto max-w-3xl p-4" data-app-notify={draft.notify.length}>
       <SectionBar title={T.sections.notify} hint={T.notifyHint}>
@@ -372,12 +379,12 @@ export function NotifySection() {
                 <DeleteButton label={T.notifyRemove} onClick={() => set(draft.notify.filter((_, j) => j !== i))} />
               </div>
               <div className="grid grid-cols-3 gap-1">
-                {events.map((ev) => (
+                {eventsOf(n.events).map((ev) => (
                   <label key={ev} className="flex items-center gap-1.5 text-xs">
                     <input type="checkbox" className="accent-[var(--accent)]" checked={n.events.includes(ev)}
                            onChange={(e) => set(draft.notify.map((x, j) => (j === i
                              ? { ...x, events: e.target.checked ? [...x.events, ev] : x.events.filter((y) => y !== ev) } : x)))} />
-                    {NOTIFY_TEXT.eventLabel[ev]}
+                    {NOTIFY_TEXT.eventLabel[ev] ?? NOTIFY_TEXT.deliveryEventLabel[ev] ?? ev}
                   </label>
                 ))}
               </div>
@@ -385,6 +392,7 @@ export function NotifySection() {
           ))}
         </div>
       )}
+      {registryFailed && <p className="mt-2 text-2xs" style={{ color: 'var(--st-failed)' }} role="alert">{NOTIFY_TEXT.eventsError}</p>}
     </div>
   )
 }

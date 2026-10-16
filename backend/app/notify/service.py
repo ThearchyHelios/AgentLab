@@ -10,12 +10,26 @@
 （搭图时起的），不用按运行数据渲染出来的那一句。链接要设了对外访问地址（设置里的 notify）才有。
 
 推送放在后台（spawn）：接收端挂住时超时加重试要几十秒，不能拖着开待办、运行收尾。测试用 drain 等它们推完。
+
+事件只在这里登记（EVENTS，总方案 X6）：每个事件一行，名字、界面上的叫法（前端 lib/terms.ts 的 NOTIFY_TEXT.eventLabel
+逐字一致，test_notify_events 对照）、推给哪几条路（scopes：global 全局渠道自己订阅、user 相关的人自己的个人渠道、app 应用
+版本 spec.notify 的订阅）。_channels 只走登记了的路，没登记的事件推不出去；接口按 scopes 收订阅，设置页和应用的通知按
+GET /api/notify/events 列。scopes 是空的，是登记了、还没有推送的事件：不收订阅、界面上不列——勾了却收不到，就是「看着
+生效、其实没生效」（个人渠道勾了实例结束、失败却收不到，04-对外集成与触达 B1，就是这么错的）。本轮第 1 波把六个新事件
+一次登记好；实现推送的那一块写自己的 notify_*，只改自己那一行的 scopes，不再改这张表的别处、也不再改前端的叫法表：几块
+并行改同一处必然冲突。以前存下的订阅不按 scopes 重新核对（api/notify._validated 只核对新勾的）。
+
+消息的结构，新事件一律照这个写（P4、D9）：标题、状态、条数、链接，外加编号（#前 6 位）和搭建时起的名字（应用、工作流、
+节点在图上的名字，题集、数据源、访问密钥的名字）。条数说的是有几件事要处理（几个变化、通过几题、几条待办），可以放。
+不放：报告和答案里的数（金额、比例、差值、期望值），表名、列名、取值（码值、样例行），SQL，按运行数据渲染出来的句子。
+接收端是群机器人、外部系统，消息出了这个服务就不归遮罩管了。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 from collections.abc import Coroutine
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -26,12 +40,60 @@ from app.notify.core import Message, Outcome, host_of
 
 logger = logging.getLogger(__name__)
 
-#: 可以订阅的事件
-EVENTS = ("task.opened", "run.finished", "run.failed", "action.unknown", "review.done")
-EVENT_LABEL = {"task.opened": "有待办派给我", "run.finished": "实例完成", "run.failed": "实例失败",
-               "action.unknown": "写入结果未知",
-               # 个人应用提交审核之后，搭建者发布了或退回了（docs/design/normal-user-apps.md N7）
-               "review.done": "我提交审核的应用有结果"}
+@dataclass(frozen=True)
+class Event:
+    """一个可订阅的通知事件（见模块说明「事件只在这里登记」）。"""
+
+    #: 界面上的叫法：和前端 NOTIFY_TEXT.eventLabel 同一句
+    label: str
+    #: 推给哪几条路（_channels）：global 全局渠道自己订阅，user 相关的人自己的个人渠道，app 应用版本 spec.notify 的订阅。
+    #: 空的：登记了、还没有推送
+    scopes: tuple[str, ...]
+
+
+_EVERY = ("global", "user", "app")
+#: 渠道范围在说法里怎么叫（同前端 NOTIFY_TEXT.scopes）
+SCOPE_TEXT = {"global": "全局", "user": "个人", "app": "应用"}
+
+#: 可以订阅的事件，只在这里登记
+EVENTS: dict[str, Event] = {
+    # 待办派出、改派、升级、催办（_AS）：全局渠道、派给的人自己的个人渠道、应用的订阅
+    "task.opened": Event("待办打开", _EVERY),
+    # 应用实例结束、失败：个人渠道是发起人自己的（04-对外集成与触达 B1）
+    "run.finished": Event("运行结束", _EVERY),
+    "run.failed": Event("运行失败", _EVERY),
+    # 写入外部系统的结果未知：个人渠道是核实待办派给的人
+    "action.unknown": Event("动作结果未知", _EVERY),
+    # 个人应用提交审核之后，搭建者发布了或退回了（docs/design/normal-user-apps.md N7）：发给提交人，不归哪个应用
+    "review.done": Event("我提交审核的应用有结果", ("global", "user")),
+    # ---- 本轮登记、还没有推送（总方案 X6）：实现推送的那一块只改自己这一行的 scopes，消息照模块说明的规矩 ----
+    # 数据源有要处理的结构 / 取值变化（03 B3）：只推 severity 为 action 的，按源汇总；源名、各级别条数、链接
+    "source.changed": Event("数据源有变化要处理", ()),
+    # 口径升版后召回重算，数真变了（02 第 7 项）：答案的主人有 recall 待办；口径名、版本、链接，不放新旧值和差值
+    "ledger.recall": Event("口径升版，答案的数变了", ()),
+    # 定时评测有题从通过变成不通过 / 评测没跑完（01 第 15 项）：题集名、通过数、退步题数、链接；不放期望值和答案里的数
+    "eval.regressed": Event("评测有退步", ()),
+    "eval.failed": Event("评测失败", ()),
+    # 每天一条待办汇总（04 B3）：只推个人渠道；条数、最早的时限、最多 5 条（节点在图上的名字）、去待办箱的链接
+    "task.digest": Event("每天的待办汇总", ()),
+    # 访问密钥到期前 7 天、1 天各一次（04 B3）：个人密钥推本人，服务账号的推全局渠道；密钥名、到期日、链接
+    "key.expiring": Event("访问密钥快到期", ()),
+}
+EVENT_LABEL = {name: event.label for name, event in EVENTS.items()}
+
+
+def subscribe_problem(event: str, scope: str) -> str | None:
+    """范围是 scope 的渠道能不能订阅 event：不能的回一句为什么（接口原样回 422），能的是 None。"""
+    spec = EVENTS.get(event)
+    if spec is None:
+        offered = "、".join(e.label for e in EVENTS.values() if scope in e.scopes)
+        return f"不认识的通知事件：{event}。可选：{offered}"
+    if not spec.scopes:
+        return f"「{spec.label}」的通知还没有推送，暂时不能订阅"
+    if scope not in spec.scopes:
+        return f"「{spec.label}」不推给范围是「{SCOPE_TEXT.get(scope, scope)}」的渠道"
+    return None
+
 #: 这几种也是「有一条待办要你处理」，按 task.opened 的订阅推
 _AS = {"task.reassigned": "task.opened", "task.escalated": "task.opened", "task.reminded": "task.opened"}
 _TASK_HEAD = {"task.opened": "新的待办", "task.reassigned": "待办已改派给你", "task.escalated": "待办已超时，升级处理",
@@ -98,8 +160,11 @@ async def _base_url(session: Any) -> str | None:
 
 async def _channels(session: Any, event: str, run: Run | None, users: list[str]) -> list[NotifyChannel]:
     wanted = _AS.get(event, event)
+    if (registered := EVENTS.get(wanted)) is None:
+        raise ValueError(f"通知事件 {wanted} 没有登记：先在 notify/service.EVENTS 登记，再推送")
+    paths = registered.scopes
     found: dict[str, NotifyChannel] = {}
-    if run is not None and run.app_id and run.app_version is not None:
+    if "app" in paths and run is not None and run.app_id and run.app_version is not None:
         row = (await session.execute(select(AppVersion.spec, AppVersion.bindings).where(
             AppVersion.app_id == run.app_id, AppVersion.version == run.app_version))).first()
         spec, bindings = (row[0], row[1]) if row is not None else ({}, {})
@@ -115,11 +180,12 @@ async def _channels(session: Any, event: str, run: Run | None, users: list[str])
             for row in (await session.execute(select(NotifyChannel).where(
                     NotifyChannel.id.in_(subscribed), NotifyChannel.enabled.is_(True)))).scalars():
                 found[row.id] = row
-    for row in (await session.execute(select(NotifyChannel).where(
-            NotifyChannel.scope == "global", NotifyChannel.enabled.is_(True)))).scalars():
-        if wanted in (row.events or []):
-            found.setdefault(row.id, row)
-    if users:
+    if "global" in paths:
+        for row in (await session.execute(select(NotifyChannel).where(
+                NotifyChannel.scope == "global", NotifyChannel.enabled.is_(True)))).scalars():
+            if wanted in (row.events or []):
+                found.setdefault(row.id, row)
+    if "user" in paths and users:
         owners = list((await session.execute(select(User.id).where(User.username.in_(users)))).scalars())
         if owners:
             for row in (await session.execute(select(NotifyChannel).where(

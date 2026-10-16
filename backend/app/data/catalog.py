@@ -420,6 +420,18 @@ async def read_catalog(session: AsyncSession, source_id: str) -> dict[str, Catal
     return {row.table_name: _entry(row) for row in rows}
 
 
+async def read_catalogs(session: AsyncSession, source_ids: Iterable[str]) -> dict[str, dict[str, CatalogEntry]]:
+    """几个数据源的目录一次查询读出：{源 id: {表名: CatalogEntry}}，没有目录的源不出现。给模型、给自查读目录的地方经
+    data/catalog_view.py 调它，不直接查 catalog_notes。"""
+    ids = sorted({i for i in source_ids if i})
+    if not ids:
+        return {}
+    out: dict[str, dict[str, CatalogEntry]] = {}
+    for row in (await session.execute(select(CatalogNote).where(CatalogNote.source_id.in_(ids)))).scalars():
+        out.setdefault(row.source_id, {})[row.table_name] = _entry(row)
+    return out
+
+
 async def write_entry(session: AsyncSession, source_id: str, table: str, notes: dict[str, Any], *,
                       if_version: int, actor: str | None, commit: bool = True) -> CatalogEntry:
     """整份写入一张表的目录（乐观锁），提交事务，返回写入后的目录。
@@ -590,6 +602,14 @@ def _same_core(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
 def visible_notes(notes: Mapping[str, Any] | None) -> dict[str, Any]:
     """去掉被驳回的项和关系。给模型看、冻结进证据、SQL 检查（data/sqlcheck.py）都只用这一份。"""
     return _assemble({k: v for k, v in _slots(notes).items() if v.get("status") != "rejected"})
+
+
+def restrict_notes(notes: Mapping[str, Any] | None, statuses: Iterable[str]) -> dict[str, Any]:
+    """只留状态在 statuses 里的项（表级项、列级项、关系都按项算）；驳回的项原样留着——给人、给模型看的照旧经
+    visible_notes 去掉，冻结快照和 SQL 检查要靠驳回的关系编号认出不该按外键、命名现推回来的关系（frozen_catalog）。
+    目录视图「只用已核实、已确认的项」用它（data/catalog_view.py）。"""
+    keep = set(statuses) | {"rejected"}
+    return _assemble({k: v for k, v in _slots(notes).items() if v.get("status") in keep})
 
 
 def status_counts(notes: Mapping[str, Any] | None) -> dict[str, int]:
@@ -2408,15 +2428,18 @@ async def query_snapshot_tables(session: AsyncSession, source: Any) -> list[tupl
 
     使用次数（table_usage）和「这张表被哪些运行用过」（data/catalog_review.py）共用这一份取法：数据源查询工具每次成功
     查询都存一份查询快照工件（tools/datasource.py），工件引用表 artifacts 里按 (内容哈希, 运行) 各记一行；只收属于某次运行
-    （runs 里有这次运行）、属于这个源的行，工具库里的试用（不属于任何运行）不算。
+    （runs 里有这次运行）、属于这个源的行，工具库里的试用（不属于任何运行）不算；系统派生的运行（评测、口径对账、召回，
+    engine/origin.counted_runs）也不算——一跑评测，常用表的排序、起草的默认范围、审阅队列的权重就跟着被评测题刷高了。
 
     表名在查询当时就记进了引用的 meta（query_snapshot_meta），这里只读 artifacts 一张表；升级前的老引用没有 meta，退回读
     工件内容里的源名和 SQL，读过的按工件 id 缓存（内容永不改变）。SQL 里写的表名去掉 schema 前缀后按 name_key（只把
     ASCII 字母转小写，和 SQLite 比较标识符的口径一致）对到表结构上，对不上的不计。
     """
+    from app.engine.origin import counted_runs
+
     rows = (await session.execute(
         select(Artifact.id, Artifact.meta, Artifact.run_id).join(Run, Run.id == Artifact.run_id)
-        .where(Artifact.kind == QUERY_SNAPSHOT_KIND)
+        .where(Artifact.kind == QUERY_SNAPSHOT_KIND, counted_runs())
     )).all()
     tables = (getattr(source, "schema_cache", None) or {}).get("tables") or {}
     lookup: dict[str, str] = {}
@@ -2505,8 +2528,9 @@ __all__ = [
     "fk_relations", "frozen_catalog", "infer_name_relations", "initial_status", "is_date_column", "is_profile_note",
     "join_paths",
     "make_item", "merge_notes", "name_words", "now_iso", "parse_path", "plan_patch", "profile_relation_holds",
-    "query_snapshot_meta", "read_catalog", "read_entry", "relation_graph", "relation_id", "render_table_index",
-    "render_table_notes", "resolve_draft_model", "resolve_table_name", "review_entry", "review_item", "same_notes",
+    "query_snapshot_meta", "read_catalog", "read_catalogs", "read_entry", "relation_graph", "relation_id", "render_table_index",
+    "render_table_notes", "resolve_draft_model", "resolve_table_name", "restrict_notes", "review_entry", "review_item",
+    "same_notes",
     "same_profile_note", "save_human_edit", "save_patch", "status_counts", "structure_relation_ids",
     "system_notes_source", "table_usage", "unreviewed_status", "validate_notes", "visible_notes", "write_entry",
 ]

@@ -1,0 +1,1030 @@
+{
+ "graph_ok": [
+  {
+   "op": "model",
+   "model": "mock-fast"
+  },
+  {
+   "op": "plan",
+   "summary": "数一数"
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "start",
+    "type": "input",
+    "label": "start",
+    "config": {
+     "fields": [
+      {
+       "name": "question"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "init",
+    "type": "transform",
+    "label": "init",
+    "config": {
+     "mode": "expression",
+     "expression": "[1, 2]",
+     "assign_to": "items"
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "start",
+    "target": "init"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "lp",
+    "type": "loop",
+    "label": "lp",
+    "config": {
+     "mode": "while",
+     "condition": "len(vars.items) > 5",
+     "max_iterations": 2
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "init",
+    "target": "lp"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "body",
+    "type": "transform",
+    "label": "body",
+    "config": {
+     "mode": "expression",
+     "expression": "1"
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "lp",
+    "target": "body",
+    "sourceHandle": "body"
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "body",
+    "target": "lp"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "out",
+    "type": "output",
+    "label": "out",
+    "config": {
+     "fields": [
+      {
+       "name": "结果",
+       "value": "{{ vars.items }}"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "lp",
+    "target": "out",
+    "sourceHandle": "done"
+   }
+  },
+  {
+   "op": "done",
+   "explanation": "数一数",
+   "run": true
+  },
+  {
+   "op": "check",
+   "status": "passed",
+   "repaired": 0,
+   "warnings": []
+  },
+  {
+   "op": "final",
+   "graph": {
+    "nodes": [
+     {
+      "id": "start",
+      "type": "input",
+      "position": {
+       "x": 80.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "start",
+       "description": "",
+       "config": {
+        "fields": [
+         {
+          "name": "question"
+         }
+        ]
+       }
+      }
+     },
+     {
+      "id": "init",
+      "type": "transform",
+      "position": {
+       "x": 414.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "init",
+       "description": "",
+       "config": {
+        "mode": "expression",
+        "expression": "[1, 2]",
+        "assign_to": "items"
+       }
+      }
+     },
+     {
+      "id": "lp",
+      "type": "loop",
+      "position": {
+       "x": 748.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "lp",
+       "description": "",
+       "config": {
+        "mode": "while",
+        "condition": "len(vars.items) > 5",
+        "max_iterations": 2
+       }
+      }
+     },
+     {
+      "id": "body",
+      "type": "transform",
+      "position": {
+       "x": 1082.0,
+       "y": -66.0
+      },
+      "data": {
+       "label": "body",
+       "description": "",
+       "config": {
+        "mode": "expression",
+        "expression": "1"
+       }
+      }
+     },
+     {
+      "id": "out",
+      "type": "output",
+      "position": {
+       "x": 1082.0,
+       "y": 66.0
+      },
+      "data": {
+       "label": "out",
+       "description": "",
+       "config": {
+        "fields": [
+         {
+          "name": "结果",
+          "value": "{{ vars.items }}"
+         }
+        ]
+       }
+      }
+     }
+    ],
+    "edges": [
+     {
+      "id": "start:->init",
+      "source": "start",
+      "target": "init",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "init:->lp",
+      "source": "init",
+      "target": "lp",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "lp:body->body",
+      "source": "lp",
+      "target": "body",
+      "sourceHandle": "body",
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "body:->lp",
+      "source": "body",
+      "target": "lp",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "lp:done->out",
+      "source": "lp",
+      "target": "out",
+      "sourceHandle": "done",
+      "targetHandle": null,
+      "label": ""
+     }
+    ],
+    "viewport": {},
+    "defaults": {}
+   },
+   "issues": [],
+   "explanation": "数一数",
+   "autorun": true,
+   "layout": {
+    "mode": "full",
+    "placed": [
+     "start",
+     "init",
+     "lp",
+     "body",
+     "out"
+    ]
+   },
+   "tool_changes": []
+  }
+ ],
+ "graph_fixed": [
+  {
+   "op": "model",
+   "model": "mock-fast"
+  },
+  {
+   "op": "plan",
+   "summary": "数一数"
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "start",
+    "type": "input",
+    "label": "start",
+    "config": {
+     "fields": [
+      {
+       "name": "question"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "init",
+    "type": "transform",
+    "label": "init",
+    "config": {
+     "mode": "expression",
+     "expression": "[1, 2]",
+     "assign_to": "items"
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "start",
+    "target": "init"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "lp",
+    "type": "loop",
+    "label": "lp",
+    "config": {
+     "mode": "while",
+     "condition": "{{ vars.items | length }} > 5",
+     "max_iterations": 2
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "init",
+    "target": "lp"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "body",
+    "type": "transform",
+    "label": "body",
+    "config": {
+     "mode": "expression",
+     "expression": "1"
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "lp",
+    "target": "body",
+    "sourceHandle": "body"
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "body",
+    "target": "lp"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "out",
+    "type": "output",
+    "label": "out",
+    "config": {
+     "fields": [
+      {
+       "name": "结果",
+       "value": "{{ vars.items }}"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "lp",
+    "target": "out",
+    "sourceHandle": "done"
+   }
+  },
+  {
+   "op": "done",
+   "explanation": "数一数",
+   "run": true
+  },
+  {
+   "op": "check",
+   "status": "repairing",
+   "round": 1,
+   "issues": [
+    {
+     "level": "error",
+     "node_id": "lp",
+     "edge_id": null,
+     "message": "循环条件有误：表达式中不支持 | 过滤器（那是模板的写法）：取长度请写 len(x)，转换大小写请写 upper(x) / lower(x)（原文：{{ vars.items | length }} > 5）",
+     "field": "condition",
+     "code": null,
+     "fix": null
+    }
+   ]
+  },
+  {
+   "op": "update_node",
+   "id": "lp",
+   "config": {
+    "mode": "while",
+    "condition": "len(vars.items) > 5",
+    "max_iterations": 2
+   }
+  },
+  {
+   "op": "check",
+   "status": "passed",
+   "repaired": 1,
+   "warnings": []
+  },
+  {
+   "op": "final",
+   "graph": {
+    "nodes": [
+     {
+      "id": "start",
+      "type": "input",
+      "position": {
+       "x": 80.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "start",
+       "description": "",
+       "config": {
+        "fields": [
+         {
+          "name": "question"
+         }
+        ]
+       }
+      }
+     },
+     {
+      "id": "init",
+      "type": "transform",
+      "position": {
+       "x": 414.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "init",
+       "description": "",
+       "config": {
+        "mode": "expression",
+        "expression": "[1, 2]",
+        "assign_to": "items"
+       }
+      }
+     },
+     {
+      "id": "lp",
+      "type": "loop",
+      "position": {
+       "x": 748.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "lp",
+       "description": "",
+       "config": {
+        "mode": "while",
+        "condition": "len(vars.items) > 5",
+        "max_iterations": 2
+       }
+      }
+     },
+     {
+      "id": "body",
+      "type": "transform",
+      "position": {
+       "x": 1082.0,
+       "y": -66.0
+      },
+      "data": {
+       "label": "body",
+       "description": "",
+       "config": {
+        "mode": "expression",
+        "expression": "1"
+       }
+      }
+     },
+     {
+      "id": "out",
+      "type": "output",
+      "position": {
+       "x": 1082.0,
+       "y": 66.0
+      },
+      "data": {
+       "label": "out",
+       "description": "",
+       "config": {
+        "fields": [
+         {
+          "name": "结果",
+          "value": "{{ vars.items }}"
+         }
+        ]
+       }
+      }
+     }
+    ],
+    "edges": [
+     {
+      "id": "start:->init",
+      "source": "start",
+      "target": "init",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "init:->lp",
+      "source": "init",
+      "target": "lp",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "lp:body->body",
+      "source": "lp",
+      "target": "body",
+      "sourceHandle": "body",
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "body:->lp",
+      "source": "body",
+      "target": "lp",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "lp:done->out",
+      "source": "lp",
+      "target": "out",
+      "sourceHandle": "done",
+      "targetHandle": null,
+      "label": ""
+     }
+    ],
+    "viewport": {},
+    "defaults": {}
+   },
+   "issues": [],
+   "explanation": "数一数",
+   "autorun": true,
+   "layout": {
+    "mode": "full",
+    "placed": [
+     "start",
+     "init",
+     "lp",
+     "body",
+     "out"
+    ]
+   },
+   "tool_changes": []
+  }
+ ],
+ "check_failed": [
+  {
+   "op": "model",
+   "model": "mock-fast"
+  },
+  {
+   "op": "plan",
+   "summary": "数一数"
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "start",
+    "type": "input",
+    "label": "start",
+    "config": {
+     "fields": [
+      {
+       "name": "question"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "init",
+    "type": "transform",
+    "label": "init",
+    "config": {
+     "mode": "expression",
+     "expression": "[1, 2]",
+     "assign_to": "items"
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "start",
+    "target": "init"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "lp",
+    "type": "loop",
+    "label": "lp",
+    "config": {
+     "mode": "while",
+     "condition": "foo(vars.items)",
+     "max_iterations": 2
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "init",
+    "target": "lp"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "body",
+    "type": "transform",
+    "label": "body",
+    "config": {
+     "mode": "expression",
+     "expression": "1"
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "lp",
+    "target": "body",
+    "sourceHandle": "body"
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "body",
+    "target": "lp"
+   }
+  },
+  {
+   "op": "add_node",
+   "node": {
+    "id": "out",
+    "type": "output",
+    "label": "out",
+    "config": {
+     "fields": [
+      {
+       "name": "结果",
+       "value": "{{ vars.items }}"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "op": "add_edge",
+   "edge": {
+    "source": "lp",
+    "target": "out",
+    "sourceHandle": "done"
+   }
+  },
+  {
+   "op": "done",
+   "explanation": "数一数",
+   "run": true
+  },
+  {
+   "op": "check",
+   "status": "repairing",
+   "round": 1,
+   "issues": [
+    {
+     "level": "error",
+     "node_id": "lp",
+     "edge_id": null,
+     "message": "循环条件有误：不支持函数 foo()，可用的函数：len、str、int、float、bool、abs、min、max、sum、round、sorted、any、all、lower、upper、contains、startswith、endswith、matches、get、cell（原文：foo(vars.items)）",
+     "field": "condition",
+     "code": null,
+     "fix": null
+    }
+   ]
+  },
+  {
+   "op": "update_node",
+   "id": "lp",
+   "config": {
+    "mode": "while",
+    "condition": "bar(vars.items)",
+    "max_iterations": 2
+   }
+  },
+  {
+   "op": "check",
+   "status": "repairing",
+   "round": 2,
+   "issues": [
+    {
+     "level": "error",
+     "node_id": "lp",
+     "edge_id": null,
+     "message": "循环条件有误：不支持函数 bar()，可用的函数：len、str、int、float、bool、abs、min、max、sum、round、sorted、any、all、lower、upper、contains、startswith、endswith、matches、get、cell（原文：bar(vars.items)）",
+     "field": "condition",
+     "code": null,
+     "fix": null
+    }
+   ]
+  },
+  {
+   "op": "update_node",
+   "id": "lp",
+   "config": {
+    "mode": "while",
+    "condition": "bar(vars.items)",
+    "max_iterations": 2
+   }
+  },
+  {
+   "op": "check",
+   "status": "failed",
+   "issues": [
+    {
+     "level": "error",
+     "node_id": "lp",
+     "edge_id": null,
+     "message": "循环条件有误：不支持函数 bar()，可用的函数：len、str、int、float、bool、abs、min、max、sum、round、sorted、any、all、lower、upper、contains、startswith、endswith、matches、get、cell（原文：bar(vars.items)）",
+     "field": "condition",
+     "code": null,
+     "fix": null
+    }
+   ],
+   "warnings": []
+  },
+  {
+   "op": "final",
+   "graph": {
+    "nodes": [
+     {
+      "id": "start",
+      "type": "input",
+      "position": {
+       "x": 80.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "start",
+       "description": "",
+       "config": {
+        "fields": [
+         {
+          "name": "question"
+         }
+        ]
+       }
+      }
+     },
+     {
+      "id": "init",
+      "type": "transform",
+      "position": {
+       "x": 414.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "init",
+       "description": "",
+       "config": {
+        "mode": "expression",
+        "expression": "[1, 2]",
+        "assign_to": "items"
+       }
+      }
+     },
+     {
+      "id": "lp",
+      "type": "loop",
+      "position": {
+       "x": 748.0,
+       "y": 0.0
+      },
+      "data": {
+       "label": "lp",
+       "description": "",
+       "config": {
+        "mode": "while",
+        "condition": "bar(vars.items)",
+        "max_iterations": 2
+       }
+      }
+     },
+     {
+      "id": "body",
+      "type": "transform",
+      "position": {
+       "x": 1082.0,
+       "y": -66.0
+      },
+      "data": {
+       "label": "body",
+       "description": "",
+       "config": {
+        "mode": "expression",
+        "expression": "1"
+       }
+      }
+     },
+     {
+      "id": "out",
+      "type": "output",
+      "position": {
+       "x": 1082.0,
+       "y": 66.0
+      },
+      "data": {
+       "label": "out",
+       "description": "",
+       "config": {
+        "fields": [
+         {
+          "name": "结果",
+          "value": "{{ vars.items }}"
+         }
+        ]
+       }
+      }
+     }
+    ],
+    "edges": [
+     {
+      "id": "start:->init",
+      "source": "start",
+      "target": "init",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "init:->lp",
+      "source": "init",
+      "target": "lp",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "lp:body->body",
+      "source": "lp",
+      "target": "body",
+      "sourceHandle": "body",
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "body:->lp",
+      "source": "body",
+      "target": "lp",
+      "sourceHandle": null,
+      "targetHandle": null,
+      "label": ""
+     },
+     {
+      "id": "lp:done->out",
+      "source": "lp",
+      "target": "out",
+      "sourceHandle": "done",
+      "targetHandle": null,
+      "label": ""
+     }
+    ],
+    "viewport": {},
+    "defaults": {}
+   },
+   "issues": [
+    {
+     "level": "error",
+     "node_id": "lp",
+     "edge_id": null,
+     "message": "循环条件有误：不支持函数 bar()，可用的函数：len、str、int、float、bool、abs、min、max、sum、round、sorted、any、all、lower、upper、contains、startswith、endswith、matches、get、cell（原文：bar(vars.items)）",
+     "field": "condition",
+     "code": null,
+     "fix": null
+    }
+   ],
+   "explanation": "数一数",
+   "autorun": false,
+   "layout": {
+    "mode": "full",
+    "placed": [
+     "start",
+     "init",
+     "lp",
+     "body",
+     "out"
+    ]
+   },
+   "tool_changes": []
+  }
+ ],
+ "reply": [
+  {
+   "op": "model",
+   "model": "mock-fast"
+  },
+  {
+   "op": "reply",
+   "text": "上一轮已经查过了：一共 3 家门店。"
+  }
+ ],
+ "ask_only": [
+  {
+   "op": "model",
+   "model": "mock-fast"
+  },
+  {
+   "op": "plan",
+   "summary": "先问清楚"
+  },
+  {
+   "op": "ask",
+   "question": "要看哪个月的？",
+   "options": [
+    "九月",
+    "十月"
+   ]
+  },
+  {
+   "op": "final",
+   "graph": {
+    "nodes": [],
+    "edges": []
+   },
+   "issues": [],
+   "explanation": "",
+   "autorun": false,
+   "layout": {
+    "mode": "keep",
+    "placed": []
+   },
+   "tool_changes": [],
+   "asked": {
+    "question": "要看哪个月的？",
+    "options": [
+     "九月",
+     "十月"
+    ]
+   }
+  }
+ ],
+ "error": [
+  {
+   "op": "model",
+   "model": "mock-fast"
+  },
+  {
+   "op": "error",
+   "message": "助手本轮未完成：接入返回了 502",
+   "hint": "",
+   "detail": "RuntimeError: 接入返回了 502"
+  }
+ ],
+ "no_ops": [
+  {
+   "op": "model",
+   "model": "mock-fast"
+  },
+  {
+   "op": "error",
+   "message": "助手本轮未完成：模型没有给出任何修改，也没有说明原因",
+   "hint": "画布未修改。可以重试，或把需求描述得更具体",
+   "detail": ""
+  }
+ ],
+ "truncated": [
+  {
+   "op": "model",
+   "model": "mock-fast"
+  },
+  {
+   "op": "plan",
+   "summary": "想了很久"
+  },
+  {
+   "op": "error",
+   "message": "助手本轮未完成：模型的输出超出了长度上限，修改没有写完",
+   "hint": "画布未修改。可以重试，或把需求拆成几步分别提出",
+   "detail": "finish_reason=length"
+  }
+ ]
+}

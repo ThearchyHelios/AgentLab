@@ -380,8 +380,10 @@ const TABLES = {
 
 const log = {
   patches: [], cancels: [], continues: [], runStarts: [], archived: [], posts: [], approvalGets: [], runGets: [],
-  deleted: [], gens: [], sourceGets: 0, catalogPatches: [],
+  deleted: [], gens: [], sourceGets: 0, catalogPatches: [], reviews: [],
 }
+/** 新服务端复核给的重来那句话：前端得原样交回去，不自己拼 */
+const DECIDE_RETRY = '（服务端拼好的重来说法）照服务端的决定重新回答：有几家门店'
 const ctl = {
   slowMs: 0, failE: true, wsClosed: {}, approvals: [], thinkGo: false, writingGo: false, writingAt: 0,
   /** 列表只给前 8 个：筛选框刚好出现，删一个就不够 8 个了 */
@@ -495,6 +497,22 @@ async function fakeApi(route) {
       return route.fulfill({ status: 200, contentType: 'text/event-stream',
         body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
     }
+    if (String(b.instruction ?? '').includes('照服务端的决定') || String(b.instruction ?? '').includes(DECIDE_RETRY)) {
+      // 新服务端：final 带 next（backend/app/chat/turn.py），最后一条是这一轮建图的用量（answer_ops 的 usage）。
+      // 「只建不跑」那一问：autorun 没写 false，next 却是 ready——前端得照 next 走
+      const ready = String(b.instruction ?? '').includes('只建不跑')
+      const ops = [
+        { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+        ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
+        { op: 'done', explanation: '一张三步的图' },
+        { op: 'check', status: 'passed', repaired: 0, warnings: [] },
+        { op: 'final', graph: GRAPH, issues: [], explanation: '一张三步的图', autorun: true, next: ready ? 'ready' : 'run' },
+        { op: 'usage', by_model: { m: { input_tokens: 4000, output_tokens: 300, calls: 1, cost_usd: 0.012, unpriced_calls: 0 } },
+          input_tokens: 4000, output_tokens: 300, calls: 1, cost_usd: 0.012, unpriced_calls: 0 },
+      ]
+      return route.fulfill({ status: 200, contentType: 'text/event-stream',
+        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
+    }
     if (String(b.instruction ?? '').includes('先问清楚')) {
       // 助手要先问清楚才能动手（服务端 copilot_gen 的 ask）：问题转出去，这一轮到此为止——没有 final，也没有 reply
       const ops = [
@@ -553,6 +571,15 @@ async function fakeApi(route) {
   if (path === '/copilot/review' && method === 'POST') {
     const wait = ctl.reviewDelay[body().run_id]
     if (wait) await new Promise((r) => setTimeout(r, wait))
+    if (String(body().run_id).startsWith('run-decide')) {
+      // 新服务端：第一次判不可用、给出重来的那句话；重来之后的那次没问题、不再重来。各带复核的用量
+      log.reviews.push(body())
+      const first = body().attempt === 0
+      return json({ verdict: first ? 'annotated' : 'ok', note: first ? '查到一半就停了' : '', answer: null, retry: first,
+                    severity: first ? 'broken' : '', signals: first ? [{ kind: 'step_limit', detail: '用满了步数', severity: 'broken' }] : [],
+                    retry_instruction: first ? DECIDE_RETRY : null,
+                    usage: { cost_usd: first ? 0.003 : 0, unpriced_calls: 0, calls: first ? 1 : 0 } })
+    }
     // 老后端的复核不认 _evidence，照样回一次改写
     if (body().run_id === 'run-evid' || body().run_id === 'run-evq') {
       return json({ verdict: 'rewritten', note: '检索降级过，结论请对照原始数据', answer: '改写后的答案：销售额大约四万多',
@@ -584,6 +611,7 @@ async function fakeApi(route) {
       : conversation.includes('正在写') ? 'run-writing'
       : conversation.includes('强杀') ? 'run-killed'
       : conversation.includes('步数用满') ? `run-steps-${++runSeq}`
+      : conversation.includes('照服务端的决定') ? `run-decide-${++runSeq}`
       : `run-busy-${++runSeq}`
     log.runStarts.push({ id, graph: b.graph })
     return json({ id, status: 'queued', run_class: 'exploratory', output: {}, usage: {} })
@@ -605,6 +633,10 @@ async function fakeApi(route) {
     if (id.startsWith('run-404')) return json({ detail: '运行不存在' }, 404)
     if (RUNS[id]) return json({ id, run_class: 'exploratory', usage: {}, ...RUNS[id] })
     if (id.startsWith('run-c') || id === 'run-b1') return json({ id, status: 'succeeded', run_class: 'exploratory', output: {}, usage: {} })
+    if (id.startsWith('run-decide')) {
+      return json({ id, status: 'succeeded', run_class: 'exploratory', output: { answer: '三家门店。' },
+                    usage: { cost_usd: 0.02, calls: 2, input_tokens: 6000, output_tokens: 400 } })
+    }
     return json({ id, status: 'interrupted', run_class: 'exploratory', output: {}, usage: {} })
   }
   if (path.startsWith('/approvals')) {
@@ -771,6 +803,17 @@ function script(runId, after = 0) {
         ...tokens.map((delta, i) => ev(10 + i, 'llm.token', 'ag', { delta })),
       ],
       end: null,
+    }
+  }
+  if (runId.startsWith('run-decide')) {
+    return {
+      events: [
+        ev(1, 'run.started', null, { nodes: 3 }),
+        ev(2, 'node.started', 'ag', {}),
+        ev(3, 'node.finished', 'ag', { duration_ms: 900 }),
+        ev(4, 'run.finished', null, { output: { answer: '三家门店。' } }),
+      ],
+      end: 'succeeded',
     }
   }
   if (runId.startsWith('run-steps')) {
@@ -1542,6 +1585,45 @@ for (const theme of THEMES) {
     const turn = (await chatState(page)).byConversation.c0emptg.at(-1)
     check('只生成了一次（同一轮的自查修正已经做过，不再整轮重来）', log.gens.length - gens === 1, `${log.gens.length - gens} 次`)
     check('这一轮照实说没过、说明已经修正过', done && turn.failure?.reason?.includes('已按检查结果修正过'), JSON.stringify(turn.failure))
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('decide', '新服务端：照 final.next 和复核的 retry_instruction 走，这一轮的花费 = 助手 + 运行 + 复核', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0emptg')
+    const gens = log.gens.length
+    const runs = log.runStarts.length
+    const reviews = log.reviews.length
+    await send(page, '照服务端的决定：有几家门店')
+    const done = await page.waitForFunction(() => {
+      const t = window.__chat.getState().byConversation.c0emptg?.at(-1)
+      return t?.phase === 'done' && t?.run?.id?.startsWith('run-decide')
+    }, null, { timeout: 8000 }).then(() => true, () => false)
+    await page.waitForTimeout(500)
+    const turn = (await chatState(page)).byConversation.c0emptg.at(-1)
+    check('复核判不可用：带着原图重来一次', done && log.gens.length - gens === 2 && log.runStarts.length - runs === 2,
+      `${log.gens.length - gens} 次生成、${log.runStarts.length - runs} 次运行`)
+    check('重来时交回去的就是服务端给的那句话', log.gens.at(-1)?.instruction === DECIDE_RETRY, log.gens.at(-1)?.instruction)
+    check('第二次复核带着这一轮试过的次数', log.reviews.slice(reviews).map((r) => r.attempt).join(',') === '0,1',
+      JSON.stringify(log.reviews.slice(reviews)))
+    const last = log.patches.filter((x) => x.body?.meta?.usage).at(-1)?.body?.meta?.usage
+    check('meta.usage 记下助手、复核、换下来的运行和这一次运行', !!last && Math.abs(last.copilot?.cost_usd - 0.024) < 1e-9
+      && Math.abs(last.review?.cost_usd - 0.003) < 1e-9 && Math.abs(last.earlier?.cost_usd - 0.02) < 1e-9
+      && Math.abs(last.run?.cost_usd - 0.02) < 1e-9, JSON.stringify(last))
+    const tag = page.locator(`[data-turn="${turn.id}"] [data-turn-cost]`)
+    const tagText = await tag.innerText().catch(() => '')
+    const title = await tag.getAttribute('title').catch(() => '')
+    check('头部写这一轮的花费，悬停分得清助手、运行、复核', tagText.includes('$0.067') && (title ?? '').includes('助手建图')
+      && (title ?? '').includes('复核'), `${tagText} | ${title}`)
+
+    // 只建不跑：autorun 没写 false，next 是 ready，前端照 next 走、不发起运行
+    const before = log.runStarts.length
+    await send(page, '照服务端的决定，只建不跑')
+    const ready = await page.waitForFunction(() => window.__chat.getState().byConversation.c0emptg?.at(-1)?.phase === 'ready',
+      null, { timeout: 6000 }).then(() => true, () => false)
+    await page.waitForTimeout(300)
+    check('next=ready：图摆着等运行，不发起', ready && log.runStarts.length === before, `${log.runStarts.length - before} 次运行`)
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

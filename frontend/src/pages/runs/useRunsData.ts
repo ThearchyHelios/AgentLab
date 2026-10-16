@@ -3,7 +3,7 @@ import { api } from '../../api/client'
 import { toast } from '../../components/ui'
 import type { StatusCode } from '../../lib/status'
 import type { Approval, Run } from '../../types'
-import type { Task } from '../../typesApp'
+import type { Task, UnlistedRuns } from '../../typesApp'
 import { useCatalog } from '../../store/catalog'
 import { runCode, serverStatuses } from './model'
 
@@ -121,6 +121,31 @@ export function useRunList(filters: ListFilters, enabled: boolean): RunList {
   }, [])
 
   return { rows, state, error, hasMore, loadingMore, reload, loadMore, patchRow, removeRow }
+}
+
+// -------------------------------------------------------------------------
+// 没列出的系统运行
+// -------------------------------------------------------------------------
+
+/**
+ * 同样的筛选下，列表没列出的系统派生运行（评测、口径对账、口径召回）有几次。点名了来源的什么都不藏，不用问；老后端
+ * 没有这个接口时当作 0（不报错：列表本身照常）
+ */
+export function useUnlistedRuns(filters: ListFilters, epoch: number, enabled: boolean): UnlistedRuns | null {
+  const [got, setGot] = useState<UnlistedRuns | null>(null)
+  const params = paramsOf(filters)
+  const key = JSON.stringify(params)
+  const ask = enabled && !params.origin_kind
+
+  useEffect(() => {
+    if (!ask) { setGot(null); return }
+    let live = true
+    api.runs.unlisted(JSON.parse(key))
+      .then((r) => { if (live) setGot(r) }, () => { if (live) setGot(null) })
+    return () => { live = false }
+  }, [key, epoch, ask])
+
+  return ask ? got : null
 }
 
 // -------------------------------------------------------------------------

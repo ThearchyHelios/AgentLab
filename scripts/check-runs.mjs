@@ -2407,6 +2407,26 @@ await section('运行来源：标签与筛选', async () => {
   check('只剩那一种来源', (await ids()).join(',') === 'fake0origin0canvas', (await ids()).join(','))
   await sel.selectOption('')
   await settle()
+  // next-round X1：系统派生的运行（评测、口径对账、召回）默认不列，列表底下照实写有几次没列出；点名来源就不再说
+  const unlistedAsked = []
+  fakes.set('GET /api/runs/unlisted', (url) => {
+    unlistedAsked.push(url.searchParams.get('origin_kind'))
+    return { status: 200, json: { total: 3, by_origin: { eval: 2, reconcile: 1 } } }
+  })
+  await page.goto(`${WEB}/runs`, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(300)
+  const note = page.locator('[data-runs-unlisted]')
+  const noteText = await note.innerText().catch(() => '')
+  check('列表底下写明另有几次系统运行未列出、各是什么', await note.count() === 1
+    && noteText.includes('另有 3 次系统运行未列出') && noteText.includes('评测 2 次') && noteText.includes('口径对账 1 次'), noteText)
+  check('来源下拉的「全部」照实说不含系统运行', (await sel.locator('option').first().innerText()).includes('不含系统运行'))
+  await sel.selectOption('eval')
+  await settle()
+  check('点名了来源：不再问、不再写没列出', await page.locator('[data-runs-unlisted]').count() === 0
+    && !unlistedAsked.includes('eval'), unlistedAsked.join(','))
+  await sel.selectOption('')
+  await settle()
+  fakes.delete('GET /api/runs/unlisted')
   fakes.delete('GET /api/runs')
   if (base) {
     await page.goto(`${WEB}/runs/${base.id}`, { waitUntil: 'networkidle' })

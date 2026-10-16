@@ -18,6 +18,7 @@ engine/nodes/llm.py（cite_fields 的抽取）、data/recipe_ai.py 各有一份�
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Hashable
+from contextlib import aclosing
 from typing import Any
 
 #: 服务方嫌额度太大时报错里会出现的字样：超过模型的输出上限（DeepSeek chat 系只到 8K），
@@ -167,19 +168,24 @@ class BudgetFallback:
         return await (await self._current()).ainvoke(messages, *args, **kwargs)
 
     async def astream(self, messages: Any, *args: Any, **kwargs: Any):
+        # 里面那条流用 aclosing 包着：调用方读到一半不读了（助手读到 done、look 就关流），关这一层时里面那条也当场关掉、
+        # 模型那一次调用当场收尾（LangChain 的回调这时把已经收到的用量交出来，providers/usage.py）。不包的话里面那条要等
+        # 垃圾回收才关，收尾落在调用方算完账之后
         used = await self._current()
         started = False
         try:
-            async for chunk in used.astream(messages, *args, **kwargs):
-                started = True
-                yield chunk
+            async with aclosing(used.astream(messages, *args, **kwargs)) as stream:
+                async for chunk in stream:
+                    started = True
+                    yield chunk
             return
         except Exception as e:
             if started or not self._can_fall_back(used) or not self._switch.rejected(e):
                 raise
             self._switch.fall_back()
-        async for chunk in (await self._current()).astream(messages, *args, **kwargs):
-            yield chunk
+        async with aclosing((await self._current()).astream(messages, *args, **kwargs)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     def _derived(self, make: Callable[[Any], Any]) -> BudgetFallback:
         """对大小两个模型做同一件事（绑工具、要结构化输出），包成共用开关的一层。小的还没建时，建好再做。"""

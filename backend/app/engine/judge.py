@@ -37,7 +37,6 @@ import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -68,6 +67,7 @@ from app.engine.evidence import (
 )
 from app.engine.expressions import CellError, column_kind, locate_cell
 from app.engine.merge_query import MERGE_SOURCE
+from app.engine import spend
 from app.engine.nodes.llm import _split_structured, _usage_of
 from app.engine.state import message_text
 from app.providers import catalog as pricing
@@ -855,7 +855,7 @@ JUDGE_DEFAULTS: dict[str, Any] = {
     "click_max_cost_usd": 0.01,   # 探索运行里每点一次「请模型判断」的金额上限
     "daily_max_usd": 2.0,         # 全局每日裁判金额上限（按本地日期）
 }
-#: 每日计数存在设置表的这一行：{date: 本地日期, usd, calls, unpriced_calls}。不从设置接口进出
+#: 每日计数存在设置表的这一行：{date: 本地日期, usd, calls, unpriced_calls}。不从设置接口进出（账本见 engine/spend.py）
 SPEND_KEY = "judge_spend"
 _COUNTS = frozenset({"report_max_claims"})
 _SECONDS = frozenset({"report_timeout_s"})
@@ -1024,61 +1024,20 @@ async def source_masks(catalog: dict[str, Any], *, loader: Callable[[str], Any] 
 # 每日计数
 # --------------------------------------------------------------------------
 
-_spend_lock = asyncio.Lock()
-
 
 def _today() -> str:
-    """本地日期：每日上限按它滚动。"""
-    return datetime.now().astimezone().date().isoformat()
+    """裁判这本账的日历：本地日期（同 engine/spend._today）。单独留一个名字：测试换掉它来模拟裁判这边跨天。"""
+    return spend._today()
 
 
-def _spend_of(row: Any) -> dict[str, Any]:
-    value = row.value if row is not None and isinstance(row.value, dict) else {}
-    today = _today()
-    if value.get("date") != today:
-        return {"date": today, "usd": 0.0, "calls": 0, "unpriced_calls": 0}
-    return {"date": today, "usd": float(value.get("usd") or 0.0), "calls": int(value.get("calls") or 0),
-            "unpriced_calls": int(value.get("unpriced_calls") or 0)}
+#: 裁判这本每日账（engine/spend.py 的 Ledger：预留、找补、按本地日期滚动和核查、评测是同一套代码，各记各的键）
+judge_spend = spend.Ledger(SPEND_KEY, today=lambda: _today())
+_LEDGER = judge_spend
 
 
 async def daily_spend() -> dict[str, Any]:
     """今天（本地日期）裁判已经花了多少：{date, usd, calls, unpriced_calls}。估不出金额的调用只计次数。"""
-    async with SessionLocal() as session:
-        return _spend_of(await session.get(Setting, SPEND_KEY))
-
-
-async def _charge(amount: float, *, limit: float | None, priced: bool) -> str | None:
-    """记一次调用、先按估算预留金额。加上这笔会超过每日上限就不记，返回 None；记下了返回记在哪天。"""
-    async with _spend_lock:
-        async with SessionLocal() as session:
-            row = await session.get(Setting, SPEND_KEY)
-            spend = _spend_of(row)
-            if limit is not None and spend["usd"] + amount > limit + 1e-12:
-                return None
-            spend["usd"] = round(spend["usd"] + amount, 8)
-            spend["calls"] += 1
-            spend["unpriced_calls"] += 0 if priced else 1
-            if row is None:
-                session.add(Setting(key=SPEND_KEY, value=spend))
-            else:
-                row.value = spend
-            await session.commit()
-            return spend["date"]
-
-
-async def _settle(date: str, delta: float) -> None:
-    """调用结束后按实际用量找补预留的差额。跨了天就不找补：预留记在前一天，今天从零算。"""
-    if not delta:
-        return
-    async with _spend_lock:
-        async with SessionLocal() as session:
-            row = await session.get(Setting, SPEND_KEY)
-            spend = _spend_of(row)
-            if row is None or spend["date"] != date:
-                return
-            spend["usd"] = max(0.0, round(spend["usd"] + delta, 8))
-            row.value = spend
-            await session.commit()
+    return await _LEDGER.daily()
 
 
 # --------------------------------------------------------------------------
@@ -1318,7 +1277,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
                         pending = pending[:len(batch)]
             pending = pending[len(batch):]
             charged = cost or 0.0
-            day = await _charge(charged, limit=budget.daily_max_usd if priced else None, priced=priced)
+            day = await _LEDGER.charge(charged, limit=budget.daily_max_usd if priced else None, priced=priced)
             if day is None:          # 估算之后、记账之前别的裁判先花掉了今天剩下的钱
                 stop([*batch, *pending], "daily_max_usd")
                 pending = []
@@ -1353,7 +1312,7 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
             inp, out = sum(t["input_tokens"] for t in tokens), sum(t["output_tokens"] for t in tokens)
             # 回复没带用量（有的网关不给、调用超时）就按估算记：宁可多记，不能让每日上限漏掉
             actual = (pricing.estimate_cost(model_id, inp, out) if inp or out else charged) if priced else 0.0
-            await _settle(day, actual - charged)
+            await _LEDGER.settle(day, actual - charged)
             spent += actual
             usage["input_tokens"] += inp
             usage["output_tokens"] += out

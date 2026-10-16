@@ -96,7 +96,8 @@ async def _stream(client, monkeypatch, model, body: dict) -> tuple[int, list[dic
         if r.status_code != 200:
             return r.status_code, [json.loads(await r.aread())]
         async for line in r.aiter_lines():
-            if line.startswith("data: "):
+            # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+            if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                 events.append(json.loads(line[6:]))
     return 200, events
 

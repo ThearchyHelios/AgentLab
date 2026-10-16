@@ -5,6 +5,7 @@
 import type { CatalogReviewAction, CatalogSource, CatalogStatus } from '../types'
 import type {
   CapabilityEffect, CapabilityReviewOutcome, CapabilityReviewRow, CapabilityRow, EndpointRow, NotifyChannelRow,
+  NotifyEventRow,
 } from '../typesApp'
 import { del, get, patch, post, put, qs, type RequestOptions } from './http'
 
@@ -128,4 +129,6 @@ export const notify = {
   removeChannel: (id: string) => del(`/notify/channels/${encodeURIComponent(id)}`),
   testChannel: (id: string) => post<{ ok: boolean; message: string }>(`/notify/channels/${encodeURIComponent(id)}/test`),
   deliveries: (params?: { channel_id?: string; limit?: number }) => get<{ items: any[] }>(`/notify/deliveries${qs(params)}`),
+  /** 登记的事件和推给哪几条路：哪种渠道能订阅哪些由服务端说，界面不自己猜 */
+  events: () => get<NotifyEventRow[]>('/notify/events'),
 }

@@ -695,6 +695,16 @@ export interface NotifyChannelRow {
   enabled: boolean
 }
 
+/**
+ * 登记的通知事件（GET /api/notify/events，服务端 notify/service.EVENTS，总方案 X6）。scopes 是推给哪几条路：global
+ * 全局渠道自己订阅，user 相关的人自己的个人渠道，app 应用版本里的订阅；空的是登记了、还没有推送的，界面上不列
+ */
+export interface NotifyEventRow {
+  event: string
+  label: string
+  scopes: ('global' | 'user' | 'app')[]
+}
+
 // ---------------------------------------------------------------------------
 // 运行来源（§2.10 X3）与助手查看（§2.9 L2）
 // ---------------------------------------------------------------------------
@@ -704,6 +714,15 @@ export type OriginKind =
   | 'chat' | 'canvas' | 'launcher' | 'schedule' | 'app_entry' | 'app_view' | 'app_backfill' | 'hook' | 'api'
   | 'trial' | 'personal_app'
   | 'eval' | 'ledger_issue' | 'reconcile' | 'recall'
+
+/**
+ * GET /api/runs/unlisted：同样的筛选下，记录页因为「系统派生的运行默认不列」而没列出的次数。系统派生的是评测、口径对账、
+ * 口径召回（服务端 engine/origin.SYSTEM_ORIGINS）：不进使用统计，按来源点名才列
+ */
+export interface UnlistedRuns {
+  total: number
+  by_origin: Partial<Record<OriginKind, number>>
+}
 
 /** 查看的对象。caliber 是已发布口径卡上的指标（蓝图助手复用口径时看，服务端 look/calibers.py） */
 export interface LookObject {

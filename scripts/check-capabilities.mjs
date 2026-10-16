@@ -299,6 +299,31 @@ await section('设置：身份、通知、审计', async () => {
   check('审计照实标自报署名', await row.count() === 1 && (await row.innerText()).includes('自报署名'))
 })
 
+await section('设置 → 通知：可订阅的事件照服务端登记列（总方案 X6）', async () => {
+  // 列表从真后端的 GET /api/notify/events 来（GET 放行）：这种范围的渠道收得到的才列；从来推不到的（以前列着、一勾就 422
+  // 的「待办升级」「动作已生效」……）和登记了还没推送的（评测、召回、待办汇总……）都不列
+  const { page, errors } = await open('/settings/notify')
+  await page.getByRole('button', { name: '添加渠道' }).first().click()
+  const dlg = page.locator('[role="dialog"]')
+  const listed = () => dlg.locator('[data-notify-event]').evaluateAll((els) => els.map((e) => e.getAttribute('data-notify-event')))
+  const scope = async (value) => {
+    await dlg.getByLabel('范围', { exact: true }).selectOption(value)
+    return waitFor(page, async () => await dlg.locator(`[data-notify-events="${value}"]`).count() === 1)
+  }
+  const every = ['task.opened', 'run.finished', 'run.failed', 'action.unknown']
+  check('全局渠道：推给全局渠道的五项', await waitFor(page, async () => await dlg.locator('[data-notify-events="global"]').count() === 1)
+    && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done']), JSON.stringify(await listed()))
+  const text = await dlg.innerText()
+  check('从来推不到的不列', !['待办升级', '待办超时', '待办处理完', '动作失败', '动作已生效'].some((t) => text.includes(t)), text)
+  check('登记了还没推送的不列', !['评测有退步', '评测失败', '每天的待办汇总', '访问密钥快到期', '数据源有变化要处理', '口径升版，答案的数变了']
+    .some((t) => text.includes(t)), text)
+  check('应用的渠道：不列只发给提交人的「我提交审核的应用有结果」', await scope('app')
+    && JSON.stringify(await listed()) === JSON.stringify(every), JSON.stringify(await listed()))
+  check('个人渠道：五项都列', await scope('user') && JSON.stringify(await listed()) === JSON.stringify([...every, 'review.done']),
+    JSON.stringify(await listed()))
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 2).join(' | '))
+})
+
 await section('能力：待审阅复用数据目录的审阅队列，成批确认逐项带能力的治理版本', async () => {
   const { page, state, errors } = await open('/tools/capabilities?view=review')
   check('左栏换成待审阅视图', await page.locator('[data-capability-views="review"]').count() === 1)

@@ -110,7 +110,8 @@ async def _stream(client, monkeypatch, model, body: dict) -> list[dict]:
     async with client.stream("POST", "/api/copilot/generate-stream", json=body) as r:
         assert r.status_code == 200, await r.aread()
         async for line in r.aiter_lines():
-            if line.startswith("data: "):
+            # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+            if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                 events.append(json.loads(line[6:]))
     return events
 

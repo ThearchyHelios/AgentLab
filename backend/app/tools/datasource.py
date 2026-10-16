@@ -277,7 +277,7 @@ async def build_datasource_tools(
         except table_versions.SnapshotMissing as e:
             tools.extend(_unavailable_tool(row, prefix, str(e)) for prefix in prefixes)
             continue
-        entries = await _catalog_of(row)
+        entries = await _catalog_of(row, ctx.catalog_view)
         for prefix in prefixes:
             if prefix == QUERY_PREFIX:
                 tools.append(_make_query_tool(source, ctx, fixed=fixed, catalog=entries, force_readonly=force_readonly,
@@ -287,20 +287,17 @@ async def build_datasource_tools(
     return tools
 
 
-async def _catalog_of(row: DataSource) -> dict[str, data_catalog.CatalogEntry]:
+async def _catalog_of(row: Any, view: Any = None) -> dict[str, data_catalog.CatalogEntry]:
     """这个源的数据目录，建工具时读一次：db_schema 给模型看的和查询时冻结进表结构快照的是同一版。
 
-    读不到就当没有目录，工具照常可用——目录是附加说明，不能挡住查询。用单独的会话读：出错要回滚，
-    而回滚会让调用方会话里已经加载的对象（row）全部过期，之后再读属性就是异步环境里的懒加载。
+    读哪一份由目录视图定（view，data/catalog_view.py：当前目录、目录快照、关；只用已核实的项），不给就是当前目录。
+    读不到就当没有目录，工具照常可用——目录是附加说明，不能挡住查询；视图指定的目录快照不在了照实报错（不悄悄换成当前
+    目录）。用单独的会话读：出错要回滚，而回滚会让调用方会话里已经加载的对象（row）全部过期，之后再读属性就是异步环境里
+    的懒加载。
     """
-    from app.db.base import SessionLocal
+    from app.data import catalog_view
 
-    try:
-        async with SessionLocal() as own:
-            return await data_catalog.read_catalog(own, row.id)
-    except Exception:  # noqa: BLE001
-        logger.exception("读取数据源 %s 的数据目录失败，本次不附目录", row.name)
-        return {}
+    return await catalog_view.read(catalog_view.CatalogView.parse(view), row)
 
 
 # --------------------------------------------------------------------------
@@ -753,6 +750,12 @@ async def _store_schema(source: Any, ctx: ToolContext, *,
     if frozen := data_catalog.frozen_catalog(catalog or {}, tables):
         content[CATALOG_SNAPSHOT_KEY] = frozen
         meta["catalog_tables"] = len(frozen)
+    # 这次运行读的不是缺省的当前目录（评测的对照：关、目录快照、只用已核实的项）：记在引用的 meta 里，证据面板写得出
+    # 「本次运行目录：关」。不进内容哈希，缺省视图不记，快照和以前一字不差
+    from app.data.catalog_view import CatalogView, describe
+
+    if (view := describe(CatalogView.parse(getattr(ctx, "catalog_view", None)))) is not None:
+        meta["catalog_view"] = view
     try:
         return await put_json(content, kind=SCHEMA_SNAPSHOT, run_id=ctx.run_id or "", node_id=ctx.node_id or "",
                               meta=meta)

@@ -3,6 +3,11 @@
 调度循环（loop.py）到点调 fire_once，接口的「立即运行」也调它：重叠跳过、渲染输入、记触发、发起运行这一套
 只有一份。发起本身走 engine/launch.py 的 launch_run，和 HTTP 发起是同一套规则——正式运行只能从当前发布版本
 发起，这一条不会在定时任务这边被绕过。
+
+**定时的目标**（docs/design/next-round/00-总方案.md X4：定时只有一套）：一个定时任务指向一个目标——工作流、评测题集
+（第 3 波）或数据源维护（第 3 波）。认领、补跑、重叠跳过、触发记录、通知都只有这一套，fire_once 按目标种类分派。
+老表的 workflow_id 是非空约束，只加不改的迁移放宽不了：目标不是工作流时它存空串。这条规矩只在 target_of /
+target_columns 这一处，别处读写目标都经它们，不直接碰这两列。
 """
 from __future__ import annotations
 
@@ -62,6 +67,33 @@ _TEMPLATE_RE = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
 INTERRUPTED_REASON = "服务在发起运行前停止，这次触发没有发起运行"
 #: launch_run 抛了 LaunchRefused 以外的异常（库出错之类）。详细信息只进日志
 GENERIC_REASON = "发起运行时出错，详细信息见服务日志"
+
+
+#: 定时的目标种类（Schedule.target_kind），顺序即以后界面上的顺序。这一波 fire_once 只会发起 workflow
+TARGET_KINDS = ("workflow", "eval_suite", "source_maintenance")
+TARGET_LABEL = {"workflow": "工作流", "eval_suite": "评测题集", "source_maintenance": "数据源维护"}
+#: 目标种类这个版本还发起不了（库里有别的版本建的任务、手改过库）：照实记「未能发起」，不当成工作流去跑
+TARGET_UNSUPPORTED = "这个定时任务的目标是「{kind}」，当前版本还不能按时发起这类目标，这次触发没有发起"
+
+
+def target_of(schedule: Any) -> tuple[str, str]:
+    """一个定时任务的目标：(种类, id)。加列之前建的任务 target_kind 缺省 workflow、target_id 为空，目标就是 workflow_id。
+
+    workflow 时 id 以 workflow_id 为准（两列由 target_columns 一起写，对得上；老任务只有这一列）。"""
+    kind = getattr(schedule, "target_kind", None) or "workflow"
+    if kind == "workflow":
+        return kind, schedule.workflow_id or getattr(schedule, "target_id", None) or ""
+    return kind, getattr(schedule, "target_id", None) or ""
+
+
+def target_columns(kind: str, target_id: str) -> dict[str, str]:
+    """写目标的几列：{target_kind, target_id, workflow_id}。workflow 时 target_id 同 workflow_id；别的种类 workflow_id 存空串
+    （老表的非空约束）。种类不认识、id 为空抛 ValueError。"""
+    if kind not in TARGET_KINDS:
+        raise ValueError(f"不认识的定时目标种类：{kind}")
+    if not target_id:
+        raise ValueError("定时任务的目标 id 不能为空")
+    return {"target_kind": kind, "target_id": target_id, "workflow_id": target_id if kind == "workflow" else ""}
 
 
 class TemplateError(ValueError):
@@ -282,46 +314,61 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
     """处理一次触发，返回记下的触发记录。同一 (任务, fire_at, kind) 已经有记录（两拍撞在一起、立即运行连点两下）
     时不再发起，返回已有的那一条；任务不存在返回 None。
 
-    上一次运行还没结束就记 skipped_overlap；输入渲染不了、launch_run 拒绝或出错记 failed_to_start（拒绝写原话，
-    其他异常写通用说明、详细信息进日志）；发起成功记 started 和运行 id。
+    按目标种类分派（target_of）：这一波只有工作流（_fire_workflow），别的种类记 failed_to_start、写明原因，不发起。
     """
     async with launch_lock():
         async with SessionLocal() as session:
             schedule = await session.get(Schedule, schedule_id)
             if schedule is None:
                 return None
-            name, workflow_id, run_class = schedule.name, schedule.workflow_id, schedule.run_class
+            target_kind, target_id = target_of(schedule)
+            name, run_class = schedule.name, schedule.run_class
             tz, cron_expr, template = schedule.timezone, schedule.cron, schedule.input_template
-        try:
-            inputs = render_inputs(check_template(template), template_values(fire_at, tz, cron_expr))
-        except (TemplateError, cron.CronError, cron.TimezoneError) as e:
-            # 存进库之后才坏掉的（手改过库、时区库升级删了时区）：照实说是哪一项，不发起
-            return await _record(schedule_id, fire_at, kind, "failed_to_start", f"无法生成这次运行的输入：{e}", {})
-        busy = await _active_run(schedule_id)
-        if busy is not None:
-            return await _record(schedule_id, fire_at, kind, "skipped_overlap", overlap_reason(*busy), inputs)
-        fire = await _record(schedule_id, fire_at, kind, "failed_to_start", INTERRUPTED_REASON, inputs, fresh=True)
-        if fire is None:
-            return await _existing(schedule_id, fire_at, kind)
-        from app.engine.launch import LaunchRefused, launch_run
+        if target_kind != "workflow":
+            reason = TARGET_UNSUPPORTED.format(kind=TARGET_LABEL.get(target_kind, target_kind))
+            return await _record(schedule_id, fire_at, kind, "failed_to_start", reason, {})
+        return await _fire_workflow(schedule_id, fire_at, kind, actor=actor, name=name, workflow_id=target_id,
+                                    run_class=run_class, tz=tz, cron_expr=cron_expr, template=template)
 
-        _LAUNCHING.add(fire.id)
+
+async def _fire_workflow(schedule_id: str, fire_at: datetime, kind: str, *, actor: str | None, name: str,
+                         workflow_id: str, run_class: str, tz: str, cron_expr: str, template: Any,
+                         ) -> ScheduleFire | None:
+    """目标是工作流的一次触发（持着 launch_lock）。
+
+    上一次运行还没结束就记 skipped_overlap；输入渲染不了、launch_run 拒绝或出错记 failed_to_start（拒绝写原话，
+    其他异常写通用说明、详细信息进日志）；发起成功记 started 和运行 id。
+    """
+    try:
+        inputs = render_inputs(check_template(template), template_values(fire_at, tz, cron_expr))
+    except (TemplateError, cron.CronError, cron.TimezoneError) as e:
+        # 存进库之后才坏掉的（手改过库、时区库升级删了时区）：照实说是哪一项，不发起
+        return await _record(schedule_id, fire_at, kind, "failed_to_start", f"无法生成这次运行的输入：{e}", {})
+    busy = await _active_run(schedule_id)
+    if busy is not None:
+        return await _record(schedule_id, fire_at, kind, "skipped_overlap", overlap_reason(*busy), inputs)
+    fire = await _record(schedule_id, fire_at, kind, "failed_to_start", INTERRUPTED_REASON, inputs, fresh=True)
+    if fire is None:
+        return await _existing(schedule_id, fire_at, kind)
+    from app.engine.launch import LaunchRefused, launch_run
+
+    _LAUNCHING.add(fire.id)
+    try:
         try:
-            try:
-                async with SessionLocal() as session:
-                    run = await launch_run(session, workflow_id=workflow_id, run_class=run_class,
-                                           input_payload=inputs, actor=actor or actor_label(name),
-                                           schedule_id=schedule_id, origin_kind="schedule",
-                                           origin={"schedule_id": schedule_id, "schedule": name,
-                                                   "fire_id": fire.id, "fire_kind": kind})
-            except LaunchRefused as e:
-                return await _finish(fire.id, status="failed_to_start", reason=e.message)
-            except Exception:  # noqa: BLE001 - 发起失败不能让调度循环停下；详细信息进日志，记录上写通用说明
-                logger.exception("定时任务「%s」（%s）发起运行失败", name, schedule_id)
-                return await _finish(fire.id, status="failed_to_start", reason=GENERIC_REASON)
-            return await _finish(fire.id, status="started", reason=None, run_id=run.id)
-        finally:
-            _LAUNCHING.discard(fire.id)
+            async with SessionLocal() as session:
+                run = await launch_run(session, workflow_id=workflow_id, run_class=run_class,
+                                       input_payload=inputs, actor=actor or actor_label(name),
+                                       schedule_id=schedule_id, origin_kind="schedule",
+                                       origin={"schedule_id": schedule_id, "schedule": name,
+                                               "fire_id": fire.id, "fire_kind": kind})
+        except LaunchRefused as e:
+            return await _finish(fire.id, status="failed_to_start", reason=e.message)
+        except Exception:  # noqa: BLE001 - 发起失败不能让调度循环停下；详细信息进日志，记录上写通用说明
+            logger.exception("定时任务「%s」（%s）发起运行失败", name, schedule_id)
+            return await _finish(fire.id, status="failed_to_start", reason=GENERIC_REASON)
+        return await _finish(fire.id, status="started", reason=None, run_id=run.id)
+    finally:
+        _LAUNCHING.discard(fire.id)
 
 
 async def record_skip(schedule_id: str, fire_at: datetime, reason: str) -> ScheduleFire | None:

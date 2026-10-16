@@ -99,7 +99,8 @@ async def _events(client, monkeypatch, model, body: dict, path: str = "/api/copi
     async with client.stream("POST", path, json=body) as r:
         assert r.status_code == 200, await r.aread()
         async for line in r.aiter_lines():
-            if line.startswith("data: "):
+            # 末尾那条 usage 是这一轮助手的用量（answer_ops），不是生成的操作
+            if line.startswith("data: ") and not line.startswith('data: {"op": "usage"'):
                 out.append(json.loads(line[6:]))
     return out
 

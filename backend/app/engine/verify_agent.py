@@ -758,6 +758,7 @@ async def run_verify_agent(
     node_id: str = "",
     data_versions: dict[str, Any] | Versions | None = Versions.UNSET,
     masked_values: Any = None,
+    catalog_view: Any = None,
 ) -> VerifyOutcome:
     """让一个只读 agent 查库，按 output_schema 交回有出处的结果。永远不抛。
 
@@ -775,6 +776,8 @@ async def run_verify_agent(
     - masked_values：调用方已经认出的遮罩值（engine/masking 的 _Secrets，审批质询、反方审稿收的报告快照里的值）。
       查询工具从第一条查询起就按它们按值遮：agent 查到的备注、别的表里写着同一个号码时，模型看不到。随查询时遮掉的值
       一起交回（VerifyOutcome.masked_values）。不改它。
+    - catalog_view：db_schema 给 agent 看哪一份数据目录（data/catalog_view.py）。运行里的节点传这次运行的视图
+      （catalog_view.of_run）；不给是当前目录（质询接口）。
     """
     state = _State(started=time.monotonic(), seen=SeenValues(
         given=masked_values if masked_values is not None else _Secrets()))
@@ -782,7 +785,7 @@ async def run_verify_agent(
         out = await _verify(state, spec=spec, system=system, task=task, sources=sources,
                             output_schema=output_schema, max_queries=max_queries, timeout_s=timeout_s,
                             max_cost_usd=max_cost_usd, daily_max_usd=daily_max_usd, max_steps=max_steps, emit=emit,
-                            run_id=run_id, node_id=node_id, data_versions=data_versions)
+                            run_id=run_id, node_id=node_id, data_versions=data_versions, catalog_view=catalog_view)
     except Exception as e:  # noqa: BLE001 - 永远不抛：库写不进去、建工具出错这类意外也落在返回值里
         logger.warning("核查出错", exc_info=True)
         out = state.outcome(error=f"核查出错（{describe_exception(e)}）")
@@ -798,6 +801,7 @@ async def run_verify_agent(
 async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sources: Iterable[str],
                   output_schema: dict[str, Any], max_queries: int | None, timeout_s: float | None,
                   max_cost_usd: float | None, daily_max_usd: float | None | Default, max_steps: int | None,
+                  catalog_view: Any = None,
                   emit: Emit | None, run_id: str, node_id: str,
                   data_versions: dict[str, Any] | Versions | None) -> VerifyOutcome:
     deadline = state.started + timeout_s if timeout_s is not None else None
@@ -834,7 +838,7 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
 
     # ---- 工具：只读的 db_schema / db_query，查询结果先遮再交给模型（遮掉的值并进 state.seen）
     wanted = list(dict.fromkeys(s for s in sources if isinstance(s, str) and s))
-    ctx = ToolContext(run_id=run_id, node_id=node_id, data_versions=data_versions, emit=emit,
+    ctx = ToolContext(run_id=run_id, node_id=node_id, data_versions=data_versions, emit=emit, catalog_view=catalog_view,
                       extra={MASKED_VALUES_KEY: state.seen})
     async with SessionLocal() as session:
         tools = await build_datasource_tools([f"{p}{s}" for s in wanted for p in (SCHEMA_PREFIX, QUERY_PREFIX)], ctx,

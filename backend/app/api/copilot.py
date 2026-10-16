@@ -110,11 +110,12 @@ def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None) ->
 
 async def _look_service(session: AsyncSession, payload: GenerateIn, sources: list[Any], *,
                         graph: dict[str, Any] | None, kinds: tuple[str, ...] = ("table", "capability"),
-                        ) -> Any:
-    """这一轮的查看服务（copilot_context.look_service）。挑选模型用同一个助手模型，第一次要挑时才拿。"""
+                        catalog_view: Any = None) -> Any:
+    """这一轮的查看服务（copilot_context.look_service）。挑选模型用同一个助手模型，第一次要挑时才拿。catalog_view：表详情
+    里给哪一份数据目录（data/catalog_view.py），不给是当前目录。"""
     spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
     return await copilot_context.look_service(sources, spec=spec, graph=graph, kinds=kinds,
-                                              answer=payload.intent == "answer")
+                                              answer=payload.intent == "answer", catalog_view=catalog_view)
 
 
 NODE_REFERENCE = """\
@@ -1756,45 +1757,81 @@ def _repair_request(
 
 
 @router.post("/generate-stream")
-async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(get_session)):
+async def generate_stream(payload: GenerateIn):
     """流式版生成：SSE 逐操作推送，前端边收边把节点摆上画布。
 
-    生成过程（copilot_gen）读到 look 就停下、查看、接着写，查看记录作为 look 事件发给前端（前端存进这一轮的
-    meta.looks）。结束时（done 或流断）发一条 final：服务端把累积的图排版、校验后整体给出——过程可见性来自操作流，
-    最终质量仍由和手工编排相同的 layout + validate 保证。模型问了用户（ask）的，这一轮到此为止，不自查修正、不自动运行。
+    生成过程整个在 answer_ops 里（评测直接迭代它，和问数据页走同一条路），这里只包一层 SSE。开流前的拒绝（模型没配好、
+    对话读不了、限定的数据源都不在）发生在 answer_ops 交出第一条操作之前：先取第一条，拒绝照旧是 HTTP 错误，不进流。
     """
     from fastapi.responses import StreamingResponse
 
-    from app.data.sqlcheck import load_checkers
+    ops = answer_ops(payload)
+    first = await ops.__anext__()
 
+    async def event_stream():
+        yield _sse(first)
+        async for op in ops:
+            yield _sse(op)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
+    """生成过程：按需求起草、按需查看、自查修正、排版校验，逐条交出操作（op dict）。问数据页（经 SSE）和评测（直接迭代）
+    走的是这同一条路（细案 01 做法 2）。
+
+    读到 look 就停下、查看、接着写，查看记录作为 look 操作交出（前端存进这一轮的 meta.looks）。结束时（done 或流断）交一条
+    final：累积的图排版、校验后整体给出——过程可见性来自操作流，最终质量仍由和手工编排相同的 layout + validate 保证。模型
+    问了用户（ask）的，这一轮到此为止，不自查修正、不自动运行。
+
+    开流前的准备（取数据源、读目录检查器、取助手模型、拼历史、组查看服务）用自己的短会话，在交出第一条操作之前做完：
+    拒绝在这里抛 HTTPException（调用方没迭代到第一条就知道）。catalog_view 是这一轮读哪一份数据目录（data/catalog_view.py：
+    查看的表详情、自查的 SQL 检查器都按它），不给是当前目录。
+
+    final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、fail 判失败），问数据页照它走。最后多交一条 usage
+    （providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
+    unpriced_calls}——这一轮助手建图（含挑表、接着写、自查修正）花了多少。前面每一条和抽出来之前逐条一样。运行不在这里，
+    不计。
+    """
     from app.api.deps import restricted
+    from app.chat import turn
+    from app.data.catalog_view import CatalogView
+    from app.data.sqlcheck import load_checkers
+    from app.db.base import SessionLocal
+    from app.providers import usage
 
-    # 带了对话的，先核对这个人能不能用它（D-d）：历史、上一轮的图都从它来
-    await _ensure_conversation_access(session, payload.conversation_id)
-    # 开登录后的 user 角色（D-c）：图只能用 chat_policy 放行的节点和工具，提示词先说、自查按同一个判断挡
-    chat_user = restricted()
-    sources = await _sources(session, payload.datasource_ids)
-    scope = {r.name for r in sources} if payload.datasource_ids else None
-    # 基于数据目录的 SQL 检查器：在开流之前读好目录（流里不再碰这个会话），自查和收尾共用
-    checkers = await load_checkers(session, sources)
-    nodes, edges = _start_graph(payload)
-    # 用户摆好的坐标，收尾排版时原样留着
-    pinned = _pinned_positions(payload.base_graph)
+    view = CatalogView.parse(catalog_view)
+    async with SessionLocal() as session:
+        # 带了对话的，先核对这个人能不能用它（D-d）：历史、上一轮的图都从它来
+        await _ensure_conversation_access(session, payload.conversation_id)
+        # 开登录后的 user 角色（D-c）：图只能用 chat_policy 放行的节点和工具，提示词先说、自查按同一个判断挡
+        chat_user = restricted()
+        sources = await _sources(session, payload.datasource_ids)
+        scope = {r.name for r in sources} if payload.datasource_ids else None
+        # 基于数据目录的 SQL 检查器：在开流之前读好目录（流里不再碰这个会话），自查和收尾共用
+        checkers = await load_checkers(session, sources, catalog_view=view)
+        nodes, edges = _start_graph(payload)
+        # 用户摆好的坐标，收尾排版时原样留着
+        pinned = _pinned_positions(payload.base_graph)
 
-    try:
-        model, model_id = await _op_model(session, payload)
-    except ProviderNotConfigured as e:
-        raise HTTPException(400, _unconfigured(e)) from e
+        try:
+            model, model_id = await _op_model(session, payload)
+        except ProviderNotConfigured as e:
+            raise HTTPException(400, _unconfigured(e)) from e
 
-    human = _with_history(_graph_request(payload), await _history_section(session, payload.conversation_id))
-    # 兜底用：模型只发了改动操作时，把它们重放到这张图上
-    prev_graph = await _previous_graph(session, payload.conversation_id)
-    # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
-    baseline = copy.deepcopy(
-        (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
-    # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里
-    looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
-        payload.base_graph or {}).get("nodes") else prev_graph)
+        human = _with_history(_graph_request(payload), await _history_section(session, payload.conversation_id))
+        # 兜底用：模型只发了改动操作时，把它们重放到这张图上
+        prev_graph = await _previous_graph(session, payload.conversation_id)
+        # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
+        baseline = copy.deepcopy(
+            (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
+        # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里
+        looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
+            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view)
     # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
     system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user)
     applier = GraphApplier(nodes, edges)
@@ -1803,8 +1840,8 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                      checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,
                                           chat_user=chat_user))
 
-    async def event_stream():
-        yield _sse({"op": "model", "model": model_id})
+    async def steps():
+        yield {"op": "model", "model": model_id}
         patches = 0
         try:
             async for op in _with_heartbeat(gen.draft(human), started=started):
@@ -1813,23 +1850,24 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                     # reply 先压着（applier.replied）：前端收到 reply 就收尾，提案得排在它前面转出
                     if (checked := await catalog_patch_op(op, sources)) is not None:
                         patches += 1
-                        yield _sse(checked)
+                        yield checked
                     continue
-                yield _sse(op)
+                yield op
             if applier.replied is not None:
                 # 这句话不需要工作流：后面那套排版校验对着一张空图跑，只会得到"图是空的，先拖一个节点进来"
-                yield _sse(applier.replied)
+                yield applier.replied
                 return
             if gen.asked is not None and not applier.effective:
                 # 先问清楚才能动手，什么都还没改：这一轮到此为止。照样发一条 final 收尾，带上问题（asked）和没动过的图：
                 # 前端据此把这一轮记成「助手反问」、问题进历史（以前流就这么断了，问数据页一直停在「进行中」），
                 # 不运行、不重排。图给一份对象（画布上原来的图、问数据上一轮的图，都没有就是空图），老前端照样认得
-                yield _sse(_asked_final(gen.asked, payload.base_graph, prev_graph))
+                asked_final = _asked_final(gen.asked, payload.base_graph, prev_graph)
+                yield {**asked_final, "next": turn.next_step(asked_final)}
                 return
             # 只发了目录修改提案，既没回答也没改图（用户只是在说一条数据事实）：补一句回答收尾，
             # 不能按下面的「模型没有给出任何修改」报错——提案已经摆在用户面前了
             if patches and all(o.get("op") == "plan" for o in applier.seen):
-                yield _sse({"op": "reply", "text": PATCH_ONLY_REPLY})
+                yield {"op": "reply", "text": PATCH_ONLY_REPLY}
                 return
             # 流正常结束，却没有 done、也没有一个操作能认（格式跑偏，每一行都被跳过）：
             # 往下走就是拿原图去自查、交付，界面上写「无需修改」——而模型什么都没说
@@ -1837,12 +1875,11 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
                                         hint="画布未修改。可以重试，或把需求描述得更具体")
         except CopilotIncomplete as e:
-            yield _sse({"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail})
+            yield {"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail}
             return
         except Exception as e:  # noqa: BLE001
             reason, hint = explain_error(e)
-            yield _sse({"op": "error", "message": f"助手本轮未完成：{reason}",
-                        "hint": hint, "detail": raw_error(e)})
+            yield {"op": "error", "message": f"助手本轮未完成：{reason}", "hint": hint, "detail": raw_error(e)}
             return
 
         # 兜底：一个操作都没落地，而上一轮有图。
@@ -1858,7 +1895,7 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
         # 以前这些问题照样交付、照样自动开跑——跑到那一步才炸（开发库里四次运行死在
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
         async for op in _with_heartbeat(gen.repair(), phase="repairing"):
-            yield _sse(op)
+            yield op
         remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers,
                                      chat_user=chat_user)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
@@ -1871,11 +1908,9 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
             # 改不好也照实交付、列出问题，但不自动运行：明知跑不起来的图，开跑只会
             # 在半路报一个用户看不懂的错
             autorun = False
-            yield _sse({"op": "check", "status": "failed", "issues": remaining,
-                        "warnings": warnings})
+            yield {"op": "check", "status": "failed", "issues": remaining, "warnings": warnings}
         elif remaining is not None:
-            yield _sse({"op": "check", "status": "passed", "repaired": gen.repaired,
-                        "warnings": warnings})
+            yield {"op": "check", "status": "passed", "repaired": gen.repaired, "warnings": warnings}
 
         # 收尾：排版 + 校验，把最终图整体交付。改图时旧节点留在原处，只排新节点
         try:
@@ -1913,16 +1948,17 @@ async def generate_stream(payload: GenerateIn, session: AsyncSession = Depends(g
                 # 改了图又问了用户（这一轮照样结束、不自动运行）：问题跟着 final 交付，前端记进这一轮
                 **({"asked": _asked_of(gen.asked)} if gen.asked is not None else {}),
             }
+            # 建完之后怎么走（chat/turn.next_step）：run 运行、ready 只建不跑、fail 判失败。问数据页照它走，评测用同一个函数
+            final["next"] = turn.next_step(final)
         except Exception as e:  # noqa: BLE001
             final = {"op": "error", "message": f"模型返回的工作流结构有误：{graph_error(e)}",
                      "hint": "请重试，或把需求描述得更具体", "detail": raw_error(e)}
-        yield _sse(final)
+        yield final
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    spent = usage.meter()
+    async for op in usage.metered(steps(), spent):
+        yield op
+    yield {"op": "usage", **spent.summary()}
 
 
 # --------------------------------------------------------------------------
@@ -2774,13 +2810,31 @@ class ReviewIn(BaseModel):
     #: 默认只在扫出异常信号时才叫模型。打开它就每次都复核——排查时有用，
     #: 平时不开：干净的运行没什么可复核的，代价却是每次问数都多一次调用
     always: bool = False
+    #: 这一轮已经自动试了几次（从 0 数，同 chat/turn.retry_after_review）：结果里的 retry_instruction 据此给不给。
+    #: 不传按第一次算
+    attempt: int = Field(default=0, ge=0)
 
 
 @router.post("/review")
 async def review_run(
     payload: ReviewIn, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
-    """接住一次编排的产出，判断它能不能就这么交给用户。
+    """接住一次编排的产出，判断它能不能就这么交给用户（规则见 review_of_run）。这里只核对能不能读这次运行。"""
+    from app.api.deps import PRIVATE_RUN, can_read_run, current_principal
+    from app.db.models import Run
+
+    run = await session.get(Run, payload.run_id)
+    if not run:
+        raise HTTPException(404, "运行记录不存在，可能已被删除")
+    if not await can_read_run(current_principal(), run):
+        raise HTTPException(403, PRIVATE_RUN)
+    return await review_of_run(session, run, question=payload.question, provider=payload.provider,
+                               model=payload.model, always=payload.always, attempt=payload.attempt)
+
+
+async def review_of_run(session: AsyncSession, run: Any, *, question: str, provider: str | None = None,
+                        model: str | None = None, always: bool = False, attempt: int = 0) -> dict[str, Any]:
+    """复核一次运行（问数据页经 /copilot/review、评测直接调，同一个函数）。
 
     「跑完了」和「答得对」是两回事。运行状态只说明流程走完了，而过程中检索
     降级、工具报错、agent 步数用满这些事，原先一件都不会进到答案里——用户拿到
@@ -2788,47 +2842,57 @@ async def review_run(
 
     规则层先扫一遍（engine/review.py:scan），没扫出东西就到此为止、直接返回，
     不花一次模型调用；扫出来了才叫模型重组答案并把异常说破。
-    """
-    from app.api.deps import PRIVATE_RUN, can_read_run, current_principal
-    from app.db.models import Run, RunEvent
-    from app.engine import review as rv
 
-    run = await session.get(Run, payload.run_id)
-    if not run:
-        raise HTTPException(404, "运行记录不存在，可能已被删除")
-    if not await can_read_run(current_principal(), run):
-        raise HTTPException(403, PRIVATE_RUN)
+    结果是 ReviewResult.as_dict()，另带两项：
+    - retry_instruction：要不要带着原图重来一次（chat/turn.retry_after_review，按 attempt 算这一轮还能不能再试）——要的话
+      是交给助手的那句话（chat/turn.retry_instruction），不要是 null。问数据页照它走；
+    - usage：复核这一次模型调用花了多少（providers/usage.py 的汇总，没调模型时是全 0），这一轮的花费 = 助手 + 运行 + 复核。
+    """
+    from app.chat import turn
+    from app.db.models import RunEvent
+    from app.engine import review as rv
+    from app.providers import usage
 
     rows = list((await session.execute(
-        select(RunEvent).where(RunEvent.run_id == payload.run_id).order_by(RunEvent.seq)
+        select(RunEvent).where(RunEvent.run_id == run.id).order_by(RunEvent.seq)
     )).scalars())
 
     output = run.output if isinstance(run.output, dict) else None
     signals = rv.scan(rows, output)
     answer = rv.answer_text(output)
+    spent = usage.meter()
 
-    if not signals and not payload.always:
-        return rv.ReviewResult(verdict="ok", signals=[]).as_dict()
+    def done(result: Any) -> dict[str, Any]:
+        out = result.as_dict()
+        out["retry_instruction"] = (
+            turn.retry_instruction(question, turn.review_reason(out), turn.has_nodes(run.graph))
+            if turn.retry_after_review(out, attempt) else None)
+        out["usage"] = spent.summary()
+        return out
+
+    if not signals and not always:
+        return done(rv.ReviewResult(verdict="ok", signals=[]))
 
     try:
         spec = await copilot_model_spec(session, GenerateIn(
-            instruction="review", provider=payload.provider, model=payload.model,
+            instruction="review", provider=provider, model=model,
         ), max_tokens=4096)
-        model, _ = await get_chat_model(session, spec)
+        chat_model, _ = await get_chat_model(session, spec)
     except (ProviderNotConfigured, HTTPException) as e:
         # 没配模型不该让这一轮挂掉：规则层已经知道出了什么事，照样说得出话
-        return rv.ReviewResult(
+        return done(rv.ReviewResult(
             verdict="annotated",
             note="；".join(s.detail for s in signals) or (
                 _unconfigured(e) if isinstance(e, ProviderNotConfigured) else str(e.detail)
             ),
             retry=rv.should_retry(signals),
             signals=signals, severity=rv.worst(signals),
-        ).as_dict()
+        ))
 
-    result = await rv.review(
-        model, question=payload.question, answer=answer, signals=signals,
-        # 报告撰写节点产出的答案逐段对应着证据文档：只能加说明，不能改写
-        locked=bool(output and output.get("_evidence")),
-    )
-    return result.as_dict()
+    with usage.metering(spent):
+        result = await rv.review(
+            chat_model, question=question, answer=answer, signals=signals,
+            # 报告撰写节点产出的答案逐段对应着证据文档：只能加说明，不能改写
+            locked=bool(output and output.get("_evidence")),
+        )
+    return done(result)

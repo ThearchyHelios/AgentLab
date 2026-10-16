@@ -7,12 +7,12 @@ import {
   formatCost, formatDateTime, formatDay, formatSpan, formatTime, formatTokens, parseServerTime, shortId,
 } from '../../lib/format'
 import {
-  ORIGIN_LABEL, ORIGIN_TEXT, RUN_CLASS_LABEL, TASK_KIND_LABEL, TASK_LOG_TEXT, UNSAVED_HINT, UNSAVED_NAME, isUnsaved, originLabel,
-  runName,
+  ORIGIN_LABEL, ORIGIN_TEXT, RUN_CLASS_LABEL, SYSTEM_RUNS_TEXT, TASK_KIND_LABEL, TASK_LOG_TEXT, UNSAVED_HINT, UNSAVED_NAME, isUnsaved,
+  originLabel, runName,
 } from '../../lib/terms'
 import { summarizeRun } from '../../run/decode'
 import type { Approval, Run, Workflow } from '../../types'
-import type { OriginKind, Task } from '../../typesApp'
+import type { OriginKind, Task, UnlistedRuns } from '../../typesApp'
 import { UNSAVED_WORKFLOW_ID } from '../../api/client'
 import { explainRunError } from '../../lib/explain'
 import {
@@ -195,7 +195,7 @@ function Segment({ on, onClick, children, data, title }: {
 // -------------------------------------------------------------------------
 
 export function RunRows({
-  list, codeOf, pendingOf, selectedId, onOpen, dupNames, emptyTitle, emptyBody, filtered, onClear,
+  list, codeOf, pendingOf, selectedId, onOpen, dupNames, emptyTitle, emptyBody, filtered, onClear, unlisted,
 }: {
   list: RunList
   codeOf: (run: Run) => StatusCode
@@ -208,6 +208,8 @@ export function RunRows({
   /** 带着筛选条件：空了要说"没有匹配"，不能说"还没有运行记录" */
   filtered: string | null
   onClear: () => void
+  /** 没列出的系统派生运行（评测、口径对账、口径召回）。没有或点名了来源时不给 */
+  unlisted?: UnlistedRuns | null
 }) {
   const changed = useChangedRows(list.rows)
   const now = useTicker(60_000)
@@ -221,18 +223,25 @@ export function RunRows({
     return <ErrorState error={list.error} onRetry={() => void list.reload()} compact className="m-3" />
   }
   const rows = list.rows
+  // 空着的时候也照实说有几次没列出：不能让「还没有运行记录」盖住几十次评测运行
+  const note = unlistedNote(unlisted)
   if (!rows.length) {
-    return filtered
-      ? (
-        <EmptyState
-          icon={<Search size={22} />}
-          title="没有匹配的运行"
-          body={filtered}
-          offline={false}
-          action={<button type="button" className="btn btn-sm" onClick={onClear}>清除筛选</button>}
-        />
-      )
-      : <EmptyState icon={<History size={22} />} title={emptyTitle} body={emptyBody} />
+    return (
+      <>
+        {filtered
+          ? (
+            <EmptyState
+              icon={<Search size={22} />}
+              title="没有匹配的运行"
+              body={filtered}
+              offline={false}
+              action={<button type="button" className="btn btn-sm" onClick={onClear}>清除筛选</button>}
+            />
+          )
+          : <EmptyState icon={<History size={22} />} title={emptyTitle} body={emptyBody} />}
+        {note}
+      </>
+    )
   }
 
   // 按天分组，组头吸顶：翻到哪天一眼可见
@@ -278,7 +287,22 @@ export function RunRows({
         )}
         {!list.hasMore && rows.length > 0 && <span>· 已全部加载</span>}
       </div>
+      {note}
     </div>
+  )
+}
+
+/** 「另有 N 次系统运行未列出（评测 2 次、口径对账 1 次）……」：没有没列出的就不画 */
+function unlistedNote(unlisted: UnlistedRuns | null | undefined): ReactNode {
+  if (!unlisted?.total) return null
+  const parts = (Object.keys(ORIGIN_LABEL) as OriginKind[])
+    .filter((k) => (unlisted.by_origin[k] ?? 0) > 0)
+    .map((k) => SYSTEM_RUNS_TEXT.part(ORIGIN_LABEL[k], unlisted.by_origin[k] ?? 0))
+    .join('、')
+  return (
+    <p className="px-3 pb-3 text-center text-2xs text-faint" title={SYSTEM_RUNS_TEXT.hint} data-runs-unlisted={unlisted.total}>
+      {SYSTEM_RUNS_TEXT.unlisted(unlisted.total, parts)}
+    </p>
   )
 }
 

@@ -759,6 +759,21 @@ export function runCostText(usd: number | null | undefined, unpriced: number, ap
   return `${(approx || unpriced > 0) && usd > 0 ? '≥ ' : ''}${formatCost(usd)}`
 }
 
+/**
+ * 问数据一轮的花费：助手建图（含挑表、接着写、自查修正）+ 运行 + 复核（next-round 细案 01 做法 3）。以前只算运行那份，
+ * 这一轮的花费是低报的
+ */
+export const TURN_COST_TEXT = {
+  copilot: '助手建图',
+  run: '运行',
+  review: '复核',
+  /** 悬停说明的第一行，parts 是「助手建图 $0.012 · 运行 $0.03 · 复核 $0」 */
+  title: (parts: string) => `这一轮的花费：${parts}`,
+  /** n 次调用的金额估不出来：金额只是下限 */
+  unpriced: (n: number) =>
+    `其中 ${formatNumber(n)} 次调用的金额无法估算（模型不在价格目录中，或用量没有报全），未计入，实际花费不低于此数`,
+} as const
+
 export const JUDGE_SETTING_TEXT = {
   label: '证据裁判',
   hint: '报告中的结论句（如「增长主要来自新客首单」）由另一个模型按证据逐句判断：正式运行由报告撰写节点当场裁判，探索运行在点击时逐句裁判。判断由模型给出，不是系统核对，界面上一律标注「非确定」。',
@@ -5124,7 +5139,8 @@ export const ORIGIN_TEXT = {
   unknown: '来源未记录',
   unknownHint: '这次运行发起时还没有记录来源',
   hint: '这次运行从哪里发起。发起时写进运行记录，在封存范围内',
-  filterAll: '全部来源',
+  // 不点名来源时系统派生的运行（评测、口径对账、口径召回）不列，「全部」得照实说不含它们
+  filterAll: '全部来源（不含系统运行）',
   filterLabel: '按运行来源筛选',
   /** 时间线里 run.origin 那一行 */
   step: (label: string) => `来源：${label}`,
@@ -5133,6 +5149,18 @@ export const ORIGIN_TEXT = {
   view: (id: string) => `视图「${id}」`,
   hook: (name: string) => `钩子「${name}」`,
   actor: (who: string, verified: boolean) => `${verified ? '已登录用户' : '署名'}「${who}」`,
+}
+
+/**
+ * 记录页没列出的系统派生运行（评测、口径对账、口径召回：服务端 engine/origin.SYSTEM_ORIGINS，next-round X1）。它们是完整的
+ * 运行、不进使用统计，默认不列；照实写有几次没列出、在哪儿能看
+ */
+export const SYSTEM_RUNS_TEXT = {
+  /** parts 是「评测 2 次、口径对账 1 次」 */
+  unlisted: (total: number, parts: string) =>
+    `另有 ${total} 次系统运行未列出（${parts}），在来源筛选中选择对应来源即可查看`,
+  part: (label: string, n: number) => `${label} ${n} 次`,
+  hint: '评测、口径对账、口径召回是系统代为发起的运行：证据仍可查看，但不计入使用统计，记录页默认不列',
 }
 
 /** 来源标签：老运行没有来源时写「来源未记录」 */
@@ -5368,13 +5396,26 @@ export const NOTIFY_TEXT = {
   scope: '范围',
   scopes: { global: '全局', app: '应用', user: '个人' } as Record<string, string>,
   events: '订阅的事件',
+  /**
+   * 通知事件的叫法：和服务端 notify/service.EVENTS 一一对应、逐字一致（test_notify_events 对照），事件只在那里登记（总方案
+   * X6）。哪种渠道能订阅哪些、推没推，由服务端说（GET /api/notify/events 的 scopes）：本轮登记了、还没有推送的几个这里
+   * 先有叫法，界面上不列，实现推送的那一块不用再改这张表
+   */
   eventLabel: {
-    'task.opened': '待办打开', 'task.escalated': '待办升级', 'task.expired': '待办超时', 'task.resolved': '待办处理完',
-    'action.unknown': '动作结果未知', 'action.failed': '动作失败', 'action.confirmed': '动作已生效',
-    'run.failed': '运行失败', 'run.finished': '运行结束',
+    'task.opened': '待办打开', 'run.finished': '运行结束', 'run.failed': '运行失败', 'action.unknown': '动作结果未知',
     // 个人应用提交审核有了结果（发布了或退回了），通知提交人：只对个人渠道、全局渠道有意义（服务端 notify/service.notify_review）
     'review.done': '我提交审核的应用有结果',
+    'source.changed': '数据源有变化要处理', 'ledger.recall': '口径升版，答案的数变了',
+    'eval.regressed': '评测有退步', 'eval.failed': '评测失败',
+    'task.digest': '每天的待办汇总', 'key.expiring': '访问密钥快到期',
   } as Record<string, string>,
+  /** 投递记录里才有的事件：改派、升级、催办按「待办打开」的订阅推，记录里照实写是哪一种（服务端 notify/service._AS） */
+  deliveryEventLabel: {
+    'task.reassigned': '待办改派', 'task.escalated': '待办升级', 'task.reminded': '待办催办', test: '测试消息',
+  } as Record<string, string>,
+  /** 渠道编辑框、应用的通知：可订阅的事件还没取到 / 没取到 */
+  eventsLoading: '正在读取可订阅的事件…',
+  eventsError: '没能读取可订阅的事件，请刷新页面后重试',
   enabled: '启用',
   signed: '已签名',
   test: '发送测试消息',
