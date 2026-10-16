@@ -33,6 +33,7 @@
 //  17. 口径账本（next-round 02）：交付了的轮次底部写「正在比对口径」，按退避再取到比对出结果、比完不再取；一行摘要
 //      （几个数来自哪份口径）、按口径正式出具和对账按钮照服务端给的动作摆；出具、对账的写请求在浏览器层拦下并核对请求体，
 //      出具过的正式运行挂在轮次下面（档位、打开运行）。
+//  18. 过程里被驳回的那一步（node.failed 带 reason=rejected）：停止的剪影、中性色、行尾写「被驳回」，不画成完成的绿勾。
 //
 // 所有写请求都被拦在浏览器里，不碰任何库。
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
@@ -676,6 +677,14 @@ async function fakeApi(route) {
     return json(ctl.approvals.filter((a) => !runId || a.run_id === runId))
   }
   m = path.match(/^\/runs\/([^/]+)\/events$/)
+  if (m && method === 'GET' && m[1] === 'run-rej2') {
+    // 被驳回的那一轮：「查数」里的动作确认被驳回，那一步的 node.failed 带 reason=rejected（服务端 compiler 的写法）
+    return json([ev(1, 'run.started', null, { nodes: 3 }), ev(2, 'node.started', 'ag', { node_type: 'agent', label: '查数' }),
+      ev(3, 'node.failed', 'ag', { duration_ms: 900, error: '人工驳回：数字对不上', reason: 'rejected', kind: 'action',
+        decision: 'reject', actor: '张工', note: '数字对不上' }),
+      ev(4, 'run.cancelled', null, { reason: 'rejected', node_id: 'ag', label: '查数', kind: 'action', decision: 'reject',
+        actor: '张工', note: '数字对不上' })])
+  }
   if (m && method === 'GET') {
     return json([ev(1, 'run.started', null, { nodes: 3 }), ev(2, 'node.started', 'ag', {}),
       ev(3, 'node.finished', 'ag', { duration_ms: 700 }), ev(4, 'run.finished', null, { output: {} })])
@@ -1496,6 +1505,33 @@ for (const theme of THEMES) {
       check('补救区说是审批人驳回、谁在哪一步驳回，不说「你已停止本轮」', cardText.includes('被审批人驳回')
         && cardText.includes('张工 驳回了「查数」：数字对不上') && !cardText.includes('你已停止本轮'), cardText)
       check('被驳回的没有「继续运行」', !(await card.getByRole('button', { name: '继续运行' }).count()))
+      // 过程里被驳回的那一步（node.failed 带 reason=rejected）：停止的剪影、中性色、行尾写「被驳回」，
+      // 不是绿色的「完成」勾，也不是失败的红三角（总方案 X9、细案 5.3「各处都写被驳回」）
+      await page.locator('[data-turn]').first().getByRole('button', { name: '查看执行过程' }).click()
+      const stepRow = page.locator('[data-turn]').first().locator('[data-node-id="ag"][data-step-status]').first()
+      await stepRow.waitFor({ timeout: 4000 }).catch(() => {})
+      const look = await stepRow.evaluate((el) => {
+        const badge = el.querySelector('svg[data-status]')
+        const line = el.querySelector('button')
+        return { status: el.dataset.stepStatus, badge: badge?.getAttribute('data-status') ?? null,
+          shape: badge?.getAttribute('data-shape') ?? null, badgeColor: badge ? getComputedStyle(badge).color : null,
+          done: getComputedStyle(document.documentElement).getPropertyValue('--st-done').trim(),
+          lineColor: line ? getComputedStyle(line).color : null, text: el.innerText.replace(/\n/g, ' / ') }
+      }).catch((e) => ({ error: String(e) }))
+      check('过程里被驳回的那一步：状态 rejected，剪影是停止、不是完成的勾', look.status === 'rejected'
+        && look.badge === 'rejected' && look.shape === 'stop', JSON.stringify(look))
+      const doneRgb = await page.evaluate(() => {
+        const probe = document.createElement('span')
+        probe.style.color = 'var(--st-done)'
+        document.body.appendChild(probe)
+        const c = getComputedStyle(probe).color
+        probe.remove()
+        return c
+      })
+      check('……图标不是绿色（完成的颜色）', !!look.badgeColor && look.badgeColor !== doneRgb, `${look.badgeColor} vs ${doneRgb}`)
+      check('……副标题写谁驳回、备注，行尾写「被驳回」，不写「失败」', (look.text ?? '').includes('张工 驳回：数字对不上')
+        && (look.text ?? '').includes('被驳回') && !(look.text ?? '').includes('失败'), look.text)
+      if (theme === 'dark') await page.screenshot({ path: `${SHOTS}/rejected-step-${theme}.png` })
       const aside = page.locator('aside[aria-label="对话列表"]')
       const rowText = async (t) => (await aside.locator('div.group', { hasText: t }).innerText().catch(() => '')).replace(/\n/g, ' / ')
       // 标题里不带「被驳回」：标出来的是状态，不是标题里的字
