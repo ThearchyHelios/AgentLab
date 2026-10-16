@@ -1260,6 +1260,8 @@ export interface ImportRecord {
   period_start: string | null
   period_end: string | null
   signed_by: string | null
+  /** 署名是不是认证过的身份：按这一期导入清单里记下的（05-已知遗留 (c)），旧清单记的是 false。老后端不给 */
+  signed_by_verified?: boolean
   /** 接受的条数 */
   overrides: number
   waivers: number

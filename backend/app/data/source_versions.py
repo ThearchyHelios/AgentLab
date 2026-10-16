@@ -110,6 +110,16 @@ def load_manifest(artifact_id: str | None) -> dict[str, Any] | None:
     return doc if isinstance(doc, dict) else None
 
 
+def _signer_verified(artifact_id: str | None) -> bool:
+    """导入清单里记下的「署名是否认证」；没有清单（简单导入）、读不出来的照实算未认证。"""
+    try:
+        doc = load_manifest(artifact_id)
+    except ValueError:
+        return False
+    signer = (doc or {}).get("signed_by")
+    return bool(signer.get("verified")) if isinstance(signer, dict) else False
+
+
 def _rows_of(report: dict[str, Any] | None) -> dict[str, int]:
     """构建回执里各表的行数（执行器回执、期 1 的解析回执都是 tables: [{name, rows}]）。"""
     out: dict[str, int] = {}
@@ -1055,6 +1065,8 @@ async def import_records(session: AsyncSession, source: DataSource, imps: list[T
             # 按配方导入才有（简单导入为空）：配方、统计期、署名，接受的条数
             "recipe_id": imp.recipe_id, "period_start": imp.period_start, "period_end": imp.period_end,
             "signed_by": imp.signed_by, "overrides": len(imp.overrides or []), "waivers": len(imp.waivers or []),
+            # 署名是不是认证过的身份：按这一期导入清单里记下的（05-已知遗留 (c)；旧清单写的是 False，照记下的说，不改写）
+            "signed_by_verified": _signer_verified(imp.manifest_artifact),
             # 期 3（7.6）
             "acceptances": _acceptance_rows(imp), "revoked": imp.revoked, "manifest_artifact": imp.manifest_artifact,
             "recipe_seq": seqs.get(imp.recipe_id) if imp.recipe_id else None, "in_current": in_current,

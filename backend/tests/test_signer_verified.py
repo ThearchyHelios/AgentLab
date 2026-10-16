@@ -56,6 +56,8 @@ async def test_login_on_import_manifest_and_purge_record_say_verified(admin):
     assert imp.signed_by == "root"
 
     source_id = out["source"]["id"]
+    records = (await admin.get(f"/api/datasources/{source_id}/imports")).json()
+    assert [(r["signed_by"], r["signed_by_verified"]) for r in records] == [("root", True)], "导入记录按清单里记下的说"
     resp = await admin.post(f"/api/datasources/{source_id}/imports/{imp.id}/purge-raw",
                             json={"reason": "含有不应保留的内容", "signed_by": "随手填的名字"})
     assert resp.status_code == 200, resp.text
