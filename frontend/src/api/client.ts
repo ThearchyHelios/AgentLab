@@ -30,6 +30,8 @@ import { apps, ledger } from './apps'
 import { actions, tasks } from './tasks'
 import { auth, identity } from './auth'
 import { accessKeys } from './accessKeys'
+// 口径账本（下一轮第 4 波 W4-c）：问数据答案的口径标签、按口径出具、对账、可沉淀的问题
+import { caliberLedger } from './caliberLedger'
 import { capabilities, endpoints, notify } from './capabilities'
 // 普通用户建应用（typesBlueprint.ts 是接口约定）
 import { blueprints, files, personal, templates } from './blueprints'
@@ -963,6 +965,8 @@ export const api = {
   identity,
   // 访问密钥与服务账号（下一轮第 2 波）
   accessKeys,
+  // 口径账本：答案里每个数的口径标签、按口径正式出具、口径对账、可沉淀的问题（typesLedger.ts 是接口约定）
+  caliberLedger,
   capabilities,
   endpoints,
   notify,

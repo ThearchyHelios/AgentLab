@@ -2527,6 +2527,13 @@ export interface EvidenceSegmentDetail {
   redacted?: { columns?: string[] }
   /** 可疑实体：最接近的已知名字（最多 3 个），给「是不是想写…」 */
   closest?: (string | { alias?: string; name?: string; table?: string; kind?: string })[]
+  /**
+   * 口径账本（next-round 02 做法 3）：这个数的口径标签和比对的来历。封存后比对，没比对过的运行、不是数的片段没有这个键
+   * （老运行的返回一字不差）。形状见 typesLedger.ts
+   */
+  ledger?: import('./typesLedger').SegmentLedger
+  /** 指标接口（/evidence/metrics/{node}/{metric}）给的展示值：遮罩的写「已遮罩」 */
+  rendered?: string
 }
 
 // -------------------------------------------------------------------------
