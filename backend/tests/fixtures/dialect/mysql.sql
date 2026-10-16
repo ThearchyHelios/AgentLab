@@ -25,3 +25,7 @@ SELECT status, COUNT(*) AS cnt FROM sales.orders WHERE paid_at >= DATE '2026-08-
 SELECT DATE(paid_at) AS d, COUNT(*) AS n FROM sales.orders WHERE paid_at >= DATE '2026-08-27' AND paid_at < DATE '9999-12-31' GROUP BY DATE(paid_at) ORDER BY d;
 -- sample
 -- （这种方言没有这类查询）
+-- max_date
+SELECT MAX(paid_at) FROM sales.orders WHERE paid_at >= DATE '0001-01-02' AND paid_at < DATE '9999-12-31';
+-- max_date_text
+SELECT MAX(biz_day) FROM sales.orders WHERE biz_day >= '0001-01-02' AND biz_day < '9999-12-31';

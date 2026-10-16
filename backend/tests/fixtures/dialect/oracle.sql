@@ -25,3 +25,7 @@ SELECT * FROM (SELECT status, COUNT(*) AS cnt FROM sales.orders WHERE paid_at >=
 SELECT TRUNC(paid_at) AS d, COUNT(*) AS n FROM sales.orders WHERE paid_at >= DATE '2026-08-27' AND paid_at < DATE '9999-12-31' GROUP BY TRUNC(paid_at) ORDER BY d;
 -- sample
 SELECT * FROM (SELECT status, COUNT(*) AS cnt FROM sales.orders SAMPLE BLOCK (1) WHERE status IS NOT NULL GROUP BY status ORDER BY cnt DESC, status) WHERE ROWNUM <= 21;
+-- max_date
+SELECT MAX(paid_at) FROM sales.orders WHERE paid_at >= DATE '0001-01-02' AND paid_at < DATE '9999-12-31';
+-- max_date_text
+SELECT MAX(biz_day) FROM sales.orders WHERE biz_day >= '0001-01-02' AND biz_day < '9999-12-31';

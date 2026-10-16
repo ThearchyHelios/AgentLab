@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import JSON, Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, UTCDateTime, new_id, utcnow
@@ -134,4 +134,101 @@ class IntrospectTask(Base):
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
 
 
-__all__ = ["IntrospectJob", "IntrospectTask", "SourceObject"]
+# --------------------------------------------------------------------------
+# 第 3 波：取值观察、变化记录（docs/design/next-round/03-数据接入与目录维护.md B2、B3）
+# --------------------------------------------------------------------------
+
+
+class TableObservation(Base):
+    """一次取值观察（剖析引擎的四类观察检查，data/catalog_profile_observe.py）：码值列的取值分布（codes_observe）、最新业务
+    日期（freshness）、最近 35 天按天的行数（daily_volume）、行数（rows）。
+
+    **为什么单独一张表。** 剖析任务的逐表一行只留最近 50 个任务，而且一张表一次剖析只有一份发现；取值漂移要拿同一口径的
+    历史比（新码值、比例剧变、断档、缺天、量跌、行数跌），得按「表 × 种类 × 列」留一串。每张表每种观察（码值按列）留最近
+    KEEP 条，更早的删掉。
+
+    **口径（basis）。** 每条都记它看的是哪一部分数据：full 整表、first_rows（按存储顺序的前 N 行）、window（业务日期最近 N 天）、
+    sample（块采样 p%）、stats / count（行数的来源）。basis_key 是口径的规范写法：只和 basis_key 相同的历史比，口径不同的照实说
+    不比。遮罩列不出现在任何一条观察查询里，取值也就不会进这张表。
+
+    挂外键、级联删除：观察是数据源的附属记录。"""
+
+    __tablename__ = "table_observations"
+    __table_args__ = (
+        Index("ix_table_observations_lookup", "source_id", "table_name", "kind", "column_name", "at"),
+    )
+
+    #: 每张表每种观察（码值按列）留几条
+    KEEP = 26
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"))
+    table_name: Mapped[str] = mapped_column(String(255))
+    #: 码值、业务日期观察的那一列；表级的（行数）是空串
+    column_name: Mapped[str] = mapped_column(String(255), default="")
+    #: codes_observe | freshness | daily_volume | rows
+    kind: Mapped[str] = mapped_column(String(20))
+    basis: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    basis_key: Mapped[str] = mapped_column(String(200), default="")
+    #: 观察到的：码值 {values: [[码, 行数]…], rows, truncated}；最新业务日期 {max}；按日 {since, until, days: {日: 行数}}；
+    #: 行数 {rows, at_least, method}
+    data: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    #: 哪个剖析任务的第几张表测到的
+    job_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    task_seq: Mapped[int | None] = mapped_column(Integer, default=None)
+    at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class SourceChange(Base):
+    """数据源的一条变化（data/source_changes.py，格式 agentlab-change/1）：结构变化（重新探查后的前后差异）和取值变化（取值
+    观察和同口径历史的比较）。全站只有这一份记录：审阅页的「变化」、数据源卡片的角标、外部通知、口径账本的召回都读它。
+
+    - seq：自增，不复用（sqlite_autoincrement），召回按它当游标拉取；id 是给界面、链接用的编号；
+    - kind：结构类 table_added / table_removed / table_left_scope / table_reflect_failed / column_added / column_removed /
+      column_type_changed / column_nullable_changed / key_changed / fk_changed / comment_changed / scope_changed；取值类
+      codes_new / codes_shift / date_stalled / date_gap / volume_drop / rows_drop / rows_jump / coverage_drop；
+    - severity：info / warning / action（现在大概率已经不对了：已确认的项、写死的 SQL 指向被删的列，或者「已列全」被撤销）；
+    - detected_by：{job_kind, job_id, task_seq, trigger: manual|schedule|on_demand, actor}；basis：{method, query_refs}；
+    - before / after：前后各是什么（码值只记非遮罩列的）；affects：{catalog: [{table, path, status, source}], templates:
+      [{workflow_id, name, version, impact, nodes}], rules_touched}；struct_version_before / after：结构变化前后的结构版本；
+    - fingerprint：去重——同一个变化再次测到只更新 last_seen_at 和 seen_count；
+    - status：open / acknowledged / resolved / dismissed；resolution：{by, at, action, note, catalog_version, job_id}。
+
+    挂外键、级联删除：变化是数据源的附属记录。"""
+
+    __tablename__ = "source_changes"
+    __table_args__ = (
+        UniqueConstraint("source_id", "fingerprint"),
+        Index("ix_source_changes_source_status", "source_id", "status"),
+        Index("ix_source_changes_source_table", "source_id", "table_name"),
+        {"sqlite_autoincrement": True},
+    )
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(32), unique=True, default=new_id)
+    source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"))
+    #: 测到时这个源叫什么（之后改了名，这条记录说的仍是当时的名字）
+    source_name: Mapped[str] = mapped_column(String(100), default="")
+    #: 源级的变化（范围规则改了）是空串
+    table_name: Mapped[str] = mapped_column(String(255), default="")
+    column_name: Mapped[str | None] = mapped_column(String(255), default=None)
+    kind: Mapped[str] = mapped_column(String(40))
+    severity: Mapped[str] = mapped_column(String(10), default="info")
+    detected_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    seen_count: Mapped[int] = mapped_column(Integer, default=1)
+    detected_by: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    basis: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    before: Mapped[Any] = mapped_column(JSON, nullable=True, default=None)
+    after: Mapped[Any] = mapped_column(JSON, nullable=True, default=None)
+    affects: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    struct_version_before: Mapped[int | None] = mapped_column(Integer, default=None)
+    struct_version_after: Mapped[int | None] = mapped_column(Integer, default=None)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    resolution: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    #: 记录的格式（agentlab-change/1）：召回按它读，字段以后改要升版本
+    schema_tag: Mapped[str] = mapped_column("schema", String(30), default="agentlab-change/1")
+
+
+__all__ = ["IntrospectJob", "IntrospectTask", "SourceChange", "SourceObject", "TableObservation"]
