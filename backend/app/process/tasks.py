@@ -212,6 +212,42 @@ async def _assign(session: AsyncSession, task: Task, run: Run | None, assignee: 
 
 #: 蓝图试运行的运行来源（engine/origin.py）：待办派给发起人自己、调度不处理时限
 TRIAL_ORIGIN = "trial"
+#: 服务账号（users.kind，docs/design/next-round/04-对外集成与触达.md A1）：只持有访问密钥、回复不了待办，所以不派给它——
+#: 组展开时跳过、发起人是它时交给任何人、表达式里点了它的名字跳过、改派给它拒收
+SERVICE_KIND = "service"
+
+
+async def _service_accounts(session: AsyncSession, names: list[str]) -> set[str]:
+    """这几个用户名里哪些是服务账号。"""
+    wanted = sorted({n for n in names if n})
+    if not wanted:
+        return set()
+    return set((await session.execute(select(User.username).where(
+        User.username.in_(wanted), User.kind == SERVICE_KIND))).scalars())
+
+
+def key_trace(principal: Any) -> dict[str, Any]:
+    """用访问密钥回复时 task.responded 另记的：via=key、哪一把、叫什么（auth/keys.trace）。别的认法什么都不加。"""
+    from app.auth.keys import trace
+
+    return trace(principal)
+
+
+def _refuse_key(task: Task, principal: Any) -> None:
+    """用访问密钥回复待办（04 细案 A4，集成-I3）：只给个人访问密钥，只限审批、补充输入、编辑稿件三种。确认写入、核实写入
+    结果、双盲复算裁决、工具和代码审批要人在界面上看过确认卡再按，一律 403（key_task_kind）。表单里有文件控件的也不行
+    （文件要先在应用里上传，422 key_files_unsupported）。不是访问密钥认出来的不管。"""
+    if getattr(principal, "via", None) != "key":
+        return
+    from app.auth import keys
+    from app.files import store as files_store
+
+    if task.kind not in keys.TASK_KINDS:
+        raise TaskRefused("这种待办不能用访问密钥回复：确认写入、核实写入结果、双盲复算裁决、工具和代码审批要在界面上看过"
+                          "确认卡再处理", status_code=403, code=keys.KEY_TASK_KIND)
+    if files_store.file_fields(task.form):
+        raise TaskRefused("这条待办的表单里要传文件，不能用访问密钥回复：请在应用里处理", status_code=422,
+                          code=keys.KEY_FILES_UNSUPPORTED)
 
 
 async def _targets(session: AsyncSession, task: Task, run: Run | None, assignee: Any) -> list[tuple[str, str, str]]:
@@ -232,10 +268,15 @@ async def _targets(session: AsyncSession, task: Task, run: Run | None, assignee:
         else:
             out.append(("anyone", "", f"slot:{slot}"))
     elif kind == "initiator":
-        out.append(("user", run.started_by, "initiator") if run is not None and run.started_by
-                   else ("anyone", "", "initiator"))
+        # 用服务账号的访问密钥发起的实例：服务账号不能被派待办（它回复不了），交给「任何人」（搭建者及以上能处理）
+        starter = run.started_by if run is not None and run.started_by \
+            and not await _service_accounts(session, [run.started_by]) else None
+        out.append(("user", starter, "initiator") if starter else ("anyone", "", "initiator"))
     elif kind == "expression":
+        service = await _service_accounts(session, [str(n) for n in spec.get("names") or []])
         for name in spec.get("names") or []:
+            if str(name) in service:
+                continue
             is_group = await session.scalar(select(Group.id).where(Group.name == str(name)))
             out += await _expand(session, task, "group" if is_group else "user", str(name), "expression")
     elif kind == "hook":
@@ -261,7 +302,8 @@ async def _expand(session: AsyncSession, task: Task, kind: str, name: str, sourc
     members = list((await session.execute(
         select(User.username).join(GroupMember, GroupMember.user_id == User.id)
         .join(Group, Group.id == GroupMember.group_id)
-        .where(Group.name == name, User.disabled.is_(False)).order_by(User.username))).scalars())
+        .where(Group.name == name, User.disabled.is_(False), func.coalesce(User.kind, "person") != SERVICE_KIND)
+        .order_by(User.username))).scalars())
     if not members:
         return [("group", name, source)]
     session.add(AuditEvent(actor=None, verified=False, action="task.group_expanded", subject_kind="task",
@@ -495,6 +537,7 @@ async def respond(task_id: str, principal: Any, *, decision: Any, values: dict[s
         task = await session.get(Task, task_id)
         if task is None:
             raise TaskRefused("待办不存在，所属的运行可能已被删除", status_code=404)
+        _refuse_key(task, principal)
         if task.kind == "reconcile":
             return await _respond_reconcile(session, task, principal, decision, values, note)
         if task.kind == REVIEW_KIND:
@@ -545,7 +588,8 @@ async def respond(task_id: str, principal: Any, *, decision: Any, values: dict[s
         run_id, approval_id, node_id = task.run_id, task.approval_id, task.node_id
 
     await record(run_id, EventType.TASK_RESPONDED, node_id=node_id, task_id=task_id, actor=principal.username,
-                 verified=bool(principal.verified), decision=verdict, index=responded, of=len(voters))
+                 verified=bool(principal.verified), decision=verdict, index=responded, of=len(voters),
+                 **key_trace(principal))
     if decided is None:
         return {"task": await detail(task_id, principal), "resolved": False, "run": await _run(run_id)}
 
@@ -728,6 +772,9 @@ async def reassign(task_id: str, principal: Any, *, to: list[dict[str, str]], no
             raise TaskRefused(_closed(task.status))
         if not await _can_manage(session, task, principal):
             raise TaskRefused("只有管理员或这个应用的管理者可以改派待办", status_code=403)
+        if service := await _service_accounts(session, [n for k, n in targets if k == "user"]):
+            raise TaskRefused(f"「{'、'.join(sorted(service))}」是服务账号，不能被派待办：请改派给人或组", status_code=422,
+                              code="reassign_service")
         await session.execute(update(TaskAssignment).where(TaskAssignment.task_id == task_id,
                                                            TaskAssignment.status == "pending")
                               .values(status="withdrawn"))

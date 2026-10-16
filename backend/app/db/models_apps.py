@@ -118,3 +118,31 @@ class HookReceipt(Base):
     status: Mapped[str] = mapped_column(String(20))
     detail: Mapped[str | None] = mapped_column(Text, default=None)
     received_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class ApiReceipt(Base):
+    """用访问密钥发起实例、刷新视图时按 Idempotency-Key 去重的记录（docs/design/next-round/04-对外集成与触达.md A4）。
+
+    按 (拥有者, 幂等键) 唯一，不按密钥：轮换了密钥，同一个键照样认得出是同一件事。状态机和钩子的收件记录是同一套
+    （process/receipts.py）：processing 认领、处理中 → accepted / rejected；停在 processing 太久的可以重新认领。钩子那张表
+    （hook_receipts.hook_id 非空外键，SQLite 改不了可空性）不动，两张表各存各的、共用状态机。
+
+    fingerprint 是这次请求的指纹（方法、路由模板、路径参数、请求体）：同一个键拿去办另一件事（换了入口、换了表单值）不交回
+    上一件的结果，照实拒掉——钩子的键只在一个钩子里用，这里一个键跨所有应用和入口，撞键的可能大得多。"""
+
+    __tablename__ = "api_receipts"
+    __table_args__ = (UniqueConstraint("owner_user_id", "idem_key"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(32), index=True)
+    idem_key: Mapped[str] = mapped_column(String(200))
+    #: 最近一次认领它的那把密钥（轮换前后可能不同）
+    key_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    route: Mapped[str] = mapped_column(String(300), default="")
+    fingerprint: Mapped[str | None] = mapped_column(String(64), default=None)
+    run_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    task_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    # processing | accepted | rejected
+    status: Mapped[str] = mapped_column(String(20))
+    detail: Mapped[str | None] = mapped_column(Text, default=None)
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

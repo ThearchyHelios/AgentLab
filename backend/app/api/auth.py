@@ -62,6 +62,11 @@ async def me(x_actor: str | None = Header(default=None), session: AsyncSession =
         can_bootstrap = principal.mode == "local" and not await _local_admin_exists(session)
         return JSONResponse(status_code=401, content={"detail": "请先登录", "code": AUTH_REQUIRED,
                                                       "mode": principal.mode, "can_bootstrap": can_bootstrap})
+    if principal.via == "key":
+        # 用访问密钥自省（next-round 04 A4 的 me）：另给这把密钥的名字、开头、scope、限定的应用、到期时间
+        from app.auth.keys import introspect
+
+        return {**await principal_full(session, principal), "key": await introspect(session, principal)}
     return await principal_full(session, principal)
 
 

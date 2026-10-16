@@ -762,7 +762,8 @@ async def acl_issues(session: AsyncSession, app_id: str) -> list[dict[str, Any]]
     out = _Issues()
     known = await load_directory(session)
     for g in grants:
-        if (m := mismatch(known, mode, g.principal_kind, g.principal)) is None:
+        # 服务账号能拿授权（只是不能被派待办，岗位绑定那边才算错）
+        if (m := mismatch(known, mode, g.principal_kind, g.principal, allow_service=True)) is None:
             continue
         what = f"「{ROLE_TEXT.get(g.role, g.role)}」授权给的{m.text}"
         if m.blocking:

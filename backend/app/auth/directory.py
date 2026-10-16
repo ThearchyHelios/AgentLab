@@ -9,6 +9,10 @@
 - 账号密码登录：人和组都在本系统里建，名录里没有就是填错了（或人被删了），停用的人处理不了待办——都算错；
 - 单点登录：人和组第一次登录后才进名录，名录里没有的照实提醒、不拒收；停用的人名录里认得出，照样算错；
 - 关登录：没有用户表，签批记的是各自填的署名，不核对。
+
+服务账号（users.kind=service，docs/design/next-round/04-对外集成与触达.md A1）也在名录里、标 service：它能拿应用授权（外部系统
+按授权读应用），但不能被派待办——它只持有访问密钥，密钥回复不了待办。所以岗位绑定、个人应用提交审核核对时它算错
+（mismatch 的 allow_service 为假时），候选池（表单选人、提交审核）里一律不列；授权核对放过它（allow_service=True）。
 """
 from __future__ import annotations
 
@@ -19,8 +23,10 @@ from typing import Any, Literal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-#: 名录里对不上的两种：没有这个人或组、人停用了
-Problem = Literal["missing", "disabled"]
+#: 名录里对不上的几种：没有这个人或组、人停用了、是服务账号（只在不收服务账号的地方算错）
+Problem = Literal["missing", "disabled", "service"]
+#: users.kind 里服务账号的那个值（同 auth/keys.SERVICE_KIND）
+SERVICE_KIND = "service"
 _KIND = {"user": "用户", "group": "组"}
 
 
@@ -29,6 +35,8 @@ class DirectoryUser:
     username: str
     display_name: str
     disabled: bool
+    #: 服务账号（只持有访问密钥、不能被派待办）
+    service: bool = False
 
 
 @dataclass(frozen=True)
@@ -42,13 +50,17 @@ class Directory:
     users: dict[str, DirectoryUser] = field(default_factory=dict)
     groups: dict[str, DirectoryGroup] = field(default_factory=dict)
 
-    def problem(self, kind: str, name: str) -> Problem | None:
-        """这一项在名录里对不上的地方；所有人（everyone）不判。"""
+    def problem(self, kind: str, name: str, *, allow_service: bool = False) -> Problem | None:
+        """这一项在名录里对不上的地方；所有人（everyone）不判。服务账号只在 allow_service 时算对得上（应用授权）。"""
         if kind == "group":
             return None if name in self.groups else "missing"
         if kind == "user":
             user = self.users.get(name)
-            return "missing" if user is None else "disabled" if user.disabled else None
+            if user is None:
+                return "missing"
+            if user.disabled:
+                return "disabled"
+            return "service" if user.service and not allow_service else None
         return None
 
 
@@ -70,7 +82,8 @@ async def load_directory(session: AsyncSession) -> Directory:
     users = (await session.execute(select(User).order_by(User.username))).scalars()
     groups = (await session.execute(select(Group).order_by(Group.name))).scalars()
     return Directory(
-        users={u.username: DirectoryUser(u.username, u.display_name or u.username, u.disabled) for u in users},
+        users={u.username: DirectoryUser(u.username, u.display_name or u.username, u.disabled,
+                                         u.kind == SERVICE_KIND) for u in users},
         groups={g.name: DirectoryGroup(g.name, g.label or g.name) for g in groups})
 
 
@@ -85,16 +98,19 @@ class Mismatch:
     text: str
 
 
-def mismatch(directory: Directory, mode: str, kind: str, name: str) -> Mismatch | None:
-    """按登录方式判这一项：关登录、所有人、对得上的都是 None。"""
+def mismatch(directory: Directory, mode: str, kind: str, name: str, *, allow_service: bool = False) -> Mismatch | None:
+    """按登录方式判这一项：关登录、所有人、对得上的都是 None。allow_service：服务账号算不算对得上（应用授权算；岗位绑定、
+    提交审核这些要派待办的不算）。"""
     if mode == "off":
         return None
-    problem = directory.problem(kind, name)
+    problem = directory.problem(kind, name, allow_service=allow_service)
     if problem is None:
         return None
     what = f"{_KIND.get(kind, kind)}「{name}」"
     if problem == "disabled":
         return Mismatch(kind, name, problem, True, f"{what}已停用")
+    if problem == "service":
+        return Mismatch(kind, name, problem, True, f"{what}是服务账号，不能被派待办")
     if mode == "oidc":
         return Mismatch(kind, name, problem, False,
                         f"{what}名录里还没有：单点登录的人和组第一次登录后才进名录，名字要和身份提供方里的一致才生效")
@@ -137,6 +153,15 @@ def pool_of(field: Any) -> str:
     return POOL_APP
 
 
+def _person() -> Any:
+    """SQL 条件：是人，不是服务账号（kind 为空的老行按人算）。候选池里一律不列服务账号。"""
+    from sqlalchemy import func
+
+    from app.db.models import User
+
+    return func.coalesce(User.kind, "person") != SERVICE_KIND
+
+
 @dataclass
 class Pool:
     """一个候选池。open：池就是全部启用的人（应用授权给了所有人）——不带前缀不列，免得等于发通讯录。"""
@@ -171,7 +196,7 @@ async def _members(session: AsyncSession, group: str) -> dict[str, DirectoryUser
 
     rows = (await session.execute(
         select(User).join(GroupMember, GroupMember.user_id == User.id).join(Group, Group.id == GroupMember.group_id)
-        .where(Group.name == group, User.disabled.is_(False)))).scalars()
+        .where(Group.name == group, User.disabled.is_(False), _person()))).scalars()
     return {u.username: DirectoryUser(u.username, u.display_name or u.username, False) for u in rows}
 
 
@@ -183,8 +208,8 @@ async def _people(session: AsyncSession, items: Iterable[tuple[str, str]]) -> Po
     items = list(items)
     names = sorted({n for k, n in items if k == "user" and n})
     if names:
-        for u in (await session.execute(select(User).where(User.username.in_(names), User.disabled.is_(False))))\
-                .scalars():
+        for u in (await session.execute(select(User).where(User.username.in_(names), User.disabled.is_(False),
+                                                           _person()))).scalars():
             pool.users[u.username] = DirectoryUser(u.username, u.display_name or u.username, False)
     groups = sorted({n for k, n in items if k == "group" and n})
     if groups:
@@ -198,7 +223,7 @@ async def _everyone(session: AsyncSession) -> Pool:
     from app.db.models import Group, User
 
     pool = Pool(open=True)
-    for u in (await session.execute(select(User).where(User.disabled.is_(False)))).scalars():
+    for u in (await session.execute(select(User).where(User.disabled.is_(False), _person()))).scalars():
         pool.users[u.username] = DirectoryUser(u.username, u.display_name or u.username, False)
     for g in (await session.execute(select(Group))).scalars():
         pool.groups[g.name] = DirectoryGroup(g.name, g.label or g.name)
@@ -241,7 +266,7 @@ async def review_pool(session: AsyncSession) -> Pool:
     from app.db.models import User
 
     rows = (await session.execute(select(User).where(User.role.in_(("builder", "admin")),
-                                                     User.disabled.is_(False)))).scalars()
+                                                     User.disabled.is_(False), _person()))).scalars()
     return Pool(users={u.username: DirectoryUser(u.username, u.display_name or u.username, False) for u in rows})
 
 
