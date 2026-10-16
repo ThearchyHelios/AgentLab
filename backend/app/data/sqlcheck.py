@@ -1084,36 +1084,36 @@ def graph_checks(nodes: Iterable[Any], checkers: Mapping[str, SqlChecker], *,
     return out
 
 
-async def load_checkers(session: Any, sources: Iterable[Any]) -> dict[str, SqlChecker]:
+async def load_checkers(session: Any, sources: Iterable[Any], *, catalog_view: Any = None) -> dict[str, SqlChecker]:
     """给一批数据源（DataSource 行）各建一个检查器：{源名: SqlChecker}。没有目录的源不建。
 
-    一次查询读出这些源的全部目录。读不到就当没有目录（返回空 dict）：检查是附加的，不能挡住自查和发布本身。
+    一次查询读出这些源的全部目录，读哪一份由 catalog_view 定（data/catalog_view.py：当前目录、目录快照、关；只用已核实
+    的项），不给是当前目录。读不到当前目录就当没有目录（返回空 dict）：检查是附加的，不能挡住自查和发布本身；视图指定的
+    目录快照不在了照实报错。
     """
-    from sqlalchemy import select
-
-    from app.db.models import CatalogNote
+    from app.data.catalog_view import CatalogSnapshotMissing, CatalogView, read_many
 
     rows = [s for s in sources if getattr(s, "id", None) and dialect_of(getattr(s, "kind", None))]
     if not rows:
         return {}
     try:
-        notes = (await session.execute(
-            select(CatalogNote.source_id, CatalogNote.table_name, CatalogNote.notes)
-            .where(CatalogNote.source_id.in_([r.id for r in rows]))
-        )).all()
+        entries = await read_many(session, CatalogView.parse(catalog_view), [r.id for r in rows])
+    except CatalogSnapshotMissing:
+        raise
     except Exception:  # noqa: BLE001
         logger.exception("读取数据目录失败，本次不做基于目录的 SQL 检查")
         return {}
     by_source: dict[str, dict[str, Any]] = {}
-    for source_id, table, value in notes:
-        if isinstance(value, dict) and value:
-            by_source.setdefault(source_id, {})[table] = value
+    for source_id, tables in entries.items():
+        for table, entry in tables.items():
+            if isinstance(entry.notes, dict) and entry.notes:
+                by_source.setdefault(source_id, {})[table] = entry.notes
     return {r.name: SqlChecker(kind=r.kind, schema_cache=r.schema_cache, notes=by_source[r.id], source_name=r.name)
             for r in rows if r.id in by_source}
 
 
 async def load_checkers_by_name(session: Any, names: Iterable[str]) -> dict[str, SqlChecker]:
-    """按数据源名建检查器（只看启用着的源）。发布门禁用：图里写的是源名。"""
+    """按数据源名建检查器（只看启用着的源）。发布门禁用：图里写的是源名，读的是当前目录。"""
     from sqlalchemy import select
 
     from app.db.models import DataSource

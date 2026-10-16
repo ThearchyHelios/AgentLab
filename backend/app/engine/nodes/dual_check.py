@@ -68,6 +68,7 @@ from app.core.errors import describe_exception
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import DataSource
+from app.data import catalog_view
 from app.engine import deadline, recompute
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError
@@ -346,9 +347,11 @@ def _skipped(ctx: NodeContext, reason: str) -> dict[str, Any]:
 
 
 class _Sources:
-    """一次复算里要读的查询快照、数据源和快照要遮的列：同一份只读一次、只算一次。"""
+    """一次复算里要读的查询快照、数据源和快照要遮的列：同一份只读一次、只算一次。view 是这次运行的目录视图
+    （data/catalog_view.py）：交给盲算的目录、比较两条 SQL 用的中文名都按它读，和运行时工具给模型看的是同一份。"""
 
-    def __init__(self) -> None:
+    def __init__(self, view: Any = None) -> None:
+        self.view = catalog_view.CatalogView.parse(view)
         self.snapshots: dict[str, tuple[Any, str | None]] = {}
         self.rows: dict[str, DataSource | None] = {}
         self.masks: dict[tuple[str, str | None], frozenset[str]] = {}
@@ -782,14 +785,14 @@ async def _constant_columns(snapshot: Mapping[str, Any], sources: _Sources) -> f
 
 async def _catalog_text(sources: _Sources, name: str) -> str:
     """交给盲算 agent 的数据目录：表清单（表名、中文名、粒度）和有目录的表的业务说明（业务日期、有效记录条件、去重、
-    字段含义、码值、关联关系）。太长的截断，其余请它用 db_schema 查。"""
+    字段含义、码值、关联关系）。太长的截断，其余请它用 db_schema 查。读哪一份由这次运行的目录视图定（sources.view），
+    和运行时工具给模型看的是同一份。"""
     from app.data import catalog
 
     row = await sources.source(name)
     if row is None:
         return BLIND_NO_CATALOG_PROMPT
-    async with SessionLocal() as session:
-        entries = await catalog.read_catalog(session, row.id)
+    entries = await catalog_view.read(sources.view, row)
     cache = row.schema_cache if isinstance(row.schema_cache, dict) else {}
     tables = cache.get("tables") or {}
     notes = {table: entry.notes for table, entry in entries.items()}
@@ -843,7 +846,7 @@ async def _blind(ctx: NodeContext, jobs: dict[str, dict[str, Any]], options: _Op
         return {}, None, False, usage
     async with SessionLocal() as session:
         spec = await verify_model_spec(session, ctx.config, settings=dict(settings))
-    sources = _Sources()
+    sources = _Sources(catalog_view.of_run(ctx.run))
     catalogs: dict[str, str] = {}
     for job in jobs.values():
         if job["source"] not in catalogs:
@@ -870,7 +873,7 @@ async def _blind(ctx: NodeContext, jobs: dict[str, dict[str, Any]], options: _Op
             spec=spec, system=BLIND_SYSTEM, task=_task_text(job, catalogs[job["source"]]), sources=[job["source"]],
             output_schema=BLIND_SCHEMA, max_queries=options.max_queries, timeout_s=allot.timeout_s,
             daily_max_usd=options.daily_max_usd, emit=deadline.relabel(ctx.emit, allot), run_id=ctx.run.run_id,
-            node_id=ctx.node.id, data_versions=run_versions(ctx.run))
+            node_id=ctx.node.id, data_versions=run_versions(ctx.run), catalog_view=sources.view)
 
     keys = list(jobs)
     await one(keys[0], jobs[keys[0]])
@@ -1078,7 +1081,7 @@ async def _review(state: GraphState, ctx: NodeContext, checked: dict[str, Any], 
     """
     rows = [r for r in checked["rows"] if r["status"] == DIFFERENT]
     results = checked["results"]
-    sources = _Sources()
+    sources = _Sources(catalog_view.of_run(ctx.run))
     infos: dict[str, dict[str, Any]] = {}
     metrics: list[dict[str, Any]] = []
     summary: list[dict[str, Any]] = []
@@ -1179,15 +1182,15 @@ async def _source_info(sources: _Sources, name: str) -> dict[str, Any]:
     （uploaded：导入时日期一律存成文字）和它导入时认作日期的列（upload_dates，按当前版本的配方读，见
     dual_check_facts.upload_dates）——业务日期据此认上传表格的日期列，认不出的原因照实说（_dated_problem）。两项都进
     候选：审批卡的预告按发起审批时读的这一份；裁决后的真写按写入时的版本重读 upload_dates，和现读的表结构一起以写入时
-    为准（dual_check_facts.record_choices）。数据源没了就都不给，照样比原文。"""
-    from app.data import catalog
+    为准（dual_check_facts.record_choices）。数据源没了就都不给，照样比原文。目录按这次运行的目录视图读（sources.view），
+    比较两条 SQL 用到的中文名和运行时给模型看的是同一份。"""
     from app.data.sql_semantics import catalog_labels
 
     row = await sources.source(name)
     if row is None:
         return {"kind": None, "schema": None, "names": {}, "notes": {}, "uploaded": False, "upload_dates": {}}
+    entries = await catalog_view.read(sources.view, row)
     async with SessionLocal() as session:
-        entries = await catalog.read_catalog(session, row.id)
         dates = await upload_dates(session, row)
     notes = {table: entry.notes for table, entry in entries.items()}
     return {"kind": row.kind, "schema": row.schema_cache if isinstance(row.schema_cache, dict) else None,

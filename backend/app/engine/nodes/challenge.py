@@ -67,6 +67,7 @@ from app.core.errors import describe_exception
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import DataSource
+from app.data import catalog_view
 from app.engine import deadline, verify_agent
 from app.engine import judge as judging
 from app.engine.context import NodeContext, NodeError
@@ -767,7 +768,8 @@ class _Review:
                 spec=self.spec, system=CHALLENGE_SYSTEM, task=task_text, sources=live,
                 output_schema=CHALLENGE_SCHEMA, max_queries=self.max_queries, timeout_s=allot.timeout_s,
                 daily_max_usd=self.daily_max_usd, emit=deadline.relabel(ctx.emit, allot), run_id=ctx.run.run_id,
-                node_id=ctx.node.id, data_versions=run_versions(ctx.run), masked_values=known)
+                node_id=ctx.node.id, data_versions=run_versions(ctx.run), masked_values=known,
+                catalog_view=catalog_view.of_run(ctx.run))
             outcome = await asyncio.to_thread(_masked_rationale, outcome, known, given=[cand.text], kinds=self.kinds,
                                               masks=self.masks)
             if outcome.error and not outcome.model:

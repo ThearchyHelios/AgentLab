@@ -49,6 +49,9 @@ class ToolContext:
     #: 个人应用的刷新、个人蓝图的试运行）。记忆、知识库的内容不经遮罩：kb_search 的 collection 参数（调用工具节点写的、
     #: 参数名纠错改出来的、图级 defaults 补上的、模型挑的）一律拒，只能检索 collection 这一个
     fixed_scope: bool = False
+    #: 读哪一份数据目录（data/catalog_view.CatalogView）：运行里由节点从 Run.options 取来（catalog_view.of_run），db_schema
+    #: 给模型看的、查询冻结进表结构快照的、查询时的 SQL 检查都按它。None 是当前目录（缺省，行为同以前）
+    catalog_view: Any = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
