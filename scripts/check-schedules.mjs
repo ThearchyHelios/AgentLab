@@ -226,6 +226,22 @@ await section('纯函数：非工作流目标（评测题集）的表单 ⇄ 请
     JSON.stringify(probs))
 })
 
+await section('纯函数：数据源维护链到哪里、建了什么怎么写', async () => {
+  const m = await import(await load('/src/pages/schedules/model.ts'))
+  check('数据源卡片：数据源页认的 #source-<id>（id 编码）', m.sourceCardPath('ds-shop') === '/data/databases#source-ds-shop'
+    && m.sourceCardPath('ds 1/2') === '/data/databases#source-ds%201%2F2')
+  check('剖析任务：目录页认的 ?pjob=', m.profileJobPath('ds-shop', 'pj-1') === '/data/catalog/ds-shop?pjob=pj-1')
+  check('探查任务链到卡片、剖析任务链到目录', m.maintenanceJobPath('ds-shop', { kind: 'introspect', id: 'ij-1' }) === '/data/databases#source-ds-shop'
+    && m.maintenanceJobPath('ds-shop', { kind: 'profile', id: 'pj-1' }) === '/data/catalog/ds-shop?pjob=pj-1')
+  check('步骤照服务端的叫法写，合成的一个任务写成「a、b」，认不出的照原样',
+    m.maintenanceStepText('introspect') === '探查结构' && m.maintenanceStepText('profile_needed+observe') === '剖析需要的表、取值观察'
+      && m.maintenanceStepText('later_step') === 'later_step')
+  const sum = m.maintenanceSummary({ jobs: [{ step: 'introspect', kind: 'introspect', id: 'ij1a2b3c4d', tables: 1200 }],
+    skipped: [{ step: 'observe', reason: '没有开启数据剖析' }] })
+  check('立即运行的详情：一个任务一行、没执行的一行', sum === '探查结构：探查任务 #ij1a2b（1,200 张表）\n取值观察没有执行：没有开启数据剖析', sum)
+  check('什么都没有：空串', m.maintenanceSummary(null) === '' && m.maintenanceSummary({}) === '')
+})
+
 await section('纯函数：服务端会拒的组合、保存回来怎么接、测试结果', async () => {
   const m = await import(await load('/src/pages/schedules/model.ts'))
   const fields = [{ name: 'date', required: true }, { name: 'region', required: true, default: '华东' }, { name: 'note' },
@@ -512,6 +528,30 @@ const S_MAINT = {
   ...S_EVAL, id: 's-maint', name: '门店库 · 定时维护', target_kind: 'source_maintenance', target_id: 'ds-shop', target_label: '数据源维护',
   target_name: '门店库', workflow_name: '门店库', cron: '0 2 * * *', description_text: '每天 02:00（Asia/Shanghai）',
   last_fire: null, version: 5,
+}
+/**
+ * 数据源维护的触发记录（触发记录的 inputs：建了哪些任务、哪几步没执行，app/data/source_maintenance）：维护没有运行。
+ * fm1 探查、剖析各建一个；fm2 剖析没开，只建了探查，另两步没执行（服务端记的原因就是这两步的原因连成一句）；fm3 上一次的
+ * 探查还没做完、跳过；fm4 数据源不在了、没有建任务
+ */
+const MAINT_JOBS = [
+  { step: 'introspect', kind: 'introspect', id: 'ij1a2b3c4d5e', tables: 12 },
+  { step: 'profile_needed+observe', kind: 'profile', id: 'pj9f8e7d6c5b', scope: 'maintenance', tables: 3 },
+]
+const STEPS3 = ['introspect', 'profile_needed', 'observe']
+const NOT_PROFILED = '这个数据源没有开启数据剖析'
+function maintFires() {
+  const m = { run_id: null, run_status: null }
+  return [
+    fire('fm1', { ...m, kind: 'manual', inputs: { steps: STEPS3, jobs: MAINT_JOBS, skipped: [] } }),
+    fire('fm2', { ...m, fire_at: iso(NOW - 2 * 24 * H), created_at: iso(NOW - 2 * 24 * H),
+      reason: `剖析需要的表没有执行：${NOT_PROFILED}；取值观察没有执行：${NOT_PROFILED}`,
+      inputs: { steps: STEPS3, jobs: [MAINT_JOBS[0]], skipped: [{ step: 'profile_needed', reason: NOT_PROFILED }, { step: 'observe', reason: NOT_PROFILED }] } }),
+    fire('fm3', { ...m, status: 'skipped_overlap', fire_at: iso(NOW - 3 * 24 * H), created_at: iso(NOW - 3 * 24 * H),
+      reason: '数据源「门店库」上一次的维护（或别的探查、剖析）还没做完：正在探查结构，这次触发已跳过', inputs: { steps: STEPS3 } }),
+    fire('fm4', { ...m, status: 'failed_to_start', fire_at: iso(NOW - 4 * 24 * H), created_at: iso(NOW - 4 * 24 * H),
+      reason: '数据源不存在，可能已被删除', inputs: {} }),
+  ]
 }
 /** 评测题集（新建评测题集的定时任务时选） */
 const SUITES = [
@@ -936,10 +976,59 @@ await section('目标种类：新建评测题集的定时、改名称和频率�
   const ro = page.locator('[data-schedule-target-settings="source_maintenance"]')
   await ro.waitFor()
   check('数据源维护的详情只读，写明在数据源页设置，链到数据源页', (await ro.innerText()).includes('在数据源页')
-    && (await ro.locator('[data-schedule-to-source]').getAttribute('href')) === '/data/databases?source=ds-shop'
+    && (await ro.locator('[data-schedule-to-source]').getAttribute('href')) === '/data/databases#source-ds-shop'
     && await page.locator('[data-schedule-save]').count() === 0)
   check('页头的启用、立即运行照常', await page.locator('[data-schedule-toggle]').count() === 1
     && await page.locator('[data-schedules-page] [data-schedule-run]').count() === 1)
+  check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
+})
+
+await section('数据源维护的触发历史：列出建了的任务和没执行的步骤，不写「未发起运行」', async () => {
+  const state = freshState({ schedules: [structuredClone(S1), { ...structuredClone(S_MAINT), last_fire: maintFires()[0] }], fires: maintFires() })
+  const { page, errors } = await open('/schedules/s-maint?tab=history', { state })
+  await page.locator('[data-fire-id="fm4"]').waitFor()
+  const row = (id) => page.locator(`[data-fire-id="${id}"]`)
+  const all = await page.locator('[data-fire-list]').innerText()
+  check('没有一行写「未发起运行」（维护本来就不发起运行）', !all.includes('未发起运行'), all.replace(/\s+/g, ' ').slice(0, 200))
+  const jobs = row('fm1').locator('[data-fire-job]')
+  check('建了两个任务就列两个：步骤、任务种类、编号、表数', await jobs.count() === 2
+    && (await jobs.nth(0).innerText()).includes('探查结构：探查任务 #ij1a2b（12 张表）')
+    && (await jobs.nth(1).innerText()).includes('剖析需要的表、取值观察：剖析任务 #pj9f8e（3 张表）'),
+    (await jobs.allInnerTexts()).join(' ｜ '))
+  check('探查任务链到数据源页那张卡片（#source-<id>，同数据源页认的约定）',
+    await row('fm1').locator('[data-fire-job-kind="introspect"]').getAttribute('href') === '/data/databases#source-ds-shop')
+  check('剖析任务链到数据目录里那个任务的进度（?pjob=，同「定时维护」的「最近一次」）',
+    await row('fm1').locator('[data-fire-job-kind="profile"]').getAttribute('href') === '/data/catalog/ds-shop?pjob=pj9f8e7d6c5b')
+  check('建了任务的那一行不另写「没有建任务」', await row('fm1').locator('[data-fire-maintenance-none]').count() === 0)
+  const skipped = row('fm2').locator('[data-fire-skipped]')
+  check('没执行的步骤逐条写原因', await skipped.count() === 2
+    && (await skipped.nth(0).innerText()).includes(`剖析需要的表没有执行：${NOT_PROFILED}`)
+    && (await skipped.nth(1).innerText()).includes(`取值观察没有执行：${NOT_PROFILED}`), (await skipped.allInnerTexts()).join(' ｜ '))
+  check('……服务端连成一句的原因不再重复写一遍', !(await row('fm2').innerText()).includes('原因：'))
+  check('只建了探查的那一次照样列出探查任务', await row('fm2').locator('[data-fire-job]').count() === 1)
+  check('跳过的那一次：写「没有建任务」和原因', (await row('fm3').locator('[data-fire-maintenance-none]').innerText()).includes('没有建任务')
+    && (await row('fm3').innerText()).includes('还没做完：正在探查结构'))
+  check('数据源不在了的那一次：写「没有建任务」和原因', (await row('fm4').locator('[data-fire-maintenance-none]').innerText()).includes('没有建任务')
+    && (await row('fm4').innerText()).includes('数据源不存在'))
+  await shot(page, 'maintenance-history')
+
+  // 立即运行：建的是任务，说开始维护、详情写建了什么；不说「未能发起」
+  state.override = (method, path) => (method === 'POST' && path === '/schedules/s-maint/run'
+    ? { json: { fire: fire('fm-now', { kind: 'manual', run_id: null, run_status: null, inputs: { steps: STEPS3, jobs: MAINT_JOBS, skipped: [] } }), run_id: null } }
+    : null)
+  await page.locator('[data-schedules-page] [data-schedule-run]').click()
+  const started = page.locator('[data-toast]', { hasText: '已开始维护' })
+  await started.first().waitFor()
+  const detail = (await started.first().locator('details').textContent().catch(() => '')) ?? ''
+  check('立即运行一次维护：说已开始维护，详情写建了哪几个任务', detail.includes('探查结构：探查任务 #ij1a2b') && detail.includes('剖析任务 #pj9f8e'), detail)
+  check('……不说「未能发起」', !(await page.locator('[data-toast]').allInnerTexts()).some((t) => t.includes('未能发起')))
+  state.override = (method, path) => (method === 'POST' && path === '/schedules/s-maint/run'
+    ? { json: { fire: fire('fm-busy', { kind: 'manual', status: 'skipped_overlap', run_id: null, run_status: null,
+      reason: '数据源「门店库」上一次的维护（或别的探查、剖析）还没做完：正在剖析，这次触发已跳过', inputs: { steps: STEPS3 } }), run_id: null } }
+    : null)
+  await page.locator('[data-schedules-page] [data-schedule-run]').click()
+  const busy = await until(async () => (await page.locator('[data-toast]').allInnerTexts()).find((t) => t.includes('上一次维护')) ?? null)
+  check('上一次维护还没做完：照实说跳过了，不说「上一次运行」', !!busy && !busy.includes('上一次运行'), busy ?? '')
   check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
 })
 

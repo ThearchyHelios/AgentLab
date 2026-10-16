@@ -43,8 +43,8 @@ SCHEDULE_KEYS = {"id", "name", "workflow_id", "workflow_name", "cron", "timezone
                  # 定时的目标（next-round X4）：种类、id、叫法、现在的名字、还在不在
                  "target_kind", "target_id", "target_label", "target_name", "target_exists"}
 FIRE_KEYS = {"id", "fire_at", "kind", "status", "run_id", "run_status", "reason", "notified", "compare", "created_at",
-             # 目标是评测题集时这一次触发建的那次评测
-             "eval_run_id"}
+             # 目标是评测题集时这一次触发建的那次评测；目标是数据源维护时这一次建了哪些任务、哪几步没执行（别的目标为 null）
+             "eval_run_id", "inputs"}
 
 
 @pytest.fixture(autouse=True)

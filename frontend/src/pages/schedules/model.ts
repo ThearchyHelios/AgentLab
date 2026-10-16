@@ -5,8 +5,8 @@
  */
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
 import type {
-  Schedule, ScheduleCreate, ScheduleEvent, SchedulePatch, ScheduleRunClass, ScheduleTargetCreate, ScheduleTargetKind,
-  ScheduleWebhookFormat, ScheduleWebhookIn, ScheduleWebhookTest, Workflow, WorkflowVersion,
+  Schedule, ScheduleCreate, ScheduleEvent, ScheduleMaintenanceInputs, SchedulePatch, ScheduleRunClass, ScheduleTargetCreate,
+  ScheduleTargetKind, ScheduleWebhookFormat, ScheduleWebhookIn, ScheduleWebhookTest, Workflow, WorkflowVersion,
 } from '../../types'
 export * from '../../lib/freq'
 import { DEFAULT_FREQ, DEFAULT_GRACE_S, browserTimezone, cronOf, freqOf, freqProblem, type Freq } from '../../lib/freq'
@@ -233,6 +233,41 @@ export function targetProblems(f: TargetForm): Partial<Record<'name' | 'target' 
   const freq = freqProblem(f.freq)
   if (freq) out.freq = freq
   return out
+}
+
+// ---------------------------------------------------------------------------
+// 数据源维护：链到数据源页、数据目录（地址的约定照数据源页和目录页认的那几种）
+// ---------------------------------------------------------------------------
+
+/**
+ * 数据源页上这个数据源的卡片：数据源页认 #source-<id>，列表载入后滚到那张卡片（目录页后台任务条上探查的「查看」同一个
+ * 约定）。维护的设置（做哪几步、频率）在卡片的「定时维护」里，探查的结果也在卡片上
+ */
+export function sourceCardPath(sourceId: string): string {
+  return `/data/databases#source-${encodeURIComponent(sourceId)}`
+}
+
+/** 数据目录里这个剖析任务的进度和结果：目录页认 ?pjob=<任务 id>，打开那个任务的进度（数据源页「定时维护」的「最近一次」同一个约定） */
+export function profileJobPath(sourceId: string, jobId: string): string {
+  return `/data/catalog/${encodeURIComponent(sourceId)}?pjob=${encodeURIComponent(jobId)}`
+}
+
+/** 维护建的一个任务链到哪里：探查到数据源卡片，剖析到目录里那个任务的进度 */
+export function maintenanceJobPath(sourceId: string, job: { kind: 'introspect' | 'profile'; id: string }): string {
+  return job.kind === 'profile' ? profileJobPath(sourceId, job.id) : sourceCardPath(sourceId)
+}
+
+/** 维护的一个步骤（或剖析、观察合成一个任务时的 a+b）照服务端的叫法写；认不出的照原样 */
+export function maintenanceStepText(step: string): string {
+  return step.split('+').map((x) => (T.maintenanceStep as Record<string, string>)[x] ?? x).join('、')
+}
+
+/** 立即运行一次维护之后 toast 的详情：建了哪几个任务、哪几步没执行（逐行，同触发历史里的写法） */
+export function maintenanceSummary(inputs: ScheduleMaintenanceInputs | null | undefined): string {
+  const jobs = (inputs?.jobs ?? []).map((j) => T.maintenanceJob(maintenanceStepText(j.step), T.maintenanceJobKind[j.kind] ?? j.kind,
+    j.id, j.tables ?? null))
+  const skipped = (inputs?.skipped ?? []).map((k) => T.maintenanceSkipped(maintenanceStepText(k.step), k.reason))
+  return [...jobs, ...skipped].join('\n')
 }
 
 /**

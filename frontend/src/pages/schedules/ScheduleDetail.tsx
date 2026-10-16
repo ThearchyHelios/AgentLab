@@ -15,7 +15,7 @@ import {
   EnableSwitch, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled, targetKindOf,
   targetText,
 } from './parts'
-import { CREATABLE_TARGETS, graceLabel } from './model'
+import { CREATABLE_TARGETS, graceLabel, sourceCardPath } from './model'
 import { ScheduleEditor } from './ScheduleEditor'
 import { TargetEditor } from './TargetEditor'
 
@@ -312,8 +312,9 @@ export function ScheduleDetailPage({ id }: { id: string }) {
 }
 
 /**
- * 数据源维护的定时任务的设置：只读地列出名称、目标、频率、时区、补发宽限，链到数据源页（维护要做哪几步、频率和时段在数据源页的
- * 「定时维护」里改，next-round 03 B4）。页头的启用开关、立即运行、删除和触发历史照常可用
+ * 数据源维护的定时任务的设置：只读地列出名称、目标、频率、时区、补发宽限，链到数据源页上这个数据源的卡片（model.sourceCardPath：
+ * 数据源页认 #source-<id>、滚到那张卡片；维护要做哪几步、频率和时段在卡片的「定时维护」里改，next-round 03 B4）。页头的启用开关、
+ * 立即运行、删除和触发历史照常可用
  */
 function TargetSettings({ schedule }: { schedule: Schedule }) {
   const kind = targetKindOf(schedule)
@@ -327,7 +328,7 @@ function TargetSettings({ schedule }: { schedule: Schedule }) {
   return (
     <div className="mx-auto max-w-3xl space-y-3 p-4" data-schedule-target-settings={kind}>
       <p className="text-xs text-dim">{T.maintenanceNote}</p>
-      <Link to={`/data/databases?source=${encodeURIComponent(schedule.target_id ?? '')}`} className="btn btn-sm"
+      <Link to={sourceCardPath(schedule.target_id ?? '')} className="btn btn-sm"
             data-schedule-to-source={schedule.target_id ?? ''}>
         {T.toDataSource}
       </Link>

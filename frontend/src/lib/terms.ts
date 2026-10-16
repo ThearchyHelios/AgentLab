@@ -3953,6 +3953,29 @@ export const SCHEDULE_TEXT = {
   evalStarted: '已发起一次评测',
   /** 触发历史里评测题集那一次：评测的编号 */
   evalFire: (short: string) => `评测 #${short}`,
+  /**
+   * 数据源维护的一次触发：建的是探查、剖析任务，没有运行。和数据源页「定时维护」的「最近一次」同一个写法（步骤的叫法同服务端
+   * source_maintenance.STEP_LABEL）
+   */
+  maintenanceStep: { introspect: '探查结构', profile_needed: '剖析需要的表', observe: '取值观察' } as Record<
+    import('../types').ScheduleMaintenanceStep, string>,
+  maintenanceJobKind: { introspect: '探查任务', profile: '剖析任务' } as Record<'introspect' | 'profile', string>,
+  maintenanceJobs: '建了任务',
+  maintenanceJob: (step: string, kind: string, id: string, tables: number | null) =>
+    `${step}：${kind} #${id.slice(0, 6)}${tables != null ? `（${formatNumber(tables)} 张表）` : ''}`,
+  maintenanceJobTitle: {
+    introspect: '去数据源页看这个数据源的探查结果',
+    profile: '去数据目录看这个剖析任务的进度和结果',
+  } as Record<'introspect' | 'profile', string>,
+  maintenanceSkipped: (step: string, reason: string) => `${step}没有执行：${reason}`,
+  /** 维护没有建任务（发起失败、跳过）：不写「未发起运行」，维护本来就不发起运行 */
+  maintenanceNoJobs: '没有建任务',
+  /** 刚触发、任务还在建（服务端按已发起给，任务还没记上） */
+  maintenanceLaunching: '正在建维护任务',
+  maintenanceStarted: '已开始维护',
+  maintenanceBusy: '上一次维护（或别的探查、剖析）还没做完，这一次已跳过',
+  maintenanceFailed: (reason: string | null) => (reason ? `没有开始维护：${reason}` : '没有开始维护'),
+  maintenanceStartedHint: '已建好这一次维护的任务',
   runStarted: '已发起运行',
   runSkipped: '上一次运行尚未结束，本次已按重叠策略跳过',
   runFailed: (reason: string | null) => (reason ? `未能发起运行：${reason}` : '未能发起运行'),
