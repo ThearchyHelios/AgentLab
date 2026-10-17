@@ -17,6 +17,11 @@ agent 看到的目录少了遮罩列那部分（README 写明）。
 文档是表名、注释、目录里的中文名 / 粒度 / 说明、列名、列的中文名（遮罩列只用列名）；探查范围外的对象只按名字和注释参与，
 权重低一档。切词用 memory/embeddings._tokens（英文按词、中文按字补二元组）加 catalog.name_words（下划线、驼峰拆词）。
 
+**限制：范围外、又没有注释的对象，中文需求命不中。** 它只剩英文名可检索，英文名拆出的词没有中文说法：仓库里没有现成的英中
+业务词对照（命名推断只拆词、不翻译，catalog.name_words 也一样），这里不临时编一份词表（编出来的覆盖不全、还会把不相干的表
+抬上来），所以「上周的退款」找不到只叫 refund_orders、没写注释的表。真库多半有注释，注释照常参与检索，影响小；范围内的表另有
+目录里的中文名、列名可配。要用这张表时按英文名点名查看（会按需加入），或者请管理员把它加进探查范围、补上注释或目录的中文名。
+
 **三种「不在」**（absent_detail）：表已不在、在探查范围外、在范围里却读不到结构，说法分开；只有真删除才说「表已不在」。
 
 只读：只看表结构缓存（schema_cache）和调用方读好的数据目录、剖析事实、对象索引，不碰业务库。这里的文字都是写给模型看的，
@@ -342,6 +347,7 @@ def _doc_text(name: str, meta: Mapping[str, Any] | None, notes: Mapping[str, Any
 
 
 def _outside_text(name: str, comment: str | None) -> str:
+    """一个范围外对象的检索文档：名字、名字拆出的词、注释。没有注释的只有英文（见模块说明的限制）。"""
     from app.data.catalog import name_words
 
     return " ".join([name, " ".join(name_words(name)), comment or ""])
