@@ -867,10 +867,10 @@ def test_columns_inside_a_cte_are_not_compared_because_canonical_forms_prune_the
 
 
 def test_differences_that_cannot_be_checked_get_only_the_fallback():
-    """两边算法不同、又判断不了是不是真的不同的（ROUND 包了一层、CASE 和 COALESCE、两种写法的时间常量），不说具体的：
-    「A 算的是 X，B 算的是 Y」读起来就是两边不同，说错了比不说更糟。"""
-    for a, b in (("SELECT SUM(amount) FROM orders", "SELECT ROUND(SUM(amount), 2) FROM orders"),
-                 ("SELECT SUM(COALESCE(discount, 0)) FROM orders",
+    """两边算法不同、又判断不了是不是真的不同的（CASE 和 COALESCE、两种写法的时间常量），不说具体的：
+    「A 算的是 X，B 算的是 Y」读起来就是两边不同，说错了比不说更糟。ROUND 包了一层的另有一句只陈述写法、不断言值不同的
+    说明（_Explainer._rounded，见 test_ledger_cells 的 ROUND 那条）。"""
+    for a, b in (("SELECT SUM(COALESCE(discount, 0)) FROM orders",
                   "SELECT SUM(CASE WHEN discount IS NULL THEN 0 ELSE discount END) FROM orders"),
                  ("SELECT COUNT(*) FROM orders WHERE paid_at >= '2026-09-01'",
                   "SELECT COUNT(*) FROM orders WHERE paid_at >= DATE('2026-09-01')")):

@@ -190,6 +190,26 @@ def test_coalesce_explanation_holds_on_the_virtual_shop():
     assert not [i for i in counted.items if "COALESCE" in i.text]
 
 
+def test_round_around_the_value_is_still_not_equivalent_and_says_why():
+    """一边套了 ROUND(…, 2)、另一边没取整：取整改了值，照旧不等价；说明说清是哪一边取整、保留几位，不退回兜底。
+    评测的期望 SQL、口径的取数里常见这种写法（样例题集原来就是），说不清时整段兜底，人看不出只差在取整上。"""
+    from app.data.sql_semantics import explain_sql_diff
+
+    a = "SELECT SUM(amount) AS s FROM orders WHERE status = 'paid'"
+    b = "SELECT ROUND(SUM(amount), 2) AS s FROM orders WHERE status = 'paid'"
+    db = sqlite3.connect(":memory:")
+    db.executescript("CREATE TABLE orders (id INTEGER, status TEXT, amount REAL);"
+                     "INSERT INTO orders VALUES (1, 'paid', 10.005), (2, 'paid', 0.001)")
+    assert db.execute(a).fetchall() != db.execute(b).fetchall(), "取整确实改了值"
+    diff = explain_sql_diff(a, b, "sqlite")
+    assert not diff.equivalent and not diff.fallback
+    assert [(i.aspect, i.text) for i in diff.items] == [("aggregate", "B 的 s 套了 ROUND(…, 2)：保留 2 位小数，A 没有取整")]
+    whole = explain_sql_diff("SELECT ROUND(SUM(amount)) AS s FROM orders", "SELECT SUM(amount) AS s FROM orders", "sqlite")
+    assert not whole.equivalent and [i.text for i in whole.items] == ["A 的 s 套了 ROUND(…)：取整到个位，B 没有取整"]
+    other = explain_sql_diff("SELECT ROUND(AVG(amount), 2) AS s FROM orders", "SELECT SUM(amount) AS s FROM orders", "sqlite")
+    assert not [i for i in other.items if "ROUND" in i.text], "取整的不是同一个表达式时不说成只差在取整"
+
+
 def test_dates_computed_from_today_are_not_equivalent_and_say_so():
     from app.data.sql_semantics import explain_sql_diff
 

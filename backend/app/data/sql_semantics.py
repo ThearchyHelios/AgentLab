@@ -146,7 +146,9 @@ WHERE / GROUP BY 里用列别名的），而且只说五类：
   时 MAX(u.city) 和 MIN(u.city) 一样，LEFT JOIN 把行复制了也一样）；去重不起作用的不说（MIN / MAX；不分组的聚合只出
   一行；已经按选出来的列分组；只取一行；表结构里的键说明每行本来就不一样）；每组只有一行时 SUM、AVG、MIN、MAX 不说。
   同一位置上一边套了 COALESCE(聚合, 常量)、另一边就是那个聚合（SUM / AVG / MIN / MAX，COUNT 不会是空、不说），说
-  「X 套了 COALESCE(…, 0)：没有符合条件的行（或参数都为空）时 A 是 0、B 是空」（_coalesced）。
+  「X 套了 COALESCE(…, 0)：没有符合条件的行（或参数都为空）时 A 是 0、B 是空」（_coalesced）。同一位置上一边套了
+  ROUND(表达式, 位数)、另一边就是那个表达式，说「X 套了 ROUND(…, 2)：保留 2 位小数，B 没有取整」（_rounded）：取整改了值，
+  判等价照旧不等价；口径、期望 SQL 里的取整最好交给口径卡、展示的小数位。
 - 同一列上一边按运行当天现算（CURRENT_DATE、date('now', …)、now()）、另一边写定的常量（time_range，_relative）：说「A 对 X
   的条件是 …，按运行当天现算；B 写定的是 …」，要求同 _rewrites。
 - 关联的表、关联类型（tables / join）：换了一张表；一边多关联了一张表（表结构里有指向它的外键、关联条件又用到它的键的
@@ -7785,7 +7787,8 @@ class _Explainer:
             return False
         covered = True
         for i, (x, y, fx, fy) in enumerate(zip(A.exprs, B.exprs, ta, tb)):
-            if fx != fy and not self._aggregates(x, y, A, B, mapping) and not self._coalesced(i, x, y, A, B, mapping):
+            if fx != fy and not self._aggregates(x, y, A, B, mapping) and not self._coalesced(i, x, y, A, B, mapping) \
+                    and not self._rounded(i, x, y, A, B, mapping):
                 covered = False
         return covered
 
@@ -7835,6 +7838,32 @@ class _Explainer:
             const = self.sql(wrapped.expressions[0])
             self.add("aggregate", self.show(x, A), self.show(y, B),
                      _say(what, "套了 COALESCE(…,", const + ")：", when, me, "是", const, "、", them, "是空"))
+            return True
+        return False
+
+    def _rounded(self, index: int, x: Any, y: Any, A: _Block, B: _Block, mapping: Mapping[str, str]) -> bool:
+        """同一位置上一边是 ROUND(表达式, 位数常量)、另一边就是那个表达式本身：说「X 套了 ROUND(…, 2)：保留 2 位小数，B 没有
+        取整」。位数不写（ROUND(x)）按 0 位。只改说明：走到这里时两边已经判了不等价（取整确实改了值）。"""
+        from sqlglot import exp
+
+        for side, (wrapped, plain) in enumerate(((x.unalias(), y.unalias()), (y.unalias(), x.unalias()))):
+            if not isinstance(wrapped, exp.Round) or wrapped.this is None:
+                continue
+            digits = wrapped.args.get("decimals")
+            if digits is not None and not (isinstance(digits, exp.Literal) and digits.is_int):
+                continue
+            same = self.fp(wrapped.this) == self.mfp(plain, mapping) if side == 0 else \
+                self.mfp(wrapped.this, mapping) == self.fp(plain)
+            if not same:
+                continue
+            places = int(digits.this) if digits is not None else 0
+            me, them = (self.la, self.lb) if side == 0 else (self.lb, self.la)
+            name = self._output_name(side, index)
+            what = _say(me, "的", name) if name else _say(me, "的这一列")
+            keep = f"保留 {places} 位小数" if places > 0 else "取整到个位"
+            self.add("aggregate", self.show(x, A), self.show(y, B),
+                     _say(what, f"套了 ROUND(…, {places})：" if digits is not None else "套了 ROUND(…)：", keep + "，",
+                          them, "没有取整"))
             return True
         return False
 
