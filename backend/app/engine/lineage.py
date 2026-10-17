@@ -10,7 +10,9 @@
   这么写的）跨卡往下追——接上那个指标自己的出处，那个指标的输入都追到了原始数据，这一项才算追到（upstream.traced）；
   转抄的转抄一层层接着追，最多 MAX_COPY_DEPTH 层（循环里抄自己上一轮的卡每一轮多一层，到了上限就算没追到）；
 - 证据面板（api/evidence 的指标步骤）：卡上记的输入里追不到原始数据的（untraced），照实说出处追到哪个节点为止；
-- 应用检查（apps/lint）：受管级应用里绑定的指标，按 static_stops 静态地认（只有图、没有运行），追不到的给提示。
+- 应用检查（apps/lint）、受管级发布检查（governance）：按 static_stops 静态地认（只有图、没有运行），追不到的给提示。
+  转抄同一张图里另一张口径卡的指标，和运行时一样跨卡按那个指标的式子接着认（最多 MAX_COPY_DEPTH 层）；被抄的卡按
+  caliber_from 固定在别处的版本时，静态看不到那一版的图，照旧停在那张卡。
 """
 from __future__ import annotations
 
@@ -138,26 +140,52 @@ class Stop:
     node_id: str | None
 
 
-def static_stops(nodes: Mapping[str, Mapping[str, Any]], expression: str) -> list[Stop]:
+def static_stops(nodes: Mapping[str, Mapping[str, Any]], expression: str, *, _depth: int = 0) -> list[Stop]:
     """静态地认一个指标表达式里追不到原始数据的输入。nodes 是节点 id → {type, config}（apps/tree.node_map 的形状）。
 
     和运行时同一套认法，只是不看值：cell() 的第一个参数是查询结果（调用工具、合并查询的产出，或原样解析它的整形节点）、
-    按位置取的格穿过原样解析的整形节点、运行输入、开了按出处核对字段的 Agent 交来的字段，算追到了；别的（表达式整形、
-    沙箱代码、模型调用、转抄别的口径卡……）停在写它的那个节点。表达式写错了的不在这里报（画布的校验报）。"""
+    按位置取的格穿过原样解析的整形节点、运行输入、开了按出处核对字段的 Agent 交来的字段，算追到了；转抄同一张图里
+    另一张口径卡的指标，按那个指标的式子接着认（它的输入都追到了才算）；别的（表达式整形、沙箱代码、模型调用、转抄
+    固定在别处版本的口径卡……）停在写它的那个节点。表达式写错了的不在这里报（画布的校验报）。"""
     try:
         tree = parse_expression(expression)[0]
     except ExpressionError:
         return []
     out: list[Stop] = []
     for path in leaf_refs(tree):
-        stop = _static_stop(nodes, path)
+        stop = _static_stop(nodes, path, _depth)
         if stop is not None:
             out.append(stop)
     return out
 
 
-def _static_stop(nodes: Mapping[str, Mapping[str, Any]], path: str) -> Stop | None:
+def _copied_metric(nodes: Mapping[str, Mapping[str, Any]], path: str) -> tuple[str, str] | None:
+    """path 转抄同一张图里一张口径卡的第 i 个指标时：(写它的卡, 那个指标的式子)。卡按 caliber_from 固定在别处版本的、
+    认不出是哪张卡的、下标越界的为 None。"""
+    copy = metric_copy(path)
+    if copy is None:
+        return None
+    root, name, index = copy
+    writers = _writers(nodes, f"{root}.{name}")
+    if len(writers) != 1:
+        return None
+    card = nodes.get(writers[0]) or {}
+    cfg = card.get("config") or {}
+    if card.get("type") != "metrics" or isinstance(cfg.get("caliber_from"), dict):
+        return None
+    metrics = cfg.get("metrics") or []
+    if index >= len(metrics) or not isinstance(metrics[index], dict) or not metrics[index].get("expression"):
+        return None
+    return writers[0], str(metrics[index]["expression"])
+
+
+def _static_stop(nodes: Mapping[str, Mapping[str, Any]], path: str, depth: int = 0) -> Stop | None:
     type_of = lambda node_id: (nodes.get(node_id) or {}).get("type")  # noqa: E731
+    if (copied := _copied_metric(nodes, path)) is not None:
+        card_id, expression = copied
+        if depth < MAX_COPY_DEPTH and not static_stops(nodes, expression, _depth=depth + 1):
+            return None
+        return Stop(path, card_id)
     if (parts := cell_parts(path)) is not None:
         writers = _writers(nodes, parts[0])
         bad = [w for w in writers if not _table(nodes, w, type_of)]
