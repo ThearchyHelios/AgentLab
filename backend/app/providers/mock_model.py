@@ -126,6 +126,12 @@ class MockChatModel(BaseChatModel):
     def _llm_type(self) -> str:
         return "mock"
 
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        """调用参数里带上模型名（同 OpenAI 兼容、Anthropic 的 model）：用量计量（providers/usage）按它记在哪个模型名下，
+        不报的话评测汇总里助手用量的模型就成了 unknown。"""
+        return {"model_name": self.model_name}
+
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> "MockChatModel":
         normalized: list[dict[str, Any]] = []
         for tool in tools:

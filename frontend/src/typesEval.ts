@@ -393,11 +393,14 @@ export interface EvalSpend {
 export type EvalStatus = 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled' | 'interrupted'
 export type EvalTrigger = 'manual' | 'schedule' | 'pair'
 
+/** 一臂的计数（服务端 runner._counts）：done 是真的跑过的（评完、出错），not_run 是停止、中断、到了上限、止损没跑的，
+ * errors 是出错的（不含没跑的）；done + not_run + running + pending = total */
 export interface EvalCounts {
   total?: number
   done?: number
   running?: number
   pending?: number
+  not_run?: number
   passed?: number
   failed?: number
   ungradable?: number
@@ -428,7 +431,9 @@ export interface EvalSummary {
   done?: number
   cases?: number
   verdicts?: Partial<Record<EvalVerdict, number>>
+  /** 没跑的（停止、中断、到了上限、止损没开评）；出错的另在 errors */
   not_run?: number
+  errors?: number
   accuracy?: EvalRate
   traced_accuracy?: EvalRate
   outcomes?: Partial<Record<EvalOutcome, number>>
@@ -558,7 +563,10 @@ export interface EvalResult {
   error: string | null
   started_at: string | null
   finished_at: string | null
+  /** 这一题实际问的问题（变量按这次评测的截至时间渲染好了）；题目之后改过、又没有作答运行可取时为 null */
   question?: string | null
+  /** 题目的原文（可能带 {{ schedule.… }} 变量的模板）；题目删了为 null */
+  question_template?: string | null
   /** 这一题的花费：助手（含复核）+ 写作 + 结论裁判，服务端加好的 */
   cost?: { cost_usd: number | null; unpriced_calls: number }
 }

@@ -8,8 +8,9 @@
   配方里认作日期的列（候选的 upload_dates）：是的算日期列，不是的、读不出配方的说清日期是按文字保存的；数据源还没有
   可用的表结构时说表结构不可用
 - 差了不止一处、有兜底说明、两条 SQL 规范化后一致、差在别的方面、被采纳的一边没有可记的写法、只有一边按时间筛：不写，
-  照实说原因。同一列上的时间范围不同、跨两张表的条件，差异说明只给兜底，同样不写；说明以后真把跨两张表的条件说成一条
-  筛选条件，derive 自己那道「只涉及一张表」的检查也拦得下
+  照实说原因。同一列上的时间范围不同（差异说明说成 time_range）、同一列上换了筛选的值（filter，两边都有条件）不是业务日期、
+  也不是一边多出来的有效记录条件，同样不写；跨两张表的条件差异说明只给兜底，说明以后真把它说成一条筛选条件，derive 自己
+  那道「只涉及一张表」的检查也拦得下
 - 指标自己的筛选范围（只看华东、只看线上）不是有效记录条件：取值出现在指标名称、口径说明、所在分组、运行输入里的，
   条件用到分组的列的，不是在排除退款、作废、测试这类无效记录的，都不写
 - 写的是人工填写、已确认，备注写明运行、节点、指标；同样的说法已确认过就不再写（不升版本），确认过的不同说法不覆盖；
@@ -234,10 +235,15 @@ def test_equivalent_sql_or_fallback_or_other_aspects_are_not_recorded():
     assert [i["aspect"] for i in joined["diff"]["items"]] == ["aggregate"]
     assert "不只是去不去重" in derive(joined, SCHEMA)[1]
 
-    # 同一列上的时间范围不同：差异说明只给兜底（说不清差的是哪一段），不写
+    # 同一列上的时间范围不同：差异说明说成 time_range（「原流程对 paid_date 的条件是 …，盲算是 …」），不是换了时间列，不写
     ranged = candidate(RIGHT, RIGHT.replace("'2026-09-07'", "'2026-09-06'"), "b")
-    assert ranged["diff"]["fallback"] is True and [i["aspect"] for i in ranged["diff"]["items"]] == ["other"]
-    assert "未能归纳" in derive(ranged, SCHEMA)[1]
+    assert ranged["diff"]["fallback"] is False and [i["aspect"] for i in ranged["diff"]["items"]] == ["time_range"]
+    assert "两边差在时间范围" in derive(ranged, SCHEMA)[1]
+    # 同一列上换了筛选的值：两边都有条件（filter 两边都有），不是一边多出来的有效记录条件，不写
+    valued = candidate(RIGHT, RIGHT.replace("status <> 'refunded'", "status NOT IN ('refunded', 'void')"), "b")
+    assert valued["diff"]["fallback"] is False and [(i["aspect"], i["a"] is not None, i["b"] is not None)
+                                                    for i in valued["diff"]["items"]] == [("filter", True, True)]
+    assert "两边各有不同的筛选条件" in derive(valued, SCHEMA)[1]
 
     # 只差一个方面、可那个方面对不上目录里的三项（关联方式）：不写，原因说清差在哪
     left = (f"SELECT SUM(o.amount) AS gmv FROM orders o LEFT JOIN customers c ON c.id = o.customer_id "

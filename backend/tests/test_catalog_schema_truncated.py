@@ -147,6 +147,35 @@ async def test_schema_tool_adds_an_out_of_scope_table_instead_of_denying_it(wide
     assert "没有 nope" in await tool.coroutine(table="nope")
 
 
+async def test_schema_tool_on_demand_trail_records_who_started_the_run(wide):
+    """运行时 db_schema 按需加入范围的留痕：记上运行的发起人（by），不只是 run_id（下一轮验收：以前 by 是 null）。"""
+    from sqlalchemy import select as _select
+
+    from app.data import source_objects
+    from app.db.models import Run
+    from app.db.models_sources import SourceObject
+    from app.tools.datasource import build_datasource_tools
+    from app.tools.registry import ToolContext, Versions
+
+    sid, name = wide
+    async with SessionLocal() as session:
+        run = Run(workflow_name="按需加入", status="running", graph={"nodes": [], "edges": []}, input={},
+                  started_by="分析员甲")
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+    async with SessionLocal() as session:
+        (tool,) = await build_datasource_tools(
+            [f"db_schema__{name}"], ToolContext(run_id=run_id, node_id="ask", data_versions=Versions.CURRENT), session)
+    assert "按需加入了探查范围" in await tool.coroutine(table="t204")
+    async with SessionLocal() as session:
+        obj = (await session.execute(_select(SourceObject).where(SourceObject.source_id == sid,
+                                                                 SourceObject.name == "t204"))).scalar_one()
+    trail = source_objects.trail_dict(obj)
+    assert trail["via"] == source_objects.VIA_SCHEMA_TOOL and trail["run_id"] == run_id and trail["ref"] == "ask"
+    assert trail["by"] == "分析员甲", trail
+
+
 def test_legacy_truncated_cache_still_does_not_deny():
     """升级前只探查了前 200 张的老缓存（没有对象索引）：查一张没探查到的表照旧说「只探查了」、请查数据字典。"""
     from types import SimpleNamespace
@@ -157,3 +186,24 @@ def test_legacy_truncated_cache_still_does_not_deny():
                                                        "truncated": True, "total": 205})
     text = describe_table(row, "t300")
     assert "中没有" not in text and "只探查了" in text and "information_schema" in text
+
+
+async def test_catalog_detail_of_an_out_of_scope_table_says_so(client, wide):
+    """对象索引里有、在探查范围外的表：GET /catalog/{表} 的 404 说「在探查范围外」，和 /schema、/catalog/search 同一套「不在」
+    （下一轮验收：以前说「可能已被删除或尚未探查结构」）；表助手、批量审阅的同一个错误也一样。对象索引里也没有的说「没有
+    这张表」。"""
+    sid, _ = wide
+    r = await client.get(f"/api/datasources/{sid}/catalog/t200")
+    assert r.status_code == 404 and "探查范围外" in r.json()["detail"], r.text
+    assert "可能已被删除" not in r.json()["detail"]
+    found = (await client.get(f"/api/datasources/{sid}/catalog/search", params={"q": "t200"})).json()["items"]
+    assert [i["absent_reason"] for i in found if i["name"] == "t200"] in (["out_of_scope"], [None]), found
+    r = await client.post(f"/api/datasources/{sid}/catalog/t201/assistant", json={"messages": [
+        {"role": "user", "content": "这张表是干什么的"}]})
+    assert r.status_code == 404 and "探查范围外" in r.json()["detail"], r.text
+    r = await client.post(f"/api/datasources/{sid}/catalog/review/batch", json={"items": [
+        {"table_name": "t202", "path": "label", "action": "confirm", "if_version": 0}]})
+    [result] = r.json()["results"]
+    assert result["ok"] is False and "探查范围外" in result["error"], result
+    r = await client.get(f"/api/datasources/{sid}/catalog/no_such_table")
+    assert r.status_code == 404 and "没有表 no_such_table" in r.json()["detail"] and "探查范围外" not in r.json()["detail"]

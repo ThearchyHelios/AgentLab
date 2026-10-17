@@ -73,11 +73,11 @@ def test_an_extra_condition_sorted_first_does_not_drag_the_shared_ones_along():
 
 
 def test_two_conditions_on_each_side_mark_only_the_one_that_differs():
-    """同一列上的区间只差结束日期（这种只给兜底说明，审核人全靠逐行对照）：开始日期那一行两边一样，不标。"""
+    """同一列上的区间只差结束日期（差异说明说成 time_range，逐行对照照样给）：开始日期那一行两边一样，不标。"""
     a = f"SELECT SUM(fee) FROM parcels WHERE {WEEK}"
     b = "SELECT SUM(fee) FROM parcels WHERE sent_on BETWEEN '2031-03-03' AND '2031-03-10'"
     got = diff(a, b)
-    assert got.fallback
+    assert not got.fallback and [i.aspect for i in got.items] == ["time_range"]
     assert got.text_diff == ("  WHERE", "-   AND parcels.sent_on <= '2031-03-09'", "+   AND parcels.sent_on <= '2031-03-10'")
 
 

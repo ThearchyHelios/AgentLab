@@ -98,6 +98,33 @@ def test_volume_drop_against_the_previous_28_days():
     assert vd.daily(partial, [], today=TODAY) == []
 
 
+def test_future_business_dates_do_not_turn_today_into_the_last_full_day():
+    """业务日期有未来值（最晚到明天）：最近一个整天仍是昨天，今天这个还没写完的日子不算量跌；昨天真跌了照样报。以前取
+    max(days) 再退一天，max 在明天时就落到了今天（只有几行）上，记出一条量跌。"""
+    start = TODAY - timedelta(days=30)                      # start + 30 是今天
+    ahead = _days(start, [100] * 30 + [5, 40])              # 昨天 100、今天 5 行、明天 40 行
+    assert not [f for f in vd.daily(ahead, [], today=TODAY) if f.kind == "volume_drop"]
+    [f] = [f for f in vd.daily(_days(start, [100] * 29 + [20, 5, 40]), [], today=TODAY) if f.kind == "volume_drop"]
+    assert f.after["day"] == (TODAY - timedelta(days=1)).isoformat() and f.after["rows"] == 20
+
+
+def test_days_after_today_are_not_gaps_now_or_in_history():
+    """缺天只看到今天为止：今天以后两天没数据、第三天又有（预约、计划类的日期）不算缺天；以前那次观察窗口里它自己的「今天」
+    以后的空日子也不算以前有过缺天，挡不住这一次真缺的天。"""
+    start = TODAY - timedelta(days=30)
+    full = _days(start - timedelta(days=1), [100] * 31)
+    ahead = _days(start, [100] * 31 + [0, 0, 3])            # 今天之后空两天、第三天 3 行
+    assert not [f for f in vd.daily(ahead, [full], today=TODAY) if f.kind == "date_gap"]
+    then = TODAY - timedelta(days=7)
+    old = vd.Obs("daily_volume", "window:paid_on:35", {
+        "until": then.isoformat(),
+        "days": {**{(then - timedelta(days=i)).isoformat(): 100 for i in range(30)},
+                 (then + timedelta(days=5)).isoformat(): 2}}, AT)  # 那次的「今天」以后空了几天、又有一行
+    holed = _days(start, [100] * 10 + [0, 0] + [100] * 19)
+    [gap] = [f for f in vd.daily(holed, [old], today=TODAY) if f.kind == "date_gap"]
+    assert gap.after["gaps"] == 2
+
+
 def _rows(n: int, method: str = "count") -> vd.Obs:
     return vd.Obs("rows", method, {"rows": n, "method": method}, AT)
 

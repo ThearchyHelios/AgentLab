@@ -21,7 +21,7 @@ export const PROFILE_POLL_MS = 1500
 
 export const retryableTasks = (j: CatalogProfileJob): CatalogProfileTaskRow[] => j.tasks.filter((t) => PROFILE_RETRYABLE.has(t.status))
 
-export interface ProfileStartBody { tables?: string[]; scope?: 'needed' | 'all' }
+export interface ProfileStartBody { tables?: string[]; scope?: 'needed' | 'all' | 'observe' }
 
 export function useProfileJob(sourceId: string, active: CatalogActiveProfileJob | null | undefined, on: {
   /** 这一次取回来新结束的表（写进目录了，或者失败、停止了）：重取清单，正在看的表在里面就重新载入 */

@@ -295,6 +295,35 @@ async def test_stats_count_what_the_fixtures_did(client, monkeypatch):
     assert body["e4"]["per_publish"]["available"] is True and body["e4"]["per_publish"]["groups"] == 0
 
 
+async def test_e4_usage_counts_formal_runs_only_of_workflows_with_a_caliber_card(client):
+    """E4 的版本用量只算有口径卡的工作流（下一轮验收：没有口径卡的普通发布工作流的正式运行也被当成口径计数）。卡是转抄别处
+    口径（caliber_from）的不算源头口径，同 recall.source_cards。"""
+    from datetime import datetime, timezone
+
+    from app.db.models import Run, Workflow, WorkflowVersion
+
+    since = datetime.now(timezone.utc)
+    card = {"id": "card", "type": "metrics", "position": {"x": 0, "y": 0},
+            "data": {"label": "口径卡", "config": {"caliber": "周销售", "caliber_version": "v1", "metrics": []}}}
+    plain = {"id": "out", "type": "output", "position": {"x": 0, "y": 0}, "data": {"label": "出口", "config": {}}}
+    async with SessionLocal() as session:
+        made = {}
+        for name, nodes in (("有口径卡", [card, plain]), ("普通工作流", [plain])):
+            wf = Workflow(name=name, graph={"nodes": nodes, "edges": []}, status="published", published_version=1)
+            session.add(wf)
+            await session.flush()
+            session.add(WorkflowVersion(workflow_id=wf.id, version=1, graph={"nodes": nodes, "edges": []}))
+            for _ in range(2):
+                session.add(Run(workflow_id=wf.id, version=1, run_class="formal", status="succeeded",
+                                graph={"nodes": nodes, "edges": []}, input={}))
+            made[name] = wf.id
+        await session.commit()
+    body = (await client.get("/api/ledger/stats", params={"since": since.isoformat()})).json()
+    usage = {u["caliber"]: u for u in body["e4"]["usage"]}
+    assert usage[f"{made['有口径卡']}@1"]["formal_runs"] == 2
+    assert f"{made['普通工作流']}@1" not in usage, usage
+
+
 async def test_stats_take_the_run_ids_the_caller_names(monkeypatch):
     """评测（第 3 波）直接调 compute_stats，点名自己的运行：只算这几次。"""
     from app.ledger.stats import compute_stats

@@ -11,13 +11,16 @@
   个问题的类；
 - 被反复用的答案（reused）：导出过 ≥ 2 次（report.exported 审计，第 2 波）、做成过应用（蓝图的来源是这次运行）、在画布里
   打开过或提取过（工作流的 origin.run_id 是这次运行）的轮次。
-每项给代表问题、轮次链接、（shape 的）SQL 形状和参数候选、有没有相关口径（可以对账的那份）、是不是已经固化过。点「不是口径」
+每项给代表问题、轮次链接、（shape 的）SQL 形状和参数候选、有没有相关口径（可以对账的那份）、是不是已经固化过（frozen_into，
+同一个工作流只列一次）。点「不是口径」
 写一条审计（ledger.certify.dismiss，subject 是这一项的 id），之后不再进队。门槛同 ledger/stats（E3 的重复度）。
 
 **固化成口径草稿**（freeze，from-run 加 freeze 选项后转调它）：代表运行里报告引用了的查询，各变成一个调用工具节点——SQL 用
 规范化后的文本，跨轮变化的字面量换成 '{{ input.p1 }}'（同组的别的运行 peers 用来认哪些位置变了），入口字段的缺省值取
-代表运行里的值；只有一行的结果每个数值列建一项口径卡指标（cell(nodes.取数, 0, '列')）；报告节点保留，出口契约写
-report_from + metrics_from（有多行结果的另加 cells: true），过 validate_graph。新工作流记 origin.sources：
+代表运行里的值；只有一行的结果每个数值列建一项口径卡指标（cell(nodes.取数, 0, '列')，指标名能从数据目录取到中文名的
+用中文名，取不到用列名）；口径卡的名字用传入的 name，没传用代表问题；报告节点保留，指令在有入口参数时不写代表那一轮的问题
+原文（里面的日期参数化之后就不对了），改写运行时渲染的参数，没有参数时照旧写问题原文；出口契约写 report_from +
+metrics_from（有多行结果的另加 cells: true），过 validate_graph。新工作流记 origin.sources：
 [{run_id, conversation_id, turn_id, question}]，这就是「口径 → 来源问题」的记录。之后由人在画布上审改、按受管级别发布——
 提取器是作者，不是发布者。
 
@@ -64,6 +67,9 @@ DRAFT_NAME = "{question}（固化的口径草稿）"
 DRAFT_DESCRIPTION = ("从问数据的回答固化：报告引用了的 {n} 条查询变成固定的取数，跨轮变化的 {p} 个字面量成为入口参数。"
                      "经人工审核、按受管级别发布后，再问同样的问题就能认出等价、按口径出具")
 REPORT_INSTRUCTIONS = "回答：{question}"
+#: 有入口参数时的报告指令：不写代表那一轮的问题原文——里面的日期（「上周（10月5日到11日）」「九月第一周」）参数化之后
+#: 就不对了；改写这次运行时渲染出来的参数。{params} 是「p1 = {{ input.p1 }}，…」
+REPORT_INSTRUCTIONS_PARAMS = "按取到的数回答这个口径的问题（这次的参数：{params}；时间范围、筛选的取值以参数为准）"
 
 
 class CertifyRefused(Exception):
@@ -228,6 +234,16 @@ async def _frozen(session: Any) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
+def _frozen_of(run_ids: Sequence[str | None], frozen: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """这几次运行固化进了哪些工作流：同一个工作流只列一次（固化时同组的运行都记进 origin.sources，一项里的几次运行常常
+    指着同一个工作流），按先后。"""
+    out: dict[str, dict[str, Any]] = {}
+    for run_id in run_ids:
+        for w in frozen.get(run_id or "", []):
+            out.setdefault(str(w["workflow_id"]), w)
+    return list(out.values())
+
+
 def _turn_view(member: Any) -> dict[str, Any]:
     return {"run_id": member.run_id, "conversation_id": member.conversation_id, "turn_id": member.turn_id,
             "question": member.question}
@@ -308,7 +324,7 @@ async def queue(session: Any, *, principal: Any) -> dict[str, Any]:
             "constants": len(rep.literals) - len(params), "related": related,
             "representative": {"run_id": rep.run_id, "query": rep.artifact},
             "peers": [m.run_id for m in once[1:]],
-            "frozen_into": [w for m in once for w in frozen.get(m.run_id, [])],
+            "frozen_into": _frozen_of([m.run_id for m in once], frozen),
         })
     # 问题聚类
     questions = await recent_questions(session, principal, limit=QUESTION_LIMIT)
@@ -322,7 +338,7 @@ async def queue(session: Any, *, principal: Any) -> dict[str, Any]:
         items.append({"id": iid, "kind": "cluster", "question": seed.text, "count": cluster.count,
                       "turns": [{"run_id": q.run_id, "turn_id": q.turn_id, "question": q.text}
                                 for q in cluster.members[:TURNS_LIMIT]],
-                      "frozen_into": [w for q in cluster.members if q.run_id for w in frozen.get(q.run_id, [])]})
+                      "frozen_into": _frozen_of([q.run_id for q in cluster.members], frozen)})
     items += await _reused(session, runs, turns, dismissed, frozen)
     return {"items": items, "considered": {"runs": len(runs), "matched": len(latest), "questions": len(questions)},
             "threshold": {"runs": REPEAT_RUNS, "conversations": REPEAT_CONVERSATIONS, "exports": EXPORTS},
@@ -367,7 +383,7 @@ async def _reused(session: Any, runs: list[Run], turns: dict[str, dict[str, Any]
         out.append({"id": iid, "kind": "reused", "question": info.get("question") or "", "uses": uses,
                     "turns": [{"run_id": run.id, "conversation_id": info.get("conversation_id"),
                                "turn_id": info.get("turn_id"), "question": info.get("question") or ""}],
-                    "representative": {"run_id": run.id}, "frozen_into": frozen.get(run.id, [])})
+                    "representative": {"run_id": run.id}, "frozen_into": _frozen_of([run.id], frozen)})
     return out
 
 
@@ -383,6 +399,24 @@ async def dismiss(session: Any, iid: str, *, kind: str | None = None, note: str 
 # ==========================================================================
 # 固化成口径草稿
 # ==========================================================================
+
+
+async def _labels(session: Any, snap: dict[str, Any], source: str) -> Any:
+    """结果列的中文名：先看查询当时冻结的数据目录（快照的 schema_artifact，同口径比对），没冻结的（老快照）看数据源现在
+    的目录。只认列名本身就是目录里的一列（SELECT amount、SUM(amount) AS amount）；算出来起的别名（gmv）取不到，调用方
+    照旧用列名。返回 _labeler：(表, 列) → 中文名或 None。"""
+    from app.data import catalog
+    from app.data.sql_semantics import _labeler, catalog_labels
+    from app.db.models import DataSource
+    from app.ledger.match import _frozen as frozen_schema
+
+    _, names = frozen_schema(snap.get("schema_artifact"))
+    if not names:
+        source_id = (await session.execute(select(DataSource.id).where(DataSource.name == source))).scalar()
+        if source_id:
+            entries = await catalog.read_catalog(session, source_id)
+            names = catalog_labels({table: entry.notes for table, entry in entries.items()})
+    return _labeler(names)
 
 
 async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: str = "",
@@ -460,9 +494,10 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
         rows = snap.get("rows") if isinstance(snap.get("rows"), list) else []
         columns = [str(c) for c in snap.get("columns") or []]
         if len(rows) == 1 and isinstance(rows[0], (list, tuple)):
+            label = await _labels(session, snap, shape.source)
             for col, value in zip(columns, rows[0]):
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    metrics.append({"id": f"m{len(metrics) + 1}", "name": col,
+                    metrics.append({"id": f"m{len(metrics) + 1}", "name": label((None, col)) or col,
                                     "expression": f"cell(nodes.{nid(i)}, 0, {col!r})"})
         else:
             multi = True
@@ -473,15 +508,20 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
         found = next((n for n in (run.graph or {}).get("nodes") or [] if n.get("id") == reports[0].node_id), None)
         cfg = ((found or {}).get("data") or {}).get("config") or {}
         report_cfg = {k: cfg[k] for k in ("provider", "model", "entities") if k in cfg}
-    report_cfg["instructions"] = REPORT_INSTRUCTIONS.format(question=question or "（问题）")
+    if fields:
+        report_cfg["instructions"] = REPORT_INSTRUCTIONS_PARAMS.format(
+            params="，".join(f"{f['name']} = {{{{ input.{f['name']} }}}}" for f in fields))
+    else:
+        # 没有入口参数：取数的字面量都是口径的常量，问题原文里的日期和它们对得上
+        report_cfg["instructions"] = REPORT_INSTRUCTIONS.format(question=question or "（问题）")
     # 报告的核对规则一律按受管级别的要求写（engine/governance.REPORT_POLICY，和发布门禁同一份）：草稿要能按受管发布
     report_cfg.update({key: value for key, value, _ in REPORT_POLICY})
     contract: dict[str, Any] = {"report_from": "write"}
     tail: list[dict[str, Any]] = []
     if metrics:
         tail.append({"id": "card", "type": "metrics", "position": {"x": 0, "y": 0},
-                     "data": {"label": "口径卡", "config": {"caliber": (question or "口径")[:40], "caliber_version": "v1",
-                                                         "metrics": metrics}}})
+                     "data": {"label": "口径卡", "config": {"caliber": (name.strip() or question or "口径")[:40],
+                                                         "caliber_version": "v1", "metrics": metrics}}})
         report_cfg["metrics_from"] = ["card"]
         # 受管出具要写必需指标（不然「不予出具」这一档触发不了）：固化出的每个指标都是这个口径要给的数
         contract.update({"metrics_from": "card", "required": [m["id"] for m in metrics]})

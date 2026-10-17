@@ -20,8 +20,8 @@ import {
 } from '../../lib/terms'
 import { STATUS_TONE, StatusChip } from './parts'
 import {
-  PROFILE_MAX_TABLES, PROFILE_RETRYABLE, UNFINISHED_REASONS, coverageText, fillKey, isProfilable, profileBlockOf, profileScopeTables,
-  secondsText, sizeText, spanText,
+  PROFILE_MAX_TABLES, PROFILE_OBSERVE_EVERY_H, PROFILE_RETRYABLE, UNFINISHED_REASONS, coverageText, fillKey, isProfilable, profileBlockOf,
+  profileScopeTables, secondsText, sizeText, spanText,
 } from './profile'
 import type { ProfileBlock } from './profile'
 import { isJobActive } from './draftJob'
@@ -32,16 +32,18 @@ import type { ProfileStartBody } from './profileJob'
 // 数据目录页的「数据剖析」。剖析是服务端的后台任务（profileJob.ts）：这里选范围、看预算、建任务；之后显示页面跟着的
 // 那个任务（进行中的逐表进度、结束后的结果），任务本身的状态在页面上，关掉对话框照常进行。照起草对话框的结构：
 //
-// 开始前：范围（已选 / 当前筛选 / 需要剖析的表（默认）/ 全部表，个数按清单上每行的 profile_due、profile_checks 算）、按表写的
-// 预算和这次最多约几条查询、醒目一句「只读查询、一条一条发、可随时停止」；同一个数据源有起草任务时按钮写「排队剖析」。
+// 开始前：范围（已选 / 当前筛选 / 需要剖析的表（默认）/ 全部表 / 取值观察，个数按清单上每行的 profile_due、profile_checks、
+// 有没有数据目录算；取值观察只观察不剖析，最近观察过的服务端这次不观察，张数是上限）、按表写的预算和这次最多约几条查询、
+// 醒目一句「只读查询、一条一条发、可随时停止」；同一个数据源有起草任务时按钮写「排队剖析」。
 // 进行中：几张 / 共几张、已发几条查询、用时，按表数的真进度条，停止；逐表一行（状态、各类检查的进度、查询数、用时、正在做
 // 哪一项），点一行展开这张表的检查清单、发现和发过的查询。
 // 结束后：汇总（各状态几张、核实了什么）、止损和停止的原因照实写、按「有发现 / 有跳过 / 失败」筛、重试没做完的表；码值的
 // 「填写含义」照旧（填完回到这里，接着下一列）。
-// 开始不了（409）：每种情况一句说法和下一步（未开启就地打开剖析设置；正忙写清是谁的、到哪了，可以去看它的进度）。
+// 开始不了（409）：每种情况一句说法和下一步（未开启就地打开剖析设置；正忙写清是谁的、到哪了，可以去看它的进度；取值观察
+// 挑不出表时说「没有要观察的表」，不给「改选全部表」）。
 // ===========================================================================
 
-type Scope = 'selected' | 'filtered' | 'needed' | 'all'
+type Scope = 'selected' | 'filtered' | 'needed' | 'all' | 'observe'
 type Filter = 'all' | 'findings' | 'skipped' | 'failed'
 const FILTERS: readonly Filter[] = ['all', 'findings', 'skipped', 'failed']
 
@@ -114,6 +116,10 @@ export function ProfileDialog({
       tables: needed, leftOut: 0, body: { scope: 'needed' } })
     const all = profileScopeTables(rows, 'all')
     out.push({ key: 'all', label: PT.scopeAll(all.length), hint: PT.scopeAllHint, tables: all, leftOut: 0, body: { scope: 'all' } })
+    const watched = profileScopeTables(rows, 'observe')
+    out.push({ key: 'observe', label: PT.scopeObserve(watched.length),
+      hint: watched.length ? PT.scopeObserveHint(PROFILE_OBSERVE_EVERY_H) : PT.scopeObserveNone, tables: watched, leftOut: 0,
+      body: { scope: 'observe' } })
     return out
   }, [rows, visible, selected, filtered])
   const [scope, setScope] = useState<Scope>(() => {
@@ -260,8 +266,9 @@ export function ProfileDialog({
           <div className="space-y-1.5" role="radiogroup" aria-label={PT.scope}>
             {scopes.map((s) => {
               const over = !!s.body.tables && s.tables.length > PROFILE_MAX_TABLES
-              const note = over ? PT.scopeTooMany(PROFILE_MAX_TABLES) : !s.tables.length && s.key !== 'needed' ? PT.scopeEmpty
-                : s.leftOut ? PT.scopeLeftOut(s.leftOut) : s.hint
+              const note = over ? PT.scopeTooMany(PROFILE_MAX_TABLES)
+                : !s.tables.length && s.key !== 'needed' && s.key !== 'observe' ? PT.scopeEmpty
+                  : s.leftOut ? PT.scopeLeftOut(s.leftOut) : s.hint
               return (
                 <label key={s.key} className={clsx('flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 text-xs',
                   picked.key === s.key ? 'border-[var(--accent)] bg-accent-soft' : 'hover:bg-hover')} data-profile-scope={s.key}
@@ -307,7 +314,8 @@ export function ProfileDialog({
       </>
     )
   } else if (phase === 'blocked' && blocked) {
-    body = <Blocked blocked={blocked} onSettings={onSettings} onGoSource={onGoSource} onViewActive={() => void viewActive()}
+    body = <Blocked blocked={blocked} observing={blocked.body.scope === 'observe'} onSettings={onSettings} onGoSource={onGoSource}
+                    onViewActive={() => void viewActive()}
                     onChooseAll={() => { setScope('all'); void begin({ scope: 'all' }) }} onRetry={() => void begin(blocked.body)} />
     footer = (
       <>
@@ -384,32 +392,35 @@ function Budget({ settings: s, sourceName, tables, onSettings }: {
 }
 
 /** 开始不了（409）：是哪种情况、服务端的原话、下一步和对应的按钮 */
-function Blocked({ blocked: b, onSettings, onGoSource, onViewActive, onChooseAll, onRetry }: {
+function Blocked({ blocked: b, observing, onSettings, onGoSource, onViewActive, onChooseAll, onRetry }: {
   blocked: { kind: ProfileBlock; message: string; active: CatalogProfileJob | null }
+  /** 选的是取值观察：挑不出表时说「没有要观察的表」，不给「改选全部表」（那是剖析，不是观察） */
+  observing: boolean
   onSettings: () => void
   onGoSource: () => void
   onViewActive: () => void
   onChooseAll: () => void
   onRetry: () => void
 }) {
+  const nothingObserve = observing && b.kind === 'nothing'
   const action = b.kind === 'disabled'
     ? <button type="button" className="btn btn-sm btn-primary" onClick={onSettings} data-profile-enable="">{PT.enable}</button>
     : b.kind === 'busy'
       ? <button type="button" className="btn btn-sm btn-primary" onClick={onViewActive} data-profile-view-active="">{PT.viewActive}</button>
       : b.kind === 'nothing'
-        ? <button type="button" className="btn btn-sm" onClick={onChooseAll} data-profile-choose-all="">{PT.chooseAll}</button>
+        ? (observing ? null : <button type="button" className="btn btn-sm" onClick={onChooseAll} data-profile-choose-all="">{PT.chooseAll}</button>)
         : b.kind === 'other'
           ? <button type="button" className="btn btn-sm" onClick={onRetry} data-profile-retry-start="">{PT.retryStart}</button>
           : <button type="button" className="btn btn-sm" onClick={onGoSource} data-profile-go-source="">{PT.goSource}</button>
   return (
     <Notice tone={b.kind === 'busy' || b.kind === 'nothing' ? 'info' : 'warn'} attr={{ 'data-profile-blocked': b.kind }}>
-      <p className="font-medium">{PT.blocked[b.kind]}</p>
+      <p className="font-medium">{PT.blocked[nothingObserve ? 'nothingObserve' : b.kind]}</p>
       <p className="mt-0.5 break-words text-dim">{b.message}</p>
       {b.kind === 'busy' && b.active && (
         <p className="tnum mt-0.5 text-dim" data-profile-busy-at="">{PT.busyAt(b.active.created_by, b.active.done, b.active.total)}</p>
       )}
-      <p className="mt-0.5 text-dim">{PT.blockedNext[b.kind]}</p>
-      <div className="mt-2">{action}</div>
+      <p className="mt-0.5 text-dim">{PT.blockedNext[nothingObserve ? 'nothingObserve' : b.kind]}</p>
+      {action && <div className="mt-2">{action}</div>}
     </Notice>
   )
 }

@@ -825,6 +825,33 @@ async def absent_reasons(session: AsyncSession, row: Any, names: Iterable[str]) 
     return out
 
 
+#: 表结构里没有的表给人看的一句（接口的 404、批量审阅逐条的错误）：和界面的 CATALOG_ABSENT_TEXT、/schema 的说法
+#: （schema_view.absent_detail，给模型看）同一套「不在」。{table} 是点名的表
+ABSENT_MESSAGE = {
+    ABSENT_REMOVED: "数据源中已经没有表 {table}（已删除或改名）",
+    ABSENT_MISSING: "数据源中没有表 {table}（全库的对象清单里也没有）",
+    ABSENT_OUT_OF_SCOPE: ("表 {table} 在探查范围外：对象索引里有它，但没有读取结构。在数据源卡片的「探查范围」里加入它，"
+                          "或在数据目录的搜索框搜索它并「加入范围」"),
+    ABSENT_REFLECT_FAILED: "表 {table} 在探查范围内，但上次探查读不到它的结构（权限不够或对象有问题），修好后重新探查即可",
+    ABSENT_UNKNOWN: ("表 {table} 不在已探查的表里：升级前的探查只取了一部分表，无法判断它是否还在，请回到数据源卡片重新"
+                     "「探查结构」"),
+}
+#: 说不出是哪一种「不在」时（上传表格、记录表按版本走；没有对象索引、又没截断过的老缓存认不出名字是不是从来就没有）
+ABSENT_PLAIN = "数据源中没有表 {table}"
+
+
+async def absent_message(session: AsyncSession, row: Any, table: str) -> str:
+    """点名的表不在表结构里时给人看的一句（ABSENT_MESSAGE）。手工接入的源按 absent_reasons 说是哪一种；上传表格、记录表
+    的结构随版本走，只说没有（目录清单把它们记成 removed，是说「那一版里没有」，点名一个从来没有过的名字时说不得「已删除」）；
+    没有对象索引的老缓存同理：absent_reasons 对没截断的一律记 removed，名字写错了也会这样，只说没有。"""
+    if (getattr(row, "origin", None) or "manual") != "manual":
+        return ABSENT_PLAIN.format(table=table)
+    reason = (await absent_reasons(session, row, [table])).get(table)
+    if reason == ABSENT_REMOVED and not await has_index(session, row.id, index_schema(row)):
+        reason = None
+    return ABSENT_MESSAGE.get(reason or "", ABSENT_PLAIN).format(table=table)
+
+
 @dataclass(frozen=True)
 class OutsideObject:
     """对象索引里在、范围外的一个对象（助手检索、目录搜索用）。"""
@@ -1039,7 +1066,8 @@ async def delete_index(session: AsyncSession, source_id: str) -> None:
 
 
 __all__ = [
-    "ABSENT_MISSING", "ABSENT_OUT_OF_SCOPE", "ABSENT_REFLECT_FAILED", "ABSENT_REMOVED", "ABSENT_UNKNOWN", "ADD_LIMIT", "AddOutcome",
+    "ABSENT_MESSAGE", "ABSENT_MISSING", "ABSENT_OUT_OF_SCOPE", "ABSENT_PLAIN", "ABSENT_REFLECT_FAILED",
+    "ABSENT_REMOVED", "ABSENT_UNKNOWN", "ADD_LIMIT", "AddOutcome", "absent_message",
     "INDEX_LIMIT", "IndexResult", "IndexedObject", "OutsideObject", "REFLECT_BATCH", "RULES_MAX", "Reflected",
     "RefreshStats", "SCOPE_DEFAULT", "SCOPE_MAX", "SCOPE_OPTION", "SCOPE_REASONS", "ScopePlan", "ScopeRules", "Trail",
     "VIA_CATALOG", "VIA_LOOK", "VIA_SCHEMA_TOOL", "absent_reasons", "add_to_scope", "apply_scope",

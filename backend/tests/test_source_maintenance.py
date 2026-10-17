@@ -111,6 +111,32 @@ async def test_fire_builds_introspect_then_profile_in_order(client, tmp_path, ma
         await drop_source(sid)
 
 
+async def test_observing_again_within_the_window_records_why_in_the_fire(client, tmp_path, made):
+    """只选取值观察：12 小时内观察过的表不再观察，任务以 0 张表结束。建任务时就判断得出（这次没有探查、也没排在起草后面，
+    开始时表结构、目录不会变）：原因记进触发记录的 inputs.skipped 和 reason（下一轮验收：以前只在剖析任务的提醒里）。
+    任务照建（触发照旧是 started，不当成没能发起）。"""
+    sid = await _source(client, tmp_path / "c.db")
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(DataSource, sid)
+            row.options = sm.with_steps(row.options, ["observe"], actor="测试员")
+            await session.commit()
+        schedule_id = await _schedule(sid)
+        made.append(schedule_id)
+        at = utcnow().replace(microsecond=0)
+        first = await service.fire_once(schedule_id, at, "manual")
+        assert first.status == "started" and not first.inputs.get("skipped"), first.inputs
+        await _wait_jobs(first)
+        second = await service.fire_once(schedule_id, at + timedelta(seconds=1), "manual")
+        await _wait_jobs(second)
+        assert second.status == "started" and [j["tables"] for j in second.inputs["jobs"]] == [0]
+        [skipped] = second.inputs["skipped"]
+        assert skipped["step"] == "observe" and "12 小时内都观察过" in skipped["reason"], skipped
+        assert "取值观察没有执行" in second.reason
+    finally:
+        await drop_source(sid)
+
+
 async def test_profile_off_records_steps_not_run_and_still_introspects(client, tmp_path, made):
     sid = await _source(client, tmp_path / "b.db", profile=False)
     try:

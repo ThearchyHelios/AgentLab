@@ -145,7 +145,7 @@ def test_profile_sql_passes_readonly_guard_on_every_dialect(kind):
             d.value_counts_sql(tbl, col, 21, scan_cap=100_000),
             d.min_max_sql(tbl, [(col, False)]),
             d.min_max_sql(tbl, [(col, True)]),
-            d.day_volume_sql(tbl, col, "2026-08-01"),
+            d.day_volume_sql(tbl, col, "2026-08-01", "2026-09-04"),
             d.window_value_counts_sql(tbl, col, col, "2026-08-01", 21),
         ]
         sampled = d.sample_value_counts_sql(tbl, col, 1, 21)

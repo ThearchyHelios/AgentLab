@@ -421,7 +421,9 @@ function dueOf(state, src, t) {
 }
 /** 范围 needed / all：服务端的口径（有待核实关系的在前，这里按使用次数，同清单顺序） */
 const scopeTables = (state, src, scope) => state.tables[src].filter((t) => !t.missing).sort((a, b) => b.usage - a.usage)
-  .filter((t) => (scope === 'all' ? checksOf(t) > 0 && !t.is_view : dueOf(state, src, t) != null)).map((t) => t.name)
+  .filter((t) => (scope === 'all' ? checksOf(t) > 0 && !t.is_view
+    // 取值观察：有数据目录、不是视图的表；state.observedRecently 时都算最近观察过（服务端 12 小时内不再观察）
+    : scope === 'observe' ? !!t.notes && !t.is_view && !state.observedRecently : dueOf(state, src, t) != null)).map((t) => t.name)
 
 // ---------------------------------------------------------------------------
 // 假服务端的起草任务：只做排队要用的部分（建、取、停），起草本身不推
@@ -560,6 +562,10 @@ function handlers(state, replies = {}) {
       if ((body?.tables?.length ?? 0) > 500) return json({ detail: '一次最多剖析 500 张表' }, 422)(route)
       const tables = body?.tables?.length ? [...new Set(body.tables)] : scopeTables(state, src, body?.scope ?? 'needed')
       if (!tables.length) {
+        if (body?.scope === 'observe') {
+          return json({ detail: '没有要观察的表：取值观察只看有数据目录的表，这些表最近 12 小时内都观察过了（或者还没有数据目录）',
+            code: 'profile_nothing' }, 409)(route)
+        }
         return json({ detail: '按「需要剖析的表」挑出 0 张表：表都剖析过、上次都做完了，也没有新的待核实关联关系。可以改选「全部表」，或指定要剖析的表',
           code: 'profile_nothing' }, 409)(route)
       }
@@ -793,10 +799,14 @@ await section('剖析 · 开始前：范围、个数与预算', async () => {
   check('页头写「数据剖析」', (await head(page).getAttribute('aria-label')) === '数据剖析' && (await head(page).getAttribute('data-catalog-profile')) === '')
   await openDialog(page)
   const scopes = await box(page).locator('[data-profile-scope]').evaluateAll((els) => els.map((e) => `${e.getAttribute('data-profile-scope')}:${e.getAttribute('data-count')}`))
+  const observeText = await inBox(page, '[data-profile-scope="observe"]')
   // 需要剖析：从没剖析过的订单、空日志表；上次没做完的访问记录、退款；剖析后有新关系的商品。全部：再加上客户，不含视图、
   // 没有可剖析项的配置表、只剩目录的旧表
-  check('没选表、没筛选：范围是「需要剖析的 5 张表」（默认）和「全部 6 张表」', scopes.join(',') === 'needed:5,all:6'
+  check('没选表、没筛选：范围是「需要剖析的 5 张表」（默认）、「全部 6 张表」和「取值观察：有数据目录的 1 张表」',
+    scopes.join(',') === 'needed:5,all:6,observe:1'
         && await box(page).locator('[data-profile-scope="needed"] input').isChecked(), scopes.join(','))
+  check('……取值观察写明只观察不剖析、看哪几样、最近 12 小时内观察过的不再观察', ['取值观察：有数据目录的 1 张表', '只观察、不剖析',
+    '码值分布、最新业务日期、按日行数和行数', '最近 12 小时内观察过的表这次不再观察'].every((x) => observeText.includes(x)), observeText)
   check('……写明需要剖析的口径（含上次是空表的不算）、全部不含视图', (await inBox(page, '[data-profile-scope="needed"]')).includes('从没剖析过、上次没做完，或剖析之后又出现了待核实关联关系、要取码值或日期范围的列的表。上次是空表的不算')
         && (await inBox(page, '[data-profile-scope="all"]')).includes('不含视图'))
   const budget = await inBox(page, '[data-profile-budget]')
@@ -835,6 +845,43 @@ await section('剖析 · 开始前：范围、个数与预算', async () => {
   check('有筛选：多一项「当前筛选结果中的 N 张表」', await box(page).locator('[data-profile-scope="filtered"]').count() === 1
         && (await inBox(page, '[data-profile-scope="filtered"]')).startsWith('当前筛选结果中的 1 张表'), await inBox(page, '[data-profile-scope="filtered"]'))
   check('没有调用旧的同步剖析接口', count(sent, /catalog\/profile$/) === 0)
+  check('没有原生对话框', natives.length === 0, natives.join(' | '))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('剖析 · 取值观察：范围、请求与挑不出表', async () => {
+  // 取值观察以前只能经定时维护触发（下一轮验收）：对话框的范围里多一项「取值观察」，建任务带 scope: observe；
+  // 有数据目录的表都在 12 小时内观察过时服务端 409 profile_nothing，说「没有要观察的表」，不给「改选全部表」（那是剖析）
+  const state = freshState()
+  const { page, sent, errors, natives, close } = await open(`/data/catalog/${S1}`, { handlers: handlers(state) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  await openDialog(page)
+  await box(page).locator('[data-profile-scope="observe"]').click()
+  check('选取值观察：预算按 1 张表估', (await inBox(page, '[data-profile-budget-total]')).startsWith('这次 1 张表'),
+    await inBox(page, '[data-profile-budget-total]'))
+  await page.locator('[data-profile-start]').click()
+  check('开始：建任务的请求带「取值观察」范围', await until(async () => (await phase(page)) === 'running')
+        && JSON.stringify(lastBody(sent, /profile-jobs$/)) === JSON.stringify({ scope: 'observe' }), JSON.stringify(lastBody(sent, /profile-jobs$/)))
+  const job = state.pjobs.at(-1)
+  check('……任务的范围是 observe、只含有数据目录的订单表', job.scope === 'observe' && job.tasks.map((t) => t.table_name).join(',') === 'orders',
+    `${job.scope} ${job.tasks.map((t) => t.table_name).join(',')}`)
+  for (const t of job.tasks) settle(state, job, t.table_name, { queries: 4, elapsed_ms: 2000 })
+  finish(job)
+  check('……观察完：对话框显示结束后的结果', await until(async () => (await phase(page)) === 'done'), await phase(page))
+  await page.keyboard.press('Escape')
+  await until(async () => (await box(page).count()) === 0)
+
+  // 都在 12 小时内观察过：开始不了，说「没有要观察的表」，没有「改选全部表」
+  state.observedRecently = true
+  await openDialog(page)
+  await box(page).locator('[data-profile-scope="observe"]').click()
+  await page.locator('[data-profile-start]').click()
+  check('挑不出表：说「没有要观察的表」和服务端的原话（12 小时内都观察过）', await until(async () => (await inBox(page, '[data-profile-blocked]')).startsWith('没有要观察的表'))
+        && (await inBox(page, '[data-profile-blocked]')).includes('最近 12 小时内都观察过了'), await inBox(page, '[data-profile-blocked]'))
+  check('……不给「改选全部表」（那是剖析，不是观察），可以回到上一步', await box(page).locator('[data-profile-choose-all]').count() === 0
+        && await page.locator('[data-profile-back]').count() === 1)
+  check('写请求只有建任务', writes(sent, /./).every((s) => /profile-jobs$/.test(s.key)), JSON.stringify(writes(sent, /./).map((s) => s.key)))
   check('没有原生对话框', natives.length === 0, natives.join(' | '))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()

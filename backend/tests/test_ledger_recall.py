@@ -464,9 +464,55 @@ async def test_recall_notification_has_no_numbers(monkeypatch):
     text = mine[0]["title"] + "".join(f"{k}{v}" for k, v in mine[0]["lines"])
     for number in ("170.5", "208.5", "38.0", "38.00"):
         assert number not in text, f"消息里不放数：{number}"
-    assert dict(mine[0]["lines"]) == {"状态": "待处理", "口径": "「周销售」", "版本": "v1 → v2", "答案": "1 个",
+    assert dict(mine[0]["lines"]) == {"状态": "待处理", "口径": "「周销售」", "版本": "v1 → v2", "答案": "问数回答 1 个",
                                       "召回": dict(mine[0]["lines"])["召回"]}
     assert "周销售" in mine[0]["title"] and "v2" in mine[0]["title"]
+
+
+async def test_recall_message_counts_answers_by_kind(monkeypatch):
+    """召回消息按种类分开写条数：一个问数回答、一次正式运行写「问数回答 1 个、正式运行 1 个」（下一轮验收：以前写「答案：2 个」，
+    读的人以为是两个问数回答）。只写条数，照旧不放数。"""
+    from app.core.crypto import encrypt
+    from app.db.models import NotifyChannel
+    from app.engine.launch import launch_run
+    from app.notify import service
+
+    sent: list[dict] = []
+
+    async def capture(channel, message):
+        sent.append({"channel": channel.name, **message})
+        from app.notify.core import Outcome
+
+        return Outcome(True, 200, 1, None)
+
+    monkeypatch.setattr("app.notify.send", capture)
+    async with SessionLocal() as session:
+        row = NotifyChannel(name="召回-按种类", scope="global", url=encrypt("https://hooks.example.com/recall-kinds"),
+                            events=["ledger.recall"])
+        session.add(row)
+        await session.commit()
+        channel_id = row.id
+    try:
+        wf = await S.publish()
+        await answer(monkeypatch)
+        S.script(monkeypatch, "本周销售额 [[m:gmv]]。")
+        async with SessionLocal() as session:
+            formal = await launch_run(session, workflow_id=wf, run_class="formal", version=1, input_payload=WEEK1,
+                                      actor="analyst")
+        assert (await S.wait(formal.id)).status == "succeeded"
+        await publish_v2(wf)
+        await run_recall(wf)
+        await service.drain()
+    finally:
+        async with SessionLocal() as session:
+            await session.delete(await session.get(NotifyChannel, channel_id))
+            await session.commit()
+    mine = [m for m in sent if m["channel"] == "召回-按种类"]
+    assert mine, sent
+    answers = [v for m in mine for k, v in m["lines"] if k == "答案"]
+    assert "问数回答 1 个、正式运行 1 个" in answers, answers
+    for number in ("170.5", "208.5", "38.0"):
+        assert all(number not in v for m in mine for _, v in m["lines"]), "消息里不放数"
 
 
 async def test_recall_pushes_the_shared_channel_once_per_recall_run(monkeypatch):
@@ -522,12 +568,12 @@ async def test_recall_pushes_the_shared_channel_once_per_recall_run(monkeypatch)
     team = [m for m in sent if m["channel"] == "团队-召回"]
     assert [m["event"] for m in team] == ["ledger.recall"], [m["event"] for m in team]
     lines = dict(team[0]["lines"])
-    assert lines["答案"] == "2 个" and lines["待办"] == "2 条", lines
+    assert lines["答案"] == "问数回答 2 个" and lines["待办"] == "2 条", lines
     assert [label for label, _ in team[0]["links"]] == ["去待办箱"] or team[0]["links"] == []
     assert [m["event"] for m in sent if m["channel"] == "团队-待办"] == ["task.opened"], "只订阅了新待办的团队渠道也只收一条"
     for name in ("analyst_a", "analyst_b"):
         mine = [m for m in sent if m["channel"] == f"个人-{name}"]
-        assert [m["event"] for m in mine] == ["ledger.recall"] and dict(mine[0]["lines"])["答案"] == "1 个", mine
+        assert [m["event"] for m in mine] == ["ledger.recall"] and dict(mine[0]["lines"])["答案"] == "问数回答 1 个", mine
     # 账本接口里的召回待办只列看的这个人手上的：第一个答案的主人看得到自己那条，另一个主人看不到
     from app.api.deps import Principal
 

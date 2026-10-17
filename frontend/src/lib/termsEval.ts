@@ -411,7 +411,8 @@ export const EVAL_TEXT = {
     traced: '可追溯准确率',
     tracedHint: '必需的期望全部经引用对上（答案里的数点得开、来自查询的那一格或口径卡的指标）',
     verdicts: '结论',
-    notRun: (n: number) => `${formatNumber(n)} 项没评（停下、出错、到了上限）`,
+    notRun: (n: number) => `${formatNumber(n)} 项没评（停止、中断，或者到了上限、止损之后没开评）`,
+    errors: (n: number) => `${formatNumber(n)} 项出错`,
     cost: '花费',
     costHint: '助手（建图、挑表、复核）+ 写作（答案运行里的模型调用）+ 结论裁判；算期望不调模型',
     perCase: (v: string) => `每题约 ${v}`,
@@ -473,6 +474,8 @@ export const EVAL_TEXT = {
     cleaned: '明细已清理',
     seq: '题',
     question: '问法',
+    /** 逐题表里实际问的问题下面一行：题目原文和实际问的不同（带变量的模板，或者题目之后改过）时写原文 */
+    questionTemplate: (text: string) => `题目原文：${text}`,
     verdict: '结论',
     expected: '期望',
     got: '答案里的数',

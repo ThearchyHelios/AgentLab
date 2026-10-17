@@ -186,6 +186,35 @@ async def test_the_api_carries_end_reason_and_refuses_to_continue_a_rejected_run
     assert stop.status_code == 409 and "被驳回" in stop.json()["detail"]
 
 
+async def test_resume_on_a_rejected_run_says_rejected_with_the_same_code(client):
+    """对被驳回的运行调 /resume：照 end_reason 说「被驳回」，和 /continue 同一个错误码 run_rejected（下一轮验收：以前说
+    「这次运行已取消…已取消的运行请重新发起」）。手动停止的照旧说已取消；存量的 failed + 驳回也说被驳回，不再叫人点
+    「继续运行」。"""
+    run_id = await _rejected_run("approve")
+    await _wait(run_id, ("cancelled",))
+    r = await client.post(f"/api/runs/{run_id}/resume", json={"response": {"approved": True}})
+    assert r.status_code == 409 and r.json()["code"] == "run_rejected", r.text
+    assert "被驳回" in r.json()["detail"] and "已取消" not in r.json()["detail"]
+    async with SessionLocal() as session:
+        stopped = Run(workflow_name="停掉的", status="cancelled", end_reason="stopped", graph=chain(START, OUT), input={})
+        old = Run(workflow_name="老的驳回", status="failed", graph=chain(START, GATES["approve"][0], OUT), input={},
+                  error="人工驳回：不对", error_node_id="gate")
+        session.add_all([stopped, old])
+        await session.flush()
+        session.add_all([
+            RunEvent(run_id=old.id, seq=1, type="node.failed", node_id="gate", ts=1.0, data={"error": "人工驳回：不对"}),
+            Task(run_id=old.id, node_id="gate", kind="approve", title="可以吗", status="resolved",
+                 outcome={"decision": "reject"}),
+        ])
+        await session.commit()
+        stopped_id, old_id = stopped.id, old.id
+    other = await client.post(f"/api/runs/{stopped_id}/resume", json={"response": {"approved": True}})
+    assert other.status_code == 409 and other.json().get("code") != "run_rejected" and "已取消" in other.json()["detail"]
+    legacy = await client.post(f"/api/runs/{old_id}/resume", json={"response": {"approved": True}})
+    assert legacy.status_code == 409 and legacy.json()["code"] == "run_rejected", legacy.text
+    assert "继续运行" not in legacy.json()["detail"].replace("不能继续运行", "")
+
+
 async def test_a_legacy_failed_rejection_cannot_be_continued_either(client):
     """加 end_reason 之前被驳回的运行记的是 failed（封存不改写）：失败的那一步上最近一条处理完的待办是驳回，也不许接着跑。
     别的失败照旧能接着跑（这里断点不在，说的是没有断点，不是被驳回）。"""

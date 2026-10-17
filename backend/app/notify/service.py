@@ -342,6 +342,18 @@ async def notify_task(task_id: str, event: str, *, users: list[str], exclude: fr
                        task_id=task_id)
 
 
+def _answers_text(uses: list[dict[str, Any]]) -> str:
+    """召回消息里「答案」那一行：按种类分开写条数（「问数回答 1 个、正式运行 1 个」，种类的叫法同版本用量 ledger.uses.KIND_TEXT），
+    只写条数、不放数。以前合成一个「2 个」，一个问数回答加一次正式运行读起来像两个问数回答。一个都没有写「0 个」。"""
+    from collections import Counter
+
+    from app.ledger.uses import KIND_TEXT, KINDS
+
+    counts = Counter(str(u.get("kind") or "") for u in uses)
+    order = [k for k in KINDS if counts.get(k)] + sorted(k for k in counts if k not in KINDS)
+    return "、".join(f"{KIND_TEXT.get(k, k or '答案')} {counts[k]} 个" for k in order) or "0 个"
+
+
 async def notify_recall(task_id: str, users: list[str]) -> int:
     """口径召回的待办开出来了（app/ledger/recall）：口径升版、数真变了的那一种推 ledger.recall——订阅了它的全局渠道、答案主人
     自己的个人渠道；然后照别的待办推 task.opened（已经推过 ledger.recall 的渠道不再推，同一个渠道只推一次）。目录、表结构变了
@@ -352,8 +364,9 @@ async def notify_recall(task_id: str, users: list[str]) -> int:
     答案、待办按这一批汇总，链到待办箱（各人在那里看到派给自己的那条）；别的几条连 task.opened 也不再推全局渠道。个人渠道
     照旧每个主人各一条，只数他的答案、链到他的那条待办。
 
-    消息照模块说明的规矩（X6）：口径名（搭建时起的工作流名）、新旧版本号、几个答案（几条待办）、召回编号、去处理的链接；不放
-    旧口径的值、新口径的值、差值和原答案的值。返回推了几个渠道。"""
+    消息照模块说明的规矩（X6）：口径名（搭建时起的工作流名）、新旧版本号、几个答案（按种类分开写条数：问数回答几个、正式运行
+    几个……，见 _answers_text；几条待办）、召回编号、去处理的链接；不放旧口径的值、新口径的值、差值和原答案的值。返回推了几个
+    渠道。"""
     from app.ledger import recall
 
     try:
@@ -387,13 +400,13 @@ async def notify_recall(task_id: str, users: list[str]) -> int:
         head = [("状态", "待处理"), ("口径", f"「{name[:80]}」"),
                 ("版本", f"v{origin.get('from_version')} → v{origin.get('to_version')}")]
         tail = [("召回", f"#{task.run_id[:6]}")]
-        mine = len(recall._uses_of(origin, recall._owner_of_key(key)))
-        everyone = len(recall._uses_of(origin, ("anyone", "")))
+        mine = _answers_text(recall._uses_of(origin, recall._owner_of_key(key)))
+        everyone = _answers_text(recall._uses_of(origin, ("anyone", "")))
 
-        def message(answers: int, tasks: int, link: tuple[str, str] | None) -> dict[str, Any]:
+        def message(answers: str, tasks: int, link: tuple[str, str] | None) -> dict[str, Any]:
             return {"event": event, "status": "pending", "ok": False,
                     "title": recall.CHANGED_TITLE.format(name=name[:80] or "口径", version=origin.get("to_version")),
-                    "lines": [*head, ("答案", f"{answers} 个"), *([("待办", f"{tasks} 条")] if tasks > 1 else []), *tail],
+                    "lines": [*head, ("答案", answers), *([("待办", f"{tasks} 条")] if tasks > 1 else []), *tail],
                     "links": [link] if base and link else [],
                     "subject": {"task_id": task_id, "run_id": task.run_id, "workflow_id": origin.get("workflow_id")}}
 

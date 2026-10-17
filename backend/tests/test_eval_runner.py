@@ -146,10 +146,14 @@ async def test_stop_then_retry_only_the_unfinished(monkeypatch):
     await asyncio.sleep(0.1)
     assert await runner.stop(run.id)
     row = await get(run.id)
-    assert row.status == "cancelled" and row.error == runner.STOPPED
+    # 停止是「停下」不是「出错」：原因记在 stop_reason；没跑的题单独计 not_run，不算进 errors，done 不再等于 total
+    assert row.status == "cancelled" and row.stop_reason == runner.STOPPED and row.error is None
     before = {r.id: (r.status, r.finished_at) for r in await results(run.id)}
     done = [rid for rid, (status, _) in before.items() if status == "ok"]
     assert done and any(status == "cancelled" for status, _ in before.values())
+    assert row.counts["errors"] == 0 and row.counts["done"] == len(done)
+    assert row.counts["not_run"] == 4 - len(done) and row.counts["done"] + row.counts["not_run"] == row.counts["total"]
+    assert row.summary["not_run"] == 4 - len(done) and row.summary["errors"] == 0
     assert not await runner.stop(run.id), "已经结束的停不了"
 
     stub(monkeypatch, delay=0.01)
@@ -175,10 +179,23 @@ async def test_a_restart_marks_unfinished_evaluations_interrupted_and_does_not_r
         run_id = row.id
     assert await runner.startup() >= 1
     row = await get(run_id)
-    assert row.status == "interrupted" and row.error == runner.INTERRUPTED
+    assert row.status == "interrupted" and row.stop_reason == runner.INTERRUPTED and row.error is None
+    assert row.counts["not_run"] == 1 and row.counts["running"] == 0 and row.counts["errors"] == 0, row.counts
     [item] = await results(run_id)
     assert item.status == "cancelled"
     assert not runner.manager.running(run_id), "不自动续跑"
+
+
+async def test_stopping_a_queued_evaluation_counts_everything_as_not_run(monkeypatch):
+    """排队中就停掉（还没开始）：每一题都没跑，stop_reason 写停止，计数跟着重算（以前还是建的时候那份：pending 照旧）。"""
+    stub(monkeypatch)
+    suite_id = await es.make_suite("none", cases=ask_cases(2))
+    monkeypatch.setattr(runner.manager, "start", lambda *_a, **_k: None)  # 不让它开跑：停在排队
+    [run] = await start(suite_id)
+    assert await runner.stop(run.id)
+    row = await get(run.id)
+    assert row.status == "cancelled" and row.stop_reason == runner.STOPPED
+    assert (row.counts["not_run"], row.counts["pending"], row.counts["done"]) == (2, 0, 0), row.counts
 
 
 async def test_the_per_run_cap_stops_new_items(monkeypatch):
@@ -190,6 +207,8 @@ async def test_the_per_run_cap_stops_new_items(monkeypatch):
     items = await results(run.id)
     assert [r.status for r in items] == ["ok", "ok", "skipped"]
     assert row.status == "partial" and row.stop_reason == runner.LIMIT_RUN.format(limit=1.5)
+    assert (row.counts["done"], row.counts["not_run"], row.counts["errors"], row.counts["skipped"]) == (2, 1, 0, 0), \
+        "到了上限没开评的是没跑，不是跳过（跳过是评了、但期望算不出、不评分）"
     assert "金额上限" in items[2].error and row.summary["cost_usd"] == 2.0
 
 
@@ -326,6 +345,44 @@ async def test_the_api_starts_estimates_and_reports_progress(client, monkeypatch
     assert second["estimate"]["basis"] == ev["id"], "第二次按上一次的每题平均花费估"
     bad = await client.post(f"/api/evals/suites/{suite_id}/evaluations", json={"variant": {"catalog": "nope"}})
     assert bad.status_code == 422 and bad.json()["code"] == "eval_variant_invalid"
+
+
+async def test_results_give_the_question_actually_asked_and_the_template_apart(client, monkeypatch):
+    """逐题结果的 question 是这一题实际问的（变量按这次评测的截至时间渲染好了，和作答时 Driver 收到的一字不差），模板原文
+    另放 question_template（下一轮验收：以前 question 是带 {{ schedule.last_week_start }} 的原始模板）。没有变量的题两个一样。"""
+    from datetime import datetime, timezone
+
+    from app.db.models_eval import EvalCase
+    from app.eval.cases import render, variable_values
+
+    asked: list[str] = []
+    real_init = answer_mod.Driver.__init__
+
+    def init(self, question, **kw):
+        asked.append(question)
+        real_init(self, question, **kw)
+
+    monkeypatch.setattr(answer_mod.Driver, "__init__", init)
+    stub(monkeypatch)
+    template = "{{ schedule.last_week_start }} 到 {{ schedule.last_week_end }} 那周的问题"
+    suite_id = await es.make_suite("none", cases=[{"question": template, "expectations": [{"kind": "ask"}]},
+                                                  {"question": "没有变量的问题", "expectations": [{"kind": "ask"}]}])
+    as_of = datetime(2026, 10, 14, 2, 0, tzinfo=timezone.utc)
+    [run] = await start(suite_id, as_of=as_of)
+    await es.wait_eval(run.id)
+    rows = (await client.get(f"/api/evals/evaluations/{run.id}/results")).json()["results"]
+    expected = render(template, variable_values(as_of, "Asia/Shanghai", None))
+    assert "{{" not in expected and rows[0]["question"] == expected, rows[0]["question"]
+    assert rows[0]["question"] in asked, "和作答时实际问的一样"
+    assert rows[0]["question_template"] == template
+    assert rows[1]["question"] == rows[1]["question_template"] == "没有变量的问题"
+    # 题目改过（指纹对不上）：现在的模板不一定是当时问的，没有作答运行可取时不编一个，question 为空、模板照给
+    async with SessionLocal() as session:
+        case = (await session.execute(select(EvalCase).where(EvalCase.suite_id == suite_id, EvalCase.seq == 1))).scalar_one()
+        case.question, case.case_hash = "改过的 {{ schedule.today }}", "changed"
+        await session.commit()
+    rows = (await client.get(f"/api/evals/evaluations/{run.id}/results")).json()["results"]
+    assert rows[0]["question"] is None and rows[0]["question_template"] == "改过的 {{ schedule.today }}"
 
 
 async def test_eval_settings_group_and_spend_endpoint(client):

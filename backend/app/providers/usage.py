@@ -18,8 +18,10 @@ async generator：with 块跨着 yield 的话，变量在两次 yield 之间留�
 流末尾那一段用量收得到；只有模型在那一行之后还往下写超过 DRAIN_CHARS 字的闲话时才当场关流（不为闲话付钱），连接断了也一样，
 这一次只拿得到已经报了的部分：照样计次数、计已报的 token，记成估不出，不悄悄少算。
 
-模型名按发起调用时的参数取（invocation_params 的 model / model_name，就是接入里配的模型 id，价格目录按它查），取不到再
-看回复里的 model_name。
+模型名按发起调用时的参数取（invocation_params 的 model / model_name，就是接入里配的模型 id，价格目录按它查）；调用参数里
+没有的（以前的演示模型就没报，评测汇总里助手用量的模型因此记成 unknown），看 LangChain 照模型对象给回调的 metadata 里的
+ls_model_name；再取不到看回复里的 model_name，都没有才记 UNKNOWN_MODEL。OpenAI 兼容、Anthropic 的模型在调用参数里就带着
+model，演示模型（providers/mock_model）也把 model_name 报进调用参数。
 """
 from __future__ import annotations
 
@@ -54,6 +56,10 @@ class Meter(BaseCallbackHandler):
     def _started(self, run_id: UUID, serialized: dict[str, Any] | None, kwargs: dict[str, Any]) -> None:
         params = kwargs.get("invocation_params") or {}
         model = params.get("model") or params.get("model_name") or params.get("model_id")
+        if not model:
+            # LangChain 照模型对象给回调的 metadata 里带着 ls_model_name（调用时传的 model，否则对象上的 model /
+            # model_name）：调用参数里不报模型名的模型类也认得出
+            model = (kwargs.get("metadata") or {}).get("ls_model_name")
         if not model and isinstance(serialized, dict):
             model = (serialized.get("kwargs") or {}).get("model") or (serialized.get("kwargs") or {}).get("model_name")
         with self._lock:

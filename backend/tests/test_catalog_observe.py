@@ -228,6 +228,70 @@ async def test_large_table_basis_window_or_first_rows_and_no_cross_basis_compare
         await drop_source(b)
 
 
+async def test_future_business_dates_stay_out_of_the_daily_window(client, tmp_path):
+    """业务日期最晚到明天、今天只写了几行：按日行数的查询只数到今天（上界，今天以后的不算），不记量跌。以前窗口只有下界，
+    明天那一天也进了窗口，比较器再退一天就退到今天这个不完整的日子上，记出一条量跌（下一轮验收）。"""
+    path = tmp_path / "ahead.db"
+    _build(path, rows=0)
+    db = sqlite3.connect(path)
+    rows = [(TODAY - timedelta(days=d)).isoformat() for d in range(1, 31) for _ in range(30)]
+    rows += [TODAY.isoformat()] * 3 + [(TODAY + timedelta(days=1)).isoformat()] * 30
+    db.executemany("INSERT INTO orders (status, paid_on, amount, secret) VALUES ('paid', ?, 1, 'x')", [(r,) for r in rows])
+    db.commit()
+    db.close()
+    sid = await _make(client, path)
+    try:
+        job_id = await _observe(sid)
+        got = {(o.kind, o.column_name): o for o in await _obs(sid)}
+        days = got[("daily_volume", "paid_on")].data["days"]
+        assert (TODAY + timedelta(days=1)).isoformat() not in days and days[TODAY.isoformat()] == 3
+        assert got[("daily_volume", "paid_on")].data["until"] == TODAY.isoformat()
+        async with SessionLocal() as session:
+            drops = list((await session.execute(select(SourceChange).where(
+                SourceChange.source_id == sid, SourceChange.kind == "volume_drop"))).scalars())
+        assert drops == [], "今天还没写完、明天的日子不是整天：不算量跌"
+        assert all(o.job_id == job_id for o in got.values())
+    finally:
+        await drop_source(sid)
+
+
+def test_observation_today_is_the_server_local_date(monkeypatch):
+    """观察用的「今天」按服务端所在时区（和待办汇总 notify.digest_at 同一个口径）：业务日期是本地日期，UTC 20 点在东八区
+    已经是第二天。"""
+    import time
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+    time.tzset()
+    try:
+        assert observe.local_today(datetime(2026, 10, 17, 20, 0, tzinfo=timezone.utc)) == date(2026, 10, 18)
+        assert observe.local_today(datetime(2026, 10, 17, 15, 0, tzinfo=timezone.utc)) == date(2026, 10, 17)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+async def test_the_profile_jobs_api_takes_the_observe_scope(client, shop):
+    """取值观察以前只能经定时维护触发：POST /catalog/profile-jobs 的 scope 只收 needed、all（下一轮验收）。现在也收 observe：
+    只观察、不剖析；12 小时内都观察过时 409 profile_nothing，说清为什么。"""
+    sid, _ = shop
+    r = await client.post(f"/api/datasources/{sid}/catalog/profile-jobs", json={"scope": "observe"})
+    assert r.status_code == 202, r.text
+    job = r.json()["job"]
+    assert job["scope"] == "observe"
+    await catalog_profile_jobs.manager.wait(job["id"], timeout=60)
+    async with SessionLocal() as session:
+        [task] = (await session.execute(select(CatalogProfileTask).where(
+            CatalogProfileTask.job_id == job["id"]))).scalars()
+    assert {c["kind"] for c in task.checks} == set(observe.OBSERVE_KINDS), "只观察：不做关系、码值、日期的剖析"
+    assert {o.kind for o in await _obs(sid)} == set(observe.OBSERVE_KINDS)
+    again = await client.post(f"/api/datasources/{sid}/catalog/profile-jobs", json={"scope": "observe"})
+    assert again.status_code == 409 and again.json()["code"] == "profile_nothing"
+    assert f"{observe.OBSERVE_EVERY_H} 小时内都观察过" in again.json()["detail"]
+    bad = await client.post(f"/api/datasources/{sid}/catalog/profile-jobs", json={"scope": "maintenance"})
+    assert bad.status_code == 422, "maintenance 是定时维护用的，接口不收"
+
+
 class _FakeCx:
     """只看拼出来的 SQL：大表、业务日期没有索引。"""
 

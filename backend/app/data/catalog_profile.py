@@ -45,7 +45,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
-from datetime import date as _date, datetime, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, NamedTuple
 
@@ -493,17 +493,23 @@ class SqlDialect:
         hi = self.date_literal(VALID_DATE_BEFORE, text=text)
         return f"SELECT MAX({column}) FROM {table} WHERE {column} >= {lo} AND {column} < {hi}"
 
-    def _window(self, column: str, since: Any, text: bool) -> str:
-        """时间窗口的条件：since 起（含），并且早于占位日期 9999-12-31——PostgreSQL 的 infinity、Oracle 的 9999-12-31
-        都大于任何一天，不截掉上端就会在「最近 35 天」里多出一天。"""
+    def _window(self, column: str, since: Any, text: bool, before: Any = None) -> str:
+        """时间窗口的条件：since 起（含），并且早于 before（不含；缺省是占位日期 9999-12-31——PostgreSQL 的 infinity、
+        Oracle 的 9999-12-31 都大于任何一天，不截掉上端就会在「最近 35 天」里多出一天）。"""
         return (f"{column} >= {self.date_literal(since, text=text)} "
-                f"AND {column} < {self.date_literal(VALID_DATE_BEFORE, text=text)}")
+                f"AND {column} < {self.date_literal(before or VALID_DATE_BEFORE, text=text)}")
 
-    def day_volume_sql(self, table: str, column: str, since: Any, *, text: bool = False) -> str:
-        """最近若干天按天计数：since 起（含）每天几行。只在日期列打头有索引时对大表发（走索引的范围扫描）。"""
+    def day_volume_sql(self, table: str, column: str, since: Any, until: Any, *, text: bool = False) -> str:
+        """最近若干天按天计数：since 到 until（都含；until 是观察当天）每天几行。只在日期列打头有索引时对大表发（走索引的
+        范围扫描）。上界是 until 的第二天（不含）：业务日期有未来值（预约、计划类的日期，或者写错的）时，今天以后的日子
+        不进窗口——它们不是「最近的整天」，也不该被当成缺天（data/value_drift）。时间列上「< 第二天」把 until 当天的
+        时分秒都算进来；文字存的日期按字符串比，同样成立。"""
+        last = until if isinstance(until, _date) else _date.fromisoformat(str(until))
+        if isinstance(last, datetime):
+            last = last.date()
         day = self.day_trunc(column)
         return (f"SELECT {day} AS d, COUNT(*) AS n FROM {table} "
-                f"WHERE {self._window(column, since, text)} GROUP BY {day} ORDER BY d")
+                f"WHERE {self._window(column, since, text, last + timedelta(days=1))} GROUP BY {day} ORDER BY d")
 
     def window_value_counts_sql(self, table: str, column: str, date_column: str, since: Any, n: int, *,
                                 text: bool = False) -> str:

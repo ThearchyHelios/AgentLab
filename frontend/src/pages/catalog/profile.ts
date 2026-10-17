@@ -167,9 +167,19 @@ export const isProfilable = (r: Pick<CatalogTableRow, 'in_schema' | 'is_view' | 
 /** 服务端「需要剖析」的口径：能剖析、并且 profile_due（从没剖析过、上次没做完、之后出现了新的待核实关系） */
 export const isProfileDue = (r: CatalogTableRow): boolean => isProfilable(r) && r.profile_due === true
 
-/** 范围的几张表：needed 需要剖析的、all 全部能剖析的（服务端挑表的顺序：有待核实关系的在前，再按使用次数） */
-export function profileScopeTables(rows: CatalogTableRow[], scope: 'needed' | 'all'): string[] {
-  return rows.filter(scope === 'needed' ? isProfileDue : isProfilable).map((r) => r.table_name)
+/** 能不能做取值观察：在表结构里、不是视图、有数据目录（version > 0）。同服务端 _pick_observing 的前两条；观察到期没有
+ * （上一次观察在 PROFILE_OBSERVE_EVERY_H 小时以前）清单里没有，由服务端判 */
+export const isObservable = (r: Pick<CatalogTableRow, 'in_schema' | 'is_view' | 'version'>): boolean =>
+  r.in_schema && !r.is_view && r.version > 0
+
+/** 上一次观察多久以前才再观察（同服务端 catalog_profile_observe.OBSERVE_EVERY_H） */
+export const PROFILE_OBSERVE_EVERY_H = 12
+
+/** 范围的几张表：needed 需要剖析的、all 全部能剖析的（服务端挑表的顺序：有待核实关系的在前，再按使用次数）、observe 有数据
+ * 目录、可以观察的（其中最近观察过的服务端这次不观察，张数是上限） */
+export function profileScopeTables(rows: CatalogTableRow[], scope: 'needed' | 'all' | 'observe'): string[] {
+  const test = scope === 'needed' ? isProfileDue : scope === 'observe' ? isObservable : isProfilable
+  return rows.filter(test).map((r) => r.table_name)
 }
 
 /** 因为运行原因没查成的项（计入 unfinished、使表成为部分完成）；其余跳过的原因是按规则不查 */

@@ -161,13 +161,15 @@ const RESULTS = [
     scores: [{ id: 'e1', kind: 'scalar', required: true, outcome: 'traced', expected: 330, got: 330 }], traced: true, review: null, tier: null,
     judge: null, looks: { model: 1, system: 1 }, calls: 2, timings: { total_ms: 41000 }, usage: {}, sql_match: { status: 'proven', aspects: [] },
     details_artifact: 'd-1', current: null, error: null, started_at: iso(NOW - 2 * H), finished_at: iso(NOW - H), question: CASE_SQL.question,
-    cost: { cost_usd: 0.014, unpriced_calls: 0 } },
+    question_template: CASE_SQL.question, cost: { cost_usd: 0.014, unpriced_calls: 0 } },
   { id: 'r-2', eval_run_id: 'ev-1', seq: 2, case_id: 'case-2', case_seq: 2, case_hash: 'h2', repeat: 0, arm: null, status: 'ok',
     run_id: 'run-answer-2', gold_run_ids: ['run-gold-2'], gold: { status: 'ok' }, path: 'ran', verdict: 'fail',
     scores: [{ id: 'e1', kind: 'scalar', required: true, outcome: 'wrong', expected: 330, got: 310, reason: '答案里的数和期望对不上' }], traced: false,
     review: null, tier: null, judge: null, looks: { model: 1, system: 0 }, calls: 2, timings: { total_ms: 60000 }, usage: {},
     sql_match: { status: 'related', aspects: ['time'] }, details_artifact: 'd-2', current: null, error: '答案里的数和期望对不上',
-    started_at: iso(NOW - 2 * H), finished_at: iso(NOW - H), question: CASE_CAL.question, cost: { cost_usd: 0.02, unpriced_calls: 0 } },
+    started_at: iso(NOW - 2 * H), finished_at: iso(NOW - H), cost: { cost_usd: 0.02, unpriced_calls: 0 },
+    // 带变量的题：question 是实际问的（服务端按这次评测的截至时间渲染好），模板原文另放
+    question: '10 月 5 日到 10 月 11 日的周销售额？', question_template: '{{ schedule.last_week_start }} 到 {{ schedule.last_week_end }} 的周销售额？' },
   { id: 'r-3', eval_run_id: 'ev-1', seq: 3, case_id: 'case-3', case_seq: 3, case_hash: 'h3', repeat: 0, arm: null, status: 'ok',
     run_id: null, gold_run_ids: [], gold: null, path: 'asked', verdict: 'pass', scores: [{ id: 'e1', kind: 'ask', required: true, outcome: 'traced' }],
     traced: true, review: null, tier: null, judge: null, looks: { model: 0, system: 0 }, calls: 1, timings: { total_ms: 9000 }, usage: {},
@@ -254,6 +256,9 @@ function reply(state, method, path, url, body) {
     if (out) return out
   }
   if (path === '/auth/me' && state.me) return { json: state.me }
+  // 「提取模板」去画布之后，画布页给这张图起一段画布对话（POST /conversations）：早晚不定，以前偶尔赶在检查结束前发出去、
+  // 漏到服务端。照 check-ledger 的写法在这里接住，不进写请求的清单（不是评测页发的）
+  if (method === 'POST' && path === '/conversations') return { json: { id: 'cv-eval', kind: body?.kind ?? 'canvas', title: '', turns: [] } }
   if (method === 'GET' && path === '/datasources') return { json: [DS] }
   if (method === 'GET' && path === '/evals/suites') return { json: { suites: state.suites } }
   if (method === 'POST' && path === '/evals/suites') {
@@ -357,7 +362,11 @@ function reply(state, method, path, url, body) {
     }
     if (method === 'POST' && rest === '/stop') {
       write()
-      Object.assign(ev, { status: 'cancelled', running: false, current: [], stop_reason: null,
+      // 服务端（runner._counts、_close）：停下的原因记 stop_reason、不当成出错；没跑的题单独计 not_run，不进 errors，done 不等于 total
+      Object.assign(ev, { status: 'cancelled', running: false, current: [], stop_reason: '评测已停止', error: null,
+        counts: { total: 3, done: 1, not_run: 2, running: 0, pending: 0, passed: 1, failed: 0, ungradable: 0, skipped: 0, errors: 0 },
+        summary: { ...clone(SUMMARY), items: 3, done: 3, verdicts: { pass: 1, fail: 0, ungradable: 0, skipped: 0 }, not_run: 2, errors: 0,
+          accuracy: RATE(1, 1), traced_accuracy: RATE(1, 1) },
         actions: { stop: false, retry: true, rescore: true, pin: false, unpin: false, open: 2, cleaned: false } })
       return { json: ev }
     }
@@ -738,6 +747,11 @@ await section('评测详情：进度、正在做什么、停止和重试、重�
   await page.locator('[data-eval-retry]').waitFor()
   check('停止之后：服务端说能重试，给「重试没做完的」，悬停写几项', (await page.locator('[data-eval-retry]').getAttribute('title')).includes('2 项')
     && writes(state, /\/stop$/).length === 1)
+  check('……停下的原因照服务端写「评测已停止」，不当成出错；没评的 2 项单列，不算出错', await until(async () =>
+    (await page.locator('[data-eval-stop-reason]').count()) === 1)
+    && (await text(page, '[data-eval-stop-reason]')).includes('评测已停止') && await page.locator('[data-eval-error]').count() === 0
+    && (await text(page, '[data-eval-not-run]')).startsWith('2 项没评') && await page.locator('[data-eval-errors]').count() === 0,
+  await text(page, '[data-eval-run-head]'))
   await page.locator('[data-eval-retry]').click()
   await until(() => writes(state, /\/retry$/).length === 1)
   check('重试：发了一次', writes(state, /\/retry$/).length === 1)
@@ -772,6 +786,11 @@ await section('逐题结果、和上一次比、A/B 配对表', async () => {
   check('?case= 打开逐题、定位并展开那道题', await page.locator('[data-eval-result-detail="r-2"]').count() === 1)
   check('逐题：结论、期望和答案里的数、SQL 差在哪', t2.includes('不通过') && t2.includes('330') && t2.includes('310') && t2.includes('时间口径'), t2)
   check('一题的花费照服务端加好的写', (await page.locator('[data-eval-result="r-1"]').innerText()).includes('$0.014'))
+  check('逐题的问法写实际问的（变量渲染好了），模板原文另起一行', await text(page, '[data-eval-result="r-2"] [data-eval-result-question]')
+      === '10 月 5 日到 10 月 11 日的周销售额？'
+    && (await text(page, '[data-eval-result="r-2"] [data-eval-result-template]')).startsWith('题目原文：{{ schedule.last_week_start }}')
+    && await page.locator('[data-eval-result="r-1"] [data-eval-result-template]').count() === 0,
+  await text(page, '[data-eval-result="r-2"] [data-eval-result-question]'))
   check('点开去运行详情', await page.locator('[data-eval-result-detail="r-2"] [data-eval-result-run]').getAttribute('href') === '/runs/run-answer-2')
   await page.locator('[data-eval-result-details]').waitFor()
   check('展开的明细写作答的经过和答案原文（明细工件）', (await text(page, '[data-eval-result-details]')).includes('自动重来了 1 次')

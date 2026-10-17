@@ -180,7 +180,11 @@ async def test_freezing_makes_a_fixed_sql_draft_that_passes_the_governed_gate(cl
                                                           "required": ["m1"]}
     assert {k: nodes["write"]["data"]["config"].get(k) for k in ("numbers", "on_violation", "claims")} == {
         "numbers": "strict", "on_violation": "fail", "claims": "require_citation"}
-    assert nodes["write"]["data"]["config"]["instructions"] == f"回答：{QUESTION}"
+    # 有入口参数：不写代表那一轮的问题原文（「九月第一周」参数化之后就不对了），写运行时渲染的参数
+    instructions = nodes["write"]["data"]["config"]["instructions"]
+    assert QUESTION not in instructions and "2026-09" not in instructions, instructions
+    assert "{{ input.p1 }}" in instructions and "{{ input.p2 }}" in instructions
+    assert nodes["card"]["data"]["config"]["caliber"] == QUESTION, "没传名字：口径卡照旧用代表问题"
     spec = GraphSpec.model_validate(wf.graph)
     assert not [i for i in validate_graph(spec).issues if i.level == "error"]
     assert not [i for i in publish_issues(spec, level="governed") if i.level == "error"], \
@@ -189,9 +193,12 @@ async def test_freezing_makes_a_fixed_sql_draft_that_passes_the_governed_gate(cl
     assert all(s["question"] == QUESTION for s in wf.origin["sources"])
     assert wf.origin["run_id"] == rep_run.id and wf.origin["freeze"] is True
 
-    # 队列上标着已经固化过
-    [again] = shape_items((await client.get("/api/ledger/certify-queue")).json())
-    assert {w["workflow_id"] for w in again["frozen_into"]} == {wf.id}
+    # 队列上标着已经固化过：同一个工作流只列一次（三个来源运行都指着它）
+    body = (await client.get("/api/ledger/certify-queue")).json()
+    [again] = shape_items(body)
+    assert [w["workflow_id"] for w in again["frozen_into"]] == [wf.id]
+    [cluster] = [i for i in body["items"] if i["kind"] == "cluster" and i["question"] == QUESTION]
+    assert [w["workflow_id"] for w in cluster["frozen_into"]] == [wf.id], cluster["frozen_into"]
 
     # 按受管级别发布：来源运行在后台补比，变成等价已证明、出了队
     res = await client.post(f"/api/workflows/{wf.id}/publish", json={"level": "governed"})
@@ -214,6 +221,47 @@ async def test_freezing_makes_a_fixed_sql_draft_that_passes_the_governed_gate(cl
 
     stats = (await client.get("/api/ledger/stats")).json()["e3"]["certify"]
     assert stats["frozen"] >= 1 and stats["published"] >= 1
+
+
+async def test_freezing_uses_the_given_name_and_catalog_labels_and_no_dates_without_parameters(client, monkeypatch):
+    """传了名字：口径卡用它（下一轮验收：以前用代表问题的原文）。指标名能从数据目录取到中文名的用中文名，取不到照旧用
+    列名。没有入口参数（字面量都没变过）时报告指令照旧写问题原文：那时问题里的日期就是口径的常量。"""
+    from app.data import catalog
+    from app.db.models import DataSource
+    from sqlalchemy import select
+
+    async with SessionLocal() as session:
+        source = (await session.execute(select(DataSource).where(DataSource.name == S.CURRENT["source"]))).scalar_one()
+        await catalog.write_entry(session, source.id, "orders", {"columns": {
+            "amount": {"label": catalog.make_item("金额", "human")}}}, if_version=0, actor="测试员")
+    sql = "SELECT SUM(amount) AS amount, COUNT(*) AS n FROM orders WHERE status = 'paid' AND paid_at >= '2026-09-01'"
+    S.script(monkeypatch, "金额 [[v:Q1.r0.amount]]，[[v:Q1.r0.n]] 单。")
+    conv = await conversation()
+    async with SessionLocal() as session:
+        turn = ConversationTurn(conversation_id=conv, question=QUESTION)
+        session.add(turn)
+        await session.commit()
+        turn_id = turn.id
+    run = await run_manager.start(graph=S.explore_graph(sql), input_payload={"question": QUESTION}, origin_kind="chat",
+                                  origin={"conversation_id": conv, "turn_id": turn_id})
+    row = await S.wait(run.id)
+    assert row.status == "succeeded", row.error
+    async with SessionLocal() as session:
+        (await session.get(ConversationTurn, turn_id)).run_id = row.id
+        await session.commit()
+    await ledger_match.drain()
+    res = await client.post("/api/copilot/from-run", json={"run_id": row.id, "freeze": True, "name": "九月销售额口径"})
+    assert res.status_code == 200, res.text
+    made = res.json()
+    assert made["params"] == [] and made["name"] == "九月销售额口径"
+    async with SessionLocal() as session:
+        wf = await session.get(Workflow, made["workflow_id"])
+    nodes = {n["id"]: n for n in wf.graph["nodes"]}
+    card = nodes["card"]["data"]["config"]
+    assert card["caliber"] == "九月销售额口径"
+    assert [(m["name"], m["expression"]) for m in card["metrics"]] == [
+        ("金额", "cell(nodes.fetch, 0, 'amount')"), ("n", "cell(nodes.fetch, 0, 'n')")]
+    assert nodes["write"]["data"]["config"]["instructions"] == f"回答：{QUESTION}"
 
 
 async def test_freezing_needs_a_matched_successful_run(client, monkeypatch):

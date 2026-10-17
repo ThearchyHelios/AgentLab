@@ -221,7 +221,8 @@ function Overview({ run }: { run: EvalRun }) {
       </div>
       <Section title={O.verdicts} attr="verdicts">
         <p>{distText(s.verdicts as Record<string, number>, T.verdict)}</p>
-        {!!s.not_run && <p className="text-dim">{O.notRun(s.not_run)}</p>}
+        {!!s.not_run && <p className="text-dim" data-eval-not-run={s.not_run}>{O.notRun(s.not_run)}</p>}
+        {!!s.errors && <p className="text-dim" data-eval-errors={s.errors}>{O.errors(s.errors)}</p>}
         <p className="text-dim">{O.outcomes}：{distText(s.outcomes as Record<string, number>, T.outcome)}</p>
         {s.text && Object.keys(s.text).length > 0 && <p className="text-dim">{O.text}：{distText(s.text as Record<string, number>, T.textOutcome)}</p>}
       </Section>
@@ -370,7 +371,10 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
                     {r.arm && <div className="text-2xs text-faint">{T.run.arm(r.arm)}</div>}
                   </td>
                   <td className="max-w-xs px-2 py-1.5">
-                    <div className="line-clamp-2 break-words">{r.question ?? '—'}</div>
+                    <div className="line-clamp-2 break-words" data-eval-result-question="">{r.question ?? '—'}</div>
+                    {r.question_template && r.question_template !== r.question && (
+                      <div className="line-clamp-2 break-words text-2xs text-faint" data-eval-result-template="">{R.questionTemplate(r.question_template)}</div>
+                    )}
                     {r.path && <div className="text-2xs text-faint">{R.path}：{T.path[r.path]}</div>}
                   </td>
                   <td className="px-2 py-1.5">
