@@ -8727,7 +8727,366 @@ def _column_map(sql: str, rendered: str, read: str | None, info: _Schema,
     return tuple({"index": i, "ours": a, "caliber": b} for i, (a, b) in enumerate(zip(ours, theirs)))
 
 
+# ==========================================================================
+# 按引用的列投影（next-round 口径账本：整题等价按答案引用的那几列比）
+# ==========================================================================
+#
+# 真实的助手写 SQL 总会多选几列（订单数、日期常量、MIN / MAX、COALESCE……），报告只引用其中一列；口径的取数也只选它的
+# 指标要的那几列。拿整条 SQL 去比永远不等价，「上周的销售额是多少」就永远只标相关口径。这里把最外层 SELECT 列表里没被
+# 引用、去掉也不改变被引用那几列取值的选择项去掉（需要时也调换留下的几项的先后），得到一条改写后的 SQL，交给调用方再走
+# 现有的绑定和判等价（match_template → explain_sql_diff）：投影本身不判等价、不给信任，判等价的那一步一点不放宽。
+#
+# 只在确定去掉不影响时才投影，不然照实给不投影的原因（Projection.refused），调用方照旧整条比：
+# - 整条语句就是一段 SELECT（可以带 WITH）：UNION 这类合并、外面套着括号的不投影——各支的列按位置合并，去掉一支的一列
+#   就错位了；
+# - SELECT 里只有 WITH、选择列表、FROM、JOIN、WHERE、GROUP BY、HAVING、QUALIFY、WINDOW、ORDER BY、LIMIT、OFFSET；
+#   DISTINCT / DISTINCT ON（按整行去重，去掉一列行数就可能变）和别的修饰（提示、INTO、加锁、采样、LATERAL VIEW……）
+#   不投影；
+# - 选择列表里没有 * / t.*（展开之后按位置对不准）；给了查询结果的列数（width）时要和选择列表的项数一样：被引用的列按
+#   位置对上选择项；
+# - ORDER BY / GROUP BY 里没有按位置引用的（ORDER BY 2：去掉、调换之后指到别的列）；
+# - 有 LIMIT / OFFSET 时只投影不分组的聚合（只出一行，取哪一行和选出来的列无关）：别的「取前几行」有并列时取到哪几行
+#   可能跟着选择列表变；
+# - 去掉的每一项：不含认不准会不会改变行数的函数（UNNEST / EXPLODE / generate_series 这类展开成多行的、sqlglot 不认识的
+#   函数）；它的输出名（别名，没有别名的是列名）在整条语句别处（同一段的 WHERE、GROUP BY、HAVING、QUALIFY、ORDER BY、
+#   窗口、别的选择项、子查询）一次都没有被不带表名地写到——SQLite 的 WHERE、GROUP BY 都认列别名，和表列同名的也算，
+#   宁可不投影；不是常量的话，同样的写法没有出现在 GROUP BY、HAVING、ORDER BY、QUALIFY、窗口里（「出现在 GROUP BY 里」
+#   「被 HAVING 用到」都在这一条）；
+# - 去掉之后这一段聚不聚合不变：没有 GROUP BY、HAVING 时去掉的不能是仅有的聚合（剩下的列就不止一行了）；留下的列里没有
+#   既不在聚合里、也不是分组键的列（SQLite 取 MAX 那一行的值、MySQL 取任意一行：去掉别的聚合可能换了取值的那一行）；
+# - 调换先后时，留下的各项不按名字写到别的选择项的输出名（DuckDB 这类认「前面的列别名」）。
+#
+# 改写在原文上做：按方言切词、按括号深度认出最外层 SELECT 列表每一项在原文里的起止，只把留下的几项按新的先后原样拼回去，
+# 选择列表前后的原文一字不动（explain_sql_diff 的保真守卫照样看得到原文里的写法）。拼完重新解析，语法树要和「原来的树换成
+# 留下的几项」一模一样，不然不投影。口径模板（{{ input.x }}）按 _template_slots 的哨兵渲染之后认起止，再按位置换回模板
+# 的原文；MySQL 原文里有被当成两个减号的 --（_mysql_dashes 会改写的）不投影：改写后位置对不上原文。
+
+#: 投影的那一段能有的子句
+_PROJECTABLE_ARGS = frozenset({"with_", "expressions", "from_", "joins", "where", "group", "having", "qualify",
+                               "windows", "order", "limit", "offset"})
+#: 去掉的选择项里不许有的、可能把一行展开成多行的函数（sqlglot 的类名；表函数的基类 UDTF、不认识的函数另认）
+_ROW_CHANGING = frozenset({"Explode", "Posexplode", "ExplodeOuter", "PosexplodeOuter", "Unnest", "Inline", "Stack",
+                           "ExplodingGenerateSeries", "GenerateSeries"})
+#: 最外层 SELECT 列表到这些词就结束了
+_LIST_ENDS = _CLAUSE_ENDS | {"FROM", "INTO"}
+_OPENS = frozenset({"L_PAREN", "L_BRACKET", "L_BRACE"})
+_CLOSES = frozenset({"R_PAREN", "R_BRACKET", "R_BRACE"})
+
+#: 不投影的原因（只进比对的说明和测试，不判等价）
+_PROJ_UNPARSED = "SQL 无法解析，不投影"
+_PROJ_SETOP = "不是一段 SELECT（UNION 这类合并、外面套着括号），不投影"
+_PROJ_DISTINCT = "有 DISTINCT，去掉一列行数就可能变，不投影"
+_PROJ_CLAUSE = "SELECT 里有投影认不准的子句（{clause}），不投影"
+_PROJ_STAR = "选择列表里有 *，按位置对不准，不投影"
+_PROJ_WIDTH = "查询结果的列数（{width}）和选择列表的项数（{items}）对不上，不投影"
+_PROJ_KEEP = "要留下的列不对（空的、重复的、超出选择列表），不投影"
+_PROJ_ORDINAL = "ORDER BY / GROUP BY 按位置引用了选择项，去掉、调换之后会指到别的列，不投影"
+_PROJ_LIMIT = "有 LIMIT / OFFSET，取哪几行可能跟着选择列表变，不投影"
+_PROJ_ROWS = "去掉的「{item}」里有可能改变行数的函数，不投影"
+_PROJ_NAMED = "去掉的「{item}」在别处被按名字写到了，不投影"
+_PROJ_USED = "去掉的「{item}」同样的写法出现在 GROUP BY、HAVING、ORDER BY、QUALIFY 或窗口里，不投影"
+_PROJ_AGGREGATE = "去掉的是仅有的聚合，剩下的列就不止一行了，不投影"
+_PROJ_LOOSE = "留下的列里有既不在聚合里、也不是分组键的列，去掉别的列可能换了取值的那一行，不投影"
+_PROJ_REORDER = "留下的「{item}」按名字写到了别的选择项，不调换先后"
+_PROJ_TEXT = "认不出选择列表在原文里的起止，不投影"
+_PROJ_DASHES = "原文里有 MySQL 当成两个减号的 --，不投影"
+
+
+@dataclass(frozen=True)
+class Projection:
+    """project_select / project_template 的结果。
+
+    sql 是投影后的 SQL（模板投影之后仍是模板，{{ input.x }} 原样留着）；kept 是留下的选择项在原来的选择列表里的位置
+    （按投影后的先后）；dropped 是去掉了几项；names 是留下的各项的输出名（别名、列名，别的写成它的 SQL，同
+    _result_columns）。refused 不为空时不投影：sql 为 None，写为什么。要留下的就是全部、先后也没变时原样交回（dropped
+    为 0）。"""
+
+    sql: str | None
+    kept: tuple[int, ...] = ()
+    dropped: int = 0
+    names: tuple[str, ...] = ()
+    refused: str | None = None
+
+
+class _NotProjectable(Exception):
+    """不投影：args[0] 是原因。"""
+
+
+def _output_name(item: Any, read: str | None) -> str:
+    from sqlglot import exp
+
+    name = item.alias_or_name if isinstance(item, (exp.Alias, exp.Column)) else ""
+    return name or item.sql(dialect=read)
+
+
+def _name_of(item: Any) -> str:
+    """选择项按名字被引用时的那个名字（别名、列名；小写）。表达式、常量没有。"""
+    from sqlglot import exp
+
+    return (item.alias_or_name if isinstance(item, (exp.Alias, exp.Column)) else "").translate(_ASCII_LOWER)
+
+
+def _ordinal(node: Any) -> bool:
+    """ORDER BY / GROUP BY 的一项是按位置引用（一个整数常量）。"""
+    from sqlglot import exp
+
+    inner = _unparen(node.this if isinstance(node, exp.Ordered) else node)
+    return isinstance(inner, exp.Literal) and not inner.is_string
+
+
+def _projection_problem(root: Any, keep: Sequence[int], read: str | None) -> str | None:
+    """按 keep 投影这一段会不会改变留下的那几列的取值（见本节开头）：会、或者认不准时交回原因，确定不会时为 None。"""
+    from sqlglot import exp
+
+    if not isinstance(root, exp.Select):
+        return _PROJ_SETOP
+    if root.args.get("distinct") is not None:
+        return _PROJ_DISTINCT
+    extra = sorted(k for k, v in root.args.items() if v not in (None, False, []) and k not in _PROJECTABLE_ARGS)
+    if extra:
+        return _PROJ_CLAUSE.format(clause=extra[0])
+    items = list(root.expressions)
+    if any(_is_star(item) for item in items):
+        return _PROJ_STAR
+    if not keep or len(set(keep)) != len(keep) or any(not isinstance(k, int) or not 0 <= k < len(items) for k in keep):
+        return _PROJ_KEEP
+    group, order = root.args.get("group"), root.args.get("order")
+    for clause in (group, order):
+        if clause is not None and any(_ordinal(e) for e in clause.expressions):
+            return _PROJ_ORDINAL
+    if (root.args.get("limit") is not None or root.args.get("offset") is not None) and \
+            not (group is None and _aggregating(root)):
+        return _PROJ_LIMIT
+    kept = set(keep)
+    removed = [i for i in range(len(items)) if i not in kept]
+    holders = [c for c in (group, root.args.get("having"), order, root.args.get("qualify")) if c is not None]
+    holders += [w for w in root.args.get("windows") or [] if isinstance(w, exp.Expr)]
+    holders += [w for k in keep for w in items[k].find_all(exp.Window)]
+    used = {_fingerprint(n) for holder in holders for n in holder.walk()}
+    for i in removed:
+        item = items[i]
+        shown = item.sql(dialect=read, comments=False)[:60]
+        if any(isinstance(n, (exp.UDTF, exp.Anonymous)) or type(n).__name__ in _ROW_CHANGING for n in item.walk()):
+            return _PROJ_ROWS.format(item=shown)
+        name = _name_of(item)
+        if name:
+            inside = {id(n) for n in item.walk()}
+            if any(isinstance(n, exp.Column) and not n.table and id(n) not in inside
+                   and n.name.translate(_ASCII_LOWER) == name for n in root.walk()):
+                return _PROJ_NAMED.format(item=shown)
+        body = item.unalias()
+        if not _constant(body) and _fingerprint(body) in used:
+            return _PROJ_USED.format(item=shown)
+    projected = root.copy()
+    projected.set("expressions", [items[k].copy() for k in keep])
+    if group is None and root.args.get("having") is None and _aggregating(root) != _aggregating(projected):
+        return _PROJ_AGGREGATE
+    if _loose_columns(projected):
+        return _PROJ_LOOSE
+    if list(keep) != sorted(keep):
+        names = {_name_of(item) for item in items} - {""}
+        for k in keep:
+            others = names - {_name_of(items[k])}
+            if any(isinstance(n, exp.Column) and not n.table and n.name.translate(_ASCII_LOWER) in others
+                   for n in items[k].walk()):
+                return _PROJ_REORDER.format(item=items[k].sql(dialect=read, comments=False)[:60])
+    return None
+
+
+def _list_spans(text: str, read: str | None) -> list[tuple[int, int]] | None:
+    """最外层 SELECT 列表每一项在原文里的起止（含两头）：按方言切词、按括号深度，深度 0 的 SELECT 之后、深度 0 的子句
+    开头的词（FROM、WHERE……）之前，深度 0 的逗号分开。深度 0 的 SELECT 不止一个、括号对不上、有空项的为 None。"""
+    try:
+        tokens = _tokens(text, read)
+    except Exception:  # noqa: BLE001 - 切词都不行：认不出
+        return None
+    depth = 0
+    state = 0       # 0：还没到最外层的 SELECT；1：在选择列表里；2：选择列表之后
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    end = 0
+    for token in tokens:
+        kind = token.token_type.name
+        if state == 1 and depth == 0 and (kind == "COMMA" or kind in _LIST_ENDS):
+            if start is None:
+                return None
+            spans.append((start, end))
+            start = None
+            if kind != "COMMA":
+                state = 2
+            continue
+        if kind in _OPENS:
+            depth += 1
+        elif kind in _CLOSES:
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and kind == "SELECT":
+            if state != 0:
+                return None
+            state = 1
+            continue
+        if state == 1:
+            start = token.start if start is None else start
+            end = token.end
+    if state == 1:
+        if start is None:
+            return None
+        spans.append((start, end))
+    return spans or None
+
+
+def _cut(text: str, spans: Sequence[tuple[int, int]], keep: Sequence[int]) -> str:
+    """把选择列表换成留下的几项（按 keep 的先后，原文照抄、逗号隔开）：选择列表前后的原文一字不动。"""
+    head, tail = text[:spans[0][0]], text[spans[-1][1] + 1:]
+    return head + ", ".join(text[spans[k][0]:spans[k][1] + 1] for k in keep) + tail
+
+
+def _plan_projection(text: str, keep: Sequence[int], read: str | None, width: int | None
+                     ) -> tuple[Any, list[tuple[int, int]] | None, Any]:
+    """(原文的语法树, 选择列表各项的起止, 投影后应有的语法树)。原样（keep 就是全部、先后不变）时后两样为 None。不投影抛
+    _NotProjectable。"""
+    if read == "mysql" and _mysql_dashes(text) != text:
+        raise _NotProjectable(_PROJ_DASHES)
+    root, _ = _parse(text, read)
+    if root is None:
+        raise _NotProjectable(_PROJ_UNPARSED)
+    from sqlglot import exp
+
+    items = list(root.expressions) if isinstance(root, exp.Select) else []
+    if width is not None and isinstance(root, exp.Select) and len(items) != width:
+        raise _NotProjectable(_PROJ_WIDTH.format(width=width, items=len(items)))
+    if isinstance(root, exp.Select) and list(keep) == list(range(len(items))):
+        return root, None, None
+    why = _projection_problem(root, keep, read)
+    if why:
+        raise _NotProjectable(why)
+    spans = _list_spans(text, read)
+    if spans is None or len(spans) != len(items):
+        raise _NotProjectable(_PROJ_TEXT)
+    expected = root.copy()
+    expected.set("expressions", [items[k].copy() for k in keep])
+    return root, spans, expected
+
+
+def _same_tree(text: str, read: str | None, expected: Any) -> bool:
+    root, _ = _parse(text, read)
+    return root is not None and _fingerprint(root) == _fingerprint(expected)
+
+
+def project_select(sql: str, keep: Sequence[int], dialect: str | None = None, *,
+                   width: int | None = None) -> Projection:
+    """按引用的列投影一条查询（见本节开头）：最外层选择列表只留 keep 那几项（位置从 0 数，按 keep 的先后）。从不抛异常。
+
+    width 是查询结果的列数（查询快照里记的）：给了就要和选择列表的项数一样，被引用的列才按位置对得上选择项。不投影时
+    refused 写为什么，调用方照旧整条比。投影出来的 SQL 不判等价：交给 match_template / explain_sql_diff 判。"""
+    read = _read(dialect)
+    text = (sql or "").strip()
+    keep = tuple(keep)
+    try:
+        root, spans, expected = _plan_projection(text, keep, read, width)
+        items = list(root.expressions)
+        names = tuple(_output_name(items[k], read) for k in keep)
+        if spans is None:
+            return Projection(text, keep, 0, names)
+        out = _cut(text, spans, keep)
+        if not _same_tree(out, read, expected):
+            raise _NotProjectable(_PROJ_TEXT)
+        return Projection(out, keep, len(items) - len(keep), names)
+    except _NotProjectable as e:
+        return Projection(None, keep, refused=str(e))
+    except Exception:  # noqa: BLE001 - 投影本身的缺陷不能连累调用方：当作不投影，照旧整条比
+        logger.warning("SQL 投影失败", exc_info=True)
+        return Projection(None, keep, refused=_PROJ_TEXT)
+
+
+def _template_marks(template: str, spans: Sequence[tuple[int, int, TemplateSlot]]) -> list[tuple[int, int, int, int]]:
+    """模板里每一处槽位在哨兵渲染的 SQL 里、在模板原文里的起止：[(哨兵起, 哨兵止, 模板起, 模板止)]（止不含）。槽位之外
+    两边逐字相同（_template_slots 只换槽位）。"""
+    out: list[tuple[int, int, int, int]] = []
+    shift = 0
+    for start, end, slot in spans:
+        size = len(_STRING_SENTINEL.format(slot.index)) if slot.context == "quoted" else \
+            len(str(_NUMBER_SENTINEL + slot.index)) if slot.context == "bare" else 0
+        out.append((start - shift, start - shift + size, start, end))
+        shift += (end - start) - size
+    return out
+
+
+def _to_template(pos: int, marks: Sequence[tuple[int, int, int, int]], *, last: bool) -> int | None:
+    """哨兵 SQL 里的一个位置 → 模板原文里的位置。落在哨兵中间的认不出（选择项的起止只会在一个词的两头）。last：这是一项
+    的最后一个字（含），落在哨兵最后一个字上时对到槽位的最后一个字。"""
+    delta = 0
+    for s0, s1, t0, t1 in marks:
+        if pos < s0:
+            break
+        if pos < s1:
+            if not last and pos == s0:
+                return t0
+            if last and pos == s1 - 1:
+                return t1 - 1
+            return None
+        delta = t1 - s1
+    return pos + delta
+
+
+def project_template(template_sql: str, keep: Sequence[int], dialect: str | None = None) -> Projection:
+    """按口径卡读到的列投影口径的取数模板（{{ input.<字段> }} 原样留着，见本节开头）。规则同 project_select，在哨兵渲染
+    的 SQL 上判；起止按位置换回模板原文。从不抛异常。"""
+    read = _read(dialect)
+    template = (template_sql or "").strip()
+    keep = tuple(keep)
+    try:
+        slots, sentinel = _template_slots(template)
+        root, spans, expected = _plan_projection(sentinel, keep, read, None)
+        items = list(root.expressions)
+        names = tuple(_output_name(items[k], read) for k in keep)
+        if spans is None:
+            return Projection(template, keep, 0, names)
+        if not _same_tree(_cut(sentinel, spans, keep), read, expected):
+            raise _NotProjectable(_PROJ_TEXT)
+        marks = _template_marks(template, slots)
+        mapped = [(_to_template(s, marks, last=False), _to_template(e, marks, last=True)) for s, e in spans]
+        if any(s is None or e is None for s, e in mapped):
+            raise _NotProjectable(_PROJ_TEXT)
+        out = _cut(template, mapped, keep)  # type: ignore[arg-type]
+        # 换回模板之后再按哨兵渲染一遍：结构（字面量只看位置，槽位的编号会因为去掉了几处而变）要和投影后的一样
+        _, again = _template_slots(out)
+        root_again, _ = _parse(again, read)
+        lits_a: list[Any] = []
+        lits_b: list[Any] = []
+        if root_again is None or _erased(root_again, lits_a) != _erased(expected, lits_b) or len(lits_a) != len(lits_b):
+            raise _NotProjectable(_PROJ_TEXT)
+        return Projection(out, keep, len(items) - len(keep), names)
+    except _NotComparable as e:
+        return Projection(None, keep, refused=str(e))
+    except _NotProjectable as e:
+        return Projection(None, keep, refused=str(e))
+    except Exception:  # noqa: BLE001 - 同 project_select
+        logger.warning("口径模板投影失败", exc_info=True)
+        return Projection(None, keep, refused=_PROJ_TEXT)
+
+
+def output_names(sql: str, dialect: str | None = None, *, template: bool = False) -> list[str] | None:
+    """最外层选择列表各项的输出名（按位置；同 _result_columns，不展开 *：有 * 的为 None）。template 为真时 sql 是口径
+    模板，按哨兵渲染之后认。解析不了、不是一段 SELECT 的为 None。"""
+    from sqlglot import exp
+
+    read = _read(dialect)
+    text = (sql or "").strip()
+    try:
+        if template:
+            _, text = _template_slots(text)
+        root, _ = _parse(_mysql_dashes(text) if read == "mysql" else text, read)
+    except _NotComparable:
+        return None
+    if not isinstance(root, exp.Select) or any(_is_star(i) for i in root.expressions):
+        return None
+    return [_output_name(i, read) for i in root.expressions]
+
+
 __all__ = ["BINDING_LEVELS", "MAX_SQL_CHARS", "PLACEHOLDER", "Aggregate", "ColumnRef", "Computed", "FacetDiff", "Facets",
-           "JoinFacet", "LimitFacet", "NormalizedSql", "Part", "SqlDiff", "TemplateBinding", "TemplateMatch",
-           "TemplateSlot", "TimePredicate", "bind_template", "catalog_labels", "diff_facets", "explain_sql_diff",
-           "facets", "match_template", "normalize_sql", "render_bound"]
+           "JoinFacet", "LimitFacet", "NormalizedSql", "Part", "Projection", "SqlDiff", "TemplateBinding",
+           "TemplateMatch", "TemplateSlot", "TimePredicate", "bind_template", "catalog_labels", "diff_facets",
+           "explain_sql_diff", "facets", "match_template", "normalize_sql", "output_names", "project_select",
+           "project_template", "render_bound"]

@@ -162,6 +162,78 @@ def card_expressions(cards: list[Mapping[str, Any]]) -> list[tuple[str, str, str
     return out
 
 
+def card_reads(cards: list[Mapping[str, Any]]) -> list[tuple[str, str, tuple[tuple[str, str], ...]]]:
+    """口径版本里每张源头口径卡的每个指标读了哪几格的列：(卡的节点 id, 指标 id, ((取数节点, 列), …))，按式子里出现的先后、
+    去重。只认 cell(nodes.X, 行, '列') 这种输入（同 card_expressions）；有别的写法的指标不收。比对时口径一侧按它投影到
+    「这个指标引用的列」（ledger/match 的 _projected）。"""
+    import ast
+
+    from app.engine.expressions import ExpressionError, cell_parts, leaf_refs, parse_expression
+
+    out: list[tuple[str, str, tuple[tuple[str, str], ...]]] = []
+    for card in cards:
+        for metric in card.get("metrics") or []:
+            try:
+                tree = parse_expression(str((metric or {}).get("expression") or ""))[0]
+            except ExpressionError:
+                continue
+            reads: list[tuple[str, str]] = []
+            for leaf in leaf_refs(tree):
+                parts = cell_parts(leaf)
+                if parts is None or not parts[0].startswith("nodes."):
+                    break
+                try:
+                    column = ast.literal_eval(parts[2])
+                except (ValueError, SyntaxError):
+                    break
+                if not isinstance(column, str):
+                    break
+                read = (parts[0][len("nodes."):], column)
+                if read not in reads:
+                    reads.append(read)
+            else:
+                if reads:
+                    out.append((str(card.get("node_id")), str(metric.get("id")), tuple(reads)))
+    return out
+
+
+def referenced_columns(docs: list[Mapping[str, Any]],
+                       load_card: Callable[[str], Mapping[str, Any] | None]) -> dict[str, set[str]]:
+    """报告里引用了哪条查询的哪几列：{查询快照: {列名}}。和 label_doc 标的是同一批数——单元格（[[v:]]、[[table:]] 里的格）
+    按证据目录找到的快照和列；指标（[[m:]]）按指标集里这个指标的输入（落在查询快照一格上的）。比对时按它投影：只比被
+    引用的那几列（ledger/match 的 _projected）。"""
+    from app.engine.evidence import iter_units
+
+    out: dict[str, set[str]] = {}
+    cards: dict[str, Mapping[str, Any] | None] = {}
+    for doc in docs:
+        catalog = doc.get("catalog") if isinstance(doc.get("catalog"), dict) else {}
+        for _, unit in iter_units(doc):
+            for seg in unit.get("segments") or []:
+                if not isinstance(seg, dict) or seg.get("kind") not in ("number", "value") or not seg.get("id"):
+                    continue
+                cite = seg.get("cite") if isinstance(seg.get("cite"), dict) else {}
+                if cite.get("status") != "resolved":
+                    continue
+                entry = catalog.get(cite.get("alias")) if isinstance(catalog.get(cite.get("alias")), dict) else {}
+                locator = cite.get("locator") if isinstance(cite.get("locator"), dict) else {}
+                artifact = str(entry.get("artifact") or "")
+                if cite.get("kind") == "cell" and artifact and isinstance(locator.get("column"), str):
+                    out.setdefault(artifact, set()).add(locator["column"])
+                elif cite.get("kind") == "metric" and artifact:
+                    if artifact not in cards:
+                        cards[artifact] = load_card(artifact)
+                    card = cards[artifact] or {}
+                    metric = next((m for m in card.get("metrics") or []
+                                   if isinstance(m, dict) and m.get("id") == locator.get("metric")), None)
+                    for item in (metric or {}).get("inputs") or []:
+                        where = item.get("locator") if isinstance(item, dict) else None
+                        if isinstance(item, dict) and item.get("artifact") and item.get("via") in _SNAPSHOT_VIAS \
+                                and isinstance(where, dict) and isinstance(where.get("column"), str):
+                            out.setdefault(str(item["artifact"]), set()).add(where["column"])
+    return out
+
+
 def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mapping[str, Mapping[str, Any]],
                  calibers: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     """指标的标签（见模块说明）。card 是封存的指标集工件（读不出为 None）；calibers 是 {「工作流@版本」: {level, cards}}，
@@ -359,5 +431,5 @@ def related_view(item: Mapping[str, Any], *, hide: Callable[[Any], bool], shown:
 
 
 __all__ = ["CERTIFIED_NOTE", "HOWS", "KINDS", "LEVEL_TEXT", "POST_SEAL_NOTE", "RETRO_NOTE", "binding_view", "caliber_key",
-           "card_expressions", "cell_label", "diff_view", "label_doc", "metric_label", "related_view", "view_label",
-           "whole_of"]
+           "card_expressions", "card_reads", "cell_label", "diff_view", "label_doc", "metric_label", "referenced_columns",
+           "related_view", "view_label", "whole_of"]

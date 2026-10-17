@@ -253,7 +253,7 @@ async def test_an_answer_built_with_use_caliber_is_labelled_composed(client, mon
     await ledger_match.drain()
     recorded = await store.latest(row.id)
     content = recorded.content
-    assert content["algo"] == store.ALGO == "2"
+    assert content["algo"] == store.ALGO == "3"
     [query] = content["queries"]
     assert query["status"] == "composed" and query["node_id"] == "c1_fetch"
     [cand] = query["candidates"]

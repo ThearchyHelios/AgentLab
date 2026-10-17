@@ -16,7 +16,8 @@
 的字段校验，ledger/compose.check_inputs 同一套），界面写「参数按这次的 SQL 推断，请核对」。
 
 **列怎么配。** 只有一行结果时：口径卡上的指标式就是取数第一行某一列（cell(nodes.取数, 0, '列')）的，按那一列在口径取数
-结果里的位置配这次结果同一位置的列（等价时已实测列的先后计；不等价的两条 SQL 选择列表一样时位置照样对得上）。差异
+结果里的位置配这次结果同一位置的列（等价时已实测列的先后计；不等价的两条 SQL 选择列表一样时位置照样对得上）。比对时
+按引用的列投影过的（候选的 projection，ledger/match 的 _projected），按投影之后两边留下的列逐个配（这次多选的列不算）。差异
 有兜底说明（fallback：两条 SQL 对不上结构）、列数不同、一个都配不上时不猜，要人选（pairs：{ours: 这次的列, metric: 口径卡
 上的指标 id}），这个选择记进对账运行的 origin。
 
@@ -327,8 +328,9 @@ def _plain_cell(expression: str, fetch: str) -> str | None:
 
 def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str], caliber_columns: list[str] | None,
                metrics: list[dict[str, Any]], fetch: str, card: str, fallback: bool, chosen: Any,
-               referenced: list[tuple[int, str]]) -> Plan:
-    """配列、（多行时）定行和键：交回 Plan，配不了的抛 ReconcileRefused（见模块说明）。纯计算。"""
+               referenced: list[tuple[int, str]], projected: Any = None) -> Plan:
+    """配列、（多行时）定行和键：交回 Plan，配不了的抛 ReconcileRefused（见模块说明）。projected 是比对候选的 projection
+    （按引用的列投影过的：{ours: [这次留下的列], caliber: [口径留下的列]}，按位置一一对应）。纯计算。"""
     def check_column(column: str) -> None:
         if column not in ours_columns:
             raise ReconcileRefused(422, PAIR_COLUMN.format(column=column))
@@ -360,7 +362,17 @@ def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str
     if fallback:
         raise ReconcileRefused(409, PAIRS_FALLBACK, NEEDS_PAIRS, extra=options)
     pairs = []
-    if caliber_columns is not None and len(caliber_columns) == len(ours_columns):
+    kept = _projected_pairs(projected, ours_columns)
+    if kept is not None:
+        # 按投影之后留下的列配：这次多选的列不算，口径一侧只看投影留下的那几列（列名不分大小写）
+        for index, m in enumerate(metrics):
+            column = _plain_cell(str(m.get("expression") or ""), fetch)
+            ours = next((o for o, c in kept if column is not None and c.lower() == column.lower()), None)
+            if ours is None or ours.lower() in hidden:
+                continue
+            pairs.append(Pair(ours=ours, metric=str(m.get("id")), index=index, name=str(m.get("name") or m.get("id")),
+                              unit=str(m.get("unit") or ""), decimals=m.get("decimals")))
+    elif caliber_columns is not None and len(caliber_columns) == len(ours_columns):
         for index, m in enumerate(metrics):
             column = _plain_cell(str(m.get("expression") or ""), fetch)
             if column is None or column not in caliber_columns:
@@ -373,6 +385,19 @@ def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str
     if not pairs:
         raise ReconcileRefused(409, PAIRS_NONE, NEEDS_PAIRS, extra=options)
     return Plan(pairs=pairs)
+
+
+def _projected_pairs(projected: Any, ours_columns: list[str]) -> list[tuple[str, str]] | None:
+    """比对候选的 projection → [(这次的列, 口径的列)]，按位置一一对应；不是投影过的、两边列数不一样、这次的列不在结果里的
+    为 None（照旧按整条的位置配）。"""
+    if not isinstance(projected, dict):
+        return None
+    ours, theirs = projected.get("ours"), projected.get("caliber")
+    if not isinstance(ours, list) or not isinstance(theirs, list) or not ours or len(ours) != len(theirs):
+        return None
+    if any(not isinstance(o, str) or o not in ours_columns or not isinstance(c, str) for o, c in zip(ours, theirs)):
+        return None
+    return list(zip(ours, theirs))
 
 
 def _plan_rows(ours_columns: list[str], rows: list[Any], hidden: set[str], caliber_columns: list[str] | None,
@@ -536,7 +561,7 @@ async def reconcile(run_id: str, req: Request, *, principal: Any) -> Run:
                       caliber_columns=_caliber_columns(template, inputs, list(pinned.entry_fields), kind, schema),
                       metrics=pinned.metrics, fetch=str(fetch["id"]), card=pinned.card_title,
                       fallback=bool((cand.get("diff") or {}).get("fallback")), chosen=req.pairs,
-                      referenced=_referenced(sealed, req.query))
+                      referenced=_referenced(sealed, req.query), projected=cand.get("projection"))
     graph = build(pinned, sql=snap["sql"], tool=f"{QUERY_PREFIX}{source}", plan=plan, inputs=inputs,
                   fetch=str(fetch["id"]))
 

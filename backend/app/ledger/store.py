@@ -31,7 +31,8 @@ FORMAT = "agentlab.caliber_match/1"
 #: 比对算法的版本：绑定、证明、标签的规则改了就加一，界面和统计据此分得清是哪一版算法比的。
 #: 2（第 3 波）：认出助手选用的口径（查询 composed、标签 how=composed），指标的标签记它取自哪几条查询（queries，认证队列
 #: 认「被报告引用的查询」用）
-ALGO = "2"
+#: 3：整条比不等价时按报告引用的列投影再比（ledger/match 的 _projected），候选记 projection；没投影的照旧
+ALGO = "3"
 #: 触发方式（见模块说明）。certified（第 3 波）：从问数据固化出的口径发布之后，对来源运行补比的（ledger/certify）
 TRIGGERS = ("sealed", "backfill", "on_demand", "certified")
 

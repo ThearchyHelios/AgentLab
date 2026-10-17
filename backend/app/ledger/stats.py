@@ -8,8 +8,9 @@
 这时不再按来源和计入统计筛——调用方点名的就是要算的）。
 
 - E1 等价命中：比对过的查询里 proven / composed / related / none / skipped 各几条（skipped 单独列，不混进 none），有候选口径
-  的查询里各自的比率；证明等价的绑定是在哪一级配上的；没证明的原因（不可比、参数绑不上、配上了但不等价）；不等价的差异类型
-  分布（time / filter / aggregate / join / other / parse，每份口径的差异每类只计一次）；逐个数的标签各几个、整题等价几次。
+  的查询里各自的比率；证明等价的绑定是在哪一级配上的，其中几份是按引用的列投影之后才证明的（proven_projected，ledger/match
+  的 _projected）；没证明的原因（不可比、参数绑不上、配上了但不等价）；不等价的差异类型分布（time / filter / aggregate /
+  join / other / parse，每份口径的差异每类只计一次）；逐个数的标签各几个、整题等价几次。
 - E2 对账：对账运行（origin=reconcile，第 3 波起由 ledger/reconcile 发起）发起、完成、失败各几次，对过账的答案几个，其中参数
   经人核对过的、对照的指标由人选的各几次；相关口径的差异说明里兜底说明的占比；对账结果上「说明有用 / 看不懂」的反馈
   （第 4 波，ledger/feedback：对账运行上的封存后事件 ledger.feedback，每人只算最后一次）各几个、有用的比率。
@@ -98,6 +99,7 @@ def e1_of(contents: list[dict[str, Any]]) -> dict[str, Any]:
     status = Counter({s: 0 for s in STATUSES})
     with_candidates = Counter({s: 0 for s in STATUSES})
     via: Counter[str] = Counter()
+    projected = 0
     unproven: Counter[str] = Counter()
     diffs = Counter({g: 0 for g in DIFF_GROUPS})
     labels = Counter({k: 0 for k in ledger_labels.KINDS})
@@ -113,6 +115,7 @@ def e1_of(contents: list[dict[str, Any]]) -> dict[str, Any]:
             for cand in query.get("candidates") or []:
                 if cand.get("status") == "proven":
                     via[str(cand.get("via") or "parsed")] += 1
+                    projected += isinstance(cand.get("projection"), dict)
                     continue
                 if cand.get("status") == "skipped":
                     continue
@@ -136,7 +139,8 @@ def e1_of(contents: list[dict[str, Any]]) -> dict[str, Any]:
         "runs": len(contents), "queries": queries, "status": dict(status),
         "with_candidates": candidates,
         "rates": {s: _ratio(with_candidates[s], candidates) for s in STATUSES if s != "none"},
-        "proven_via": dict(via), "unproven_reasons": dict(unproven.most_common(20)), "diff_aspects": dict(diffs),
+        "proven_via": dict(via), "proven_projected": projected, "unproven_reasons": dict(unproven.most_common(20)),
+        "diff_aspects": dict(diffs),
         "labels": dict(labels), "whole_equivalent": whole,
     }
 
