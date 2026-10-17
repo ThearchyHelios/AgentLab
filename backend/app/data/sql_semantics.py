@@ -7037,6 +7037,8 @@ class _Explainer:
         pb, jb = self._shape(B)
         if pa == pb and ja == jb:
             return True, {}, set(), set()
+        if (said := self._left_on_times(A, B, pa, ja, pb, jb)) is not None:
+            return said
         if not ja and not jb:
             only_a = [r for r in A.rels if r.alias not in pb]
             only_b = [r for r in B.rels if r.alias not in pa]
@@ -7065,6 +7067,80 @@ class _Explainer:
             return None
         x = flipped[0]
         return self._left_inner(A, B, x, 0) if kinds_a[x] == "left" else self._left_inner(B, A, x, 1)
+
+    def _left_on_times(self, A: _Block, B: _Block, pa: Any, ja: Any, pb: Any, jb: Any
+                       ) -> tuple[bool, dict[str, str], set[str], set[str]] | None:
+        """来源两边一样，只差在一个 LEFT JOIN 的 ON 里的时间条件（日期条件写在 LEFT JOIN 的 ON 里）：说「A 用 LEFT JOIN
+        关联 X 表时只关联 … 的行，B 没有这个条件」「A 用 LEFT JOIN 关联 X 表时对 paid_at 的条件是 …，B 是 …」「A … 时按
+        paid_at 筛时间，B 按 created_at」。说不准的返回 None（照旧整条兜底）。
+
+        说得准要（每一条都是为了不说出不存在的不同）：开头那组来源一样，后面的连接只有这一个的 ON 不同（别名、表、LEFT 都
+        一样）；两边 ON 里没配上的条件每一个都是时间条件（timed）、只涉及这张可空一侧的表的列；这张表在 ON 之外只出现在
+        结果里（SELECT 列表、分组、排序），没在 WHERE、HAVING、别的连接里用到（用到了就是反连接、或者关联条件的事）；
+        SELECT 列表里用到了它的列（不然 ON 里的不同只影响行会不会重复，说不准）；结果看得见行；这张表在这一段只出现一次。
+        两边都有、同一列上的，按取值逐段算过留下的取值确实不同（_Range.compare，同 _rewrites）；只有一边有的，不是恒为真的
+        （_always）。aspect 是 join：说的是关联条件，dual_check_facts 不会把它当成业务日期写进数据目录。
+
+        只改说明，不碰等价判定：走到这里时两边已经判了不等价（见 explain_sql_diff）。"""
+        from sqlglot import exp
+
+        if pa != pb or len(ja) != len(jb) or not self.visible:
+            return None
+        differing = [i for i, (x, y) in enumerate(zip(ja, jb)) if x != y]
+        if len(differing) != 1:
+            return None
+        i = differing[0]
+        if ja[i][:3] != jb[i][:3] or ja[i][2] != "left":
+            return None
+        alias = ja[i][0]
+        join_a, join_b = A.joins[i], B.joins[i]
+        rel = A.rel(alias)
+        if rel is None or not rel.table or A.names().count(rel.name) != 1 or B.names().count(rel.name) != 1:
+            return None
+        on_a, on_b = _conjuncts(join_a.args["on"]), _conjuncts(join_b.args["on"])
+        only_a, only_b = self._unmatched(on_a, on_b, {})
+        keys: set[tuple[str, str]] = set()
+        for block, conds in ((A, only_a), (B, only_b)):
+            for cond in conds:
+                cols = self.base_columns(cond, block)
+                found = self.timed(cond, block)
+                if found is None or not cols or any(r.alias != alias for r, _ in cols):
+                    return None
+                keys.add(found)
+        for block, join in ((A, join_a), (B, join_b)):
+            if self._used_outside(block, alias, join, outputs=False):
+                return None
+            if not any(col.table == alias for e in block.exprs for col in e.find_all(exp.Column)):
+                return None
+        what = self.what(rel)
+        if only_a and only_b:
+            if len(keys) == 1:
+                key = next(iter(keys))
+                same_a = [c for c in on_a if self.refs(c, A) == {key}]
+                same_b = [c for c in on_b if self.refs(c, B) == {key}]
+                if self.range.compare(same_a, same_b, never_null=False) is not False:
+                    return None
+                shown_a, shown_b = self.show_all(_by_bound(same_a), A), self.show_all(_by_bound(same_b), B)
+                text = _say(self.la, "用 LEFT JOIN 关联", what, "时对", self.named(*key), "的条件是", shown_a, "，",
+                            self.lb, "是", shown_b)
+            else:
+                cols_a = {self.timed(c, A) for c in only_a}
+                cols_b = {self.timed(c, B) for c in only_b}
+                if len(cols_a) != 1 or len(cols_b) != 1:
+                    return None
+                shown_a, shown_b = self.show_all(only_a, A), self.show_all(only_b, B)
+                text = _say(self.la, "用 LEFT JOIN 关联", what, "时按", self.named(*next(iter(cols_a))), "筛时间，",
+                            self.lb, "按", self.named(*next(iter(cols_b))))
+            self.add("join", shown_a, shown_b, text)
+            return True, {}, set(), set()
+        side, block, conds = (0, A, only_a) if only_a else (1, B, only_b)
+        if self._always(conds, block) is not False:
+            return None
+        shown = self.show_all(_by_bound(conds), block)
+        me, them = (self.la, self.lb) if side == 0 else (self.lb, self.la)
+        self.add("join", shown if side == 0 else None, shown if side == 1 else None,
+                 _say(me, "用 LEFT JOIN 关联", what, "时只关联", shown, "的行，", them, "没有这个条件"))
+        return True, {}, set(), set()
 
     def _swapped(self, A: _Block, B: _Block, x: _Rel, y: _Rel) -> tuple[bool, dict[str, str], set[str], set[str]] | None:
         """换了一张表：开头那组来源只差一张实表（各自只出现一次、名字不只差在大小写上，都没带库名）。换了表的那一边，

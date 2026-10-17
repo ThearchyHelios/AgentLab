@@ -6,6 +6,7 @@
 - 不错给信任：多一个分组列、DISTINCT、按别的列排序再取前几行、HAVING 用到多出来的聚合的，一律仍然证明不了，结果和
   不投影时一字不差；
 - 没投影的（报告没引用、两边都不用投影、投影不了）逐对和以前一字不差；
+- 没证明的，差在哪按投影之后说：先说「这次多查了 N 列，不影响这个数」，再照常说条件上的不同；
 - 跑一次真的探索运行：报告引用销售额那一格，整题等价；E1 照实数出几份是投影之后才证明的。
 """
 from __future__ import annotations
@@ -132,13 +133,35 @@ def test_without_a_projection_every_pair_is_exactly_the_old_result():
         assert compare(sql, columns, cited) == compare(sql, columns, None), sql
 
 
-def test_e1_counts_the_proofs_that_needed_a_projection():
+# --------------------------------------------------------------------------
+# 说得清：没证明的按投影之后说
+# --------------------------------------------------------------------------
+
+
+def test_an_unproven_projection_says_the_extra_columns_first_then_the_real_difference():
+    sql = ("SELECT SUM(amount) AS 销售额, COUNT(*) AS 单数, MIN(paid_at) AS 起, MAX(paid_at) AS 止 FROM orders "
+           "WHERE paid_at >= '2026-09-01' AND paid_at < '2026-09-08'")
+    row = compare(sql, ["销售额", "单数", "起", "止"], {"销售额"})
+    assert row["status"] == "related"
+    [cand] = row["candidates"]
+    items = cand["diff"]["items"]
+    assert items[0] == {"aspect": "projection", "a": None, "b": None, "text": "这次多查了 3 列，不影响这个数"}
+    assert items[1]["aspect"] == "filter" and "status = 'paid'" in items[1]["text"]
+    assert cand["diff"]["fallback"] is False
+    assert cand["projection"]["dropped"] == 3
+    # 不投影时整段退回兜底（真实验收里 E2 的兜底比例 45% 就是这么来的）
+    [old] = compare(sql, ["销售额", "单数", "起", "止"], None)["candidates"]
+    assert old["diff"]["fallback"] is True
+
+
+def test_e1_does_not_count_the_extra_columns_note_as_a_difference_and_counts_projected_proofs():
     proven = compare(f"SELECT SUM(amount) AS 销售额, COUNT(*) AS 单数 FROM orders WHERE {WINDOW}",
                      ["销售额", "单数"], {"销售额"})
     related = compare("SELECT SUM(amount) AS 销售额, COUNT(*) AS 单数 FROM orders WHERE paid_at >= '2026-09-01' "
                       "AND paid_at < '2026-09-08'", ["销售额", "单数"], {"销售额"})
     e1 = ledger_stats.e1_of([{"queries": [proven, related], "reports": {}, "whole": {}}])
     assert e1["status"]["proven"] == 1 and e1["proven_projected"] == 1
+    assert e1["diff_aspects"]["filter"] == 1 and e1["diff_aspects"]["other"] == 0
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +217,7 @@ async def test_reconcile_pairs_the_columns_left_after_the_projection(engine_up, 
         [q] = body["queries"]
         [cand] = q["candidates"]
         assert cand["projection"]["ours"] == ["销售额"] and cand["projection"]["caliber"] == ["gmv"]
+        assert cand["diff"]["items"][0]["text"] == "这次多查了 2 列，不影响这个数"
         res = await client.post(f"/api/ledger/answers/{row.id}/reconcile", json={
             "query": q["artifact"], "workflow_id": wf, "version": 1, "confirm": True,
             "inputs": {"start": "2026-09-01", "end": "2026-09-08"}})

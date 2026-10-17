@@ -21,8 +21,8 @@ MAX_CANDIDATES 份（按工作流、版本、节点排好的先后）。
 和选择列表的项数要一样）；口径一侧按口径卡 cell(nodes.取数, 行, '列') 里写的列名，在取数 SQL 选择列表的输出名（别名，
 没有别名的是列名，不分大小写，同名的不止一项时不投影）里找位置。投影后两边留下的几列按位置配对（和整条比时的列映射一样：
 外层别名不计、列的先后计），两边列数一样才比；答案一侧留下两三列时另试调换先后。每份口径取数最多试 MAX_PROJECTIONS 种。
-证明了的候选记 projection {ours, dropped, caliber, caliber_dropped}；没证明的给第一种投影的比较（差在哪是投影之后的说法）。
-没有投影可试的（报告没引用这条查询、两边都不投影、
+证明了的候选记 projection {ours, dropped, caliber, caliber_dropped}；没证明的给第一种投影的比较（差在哪是投影之后的说法，
+答案多选了列的在最前面写一句「这次多查了 N 列，不影响这个数」）。没有投影可试的（报告没引用这条查询、两边都不投影、
 投影不了）照旧是整条比的结果，逐对一字不差。
 
 **助手选用的（composed）。** 问数据的助手 use_caliber 选用口径时，取数节点是服务端照那一版拷进来的（ledger/compose.py），
@@ -93,6 +93,8 @@ PARSE_FAILED = "这次的 SQL 无法解析，没有比对"
 MERGED = "合并查询的格不和口径比对（它的数来自各个输入的查询）"
 COMPOSED_UNPROVEN = "这条查询出自助手选用的口径，但和口径的取数没能证明一致（可能被改过）"
 MORE_CANDIDATES = "另有 {n} 份相关口径没有比对（每条查询最多比 {max} 份）"
+#: 按引用的列投影之后没证明等价时，差在哪的第一句：答案只是多选了几列（去掉它们不影响被引用的数，见 sql_semantics 的投影）
+EXTRA_COLUMNS = "这次多查了 {n} 列，不影响这个数"
 
 #: 不比对的原因（GET 账本时照实说）
 NOT_FOUND = "运行记录不存在"
@@ -395,7 +397,7 @@ def _projected(caliber: Caliber, fetch: Fetch, query: Query, wanted: tuple[int, 
     没有投影可试的为 None（照旧用整条比的结果）。"""
     from itertools import permutations
 
-    from app.data.sql_semantics import match_template, output_names, project_select, project_template
+    from app.data.sql_semantics import FacetDiff, match_template, output_names, project_select, project_template
 
     width = len(query.columns or [])
     whole = project_select(query.sql, tuple(range(width)), query.dialect, width=width)
@@ -438,7 +440,11 @@ def _projected(caliber: Caliber, fetch: Fetch, query: Query, wanted: tuple[int, 
     if first is None:
         return None
     a, c, m = first
-    return {**_candidate(caliber, fetch, m), "projection": _projection_view(query, a, c)}
+    cand = {**_candidate(caliber, fetch, m), "projection": _projection_view(query, a, c)}
+    if a.dropped and isinstance(cand.get("diff"), dict):
+        note = FacetDiff("projection", None, None, EXTRA_COLUMNS.format(n=a.dropped)).as_dict()
+        cand["diff"] = {**cand["diff"], "items": [note, *cand["diff"]["items"]]}
+    return cand
 
 
 def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: float | None = None,
@@ -737,7 +743,7 @@ async def shutdown() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-__all__ = ["BACKFILL_DAYS", "CONCURRENCY", "EXPLORE_ORIGINS", "MAX_PROJECTIONS", "TIMEOUT_S", "Caliber",
+__all__ = ["BACKFILL_DAYS", "CONCURRENCY", "EXPLORE_ORIGINS", "EXTRA_COLUMNS", "MAX_PROJECTIONS", "TIMEOUT_S", "Caliber",
            "Fetch", "Query", "backfill", "caliber_of", "compare_queries", "composed_nodes", "compute", "drain",
            "ineligible", "load_calibers", "match_run", "pending", "read_queries", "schedule", "shutdown",
            "start_backfill", "wanted"]
