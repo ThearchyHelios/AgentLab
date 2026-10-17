@@ -843,8 +843,8 @@
     },
     "fallback": {
       "sql": [
-        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-08'",
-        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND paid_at < '2026-09-09'"
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND DATE(paid_at) < '2026-09-08'",
+        "SELECT SUM(amount) AS gmv\nFROM orders\nWHERE paid_at >= '2026-09-01'\n  AND DATE(paid_at) < '2026-09-09'"
       ],
       "diff": {
         "equivalent": false,
@@ -857,8 +857,8 @@
         "fallback": true,
         "text_diff": [
           "  WHERE",
-          "-   AND orders.paid_at < '2026-09-08'",
-          "+   AND orders.paid_at < '2026-09-09'"
+          "-   AND DATE(orders.paid_at) < '2026-09-08'",
+          "+   AND DATE(orders.paid_at) < '2026-09-09'"
         ]
       },
       "catalog": {

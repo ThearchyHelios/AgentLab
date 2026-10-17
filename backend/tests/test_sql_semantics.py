@@ -616,10 +616,10 @@ def test_specific_differences_are_said_in_one_sentence_each(a, b, expected):
 
 
 @pytest.mark.parametrize("a,b", [
-    # 同一列上的时间范围不同、同一列上换了筛选的值：不在能说的四类里
-    (BASE, "SELECT SUM(amount) FROM orders WHERE paid_at BETWEEN '2026-09-01' AND '2026-09-30'"),
-    ("SELECT SUM(amount) FROM orders WHERE status = 'paid'",
-     "SELECT SUM(amount) FROM orders WHERE status IN ('paid', 'shipped')"),
+    # 算出来的值上换了筛选的值：认不出取值范围，不在能说的五类里（光一列上的条件改写见
+    # test_rewritten_conditions_on_one_column_say_both_sides）
+    ("SELECT SUM(amount) FROM orders WHERE LOWER(status) = 'paid'",
+     "SELECT SUM(amount) FROM orders WHERE LOWER(status) IN ('paid', 'shipped')"),
     # 聚合的参数不同、选出来的列换了先后
     ("SELECT SUM(paid_amount) FROM orders", "SELECT SUM(amount) FROM orders"),
     ("SELECT SUM(o.amount) FROM orders o JOIN refunds r ON r.order_id = o.id",
@@ -653,14 +653,102 @@ def test_specific_differences_are_said_in_one_sentence_each(a, b, expected):
      "WITH t AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT COUNT(*) FROM t WHERE total > 100"),
 ], ids=lambda v: None)
 def test_differences_outside_the_four_kinds_get_only_the_fallback(a, b):
-    """具体说法只说四类（按哪一列筛时间、一边多出来的筛选条件、顶层的聚合函数和去重、关联的表和关联类型），而且只在
-    两边都是简单形状时说。别的不同（同一列上的范围、换了筛选的值、聚合的参数、分组、HAVING、取行、排序、关联条件、
+    """具体说法只说五类（按哪一列筛时间、一边多出来的筛选条件、同一列上的条件改写、顶层的聚合函数和去重、关联的表和
+    关联类型），而且只在两边都是简单形状时说。别的不同（算出来的值上换了筛选的值、聚合的参数、分组、HAVING、取行、排序、关联条件、
     UNION、CTE 和子查询里的不同）以前说得出具体的，复验在这些地方一再抓到不存在的差异（被 WHERE 定死的排序键、恒为真的
     HAVING、外层不在乎的子查询差异……），现在一律只给兜底说明，附规范化后不同的行。"""
     for dialect in DIALECTS:
         diff = explain_sql_diff(a, b, dialect)
         check_shape(diff)
         assert not diff.equivalent and diff.items == [FacetDiff("other", None, None, FALLBACK)], (dialect, diff.items)
+
+
+@pytest.mark.parametrize("a,b,aspect,text", [
+    # 等号对 IN：口径 status = 'paid'，这次多收了 refunded（账本的叫法：A 是这次、B 是口径）
+    ("SELECT SUM(amount) FROM orders WHERE status IN ('paid', 'refunded')",
+     "SELECT SUM(amount) FROM orders WHERE status = 'paid'", "filter",
+     "这次对 status 的条件是 status IN ('paid', 'refunded')，口径是 status = 'paid'（这次多了 'refunded'）"),
+    # 取值集合不同：各多了几个
+    ("SELECT SUM(o.amount) FROM orders o JOIN stores s ON s.id = o.store_id WHERE o.status IN ('paid', 'open', 'done')",
+     "SELECT SUM(o.amount) FROM orders o JOIN stores s ON s.id = o.store_id WHERE o.status IN ('paid', 'void')", "filter",
+     "这次对 orders.status 的条件是 orders.status IN ('done', 'open', 'paid')，口径是 orders.status IN ('paid', 'void')"
+     "（这次多了 'done'、'open'，口径多了 'void'）"),
+    # 取值毫不相干：前一句已经说全了，不补
+    ("SELECT COUNT(*) FROM orders WHERE status = 'paid'", "SELECT COUNT(*) FROM orders WHERE status = 'done'", "filter",
+     "这次对 status 的条件是 status = 'paid'，口径是 status = 'done'"),
+    # 范围的端点不同
+    ("SELECT COUNT(*) FROM orders WHERE amount >= 100", "SELECT COUNT(*) FROM orders WHERE amount > 100", "filter",
+     "这次对 amount 的条件是 amount >= 100，口径是 amount > 100"),
+    # 同一时间列上的范围不同：time_range
+    (BASE, "SELECT SUM(amount) FROM orders WHERE paid_at >= '2026-09-01' AND paid_at < '2026-11-01'", "time_range",
+     "这次对 paid_at 的条件是 paid_at >= '2026-09-01' AND paid_at < '2026-10-01'，"
+     "口径是 paid_at >= '2026-09-01' AND paid_at < '2026-11-01'"),
+], ids=lambda v: None)
+def test_rewritten_conditions_on_one_column_say_both_sides(a, b, aspect, text):
+    """同一列上的条件两边各写了一套、留下的取值不同（下一轮验收：口径 status = 'paid'，这次 status IN ('paid',
+    'refunded') 以前只给兜底）：说「这次对 X 的条件是 …，口径是 …」，aspect 两边都有（dual_check_facts 不会把它当成一边
+    多出来的有效行条件）。各方言、给不给表结构都一样。"""
+    for dialect in DIALECTS:
+        for schema in (None, sql_pairs.schema_cache()):
+            diff = explain_sql_diff(a, b, dialect, schema=schema, labels=("这次", "口径"))
+            check_shape(diff)
+            assert not diff.equivalent and not diff.fallback, (dialect, diff.items)
+            [item] = diff.items
+            assert (item.aspect, item.text) == (aspect, text), (dialect, item)
+            assert item.a is not None and item.b is not None
+            assert item.detail == {"columns": [{"table": "orders", "column": text.split("对 ")[1].split(" ")[0]
+                                                .split(".")[-1]}]}
+
+
+@pytest.mark.parametrize("a,b,schema", [
+    # 冗余的写法：算出来留下的取值一样，不说
+    ("SELECT COUNT(*) FROM orders WHERE amount >= 100 AND amount >= 50", "SELECT COUNT(*) FROM orders WHERE amount >= 100",
+     None),
+    # 主键不为空：差的只是空值那一段，不说（没给表结构时照说，那时不知道它不为空）
+    ("SELECT COUNT(*) FROM orders WHERE id = 1 OR id IS NULL", "SELECT COUNT(*) FROM orders WHERE id = 1", "schema"),
+    # WHERE 之外还用到了这一列：SUM(CASE WHEN status = 'paid' …) 配上 IN (…) 和只筛 'paid' 结果一样
+    ("SELECT SUM(CASE WHEN status = 'paid' THEN amount END) FROM orders WHERE status IN ('paid', 'refunded')",
+     "SELECT SUM(amount) FROM orders WHERE status = 'paid'", None),
+    # 和别的列交错的条件
+    ("SELECT COUNT(*) FROM orders WHERE status = 'paid' OR amount > 100",
+     "SELECT COUNT(*) FROM orders WHERE status IN ('paid', 'done') OR amount > 100", None),
+], ids=lambda v: None)
+def test_rewritten_conditions_that_may_not_change_the_result_are_not_said(a, b, schema):
+    for dialect in DIALECTS:
+        diff = explain_sql_diff(a, b, dialect, schema=sql_pairs.schema_cache() if schema else None)
+        check_shape(diff)
+        assert not diff.equivalent and not any("的条件是" in d.text for d in diff.items), (dialect, diff.items)
+
+
+def test_explaining_rewritten_conditions_never_changes_the_equivalence_verdict(monkeypatch):
+    """同一列上的条件改写只进说明：等价与否、在哪一级规范形式上判的，和不说这一类时一字不差（语料各对、两种先后、给不给
+    表结构）；规范化本来就认得的改写（IN 只有一个值、IN 列表去重排序）照样判等价、没有条目。"""
+    from app.data import sql_semantics
+
+    pairs = [(p.a, p.b) for p in sql_pairs.PAIRS] + [
+        ("SELECT SUM(amount) FROM orders WHERE status IN ('paid')", "SELECT SUM(amount) FROM orders WHERE status = 'paid'"),
+        ("SELECT COUNT(*) FROM orders WHERE status IN ('void', 'paid', 'paid')",
+         "SELECT COUNT(*) FROM orders WHERE status IN ('paid', 'void')"),
+        ("SELECT SUM(amount) FROM orders WHERE status IN ('paid', 'refunded')",
+         "SELECT SUM(amount) FROM orders WHERE status = 'paid'"),
+    ]
+    schema = sql_pairs.schema_cache()
+
+    def verdicts() -> list[tuple[bool, str | None]]:
+        out = []
+        for a, b in pairs:
+            for x, y in ((a, b), (b, a)):
+                for sc in (None, schema):
+                    diff = explain_sql_diff(x, y, "sqlite", schema=sc)
+                    out.append((diff.equivalent, diff.level))
+        return out
+
+    with_rewrites = verdicts()
+    monkeypatch.setattr(sql_semantics._Explainer, "_rewrites", lambda self, A, B, xa, xb, oa, ob, m: (oa, ob))
+    assert verdicts() == with_rewrites
+    for a, b in pairs[-3:-1]:
+        diff = explain_sql_diff(a, b, "sqlite")
+        assert diff.equivalent and diff.items == [], (a, b)
 
 
 def test_a_difference_inside_a_cte_used_only_in_a_condition_subquery_is_never_missed():
@@ -754,9 +842,9 @@ def test_nothing_specific_gives_one_fallback_item_and_the_lines_that_differ():
 
 
 def test_specific_items_that_cover_only_part_end_with_the_rest_note():
-    """按哪一列筛时间说得准，同一列 status 上换了筛选的值说不了：说时间那一句，补一句「另有未能归纳的差异」。"""
-    a = "SELECT SUM(amount) FROM orders WHERE paid_at >= '2026-09-01' AND status = 'paid'"
-    b = "SELECT SUM(amount) FROM orders WHERE created_at >= '2026-09-01' AND status IN ('paid', 'done')"
+    """按哪一列筛时间说得准，LOWER(status) 上换了筛选的值说不了：说时间那一句，补一句「另有未能归纳的差异」。"""
+    a = "SELECT SUM(amount) FROM orders WHERE paid_at >= '2026-09-01' AND LOWER(status) = 'paid'"
+    b = "SELECT SUM(amount) FROM orders WHERE created_at >= '2026-09-01' AND LOWER(status) IN ('paid', 'done')"
     diff = explain_sql_diff(a, b, labels=LABELS)
     check_shape(diff)
     assert diff.fallback and [d.text for d in diff.items] == ["原流程按 paid_at 筛时间，盲算按 created_at", FALLBACK_REST]

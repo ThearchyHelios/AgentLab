@@ -111,7 +111,7 @@ PIPES_AS_CONCAT 的库这两处的意思不同，sqlglot 的 MySQL 读法和这�
 **具体说法（见 _Explainer）。** 只在两边的规范形式都是「简单形状」时说（_simple_block：整条语句就是一段 SELECT，没有
 CTE、子查询、UNION 这类合并、窗口函数、DISTINCT ON；FROM 里只有实表，连接只有内连接、CROSS JOIN、逗号和 LEFT JOIN；
 LIMIT 是至少为 1 的常数；没有认不准的名字、SELECT 列表里没有 sqlglot 不认识的函数；不认列的那一级里原文没有在
-WHERE / GROUP BY 里用列别名的），而且只说四类：
+WHERE / GROUP BY 里用列别名的），而且只说五类：
 
 - 时间列（time）：两边各在一张底层表的一列上按时间筛、列不同（另一边哪儿都没用这一列筛选，两边的时间条件都不是恒为
   真的，时间列不在 LEFT JOIN 的可空一侧）；一边按时间筛了、另一边哪儿都没有可能是时间窗口的条件的（见下），也说成
@@ -129,6 +129,13 @@ WHERE / GROUP BY 里用列别名的），而且只说四类：
   不用到 LEFT JOIN 可空一侧的列（WHERE r.id IS NULL 是反连接，说的是「没关联上」；r.order_id IS NULL 和 ON 里的
   r.order_id = o.id 一起已经蕴含 r.id IS NULL）；不是可能的时间窗口（_window_like：date_key BETWEEN 20260901 AND
   20260930、stat_month = 202609——认不准是不是时间列，说成有效行过滤会被写进数据目录）。detail 给条件涉及的实表列。
+- 同一列上的条件改写（filter / time_range，a、b 两边都有）：两边 WHERE 里对同一张实表的同一列各写了一套条件、留下的
+  取值不同——等号对 IN（口径 status = 'paid'，这次 status IN ('paid', 'refunded')）、取值集合不同、范围的端点不同，说
+  「A 对 status 的条件是 …，B 是 …」，两边都只是取值集合、又有共同的取值时补「（B 多了 'refunded'）」。要两边用到这一列
+  的条件都只涉及这一列、比的就是那一列本身，按取值逐段算过两边留下的取值确实不同（_Range.compare：表结构里确定不为空
+  的列不拿空值比；x >= 100 AND x >= 50 对 x >= 100 这类冗余写法算出来一样，不说），这一列不在 LEFT JOIN 的可空一侧，
+  两边在 WHERE 之外（ON、HAVING、CASE / FILTER、聚合的参数）都没用到这一列，不是认不准的时间窗口，没换表。两边都是
+  时间条件时 aspect 是 time_range。只改说明：走到这里时已经判了不等价（见 _Explainer._rewrites）。
 - 聚合与去重（aggregate / group_by）：选出来的列只差在顶层的聚合函数上（同一列做参数，SUM 对 AVG；COUNT(*) 对 SUM(x)）
   或者去重上（COUNT / SUM / AVG 去不去重、COUNT(*) 对 COUNT(DISTINCT x)、SELECT DISTINCT 对不去重），分组一样。参数
   得是光一列、在每组里不是定死的（不被 WHERE 定成常量、不等于分组键、表结构里它那张表的键没有在组里定死——按 u.id 分组
@@ -144,7 +151,7 @@ WHERE / GROUP BY 里用列别名的），而且只说四类：
 每一句都先确认这处不同真会影响结果：两边的 WHERE、HAVING、ON 里有可能恒为假的条件（常量条件，同一个对象上取不到值的
 几个条件）时什么都不说；结果看不见行的（SELECT COUNT(*) > -1 这类只出一行、值又和行无关的）不说筛选、关联上的不同；
 表结构里的约束（主键、唯一约束、外键、NOT NULL）说明不起作用的不说——约束只拿来少说，不拿来判等价。被 WHERE 用常量定死
-的列出现在排序、分组里的差异，恒为真的 HAVING，都不在四类里，不说。两边给人看的写法一样、和已经说过的一句正好反过来的
+的列出现在排序、分组里的差异，恒为真的 HAVING，都不在五类里，不说。两边给人看的写法一样、和已经说过的一句正好反过来的
 不说。
 
 **兜底。** 规范形式不一致、一条具体说法都没有时，给一条 aspect="other" 的「两条 SQL 的写法不同，未能归纳成具体差异，
@@ -164,8 +171,9 @@ WHERE / GROUP BY 里用列别名的），而且只说四类：
   关联先后、按 WHERE 把外连接改成内连接、换成相等的列；没给表结构（或者类型不一样）时按关联条件相等的两列换着分组、
   排序；PostgreSQL、MySQL 没给表结构时去重、分组、求和的一段调换关联先后、并子查询、去掉没用到的 LEFT JOIN、把只取
   可空一侧聚合的 LEFT JOIN 写成内连接。
-- 只给兜底的：不是简单形状的（CTE、子查询、UNION、窗口函数，规范化没把它们并掉的）；四类以外的不同（同一列上的时间
-  范围、同一列上换了筛选的值、关联条件、分组、HAVING、排序、取几行、选出来的列、聚合的参数）；几张表、几列交错的条件；
+- 只给兜底的：不是简单形状的（CTE、子查询、UNION、窗口函数，规范化没把它们并掉的）；五类以外的不同（算出来的值上的
+  条件改写——LOWER(status) = 'paid' 对 LOWER(status) IN (…)、和别的列交错的同一列条件、关联条件、分组、HAVING、排序、
+  取几行、选出来的列、聚合的参数）；几张表、几列交错的条件；
   自己关联自己、同名的表关联了几次的；换了表又有关联条件不同的；条件写在聚合里的一边对条件写在 WHERE 里的一边（SUM(status
   = 'paid') 对 COUNT(*) … WHERE status = 'paid'：真正的不同是计数为 0 的组、空集时是 0 还是 NULL，说不清）；反连接；
   可能是时间窗口、又认不准是不是时间列的条件（业务日期键、统计月份、分区，第几天这类范围）。
@@ -5902,8 +5910,9 @@ class FacetDiff:
     set_op（几支查询怎么合并）/ group_by（分组键、去重）/ having / limit（取哪几行，含取行前的排序）/ order（只是最终
     结果的排序不同，不影响取到哪些行）/ parse（解析不了）/ other（兜底：未能归纳成具体差异，见 explain_sql_diff）。a、b
     是两边各自的写法（给人看，没有就是 None），text 是一句中文说明。detail 只在 time 上有：两边的时间列
-    [{table, column}]（各是各的表），调用方据此对照数据目录（业务日期）；在 filter 上有 {"columns": [{table, column}]}：
-    条件只涉及的实表列，对照有效行过滤用。"""
+    [{table, column}]（各是各的表），调用方据此对照数据目录（业务日期）；在 filter、time_range 上有 {"columns":
+    [{table, column}]}：条件只涉及的实表列，对照有效行过滤用。filter 一边是 None 的是「一边多出来的条件」；两边都有的是
+    同一列上的条件两边各写了一套（「A 对 X 的条件是 …，B 是 …」），不是一边多出来的有效行条件。"""
 
     aspect: str
     a: Any
@@ -6360,8 +6369,10 @@ class _Range:
             subject = n.this
         return self._truth(n, assign[_fingerprint(subject)])
 
-    def compare(self, conds_a: list[Any], conds_b: list[Any], grouped: bool = False) -> bool | None:
-        """两组条件（各自 AND 连，可以一边为空 = 不筛）留下的取值是不是一样：一样 True，不一样 False，认不出 None。"""
+    def compare(self, conds_a: list[Any], conds_b: list[Any], grouped: bool = False,
+                never_null: bool = False) -> bool | None:
+        """两组条件（各自 AND 连，可以一边为空 = 不筛）留下的取值是不是一样：一样 True，不一样 False，认不出 None。
+        never_null：对象一定不为空（表结构里不为空的列），不拿空值比。"""
         parsed = [self.subject(c) for c in conds_a + conds_b]
         if any(p is None for p in parsed) or len({p[0] for p in parsed}) != 1:
             return None
@@ -6373,7 +6384,7 @@ class _Range:
         from sqlglot import exp
 
         values = self._pieces(subject, literals, ranged, grouped)
-        if not isinstance(_unparen(subject), exp.Count):
+        if not isinstance(_unparen(subject), exp.Count) and not never_null:
             values.append(None)
         for v in values:
             ta = all(self._truth(c, v) == "T" for c in conds_a)
@@ -6745,7 +6756,7 @@ def _alias_named(root: Any) -> bool:
 class _Explainer:
     """在两边的规范形式上找有把握、又确实影响结果的不同，写成具体的中文句子，同时记下是不是所有不同都说到了。
 
-    只在两边都是简单形状时说（见 _simple_block），也只说下面四类；别的不同（同一列上的时间范围、同一列上换了筛选的值、
+    只在两边都是简单形状时说（见 _simple_block），也只说下面五类；别的不同（算出来的值上换了筛选的值、
     关联条件、分组、HAVING、排序、取几行、选出来的列、聚合的参数……）一律算没说到，交给兜底说明：
 
     - time：底层表上按哪一列筛时间不同（两边各在一列上按时间筛，列不同，另一边哪儿都没用这一列筛选，时间列不在 LEFT
@@ -6757,6 +6768,8 @@ class _Explainer:
       那一列（LOWER(x) <> 'PAID' 这类认不出取值范围、可能恒为真）；按取值逐段算过不是恒为真的（见 _Range.always，一定
       不为空的列不算空值，见 _never_null）；不用到 LEFT JOIN 可空一侧的列（反连接，见 _on_nullable_side）；不是认不准
       的时间窗口（见 _window_like）。
+    - filter / time_range（a、b 两边都有）：同一列上的条件两边各写了一套、留下的取值确实不同（等号对 IN、取值集合不同、
+      范围的端点不同），说「A 对 X 的条件是 …，B 是 …」，见 _rewrites。
     - aggregate / group_by：选出来的列只差在顶层的聚合函数（同一列做参数，SUM 对 AVG；COUNT(*) 对 SUM(x)）或者去重上
       （COUNT / SUM / AVG 去不去重，COUNT(*) 对 COUNT(DISTINCT x)，SELECT DISTINCT 对不去重），分组一样。参数在组里
       定死的不说（被 WHERE / ON 定成常量、等于分组键、本身是常量、它那张表的键在组里定死了，见 _fixed_in_group）；去重
@@ -7312,8 +7325,8 @@ class _Explainer:
 
     def conditions(self, A: _Block, B: _Block, mapping: Mapping[str, str], skip_a: set[str],
                    skip_b: set[str]) -> bool:
-        """WHERE：两边没配上的条件里说得准的两类——按哪一列筛时间不同（_times）、一边多出来的筛选条件（_extra_filters）；
-        剩下的算没说到。"""
+        """WHERE：两边没配上的条件里说得准的三类——按哪一列筛时间不同（_times）、同一列上的条件两边各写了一套（_rewrites）、
+        一边多出来的筛选条件（_extra_filters）；剩下的算没说到。"""
         xa = [c for c in A.where if self.fp(c) not in skip_a]
         xb = [c for c in B.where if self.fp(c) not in skip_b]
         only_a, only_b = self._unmatched(xa, xb, mapping)
@@ -7322,6 +7335,7 @@ class _Explainer:
         if not self.visible:
             return False
         only_a, only_b, covered = self._times(A, B, only_a, only_b)
+        only_a, only_b = self._rewrites(A, B, xa, xb, only_a, only_b, mapping)
         covered &= self._extra_filters(A, B, xa, only_a, 0)
         covered &= self._extra_filters(B, A, xb, only_b, 1)
         return covered
@@ -7360,6 +7374,100 @@ class _Explainer:
         self.add("time", ka[1], kb[1], text, detail)
         return [c for c in only_a if all(c is not x for x in conds_a)], \
             [c for c in only_b if all(c is not x for x in conds_b)], True
+
+    def _rewrites(self, A: _Block, B: _Block, xa: list[Any], xb: list[Any], only_a: list[Any], only_b: list[Any],
+                  mapping: Mapping[str, str]) -> tuple[list[Any], list[Any]]:
+        """同一列上的条件两边各写了一套、留下的取值确实不同：说「A 对 X 的条件是 …，B 是 …」——等号对 IN（口径
+        status = 'paid'，这次 status IN ('paid', 'refunded')）、取值集合不同、范围的端点不同。两边都只是「等于常量 / 在
+        常量列表里」、又有共同的取值时补一句各多了哪几个取值。说到了的从两边拿掉，说不准的原样还回去（交给
+        _extra_filters，多半是兜底）。
+
+        说得准要（每一条都是为了不说出不存在的不同）：两边对这一列都有条件、至少一边有没配上的；两边 WHERE 里用到这一列的
+        条件都只涉及这一列（不和别的列交错）、比的就是那一列本身（不是 LOWER(x)），按取值逐段算过两边留下的取值不一样
+        （_Range.compare：表结构里确定不为空的列不拿空值比；认不出、算出来一样的不说——x >= 100 AND x >= 50 对 x >= 100
+        只是冗余的写法）；这一列不在 LEFT JOIN 的可空一侧（那是关联上的事）；两边在 WHERE 之外（ON、HAVING、CASE / FILTER、
+        条件里套着的聚合参数）都没用到这一列（SUM(CASE WHEN status = 'paid' …) 配上 WHERE status IN (…) 可能和只筛
+        'paid' 一样）；不是认不准的时间窗口（_window_like：date_key BETWEEN 20260901 AND 20260930）；没换表。两边的条件
+        都是时间条件（timed）时 aspect 是 time_range，否则是 filter（a、b 两边都有，dual_check_facts 不会把它当成「一边
+        多出来的有效行条件」写进数据目录）。
+
+        只改说明，不碰等价判定：走到这里时两边已经判了不等价（见 explain_sql_diff）。"""
+        if self.swapped or self.usage_a is None or self.usage_b is None:
+            return only_a, only_b
+        refs_a = [self.refs(c, A) for c in xa]
+        refs_b = [self.refs(c, B) for c in xb]
+        if any(r is None for r in refs_a + refs_b):
+            # 有认不出用到哪些列的条件：它可能也用到了这一列，说「A 对 X 的条件是 …」就不全
+            return only_a, only_b
+        keys: list[tuple[str, str]] = []
+        for c, block in [(c, A) for c in only_a] + [(c, B) for c in only_b]:
+            found = self.refs(c, block)
+            if found is not None and len(found) == 1 and next(iter(found)) not in keys:
+                keys.append(next(iter(found)))
+        for key in keys:
+            on_a = [c for c, r in zip(xa, refs_a) if key in r]
+            on_b = [c for c, r in zip(xb, refs_b) if key in r]
+            pending_a = [c for c in only_a if any(c is x for x in on_a)]
+            pending_b = [c for c in only_b if any(c is x for x in on_b)]
+            if not on_a or not on_b or not (pending_a or pending_b):
+                continue
+            if any(r != {key} for r in refs_a if r & {key}) or any(r != {key} for r in refs_b if r & {key}):
+                continue
+            if self._on_nullable_side(on_a, A) or self._on_nullable_side(on_b, B):
+                continue
+            mapped_b = [self.mapped(c, mapping) for c in on_b]
+            if not self._plain_subjects(on_a + mapped_b):
+                continue
+            times = {self.timed(c, A) for c in on_a} | {self.timed(c, B) for c in on_b}
+            if times != {key} and any(_window_like(c) for c in on_a + on_b):
+                continue
+            kinds = _kinds_for(on_a + on_b)
+            if self.usage_a.touches({key}, skip=on_a, kinds=kinds) or self.usage_b.touches({key}, skip=on_b, kinds=kinds):
+                continue
+            never_null = _not_null_column(self.info, key[0], key[1], self.read)
+            if self.range.compare(on_a, mapped_b, never_null=never_null) is not False:
+                continue
+            shown_a, shown_b = self.show_all(_by_bound(on_a), A), self.show_all(_by_bound(on_b), B)
+            text = _say(self.la, "对", self.named(*key, qualified=len(A.all_rels()) > 1), "的条件是", shown_a, "，",
+                        self.lb, "是", shown_b)
+            more = self._members(on_a), self._members(mapped_b)
+            # 两边都只是取值集合、又有共同的取值时补一句各多了哪几个（两边的取值毫不相干时前一句已经说全了）
+            if more[0] is not None and more[1] is not None and set(more[0]) & set(more[1]):
+                extra_a = [shown for value, shown in more[0].items() if value not in more[1]]
+                extra_b = [shown for value, shown in more[1].items() if value not in more[0]]
+                parts = [_say(label, "多了", "、".join(extra)) for label, extra in ((self.la, extra_a),
+                                                                                  (self.lb, extra_b)) if extra]
+                if parts:
+                    text = _say(text, "（", "，".join(parts), "）")
+            self.add("time_range" if times == {key} else "filter", shown_a, shown_b, text,
+                     {"columns": [{"table": key[0], "column": key[1]}]})
+            only_a = [c for c in only_a if all(c is not x for x in on_a)]
+            only_b = [c for c in only_b if all(c is not x for x in on_b)]
+        return only_a, only_b
+
+    def _members(self, conds: list[Any]) -> dict[Any, str] | None:
+        """几个条件（AND 连）都是「一列等于常量 / 在常量列表里」时，留下的取值 {比较用的值（见 _Range._norm）: 给人看的
+        写法}；有别的写法（比大小、不等于、NOT、OR、列表里的 NULL）返回 None。"""
+        from sqlglot import exp
+
+        kept: dict[Any, str] | None = None
+        for cond in conds:
+            cond = _unparen(cond)
+            if isinstance(cond, exp.EQ):
+                items = [cond.expression] if _literal_value(cond.expression) is not None else [cond.this]
+            elif isinstance(cond, exp.In) and cond.expressions and not cond.args.get("query") and \
+                    not cond.args.get("unnest") and not cond.args.get("field"):
+                items = list(cond.expressions)
+            else:
+                return None
+            values: dict[Any, str] = {}
+            for item in items:
+                value = _literal_value(item)
+                if value is None:
+                    return None
+                values.setdefault(self.range._norm(value), self.sql(item))
+            kept = values if kept is None else {v: shown for v, shown in kept.items() if v in values}
+        return kept
 
     def _extra_filters(self, block: _Block, other: _Block, where: list[Any], rest: list[Any], side: int) -> bool:
         """block 这一边多出来的筛选条件（rest 是它没配上的 WHERE 项）。按用到的列连成一组（x > 5 和 x IS NOT NULL
@@ -7943,9 +8051,9 @@ def explain_sql_diff(a: str, b: str, dialect: str | None = None, *, schema: Mapp
     一元加号、0x10、换了名字的类型名，不知道是哪种库时套着的块注释、紧跟着字的 --、双引号括起来的名字……，见
     _lost_in_parsing、_misread）不在语法树上判等价，只给兜底和原文的逐行对照。
 
-    不等价时怎么说：两边的规范形式都是简单形状时（一段 SELECT、实表、普通的连接，见 _simple_block），只把四类有把握、
-    真会影响结果的不同写成具体的中文句子（按哪一列筛时间、一边多出来的筛选条件、顶层的聚合函数和去重、关联的表和关联
-    类型，见 _Explainer）；具体说法一条都没有时给一条 aspect="other" 的兜底说明（「两条 SQL 的写法不同，未能归纳成具体
+    不等价时怎么说：两边的规范形式都是简单形状时（一段 SELECT、实表、普通的连接，见 _simple_block），只把五类有把握、
+    真会影响结果的不同写成具体的中文句子（按哪一列筛时间、一边多出来的筛选条件、同一列上的条件改写、顶层的聚合函数和
+    去重、关联的表和关联类型，见 _Explainer）；具体说法一条都没有时给一条 aspect="other" 的兜底说明（「两条 SQL 的写法不同，未能归纳成具体
     差异，请对照原文」），只覆盖了一部分时追加一条「另有未能归纳的差异」，fallback 为真；text_diff 给出规范化之后不同
     的行（没有规范形式可比时给原文的逐行对照）。
 

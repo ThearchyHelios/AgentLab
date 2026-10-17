@@ -450,9 +450,9 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
   // 而避开本来对的一边。变体的 catalog 是服务端对这一对 SQL 的真实预告，按它核对
   const { CATALOG_TABLE_FIELD_LABEL: LABEL } = await import(await load('/src/lib/terms.ts'))
   // [变体, 说明, 服务端不写的那一种卡上照实说的那句（只在卡上提数据目录时有）]。变体挑的是收尾版差异说明下各有代表性
-  // 的几种（backend/tests/test_dual_check_fixture.py 的模块说明）：同一列上的时间范围不同只给兜底（fallback）
+  // 的几种（backend/tests/test_dual_check_fixture.py 的模块说明）：套着 DATE() 的时间范围不同只给兜底（fallback）
   const cases = [
-    ['fallback', '说不清的（同一列上的时间范围不同，只给兜底）'],
+    ['fallback', '说不清的（套着 DATE() 的时间范围不同，只给兜底）'],
     ['two_filters', '差两个筛选条件'],
     ['join', '差在关联方式'],
     ['parse', '一边解析失败'],
@@ -492,7 +492,7 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
         && note.includes('按不同的列筛时间') && note.includes('采用的一边所用的时间列'), note)
     }
     if (name === 'fallback') {
-      // 收尾版差异说明归纳不了同一列上的时间范围：卡上写那句固定的兜底说明，默认展开对照，审核人逐行对照两条 SQL
+      // 收尾版差异说明归纳不了套着函数的时间范围：卡上写那句固定的兜底说明，默认展开对照，审核人逐行对照两条 SQL
       check('……写那句固定的兜底说明，不当成一条具体差异', (await text(gmv.locator('[data-dual-fallback]'))) === '两条 SQL 的写法不同，未能归纳成具体差异'
         && await gmv.locator('[data-dual-diff-item]').count() === 0, await text(gmv.locator('[data-dual-fallback]')))
       check('……默认展开对照', (await gmv.locator('[data-dual-compare-toggle]').getAttribute('aria-expanded')) === 'true')
@@ -532,7 +532,7 @@ await section('审批卡：没有预告时，「记入数据目录」只说必�
         const marked = [...m.normDel, ...m.normAdd]
         check('……两边相同的条件（开始日期）不标，只标不同的那一行', m.normDel.length === 1 && m.normAdd.length === 1
           && !marked.some((l) => l.includes(">= '2026-09-01'"))
-          && marked.every((l) => l.includes("orders.paid_at < '2026-09-")), marked.join(' ‖ '))
+          && marked.every((l) => l.includes("DATE(orders.paid_at) < '2026-09-")), marked.join(' ‖ '))
       }
       if (name === 'two_filters') {
         check('……一边多出的两个条件各占一行', m.normDel.includes("orders.channel = 'web'")
