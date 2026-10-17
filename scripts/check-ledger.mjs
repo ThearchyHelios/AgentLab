@@ -24,7 +24,8 @@
 import { readFileSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 import {
-  ISSUE, QUEUE, RECONCILE, RECONCILE_VALUES, WHOLE, WHOLE_LABELS, copiedMetricDetail, ledgerOf, metricDetail, reconciledOf,
+  CELL_LABELS, CELL_WHOLE, ISSUE, QUEUE, RECONCILE, RECONCILE_VALUES, WHOLE, WHOLE_LABELS, copiedMetricDetail, ledgerOf,
+  metricDetail, reconciledOf,
 } from './ledger-fixtures.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -177,6 +178,29 @@ await section('「口径」一步的三种情况：来自口径、相关口径�
   await openSeg(page, 's12')
   await page.locator('[data-evidence-panel] [data-ev-ledger="reasoning"]').waitFor({ timeout: 5000 })
   check('这次的推理：没有相关的已发布口径', (await panelPart(page).innerText()).includes('没有相关的已发布口径'))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+// ---------------------------------------------------------------- 逐格判
+
+await section('同一条查询的几个数逐格标：一格来自口径、一格只是相关，整题不等价不给出具', async () => {
+  const { page, errors } = await open('/ui-harness.html?evidence=1', {
+    reply: evidenceReply(() => ledgerOf(RUN, { labels: CELL_LABELS, whole: CELL_WHOLE, actions: [] })) })
+  await page.waitForSelector('#evidence-wide [data-ev-caliber-of="s6"]', { timeout: 10000 })
+  check('正文的小标记按数挂：来自口径的那一格挂上，相关的那一格不挂', await page.locator('#evidence-wide [data-ev-caliber-of="s6"]').count() === 1
+    && await page.locator('#evidence-wide [data-ev-caliber-of="s10"]').count() === 0)
+  await openSeg(page, 's6')
+  await page.locator('[data-evidence-panel] [data-ev-ledger="caliber"]').waitFor({ timeout: 5000 })
+  const caliber = await panelPart(page).innerText()
+  check('销售额那一格：来自口径、等价已证明、按口径的哪一列、参数', caliber.includes('来自口径「周报口径」v2（受管）')
+    && caliber.includes('等价已证明') && caliber.includes('gmv') && caliber.includes('start = 2026-10-05'), caliber)
+  check('……整题不等价：不给按口径出具', await page.locator('[data-evidence-panel] [data-ledger-issue]').count() === 0)
+  await openSeg(page, 's10')
+  await page.locator('[data-evidence-panel] [data-ev-ledger="related"]').waitFor({ timeout: 5000 })
+  const related = await panelPart(page).innerText()
+  check('同一条查询的订单数那一格：相关口径，差在哪先说多查了几列、再说计数对求和', related.includes('相关口径「周报口径」v2')
+    && related.includes('这次多查了 3 列，不影响这个数') && related.includes('这次数的是行数，口径对 amount 求和')
+    && !related.includes('未能归纳'), related)
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 })
 

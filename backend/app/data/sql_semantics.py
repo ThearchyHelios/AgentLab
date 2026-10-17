@@ -145,6 +145,10 @@ WHERE / GROUP BY 里用列别名的），而且只说五类：
   得是光一列、在每组里不是定死的（不被 WHERE 定成常量、不等于分组键、表结构里它那张表的键没有在组里定死——按 u.id 分组
   时 MAX(u.city) 和 MIN(u.city) 一样，LEFT JOIN 把行复制了也一样）；去重不起作用的不说（MIN / MAX；不分组的聚合只出
   一行；已经按选出来的列分组；只取一行；表结构里的键说明每行本来就不一样）；每组只有一行时 SUM、AVG、MIN、MAX 不说。
+  同一位置上一边套了 COALESCE(聚合, 常量)、另一边就是那个聚合（SUM / AVG / MIN / MAX，COUNT 不会是空、不说），说
+  「X 套了 COALESCE(…, 0)：没有符合条件的行（或参数都为空）时 A 是 0、B 是空」（_coalesced）。
+- 同一列上一边按运行当天现算（CURRENT_DATE、date('now', …)、now()）、另一边写定的常量（time_range，_relative）：说「A 对 X
+  的条件是 …，按运行当天现算；B 写定的是 …」，要求同 _rewrites。
 - 关联的表、关联类型（tables / join）：换了一张表；一边多关联了一张表（表结构里有指向它的外键、关联条件又用到它的键的
   不说）；一边多 LEFT JOIN 了一张表（在 ON 之外没用到、结果看得见重复的行、表结构里这张表的键不在 ON 里）；同一张表、
   同样的条件，LEFT JOIN 对内连接（可空一侧在 WHERE、HAVING、后面的连接里都没用到——后面的内连接引用可空一侧时没关联上
@@ -927,6 +931,27 @@ def _window_like(node: Any) -> bool:
             continue
         if _datey(n) or any(_date_like_literal(x) for x in n.find_all(exp.Literal)) or \
                 any(c.name and _timeish_name(c.name) for c in n.find_all(exp.Column)):
+            return True
+    return False
+
+
+#: 按运行当天现算的写法：这几种节点（sqlglot 的类名）、这几个函数名（sqlglot 不认识、读成 Anonymous 的），以及 SQLite 的
+#: date('now', …) 这类把 'now' 当参数的
+_NOW_NODES = frozenset({"CurrentDate", "CurrentTimestamp", "CurrentDatetime", "CurrentTime", "Localtime",
+                        "Localtimestamp", "CurrentTimestampLTZ"})
+_NOW_NAMES = frozenset({"now", "getdate", "sysdate", "sysdatetime", "localtime", "localtimestamp", "today"})
+
+
+def _now_based(node: Any) -> bool:
+    """这个表达式按运行当天现算（CURRENT_DATE、now()、SQLite 的 date('now', '-7 days')）：同一条 SQL 换一天运行，取值就变。"""
+    from sqlglot import exp
+
+    for n in node.walk():
+        if type(n).__name__ in _NOW_NODES:
+            return True
+        if isinstance(n, exp.Anonymous) and str(n.name).lower() in _NOW_NAMES:
+            return True
+        if isinstance(n, exp.Literal) and n.is_string and str(n.this).strip().lower() == "now":
             return True
     return False
 
@@ -6805,6 +6830,8 @@ class _Explainer:
         self.visible = True
         #: 有一句话没说出口（两边给人看的写法一样，或者和前面的话矛盾）：这一处不同就没说到
         self.withheld = False
+        #: 两边解析出来的原样的树（statement 记下）：选出来的列叫什么（规范形式去掉了外层别名）从这里取
+        self.roots: tuple[Any, Any] = (None, None)
 
     def sql(self, node: Any) -> str:
         """给人看的写法：按方言生成；生成的写法读回来不是同一棵树时（SQLite 把 CAST(x AS DATE) 生成 DATE(x)，两者
@@ -6836,6 +6863,7 @@ class _Explainer:
         if self._dead(A) or self._dead(B):
             return False
         self.visible = self._rows_visible(A) and self._rows_visible(B)
+        self.roots = roots
         self.usage_a, self.usage_b = _Usage(form_a.tree), _Usage(form_b.tree)
         matched = self.relations(A, B)
         if matched is None:
@@ -7416,6 +7444,7 @@ class _Explainer:
             return False
         only_a, only_b, covered = self._times(A, B, only_a, only_b)
         only_a, only_b = self._rewrites(A, B, xa, xb, only_a, only_b, mapping)
+        only_a, only_b = self._relative(A, B, xa, xb, only_a, only_b, mapping)
         covered &= self._extra_filters(A, B, xa, only_a, 0)
         covered &= self._extra_filters(B, A, xb, only_b, 1)
         return covered
@@ -7522,6 +7551,53 @@ class _Explainer:
                     text = _say(text, "（", "，".join(parts), "）")
             self.add("time_range" if times == {key} else "filter", shown_a, shown_b, text,
                      {"columns": [{"table": key[0], "column": key[1]}]})
+            only_a = [c for c in only_a if all(c is not x for x in on_a)]
+            only_b = [c for c in only_b if all(c is not x for x in on_b)]
+        return only_a, only_b
+
+    def _relative(self, A: _Block, B: _Block, xa: list[Any], xb: list[Any], only_a: list[Any], only_b: list[Any],
+                  mapping: Mapping[str, str]) -> tuple[list[Any], list[Any]]:
+        """同一列上一边按运行当天现算（CURRENT_DATE、date('now', …)、now() 这类，见 _now_based）、另一边写定的常量：说「A 对
+        paid_date 的条件是 …，按运行当天现算（换一天运行，范围随之改变）；B 写定的是 …」。_Range 比不了现算的值，_rewrites 说不了，
+        以前整段兜底。一边现算、一边写定本身就是不同（只在某一天碰巧一样），说得准要的同 _rewrites：两边 WHERE 里用到这一列的
+        条件都只涉及这一列、一边全是现算的、另一边全是写定的；这一列不在 LEFT JOIN 的可空一侧；WHERE 之外没用到这一列；
+        没换表。只改说明：走到这里时两边已经判了不等价。"""
+        if self.swapped or self.usage_a is None or self.usage_b is None:
+            return only_a, only_b
+        refs_a = [self.refs(c, A) for c in xa]
+        refs_b = [self.refs(c, B) for c in xb]
+        if any(r is None for r in refs_a + refs_b):
+            return only_a, only_b
+        keys: list[tuple[str, str]] = []
+        for c, block in [(c, A) for c in only_a] + [(c, B) for c in only_b]:
+            found = self.refs(c, block)
+            if found is not None and len(found) == 1 and next(iter(found)) not in keys:
+                keys.append(next(iter(found)))
+        for key in keys:
+            on_a = [c for c, r in zip(xa, refs_a) if key in r]
+            on_b = [c for c, r in zip(xb, refs_b) if key in r]
+            if not on_a or not on_b or any(r != {key} for r in refs_a if r & {key}) or \
+                    any(r != {key} for r in refs_b if r & {key}):
+                continue
+            now_a, now_b = [_now_based(c) for c in on_a], [_now_based(c) for c in on_b]
+            if all(now_a) and not any(now_b):
+                side = 0
+            elif all(now_b) and not any(now_a):
+                side = 1
+            else:
+                continue
+            if self._on_nullable_side(on_a, A) or self._on_nullable_side(on_b, B):
+                continue
+            kinds = _kinds_for(on_a + on_b)
+            if self.usage_a.touches({key}, skip=on_a, kinds=kinds) or \
+                    self.usage_b.touches({key}, skip=on_b, kinds=kinds):
+                continue
+            shown_a, shown_b = self.show_all(_by_bound(on_a), A), self.show_all(_by_bound(on_b), B)
+            (me, mine), (them, theirs) = ((self.la, shown_a), (self.lb, shown_b)) if side == 0 else \
+                ((self.lb, shown_b), (self.la, shown_a))
+            text = _say(me, "对", self.named(*key, qualified=len(A.all_rels()) > 1), "的条件是", mine,
+                        "，按运行当天现算（换一天运行，范围随之改变）；", them, "写定的是", theirs)
+            self.add("time_range", shown_a, shown_b, text, {"columns": [{"table": key[0], "column": key[1]}]})
             only_a = [c for c in only_a if all(c is not x for x in on_a)]
             only_b = [c for c in only_b if all(c is not x for x in on_b)]
         return only_a, only_b
@@ -7708,10 +7784,59 @@ class _Explainer:
         if ga != gb or A.distinct != B.distinct or dedup_a != dedup_b or len(ta) != len(tb):
             return False
         covered = True
-        for x, y, fx, fy in zip(A.exprs, B.exprs, ta, tb):
-            if fx != fy and not self._aggregates(x, y, A, B, mapping):
+        for i, (x, y, fx, fy) in enumerate(zip(A.exprs, B.exprs, ta, tb)):
+            if fx != fy and not self._aggregates(x, y, A, B, mapping) and not self._coalesced(i, x, y, A, B, mapping):
                 covered = False
         return covered
+
+    def _output_name(self, side: int, index: int) -> str | None:
+        """原文里第 index 个选出来的列的别名（规范形式去掉了外层别名）；没有别名、认不出的为 None。"""
+        from sqlglot import exp
+
+        root = self.roots[side] if side < len(self.roots) else None
+        items = root.expressions if isinstance(root, exp.Select) else []
+        item = items[index] if index < len(items) else None
+        return item.alias or None if isinstance(item, exp.Alias) else None
+
+    def _coalesced(self, index: int, x: Any, y: Any, A: _Block, B: _Block, mapping: Mapping[str, str]) -> bool:
+        """同一位置上一边是 COALESCE(聚合, 常量)（IFNULL 也读成它），另一边就是那个聚合本身：说「X 套了 COALESCE(…, 0)：
+        没有符合条件的行时这次是 0、口径是空」。只认会得出空值的聚合（SUM / AVG / MIN / MAX；COUNT 不会是空，两边其实一样，
+        不说）；分组一样（outputs 已经比过）。不分组时：没有符合条件的行就出一行空值；参数那一列表结构里一定不为空时只说
+        这一种，否则补上「或者 X 都为空」。分组时每组至少有一行，只剩「这一组的 X 都为空」——参数一定不为空时两边一样，不说。
+        只改说明：走到这里时两边已经判了不等价。"""
+        from sqlglot import exp
+
+        for side, (wrapped, plain, block, other) in enumerate(((x.unalias(), y.unalias(), A, B),
+                                                                (y.unalias(), x.unalias(), B, A))):
+            if not isinstance(wrapped, exp.Coalesce) or len(wrapped.expressions) != 1 or \
+                    not _constant(wrapped.expressions[0]):
+                continue
+            found = _aggregate(wrapped.this)
+            if found is None or found[0] not in ("sum", "avg", "min", "max"):
+                continue
+            same = self.fp(wrapped.this) == self.mfp(plain, mapping) if side == 0 else \
+                self.mfp(wrapped.this, mapping) == self.fp(plain)
+            if not same:
+                continue
+            arg = found[1]
+            cols = self.base_columns(arg, block) if arg is not None else None
+            never_null = bool(cols) and len(cols) == 1 and isinstance(_unparen(arg), exp.Column) and \
+                _not_null_column(self.info, cols[0][0].name, cols[0][1].name, self.read)
+            shown_arg = self.show(arg, block) if arg is not None else "*"
+            if block.group:
+                if never_null:
+                    return False
+                when = _say("某一组的", shown_arg, "都为空时")
+            else:
+                when = "没有符合条件的行时" if never_null else _say("没有符合条件的行、或者", shown_arg, "都为空时")
+            me, them = (self.la, self.lb) if side == 0 else (self.lb, self.la)
+            name = self._output_name(side, index)
+            what = _say(me, "的", name) if name else _say(me, "的这一列")
+            const = self.sql(wrapped.expressions[0])
+            self.add("aggregate", self.show(x, A), self.show(y, B),
+                     _say(what, "套了 COALESCE(…,", const + ")：", when, me, "是", const, "、", them, "是空"))
+            return True
+        return False
 
     def _dedup(self, A: _Block, B: _Block, ga: list[str], gb: list[str]) -> bool:
         """一边去重（SELECT DISTINCT，规范化写成了按选出来的列 GROUP BY）、另一边不去重，选出来的列一样。去重不起作用的
@@ -8757,11 +8882,11 @@ def match_template(template_sql: str, slots: Any, sql: str, dialect: str | None 
             break
         rendered = render_bound(template_sql, values, slots)
         diff = explain_sql_diff(sql, rendered, dialect, schema=schema, names=names, labels=labels)
-        if diff.equivalent and _unfilled(found, values, defaults):
+        if _unfilled(found, values, defaults) and not _parse_failed(diff):
             # 有槽位既没取到值、也没有缺省值：渲染出来的是口径实际不会执行的 SQL（裸写的槽位成了空白，sqlglot 照样解析得了
-            # EXISTS (SELECT  FROM …)），不能拿它证明等价
-            diff = SqlDiff(False, [FacetDiff("other", None, None, _UNFILLED)], True, (f"- {sql.strip()}",
-                                                                                     f"+ {rendered.strip()}"))
+            # EXISTS (SELECT  FROM …)），不能拿它证明等价；拿它说差在哪也只会说出「口径写定的是 paid_at >= ''」这种不存在的
+            # 写法，改说取不到参数（这次写的是现算日期的说清楚）
+            diff = _unfilled_diff(template_sql, sql, rendered, read)
         if diff.equivalent:
             return TemplateMatch(True, binding=values, unbound=unbound, level=level, diff=diff, rendered=rendered,
                                  columns=_column_map(sql, rendered, read, info, columns))
@@ -8776,9 +8901,8 @@ def match_template(template_sql: str, slots: Any, sql: str, dialect: str | None 
     fields = tuple(dict.fromkeys(slot.field for _, _, slot in spans))
     rendered = render_bound(template_sql, {}, slots)
     diff = explain_sql_diff(sql, rendered, dialect, schema=schema, names=names, labels=labels)
-    if diff.equivalent and _unfilled(tuple(slot for _, _, slot in spans), {}, defaults):
-        diff = SqlDiff(False, [FacetDiff("other", None, None, _UNFILLED)], True,
-                       (f"- {sql.strip()}", f"+ {rendered.strip()}"))
+    if _unfilled(tuple(slot for _, _, slot in spans), {}, defaults) and not _parse_failed(diff):
+        diff = _unfilled_diff(template_sql, sql, rendered, read)
     if diff.equivalent:
         # 口径的参数只出现在注释里、或者缺省值正好就是这次的：渲染出来就是等价的
         return TemplateMatch(True, unbound=fields, diff=diff, rendered=rendered,
@@ -8789,6 +8913,80 @@ def match_template(template_sql: str, slots: Any, sql: str, dialect: str | None 
 
 #: 有槽位没取到值、又没有缺省值时的说法
 _UNFILLED = "口径的参数有的没能从这次的 SQL 里取到，又没有缺省值，无法按口径渲染出可比的 SQL"
+#: 没取到值的槽位，这次的 SQL 在那里写的是按运行当天现算的日期
+_NOW_SLOT = ("{ours}对 {column} 的条件是 {cond}，按运行当天现算；口径的入口字段「{field}」要写定的值，无法从这次的 SQL"
+             "里得出，没有按口径比较")
+_COMPARE_NODES = ("EQ", "NEQ", "GT", "GTE", "LT", "LTE")
+
+
+def _now_slots(template_sql: str, sql: str, read: str | None) -> list[tuple[str, str, str]]:
+    """口径模板里「列 比较 槽位」的几处，这次的 SQL 在同一列、同一种比较上写的是按运行当天现算的值（_now_based）：
+    [(字段, 列, 这次的条件)]。按列名和比较的方向认（启发：只拿来说清为什么取不到参数，不判等价）。"""
+    from sqlglot import exp
+
+    try:
+        spans, sentinel = _template_slots(template_sql)
+    except _NotComparable:
+        return []
+    by_index = {slot.index: slot for _, _, slot in spans}
+    root_t, _ = _parse(sentinel, read)
+    root_e, _ = _parse(sql, read)
+    if root_t is None or root_e is None:
+        return []
+
+    def column(node: Any) -> str | None:
+        node = _unparen(node)
+        inner = node.this if isinstance(node, (exp.Date, exp.Cast, exp.TsOrDsToDate)) else node
+        inner = _unparen(inner)
+        return name_key(inner.name) if isinstance(inner, exp.Column) and inner.name else None
+
+    def sides(cond: Any) -> tuple[str | None, str, Any]:
+        op = type(cond).__name__
+        left, right = cond.this, cond.expression
+        if column(left) is None and column(right) is not None:
+            return column(right), _FLIP.get(op, op), left
+        return column(left), op, right
+
+    wanted: dict[tuple[str, str], list[TemplateSlot]] = {}
+    for cond in root_t.walk():
+        if type(cond).__name__ not in _COMPARE_NODES:
+            continue
+        col, op, other = sides(cond)
+        if col is None:
+            continue
+        found = [by_index[int(m.group(1))] for lit in other.find_all(exp.Literal) if lit.is_string
+                 for m in _STRING_SENTINEL_RE.finditer(str(lit.this)) if int(m.group(1)) in by_index]
+        found += [by_index[int(lit.this) - _NUMBER_SENTINEL] for lit in other.find_all(exp.Literal)
+                  if not lit.is_string and str(lit.this).isdigit() and int(lit.this) - _NUMBER_SENTINEL in by_index]
+        if found:
+            wanted.setdefault((col, op), []).extend(found)
+    out: list[tuple[str, str, str]] = []
+    for cond in root_e.walk():
+        if type(cond).__name__ not in _COMPARE_NODES:
+            continue
+        col, op, other = sides(cond)
+        if col is None or (col, op) not in wanted or not _now_based(other):
+            continue
+        for slot in wanted[(col, op)]:
+            item = (slot.field, col, cond.sql(dialect=read, comments=False))
+            if item not in out:
+                out.append(item)
+    return out
+
+
+def _parse_failed(diff: SqlDiff) -> bool:
+    """比较的结论是解析不了（任一边）：照旧只说解析不了。"""
+    return any(item.aspect == "parse" for item in diff.items)
+
+
+def _unfilled_diff(template_sql: str, sql: str, rendered: str, read: str | None) -> SqlDiff:
+    """有槽位取不到值、又没有缺省值时的比较结果：不等价，说清取不到——这次在那里写的是按运行当天现算的日期的，逐个说出来
+    （time_range），再跟一句取不到参数、没有按口径比的兜底。"""
+    items = [FacetDiff("time_range", cond, f"{{{{ input.{field} }}}}",
+                       _NOW_SLOT.format(ours="这次", column=column, cond=cond, field=field))
+             for field, column, cond in _now_slots(template_sql, sql, read)]
+    return SqlDiff(False, [*items, FacetDiff("other", None, None, _UNFILLED)], True,
+                   (f"- {sql.strip()}", f"+ {rendered.strip()}"))
 
 
 def _unfilled(slots: Sequence[TemplateSlot], values: Mapping[str, Any], defaults: Mapping[str, Any]) -> bool:
@@ -9147,6 +9345,19 @@ def project_template(template_sql: str, keep: Sequence[int], dialect: str | None
         return Projection(None, keep, refused=_PROJ_TEXT)
 
 
+def one_row(sql: str, dialect: str | None = None) -> bool:
+    """这条查询一定只出一行（或者一行都不出）：一段 SELECT、没有 GROUP BY、本身是聚合（不分组的聚合，HAVING 至多筛掉那
+    一行）。逐格比出来的结论要合起来用（一个指标用了同一条查询的好几格）时，只在这种查询上成立：多行的结果里，每一列
+    各自对得上不等于每一行的几列一起对得上。认不出的为假。"""
+    from sqlglot import exp
+
+    read = _read(dialect)
+    root, _ = _parse(_mysql_dashes(sql) if read == "mysql" and isinstance(sql, str) else sql, read)
+    if not isinstance(root, exp.Select) or root.args.get("group") is not None or root.args.get("qualify") is not None:
+        return False
+    return _aggregating(root)
+
+
 def output_names(sql: str, dialect: str | None = None, *, template: bool = False) -> list[str] | None:
     """最外层选择列表各项的输出名（按位置；同 _result_columns，不展开 *：有 * 的为 None）。template 为真时 sql 是口径
     模板，按哨兵渲染之后认。解析不了、不是一段 SELECT 的为 None。"""
@@ -9329,5 +9540,5 @@ def sql_shape(sql: str, dialect: str | None = None) -> SqlShape | None:
 __all__ = ["BINDING_LEVELS", "MAX_SQL_CHARS", "PLACEHOLDER", "Aggregate", "ColumnRef", "Computed", "FacetDiff", "Facets",
            "JoinFacet", "LimitFacet", "NormalizedSql", "Part", "Projection", "SqlDiff", "SqlShape", "TemplateBinding",
            "TemplateMatch", "TemplateSlot", "TimePredicate", "bind_template", "catalog_labels", "diff_facets",
-           "explain_sql_diff", "facets", "match_template", "normalize_sql", "output_names", "project_select",
-           "project_template", "render_bound", "sql_shape"]
+           "explain_sql_diff", "facets", "match_template", "normalize_sql", "one_row", "output_names",
+           "project_select", "project_template", "render_bound", "sql_shape"]

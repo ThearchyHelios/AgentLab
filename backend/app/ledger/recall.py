@@ -871,12 +871,14 @@ async def original_values(use: Mapping[str, Any], meta: Sequence[Mapping[str, An
     from app.engine.evidence import render_number
     from app.engine.expressions import cell_parts
     from app.ledger import store
+    from app.ledger.labels import candidates_of
 
     recorded = await store.latest(run_id)
     content = recorded.content if recorded is not None else None
     query = next((q for q in (content or {}).get("queries") or [] if q.get("artifact") == use.get("query")), None)
-    cand = next((c for c in (query or {}).get("candidates") or [] if c.get("status") == "proven"
-                 and c.get("node_id") == use.get("node_id")), None)
+    # 整条证明了的、逐格证明了的都算：口径的哪一列对这次的哪一列，按各自的列映射找（逐格的只映射那一列）
+    proven = [c for c in candidates_of(query or {})
+              if c.get("status") == "proven" and c.get("node_id") == use.get("node_id")]
     try:
         snap = load(str(use.get("query") or "")) if use.get("query") else None
     except ValueError:
@@ -893,8 +895,8 @@ async def original_values(use: Mapping[str, Any], meta: Sequence[Mapping[str, An
                 column = ast.literal_eval(parts[2])
             except (ValueError, SyntaxError):
                 column = None
-        ours = next((m.get("ours") for m in (cand or {}).get("columns") or [] if m.get("caliber") == column), None) \
-            if isinstance(column, str) else None
+        ours = next((m.get("ours") for c in proven for m in c.get("columns") or [] if m.get("caliber") == column),
+                    None) if isinstance(column, str) else None
         if ours in columns and isinstance(rows, list) and rows and isinstance(rows[0], (list, tuple)):
             value = rows[0][columns.index(ours)]
             try:

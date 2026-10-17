@@ -25,6 +25,14 @@ MAX_CANDIDATES 份（按工作流、版本、节点排好的先后）。
 答案多选了列的在最前面写一句「这次多查了 N 列，不影响这个数」）。没有投影可试的（报告没引用这条查询、两边都不投影、
 投影不了）照旧是整条比的结果，逐对一字不差。
 
+**逐格判**（_cells，algo 4）。报告常把一条查询的好几列都引用了（销售额、订单数、区间首日、末日），口径只取其中一列：按全部
+引用列投影还是好几列，对不上口径，整条比只能标相关。整条（含按全部引用列投影）没证明、又引用了这条查询两列以上的，被引用
+的每一列单独投影到那一列（_cell），和每份口径的每个指标读的那一列逐个比，照样只走 match_template——上面的投影规则一条
+不少（多一个分组列、DISTINCT 的照旧不投影，那一格照用整条的结论）。结果记在 queries[].cells {列名: {status, candidates}}，
+每个数按它那一格标（labels._view）；同一个指标用了这条查询的好几格时，只有这条查询一定只出一行（one_row）才把逐格的结论
+合起来用。整题照拍板 L1：每个数都证明来自同一份口径才算等价，一格证明了、别的格只是相关的，整题不等价、不自动出具。召回
+反查、使用次数、工件 meta 把逐格证明了的口径也算上（labels.candidates_of）。
+
 **助手选用的（composed）。** 问数据的助手 use_caliber 选用口径时，取数节点是服务端照那一版拷进来的（ledger/compose.py），
 口径卡的 caliber_from 带着改名映射 {原 id: 新 id}。这几个节点交回的查询照样要证明：证明了的那一份记 how=composed，查询
 状态记 composed——数确实来自口径，但「这份口径答的就是这个问题」是助手凭问法判断的，不能说成「等价已证明」（拍板 L1：
@@ -447,6 +455,89 @@ def _projected(caliber: Caliber, fetch: Fetch, query: Query, wanted: tuple[int, 
     return cand
 
 
+def _cell(caliber: Caliber, fetch: Fetch, query: Query, index: int, deadline: float | None) -> dict[str, Any] | None:
+    """逐格比（algo 4，见模块说明）：答案只留这一格所在的那一列（project_select），口径只留它的指标读到的某一列
+    （口径卡上读这个取数节点的每一列各试一次；口径版本里没有口径卡的，取数选出来的每一列各试一次），投影后照样交
+    match_template 判。证明了的候选（带 projection，列映射就是这一列对口径那一列）；都没证明时第一种比法的那次比较
+    （差在哪按投影之后说，答案多选了列的先写一句）；投影不了、没有可比的为 None（这一格照旧用这条查询的结论）。"""
+    from app.data.sql_semantics import FacetDiff, match_template, output_names, project_select, project_template
+
+    width = len(query.columns or [])
+    ours = project_select(query.sql, (index,), query.dialect, width=width)
+    names = output_names(fetch.sql, query.dialect, template=True)
+    if ours.sql is None or not names:
+        return None
+    if caliber.cards:
+        columns = sorted({i for group in _caliber_sets(caliber, fetch, names) for i in group})
+    else:
+        columns = list(range(len(names)))
+    theirs = [project_template(fetch.sql, (i,), query.dialect) for i in columns] if len(names) > 1 \
+        else [project_template(fetch.sql, (0,), query.dialect)] if columns == [0] else []
+    first: tuple[Any, Any] | None = None
+    for c in theirs[:MAX_PROJECTIONS]:
+        if c.sql is None or (deadline is not None and first is not None and time.monotonic() > deadline):
+            continue
+        m = match_template(c.sql, list(caliber.fields), ours.sql, query.dialect, schema=query.schema,
+                           names=query.names, columns=[str((query.columns or [])[index])], deadline=deadline)
+        if m.equivalent:
+            return {**_candidate(caliber, fetch, m), "projection": _projection_view(query, ours, c)}
+        if first is None:
+            first = (c, m)
+    if first is None:
+        return None
+    c, m = first
+    cand = {**_candidate(caliber, fetch, m), "projection": _projection_view(query, ours, c)}
+    if ours.dropped and isinstance(cand.get("diff"), dict):
+        note = FacetDiff("projection", None, None, EXTRA_COLUMNS.format(n=ours.dropped)).as_dict()
+        cand["diff"] = {**cand["diff"], "items": [note, *cand["diff"]["items"]]}
+    return cand
+
+
+def _verdict(candidates: list[dict[str, Any]]) -> tuple[str, str | None]:
+    """一组候选的结论（查询、逐格同一个判法）：(status, 没比完时的原因)。"""
+    statuses = {c["status"] for c in candidates}
+    status = "proven" if "proven" in statuses else "skipped" if "skipped" in statuses else "related"
+    if status == "proven" and any(c.get("how") == "composed" for c in candidates if c["status"] == "proven"):
+        # 证明了的是助手选用的那一份：数来自口径，但不是这次独立写出来的（见模块说明）。同时和别的口径等价的也按选用的算
+        status = "composed"
+    reason = next((c.get("reason") for c in candidates if c["status"] == "skipped"), None) if status == "skipped" \
+        else None
+    return status, reason
+
+
+def _cells(query: Query, wanted: tuple[int, ...], pool: list[tuple[Caliber, Fetch]], whole: list[dict[str, Any]],
+           chosen: tuple[str, str] | None, deadline: float | None) -> dict[str, dict[str, Any]]:
+    """这条查询被引用的每一列各比一次（_cell）：{列名: {status, candidates, reason?}}。每份口径取数一个候选：逐格比出来的，
+    比不了（投影不了、过了时限、不可比、整条比就没比完）的照用这条查询的那一个候选。同名的几列认不出是哪一列，不逐格比。"""
+    columns = [str(c) for c in query.columns or []]
+    out: dict[str, dict[str, Any]] = {}
+    for index in wanted:
+        name = columns[index]
+        if columns.count(name) != 1:
+            continue
+        candidates: list[dict[str, Any]] = []
+        for (caliber, fetch), base in zip(pool, whole):
+            cand = None
+            if base.get("status") == "related" and base.get("comparable", True) and \
+                    (deadline is None or time.monotonic() <= deadline):
+                try:
+                    cand = _cell(caliber, fetch, query, index, deadline)
+                except Exception:  # noqa: BLE001 - 逐格比是附加的一步：出错这一格照用这条查询的结论
+                    logger.exception("逐格比对出错（运行查询 %s，口径 %s）", query.artifact[:12], caliber.key)
+            if cand is None:
+                candidates.append(dict(base))
+                continue
+            if chosen is not None and (caliber.key, fetch.node_id) == chosen:
+                if cand["status"] == "proven":
+                    cand["how"] = "composed"
+                else:
+                    cand.setdefault("reason", COMPOSED_UNPROVEN)
+            candidates.append(cand)
+        status, reason = _verdict(candidates)
+        out[name] = {"status": status, "candidates": candidates, **({"reason": reason} if reason else {})}
+    return out
+
+
 def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: float | None = None,
                     composed: dict[str, tuple[str, str]] | None = None,
                     referenced: Mapping[str, Collection[str]] | None = None) -> list[dict[str, Any]]:
@@ -455,7 +546,7 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
     等价）/ none（没有相关的口径）/ skipped（没比完：超时、解析失败、快照读不出）。composed 是 composed_nodes 的结果，
     不给就没有助手选用的。referenced 是报告引用了哪条查询的哪几列（labels.referenced_columns：{查询快照: {列名}}）：
     给了的，整条比不等价时按引用的列投影再比（_projected）；不给就只整条比。纯计算，从不抛异常。评测逐题比 SQL 也调它。"""
-    from app.data.sql_semantics import match_template, normalize_sql
+    from app.data.sql_semantics import match_template, normalize_sql, one_row
 
     out: list[dict[str, Any]] = []
     for query in queries:
@@ -500,16 +591,17 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
                 else:
                     cand.setdefault("reason", COMPOSED_UNPROVEN)
             candidates.append(cand)
-        statuses = {c["status"] for c in candidates}
-        status = "proven" if "proven" in statuses else "skipped" if "skipped" in statuses else "related"
-        if status == "proven" and any(c.get("how") == "composed" for c in candidates):
-            # 证明了的是助手选用的那一份：数来自口径，但不是这次独立写出来的（见模块说明）。同时和别的口径等价的也按选用的算
-            status = "composed"
+        status, reason = _verdict(candidates)
         if len(pool) > MAX_CANDIDATES:
             row["note"] = MORE_CANDIDATES.format(n=len(pool) - MAX_CANDIDATES, max=MAX_CANDIDATES)
-        if status == "skipped":
-            row["reason"] = next(c.get("reason") for c in candidates if c["status"] == "skipped")
-        out.append({**row, "status": status, "candidates": candidates})
+        if reason:
+            row["reason"] = reason
+        row.update(status=status, candidates=candidates)
+        if wanted is not None and len(wanted) >= 2 and status == "related":
+            # 整条（按全部引用列投影）没证明：被引用的几列逐格各比一次，每个数按它自己那一格的结论标（labels.cell_label）
+            row["cells"] = _cells(query, wanted, pool[:MAX_CANDIDATES], candidates, chosen, deadline)
+            row["one_row"] = one_row(query.sql, query.dialect)
+        out.append(row)
     return out
 
 
