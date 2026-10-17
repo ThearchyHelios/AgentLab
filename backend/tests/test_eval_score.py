@@ -248,6 +248,49 @@ async def test_reading_the_sealed_answer_and_the_per_case_sql_match(engine_on, m
     assert (await score.sql_match(case, gold, answer))["status"] == "proven"
 
 
+async def test_the_per_case_sql_match_compares_the_query_behind_the_answer(engine_on, monkeypatch, tmp_path):
+    """逐题 E1 比的是产出答案的那条查询：答案引用了就比被引用的；没引用、这次运行又查了几条时不硬比第一条（往往是探索
+    查询），照实写没法对上是哪条；没引用、只查了一条时它就是唯一可能的那条，按它比、写明依据。"""
+    from app.db.base import SessionLocal
+    from app.db.models import DataSource
+    from app.engine.runner import run_manager
+    from app.eval import score
+    from app.ledger import match as ledger_match
+    from sqlalchemy import select
+    from tests import ledger_samples as ls
+
+    await ls.fresh_source(tmp_path / "shop.db")
+    async with SessionLocal() as session:
+        sid = (await session.execute(select(DataSource.id).where(DataSource.name == ls.CURRENT["source"]))).scalar()
+    case = {"gold": {"kind": "sql", "datasource_id": sid, "sql": "x"}, "expectations": []}
+    gold = {"status": "ok", "before": {"rendered": {"sql": (
+        "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND paid_at >= '2026-09-01' "
+        "AND paid_at < '2026-09-08'")}, "sets": []}}
+
+    # 先探了一下有哪些地区，再查销售额；答案没引用查询（数写在叙述里）
+    graph = ls.chain(ls.node("start", "input"),
+                     ls.node("peek", "tool", tool=ls.tool(), args={"sql": "SELECT DISTINCT region FROM orders"}),
+                     ls.node("q", "tool", tool=ls.tool(), args={"sql": ls.WITH_REFUNDS}),
+                     ls.node("write", "report", instructions="写答案"),
+                     ls.node("out", "output", fields=[{"name": "答案", "value": "{{ nodes.write.text }}"}]))
+    ls.script(monkeypatch, "本周销售额约 200 元。")
+    started = await run_manager.start(graph=graph, input_payload={}, run_class="exploratory", origin_kind="canvas")
+    await ls.wait(started.id)
+    await ledger_match.drain()
+    answer = await score.read_answer(started.id)
+    assert answer.cited == [] and len(answer.queries) == 2, answer.queries
+    match = await score.sql_match(case, gold, answer)
+    assert match["status"] == "skipped" and match["cited"] is False and "没有引用查询" in match["reason"], match
+    assert match.get("query") is None and match.get("aspects") in (None, []), "没法对上是哪条，就不给差在哪"
+
+    # 只查了一条、答案没引用：唯一的那条就是产出答案的，按它比，依据写明
+    run = await ls.explore(monkeypatch, ls.EQUIVALENT, text="本周销售额 170.5 元。")
+    only = await score.read_answer(run.id)
+    assert only.cited == [] and len(only.queries) == 1
+    match = await score.sql_match(case, gold, only)
+    assert match["status"] == "proven" and match["basis"] == "only_query" and not match["cited"], match
+
+
 async def test_rescoring_reads_the_seal_and_never_calls_a_model(engine_on, monkeypatch, tmp_path):
     from app.db.base import SessionLocal
     from app.db.models_eval import EvalResult, EvalRun

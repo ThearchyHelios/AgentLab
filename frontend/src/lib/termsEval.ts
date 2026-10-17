@@ -464,6 +464,10 @@ export const EVAL_TEXT = {
   sqlMatch: {
     proven: '等价已证明', related: '不等价', none: '答案没有查询', skipped: '没比对',
   } as Record<string, string>,
+  /** 逐题 SQL 比对比的是哪条查询（服务端 score.sql_match 的 basis）。答案引用了查询的不用多说 */
+  sqlMatchBasis: {
+    only_query: '答案没有引用查询；这次运行只执行了这一条查询（核查用的不算），按它比',
+  } as Record<string, string>,
   aspect: {
     time: '时间口径', time_range: '时间范围', filter: '筛选条件', aggregate: '聚合', expression: '计算式', join: '关联',
     tables: '用到的表', group_by: '分组', limit: '行数限制', other: '其他', parse: '解析不了',

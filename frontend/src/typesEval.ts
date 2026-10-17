@@ -531,6 +531,8 @@ export interface EvalSqlMatch {
   aspects?: string[]
   reason?: string | null
   cited?: boolean
+  /** 比的是哪条查询：cited 答案引用的；only_query 答案没引用、这次运行只查了这一条 */
+  basis?: 'cited' | 'only_query' | string
 }
 
 export interface EvalResult {

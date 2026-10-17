@@ -32,9 +32,10 @@ wrong 错、scale 量纲不同（差 10 的整数次幂，比如元和万元、�
 没有错的）不能评分。期望没算出来按 gold 的结论：口径升版待处置是跳过，别的是不能评分——不混进「答错」。被驳回（总方案 X9）
 记路径「被驳回」，不算失败：不能评分。只有文字要点的题不能评分（单列，不计入准确率）。
 
-**逐题的 E1**（sql_match）：答案里的查询（先看报告引用了的）和期望的取数（SQL 题是期望 SQL，口径题是口径卡的取数节点）
-用口径账本同一个比对函数（ledger/match.compare_queries：先绑参数、再由 explain_sql_diff 判等价）比一次，给出等价与否和差在
-哪个方面（总方案 X2：E1 只有一份实现）。
+**逐题的 E1**（sql_match）：产出答案的那条查询和期望的取数（SQL 题是期望 SQL，口径题是口径卡的取数节点）用口径账本同一个
+比对函数（ledger/match.compare_queries：先绑参数、再由 explain_sql_diff 判等价）比一次，给出等价与否和差在哪个方面（总方案
+X2：E1 只有一份实现）。哪条是产出答案的：答案引用了就是被引用的；没引用、只查了一条就是那一条（写明依据）；没引用、查了
+几条的不硬比（照实写没法对上是哪条，不计入 E1）。
 """
 from __future__ import annotations
 
@@ -613,7 +614,8 @@ async def gold_calibers(case: Mapping[str, Any], gold: Mapping[str, Any] | None)
 
 async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, answer: Answer, *,
                     timeout: float = 8.0) -> dict[str, Any] | None:
-    """逐题的 E1：{status: proven|related|none|skipped, query, aspects, diff, reason}。没有作答运行、没有期望取数的为 None。
+    """逐题的 E1：{status: proven|related|none|skipped, query, aspects, diff, reason, cited, basis}。没有作答运行、没有期望
+    取数的为 None。比的是哪条查询见 _answering：basis 是 cited（答案引用的）或 only_query（答案没引用、运行只查了这一条）。
     比对在线程里跑（纯计算，和账本一样限时）。"""
     import asyncio
     import time
@@ -646,13 +648,12 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
     except Exception:  # noqa: BLE001 - 比对是附加的一步，出错照实记没比
         logger.exception("评测：逐题比 SQL 出错")
         return {"status": "skipped", "reason": "比对出错"}
-    cited = [r for r in rows if r.get("artifact") in set(answer.cited)]
-    pool = cited or rows
+    pool, basis = _answering(rows, answer)
+    if isinstance(pool, dict):
+        return pool
     proven = next((r for r in pool if r.get("status") == "proven"), None)
     chosen = proven or next((r for r in pool if r.get("status") == "related"), None) or \
-        next((r for r in pool if r.get("status") == "skipped"), None) or (pool[0] if pool else None)
-    if chosen is None:
-        return {"status": "none", "reason": "答案没有查询"}
+        next((r for r in pool if r.get("status") == "skipped"), None) or pool[0]
     candidate = next((c for c in chosen.get("candidates") or [] if c.get("status") == chosen.get("status")), None) or \
         next(iter(chosen.get("candidates") or []), None) or {}
     diff = candidate.get("diff") or {}
@@ -660,7 +661,31 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
     sql = next((q.get("sql") for q in answer.queries if q.get("artifact") == chosen.get("artifact")), None)
     return {"status": chosen.get("status"), "query": chosen.get("artifact"), "sql": sql, "aspects": aspects,
             "diff": diff or None, "via": candidate.get("via"), "binding": candidate.get("binding"),
-            "reason": chosen.get("reason") or candidate.get("reason"), "cited": bool(cited)}
+            "reason": chosen.get("reason") or candidate.get("reason"), "cited": basis == "cited", "basis": basis}
+
+
+def _answering(rows: list[dict[str, Any]], answer: Answer) -> tuple[list[dict[str, Any]] | dict[str, Any], str]:
+    """逐题 E1 拿哪几条查询比：产出答案的那几条。交回 (查询, 依据)，确定不了时交回 (照实的结论, "")。
+
+    - 答案引用了查询（报告里引用的格、指标所在的查询）：比被引用的那几条（依据 cited）；
+    - 没引用、这次运行（核查用的不算）只查了一条：答案的数只可能来自它，按它比（依据 only_query）；
+    - 没引用、查了几条：不比——以前取第一条相关的，取到的往往是探索查询（看看有哪些地区那种），说「差在筛选条件」和答案的数
+      毫无关系。照实写没法对上是哪条，不计入 E1。"""
+    cited = set(answer.cited)
+    if cited:
+        pool = [r for r in rows if r.get("artifact") in cited]
+        if pool:
+            return pool, "cited"
+        return {"status": "skipped", "cited": True,
+                "reason": "答案引用的查询不在可比对的查询里（合并查询不比：它的数都来自它的输入）"}, ""
+    roles = {q.get("artifact"): q.get("role") for q in answer.queries}
+    pool = [r for r in rows if roles.get(r.get("artifact")) != "verify"]
+    if not pool:
+        return {"status": "none", "reason": "答案没有查询"}, ""
+    if len(pool) > 1:
+        return {"status": "skipped", "cited": False,
+                "reason": f"答案没有引用查询，这次运行执行了 {len(pool)} 条查询，没法对上是哪条产出了答案，不比"}, ""
+    return pool, "only_query"
 
 
 __all__ = ["Answer", "CaseScore", "DEFAULT_TOLERANCE", "OUTCOMES", "OUTCOME_LABEL", "PATH_LABEL", "SCORER_VERSION",

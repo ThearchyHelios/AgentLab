@@ -417,6 +417,9 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
                           {s.reason && <span> · {s.reason}</span>}
                         </p>
                       ))}
+                      {r.sql_match?.basis && T.sqlMatchBasis[r.sql_match.basis] && (
+                        <p className="text-faint" data-eval-sql-basis={r.sql_match.basis}>{T.sqlMatchBasis[r.sql_match.basis]}</p>
+                      )}
                       {r.sql_match?.reason && <p className="text-faint">{r.sql_match.reason}</p>}
                       <ResultDetail evaluationId={id} resultId={r.id} />
                       <div className="flex flex-wrap gap-2">
