@@ -48,6 +48,11 @@ def test_next_step_branches():
     assert turn.next_step(_final(issues=[ERROR], autorun=False)) == "fail", "没过检查比只建不跑优先"
     assert turn.next_step({"op": "reply", "text": "已经查过了"}) == "reply"
     assert turn.next_step({"op": "error", "message": "x"}) == "fail"
+    empty = {"op": "error", "message": "助手本轮未完成：模型没有给出任何修改，也没有说明原因",
+             "code": turn.EMPTY_GENERATION, "reason": "模型没有给出任何修改，也没有说明原因"}
+    assert turn.next_step(empty) == "retry", "只写了思考、一个操作都没给：按重来一次的规矩自动重来"
+    assert turn.error_reason(empty) == "模型没有给出任何修改，也没有说明原因"
+    assert turn.error_reason({"op": "error", "message": "助手本轮未完成：接入返回了 502"}) == "接入返回了 502"
     assert turn.next_step(None) == "asked", "流结束时只有反问"
     assert set(turn.NEXT_STEPS) == {"run", "ready", "fail"}
 
@@ -165,6 +170,74 @@ async def _run(output: dict, graph: dict, code: str) -> str:
                              data={"level": "warn", "code": code, "message": "agent 用满了 8 步还没给出结论"}))
         await session.commit()
         return run.id
+
+
+def test_the_frontend_retries_an_error_the_server_says_to_retry():
+    """问数据页照服务端给的 next 走：error 操作带 next=retry（只写了思考、一个操作都没给）时带着原因重来一次，不再直接报
+    「助手本轮未完成」。读 chat.ts 里 error 那一支（行为另由 scripts/check-chat.mjs 的 emptyretry 一节在浏览器里守）。"""
+    branch = re.search(r"case 'error':(.*?)break\n", _ts(), re.S)
+    assert branch, "chat.ts 里找不到 error 那一支"
+    assert re.search(r"op\.next === 'retry'", branch.group(1)) and "retry(" in branch.group(1), branch.group(1)
+
+
+async def test_answer_ops_says_to_retry_an_empty_generation(client, monkeypatch):
+    """生成过程一个操作都没给（deepseek 偶发只出思考）：error 操作带机读码 copilot_empty、原因、next=retry。"""
+    import json
+
+    import app.api.copilot as copilot
+    from tests.test_usage_meter import Scripted
+
+    model = Scripted(model="claude-opus-5", replies=[[""]])
+
+    async def _model(*_a, **_k):
+        return model, "claude-opus-5"
+
+    monkeypatch.setattr(copilot, "get_chat_model", _model)
+    events = []
+    async with client.stream("POST", "/api/copilot/generate-stream",
+                             json={"instruction": "上周各地区销售额", "intent": "answer"}) as r:
+        async for line in r.aiter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    [err] = [e for e in events if e["op"] == "error"]
+    assert err["code"] == turn.EMPTY_GENERATION and err["next"] == "retry", err
+    assert err["reason"] == "模型没有给出任何修改，也没有说明原因" and err["message"].startswith("助手本轮未完成")
+
+
+async def test_the_eval_driver_retries_an_empty_generation_once(monkeypatch):
+    """评测的作答（app/eval/answer.Driver）走同一个决定：第一次一个操作都没给就带着原因重来一次，原因照实记在 retries；
+    重来还不行才照实报建图失败（助手调用失败），不再试第三次。"""
+    import json
+
+    import app.api.copilot as copilot
+    from app.eval import answer
+    from tests.test_usage_meter import Scripted
+
+    reply = json.dumps({"op": "reply", "text": "上周没有华中区的数据"}, ensure_ascii=False)
+    for replies, path in (([[""], [reply]], "reply"), ([[""]], "build_failed")):
+        model = Scripted(model="claude-opus-5", replies=replies)
+        seen: list[str] = []
+
+        async def _model(*_a, _m=model, **_k):
+            return _m, "claude-opus-5"
+
+        monkeypatch.setattr(copilot, "get_chat_model", _model)
+        real = answer.Driver._generate
+
+        async def spy(self, instruction, base_graph, _seen=seen, _real=real):
+            _seen.append(instruction)
+            return await _real(self, instruction, base_graph)
+
+        monkeypatch.setattr(answer.Driver, "_generate", spy)
+        driver = answer.Driver("上周华中区销售额", datasource_ids=[], ctx=answer.TurnContext(
+            suite_id="s", suite_name="虚构题集", eval_run_id="e", case_id=None, case_seq=1, actor=None))
+        t = await driver.drive()
+        assert t.path == path and t.attempts == 1 and model.calls == 2, (t.path, t.attempts, model.calls, t.reason)
+        assert t.retries == ["模型没有给出任何修改，也没有说明原因"], t.retries
+        assert seen[1] == turn.retry_instruction("上周华中区销售额", t.retries[0], False), seen
+        if path == "build_failed":
+            assert t.copilot_failed and t.reason.startswith("助手本轮未完成"), t.reason
+        assert t.usage["assistant"]["calls"] == 2, "两次生成都是这一题花的"
 
 
 async def test_review_says_whether_and_how_to_retry(client, monkeypatch):

@@ -505,6 +505,8 @@ export const EVAL_TEXT = {
     filter: '只看',
     repeat: (n: number) => `第 ${n + 1} 次`,
     attempts: (n: number) => `这一题自动重来了 ${n} 次`,
+    /** 每次自动重来的原因（服务端 eval/answer 的 turn.retries） */
+    retriesWhy: (reasons: string[]) => `：${reasons.join('；')}`,
     turnReason: '作答的经过',
     answer: '答案原文',
     expand: '展开',

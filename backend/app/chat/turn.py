@@ -5,13 +5,13 @@
 后端跑不了一轮问数据：评测要么照着抄一份（迟早走样，量出来的不是用户拿到的那一轮），要么做不了；这也违反「界面层不放
 逻辑」。现在决定写在这里，是纯函数：
 
-- next_step：生成过程交出结局之后做什么；
+- next_step：生成过程交出结局之后做什么（含生成过程一个操作都没给时自动重来一次）；
 - fill_input：用户的问题填进这张图的入口字段；
 - retry_after_review：复核之后要不要带着原图重来一次；
 - retry_instruction：重来时交给助手的那句话（两种措辞）。
 
-接口把决定交给问数据页：/copilot/generate-stream 的 final 带 next（run | ready | fail），/copilot/review 的结果带
-retry_instruction（要重来时是那句话，不重来是 null）。问数据页照后端给的走；老后端没有这两个字段时退回它自己那份同样的
+接口把决定交给问数据页：/copilot/generate-stream 的 final 带 next（run | ready | fail），error 带 next（retry | fail），
+/copilot/review 的结果带 retry_instruction（要重来时是那句话，不重来是 null）。问数据页照后端给的走；老后端没有这两个字段时退回它自己那份同样的
 规则（tests/test_chat_turn_policy.py 逐条对照两边的常量和措辞）。评测（第 3 波）用同一组函数把一轮串起来。
 
 只搬「决定」：重连、断点续看、取消、复核等多久这些仍在问数据页（把整轮编排搬到后端要重做这些，单独立项）。
@@ -28,8 +28,18 @@ MAX_ATTEMPTS = 2
 #: final 之后的三种走法（final.next）：运行、只建不跑（摆着等用户点运行）、判失败（没过检查的图不拿去跑）
 NEXT_RUN, NEXT_READY, NEXT_FAIL = "run", "ready", "fail"
 NEXT_STEPS = (NEXT_RUN, NEXT_READY, NEXT_FAIL)
-#: 别的结局：直接回答了（reply）、助手反问了等用户答（asked）、没自查过的老服务端交来没过检查的图时重来一次（retry）
+#: 别的结局：直接回答了（reply）、助手反问了等用户答（asked）、重来一次（retry：没自查过的老服务端交来没过检查的图，或者
+#: 生成过程一个操作都没给）
 NEXT_REPLY, NEXT_ASKED, NEXT_RETRY = "reply", "asked", "retry"
+
+#: 生成过程一个操作都没给就结束了（error 操作的 code）：模型只写了思考（deepseek 这类推理模型偶发）、或者格式跑偏每一行都被
+#: 跳过。这是偶发的，重来一次多半就好，按「重来一次」的规矩自动重来（最多 MAX_ATTEMPTS 次，含第一次）；被截断的不重来——额度
+#: 不变，重来还是截断
+EMPTY_GENERATION = "copilot_empty"
+#: 自动重来的 error（code）
+RETRY_ERRORS = frozenset({EMPTY_GENERATION})
+#: error 操作的 message 前缀（api/copilot.answer_ops）：重来时交给助手的原因不带它
+_ERROR_PREFIX = "助手本轮未完成："
 
 #: 问题往哪个入口字段放：名字像「问题」的优先（同 chat.ts fillInput 的正则，大小写不敏感）
 QUESTION_FIELD = re.compile(r"question|query|topic|input|问题|需求|主题", re.IGNORECASE)
@@ -51,7 +61,9 @@ def next_step(terminal: Mapping[str, Any] | None, *, self_checked: bool = True) 
     """生成过程交出结局之后做什么。terminal 是最后那条结局操作（final / reply / error）；流结束时只有反问（ask）、没有
     别的结局的给 None。
 
-    - reply：直接回答，这一轮到此为止；error：判失败；只有反问：等用户回答；
+    - reply：直接回答，这一轮到此为止；只有反问：等用户回答；
+    - error：生成过程一个操作都没给（code 是 EMPTY_GENERATION）时重来一次（retry，次数由调用方按 MAX_ATTEMPTS 管，原因
+      取 error_reason），别的判失败；
     - final：有 error 级问题时，服务端已经自查过（收到过 check 的结论）就判失败——没过的问题已经交回模型在同一轮里改过
       了，再整轮重来是再烧一次完整生成、改的还是同一批问题；没自查过（老服务端）才重来一次（retry）；模型说不运行
       （autorun=false：用户要的是流程本身、或者问了用户）只建不跑；其余运行。
@@ -61,6 +73,8 @@ def next_step(terminal: Mapping[str, Any] | None, *, self_checked: bool = True) 
     kind = terminal.get("op")
     if kind == "reply":
         return NEXT_REPLY
+    if kind == "error":
+        return NEXT_RETRY if terminal.get("code") in RETRY_ERRORS else NEXT_FAIL
     if kind != "final":
         return NEXT_FAIL
     if _blockers(terminal):
@@ -68,6 +82,15 @@ def next_step(terminal: Mapping[str, Any] | None, *, self_checked: bool = True) 
     if terminal.get("autorun") is False:
         return NEXT_READY
     return NEXT_RUN
+
+
+def error_reason(error: Mapping[str, Any]) -> str:
+    """生成过程交出 error 时重来的原因（交给助手的那句话里用）：error 带的 reason，没有就是 message 去掉「助手本轮未完成：」。"""
+    reason = str(error.get("reason") or "").strip()
+    if reason:
+        return reason
+    message = str(error.get("message") or "").strip()
+    return message[len(_ERROR_PREFIX):] if message.startswith(_ERROR_PREFIX) else message
 
 
 def blocked_reason(final: Mapping[str, Any]) -> str:
@@ -124,6 +147,7 @@ def has_nodes(graph: Any) -> bool:
     return isinstance(graph, Mapping) and bool(graph.get("nodes"))
 
 
-__all__ = ["MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_FAIL", "NEXT_READY", "NEXT_REPLY", "NEXT_RETRY", "NEXT_RUN", "NEXT_STEPS",
-           "QUESTION_FIELD", "RETRY_FROM_SCRATCH", "RETRY_WITH_BASE", "blocked_reason", "fill_input", "has_nodes",
-           "next_step", "retry_after_review", "retry_instruction", "review_reason"]
+__all__ = ["EMPTY_GENERATION", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_FAIL", "NEXT_READY", "NEXT_REPLY", "NEXT_RETRY",
+           "NEXT_RUN", "NEXT_STEPS", "QUESTION_FIELD", "RETRY_ERRORS", "RETRY_FROM_SCRATCH", "RETRY_WITH_BASE",
+           "blocked_reason", "error_reason", "fill_input", "has_nodes", "next_step", "retry_after_review",
+           "retry_instruction", "review_reason"]

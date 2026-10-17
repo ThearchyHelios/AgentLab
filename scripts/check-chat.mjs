@@ -29,7 +29,8 @@
 //  14. 助手反问（normal-user-apps N11）：只问不改的一轮记成「助手反问」，问题作为这一轮的内容、落库进历史，不再一直停在
 //      「正在理解需求」；输入框提示回答助手的问题；刷新后照样标「助手反问」，不当成没查库的回答；
 //  15. 回答上的「做成应用」带着这次运行进蓝图（建运行起点的蓝图），不再提取工作流、跳画布的发布弹窗；
-//  16. 服务端这一轮已经自查修正过（收到 check 的结论）还没过的：不再整轮重新生成一遍，直接说没过、给补救。
+//  16. 服务端这一轮已经自查修正过（收到 check 的结论）还没过的：不再整轮重新生成一遍，直接说没过、给补救；助手只写了思考、
+//      一个操作都没给（error.next=retry）的照服务端的决定自动重来一次，还不行再照实报。
 //  17. 口径账本（next-round 02）：交付了的轮次底部写「正在比对口径」，按退避再取到比对出结果、比完不再取；一行摘要
 //      （几个数来自哪份口径）、按口径正式出具和对账按钮照服务端给的动作摆；出具、对账的写请求在浏览器层拦下并核对请求体，
 //      出具过的正式运行挂在轮次下面（档位、打开运行）。
@@ -528,6 +529,26 @@ async function fakeApi(route) {
         ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
         { op: 'check', status: 'failed', issues: ['「查数」节点还没有选择工具'] },
         { op: 'final', graph: GRAPH, explanation: '', issues: [{ level: 'error', node_id: 'ag', message: '「查数」节点还没有选择工具' }] },
+      ]
+      return route.fulfill({ status: 200, contentType: 'text/event-stream',
+        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
+    }
+    if (String(b.instruction ?? '').includes('只写了思考')) {
+      // 生成过程一个操作都没给（deepseek 偶发只出思考）：服务端的 error 带 next=retry（backend/app/chat/turn.py 的 next_step）。
+      // 重来那一次（指令里缀了「上一次没有成功」）照常直接回答；「两次都」那一问每次都只写思考
+      const again = String(b.instruction).includes('上一次没有成功') && !String(b.instruction).includes('两次都')
+      const spent = { by_model: { m: { input_tokens: 500, output_tokens: 40, calls: 1, cost_usd: 0.001, unpriced_calls: 0 } },
+        input_tokens: 500, output_tokens: 40, calls: 1, cost_usd: 0.001, unpriced_calls: 0 }
+      const ops = again ? [
+        { op: 'heartbeat', phase: 'planning', elapsed_ms: 200 },
+        { op: 'reply', text: '已经查过了：一共 3 家门店。' },
+        { op: 'usage', ...spent },
+      ] : [
+        { op: 'heartbeat', phase: 'planning', elapsed_ms: 200 },
+        { op: 'thinking', delta: '先想一想要查哪张表……' },
+        { op: 'error', message: '助手本轮未完成：模型没有给出任何修改，也没有说明原因', hint: '画布未修改。可以重试，或把需求描述得更具体',
+          detail: '', reason: '模型没有给出任何修改，也没有说明原因', code: 'copilot_empty', next: 'retry' },
+        { op: 'usage', ...spent },
       ]
       return route.fulfill({ status: 200, contentType: 'text/event-stream',
         body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
@@ -1854,6 +1875,33 @@ for (const theme of THEMES) {
     const turn = (await chatState(page)).byConversation.c0emptg.at(-1)
     check('只生成了一次（同一轮的自查修正已经做过，不再整轮重来）', log.gens.length - gens === 1, `${log.gens.length - gens} 次`)
     check('这一轮照实说没过、说明已经修正过', done && turn.failure?.reason?.includes('已按检查结果修正过'), JSON.stringify(turn.failure))
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('emptyretry', '助手只写了思考、一个操作都没给：照服务端的 next=retry 自动重来一次，还不行再照实报', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0emptg')
+    let gens = log.gens.length
+    await send(page, '只写了思考：有几家门店')
+    const done = await page.waitForFunction(() => window.__chat.getState().byConversation.c0emptg?.at(-1)?.phase === 'done',
+      null, { timeout: 6000 }).then(() => true, () => false)
+    await page.waitForTimeout(300)
+    const turn = (await chatState(page)).byConversation.c0emptg.at(-1)
+    check('第一次没给操作：自动重来一次，第二次照常回答', done && log.gens.length - gens === 2
+      && String(turn.output?.answer ?? '').includes('3 家'), `${log.gens.length - gens} 次生成 · ${JSON.stringify(turn.output)}`)
+    check('重来时交回去的话带着原因（同服务端 retry_instruction 的从零重建措辞）',
+      log.gens.at(-1)?.instruction === '只写了思考：有几家门店\n\n（上一次没有成功：模型没有给出任何修改，也没有说明原因。请针对这个原因调整，重新给出完整的工作流。）',
+      log.gens.at(-1)?.instruction)
+    check('两次建图的用量都记进这一轮', Math.abs((turn.usage?.copilot?.cost_usd ?? 0) - 0.002) < 1e-9, JSON.stringify(turn.usage))
+    gens = log.gens.length
+    await send(page, '两次都只写了思考：有几家门店')
+    const failed = await page.waitForFunction(() => window.__chat.getState().byConversation.c0emptg?.at(-1)?.phase === 'error',
+      null, { timeout: 6000 }).then(() => true, () => false)
+    await page.waitForTimeout(500)
+    const last = (await chatState(page)).byConversation.c0emptg.at(-1)
+    check('重来还不行：照实报「助手本轮未完成」，不再试第三次', failed && log.gens.length - gens === 2
+      && JSON.stringify(last.failure ?? {}).includes('助手本轮未完成'), `${log.gens.length - gens} 次生成 · ${JSON.stringify(last.failure)}`)
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })

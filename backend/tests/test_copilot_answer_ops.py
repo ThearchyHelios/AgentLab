@@ -5,7 +5,8 @@
 
 - 几种结局（建图交付、直接回答、只问不改、自查改不好、模型出错、没给操作、输出被截断）的 SSE 输出，和抽出来之前
   逐条一样（剧本见 SCENARIOS，抽出来之前录下的输出在 fixtures/copilot_answer_ops_baseline.json），末尾只多一条 usage，
-  final 只多一个 next（问数据一轮的决定，chat/turn.py）；
+  final 只多一个 next（问数据一轮的决定，chat/turn.py）；error 多一个 next 和原因 reason（一个操作都没给的另带机读码 code，
+  next 是 retry：问数据页和评测据此自动重来一次）；
 - 直接迭代 answer_ops 和 SSE 收到的是同一串；
 - 开流前的拒绝（模型没配好、限定的数据源都不在）照旧是 HTTP 错误，不进流。
 
@@ -133,6 +134,8 @@ BODY = {"instruction": "数一数门店", "intent": "answer"}
 
 #: final 带的 next（chat/turn.next_step）：问数据页照它走
 NEXT = {"graph_ok": "run", "graph_fixed": "run", "check_failed": "fail", "ask_only": "ready"}
+#: error 带的 (next, code)：只有一个操作都没给的重来一次
+ERROR_NEXT = {"error": ("fail", None), "no_ops": ("retry", "copilot_empty"), "truncated": ("fail", None)}
 
 
 @pytest.mark.parametrize("name", list(SCENARIOS))
@@ -144,6 +147,11 @@ async def test_the_sse_output_is_unchanged_but_for_a_trailing_usage(client, monk
     # final 多了 next（问数据一轮的决定下沉到后端），别的一个字不变
     finals = [op for op in got if op["op"] == "final"]
     assert [op.pop("next") for op in finals] == ([NEXT[name]] if name in NEXT else [])
+    errors = [op for op in got if op["op"] == "error"]
+    assert [(op.pop("next"), op.pop("code", None)) for op in errors] == \
+        ([ERROR_NEXT[name]] if name in ERROR_NEXT else [])
+    for op in errors:
+        assert op["message"] == f"助手本轮未完成：{op.pop('reason')}", op
     assert got[:-1] == expected
 
 

@@ -774,6 +774,12 @@ export const TURN_COST_TEXT = {
     `其中 ${formatNumber(n)} 次调用的金额无法估算（模型不在价格目录中，或用量没有报全），未计入，实际花费不低于此数`,
 } as const
 
+/** 问数据一轮自动重来一次时的进度说明（服务端 chat/turn.next_step 判的 retry） */
+export const CHAT_RETRY_TEXT = {
+  /** 助手上一次只写了思考、一个操作都没给（error.next = retry） */
+  empty: '助手上一次没有给出任何操作，正在重新生成工作流…',
+} as const
+
 export const JUDGE_SETTING_TEXT = {
   label: '证据裁判',
   hint: '报告中的结论句（如「增长主要来自新客首单」）由另一个模型按证据逐句判断：正式运行由报告撰写节点当场裁判，探索运行在点击时逐句裁判。判断由模型给出，不是系统核对，界面上一律标注「非确定」。',

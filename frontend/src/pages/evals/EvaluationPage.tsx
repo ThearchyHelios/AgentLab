@@ -463,7 +463,11 @@ function ResultDetail({ evaluationId, resultId }: { evaluationId: string; result
   const R = T.results
   return (
     <div className="space-y-1" data-eval-result-details="">
-      {(turn.attempts ?? 0) > 0 && <p className="text-faint">{R.attempts(turn.attempts)}</p>}
+      {(turn.attempts ?? 0) > 0 && (
+        <p className="text-faint" data-eval-retries={turn.retries?.length ?? 0}>
+          {R.attempts(turn.attempts)}{turn.retries?.length ? R.retriesWhy(turn.retries) : ''}
+        </p>
+      )}
       {turn.reason && <p className="text-dim"><span className="text-faint">{R.turnReason}：</span>{turn.reason}</p>}
       {answer && (
         <details>
