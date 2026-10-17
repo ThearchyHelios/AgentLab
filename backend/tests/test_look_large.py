@@ -236,3 +236,20 @@ async def test_out_of_scope_parent_is_not_called_missing(big):
     checks = catalog_profile.plan_checks("ord_hdr_east", tables["ord_hdr_east"], {"relations": [rel]},
                                          tables=tables, masked=set(), outside=outside)
     assert [c for c in checks if c.kind == "relation"][0].skip[0] == "missing"
+
+
+def test_out_of_scope_objects_without_a_comment_match_only_their_english_name():
+    """范围外、又没有注释的对象只有英文名可检索（data/schema_view 模块说明写明的限制）：英文名拆出的词（catalog.name_words）
+    没有中文说法——仓库里没有现成的英中业务词对照，不临时编词表，中文需求命不中只叫 refund_orders 的表；有注释的照常命中。
+    以后接了词表，这条要跟着改。"""
+    from types import SimpleNamespace
+
+    from app.data import schema_view
+
+    source = SimpleNamespace(schema_cache={"tables": {}}, options={})
+    outside = [SimpleNamespace(name="refund_orders", comment=None),
+               SimpleNamespace(name="cust_complaint", comment="客户投诉单")]
+    search = schema_view.TableSearch(source, {}, outside)
+    assert [h.name for h in search.search("refund", limit=5)] == ["refund_orders"], "英文名、拆出的词照常命中"
+    assert "refund_orders" not in [h.name for h in search.search("上周的退款", limit=5)], "没有注释、没有词表：中文需求命不中英文名"
+    assert [h.name for h in search.search("投诉", limit=5)] == ["cust_complaint"], "有注释的按注释命中"

@@ -10,7 +10,8 @@
   复核跟着换）；读哪份目录按变体（answer_ops 的 catalog_view，查看的表详情、自查的 SQL 检查器都按它）。
 - 结局：reply 直接回答、asked 反问、fail 判失败（建图失败）、ready 只建不跑、retry（老服务端那条路：没自查过的图带着原因
   重来一次）、run 运行。生成过程交出 error（助手本轮未完成）、开流前就拒绝（模型没配好、数据源不在）都是建图失败，另记
-  「助手调用失败」——连续几题都这样就止损（runner.py）。
+  「助手调用失败」——连续几题都这样就止损（runner.py）；只有生成过程一个操作都没给（只写了思考，error.next=retry）时按
+  同一个规矩先带着原因重来一次，还不行才记建图失败。每次重来的原因照实记在 retries。
 - 运行：fill_input 填入口字段（单轮，history 为空），来源 eval，名字「评测：题集名·第 n 题」，选项带目录视图（Run.options
   的 catalog_view：运行时的 db_schema、冻结快照、自查都按它）、只读和遮罩（同使用者的问数据运行：评测页会显示答案里的数，
   遮罩值不能从这里露出来；评测不写业务库）。写作模型按变体写进图的 defaults：节点自己点了模型的不覆盖，照实记在
@@ -79,6 +80,8 @@ class Turn:
     #: 这一题发起过的全部作答运行（重来的话两次），失败的也在
     runs: list[str] = field(default_factory=list)
     attempts: int = 0
+    #: 每次自动重来的原因（和 attempts 一一对应）：没过检查、复核说不可信、生成过程一个操作都没给
+    retries: list[str] = field(default_factory=list)
     reason: str | None = None
     #: 助手调用失败（生成过程交出 error、开流前就被拒）：runner 据此止损
     copilot_failed: bool = False
@@ -101,25 +104,27 @@ class Turn:
 
     def to_dict(self) -> dict[str, Any]:
         return {"path": self.path, "run_id": self.run_id, "runs": list(self.runs), "attempts": self.attempts,
-                "reason": self.reason, "copilot_failed": self.copilot_failed, "timed_out": self.timed_out,
+                "retries": list(self.retries), "reason": self.reason, "copilot_failed": self.copilot_failed, "timed_out": self.timed_out,
                 "reply": self.reply, "asked": self.asked, "review": self.review, "looks": list(self.looks),
                 "assistant_model": self.assistant_model, "usage": copy.deepcopy(self.usage),
                 "timings": dict(self.timings), "own_models": list(self.own_models)}
 
 
+#: 用量汇总里相加的计数（providers/usage 的 summary）：unfinished_calls 是没做完的调用（被取消、超时，token 只计了已报的）
+_COUNTED = ("input_tokens", "output_tokens", "calls", "unpriced_calls", "unfinished_calls")
+
+
 def _add_usage(into: dict[str, Any] | None, more: Mapping[str, Any] | None) -> dict[str, Any]:
     """两份 providers/usage 汇总相加（by_model 逐个模型加）。"""
-    out = copy.deepcopy(into) if into else {"by_model": {}, "input_tokens": 0, "output_tokens": 0, "calls": 0,
-                                             "cost_usd": 0.0, "unpriced_calls": 0}
+    out = copy.deepcopy(into) if into else {"by_model": {}, **dict.fromkeys(_COUNTED, 0), "cost_usd": 0.0}
     if not more:
         return out
-    for key in ("input_tokens", "output_tokens", "calls", "unpriced_calls"):
+    for key in _COUNTED:
         out[key] = int(out.get(key) or 0) + int(more.get(key) or 0)
     out["cost_usd"] = round(float(out.get("cost_usd") or 0) + float(more.get("cost_usd") or 0), 6)
     for model, row in (more.get("by_model") or {}).items():
-        mine = out["by_model"].setdefault(model, {"input_tokens": 0, "output_tokens": 0, "calls": 0, "cost_usd": 0.0,
-                                                  "unpriced_calls": 0})
-        for key in ("input_tokens", "output_tokens", "calls", "unpriced_calls"):
+        mine = out["by_model"].setdefault(model, {**dict.fromkeys(_COUNTED, 0), "cost_usd": 0.0})
+        for key in _COUNTED:
             mine[key] = int(mine.get(key) or 0) + int(row.get(key) or 0)
         mine["cost_usd"] = round(float(mine.get("cost_usd") or 0) + float(row.get("cost_usd") or 0), 6)
     return out
@@ -379,6 +384,14 @@ class Driver:
                     return t
                 kind = terminal.get("op")
                 if kind == "error":
+                    # 生成过程一个操作都没给（只写了思考）：按重来一次的规矩带着原因重来（同问数据页，chat/turn.next_step）
+                    step = terminal.get("next") or policy.next_step(terminal)
+                    if step == policy.NEXT_RETRY and t.attempts + 1 < policy.MAX_ATTEMPTS:
+                        reason = policy.error_reason(terminal)
+                        t.attempts += 1
+                        t.retries.append(reason)
+                        instruction = policy.retry_instruction(self.question, reason, policy.has_nodes(base_graph))
+                        continue
                     t.path, t.reason, t.copilot_failed = "build_failed", str(terminal.get("message") or "助手本轮未完成"), True
                     return t
                 if kind == "reply":
@@ -393,6 +406,7 @@ class Driver:
                 if step == policy.NEXT_RETRY:
                     if t.attempts + 1 < policy.MAX_ATTEMPTS:
                         t.attempts += 1
+                        t.retries.append(policy.blocked_reason(terminal))
                         instruction = policy.retry_instruction(self.question, policy.blocked_reason(terminal),
                                                                policy.has_nodes(graph))
                         base_graph = graph if policy.has_nodes(graph) else None
@@ -421,7 +435,10 @@ class Driver:
                 t.review = {k: v for k, v in review.items() if k != "usage"}
                 t.usage["review"] = _add_usage(t.usage.get("review"), review.get("usage"))
                 if review.get("retry_instruction"):
+                    from app.chat.turn import review_reason
+
                     t.attempts += 1
+                    t.retries.append(review_reason(review) or "复核判答案不可用")
                     instruction = str(review["retry_instruction"])
                     base_graph = row.graph if policy.has_nodes(row.graph) else None
                     continue

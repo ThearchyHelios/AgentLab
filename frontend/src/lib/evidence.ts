@@ -436,13 +436,20 @@ export function inputSource(input: EvidenceInput): { tone: SourceTone; text: str
       ? { tone: 'warn', text: EVIDENCE_TEXT.codeSource(input.node_id ?? '') }
       : { tone: 'alert', text: EVIDENCE_TEXT.codeCompute(input.node_id ?? '') }
   }
+  if (input.via === 'metric' && input.upstream) {
+    // 转抄另一张口径卡的指标：出处跨卡追下去了（服务端记在 upstream 上），追没追到照实说
+    return input.upstream.traced === true
+      ? { tone: 'ok', text: EVIDENCE_TEXT.upstreamTraced }
+      : { tone: 'warn', text: EVIDENCE_TEXT.upstreamStop }
+  }
   if (status === 'missing' || input.value == null) return { tone: 'warn', text: EVIDENCE_TEXT.inputMissing }
   return { tone: 'muted', text: '' }
 }
 
-/** 值得在「输入来源」里单独列一行的输入：能核对到快照的、代码节点的、缺的 */
+/** 值得在「输入来源」里单独列一行的输入：能核对到快照的、代码节点的、转抄另一张口径卡的指标（跨卡追下去的）、缺的 */
 export const notableInput = (input: EvidenceInput): boolean =>
   input.via === 'agent_field' || input.via === 'tool_cell' || input.via === 'code'
+  || (input.via === 'metric' && !!input.upstream)
   || input.status === 'missing' || input.value == null
 
 /**

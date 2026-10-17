@@ -24,7 +24,7 @@
       "gold": {
         "kind": "sql",
         "datasource": "retail_demo",
-        "sql": "SELECT ROUND(SUM(amount), 2) AS 销售额 FROM orders WHERE status = 'paid' AND paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}'"
+        "sql": "SELECT SUM(amount) AS 销售额 FROM orders WHERE status = 'paid' AND paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}'"
       },
       "expectations": [
         {
@@ -50,7 +50,7 @@
       "gold": {
         "kind": "sql",
         "datasource": "retail_demo",
-        "sql": "SELECT COUNT(*) AS 退款单数, ROUND(SUM(amount), 2) AS 退款金额 FROM orders WHERE status = 'refunded' AND paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}'"
+        "sql": "SELECT COUNT(*) AS 退款单数, SUM(amount) AS 退款金额 FROM orders WHERE status = 'refunded' AND paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}'"
       },
       "expectations": [
         {
@@ -108,7 +108,7 @@
       "gold": {
         "kind": "sql",
         "datasource": "retail_demo",
-        "sql": "SELECT s.region AS 地区, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN stores s ON s.id = o.store_id WHERE o.status = 'paid' AND o.paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}' AND s.region IN ('华南', '华东') GROUP BY s.region ORDER BY 销售额 DESC"
+        "sql": "SELECT s.region AS 地区, SUM(o.amount) AS 销售额 FROM orders o JOIN stores s ON s.id = o.store_id WHERE o.status = 'paid' AND o.paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}' AND s.region IN ('华南', '华东') GROUP BY s.region ORDER BY 销售额 DESC"
       },
       "expectations": [
         {
@@ -137,7 +137,7 @@
       "gold": {
         "kind": "sql",
         "datasource": "retail_demo",
-        "sql": "SELECT s.region AS 地区, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN stores s ON s.id = o.store_id WHERE s.region = '华中' AND o.status = 'paid' AND o.paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}' GROUP BY s.region"
+        "sql": "SELECT s.region AS 地区, SUM(o.amount) AS 销售额 FROM orders o JOIN stores s ON s.id = o.store_id WHERE s.region = '华中' AND o.status = 'paid' AND o.paid_date BETWEEN '{{ schedule.last_week_start }}' AND '{{ schedule.last_week_end }}' GROUP BY s.region"
       },
       "expectations": [
         {

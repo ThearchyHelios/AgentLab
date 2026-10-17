@@ -263,9 +263,8 @@ export function StartDialog({ open, onClose, suite, evaluations, onStarted }: {
             <>
               <p data-eval-estimate-items={est.estimate.items}>{T.estimateText(est.estimate.items, est.cases, est.repeats, est.arms.length)}</p>
               <p data-eval-estimate-cost="">
-                {est.estimate.total_usd != null
-                  ? T.cost(formatCost(est.estimate.total_usd), formatCost(est.estimate.per_item_usd))
-                  : T.costNone}
+                {est.estimate.total_usd == null ? T.costNone
+                  : (est.estimate.at_least ? T.costAtLeast : T.cost)(formatCost(est.estimate.total_usd), formatCost(est.estimate.per_item_usd))}
                 <span className="text-faint"> · {est.estimate.note}</span>
               </p>
               {est.arms.map((a, i) => (

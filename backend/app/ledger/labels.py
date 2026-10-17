@@ -8,10 +8,14 @@
 - unknown：没比对、比对没做完（超时、解析失败）、快照读不出来。
 
 怎么认：
-- 单元格（[[v:]]、[[table:]] 里的格）：按证据目录找到查询快照，取那条查询的比对状态。等价时按列映射写出口径那边的列名。
+- 单元格（[[v:]]、[[table:]] 里的格）：按证据目录找到查询快照，取那条查询的比对状态；这条查询逐格比过（algo 4：整条按全部
+  引用列投影没证明时，被引用的每一列单独投影、和口径的每个指标列逐个比，ledger/match._cells）的，按这一格所在的那一列的
+  结论——同一条查询里一列等价、一列不等价各标各的。等价时按列映射写出口径那边的列名。
 - 指标（[[m:]]）：指标集工件里这个指标的每个输入都要来自查询快照，而且这些快照都被证明等价于同一份口径的同一版、绑定一致；
   指标式还要和那一版里某张口径卡上的某个指标相同——两边的式子把每个输入换成「口径的哪个取数节点、第几行、哪一列」之后
   一字不差（caliber_from 转抄来的式子本来就是那一张卡的，同样按这个比）。输入有不来自查询的（运行输入、整形、代码）不算来自口径。
+  逐格比过的输入按它那一格的结论；同一条查询的好几格合起来用时，只在这条查询一定只出一行（one_row）时才按逐格的结论，
+  别的按整条查询：多行的结果里每一列各自对得上，不等于每一行的几列一起对得上。
 
 整题（whole_of）：主报告里所有带标签的数都来自同一口径的同一版、绑定一致，就记 equivalent，并写出还缺的入口字段（口径入口
 节点声明了、这次的绑定里没有的；required 且没有缺省值的另列）。
@@ -92,11 +96,38 @@ def _caliber_column(cand: Mapping[str, Any], column: Any) -> str | None:
     return None
 
 
+def cells_of(query: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """这条查询逐格比出来的几格（algo 4 的 cells，见 ledger/match._cells）；老工件、没逐格比的为空。"""
+    cells = query.get("cells")
+    return [c for c in cells.values() if isinstance(c, Mapping)] if isinstance(cells, Mapping) else []
+
+
+def candidates_of(query: Mapping[str, Any], *, shown: bool = False) -> list[Mapping[str, Any]]:
+    """一条查询的候选：整条比的，加上逐格比出来的。召回反查、使用次数、工件 meta 都要算上逐格证明了的那几份口径。shown 为真
+    时只要标签上给人看的那一份：逐格比过的只要逐格的（整条的那一份不在标签上），别的照旧是整条的（统计兜底说明的比例用）。"""
+    cells = [c for cell in cells_of(query) for c in cell.get("candidates") or [] if isinstance(c, Mapping)]
+    whole = [c for c in query.get("candidates") or [] if isinstance(c, Mapping)]
+    if shown:
+        return cells or whole
+    return whole + cells
+
+
+def _view(query: Mapping[str, Any], column: Any, *, alone: bool = True) -> Mapping[str, Any]:
+    """这一格按什么判：这条查询逐格比过这一列（cells 里有）的按那一格的结论，别的按整条查询的。alone 为假（一个指标用了
+    这条查询的好几格）时，只有这条查询一定只出一行（one_row）才按逐格的（见模块说明）。老工件没有 cells，照旧按整条。"""
+    cells = query.get("cells")
+    cell = cells.get(column) if isinstance(cells, Mapping) and isinstance(column, str) else None
+    if isinstance(cell, Mapping) and (alone or query.get("one_row") is True):
+        return cell
+    return query
+
+
 def cell_label(artifact: str, column: Any, queries: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-    """单元格的标签：它所在的那条查询的比对状态。"""
-    query = queries.get(artifact)
-    if query is None:
+    """单元格的标签：它所在的那条查询的比对状态（逐格比过的按这一格，_view）。"""
+    found = queries.get(artifact)
+    if found is None:
         return _unknown(NO_RECORD)
+    query = _view(found, column)
     status = query.get("status")
     if status in ("proven", "composed"):
         cand = _proven(query)[0] if _proven(query) else {}
@@ -162,6 +193,78 @@ def card_expressions(cards: list[Mapping[str, Any]]) -> list[tuple[str, str, str
     return out
 
 
+def card_reads(cards: list[Mapping[str, Any]]) -> list[tuple[str, str, tuple[tuple[str, str], ...]]]:
+    """口径版本里每张源头口径卡的每个指标读了哪几格的列：(卡的节点 id, 指标 id, ((取数节点, 列), …))，按式子里出现的先后、
+    去重。只认 cell(nodes.X, 行, '列') 这种输入（同 card_expressions）；有别的写法的指标不收。比对时口径一侧按它投影到
+    「这个指标引用的列」（ledger/match 的 _projected）。"""
+    import ast
+
+    from app.engine.expressions import ExpressionError, cell_parts, leaf_refs, parse_expression
+
+    out: list[tuple[str, str, tuple[tuple[str, str], ...]]] = []
+    for card in cards:
+        for metric in card.get("metrics") or []:
+            try:
+                tree = parse_expression(str((metric or {}).get("expression") or ""))[0]
+            except ExpressionError:
+                continue
+            reads: list[tuple[str, str]] = []
+            for leaf in leaf_refs(tree):
+                parts = cell_parts(leaf)
+                if parts is None or not parts[0].startswith("nodes."):
+                    break
+                try:
+                    column = ast.literal_eval(parts[2])
+                except (ValueError, SyntaxError):
+                    break
+                if not isinstance(column, str):
+                    break
+                read = (parts[0][len("nodes."):], column)
+                if read not in reads:
+                    reads.append(read)
+            else:
+                if reads:
+                    out.append((str(card.get("node_id")), str(metric.get("id")), tuple(reads)))
+    return out
+
+
+def referenced_columns(docs: list[Mapping[str, Any]],
+                       load_card: Callable[[str], Mapping[str, Any] | None]) -> dict[str, set[str]]:
+    """报告里引用了哪条查询的哪几列：{查询快照: {列名}}。和 label_doc 标的是同一批数——单元格（[[v:]]、[[table:]] 里的格）
+    按证据目录找到的快照和列；指标（[[m:]]）按指标集里这个指标的输入（落在查询快照一格上的）。比对时按它投影：只比被
+    引用的那几列（ledger/match 的 _projected）。"""
+    from app.engine.evidence import iter_units
+
+    out: dict[str, set[str]] = {}
+    cards: dict[str, Mapping[str, Any] | None] = {}
+    for doc in docs:
+        catalog = doc.get("catalog") if isinstance(doc.get("catalog"), dict) else {}
+        for _, unit in iter_units(doc):
+            for seg in unit.get("segments") or []:
+                if not isinstance(seg, dict) or seg.get("kind") not in ("number", "value") or not seg.get("id"):
+                    continue
+                cite = seg.get("cite") if isinstance(seg.get("cite"), dict) else {}
+                if cite.get("status") != "resolved":
+                    continue
+                entry = catalog.get(cite.get("alias")) if isinstance(catalog.get(cite.get("alias")), dict) else {}
+                locator = cite.get("locator") if isinstance(cite.get("locator"), dict) else {}
+                artifact = str(entry.get("artifact") or "")
+                if cite.get("kind") == "cell" and artifact and isinstance(locator.get("column"), str):
+                    out.setdefault(artifact, set()).add(locator["column"])
+                elif cite.get("kind") == "metric" and artifact:
+                    if artifact not in cards:
+                        cards[artifact] = load_card(artifact)
+                    card = cards[artifact] or {}
+                    metric = next((m for m in card.get("metrics") or []
+                                   if isinstance(m, dict) and m.get("id") == locator.get("metric")), None)
+                    for item in (metric or {}).get("inputs") or []:
+                        where = item.get("locator") if isinstance(item, dict) else None
+                        if isinstance(item, dict) and item.get("artifact") and item.get("via") in _SNAPSHOT_VIAS \
+                                and isinstance(where, dict) and isinstance(where.get("column"), str):
+                            out.setdefault(str(item["artifact"]), set()).add(where["column"])
+    return out
+
+
 def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mapping[str, Mapping[str, Any]],
                  calibers: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     """指标的标签（见模块说明）。card 是封存的指标集工件（读不出为 None）；calibers 是 {「工作流@版本」: {level, cards}}，
@@ -175,9 +278,18 @@ def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mappin
     from_queries = [i for i in inputs if i.get("artifact") and i.get("via") in _SNAPSHOT_VIAS]
     if not from_queries:
         return {"kind": "reasoning"}
-    found = [queries.get(str(i["artifact"])) for i in from_queries]
-    if any(q is None for q in found):
+    rows = [queries.get(str(i["artifact"])) for i in from_queries]
+    if any(q is None for q in rows):
         return _unknown(NO_RECORD)
+    # 每个输入按它那一格判（_view）：同一条查询用了好几格的，那条查询一定只出一行才按逐格的结论
+    used: dict[str, set[Any]] = {}
+    for item in from_queries:
+        where = item.get("locator") if isinstance(item.get("locator"), dict) else {}
+        used.setdefault(str(item["artifact"]), set()).add(where.get("column"))
+    found: list[Mapping[str, Any] | None] = [
+        _view(q, (i.get("locator") if isinstance(i.get("locator"), dict) else {}).get("column"),
+              alone=len(used[str(i["artifact"])]) == 1) if q is not None else None
+        for q, i in zip(rows, from_queries)]
     if any(q.get("status") == "skipped" for q in found):      # type: ignore[union-attr]
         return _unknown(next(str(q.get("reason") or UNFINISHED) for q in found
                              if q.get("status") == "skipped"))  # type: ignore[union-attr]
@@ -281,8 +393,9 @@ def whole_of(labels: Mapping[str, Mapping[str, Any]], calibers: Mapping[str, Map
         return {"equivalent": False, "reason": "报告里没有可标口径的数", "counts": counts}
     keys = {label.get("caliber") for label in labels.values() if label.get("kind") == "caliber"}
     if counts["caliber"] != len(labels):
-        reason = ("有的数没有比对" if counts["unknown"] else "有的数是这次的推理" if counts["caliber"]
-                  else "没有数来自口径")
+        # 逐格判之后常见「一部分数来自口径、另几个只是相关」：照实说是不一致，不说成这次的推理
+        reason = ("有的数没有比对" if counts["unknown"] else "没有数来自口径" if not counts["caliber"]
+                  else "有的数和相关口径不一致，不来自口径" if counts["related"] else "有的数是这次的推理")
         return {"equivalent": False, "reason": reason, "counts": counts}
     if len(keys) != 1:
         return {"equivalent": False, "reason": "数来自不同的口径", "counts": counts}
@@ -359,5 +472,6 @@ def related_view(item: Mapping[str, Any], *, hide: Callable[[Any], bool], shown:
 
 
 __all__ = ["CERTIFIED_NOTE", "HOWS", "KINDS", "LEVEL_TEXT", "POST_SEAL_NOTE", "RETRO_NOTE", "binding_view", "caliber_key",
-           "card_expressions", "cell_label", "diff_view", "label_doc", "metric_label", "related_view", "view_label",
-           "whole_of"]
+           "candidates_of", "card_expressions", "card_reads", "cell_label", "cells_of", "diff_view", "label_doc",
+           "metric_label",
+           "referenced_columns", "related_view", "view_label", "whole_of"]

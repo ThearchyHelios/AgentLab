@@ -659,7 +659,7 @@ def app_base(bp: dict[str, Any], graph: dict[str, Any], *, use: str, name: str, 
     writes 是写外部系统的调用工具节点 → 能力名（模板知道哪几个是写入，不用查库）。页面、视图、入口由各模板排。"""
     from app.apps.derive import PIN, RECONCILER
     from app.apps.spec import APP_FORMAT
-    from app.apps.tree import node_map, slot_refs
+    from app.apps.tree import node_map, slot_label, slot_refs
     from app.core.artifact_store import graph_hash
 
     ctx = context(bp)
@@ -673,9 +673,14 @@ def app_base(bp: dict[str, Any], graph: dict[str, Any], *, use: str, name: str, 
         "format": APP_FORMAT, "name": name, "description": description, "icon": "app", "pins": [pin], "slots": {},
         "entries": [], "forms": {}, "task_ui": {}, "views": {}, "pages": [], "hooks": [], "notify": [],
     }
+    # 岗位的显示名：卡片上起了名字的用它（审批模板的步骤名）；卡片上就是岗位名本身的（处理人写的是岗位、自由形导入的图）按
+    # 用到它的节点名拼（apps/tree.slot_label，同派生）
     labels = slot_labels(bp)
-    for ref in slot_refs(graph, writes or {}):
-        spec["slots"].setdefault(ref["slot"], {"label": labels.get(ref["slot"], ref["slot"])})
+    refs = slot_refs(graph, writes or {})
+    for ref in refs:
+        label = labels.get(ref["slot"])
+        spec["slots"].setdefault(ref["slot"], {"label": label if label and label != ref["slot"]
+                                               else slot_label(ref["slot"], refs)})
     for nid, n in node_map(graph).items():
         if n["type"] == "human":
             spec["task_ui"][nid] = {"title": n["title"]}

@@ -17,11 +17,13 @@ wrong 错、scale 量纲不同（差 10 的整数次幂，比如元和万元、�
 - scalar：数值按「允许的相对误差」比（engine/tolerance.agree，和双盲复算同一个函数）；期望没写容差时，引用的原值按
   DEFAULT_TOLERANCE，裸写的数按它写出的精度（3.5 万 ±500）。维度配对：期望写了 where（或期望那一行本身有维度）时，答案
   那一格所在行的非数值列要有这个取值；答案那一格没有维度（按条件筛过、只剩一个数）不算对不上。期望值是 0–10 的小整数
-  又没有维度可配时标「弱匹配」（巧合的数：3 家门店正好等于期望的 3）。
+  又没有维度可配时标「弱匹配」（巧合的数：3 家门店正好等于期望的 3）。答错时「答案里的数」给和这一项配对上的那一格（列名、
+  指标、说明同名，或者维度对得上的只有一个数），配不上就不给、原因里照实写配不上，列出答案引用了哪几个数。
 - table：逐行按 keys 的取值配对，每个要比的值同 scalar；ordered 时按答案里各行键值出现的先后核对顺序。
 - set：名单里每一项都要在答案里出现（ordered 时按顺序）；每一项都出现在答案查过的结果里算可追溯。
 - none：期望答「没有数据」：答案里没有数，而且查过的查询里有返回 0 行的（可追溯）；没有数、但也没有一条查询返回 0 行的
-  算「对但没引用」。
+  算「对但没引用」。「给了数」只认引用的数值格和叙述里写的数：引用文字格（地区名这种维度）、空值格（NULL）不算——「华中区
+  没有数据」引用了地区那一格，说的仍是没有数据。
 - ask：期望反问：作答路径是反问才对。
 - text：文字要点，由裁判判（covered / partial / missing / unjudged），单列「模型判断」，不进准确率（评测-D4）。
 
@@ -30,9 +32,10 @@ wrong 错、scale 量纲不同（差 10 的整数次幂，比如元和万元、�
 没有错的）不能评分。期望没算出来按 gold 的结论：口径升版待处置是跳过，别的是不能评分——不混进「答错」。被驳回（总方案 X9）
 记路径「被驳回」，不算失败：不能评分。只有文字要点的题不能评分（单列，不计入准确率）。
 
-**逐题的 E1**（sql_match）：答案里的查询（先看报告引用了的）和期望的取数（SQL 题是期望 SQL，口径题是口径卡的取数节点）
-用口径账本同一个比对函数（ledger/match.compare_queries：先绑参数、再由 explain_sql_diff 判等价）比一次，给出等价与否和差在
-哪个方面（总方案 X2：E1 只有一份实现）。
+**逐题的 E1**（sql_match）：产出答案的那条查询和期望的取数（SQL 题是期望 SQL，口径题是口径卡的取数节点）用口径账本同一个
+比对函数（ledger/match.compare_queries：先绑参数、再由 explain_sql_diff 判等价）比一次，给出等价与否和差在哪个方面（总方案
+X2：E1 只有一份实现）。哪条是产出答案的：答案引用了就是被引用的；没引用、只查了一条就是那一条（写明依据）；没引用、查了
+几条的不硬比（照实写没法对上是哪条，不计入 E1）。
 """
 from __future__ import annotations
 
@@ -46,8 +49,10 @@ from app.engine.tolerance import agree, is_finite_number
 
 logger = logging.getLogger(__name__)
 
-#: 评分规则的版本：规则改了就加一，结果里记着按哪一版评的，可以按新规则重评
-SCORER_VERSION = 1
+#: 评分规则的版本：规则改了就加一，结果里记着按哪一版评的，可以按新规则重评。
+#: 2：期望「没有数据」时引用文字格、空值格不算给了数；判错时「答案里的数」给配对上的那一格；答案没引用查询时逐题 E1
+#: 不硬比第一条查询
+SCORER_VERSION = 2
 
 OUTCOMES = ("traced", "untraced", "wrong", "scale", "ungradable")
 OUTCOME_LABEL = {"traced": "对且可追溯", "untraced": "对但没引用", "wrong": "错", "scale": "量纲不同",
@@ -64,6 +69,8 @@ DEFAULT_TOLERANCE = 1e-6
 SCALE_FACTORS = (10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e8)
 #: 弱匹配：期望是这么小的整数、又没有维度可配
 WEAK_MAX = 10
+#: 判错、又配不上时原因里列出答案引用的前几个数
+PAIR_SHOWN = 3
 
 #: 路径不对时给人看的原因
 WRONG_PATH = {
@@ -316,9 +323,48 @@ def _score_scalar(exp: Mapping[str, Any], gold: Mapping[str, Any], answer: Answe
     for token in answer.bare:
         if _scaled(expected, float(token["value"])):
             return {**out, "outcome": "scale", "got": token["value"], "raw": token["raw"]}
-    got = next((v.get("value") for v in clean), None)
-    return {**out, "outcome": "wrong", **({"got": got} if got is not None else {}),
-            "reason": "答案里没有对得上的数" if not answer.values and not answer.bare else "答案里的数和期望对不上"}
+    numeric = [v for v in clean if is_finite_number(v.get("value"))]
+    if not numeric and not answer.bare:
+        return {**out, "outcome": "wrong", "reason": "答案里没有对得上的数"}
+    paired = _paired(numeric, exp, gold, key)
+    if paired is not None:
+        return {**out, "outcome": "wrong", "got": paired.get("value"), "cell": _cell_ref(paired),
+                "reason": "答案里的数和期望对不上"}
+    if numeric:
+        shown = "、".join(f"{_value_name(v)} {_plain(v.get('value'))}" for v in numeric[:PAIR_SHOWN])
+        more = f" 等 {len(numeric)} 个" if len(numeric) > PAIR_SHOWN else ""
+        return {**out, "outcome": "wrong",
+                "reason": f"答案里的数和期望对不上：答案引用的数按列名、维度都配不上这一项（引用了 {shown}{more}）"}
+    return {**out, "outcome": "wrong", "reason": "答案里的数和期望对不上"}
+
+
+def _norm(name: Any) -> str:
+    return str(name).strip().strip('"`[]').lower() if name is not None else ""
+
+
+def _paired(numeric: Sequence[Mapping[str, Any]], exp: Mapping[str, Any], gold: Mapping[str, Any],
+            key: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """答错时答案里和这一项配对上的那一格（「答案里的数」给它）：按名字配——列名（或口径卡的指标）是期望取的那一列、
+    那个指标，或者和期望的说明（label）同名；名字配不上时按维度配——期望写了维度、答案里维度对得上的数恰好只有一个。
+    都配不上为 None：以前取答案引用的第一个值，退款金额那一项显示成了答案里的订单数，甚至显示成一格文字。"""
+    names = {_norm(n) for n in (exp.get("column"), gold.get("column"), exp.get("metric"), gold.get("metric"),
+                                gold.get("name"), exp.get("label")) if n not in (None, "")}
+    named = [v for v in numeric if _norm(v.get("column")) in names or _norm(v.get("metric")) in names]
+    if named:
+        return named[0]
+    if key:
+        on_dims = [v for v in numeric if v.get("dims") and _dims_ok(key, v["dims"])]
+        if len(on_dims) == 1:
+            return on_dims[0]
+    return None
+
+
+def _value_name(value: Mapping[str, Any]) -> str:
+    return str(value.get("column") or value.get("metric") or value.get("alias") or "（没有列名）")
+
+
+def _plain(value: Any) -> str:
+    return str(int(value)) if is_finite_number(value) and float(value).is_integer() else str(value)
 
 
 def _cell_ref(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -371,8 +417,15 @@ def _score_set(exp: Mapping[str, Any], gold: Mapping[str, Any], answer: Answer, 
 
 
 def _score_none(answer: Answer) -> dict[str, Any]:
-    if answer.values or answer.bare:
-        return {"outcome": "wrong", "reason": "期望答「没有数据」，答案里却给了数"}
+    """期望答「没有数据」。「给了数」只认引用的数值格、叙述里写的数：引用的文字格（地区名这种维度）、空值格（NULL）不是数——
+    「华中区（[[v:Q1.r0.地区]]）没有数据」说的正是没有数据，以前因为它引用了一格就判成「给了数」。"""
+    numeric = next((v for v in answer.values if is_finite_number(v.get("value"))), None)
+    if numeric is not None:
+        return {"outcome": "wrong", "got": numeric.get("value"), "cell": _cell_ref(numeric),
+                "reason": "期望答「没有数据」，答案里却引用了数"}
+    if answer.bare:
+        return {"outcome": "wrong", "got": answer.bare[0]["value"], "raw": answer.bare[0]["raw"],
+                "reason": "期望答「没有数据」，答案的叙述里却写了数"}
     if any(int(q.get("row_count") or 0) == 0 and q.get("role") != "verify" for q in answer.queries):
         return {"outcome": "traced"}
     return {"outcome": "untraced", "reason": "答案没有给数，但没有一条查询返回 0 行可以说明「没有数据」"}
@@ -560,14 +613,19 @@ async def gold_calibers(case: Mapping[str, Any], gold: Mapping[str, Any] | None)
 
 
 async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, answer: Answer, *,
-                    timeout: float = 8.0) -> dict[str, Any] | None:
-    """逐题的 E1：{status: proven|related|none|skipped, query, aspects, diff, reason}。没有作答运行、没有期望取数的为 None。
-    比对在线程里跑（纯计算，和账本一样限时）。"""
+                    timeout: float = 8.0, cells: Sequence[Any] = ()) -> dict[str, Any] | None:
+    """逐题的 E1：{status: proven|related|none|skipped, query, column?, aspects, diff, reason, cited, basis}。没有作答运行、
+    没有期望取数的为 None。比的是哪条查询见 _answering：basis 是 cited（答案引用的）或 only_query（答案没引用、运行只查了
+    这一条）。比对在线程里跑（纯计算，和账本一样限时）。
+
+    和账本同一个口径逐格判（ledger/match._cells）：引用了好几列、整条比不上的查询，每一列各比一次。cells 是评分时和期望
+    配上的那几格（各项期望的 cell：{artifact, column}）：取那一格的结论（column 写是哪一列）；没给、配上的格没逐格比过时，
+    逐格证明了的取那一格，再不然照旧按整条查询。"""
     import asyncio
     import time
 
     from app.api.evidence import _sealed
-    from app.ledger.match import _kinds, compare_queries, read_queries
+    from app.ledger.match import _kinds, compare_queries, read_queries, referenced_of
 
     if not answer.run_id or answer.problem:
         return None
@@ -585,7 +643,9 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
 
     def work() -> list[dict[str, Any]]:
         queries = [q for q in read_queries(sealed, kinds)]
-        return compare_queries(queries, calibers, deadline=time.monotonic() + timeout)
+        # 和账本同一个口径：报告引用了查询的哪几列，整条比不等价时按这几列投影再比（ledger/match._projected）。答案的
+        # SQL 多查了几列（订单数、日期常量）不该让这一题的 E1 变成「相关」
+        return compare_queries(queries, calibers, deadline=time.monotonic() + timeout, referenced=referenced_of(sealed))
 
     try:
         rows = await asyncio.wait_for(asyncio.to_thread(work), timeout=timeout + 2)
@@ -594,22 +654,73 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
     except Exception:  # noqa: BLE001 - 比对是附加的一步，出错照实记没比
         logger.exception("评测：逐题比 SQL 出错")
         return {"status": "skipped", "reason": "比对出错"}
-    cited = [r for r in rows if r.get("artifact") in set(answer.cited)]
-    pool = cited or rows
+    pool, basis = _answering(rows, answer)
+    if isinstance(pool, dict):
+        return pool
+    column, cell = _cell_of(pool, cells)
     proven = next((r for r in pool if r.get("status") == "proven"), None)
-    chosen = proven or next((r for r in pool if r.get("status") == "related"), None) or \
-        next((r for r in pool if r.get("status") == "skipped"), None) or (pool[0] if pool else None)
-    if chosen is None:
-        return {"status": "none", "reason": "答案没有查询"}
+    chosen = cell or proven or next((r for r in pool if r.get("status") == "related"), None) or \
+        next((r for r in pool if r.get("status") == "skipped"), None) or pool[0]
     candidate = next((c for c in chosen.get("candidates") or [] if c.get("status") == chosen.get("status")), None) or \
         next(iter(chosen.get("candidates") or []), None) or {}
     diff = candidate.get("diff") or {}
-    aspects = sorted({i.get("aspect") for i in diff.get("items") or [] if i.get("aspect")})
+    # projection 那一条只是说「多查了几列，不影响这个数」，不是差在哪个方面（账本的 E1 差异类型也不数它）
+    aspects = sorted({i.get("aspect") for i in diff.get("items") or [] if i.get("aspect") not in (None, "", "projection")})
     sql = next((q.get("sql") for q in answer.queries if q.get("artifact") == chosen.get("artifact")), None)
-    return {"status": chosen.get("status"), "query": chosen.get("artifact"), "sql": sql, "aspects": aspects,
-            "diff": diff or None, "via": candidate.get("via"), "binding": candidate.get("binding"),
-            "reason": chosen.get("reason") or candidate.get("reason"), "cited": bool(cited)}
+    return {"status": chosen.get("status"), "query": chosen.get("artifact"), **({"column": column} if column else {}),
+            "sql": sql, "aspects": aspects, "diff": diff or None, "via": candidate.get("via"),
+            "binding": candidate.get("binding"), "reason": chosen.get("reason") or candidate.get("reason"),
+            "cited": basis == "cited", "basis": basis}
+
+
+def matched_cells(graded: "CaseScore") -> list[dict[str, Any]]:
+    """评分时各项期望和答案里配上的那一格（答对的、量纲不同的、答错时配对上的）：逐题 E1 取它们的逐格结论。"""
+    return [dict(item["cell"]) for item in graded.scores
+            if isinstance(item, Mapping) and isinstance(item.get("cell"), dict)]
+
+
+def _cell_of(pool: list[dict[str, Any]], cells: Sequence[Any]) -> tuple[str | None, dict[str, Any] | None]:
+    """逐格比过的格里挑一格：评分时和期望配上的那几格先（其中证明了的先），再不然逐格证明了的那一格。交回 (列名, 那一格的
+    结论，带上查询快照 artifact)；没有可挑的为 (None, None)。"""
+    hinted = [(str(c.get("artifact")), str(c.get("column"))) for c in cells
+              if isinstance(c, Mapping) and c.get("artifact") and c.get("column") is not None]
+    found: list[tuple[str, dict[str, Any]]] = []
+    for row in pool:
+        for name, entry in (row.get("cells") or {}).items() if isinstance(row.get("cells"), dict) else []:
+            if isinstance(entry, dict):
+                found.append((name, {**entry, "artifact": row.get("artifact"), "_hinted": (row.get("artifact"), name)
+                                     in hinted}))
+    ranked = sorted(found, key=lambda f: (not f[1]["_hinted"], f[1].get("status") != "proven"))
+    for name, entry in ranked:
+        if entry["_hinted"] or entry.get("status") == "proven":
+            return name, {k: v for k, v in entry.items() if k != "_hinted"}
+    return None, None
+
+
+def _answering(rows: list[dict[str, Any]], answer: Answer) -> tuple[list[dict[str, Any]] | dict[str, Any], str]:
+    """逐题 E1 拿哪几条查询比：产出答案的那几条。交回 (查询, 依据)，确定不了时交回 (照实的结论, "")。
+
+    - 答案引用了查询（报告里引用的格、指标所在的查询）：比被引用的那几条（依据 cited）；
+    - 没引用、这次运行（核查用的不算）只查了一条：答案的数只可能来自它，按它比（依据 only_query）；
+    - 没引用、查了几条：不比——以前取第一条相关的，取到的往往是探索查询（看看有哪些地区那种），说「差在筛选条件」和答案的数
+      毫无关系。照实写没法对上是哪条，不计入 E1。"""
+    cited = set(answer.cited)
+    if cited:
+        pool = [r for r in rows if r.get("artifact") in cited]
+        if pool:
+            return pool, "cited"
+        return {"status": "skipped", "cited": True,
+                "reason": "答案引用的查询不在可比对的查询里（合并查询不比：它的数都来自它的输入）"}, ""
+    roles = {q.get("artifact"): q.get("role") for q in answer.queries}
+    pool = [r for r in rows if roles.get(r.get("artifact")) != "verify"]
+    if not pool:
+        return {"status": "none", "reason": "答案没有查询"}, ""
+    if len(pool) > 1:
+        return {"status": "skipped", "cited": False,
+                "reason": f"答案没有引用查询，这次运行执行了 {len(pool)} 条查询，没法对上是哪条产出了答案，不比"}, ""
+    return pool, "only_query"
 
 
 __all__ = ["Answer", "CaseScore", "DEFAULT_TOLERANCE", "OUTCOMES", "OUTCOME_LABEL", "PATH_LABEL", "SCORER_VERSION",
-           "TEXT_LABEL", "TEXT_OUTCOMES", "VERDICT_LABEL", "gold_calibers", "read_answer", "score_case", "sql_match"]
+           "TEXT_LABEL", "TEXT_OUTCOMES", "VERDICT_LABEL", "gold_calibers", "matched_cells", "read_answer",
+           "score_case", "sql_match"]

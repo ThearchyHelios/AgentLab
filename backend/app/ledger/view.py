@@ -78,18 +78,27 @@ def _whole_view(whole: dict[str, Any], hider: _Hide, names: dict[str, str]) -> d
     return out
 
 
+def _candidate_view(cand: dict[str, Any], hider: _Hide, names: dict[str, str]) -> dict[str, Any]:
+    item = ledger_labels.related_view(cand, hide=hider.hide, shown=hider.shown, names=names)
+    item["status"] = cand.get("status")
+    if cand.get("how"):
+        item["how"] = cand["how"]
+    if cand.get("columns") is not None:
+        item["columns"] = cand["columns"]
+    if isinstance(cand.get("projection"), dict):
+        # 按引用的列投影之后比的（ledger/match 的 _projected、_cell）：两边各留下了哪几列、去掉了几列（列名，不带值）
+        item["projection"] = cand["projection"]
+    return item
+
+
 def _query_view(query: dict[str, Any], hider: _Hide, names: dict[str, str]) -> dict[str, Any]:
     out = {k: query[k] for k in ("artifact", "node_id", "source", "tables", "status", "reason", "note") if k in query}
-    cands = []
-    for cand in query.get("candidates") or []:
-        item = ledger_labels.related_view(cand, hide=hider.hide, shown=hider.shown, names=names)
-        item["status"] = cand.get("status")
-        if cand.get("how"):
-            item["how"] = cand["how"]
-        if cand.get("columns") is not None:
-            item["columns"] = cand["columns"]
-        cands.append(item)
-    out["candidates"] = cands
+    out["candidates"] = [_candidate_view(c, hider, names) for c in query.get("candidates") or []]
+    if isinstance(query.get("cells"), dict):
+        # 逐格比过的（algo 4）：每一列的结论和候选，标签按它标；遮罩同上
+        out["cells"] = {column: {**{k: cell[k] for k in ("status", "reason") if k in cell},
+                                 "candidates": [_candidate_view(c, hider, names) for c in cell.get("candidates") or []]}
+                        for column, cell in query["cells"].items() if isinstance(cell, dict)}
     return out
 
 

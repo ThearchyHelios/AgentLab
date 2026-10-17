@@ -31,7 +31,10 @@ FORMAT = "agentlab.caliber_match/1"
 #: 比对算法的版本：绑定、证明、标签的规则改了就加一，界面和统计据此分得清是哪一版算法比的。
 #: 2（第 3 波）：认出助手选用的口径（查询 composed、标签 how=composed），指标的标签记它取自哪几条查询（queries，认证队列
 #: 认「被报告引用的查询」用）
-ALGO = "2"
+#: 3：整条比不等价时按报告引用的列投影再比（ledger/match 的 _projected），候选记 projection；没投影的照旧
+#: 4：按全部引用列投影仍没证明的查询，被引用的每一列逐格各比一次（queries[].cells、one_row），每个数按它那一格标；老工件
+#: 没有 cells，照旧按整条查询读
+ALGO = "4"
 #: 触发方式（见模块说明）。certified（第 3 波）：从问数据固化出的口径发布之后，对来源运行补比的（ledger/certify）
 TRIGGERS = ("sealed", "backfill", "on_demand", "certified")
 
@@ -72,10 +75,13 @@ def counts_of(queries: list[dict[str, Any]]) -> dict[str, int]:
 
 def meta_of(content: dict[str, Any]) -> dict[str, Any]:
     """工件引用的 meta：{calibers: [等价已证明的「工作流@版本」], related: [相关的], counts}。"""
+    from app.ledger.labels import candidates_of
+
     proven: list[str] = []
     related: list[str] = []
     for query in content.get("queries") or []:
-        for cand in query.get("candidates") or []:
+        # 逐格证明了的口径也算（召回按旧版本反查、统计按种类数都只读这一份 meta）
+        for cand in candidates_of(query):
             key = str(cand.get("caliber") or "")
             if not key:
                 continue

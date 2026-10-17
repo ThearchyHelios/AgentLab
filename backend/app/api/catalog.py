@@ -844,7 +844,9 @@ async def review_catalog_batch(source_id: str, payload: CatalogBatchReviewIn,
 async def catalog_table_runs(source_id: str, table: str,
                              limit: int = Query(20, ge=1, le=catalog_review.RUNS_LIMIT_MAX),
                              session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """用过这张表的运行（total 是几次运行），新的在前；取法同使用次数（catalog.table_usage）。"""
+    """用过这张表的运行，新的在前。按运行计：total 是几次运行，一次运行查了这张表几次都只算一次。和表清单的使用次数
+    （catalog.table_usage）数的是同一批查询快照，但使用次数按查询计（同一次运行里查了两次算两次），所以使用次数可能比 total
+    大。"""
     _, source = await _resolved(session, source_id)
     key, _ = await _table_key(session, source, table)
     return await catalog_review.table_runs(session, source, key, limit=limit)

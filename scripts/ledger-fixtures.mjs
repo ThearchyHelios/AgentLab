@@ -94,6 +94,24 @@ export const WHOLE = { equivalent: true, caliber: WEEKLY.caliber, workflow_id: W
   level_text: '受管', workflow_name: '周报口径', how: 'independent', binding: [{ field: 'week', value: '2026-W37' }],
   missing: [], missing_required: [], counts: { caliber: 3, related: 0, reasoning: 0, unknown: 0 } }
 
+/**
+ * 逐格判（服务端 ledger/match._cells，algo 4）的真实例子：同一条查询（q-gmv）报告引用了好几列，s6 销售额那一格证明了
+ * 等价于周报口径，s10 订单数那一格只是相关（差在哪先说多查了几列、再说计数对求和），整题不等价、没有出具入口
+ */
+export const CELL_DIFF = { items: [
+  { aspect: 'projection', a: null, b: null, text: '这次多查了 3 列，不影响这个数' },
+  { aspect: 'aggregate', a: 'COUNT(*)', b: 'SUM(amount)', text: '这次数的是行数，口径对 amount 求和' }],
+  fallback: false, text_diff: [] }
+export const CELL_LABELS = {
+  s6: caliberLabel(WEEKLY, 'independent', { binding: [{ field: 'start', value: '2026-10-05' }, { field: 'end', value: '2026-10-11' }],
+                                            query: 'q-gmv', node_id: 'fetch', column: 'gmv' }),
+  s10: { kind: 'related', query: 'q-gmv', related: [{ caliber: WEEKLY.caliber, workflow_id: WEEKLY.workflow_id, version: 2,
+                                                       level: 'governed', level_text: '受管', workflow_name: '周报口径',
+                                                       node_id: 'fetch', comparable: true, diff: CELL_DIFF }] },
+}
+export const CELL_WHOLE = { equivalent: false, reason: '有的数和相关口径不一致，不来自口径',
+  counts: { caliber: 1, related: 1, reasoning: 0, unknown: 0 } }
+
 /** 对过的一次账（单行：一组对照）。status 可以换 */
 export const reconciledOf = (status = 'succeeded') => ({
   run_id: 'run-rec-1', status, query: 'q-orders', caliber: ORDERS.caliber, workflow_id: ORDERS.workflow_id, version: 1,
@@ -109,6 +127,31 @@ export const metricDetail = (runId, metric) => ({
   run_id: runId, node: 'reconcile', metric, rendered: RECONCILE_VALUES[metric] ?? '—', eid: `ev:metric:${metric}`,
   chain: [{ step: 'metric', alias: 'm', metric, name: metric, value: 1, rendered: RECONCILE_VALUES[metric], node_id: 'reconcile',
             caliber: '口径对账', version: 'v1', expression: 'cell(nodes.ours_q1, 0, \'orders\')', sealed: true, inputs: [] }],
+  seal: { sealed: true, ok: true, covered: true }, redacted: { columns: [] },
+})
+
+/**
+ * 对账卡上「按口径」那个数的出处（服务端 api/evidence._upstream_steps 的形状）：它转抄口径卡的指标
+ * （nodes.card.metrics[0].value），出处跨卡接上口径卡「订单数」那一步，再到口径的取数查询（q-cal-fetch）
+ */
+export const copiedMetricDetail = (runId, metric) => ({
+  run_id: runId, node: 'reconcile', metric, rendered: RECONCILE_VALUES[metric] ?? '—', eid: `ev:metric:${metric}`,
+  chain: [
+    { step: 'metric', alias: 'm', metric, name: '订单数 · 口径', value: 1180, rendered: RECONCILE_VALUES[metric], node_id: 'reconcile',
+      caliber: '口径对账', version: 'v1', expression: 'nodes.card.metrics[0].value', substituted: '1180', recompute_ok: true,
+      sealed: true, hash_ok: true, untraced: [],
+      inputs: [{ path: 'nodes.card.metrics[0].value', value: 1180, node_id: 'card', via: 'metric', field: 'metrics[0].value',
+                 status: 'ok', upstream: { metric: 'orders', artifact: 'ms-card', depth: 1, traced: true } }] },
+    { step: 'upstream', of: 'nodes.card.metrics[0].value', node_id: 'card', label: '口径卡', artifact: 'ms-card', metric: 'orders',
+      traced: true, depth: 1, hash_ok: true, sealed: true, name: '订单数', value: 1180, unit: '单', rendered: '1,180单',
+      caliber: '订单口径', version: 'v1', expression: "cell(nodes.fetch, 0, 'orders')", substituted: '1180', recompute_ok: true,
+      status: 'ok', untraced: [],
+      inputs: [{ step: 'input', path: "cell(nodes.fetch, 0, 'orders')", value: 1180, node_id: 'fetch', via: 'tool_cell',
+                 status: 'verified', artifact: 'q-cal-fetch', locator: { row: 0, column: 'orders' }, eid: 'ev:cell:q-cal-fetch' }] },
+    { step: 'query', alias: null, artifact: 'q-cal-fetch', node_id: 'fetch', tool: 'db_query__shop', source: 'shop',
+      sql: "SELECT COUNT(*) AS orders FROM orders WHERE status = 'paid'", columns: ['orders'], rows: [[1180]], row_offset: 0,
+      row_index: [0], total_rows: 1, highlight: { rows: [0], cols: ['orders'], cells: [[0, 'orders']] }, sealed: true, hash_ok: true },
+  ],
   seal: { sealed: true, ok: true, covered: true }, redacted: { columns: [] },
 })
 

@@ -60,6 +60,7 @@ export function AccessSection() {
                     setBindings((b) => { const next = { ...b.slots }; delete next[name]; return { ...b, slots: next } })
                   }} />
                 </div>
+                {slot.label.trim() === name && <p className="text-2xs text-faint" data-app-slot-raw="">{T.slotLabelRaw}</p>}
                 <PrincipalPicker label={T.slots} value={bound as Picked[]}
                                  onChange={(v) => setBindings((b) => ({
                                    ...b, slots: { ...b.slots, [name]: v.filter((x) => x.kind !== 'everyone') as { kind: 'user' | 'group'; name: string }[] },

@@ -313,6 +313,15 @@ export const EVIDENCE_TEXT = {
   originChipHint: '这个数由口径卡确定性算出、复算一致，但算式用到的输入没有一路追到查询快照',
   /** 按位置取的格穿过了原样解析查询结果的整形节点 */
   through: (label: string) => `经「${label}」原样解析`,
+  /**
+   * 转抄另一张口径卡的指标（对账卡、召回卡的「口径」那一项）：出处跨卡往下追，接上那个指标自己的一段，一直到查询格子
+   */
+  upstream: '转抄的口径卡指标',
+  upstreamFrom: (card: string, metric: string) => `取自口径卡「${card}」的指标「${metric}」`,
+  gotoUpstream: (card: string) => `查看口径卡「${card}」的这个指标`,
+  upstreamTraced: '取自另一张口径卡的指标，那个指标的输入都追到了原始数据',
+  upstreamStop: '取自另一张口径卡的指标，那个指标的输入没有都追到原始数据',
+  upstreamUnreadable: '读不到那张口径卡的指标集（文件缺失或与哈希不一致），这一步不能作为证据',
   input: '运行输入',
   seal: '封存',
   sealOk: '已封存 · 核对一致',
@@ -772,6 +781,12 @@ export const TURN_COST_TEXT = {
   /** n 次调用的金额估不出来：金额只是下限 */
   unpriced: (n: number) =>
     `其中 ${formatNumber(n)} 次调用的金额无法估算（模型不在价格目录中，或用量没有报全），未计入，实际花费不低于此数`,
+} as const
+
+/** 问数据一轮自动重来一次时的进度说明（服务端 chat/turn.next_step 判的 retry） */
+export const CHAT_RETRY_TEXT = {
+  /** 助手上一次只写了思考、一个操作都没给（error.next = retry） */
+  empty: '助手上一次没有给出任何操作，正在重新生成工作流…',
 } as const
 
 export const JUDGE_SETTING_TEXT = {
@@ -2305,7 +2320,7 @@ export const CATALOG_TEXT = {
   missing: '表结构中已没有这张表',
   noCatalog: '没有目录',
   usage: (n: number) => `使用 ${formatNumber(n)} 次`,
-  usageHint: '被运行查询过的次数，同一次运行中结果相同的重复查询只算一次',
+  usageHint: '按查询算：被运行查询过的次数，同一次运行里查了几次算几次（结果相同的重复查询只算一次）；「用过这张表的运行」按运行算，两个数可能不一样',
   relationCount: (n: number) => `${formatNumber(n)} 个关联`,
   countTitle: (label: string, n: number) => `${label} ${formatNumber(n)} 项`,
   noMatch: '没有符合条件的表',
@@ -6083,6 +6098,8 @@ export const APP_EDITOR_TEXT = {
   slotAdd: '新增岗位',
   slotName: '岗位名',
   slotLabel: '显示名',
+  /** 显示名和岗位名一样：派生时没有节点名可用（服务端 apps/tree.slot_label），照实用的是岗位名，不是起好的名字 */
+  slotLabelRaw: '还没有起显示名，现在用的是图里的岗位名，可以改成一个好认的名字',
   slotUnbound: '未绑定：发布检查会拦下流程应用',
   slotRemove: (name: string) => `删除岗位「${name}」`,
   grants: '授权',

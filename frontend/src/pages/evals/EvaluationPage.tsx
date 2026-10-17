@@ -215,8 +215,7 @@ function Overview({ run }: { run: EvalRun }) {
       <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
         <RateCard title={O.accuracy} hint={O.accuracyHint} rate={s.accuracy} attr="accuracy" />
         <RateCard title={O.traced} hint={O.tracedHint} rate={s.traced_accuracy} attr="traced" />
-        <StatCard title={O.cost} hint={O.costHint} value={cost} attr="cost"
-                  sub={s.per_case_cost_usd != null ? O.perCase(formatCost(s.per_case_cost_usd)) : undefined} />
+        <StatCard title={O.cost} hint={O.costHint} value={cost} attr="cost" sub={perCaseText(s)} />
         <StatCard title={O.e1} hint={O.e1Hint} value={s.e1?.n ? pct(s.e1.rate) : '—'} sub={rateText(s.e1)} attr="e1" />
       </div>
       <Section title={O.verdicts} attr="verdicts">
@@ -278,7 +277,7 @@ function Overview({ run }: { run: EvalRun }) {
                 <li key={role} data-eval-usage-role={role}>
                   {O.role[role]}：{usageCost(u)}
                   {u.input_tokens != null && <span className="text-faint"> · {O.tokens(formatTokens(u.input_tokens, { compact: true }), formatTokens(u.output_tokens ?? 0, { compact: true }))}</span>}
-                  {u.calls != null && <span className="text-faint"> · {O.callsN(u.calls)}</span>}
+                  {u.calls != null && <span className="text-faint"> · {O.callsN(u.calls, u.unfinished_calls ?? 0)}</span>}
                 </li>
               )
             })}
@@ -294,6 +293,17 @@ function Overview({ run }: { run: EvalRun }) {
       )}
     </div>
   )
+}
+
+/**
+ * 每题平均花费：有估不出金额的调用时只是下限（写「至少」）；一分都没估出来的不写（老总表记成 0 的也一样，金额那一格已经写了
+ * 「金额无法估算」）
+ */
+function perCaseText(s: EvalSummary): string | undefined {
+  const per = s.per_case_cost_usd
+  if (per == null) return undefined
+  if (!s.unpriced_calls) return T.overview.perCase(formatCost(per))
+  return per > 0 ? T.overview.perCaseAtLeast(formatCost(per)) : undefined
 }
 
 function Section({ title, children, attr }: { title: string; children: ReactNode; attr?: string }) {
@@ -417,6 +427,9 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
                           {s.reason && <span> · {s.reason}</span>}
                         </p>
                       ))}
+                      {r.sql_match?.basis && T.sqlMatchBasis[r.sql_match.basis] && (
+                        <p className="text-faint" data-eval-sql-basis={r.sql_match.basis}>{T.sqlMatchBasis[r.sql_match.basis]}</p>
+                      )}
                       {r.sql_match?.reason && <p className="text-faint">{r.sql_match.reason}</p>}
                       <ResultDetail evaluationId={id} resultId={r.id} />
                       <div className="flex flex-wrap gap-2">
@@ -450,7 +463,11 @@ function ResultDetail({ evaluationId, resultId }: { evaluationId: string; result
   const R = T.results
   return (
     <div className="space-y-1" data-eval-result-details="">
-      {(turn.attempts ?? 0) > 0 && <p className="text-faint">{R.attempts(turn.attempts)}</p>}
+      {(turn.attempts ?? 0) > 0 && (
+        <p className="text-faint" data-eval-retries={turn.retries?.length ?? 0}>
+          {R.attempts(turn.attempts)}{turn.retries?.length ? R.retriesWhy(turn.retries) : ''}
+        </p>
+      )}
       {turn.reason && <p className="text-dim"><span className="text-faint">{R.turnReason}：</span>{turn.reason}</p>}
       {answer && (
         <details>

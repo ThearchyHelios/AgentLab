@@ -53,7 +53,7 @@ async def rescore(eval_run_id: str) -> int:
             answer = await score.read_answer(row.run_id if row.path == "ran" else None, reply=turn.get("reply"))
             graded = score.score_case(case, row.gold, answer, path=row.path, path_reason=turn.get("reason"),
                                       judgement=(row.judge or {}).get("text"))
-            match = await score.sql_match(case, row.gold, answer)
+            match = await score.sql_match(case, row.gold, answer, cells=score.matched_cells(graded))
         if graded.verdict != row.verdict:
             changed += 1
         updates[row.id] = {"verdict": graded.verdict, "scores": graded.scores, "sql_match": match,

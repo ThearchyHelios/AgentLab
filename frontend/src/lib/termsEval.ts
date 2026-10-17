@@ -356,6 +356,8 @@ export const EVAL_TEXT = {
     estimateText: (items: number, cases: number, repeats: number, arms: number) =>
       `${formatNumber(cases)} 道题 × 每题 ${repeats} 次${arms > 1 ? ` × ${arms} 臂` : ''}，共 ${formatNumber(items)} 项`,
     cost: (total: string, per: string) => `约 ${total}（每项约 ${per}）`,
+    /** 上一次有估不出金额的调用：估出来的只是下限 */
+    costAtLeast: (total: string, per: string) => `至少约 ${total}（每项至少约 ${per}）`,
     costNone: '估不出花费',
     budget: '生效的预算',
     parallel: (n: number) => `同时评 ${n} 题`,
@@ -416,6 +418,8 @@ export const EVAL_TEXT = {
     cost: '花费',
     costHint: '助手（建图、挑表、复核）+ 写作（答案运行里的模型调用）+ 结论裁判；算期望不调模型',
     perCase: (v: string) => `每题约 ${v}`,
+    /** 有估不出金额的调用：每题平均只是下限 */
+    perCaseAtLeast: (v: string) => `每题至少约 ${v}`,
     e1: '逐题的口径命中（E1）',
     e1Hint: '答案执行的 SQL 和期望的取数被证明等价的比例（口径账本同一个比对函数）',
     citations: '报告引用率',
@@ -441,7 +445,9 @@ export const EVAL_TEXT = {
     timing: { build_ms: '建图', run_wall_ms: '运行（墙钟）', run_active_ms: '运行（执行）', review_ms: '复核', total_ms: '整题' } as Record<string, string>,
     usage: '按角色的用量',
     tokens: (input: string, output: string) => `输入 ${input} · 输出 ${output}`,
-    callsN: (n: number) => `${formatNumber(n)} 次调用`,
+    /** unfinished：没做完的调用（被取消、超时，token 只计了已报的；服务端 providers/usage 的 unfinished_calls） */
+    callsN: (n: number, unfinished = 0) =>
+      `${formatNumber(n)} 次调用${unfinished > 0 ? `（其中 ${formatNumber(unfinished)} 次未完成：被取消或超时，token 只计了已报的部分）` : ''}`,
     role: { assistant: '助手', writer: '写作', judge: '结论裁判', gold: '算期望' } as Record<string, string>,
     passRates: '重复评的题的通过率',
     outcomes: '各期望的结论',
@@ -463,6 +469,10 @@ export const EVAL_TEXT = {
   } as Record<string, string>,
   sqlMatch: {
     proven: '等价已证明', related: '不等价', none: '答案没有查询', skipped: '没比对',
+  } as Record<string, string>,
+  /** 逐题 SQL 比对比的是哪条查询（服务端 score.sql_match 的 basis）。答案引用了查询的不用多说 */
+  sqlMatchBasis: {
+    only_query: '答案没有引用查询；这次运行只执行了这一条查询（核查用的不算），按它比',
   } as Record<string, string>,
   aspect: {
     time: '时间口径', time_range: '时间范围', filter: '筛选条件', aggregate: '聚合', expression: '计算式', join: '关联',
@@ -495,6 +505,8 @@ export const EVAL_TEXT = {
     filter: '只看',
     repeat: (n: number) => `第 ${n + 1} 次`,
     attempts: (n: number) => `这一题自动重来了 ${n} 次`,
+    /** 每次自动重来的原因（服务端 eval/answer 的 turn.retries） */
+    retriesWhy: (reasons: string[]) => `：${reasons.join('；')}`,
     turnReason: '作答的经过',
     answer: '答案原文',
     expand: '展开',

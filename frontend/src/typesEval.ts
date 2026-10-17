@@ -365,7 +365,11 @@ export interface EvalEstimate {
   arms: { label: string | null; variant: EvalVariant; models: EvalResolvedModels; text: string }[]
   cases: number
   repeats: number
-  estimate: { items: number; per_item_usd: number | null; total_usd: number | null; basis: string | null; note: string }
+  /** at_least：上一次另有 unpriced_calls 次调用金额估不出，估算只是下限；total_usd 为空、unpriced_calls 有值：一分都没估出来 */
+  estimate: {
+    items: number; per_item_usd: number | null; total_usd: number | null; basis: string | null; note: string
+    at_least?: boolean; unpriced_calls?: number
+  }
   budget: EvalBudget
   parallel: number
   spend: EvalSpend
@@ -415,7 +419,10 @@ export interface EvalUsage {
   calls?: number
   cost_usd?: number | null
   unpriced_calls?: number
-  by_model?: Record<string, { input_tokens: number; output_tokens: number; calls: number; cost_usd: number; unpriced_calls: number }>
+  /** 没做完的调用（被取消、超时）：算在 calls 里，token 只计了已报的 */
+  unfinished_calls?: number
+  by_model?: Record<string, { input_tokens: number; output_tokens: number; calls: number; cost_usd: number; unpriced_calls: number
+    unfinished_calls?: number }>
 }
 
 export interface EvalTiming {
@@ -531,6 +538,8 @@ export interface EvalSqlMatch {
   aspects?: string[]
   reason?: string | null
   cited?: boolean
+  /** 比的是哪条查询：cited 答案引用的；only_query 答案没引用、这次运行只查了这一条 */
+  basis?: 'cited' | 'only_query' | string
 }
 
 export interface EvalResult {
