@@ -216,7 +216,9 @@ async def list_shares(app_id: str, session: AsyncSession = Depends(get_session),
 @_manage.delete("/{app_id}/shares/{share_id}")
 async def revoke_share(app_id: str, share_id: str, session: AsyncSession = Depends(get_session),
                        x_actor: str | None = Header(default=None)) -> dict[str, Any]:
-    """撤销：之后打开回 410「链接已撤销」。撤销过的再撤销照旧交回它（不重复记审计）。管理员关了开关也能撤销。"""
+    """撤销：之后打开回 410「链接已撤销」。撤销过的再撤销照旧交回它（不重复记审计）。管理员关了开关也能撤销。交回的形状和
+    建、列的同一个（page_title 是页面标题，取法同列表：应用当前的版本）。"""
+    from app.api.apps import _previous
     from app.apps.audit import record
 
     app, _ = await _managed(session, app_id, x_actor)
@@ -228,7 +230,8 @@ async def revoke_share(app_id: str, share_id: str, session: AsyncSession = Depen
         await record(session, action="app.share_revoke", subject_kind="view_share", subject_id=row.id,
                      actor=actor_of(x_actor), data={"app_id": app.id, "page_id": row.page_id, "prefix": row.prefix})
         await session.commit()
-    return share_out(row)
+    version = await _previous(session, app)
+    return share_out(row, _titles(version.spec if version is not None else None))
 
 
 # --------------------------------------------------------------------------

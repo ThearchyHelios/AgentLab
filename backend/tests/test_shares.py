@@ -326,6 +326,10 @@ async def test_revoked_and_expired_links_say_so_with_410(world):  # noqa: F811
     admin = await auth_env.login("root")
     r = await admin.delete(f"/api/apps/{app_id}/shares/{gone['id']}")
     assert r.status_code == 200 and r.json()["state"] == "revoked" and r.json()["revoked_by"] == "root"
+    # 撤销交回的那一条和建、列的同一个形状：page_title 是页面标题，不是页面 id（下一轮验收：以前撤销回的是「home」）
+    assert gone["page_title"] == "首页" and r.json()["page_title"] == gone["page_title"], r.json()["page_title"]
+    again = await admin.delete(f"/api/apps/{app_id}/shares/{gone['id']}")
+    assert again.json()["page_title"] == "首页", "撤销过的再撤销照旧交回它，标题一样"
     async with SessionLocal() as s:
         (await s.get(ViewShare, old["id"])).expires_at = utcnow() - timedelta(minutes=5)
         await s.commit()
