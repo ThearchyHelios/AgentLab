@@ -292,3 +292,33 @@ async def test_users_do_not_get_calibers_in_the_answer_look(monkeypatch):
     with pytest.raises(RuntimeError):
         await copilot.answer_ops(GenerateIn(instruction="x", intent="build")).__anext__()
     assert seen["kinds"] == ("table", "capability")
+
+
+# --------------------------------------------------------------------------
+# card 填什么：协议写清两个 id，写错了交回的原因能一次改对（校验不放宽）
+# --------------------------------------------------------------------------
+
+
+def test_the_protocol_says_card_is_the_cards_node_id_and_id_is_the_name_you_give():
+    text = copilot_context.USE_CALIBER_PROMPT
+    assert '"card":"card"' in text and '"card":"口径卡节点 id"' not in text
+    assert "card 填那一版工作流图里口径卡的节点 id" in text and "不是你起的名字" in text
+    assert "id 是你给这次选用起的名字" in text and "workflow_id、version、card 原样照抄" in text
+
+
+async def test_writing_your_own_id_as_the_card_is_refused_with_what_to_write_instead():
+    wf = await S.publish()
+    pool = await composer()
+    with pytest.raises(compose.ComposeRefused) as e:
+        pool.compose(use(wf, card="c1"), taken={"start"})
+    message = e.value.message
+    assert "没有口径卡「c1」" in message and "card 要填那一版工作流图里口径卡的节点 id" in message
+    assert "可填的有 「card」（口径卡「card」）" in message, message
+    assert "「c1」是你给这次选用起的 id，不是口径卡的节点 id" in message
+    # 别的写错（不是自己起的 id）不多那一句
+    with pytest.raises(compose.ComposeRefused) as other:
+        pool.compose(use(wf, card="other"), taken={"start"})
+    assert "是你给这次选用起的 id" not in other.value.message
+    # 校验不放宽：照着交回的原因改成节点 id 就过
+    made = pool.compose(use(wf, card="card"), taken={"start"})
+    assert made.op_id == "c1"

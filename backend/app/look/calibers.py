@@ -41,8 +41,8 @@ DETAIL_NOT_REUSABLE_PROMPT = "    不能复用：{reason}。请按表重新对"
 DETAIL_FIELDS_PROMPT = "    口径「{workflow}」v{version} 的入口字段：{fields}"
 DETAIL_FIELD_PROMPT = "{name}（{bits}）{desc}"
 DETAIL_NO_FIELDS_PROMPT = "    口径「{workflow}」v{version} 的入口没有字段"
-DETAIL_COMPOSE_PROMPT = ("    能组合：选用写法 {op}（id 自己起，它就是口径卡的节点 id；inputs 按上面的入口字段填，没写的取缺省值；"
-                         "metrics 写要用的指标 id）")
+DETAIL_COMPOSE_PROMPT = ("    能组合：选用写法 {op}（card 原样照抄，是那一版图里口径卡的节点 id；id 自己起，生成的口径卡用它当节点 id；"
+                         "inputs 按上面的入口字段填，没写的取缺省值；metrics 写要用的指标 id）")
 DETAIL_NOT_COMPOSABLE_PROMPT = "    不能组合：{reason}。这份口径只能作为参考，查库交给 agent"
 BRIEF_PROMPT = "· {name}（{workflow} v{version}）：字数超过上限，只列名字，要看指标式时点名再 look"
 MISSING_PROMPT = "没找到口径：{items}（只能查看已发布且未退役的版本里的口径卡；别拿名字相近的顶替）"
