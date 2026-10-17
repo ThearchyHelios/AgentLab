@@ -359,6 +359,27 @@ async def test_table_usage_lists_runs_newest_first(client):
     assert (await client.get(f"{_base(sid)}/ghost/usage")).status_code == 404
 
 
+async def test_usage_counts_queries_and_the_runs_list_counts_runs(client):
+    """两个数口径不同、说明照实：表的「使用次数」按查询计（同一次运行里查了两次算两次），「用过这张表的运行」按运行计。
+    接口说明以前写「取法同使用次数」，看着该是同一个数，验收时 4 对 3 对不上。"""
+    sid = await _source()
+    async with SessionLocal() as session:
+        name = (await session.get(DataSource, sid)).name
+    runs = await _use(sid, name, {"orders": 3})
+    async with SessionLocal() as session:
+        session.add(Artifact(id=uuid.uuid4().hex, run_id=runs[0], kind=catalog.QUERY_SNAPSHOT_KIND,
+                             meta={"source_id": sid, "source": name, "tables": ["orders"]}))
+        await session.commit()
+    listed = (await client.get(f"/api/datasources/{sid}/catalog")).json()
+    assert next(t for t in listed["tables"] if t["table_name"] == "orders")["usage"] == 4
+    assert (await client.get(f"{_base(sid)}/orders/usage")).json()["total"] == 3
+    doc = _fastapi_app.openapi()["paths"]["/api/datasources/{source_id}/catalog/{table}/usage"]["get"]["description"]
+    assert "取法同使用次数" not in doc and "按运行" in doc and "按查询" in doc, doc
+    from app.data import catalog_review
+
+    assert "取法同使用次数" not in (catalog_review.table_runs.__doc__ or "")
+
+
 # --------------------------------------------------------------------------
 # 进度
 # --------------------------------------------------------------------------

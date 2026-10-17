@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { ApiError, api, streamCopilot, streamRun } from '../api/client'
 import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
 import { copilotContext, copilotLook, decodeRun, looksOf } from '../run/decode'
-import { CHAT_BLUEPRINT_TEXT, LEDGER_TEXT, LOOK_TEXT, REJECTED_TEXT } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, CHAT_RETRY_TEXT, LEDGER_TEXT, LOOK_TEXT, REJECTED_TEXT } from '../lib/terms'
 import type { LookEvent } from '../typesApp'
 import { errorMessage, humanizeError, isNetworkError } from '../lib/errors'
 import { guardReview, hasEvidence } from '../lib/evidence'
@@ -174,6 +174,8 @@ export interface UsageTotal {
   cost_usd?: number | null
   unpriced_calls?: number
   calls?: number
+  /** 没做完的调用（被取消、超时）：算在 calls 里，token 只计了已报的（服务端 providers/usage 的 unfinished_calls） */
+  unfinished_calls?: number
   input_tokens?: number
   output_tokens?: number
 }
@@ -498,7 +500,7 @@ function buildMeta(t: ChatTurn): TurnMeta {
   }
 }
 
-const USAGE_KEYS = ['cost_usd', 'unpriced_calls', 'calls', 'input_tokens', 'output_tokens'] as const
+const USAGE_KEYS = ['cost_usd', 'unpriced_calls', 'calls', 'unfinished_calls', 'input_tokens', 'output_tokens'] as const
 
 /** 两份用量相加（缺的当 0）。b 不是对象时原样交回 a */
 export function addUsage(a: UsageTotal | undefined, b: UsageTotal | null | undefined): UsageTotal | undefined {
@@ -1417,14 +1419,14 @@ function plan(flow: Flow, args: PlanArgs) {
    * 这里会清空这一次的过程和答案——它是自动补救，用户还没拿到过答案。用户主动
    * 点的重试走 retryTurn，上一次要留档。
    */
-  const retry = (reason: string, instruction?: string) => {
+  const retry = (reason: string, instruction?: string, status?: string) => {
     // 服务端给了那句话（复核的 retry_instruction）就是它已经按次数判过可以重来；老服务端由这里按次数判
     if ((!instruction && attempt + 1 >= MAX_ATTEMPTS) || !flow.alive()) return false
     const base = built && (built.nodes?.length ?? 0) > 0 ? built : null
     patch((t) => ({
       attempt: attempt + 1,
       phase: 'planning',
-      status: base ? '上次运行未成功，正在调整工作流…' : '上次运行未成功，正在重新生成工作流…',
+      status: status ?? (base ? '上次运行未成功，正在调整工作流…' : '上次运行未成功，正在重新生成工作流…'),
       ops: [], events: [], run: null, output: null, final: undefined, runStatus: undefined,
       review: null, reviewRaw: null, rawOutput: null, lastSeq: 0, failure: null, error: '',
       // 换下来的那次运行花的钱还是这一轮的
@@ -1584,9 +1586,12 @@ function plan(flow: Flow, args: PlanArgs) {
           void flow.persist()
           break
         case 'error':
+          settled = true
+          // 生成过程一个操作都没给（模型只写了思考）：服务端说重来一次（error.next = retry，backend/app/chat/turn.py 的
+          // next_step），照它带着原因重来，次数照 MAX_ATTEMPTS；试满了才照实报。这一次建图的用量随后那条 usage 照样记进这一轮
+          if (op.next === 'retry' && retry(String(op.reason ?? op.message ?? ''), undefined, CHAT_RETRY_TEXT.empty)) break
           // 后端给的是三段：message 人话、hint 怎么办、detail 原始异常。
           // 原文不再截成一行甩给用户，收进可展开、可复制的技术细节
-          settled = true
           fail({
             ...failureOf(op.message ?? '生成失败'),
             ...(op.hint ? { hint: String(op.hint) } : {}),

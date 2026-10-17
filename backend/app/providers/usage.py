@@ -12,11 +12,20 @@ async generator：with 块跨着 yield 的话，变量在两次 yield 之间留�
 在创建时拷走上下文，照样计到；调用方自己的代码一行都不在计量里。
 
 **金额。** 按 providers/catalog.estimate_cost 算，和运行的 llm.end 一个口径。估不出的调用记 unpriced_calls：模型不在价格
-目录里，或者用量没报全而目录价又不是 0。估不出的不当成 0 元，调用方据此写「≥」或「金额无法估算」。用量没报全有两种：
+目录里，或者用量没报全而目录价又不是 0。估不出的不当成 0 元，调用方据此写「≥」或「金额无法估算」。汇总的 cost_usd 永远是
+估得出的那部分（同运行的 usage，全系统一个口径），有 unpriced_calls 时它只是下限：写金额、算平均、做估算的地方都要连着
+unpriced_calls 一起看，一分都没估出来的写估不出、不写 0（评测的开跑估算、每题平均花费以前就漏了这一条，见 eval/runner.estimate、
+eval/stats.summarize）。用量没报全有两种：
 回复没带用量（有的网关流式不给）；读到一半就不读了——用量在流的末尾才报全（Anthropic 的输出 token 在最后一条，OpenAI
 兼容系开了 stream_usage 也在最后）。生成过程读到 done、look、ask 那一行之后照样把流读完再关（api/copilot_gen._drain），
 流末尾那一段用量收得到；只有模型在那一行之后还往下写超过 DRAIN_CHARS 字的闲话时才当场关流（不为闲话付钱），连接断了也一样，
 这一次只拿得到已经报了的部分：照样计次数、计已报的 token，记成估不出，不悄悄少算。
+
+**没做完的调用**（unfinished_calls）。被取消（挑表超时被 asyncio.wait_for 取消、调用方停了）、超时、流读到一半被关掉的调用
+都记一次调用、标「未完成」：token 只计已经报了的（一段都没收到的记 0，当作不知道，记成估不出），调用次数照实。以前挑表超时
+的那一次一点都不计，问数据一轮、评测按角色的调用次数就少一次。LangChain 的 ainvoke 被取消时不一定回调 on_llm_error
+（agenerate 卡在 gather 上被取消，后面的回调走不到）：开始了、到汇总时还没有结束回调的调用（_pending 里剩下的）一并算未完成。
+请求刚发出去就被拒了的（鉴权错、参数不对，一段都没收到）不算一次调用：模型没干活。
 
 模型名按发起调用时的参数取（invocation_params 的 model / model_name，就是接入里配的模型 id，价格目录按它查）；调用参数里
 没有的（以前的演示模型就没报，评测汇总里助手用量的模型因此记成 unknown），看 LangChain 照模型对象给回调的 metadata 里的
@@ -37,6 +46,17 @@ from langchain_core.tracers.context import register_configure_hook
 
 #: 取不到模型名的调用记在这个名下
 UNKNOWN_MODEL = "unknown"
+#: 每个模型累计的几项（unreported 用量没报全的次数、unfinished 没做完的次数）
+_COUNTERS = ("input_tokens", "output_tokens", "calls", "unreported", "unfinished")
+
+
+def _abandoned(error: BaseException) -> bool:
+    """调用是半路放弃的（被取消、超时），不是一发出去就被拒：模型可能已经在干活、已经计费。"""
+    import asyncio
+
+    if isinstance(error, (asyncio.CancelledError, TimeoutError)):
+        return True
+    return any(cls.__name__.endswith(("Timeout", "TimeoutError")) for cls in type(error).__mro__)
 
 
 class Meter(BaseCallbackHandler):
@@ -50,6 +70,10 @@ class Meter(BaseCallbackHandler):
         self._lock = threading.Lock()
         self._pending: dict[UUID, str] = {}
         self._models: dict[str, dict[str, int]] = {}
+
+    def _row(self, model: str) -> dict[str, int]:
+        """这个模型的累计（调用方持锁）。unreported：用量没报全的次数；unfinished：没做完的次数（见模块开头）。"""
+        return self._models.setdefault(model, dict.fromkeys(_COUNTERS, 0))
 
     # ------------------------------------------------------------------ 回调
 
@@ -83,7 +107,7 @@ class Meter(BaseCallbackHandler):
         with self._lock:
             model = self._pending.pop(run_id, "") or str(meta.get("model_name") or meta.get("model") or "") \
                 or UNKNOWN_MODEL
-            row = self._models.setdefault(model, {"input_tokens": 0, "output_tokens": 0, "calls": 0, "unreported": 0})
+            row = self._row(model)
             row["calls"] += 1
             if usage:
                 row["input_tokens"] += int(usage.get("input_tokens") or 0)
@@ -92,8 +116,9 @@ class Meter(BaseCallbackHandler):
                 row["unreported"] += 1
 
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        """流读到一半停了（生成过程在最后一行之后读到太多闲话就关流，或者连接断了）：LangChain 照样交来已经收到的那几段。
-        有收到东西的照计一次、记已报的 token，算用量没报全；一段都没收到的（请求刚发出去就被拒了）不计。"""
+        """调用没做完：流读到一半停了（生成过程在最后一行之后读到太多闲话就关流，或者连接断了）、被取消、超时。LangChain
+        照样交来已经收到的那几段。有收到东西的、被取消或超时的照计一次、记已报的 token，算用量没报全、未完成；一段都没收到
+        的报错（请求刚发出去就被拒了）不计。"""
         from langchain_core.outputs import ChatGenerationChunk
 
         response = kwargs.get("response")
@@ -105,36 +130,48 @@ class Meter(BaseCallbackHandler):
             partial = None
         with self._lock:
             model = self._pending.pop(run_id, "")
-            if partial is None:
+            if partial is None and not _abandoned(error):
                 return
             meta = getattr(partial, "response_metadata", None) or {}
             model = model or str(meta.get("model_name") or meta.get("model") or "") or UNKNOWN_MODEL
-            row = self._models.setdefault(model, {"input_tokens": 0, "output_tokens": 0, "calls": 0, "unreported": 0})
+            row = self._row(model)
             row["calls"] += 1
             row["unreported"] += 1
+            row["unfinished"] += 1
             reported = getattr(partial, "usage_metadata", None) or {}
             row["input_tokens"] += int(reported.get("input_tokens") or 0)
             row["output_tokens"] += int(reported.get("output_tokens") or 0)
+
+    def _rows(self) -> dict[str, dict[str, int]]:
+        """累计的一份拷贝，开始了还没结束回调的调用算成没做完的（调用方持锁）。"""
+        rows = {k: dict(v) for k, v in self._models.items()}
+        for model in self._pending.values():
+            row = rows.setdefault(model or UNKNOWN_MODEL, dict.fromkeys(_COUNTERS, 0))
+            row["calls"] += 1
+            row["unreported"] += 1
+            row["unfinished"] += 1
+        return rows
 
     # ------------------------------------------------------------------ 合并、汇总
 
     def merge(self, other: Meter) -> None:
         """把另一次计量并进来（嵌套的计量出块时并进外层）。"""
         with other._lock:
-            rows = {k: dict(v) for k, v in other._models.items()}
+            rows = other._rows()
         with self._lock:
             for model, row in rows.items():
-                mine = self._models.setdefault(model, dict.fromkeys(row, 0))
+                mine = self._row(model)
                 for key, value in row.items():
                     mine[key] = mine.get(key, 0) + value
 
     def summary(self) -> dict[str, Any]:
-        """{by_model: {模型: {input_tokens, output_tokens, calls, cost_usd, unpriced_calls}}, input_tokens, output_tokens,
-        calls, cost_usd, unpriced_calls}。cost_usd 只是估得出的那部分。"""
+        """{by_model: {模型: {input_tokens, output_tokens, calls, cost_usd, unpriced_calls, unfinished_calls}}, input_tokens,
+        output_tokens, calls, cost_usd, unpriced_calls, unfinished_calls}。cost_usd 只是估得出的那部分；unfinished_calls 次
+        没做完（token 只计了已报的）。"""
         from app.providers.catalog import estimate_cost, find_pricing
 
         with self._lock:
-            rows = {k: dict(v) for k, v in self._models.items()}
+            rows = self._rows()
         by_model: dict[str, dict[str, Any]] = {}
         for model, row in sorted(rows.items()):
             pricing = find_pricing(model)
@@ -146,9 +183,9 @@ class Meter(BaseCallbackHandler):
             by_model[model] = {"input_tokens": row["input_tokens"], "output_tokens": row["output_tokens"],
                                "calls": row["calls"],
                                "cost_usd": round(estimate_cost(model, row["input_tokens"], row["output_tokens"]), 6),
-                               "unpriced_calls": unpriced}
+                               "unpriced_calls": unpriced, "unfinished_calls": row["unfinished"]}
         total = {key: sum(r[key] for r in by_model.values())
-                 for key in ("input_tokens", "output_tokens", "calls", "unpriced_calls")}
+                 for key in ("input_tokens", "output_tokens", "calls", "unpriced_calls", "unfinished_calls")}
         return {"by_model": by_model, **total, "cost_usd": round(sum(r["cost_usd"] for r in by_model.values()), 6)}
 
 

@@ -24,8 +24,8 @@
   一张表冲突、写不进去不影响别的表；路径不对、表不存在逐条报（results 和请求一一对应）。审阅的规则同单项审阅
   （catalog.review_item）。写进去之后影响数字的项被驳回了的，口径账本在后台标依据了它的答案「依据有变」
   （catalog.after_review → ledger/recall，next-round 02 做法 7 二）。
-- **被哪些运行用过**（table_runs，GET /catalog/{table}/usage）：取法同使用次数（catalog.query_snapshot_tables），按运行
-  去重，新的在前；total 是运行次数。
+- **被哪些运行用过**（table_runs，GET /catalog/{table}/usage）：和使用次数数的是同一批查询快照（catalog.query_snapshot_tables），
+  但按运行去重，新的在前；total 是运行次数。使用次数按查询计，同一次运行里查了几次这张表，使用次数就比 total 多几。
 - **进度**（review_progress，GET /catalog/review-progress）：常用表（使用次数前 TOP_N 张，和起草对话框「使用次数最多的
   20 张表」是同一批：catalog.default_tables 的取法，用到的不够 TOP_N 张时按表结构的顺序补齐）、全部、影响数字的项各自的
   确认情况。项的范围和队列一样：表结构里没有的表、列不算。
@@ -391,7 +391,8 @@ async def review_batch(session: AsyncSession, source: Any, items: Iterable[Batch
 
 
 async def table_runs(session: AsyncSession, source: Any, table: str, *, limit: int = 20) -> dict[str, Any]:
-    """用过这张表的运行：{total, runs}，新的在前（按开始时间，没开始的按建立时间）。取法同使用次数。"""
+    """用过这张表的运行：{total, runs}，新的在前（按开始时间，没开始的按建立时间）。数的是和使用次数同一批查询快照
+    （catalog.query_snapshot_tables），但按运行去重：total 是运行次数，使用次数按查询计、可能比它大。"""
     run_ids = {run for run, hit in await catalog.query_snapshot_tables(session, source) if table in hit}
     if not run_ids:
         return {"total": 0, "runs": []}

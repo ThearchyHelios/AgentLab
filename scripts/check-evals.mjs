@@ -9,6 +9,7 @@
 //     数值期望不许人填（请求体里不出现 value 这类键）；
 //   - 口径升版待处置：顶部提示、处置三选一（叫法由服务端给，没有缺省）；启用开关、导出；
 //   - 发起评测：估算和发起是同一份请求体，评一次 / A/B 对照 / 目录贡献对照（预设）各自的请求体；估算的项数、花费、今天已花照服务端写；
+//     上一次的调用金额估不出时估算写「估不出花费」、估出一部分的写「至少约」，总览的每题平均不写成 $0；
 //   - 评测详情：进度、每题正在做什么；停止、只重试没做完的、重评、设为基线——摆不摆按钮照服务端的 actions；总览卡片和各项分布；
 //     逐题表（结论、期望和答案里的数、SQL 差在哪、点开去运行详情）、?case= 定位那道题；和上一次比（指纹差异、转移、归因、换基准）；
 //     A/B 配对表（都对、只 A 对、只 B 对、p 值、看不出差别）；
@@ -694,6 +695,41 @@ await section('加题：选口径、从运行认定、期望反问', async () =>
 })
 
 // ---------------------------------------------------------------- 发起评测
+
+await section('发起评测：估不出金额时估算和总览不写成 $0', async () => {
+  // 服务端 eval/runner.estimate：上一次的调用金额都估不出 → total_usd 为空、带次数；估出一部分 → at_least
+  const shaped = (patch) => ({ ...ESTIMATE(['当前目录']), estimate: { ...ESTIMATE(['当前目录']).estimate, ...patch } })
+  const none = shaped({ per_item_usd: null, total_usd: null, unpriced_calls: 6,
+    note: '上一次评测的 6 次模型调用金额都估不出（模型不在价格目录中，或用量没有报全）：金额上限只管得住估得出金额的调用' })
+  const some = shaped({ at_least: true, unpriced_calls: 2,
+    note: '按这个题集上一次评测的每题平均花费估算，实际至少这么多：上一次另有 2 次调用金额估不出，没有算进去' })
+  for (const [label, body] of [['都估不出', none], ['估出一部分', some]]) {
+    const state = freshState({ override: (method, path) => (method === 'POST' && path.endsWith('/evaluations/estimate')
+      ? { json: body } : null) })
+    const { page, errors } = await open('/evals/suites/suite-a', { state })
+    await page.locator('[data-eval-suite-start]').click()
+    await page.locator('[data-eval-estimate-items]').waitFor()
+    const cost = await text(page, '[data-eval-estimate-cost]')
+    if (label === '都估不出') {
+      check('估算：上一次都估不出时写「估不出花费」和原因，不写 $0', cost.includes('估不出花费') && cost.includes('6 次') && !cost.includes('$0'), cost)
+    } else {
+      check('估算：估出一部分时写「至少约」', cost.includes('至少约 $0.042') && cost.includes('每项至少约 $0.014') && cost.includes('2 次'), cost)
+    }
+    check(`没有页面报错（${label}）`, !errors.length, errors.join(' ｜ '))
+  }
+  const state = freshState()
+  state.evaluations['ev-1'].summary = { ...state.evaluations['ev-1'].summary, cost_usd: 0, unpriced_calls: 6, per_case_cost_usd: null }
+  const { page, errors } = await open('/evals/runs/ev-1', { state })
+  await page.locator('[data-eval-overview]').waitFor()
+  const card = await text(page, '[data-eval-card="cost"]')
+  check('总览：都估不出时花费写「金额无法估算」，不写每题 $0', card.includes('金额无法估算') && !card.includes('每题'), card)
+  state.evaluations['ev-1'].summary = { ...state.evaluations['ev-1'].summary, cost_usd: 0.042, unpriced_calls: 2, per_case_cost_usd: 0.014 }
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.locator('[data-eval-overview]').waitFor()
+  const partly = await text(page, '[data-eval-card="cost"]')
+  check('总览：估出一部分时写「≥」和「每题至少约」', partly.includes('≥ $0.042') && partly.includes('每题至少约 $0.014'), partly)
+  check('没有页面报错（总览）', !errors.length, errors.join(' ｜ '))
+})
 
 await section('发起评测：估算和发起同一份请求体；评一次、A/B、目录贡献对照', async () => {
   const { page, state, errors } = await open('/evals/suites/suite-a')

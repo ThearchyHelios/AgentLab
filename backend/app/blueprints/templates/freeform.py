@@ -104,7 +104,7 @@ def needs_reconciler(bp: dict[str, Any]) -> bool:
 
 
 def app_skeleton(bp: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
-    from app.apps.derive import ENTRY, INSTANCE_VIEW, PIN, VIEW, _entries, _results
+    from app.apps.derive import ENTRY, INSTANCE_VIEW, PIN, VIEW, _entries, _results, start_label
     from app.apps.forms import input_schema
     from app.apps.tree import input_fields, node_map
 
@@ -118,7 +118,7 @@ def app_skeleton(bp: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
     if fields:
         spec["forms"][ENTRY] = input_schema(fields)
         names = list(spec["forms"][ENTRY]["properties"])
-        spec["entries"].append({"id": ENTRY, "label": f"发起{name}" if process else "按条件运行", "pin": PIN,
+        spec["entries"].append({"id": ENTRY, "label": start_label(name) if process else "按条件运行", "pin": PIN,
                                 "form": {"$ref": f"#/forms/{ENTRY}"}, "map": {n: f"form.{n}" for n in names}})
         spec["views"][INSTANCE_VIEW] = {"source": {"kind": "instance"}}
     if not process:

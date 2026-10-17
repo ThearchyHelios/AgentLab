@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.apps.forms import input_schema
 from app.apps.spec import APP_FORMAT, parse_spec
-from app.apps.tree import input_fields, node_map, slot_refs
+from app.apps.tree import input_fields, node_map, slot_label, slot_refs
 
 PIN = "main"
 VIEW = "latest"
@@ -37,6 +37,13 @@ class DeriveRefused(Exception):
         self.status_code = status_code
         self.message = message
         self.code = code
+
+
+def start_label(name: str) -> str:
+    """流程类应用入口按钮的说法「发起…」。名字以英文字母、数字开头时中间空一格（「发起 accept 报销写回」），和界面上中英文
+    之间留空格的写法一致；以前直接拼成「发起accept 报销写回」。派生、蓝图模板（审批、自由形）都用它。"""
+    text = str(name or "").strip()
+    return f"发起 {text}" if text[:1].isascii() and text[:1].isalnum() else f"发起{text}"
 
 
 def _safe(text: str) -> str:
@@ -102,8 +109,9 @@ async def _derive(session: AsyncSession, graph: dict[str, Any], *, title: str, n
         "pins": [{**pin, "use": "process" if process else "view"}],
         "slots": {}, "entries": [], "forms": {}, "task_ui": {}, "views": {}, "pages": [], "hooks": [], "notify": [],
     }
-    for ref in slot_refs(graph, writes):
-        spec["slots"].setdefault(ref["slot"], {"label": ref["slot"]})
+    refs = slot_refs(graph, writes)
+    for ref in refs:
+        spec["slots"].setdefault(ref["slot"], {"label": slot_label(ref["slot"], refs)})
     for nid, node in humans.items():
         spec["task_ui"][nid] = {"title": node["title"]}
     if writes and not lookups:
@@ -113,7 +121,7 @@ async def _derive(session: AsyncSession, graph: dict[str, Any], *, title: str, n
         names = list(spec["forms"][ENTRY]["properties"])
         first = next((n for n in names if n in spec["forms"][ENTRY]["required"]), names[0] if names else None)
         spec["entries"].append({
-            "id": ENTRY, "label": f"发起{title}" if process else "按条件运行", "pin": PIN,
+            "id": ENTRY, "label": start_label(title) if process else "按条件运行", "pin": PIN,
             "form": {"$ref": f"#/forms/{ENTRY}"}, "map": {n: f"form.{n}" for n in names},
             **({"instance_title": {"pattern": f"{title}·{{{first}}}", "fields": [first]}}
                if first and re.fullmatch(r"[A-Za-z0-9_㐀-鿿]+", first) else {}),

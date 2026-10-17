@@ -299,3 +299,52 @@ def test_freeform_people_rows_follow_the_imported_graph():
     stale = [i for i in issues if i["code"] == "bp.template_mismatch" and "gone" in i["message"]]
     assert stale and stale[0]["level"] == "warning"
     assert freeform.people_rows(c.with_graph(get_template("freeform").example(), freeform.example_graph())) == []
+
+
+def _people_graph() -> dict:
+    """两步审核派给岗位 finance（第一步超时升级给 boss），还有一步派给没起名字的节点用的岗位 ops。名字都是虚构的。"""
+    return {"nodes": [
+        c.node("start", "input", "发起", fields=[{"name": "amount", "type": "number"}]),
+        c.node("a", "human", "初审", mode="approve", assignee={"kind": "slot", "slot": "finance"},
+               on_timeout={"action": "escalate", "to_slot": "boss"}, due="PT1H"),
+        c.node("b", "human", "复审", mode="approve", assignee={"kind": "slot", "slot": "finance"}),
+        {"id": "h3", "type": "human", "position": {"x": 0, "y": 0},
+         "data": {"config": {"mode": "approve", "assignee": {"kind": "slot", "slot": "ops"}}}},
+        c.node("done", "output", "完成", fields=[])],
+        "edges": [c.edge("start", "a"), c.edge("a", "b"), c.edge("b", "h3"), c.edge("h3", "done")]}
+
+
+def test_entry_labels_keep_a_space_before_a_latin_name():
+    """入口按钮「发起…」：名字以英文开头时中间空一格（验收时写成了「发起accept 报销写回应用」）。"""
+    from app.apps.derive import start_label
+
+    assert start_label("accept 报销写回应用") == "发起 accept 报销写回应用"
+    assert start_label("报销") == "发起报销" and start_label("2026 年报") == "发起 2026 年报"
+    graph = _people_graph()
+    inst = instantiate({**get_template("freeform").example()}, name="accept 报销写回应用", graph=graph)
+    assert inst.app_spec["entries"][0]["label"] == "发起 accept 报销写回应用", inst.app_spec["entries"]
+    approval = instantiate(get_template("approval").example(), name="erp 报销")
+    assert approval.app_spec["entries"][0]["label"] == "发起 erp 报销"
+
+
+def test_slot_labels_use_the_node_names_and_say_so_when_there_is_none():
+    """应用里岗位的显示名：图里只写了岗位名（画布上随手写的 id，常是英文 finance），以前显示名就是它，看着像起好的名字。
+    现在按用到它的节点在图上的名字拼（几处用到用顿号连、超时升级的写「…超时升级」）；节点没起名字的照实用岗位名。蓝图卡片
+    上起了名字的（审批模板的步骤名）照旧用它。"""
+    inst = instantiate({**get_template("freeform").example()}, name="报销", graph=_people_graph())
+    slots = inst.app_spec["slots"]
+    assert slots["finance"]["label"] == "初审、复审", slots
+    assert slots["boss"]["label"] == "初审超时升级" and slots["ops"]["label"] == "ops", slots
+    approval = instantiate(get_template("approval").example())
+    labels = {k: v["label"] for k, v in approval.app_spec["slots"].items()}
+    assert all(labels[k] != k for k in ("lead", "finance", "finance_up")), labels
+
+
+async def test_derived_apps_use_the_same_slot_labels_and_entry_label():
+    from app.apps.derive import derive_from_graph
+    from app.db.base import SessionLocal
+
+    async with SessionLocal() as session:
+        spec = await derive_from_graph(session, _people_graph(), name="accept 报销", blueprint_id="bp1")
+    assert {k: v["label"] for k, v in spec["slots"].items()} == {"finance": "初审、复审", "boss": "初审超时升级", "ops": "ops"}
+    assert spec["entries"][0]["label"] == "发起 accept 报销"

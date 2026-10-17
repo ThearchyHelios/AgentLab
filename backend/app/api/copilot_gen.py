@@ -69,12 +69,14 @@ def _parse_op_line(line: str) -> dict[str, Any] | None:
 
 
 class CopilotIncomplete(Exception):
-    """模型这一轮没说完：输出被截断，或者一个操作都没给。画布不能按「无需修改」交付。"""
+    """模型这一轮没说完：输出被截断，或者一个操作都没给。画布不能按「无需修改」交付。code 是机读码：一个操作都没给的是
+    chat/turn.EMPTY_GENERATION（问数据一轮按它自动重来一次），截断的不给。"""
 
-    def __init__(self, reason: str, *, hint: str = "", detail: str = "") -> None:
+    def __init__(self, reason: str, *, hint: str = "", detail: str = "", code: str = "") -> None:
         super().__init__(reason)
         self.hint = hint or "画布未修改。可以重试，或把需求拆成几步分别提出"
         self.detail = detail
+        self.code = code
 
 
 async def _drain(stream: Any, already: int) -> None:

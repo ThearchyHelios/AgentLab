@@ -69,6 +69,18 @@ def test_summary_counts_only_gradable_items_and_splits_roles():
     assert summary["e1"]["passed"] == 1 and summary["e1"]["n"] == 2 and summary["e1"]["aspects"] == {"time": 1}
 
 
+def test_the_per_case_cost_is_not_zero_when_calls_could_not_be_priced():
+    """模型不在价格目录里（价格目录空）：金额 0 只是「估得出的那部分」，每题平均花费不能写成 0（像不花钱）——一分都没估出来
+    的为 None（估不出），估出了一部分的照给、unpriced_calls 说明它只是下限。"""
+    unpriced = {"assistant": {"by_model": {}, "calls": 4, "cost_usd": 0.0, "input_tokens": 900, "output_tokens": 90,
+                              "unpriced_calls": 4}}
+    summary = stats.summarize([_row("c1", "pass", usage=unpriced), _row("c2", "fail", usage=unpriced)])
+    assert summary["unpriced_calls"] == 8 and summary["per_case_cost_usd"] is None, summary["per_case_cost_usd"]
+    partly = {"assistant": {**unpriced["assistant"], "cost_usd": 0.02, "unpriced_calls": 1}}
+    summary = stats.summarize([_row("c1", "pass", usage=partly), _row("c2", "fail", usage=partly)])
+    assert summary["per_case_cost_usd"] == 0.02 and summary["unpriced_calls"] == 2
+
+
 def test_repeats_give_a_pass_rate_per_case():
     rows = [_row("c1", "pass", repeat=0), _row("c1", "fail", repeat=1), _row("c1", "pass", repeat=2)]
     summary = stats.summarize(rows)

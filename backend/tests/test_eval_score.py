@@ -116,6 +116,59 @@ def test_tables_sets_none_and_ask():
     assert score_case(ask, {"status": "ok"}, Answer(run_id="r"), path="ran").verdict == "fail"
 
 
+def test_a_wrong_answer_shows_the_paired_cell():
+    """判错时「答案里的数」给评分时配对上的那一格（按列名、指标、维度配），不是答案引用的第一个值；配不上照实写配不上。"""
+    case = _case({**EXP, "column": "refund", "label": "退款金额"})
+    gold = _gold({"e1": _scalar(1234.5, column="refund")})
+
+    def cell(value, column, **dims):
+        return {"value": value, "kind": "cell", "artifact": "a1", "row": 0, "column": column, "dims": dims}
+
+    question = cell("上周退款金额是多少", "问题")
+    both = score_case(case, gold, Answer(run_id="r", values=[question, cell(36, "单数"), cell(1200.0, "refund")]),
+                      path="ran")
+    assert both.verdict == "fail" and both.scores[0]["got"] == 1200.0, both.scores
+    assert both.scores[0]["cell"]["column"] == "refund"
+    labelled = score_case(case, gold, Answer(run_id="r", values=[cell(36, "单数"), cell(1200.0, "退款金额")]), path="ran")
+    assert labelled.scores[0]["got"] == 1200.0, "期望的说明（label）和答案的列名一样也算配上"
+    lone = score_case(case, gold, Answer(run_id="r", values=[question, cell(36, "单数")]), path="ran")
+    [s] = lone.scores
+    assert s["outcome"] == "wrong" and "got" not in s, "单数不是退款金额：配不上就不给「答案里的数」"
+    assert "配不上" in s["reason"] and "单数 36" in s["reason"] and "上周退款" not in s["reason"], s["reason"]
+    # 按维度配：华东那一行只有一个数时就是它；同一行有几个数、列名又都配不上时不猜
+    by_dims = _case({**EXP, "column": "refund", "where": {"region": "华东"}})
+    gold = _gold({"e1": _scalar(1234.5, column="refund", where={"region": "华东"}, dims={"region": "华东"})})
+    one = score_case(by_dims, gold, Answer(run_id="r", values=[cell(1200.0, "total", region="华东")]), path="ran")
+    assert one.scores[0]["got"] == 1200.0, one.scores
+    two = score_case(by_dims, gold, Answer(run_id="r", values=[cell(36, "单数", region="华东"),
+                                                               cell(1200.0, "total", region="华东")]), path="ran")
+    assert "got" not in two.scores[0] and "配不上" in two.scores[0]["reason"], two.scores
+    text_only = score_case(case, _gold({"e1": _scalar(1234.5, column="refund")}), Answer(run_id="r", values=[question]),
+                           path="ran")
+    assert "got" not in text_only.scores[0] and text_only.scores[0]["reason"] == "答案里没有对得上的数"
+
+
+def test_none_counts_only_numbers_as_giving_data():
+    """期望「没有数据」：只有引用了数值格、或叙述里写了数，才算答案给了数。引用的是文字格（地区名）、空值格（NULL）的，
+    答案明说没有数据就按没有数据判对。"""
+    none = _case({"id": "n", "kind": "none", "required": True})
+    gold = _gold({"n": {"kind": "none", "rows": 0}})
+    empty = [{"artifact": "q", "row_count": 0, "sql": "SELECT 1"}]
+    text_cell = {"value": "华中", "kind": "cell", "artifact": "q", "row": 0, "column": "region", "dims": {}}
+    named = score_case(none, gold, Answer(run_id="r", text="华中区没有数据", values=[text_cell], queries=empty), path="ran")
+    assert named.verdict == "pass" and named.scores[0]["outcome"] == "traced", named.scores
+    null_cell = {"value": None, "kind": "cell", "artifact": "q", "row": 0, "column": "gmv", "dims": {}}
+    null = score_case(none, gold, Answer(run_id="r", text="华中区的销售额为空，没有数据", values=[null_cell],
+                                         queries=empty), path="ran")
+    assert null.verdict == "pass", null.scores
+    number = score_case(none, gold, Answer(run_id="r", text="华中区 12 元", values=[_cell(12.0)], queries=empty),
+                        path="ran")
+    assert number.verdict == "fail" and number.scores[0]["got"] == 12.0, number.scores
+    said = score_case(none, gold, Answer(run_id="r", text="华中区 12 元", values=[text_cell], bare=_bare("12 元"),
+                                         queries=empty), path="ran")
+    assert said.verdict == "fail" and said.scores[0]["raw"] == "12", said.scores
+
+
 def test_the_path_and_the_gold_decide_before_numbers():
     case = _case(EXP)
     gold = _gold({"e1": _scalar(330.0)})
@@ -193,6 +246,49 @@ async def test_reading_the_sealed_answer_and_the_per_case_sql_match(engine_on, m
     gold["before"]["rendered"]["sql"] = ("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' "
                                          "AND paid_at >= '2026-09-01' AND paid_at < '2026-09-08'")
     assert (await score.sql_match(case, gold, answer))["status"] == "proven"
+
+
+async def test_the_per_case_sql_match_compares_the_query_behind_the_answer(engine_on, monkeypatch, tmp_path):
+    """逐题 E1 比的是产出答案的那条查询：答案引用了就比被引用的；没引用、这次运行又查了几条时不硬比第一条（往往是探索
+    查询），照实写没法对上是哪条；没引用、只查了一条时它就是唯一可能的那条，按它比、写明依据。"""
+    from app.db.base import SessionLocal
+    from app.db.models import DataSource
+    from app.engine.runner import run_manager
+    from app.eval import score
+    from app.ledger import match as ledger_match
+    from sqlalchemy import select
+    from tests import ledger_samples as ls
+
+    await ls.fresh_source(tmp_path / "shop.db")
+    async with SessionLocal() as session:
+        sid = (await session.execute(select(DataSource.id).where(DataSource.name == ls.CURRENT["source"]))).scalar()
+    case = {"gold": {"kind": "sql", "datasource_id": sid, "sql": "x"}, "expectations": []}
+    gold = {"status": "ok", "before": {"rendered": {"sql": (
+        "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND paid_at >= '2026-09-01' "
+        "AND paid_at < '2026-09-08'")}, "sets": []}}
+
+    # 先探了一下有哪些地区，再查销售额；答案没引用查询（数写在叙述里）
+    graph = ls.chain(ls.node("start", "input"),
+                     ls.node("peek", "tool", tool=ls.tool(), args={"sql": "SELECT DISTINCT region FROM orders"}),
+                     ls.node("q", "tool", tool=ls.tool(), args={"sql": ls.WITH_REFUNDS}),
+                     ls.node("write", "report", instructions="写答案"),
+                     ls.node("out", "output", fields=[{"name": "答案", "value": "{{ nodes.write.text }}"}]))
+    ls.script(monkeypatch, "本周销售额约 200 元。")
+    started = await run_manager.start(graph=graph, input_payload={}, run_class="exploratory", origin_kind="canvas")
+    await ls.wait(started.id)
+    await ledger_match.drain()
+    answer = await score.read_answer(started.id)
+    assert answer.cited == [] and len(answer.queries) == 2, answer.queries
+    match = await score.sql_match(case, gold, answer)
+    assert match["status"] == "skipped" and match["cited"] is False and "没有引用查询" in match["reason"], match
+    assert match.get("query") is None and match.get("aspects") in (None, []), "没法对上是哪条，就不给差在哪"
+
+    # 只查了一条、答案没引用：唯一的那条就是产出答案的，按它比，依据写明
+    run = await ls.explore(monkeypatch, ls.EQUIVALENT, text="本周销售额 170.5 元。")
+    only = await score.read_answer(run.id)
+    assert only.cited == [] and len(only.queries) == 1
+    match = await score.sql_match(case, gold, only)
+    assert match["status"] == "proven" and match["basis"] == "only_query" and not match["cited"], match
 
 
 async def test_rescoring_reads_the_seal_and_never_calls_a_model(engine_on, monkeypatch, tmp_path):

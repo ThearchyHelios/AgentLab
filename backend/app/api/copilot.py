@@ -1751,14 +1751,20 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
             # 流正常结束，却没有 done、也没有一个操作能认（格式跑偏，每一行都被跳过）：
             # 往下走就是拿原图去自查、交付，界面上写「无需修改」——而模型什么都没说
             if gen.asked is None and all(o.get("op") == "plan" for o in applier.seen):
+                # 只写了思考（deepseek 这类推理模型偶发）、或者格式跑偏：带机读码，问数据页和评测按 chat/turn 的规矩自动
+                # 重来一次（error.next = retry），还不行再照实报
                 raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
-                                        hint="画布未修改。可以重试，或把需求描述得更具体")
+                                        hint="画布未修改。可以重试，或把需求描述得更具体", code=turn.EMPTY_GENERATION)
         except CopilotIncomplete as e:
-            yield {"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail}
+            failed = {"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail,
+                      "reason": str(e), **({"code": e.code} if e.code else {})}
+            yield {**failed, "next": turn.next_step(failed)}
             return
         except Exception as e:  # noqa: BLE001
             reason, hint = explain_error(e)
-            yield {"op": "error", "message": f"助手本轮未完成：{reason}", "hint": hint, "detail": raw_error(e)}
+            failed = {"op": "error", "message": f"助手本轮未完成：{reason}", "hint": hint, "detail": raw_error(e),
+                      "reason": reason}
+            yield {**failed, "next": turn.next_step(failed)}
             return
 
         # 兜底：一个操作都没落地，而上一轮有图。

@@ -96,7 +96,8 @@ async def test_metering_counts_by_model_and_prices_from_the_catalog():
         await Scripted(model=FREE, report=False).ainvoke("你好")
     got = m.summary()
     assert got["by_model"][PRICED] == {"input_tokens": 2000, "output_tokens": 400, "calls": 2,
-                                       "cost_usd": round(estimate_cost(PRICED, 2000, 400), 6), "unpriced_calls": 0}
+                                       "cost_usd": round(estimate_cost(PRICED, 2000, 400), 6), "unpriced_calls": 0,
+                                       "unfinished_calls": 0}
     assert got["by_model"][UNPRICED]["unpriced_calls"] == 1 and got["by_model"][UNPRICED]["cost_usd"] == 0
     # 目录外的模型名（多了后缀）照样算估不出；目录价是 0 的本地模型没报用量也不算估不出
     assert got["by_model"][PRICED + "-silent"]["unpriced_calls"] == 1
@@ -182,6 +183,64 @@ async def test_the_eval_driver_on_the_demo_model_records_its_name(monkeypatch):
     driver._take(ops)
     got = driver.turn.usage["assistant"]["by_model"]
     assert set(got) == {"mock-fast"} and got["mock-fast"]["calls"] >= 1, got
+
+
+class Slow(Scripted):
+    """回得很慢的模型：调用方等不及（挑表超时被 asyncio.wait_for 取消）。partial=True 时先报一段输入用量再卡住。"""
+
+    delay: float = 5.0
+    partial: bool = False
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        self.calls += 1
+        await asyncio.sleep(self.delay)
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="晚了"))])
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+        self.calls += 1
+        if self.partial:
+            yield ChatGenerationChunk(message=AIMessageChunk(content="{", usage_metadata={
+                "input_tokens": 900, "output_tokens": 0, "total_tokens": 900}))
+        await asyncio.sleep(self.delay)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="晚了"))
+
+
+class Refused(Scripted):
+    """请求刚发出去就被拒了（鉴权错、参数不对）：模型没干活，不算一次调用。"""
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        raise ValueError("401 鉴权失败")
+
+
+async def test_a_call_cancelled_before_any_result_still_counts_as_an_unfinished_call():
+    """挑表超时被取消的那次调用以前一点都不计（LangChain 取消时连 on_llm_error 都不一定回调）：调用次数少了一次。现在
+    记一次调用、token 不知道（没有部分结果的记 0、算没报全），标「未完成」；有部分用量的照实记已报的；被拒的仍不计。"""
+    from app.look import pick
+
+    m = usage.meter()
+    with usage.metering(m):
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(Slow(model=PRICED).ainvoke("挑表"), timeout=0.05)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(pick._ask(Slow(model=UNPRICED), [("human", "挑表")]), timeout=0.05)
+
+        async def read():
+            async for _ in Slow(model=PRICED + "-partial", partial=True).astream("挑表"):
+                pass
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(read(), timeout=0.05)
+        with pytest.raises(ValueError):
+            await Refused(model=PRICED + "-refused").ainvoke("挑表")
+    got = m.summary()
+    rows = got["by_model"]
+    assert (rows[PRICED]["calls"], rows[PRICED]["unfinished_calls"], rows[PRICED]["input_tokens"]) == (1, 1, 0), rows
+    assert rows[PRICED]["unpriced_calls"] == 1, "token 不知道，金额也就估不出"
+    assert (rows[UNPRICED]["calls"], rows[UNPRICED]["unfinished_calls"]) == (1, 1), "挑表（look/pick._ask）超时同样计"
+    partial = rows[PRICED + "-partial"]
+    assert (partial["calls"], partial["unfinished_calls"], partial["input_tokens"]) == (1, 1, 900), partial
+    assert PRICED + "-refused" not in rows, "被拒的不算一次调用"
+    assert got["calls"] == 3 and got["unfinished_calls"] == 3
 
 
 async def test_outside_the_meter_nothing_is_counted():
