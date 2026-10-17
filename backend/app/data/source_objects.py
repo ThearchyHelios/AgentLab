@@ -1066,8 +1066,8 @@ async def delete_index(session: AsyncSession, source_id: str) -> None:
 
 
 __all__ = [
-    "ABSENT_MESSAGE", "ABSENT_MISSING", "ABSENT_OUT_OF_SCOPE", "ABSENT_PLAIN", "ABSENT_REFLECT_FAILED", "ABSENT_REMOVED",
-    "ABSENT_UNKNOWN", "ADD_LIMIT", "AddOutcome",
+    "ABSENT_MESSAGE", "ABSENT_MISSING", "ABSENT_OUT_OF_SCOPE", "ABSENT_PLAIN", "ABSENT_REFLECT_FAILED",
+    "ABSENT_REMOVED", "ABSENT_UNKNOWN", "ADD_LIMIT", "AddOutcome", "absent_message",
     "INDEX_LIMIT", "IndexResult", "IndexedObject", "OutsideObject", "REFLECT_BATCH", "RULES_MAX", "Reflected",
     "RefreshStats", "SCOPE_DEFAULT", "SCOPE_MAX", "SCOPE_OPTION", "SCOPE_REASONS", "ScopePlan", "ScopeRules", "Trail",
     "VIA_CATALOG", "VIA_LOOK", "VIA_SCHEMA_TOOL", "absent_reasons", "add_to_scope", "apply_scope",

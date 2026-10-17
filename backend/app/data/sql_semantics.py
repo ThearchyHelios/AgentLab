@@ -7422,7 +7422,8 @@ class _Explainer:
             if times != {key} and any(_window_like(c) for c in on_a + on_b):
                 continue
             kinds = _kinds_for(on_a + on_b)
-            if self.usage_a.touches({key}, skip=on_a, kinds=kinds) or self.usage_b.touches({key}, skip=on_b, kinds=kinds):
+            if self.usage_a.touches({key}, skip=on_a, kinds=kinds) or \
+                    self.usage_b.touches({key}, skip=on_b, kinds=kinds):
                 continue
             never_null = _not_null_column(self.info, key[0], key[1], self.read)
             if self.range.compare(on_a, mapped_b, never_null=never_null) is not False:
