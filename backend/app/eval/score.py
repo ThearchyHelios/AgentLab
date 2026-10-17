@@ -621,7 +621,7 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
     import time
 
     from app.api.evidence import _sealed
-    from app.ledger.match import _kinds, compare_queries, read_queries
+    from app.ledger.match import _kinds, compare_queries, read_queries, referenced_of
 
     if not answer.run_id or answer.problem:
         return None
@@ -639,7 +639,9 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
 
     def work() -> list[dict[str, Any]]:
         queries = [q for q in read_queries(sealed, kinds)]
-        return compare_queries(queries, calibers, deadline=time.monotonic() + timeout)
+        # 和账本同一个口径：报告引用了查询的哪几列，整条比不等价时按这几列投影再比（ledger/match._projected）。答案的
+        # SQL 多查了几列（订单数、日期常量）不该让这一题的 E1 变成「相关」
+        return compare_queries(queries, calibers, deadline=time.monotonic() + timeout, referenced=referenced_of(sealed))
 
     try:
         rows = await asyncio.wait_for(asyncio.to_thread(work), timeout=timeout + 2)
@@ -657,7 +659,8 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
     candidate = next((c for c in chosen.get("candidates") or [] if c.get("status") == chosen.get("status")), None) or \
         next(iter(chosen.get("candidates") or []), None) or {}
     diff = candidate.get("diff") or {}
-    aspects = sorted({i.get("aspect") for i in diff.get("items") or [] if i.get("aspect")})
+    # projection 那一条只是说「多查了几列，不影响这个数」，不是差在哪个方面（账本的 E1 差异类型也不数它）
+    aspects = sorted({i.get("aspect") for i in diff.get("items") or [] if i.get("aspect") not in (None, "", "projection")})
     sql = next((q.get("sql") for q in answer.queries if q.get("artifact") == chosen.get("artifact")), None)
     return {"status": chosen.get("status"), "query": chosen.get("artifact"), "sql": sql, "aspects": aspects,
             "diff": diff or None, "via": candidate.get("via"), "binding": candidate.get("binding"),

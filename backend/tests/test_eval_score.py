@@ -291,6 +291,32 @@ async def test_the_per_case_sql_match_compares_the_query_behind_the_answer(engin
     assert match["status"] == "proven" and match["basis"] == "only_query" and not match["cited"], match
 
 
+async def test_the_per_case_sql_match_projects_to_the_cited_columns(engine_on, monkeypatch, tmp_path):
+    """逐题 E1 和账本同一个口径：答案的 SQL 多查了一列订单数、报告只引用销售额那一列时，按引用的列投影后和期望 SQL
+    证明等价；多出来的那列不算差在哪个方面。"""
+    from app.db.base import SessionLocal
+    from app.db.models import DataSource
+    from app.eval import score
+    from sqlalchemy import select
+    from tests import ledger_samples as ls
+
+    await ls.fresh_source(tmp_path / "shop.db")
+    async with SessionLocal() as session:
+        sid = (await session.execute(select(DataSource.id).where(DataSource.name == ls.CURRENT["source"]))).scalar()
+    case = {"gold": {"kind": "sql", "datasource_id": sid, "sql": "x"}, "expectations": []}
+    gold = {"status": "ok", "before": {"rendered": {"sql": (
+        "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND paid_at >= '2026-09-01' "
+        "AND paid_at < '2026-09-08'")}, "sets": []}}
+    wider = ("select count(*) as 单数, sum(o.amount) as 销售额 from orders o where o.paid_at >= '2026-09-01' "
+             "and o.status = 'paid' and o.paid_at < '2026-09-08'")
+    run = await ls.explore(monkeypatch, wider, text="本周销售额 [[v:Q1.r0.销售额]] 元。")
+    answer = await score.read_answer(run.id)
+    assert answer.cited, answer
+    match = await score.sql_match(case, gold, answer)
+    assert match["status"] == "proven" and match["cited"] is True, match
+    assert "projection" not in (match.get("aspects") or []), match
+
+
 async def test_rescoring_reads_the_seal_and_never_calls_a_model(engine_on, monkeypatch, tmp_path):
     from app.db.base import SessionLocal
     from app.db.models_eval import EvalResult, EvalRun
