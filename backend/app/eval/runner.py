@@ -143,7 +143,7 @@ async def estimate(session: AsyncSession, suite_id: str, items: int) -> dict[str
             return {"items": items, "per_item_usd": None, "total_usd": None, "basis": None,
                     "note": "这个题集上一次评测没有评完一道题，估不出花费：按每题开评前的实际花费累计，到了上限就停"}
         return {"items": items, "per_item_usd": None, "total_usd": None, "basis": row.id, "unpriced_calls": unpriced,
-                "note": f"上一次评测的 {unpriced} 次模型调用金额都估不出（模型不在价格目录中，或用量没有报全），估不出花费："
+                "note": f"上一次评测的 {unpriced} 次模型调用金额都估不出（模型不在价格目录中，或用量没有报全）："
                         "金额上限只管得住估得出金额的调用"}
     out = {"items": items, "per_item_usd": round(float(per_item), 6), "total_usd": round(float(per_item) * items, 4),
            "basis": row.id, "note": "按这个题集上一次评测的每题平均花费估算"}
