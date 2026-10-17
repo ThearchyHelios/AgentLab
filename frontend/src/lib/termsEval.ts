@@ -473,6 +473,8 @@ export const EVAL_TEXT = {
     cleaned: '明细已清理',
     seq: '题',
     question: '问法',
+    /** 逐题表里实际问的问题下面一行：题目原文和实际问的不同（带变量的模板，或者题目之后改过）时写原文 */
+    questionTemplate: (text: string) => `题目原文：${text}`,
     verdict: '结论',
     expected: '期望',
     got: '答案里的数',

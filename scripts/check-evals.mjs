@@ -161,13 +161,15 @@ const RESULTS = [
     scores: [{ id: 'e1', kind: 'scalar', required: true, outcome: 'traced', expected: 330, got: 330 }], traced: true, review: null, tier: null,
     judge: null, looks: { model: 1, system: 1 }, calls: 2, timings: { total_ms: 41000 }, usage: {}, sql_match: { status: 'proven', aspects: [] },
     details_artifact: 'd-1', current: null, error: null, started_at: iso(NOW - 2 * H), finished_at: iso(NOW - H), question: CASE_SQL.question,
-    cost: { cost_usd: 0.014, unpriced_calls: 0 } },
+    question_template: CASE_SQL.question, cost: { cost_usd: 0.014, unpriced_calls: 0 } },
   { id: 'r-2', eval_run_id: 'ev-1', seq: 2, case_id: 'case-2', case_seq: 2, case_hash: 'h2', repeat: 0, arm: null, status: 'ok',
     run_id: 'run-answer-2', gold_run_ids: ['run-gold-2'], gold: { status: 'ok' }, path: 'ran', verdict: 'fail',
     scores: [{ id: 'e1', kind: 'scalar', required: true, outcome: 'wrong', expected: 330, got: 310, reason: '答案里的数和期望对不上' }], traced: false,
     review: null, tier: null, judge: null, looks: { model: 1, system: 0 }, calls: 2, timings: { total_ms: 60000 }, usage: {},
     sql_match: { status: 'related', aspects: ['time'] }, details_artifact: 'd-2', current: null, error: '答案里的数和期望对不上',
-    started_at: iso(NOW - 2 * H), finished_at: iso(NOW - H), question: CASE_CAL.question, cost: { cost_usd: 0.02, unpriced_calls: 0 } },
+    started_at: iso(NOW - 2 * H), finished_at: iso(NOW - H), cost: { cost_usd: 0.02, unpriced_calls: 0 },
+    // 带变量的题：question 是实际问的（服务端按这次评测的截至时间渲染好），模板原文另放
+    question: '10 月 5 日到 10 月 11 日的周销售额？', question_template: '{{ schedule.last_week_start }} 到 {{ schedule.last_week_end }} 的周销售额？' },
   { id: 'r-3', eval_run_id: 'ev-1', seq: 3, case_id: 'case-3', case_seq: 3, case_hash: 'h3', repeat: 0, arm: null, status: 'ok',
     run_id: null, gold_run_ids: [], gold: null, path: 'asked', verdict: 'pass', scores: [{ id: 'e1', kind: 'ask', required: true, outcome: 'traced' }],
     traced: true, review: null, tier: null, judge: null, looks: { model: 0, system: 0 }, calls: 1, timings: { total_ms: 9000 }, usage: {},
@@ -772,6 +774,11 @@ await section('逐题结果、和上一次比、A/B 配对表', async () => {
   check('?case= 打开逐题、定位并展开那道题', await page.locator('[data-eval-result-detail="r-2"]').count() === 1)
   check('逐题：结论、期望和答案里的数、SQL 差在哪', t2.includes('不通过') && t2.includes('330') && t2.includes('310') && t2.includes('时间口径'), t2)
   check('一题的花费照服务端加好的写', (await page.locator('[data-eval-result="r-1"]').innerText()).includes('$0.014'))
+  check('逐题的问法写实际问的（变量渲染好了），模板原文另起一行', await text(page, '[data-eval-result="r-2"] [data-eval-result-question]')
+      === '10 月 5 日到 10 月 11 日的周销售额？'
+    && (await text(page, '[data-eval-result="r-2"] [data-eval-result-template]')).startsWith('题目原文：{{ schedule.last_week_start }}')
+    && await page.locator('[data-eval-result="r-1"] [data-eval-result-template]').count() === 0,
+  await text(page, '[data-eval-result="r-2"] [data-eval-result-question]'))
   check('点开去运行详情', await page.locator('[data-eval-result-detail="r-2"] [data-eval-result-run]').getAttribute('href') === '/runs/run-answer-2')
   await page.locator('[data-eval-result-details]').waitFor()
   check('展开的明细写作答的经过和答案原文（明细工件）', (await text(page, '[data-eval-result-details]')).includes('自动重来了 1 次')

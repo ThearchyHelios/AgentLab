@@ -370,7 +370,10 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
                     {r.arm && <div className="text-2xs text-faint">{T.run.arm(r.arm)}</div>}
                   </td>
                   <td className="max-w-xs px-2 py-1.5">
-                    <div className="line-clamp-2 break-words">{r.question ?? '—'}</div>
+                    <div className="line-clamp-2 break-words" data-eval-result-question="">{r.question ?? '—'}</div>
+                    {r.question_template && r.question_template !== r.question && (
+                      <div className="line-clamp-2 break-words text-2xs text-faint" data-eval-result-template="">{R.questionTemplate(r.question_template)}</div>
+                    )}
                     {r.path && <div className="text-2xs text-faint">{R.path}：{T.path[r.path]}</div>}
                   </td>
                   <td className="px-2 py-1.5">

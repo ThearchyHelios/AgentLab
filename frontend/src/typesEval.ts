@@ -558,7 +558,10 @@ export interface EvalResult {
   error: string | null
   started_at: string | null
   finished_at: string | null
+  /** 这一题实际问的问题（变量按这次评测的截至时间渲染好了）；题目之后改过、又没有作答运行可取时为 null */
   question?: string | null
+  /** 题目的原文（可能带 {{ schedule.… }} 变量的模板）；题目删了为 null */
+  question_template?: string | null
   /** 这一题的花费：助手（含复核）+ 写作 + 结论裁判，服务端加好的 */
   cost?: { cost_usd: number | null; unpriced_calls: number }
 }

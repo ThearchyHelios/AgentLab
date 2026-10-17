@@ -328,6 +328,44 @@ async def test_the_api_starts_estimates_and_reports_progress(client, monkeypatch
     assert bad.status_code == 422 and bad.json()["code"] == "eval_variant_invalid"
 
 
+async def test_results_give_the_question_actually_asked_and_the_template_apart(client, monkeypatch):
+    """逐题结果的 question 是这一题实际问的（变量按这次评测的截至时间渲染好了，和作答时 Driver 收到的一字不差），模板原文
+    另放 question_template（下一轮验收：以前 question 是带 {{ schedule.last_week_start }} 的原始模板）。没有变量的题两个一样。"""
+    from datetime import datetime, timezone
+
+    from app.db.models_eval import EvalCase
+    from app.eval.cases import render, variable_values
+
+    asked: list[str] = []
+    real_init = answer_mod.Driver.__init__
+
+    def init(self, question, **kw):
+        asked.append(question)
+        real_init(self, question, **kw)
+
+    monkeypatch.setattr(answer_mod.Driver, "__init__", init)
+    stub(monkeypatch)
+    template = "{{ schedule.last_week_start }} 到 {{ schedule.last_week_end }} 那周的问题"
+    suite_id = await es.make_suite("none", cases=[{"question": template, "expectations": [{"kind": "ask"}]},
+                                                  {"question": "没有变量的问题", "expectations": [{"kind": "ask"}]}])
+    as_of = datetime(2026, 10, 14, 2, 0, tzinfo=timezone.utc)
+    [run] = await start(suite_id, as_of=as_of)
+    await es.wait_eval(run.id)
+    rows = (await client.get(f"/api/evals/evaluations/{run.id}/results")).json()["results"]
+    expected = render(template, variable_values(as_of, "Asia/Shanghai", None))
+    assert "{{" not in expected and rows[0]["question"] == expected, rows[0]["question"]
+    assert rows[0]["question"] in asked, "和作答时实际问的一样"
+    assert rows[0]["question_template"] == template
+    assert rows[1]["question"] == rows[1]["question_template"] == "没有变量的问题"
+    # 题目改过（指纹对不上）：现在的模板不一定是当时问的，没有作答运行可取时不编一个，question 为空、模板照给
+    async with SessionLocal() as session:
+        case = (await session.execute(select(EvalCase).where(EvalCase.suite_id == suite_id, EvalCase.seq == 1))).scalar_one()
+        case.question, case.case_hash = "改过的 {{ schedule.today }}", "changed"
+        await session.commit()
+    rows = (await client.get(f"/api/evals/evaluations/{run.id}/results")).json()["results"]
+    assert rows[0]["question"] is None and rows[0]["question_template"] == "改过的 {{ schedule.today }}"
+
+
 async def test_eval_settings_group_and_spend_endpoint(client):
     got = (await client.get("/api/settings")).json()["eval"]
     assert got == {"max_parallel": 2, "per_case_timeout_s": 900, "per_run_max_usd": 2.0, "daily_max_usd": 5.0,

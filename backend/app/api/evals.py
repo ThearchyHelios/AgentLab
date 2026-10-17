@@ -1019,19 +1019,54 @@ async def _actions(session: AsyncSession, row: EvalRun) -> dict[str, Any]:
 @router.get("/evaluations/{evaluation_id}/results")
 async def evaluation_results(evaluation_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """逐题结果：结论、各期望的结论（期望值和答案里对上的数、有没有引用、维度）、作答路径、复核、出具档位、SQL 差在哪、look、
-    耗时、按角色的用量，点 run_id 去运行详情。明细清理了的照实写 cleaned。"""
+    耗时、按角色的用量，点 run_id 去运行详情。明细清理了的照实写 cleaned。question 是这一题实际问的问题（变量渲染好了，
+    见 _asked_questions；说不准时为 null），question_template 是题目的原文（带 {{ schedule.… }} 变量的模板）。"""
     from app.eval import runner
 
     row = await _evaluation(session, evaluation_id)
     results = [runner.result_dict(r) for r in (await session.execute(
         select(runner.EvalResult).where(runner.EvalResult.eval_run_id == row.id)
         .order_by(runner.EvalResult.seq))).scalars()]
-    questions = dict((await session.execute(select(EvalCase.id, EvalCase.question).where(
-        EvalCase.id.in_({r["case_id"] for r in results if r["case_id"]})))).all()) if results else {}
+    cases = {c.id: (c.question, c.case_hash) for c in (await session.execute(select(EvalCase).where(
+        EvalCase.id.in_({r["case_id"] for r in results if r["case_id"]})))).scalars()} if results else {}
+    asked = await _asked_questions(session, row, results, cases)
     for r in results:
-        r["question"] = questions.get(r["case_id"])
+        template = (cases.get(r["case_id"]) or (None, None))[0]
+        r["question"], r["question_template"] = asked.get(r["id"]), template
         r["cost"] = _result_cost(r.get("usage") or {})
     return {"evaluation_id": row.id, "cleaned": row.cleaned_at is not None, "results": results}
+
+
+async def _asked_questions(session: AsyncSession, row: EvalRun, results: list[dict[str, Any]],
+                           cases: dict[str, tuple[str, str]]) -> dict[str, str | None]:
+    """每一题实际问的问题 {结果 id: 问题}：题目的模板按这次评测的截至时间（as_of）、题集的时区、定时的 cron 渲染——和执行时
+    runner._unit 交给作答的是同一个算法、同一组输入，所以一字不差（as_of 在建评测时就定下、重试也不变）。题目在这次评测之后
+    改过（结果记的 case_hash 对不上现在的）：现在的模板不一定是当时问的，改取作答运行的输入里的 question；也没有（反问、
+    建图失败没有运行，工作流题的输入里没有问题）就是 None，不拿现在的模板编一个。"""
+    from app.db.models import Run
+    from app.eval import runner
+    from app.eval.cases import render, variable_values
+
+    if not results:
+        return {}
+    leader = row if runner.leader_of(row) == row.id else await session.get(EvalRun, runner.leader_of(row))
+    suite = await session.get(EvalSuite, row.suite_id)
+    as_of = (leader.as_of if leader is not None else None) or row.as_of
+    values = variable_values(as_of, suite.timezone, ((leader or row).fingerprint or {}).get("cron")) \
+        if as_of is not None and suite is not None else None
+    stale = {r["id"] for r in results
+             if r["case_id"] not in cases or cases[r["case_id"]][1] != r["case_hash"] or values is None}
+    runs = {r["run_id"] for r in results if r["id"] in stale and r["run_id"]}
+    inputs = dict((await session.execute(select(Run.id, Run.input).where(Run.id.in_(runs))))
+                  .all()) if runs else {}
+    out: dict[str, str | None] = {}
+    for r in results:
+        if r["id"] in stale:
+            given = (inputs.get(r["run_id"]) or {}).get("question") if r["run_id"] else None
+            out[r["id"]] = given if isinstance(given, str) and given else None
+        else:
+            out[r["id"]] = render(cases[r["case_id"]][0] or "", values or {})
+    return out
 
 
 def _result_cost(usage: dict[str, Any]) -> dict[str, Any]:
