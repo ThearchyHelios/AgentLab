@@ -193,6 +193,10 @@ async def test_last_weeks_sales_with_extra_columns_is_whole_equivalent(engine_up
     content = (await store.latest(row.id)).content
     [q] = content["queries"]
     assert q["status"] == "proven"
+    # 评测逐题比 SQL 时拿同一份「引用了哪几列」（referenced_of），和账本一样投影
+    from app.api.evidence import _sealed
+
+    assert ledger_match.referenced_of(await _sealed(row.id)) == {q["artifact"]: {"销售额"}}
     [cand] = q["candidates"]
     assert cand["projection"]["dropped"] == 3 and cand["columns"] == [{"index": 0, "ours": "销售额", "caliber": "gmv"}]
     [labels] = [r["labels"] for r in content["reports"].values()]

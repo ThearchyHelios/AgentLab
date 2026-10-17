@@ -656,8 +656,10 @@ def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,
         # 沙箱算出来的数喂给口径卡：记下它自认是「取数」还是「计算」，治理规则按它判
         entry["role"] = str(producer.config.get("evidence_role") or "compute")
     entry["status"] = "ok" if value is not None else "missing"
-    if producer is not None and str(producer.type) == "metrics" and (up := _upstream(path, tctx or template_context(state))):
-        entry["upstream"] = up
+    if producer is not None and str(producer.type) == "metrics":
+        # 转抄另一张口径卡的指标：跨卡往下追（engine/lineage.metric_copy）
+        if (up := _upstream(path, tctx or template_context(state))) is not None:
+            entry["upstream"] = up
     if producer is not None and str(producer.type) == "agent" and field:
         cited = _agent_field(state, producer.id, root if head else "", field)
         if cited is not None:

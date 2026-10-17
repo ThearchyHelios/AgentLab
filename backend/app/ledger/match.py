@@ -513,13 +513,10 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
     return out
 
 
-def compute(sealed: Any, calibers: list[Caliber], kinds: dict[str, str | None], *, timeout: float) -> dict[str, Any]:
-    """一次运行的比对工件内容（见 ledger/store 的模块说明）。在线程里调：读快照、比 SQL、标数都是同步的活。"""
-    from app.api.evidence import _choose, _reports
+def _card_loader(sealed: Any) -> Any:
+    """按工件读封存范围内的指标集（不在封存台账里的、读不出的为 None）。"""
     from app.core.artifact_store import load
 
-    deadline = time.monotonic() + timeout
-    queries = read_queries(sealed, kinds)
     sealed_cards = {artifact for _, artifact in sealed.ledger}
 
     def load_card(artifact: str) -> dict[str, Any] | None:
@@ -531,6 +528,25 @@ def compute(sealed: Any, calibers: list[Caliber], kinds: dict[str, str | None], 
             return None
         return card if isinstance(card, dict) else None
 
+    return load_card
+
+
+def referenced_of(sealed: Any) -> dict[str, set[str]]:
+    """这次运行封存的报告引用了哪条查询的哪几列（labels.referenced_columns，只读哈希核对一致的报告）：compare_queries 的
+    referenced。评测逐题比 SQL 时传它，就和账本一样按引用的列投影。在线程里调（读盘）。"""
+    from app.api.evidence import _reports
+
+    docs = [r.doc for r in _reports(sealed) if r.doc is not None and r.hash_ok is True]
+    return ledger_labels.referenced_columns(docs, _card_loader(sealed))
+
+
+def compute(sealed: Any, calibers: list[Caliber], kinds: dict[str, str | None], *, timeout: float) -> dict[str, Any]:
+    """一次运行的比对工件内容（见 ledger/store 的模块说明）。在线程里调：读快照、比 SQL、标数都是同步的活。"""
+    from app.api.evidence import _choose, _reports
+
+    deadline = time.monotonic() + timeout
+    queries = read_queries(sealed, kinds)
+    load_card = _card_loader(sealed)
     found = _reports(sealed)
     readable = [report for report in found if report.doc is not None and report.hash_ok is True]
     if not sealed.trusted:
@@ -743,7 +759,7 @@ async def shutdown() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-__all__ = ["BACKFILL_DAYS", "CONCURRENCY", "EXPLORE_ORIGINS", "EXTRA_COLUMNS", "MAX_PROJECTIONS", "TIMEOUT_S", "Caliber",
-           "Fetch", "Query", "backfill", "caliber_of", "compare_queries", "composed_nodes", "compute", "drain",
-           "ineligible", "load_calibers", "match_run", "pending", "read_queries", "schedule", "shutdown",
-           "start_backfill", "wanted"]
+__all__ = ["BACKFILL_DAYS", "CONCURRENCY", "EXPLORE_ORIGINS", "EXTRA_COLUMNS", "MAX_PROJECTIONS", "TIMEOUT_S",
+           "Caliber", "Fetch", "Query", "backfill", "caliber_of", "compare_queries", "composed_nodes", "compute",
+           "drain", "ineligible", "load_calibers", "match_run", "pending", "read_queries", "referenced_of",
+           "schedule", "shutdown", "start_backfill", "wanted"]

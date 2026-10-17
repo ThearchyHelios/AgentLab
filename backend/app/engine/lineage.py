@@ -97,8 +97,9 @@ def metric_copy(path: str) -> tuple[str, str, int] | None:
     if not (isinstance(tree, ast.Attribute) and tree.attr == "value" and isinstance(tree.value, ast.Subscript)):
         return None
     index, metrics = tree.value.slice, tree.value.value
-    if not (isinstance(metrics, ast.Attribute) and metrics.attr == "metrics" and isinstance(metrics.value, ast.Attribute)
-            and isinstance(metrics.value.value, ast.Name) and metrics.value.value.id in ("vars", "nodes")):
+    if not (isinstance(metrics, ast.Attribute) and metrics.attr == "metrics"
+            and isinstance(metrics.value, ast.Attribute) and isinstance(metrics.value.value, ast.Name)
+            and metrics.value.value.id in ("vars", "nodes")):
         return None
     if not (isinstance(index, ast.Constant) and type(index.value) is int and index.value >= 0):
         return None

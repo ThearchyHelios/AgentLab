@@ -111,7 +111,8 @@ class Shape:
 
     def params(self, canonical_positions: Sequence[int]) -> list[int]:
         """规范形里的位置 → literals 里的位置（template_of 要的）；对不上的不要。"""
-        return sorted(p for i in canonical_positions if i < len(self.positions) and (p := self.positions[i]) is not None)
+        found = (self.positions[i] for i in canonical_positions if i < len(self.positions))
+        return sorted(p for p in found if p is not None)
 
 
 def shape_of(snap: Any, kinds: dict[str, str | None]) -> Shape | None:
@@ -258,7 +259,8 @@ async def _dismissed_members(session: Any) -> list[set[str]]:
 
 def _cluster_dismissed(cluster: Any, dismissed: set[str], members: list[set[str]]) -> bool:
     """这一类点过「不是口径」没有：类的 id 记过；以前按种子问题原文算的 id 记过；或者过半的成员是某一次记下的。"""
-    if f"cluster:{cluster.id}" in dismissed or item_id("cluster", " ".join(cluster.members[0].text.split())) in dismissed:
+    legacy = item_id("cluster", " ".join(cluster.members[0].text.split()))
+    if f"cluster:{cluster.id}" in dismissed or legacy in dismissed:
         return True
     keys = set(cluster.keys)
     return any(len(keys & seen) * 2 > len(keys) for seen in members)

@@ -14,6 +14,10 @@ A / B，只差一个方面、又对得上数据目录里的事实（时间归属
   （规范形式一字不差）才返回空列表。
 - facets：把一条查询拆成表、连接、WHERE 合取式、时间条件、分组、聚合、算出来的列、HAVING、取哪几行（给调用方取
   结构用；CTE、子查询按位置编号，见 _Statement）。facets 不受下面等价判定的改动影响。
+- bind_template / match_template：口径模板的参数绑定与等价证明（口径账本，见那一节）。
+- project_select / project_template：按引用的列投影——去掉最外层选择列表里没被引用、去掉也不改变被引用那几列取值的
+  选择项，认不准的一律不投影（见那一节）。投影本身不判等价，投影后的 SQL 照样交给上面的判等价。
+- sql_shape：同一个形状（认证队列的确定性重复）：条件的先后、交换律成立处两边的先后、字面量的值都不算（见那一节）。
 
 **等价怎么判。** 过去几轮按方面归纳任意 SQL，每轮修好一批又冒出一批（还回退过），收不拢；现在先判等价、再说差在哪。
 两边各自规范化，规范化的每一步都只做保持语义的变换，同一级的两个规范形式一字不差（比语法树逐个节点的类型和参数，
@@ -9245,8 +9249,9 @@ def _shape_print(node: Any, read: str | None) -> tuple[str, list[Any]]:
             and not _quantified(node.expression):
         left, right = _shape_print(node.this, read), _shape_print(node.expression, read)
         name = type(node).__name__
-        if (_fixed(node.this) and not _fixed(node.expression)) or (
-                _fixed(node.this) == _fixed(node.expression) and (left[0], value_key(left[1])) > (right[0], value_key(right[1]))):
+        later = (left[0], value_key(left[1])) > (right[0], value_key(right[1]))
+        fixed_left, fixed_right = _fixed(node.this), _fixed(node.expression)
+        if (fixed_left and not fixed_right) or (fixed_left == fixed_right and later):
             left, right, name = right, left, _FLIP[name]
         return f"{name}({left[0]},{right[0]})", left[1] + right[1]
     if isinstance(node, exp.Expr) and type(node).__name__ in _SYMMETRIC:

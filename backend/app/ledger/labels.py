@@ -431,5 +431,5 @@ def related_view(item: Mapping[str, Any], *, hide: Callable[[Any], bool], shown:
 
 
 __all__ = ["CERTIFIED_NOTE", "HOWS", "KINDS", "LEVEL_TEXT", "POST_SEAL_NOTE", "RETRO_NOTE", "binding_view", "caliber_key",
-           "card_expressions", "card_reads", "cell_label", "diff_view", "label_doc", "metric_label", "referenced_columns",
-           "related_view", "view_label", "whole_of"]
+           "card_expressions", "card_reads", "cell_label", "diff_view", "label_doc", "metric_label",
+           "referenced_columns", "related_view", "view_label", "whole_of"]
