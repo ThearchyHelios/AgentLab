@@ -7,7 +7,7 @@ explain_sql_diff，上次的投影规则照用）：
 - 销售额标「等价已证明」，订单数、首末日照实标相关口径；整题不等价（订单数不来自口径），不自动出具、不给出具入口；
 - 同一个数在两份口径里只证明了一份时标那一份；口径有多个指标时按列配对；一个指标用了同一条一行查询的两格，两格各自
   证明了就算来自口径，多行的查询不拿逐格的结论合起来用；
-- 不错给信任：多一个分组列、DISTINCT 的查询逐格也不投影；
+- 不错给信任：多一个分组列、DISTINCT 的查询逐格也不投影；COALESCE、date('now') 现算日期的写法仍然不等价，说明说得出来；
 - 评测逐题比 SQL 取和期望配上的那一格。
 数据是虚构的。
 """
@@ -144,7 +144,7 @@ def test_a_metric_over_two_cells_uses_the_cell_proofs_only_on_a_one_row_query():
 
 
 # --------------------------------------------------------------------------
-# 不错给信任：逐格投影照样守上次的投影规则
+# 不错给信任：逐格投影照样守上次的投影规则；COALESCE、现算日期仍然不等价，说明说得出来
 # --------------------------------------------------------------------------
 
 
@@ -161,6 +161,53 @@ def test_cells_are_not_projected_where_the_projection_rules_say_no(sql):
         assert cell["status"] == "related" and all("projection" not in c for c in cell["candidates"]), name
         assert cell["candidates"] == row["candidates"], "投影不了的格照用整条查询的结论"
         assert label(row, name)["kind"] == "related"
+
+
+def test_coalesce_around_the_sum_is_still_not_equivalent_and_says_why():
+    sql = ANSWER.replace("SUM(amount) AS 销售额", "COALESCE(SUM(amount), 0) AS 销售额")
+    row = compare(sql, COLUMNS, set(COLUMNS))
+    cell = row["cells"]["销售额"]
+    assert cell["status"] == "related" and label(row, "销售额")["kind"] == "related"
+    [cand] = cell["candidates"]
+    assert texts(cand) == ["这次多查了 3 列，不影响这个数",
+                           "这次的销售额套了 COALESCE(…, 0)：没有符合条件的行、或者 amount 都为空时这次是 0、口径是空"]
+    assert cand["diff"]["fallback"] is False
+
+
+def test_coalesce_explanation_holds_on_the_virtual_shop():
+    """两条 SQL 的不同是真的：没有符合条件的行时一个是 0、一个是空。COUNT 套 COALESCE 两边其实一样，不说成不同。"""
+    from app.data.sql_semantics import explain_sql_diff
+
+    a = "SELECT COALESCE(SUM(amount), 0) AS s FROM orders WHERE status = 'nothing'"
+    b = "SELECT SUM(amount) AS s FROM orders WHERE status = 'nothing'"
+    db = sqlite3.connect(":memory:")
+    db.executescript("CREATE TABLE orders (id INTEGER, status TEXT, amount REAL)")
+    assert db.execute(a).fetchall() != db.execute(b).fetchall()
+    diff = explain_sql_diff(a, b, "sqlite")
+    assert not diff.equivalent and [i.aspect for i in diff.items] == ["aggregate"] and "COALESCE" in diff.items[0].text
+    counted = explain_sql_diff("SELECT COALESCE(COUNT(*), 0) AS n FROM orders", "SELECT COUNT(*) AS n FROM orders",
+                               "sqlite")
+    assert not [i for i in counted.items if "COALESCE" in i.text]
+
+
+def test_dates_computed_from_today_are_not_equivalent_and_say_so():
+    from app.data.sql_semantics import explain_sql_diff
+
+    now = ANSWER.replace("paid_date >= '2026-10-05' AND paid_date <= '2026-10-11'",
+                         "paid_date >= date('now', '-7 days') AND paid_date <= date('now')")
+    row = compare(now, COLUMNS, set(COLUMNS))
+    cell = row["cells"]["销售额"]
+    assert cell["status"] == "related"
+    said = texts(cell["candidates"][0])
+    assert said[0] == "这次多查了 3 列，不影响这个数"
+    assert any("按运行当天现算" in t and "「start」" in t for t in said), said
+    # 拿写定日期的期望 SQL 直接比（评测的 SQL 题）：说清一边现算、一边写定
+    fixed = "SELECT SUM(amount) AS gmv FROM orders WHERE " + WINDOW
+    single = now.replace(", COUNT(*) AS 订单数, MIN(paid_date) AS 区间首日, MAX(paid_date) AS 区间末日", "")
+    diff = explain_sql_diff(single, fixed, "sqlite", labels=("这次", "口径"))
+    assert not diff.equivalent and not diff.fallback
+    [item] = diff.items
+    assert item.aspect == "time_range" and "按运行当天现算" in item.text and "口径写定的是" in item.text
 
 
 # --------------------------------------------------------------------------
