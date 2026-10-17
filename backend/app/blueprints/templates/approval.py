@@ -50,7 +50,9 @@ def app_skeleton(bp: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
     writes = {WRITE: capability} if capability else {}
     spec = c.app_base(bp, graph, use="process", name=name, description=str(c.value(bp.get("purpose")) or ""),
                       writes=writes)
-    c.entry_and_pages(spec, bp, graph, label=f"发起{name}", writes=writes)
+    from app.apps.derive import start_label
+
+    c.entry_and_pages(spec, bp, graph, label=start_label(name), writes=writes)
     return c.finish_app(spec)
 
 

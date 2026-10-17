@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from typing import Any
 
 from app.core.artifact_store import canonical_json
@@ -119,6 +119,21 @@ def slot_refs(graph: Any, writes: Collection[str] = ()) -> list[dict[str, str]]:
             out.append({"slot": str(timeout["to_slot"]).strip(), "node_id": nid, "title": node["title"],
                         "role": "escalation"})
     return out
+
+
+#: 按用到它的节点给岗位起显示名（slot_label）：派给它的写节点名，超时升级给它的写「…超时升级」（同蓝图模板 slot_labels 的
+#: 叫法），动作确认派给它的写「…发送前确认」
+_SLOT_USE_LABEL = {"assignee": "{title}", "escalation": "{title}超时升级", "confirm": "{title}发送前确认"}
+
+
+def slot_label(slot: str, refs: Iterable[dict[str, str]]) -> str:
+    """岗位给人看的名字（应用里岗位的显示名）。图里只写了岗位名——画布上随手写的 id，常是英文（finance）：以前显示名就是
+    它，看着像起好的名字。现在按用到它的节点在图上的名字拼（refs 是 slot_refs 的结果，只看这个岗位的那几条，几处用到用顿号
+    连）；节点没起名字（名字就是节点 id）、或者没有节点用到它的，照实用岗位名——界面上显示名和岗位名一样时提示还没起名字。"""
+    names = [_SLOT_USE_LABEL[r["role"]].format(title=r["title"]) for r in refs
+             if r.get("slot") == slot and r.get("role") in _SLOT_USE_LABEL and r.get("title")
+             and r["title"] != r.get("node_id")]
+    return "、".join(dict.fromkeys(names)) or slot
 
 
 def input_fields(graph: Any) -> list[dict[str, Any]]:

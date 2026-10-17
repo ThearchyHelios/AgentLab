@@ -344,7 +344,8 @@ async def test_derive_a_process_leaves_slots_empty(monkeypatch):
     async with SessionLocal() as session:
         spec = await derive_app(session, wf, 1, name="报销审批")
     assert spec["name"] == "报销审批" and spec["pins"][0]["use"] == "process"
-    assert spec["slots"] == {"finance": {"label": "finance"}, "reconciler": {"label": "动作核实"}}
+    # 岗位的显示名按用到它的节点名起（apps/tree.slot_label），不再拿岗位名 finance 充当显示名
+    assert spec["slots"] == {"finance": {"label": "财务审批"}, "reconciler": {"label": "动作核实"}}
     # 流程的首页只放发起和我发起的：结果在实例页看，不派生「最近封存运行」（派生出来只会挂一块永远空着的印章）
     assert "latest" not in spec["views"] and spec["views"]["inst"]["source"]["kind"] == "instance"
     home = next(p for p in spec["pages"] if p["id"] == "home")

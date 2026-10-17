@@ -6089,6 +6089,8 @@ export const APP_EDITOR_TEXT = {
   slotAdd: '新增岗位',
   slotName: '岗位名',
   slotLabel: '显示名',
+  /** 显示名和岗位名一样：派生时没有节点名可用（服务端 apps/tree.slot_label），照实用的是岗位名，不是起好的名字 */
+  slotLabelRaw: '还没有起显示名，现在用的是图里的岗位名，可以改成一个好认的名字',
   slotUnbound: '未绑定：发布检查会拦下流程应用',
   slotRemove: (name: string) => `删除岗位「${name}」`,
   grants: '授权',
