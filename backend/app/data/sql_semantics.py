@@ -9161,8 +9161,168 @@ def output_names(sql: str, dialect: str | None = None, *, template: bool = False
     return [_output_name(i, read) for i in root.expressions]
 
 
+# ==========================================================================
+# 同一个形状（认证队列的「确定性重复」：条件的先后不算）
+# ==========================================================================
+#
+# normalize_sql 的规范文本把字面量换成「?」，但条件照原文的先后：WHERE a = 1 AND b = 2 和 WHERE b = 2 AND a = 1 文本不同，
+# 认证队列就拆成两组。这里在不认列的那一级规范形式（_light，和判等价同一套只保持语义的改写）上，把字面量抹成只看类型的
+# 占位，再把交换律成立的地方按抹掉之后的写法重排一遍：AND / OR 的各项、IN 列表、= / <> / + / * 的两边、比大小的两边（换边
+# 时大于小于跟着换）。规范形式里本来的排序看字面量的值（同一个形状换了参数，条件的先后可能就变了），所以要重排。重排时
+# 抹掉之后一样的几项按原值排：同一组里字面量的位置对得上。认不出的（解析不了、sqlglot 会读错的写法、规范化不了的结构）
+# 为 None，调用方照旧按 normalize_sql 的文本分组：不同就是不同，只会分得细，不会把不同的并成一组。
+
+#: 抹掉字面量之前给每个字面量记的编号（对回 normalize_sql 的字面量用）
+_LIT_TAG = "sql_semantics_literal"
+#: 对 normalize_sql 的先后时，数字字面量换成的标记：这个整数加编号（同 _NUMBER_SENTINEL，真实 SQL 里几乎不会写）
+_LIT_NUMBER = 9_173_402_581_000
+_LIT_STRING = "__agl_l{}__"
+_LIT_STRING_RE = re.compile(r"^'__agl_l(\d+)__'$")
+#: 交换律成立、两边可以对调的运算
+_SYMMETRIC = ("EQ", "NEQ", "Add", "Mul", "NullSafeEQ")
+
+
+@dataclass(frozen=True)
+class SqlShape:
+    """sql_shape 的结果。key 一样就是同一个形状（只差字面量的值、条件的先后、交换律成立处两边的先后）；literals 是按规范
+    形式里的先后排的字面量（SQL 写法，字符串带引号），同一个形状的几条按位置对得上；positions[i] 是第 i 个在
+    normalize_sql(sql).literals 里的位置（规范化时新算出来的字面量对不上，为 None）。"""
+
+    key: str
+    literals: tuple[str, ...]
+    positions: tuple[int | None, ...]
+
+
+def _normalized_order(root: Any, read: str | None) -> list[int] | None:
+    """normalize_sql 的字面量（按它重新生成的文本里的先后）各是哪一个字面量节点（_LIT_TAG 的编号）：把字面量换成带编号的
+    标记，同样地重新生成、切词，按先后读出编号。对不上（个数不同、有认不出的）为 None。"""
+    from sqlglot import exp
+    from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+
+    marked = normalize_identifiers(root.copy(), dialect=read)
+    for lit in marked.find_all(exp.Literal):
+        tag = lit.meta.get(_LIT_TAG)
+        if tag is None:
+            return None
+        lit.set("this", _LIT_STRING.format(tag) if lit.is_string else str(_LIT_NUMBER + tag))
+    text = marked.sql(dialect=read, comments=False)
+    out: list[int] = []
+    for token in _tokens(text, read):
+        if not _is_literal(token):
+            continue
+        raw = text[token.start:token.end + 1]
+        found = _LIT_STRING_RE.match(raw)
+        if found:
+            out.append(int(found.group(1)))
+            continue
+        try:
+            out.append(int(raw) - _LIT_NUMBER)
+        except ValueError:
+            return None
+    return out
+
+
+def _shape_print(node: Any, read: str | None) -> tuple[str, list[Any]]:
+    """规范形式的确定写法（同 _erased：字面量只写类型、不写值，按写出的先后收进列表），交换律成立的地方按抹掉之后的写法
+    重排（抹掉之后一样的几项按原值排）。"""
+    from sqlglot import exp
+
+    def value_key(lits: list[Any]) -> tuple[str, ...]:
+        return tuple(lit.sql(dialect=read) for lit in lits)
+
+    def ordered(parts: list[tuple[str, list[Any]]]) -> list[tuple[str, list[Any]]]:
+        return sorted(parts, key=lambda p: (p[0], value_key(p[1])))
+
+    if isinstance(node, exp.Paren):
+        return _shape_print(node.this, read)
+    if isinstance(node, exp.Literal):
+        return f"Literal({'s' if node.is_string else 'n'})", [node]
+    if isinstance(node, (exp.And, exp.Or)):
+        parts = ordered([_shape_print(p, read) for p in _flat(node, type(node))])
+        return (f"{type(node).__name__}[{','.join(p[0] for p in parts)}]",
+                [lit for _, lits in parts for lit in lits])
+    if isinstance(node, exp.Expr) and type(node).__name__ in _FLIP and not _quantified(node.this) \
+            and not _quantified(node.expression):
+        left, right = _shape_print(node.this, read), _shape_print(node.expression, read)
+        name = type(node).__name__
+        if (_fixed(node.this) and not _fixed(node.expression)) or (
+                _fixed(node.this) == _fixed(node.expression) and (left[0], value_key(left[1])) > (right[0], value_key(right[1]))):
+            left, right, name = right, left, _FLIP[name]
+        return f"{name}({left[0]},{right[0]})", left[1] + right[1]
+    if isinstance(node, exp.Expr) and type(node).__name__ in _SYMMETRIC:
+        parts = ordered([_shape_print(node.this, read), _shape_print(node.expression, read)])
+        return f"{type(node).__name__}({','.join(p[0] for p in parts)})", parts[0][1] + parts[1][1]
+    if isinstance(node, exp.In) and node.args.get("expressions"):
+        head = _shape_print(node.this, read)
+        parts = ordered([_shape_print(e, read) for e in node.expressions])
+        rest = [f"{k}={_shape_print(v, read)[0]}" for k, v in sorted(node.args.items())
+                if k not in ("this", "expressions") and v is not None and v is not False and v != []]
+        return (f"In({head[0]};[{','.join(p[0] for p in parts)}];{','.join(rest)})",
+                head[1] + [lit for _, lits in parts for lit in lits])
+    if isinstance(node, exp.Expr):
+        pieces: list[str] = []
+        lits: list[Any] = []
+        for k, v in sorted(node.args.items()):
+            if v is None or v is False or v == []:
+                continue
+            text, found = _shape_print(v, read)
+            pieces.append(f"{k}={text}")
+            lits += found
+        mark = node.meta.get("sql_semantics_join") if isinstance(node, exp.Join) else None
+        if mark:
+            pieces.append(f"@join={mark}")
+        surface = node.meta.get(_SURFACE)
+        if surface:
+            pieces.append(f"@surface={surface}")
+        return f"{type(node).__name__}({','.join(pieces)})", lits
+    if isinstance(node, list):
+        parts = [_shape_print(v, read) for v in node]
+        return "[" + ",".join(p[0] for p in parts) + "]", [lit for _, found in parts for lit in found]
+    return repr(node), []
+
+
+def sql_shape(sql: str, dialect: str | None = None) -> SqlShape | None:
+    """一条查询的形状（见本节开头）：条件的先后、交换律成立处两边的先后、字面量的值都不算；别的不同一律算不同。认不出的为
+    None（调用方按 normalize_sql 的文本分组）。从不抛异常。"""
+    from sqlglot import exp
+
+    read = _read(dialect)
+    text = (_mysql_dashes(sql) if read == "mysql" and isinstance(sql, str) else sql or "").strip()
+    root, _ = _parse(text, read)
+    if root is None:
+        return None
+    try:
+        if _lost_in_parsing(text, read, root) or _respelled(text, read, root):
+            return None
+        for i, lit in enumerate(root.find_all(exp.Literal)):
+            lit.meta[_LIT_TAG] = i
+        order = _normalized_order(root, read)
+        if order is None or len(order) != len(normalize_sql(sql, dialect).literals):
+            return None
+        marked = _mark_surfaces(root, text, read)
+        if read == "sqlite":
+            _mark_comma_joins(root, text, read)
+        if not marked:
+            return None
+        try:
+            tree = _light(root, read, _Schema()).tree
+        except _Unsupported:
+            # 规范化不了的结构（递归 CTE、不确定的函数……）：只统一名字，条件的先后照原文
+            tree = root.copy()
+            _normalize_names(tree, read, _Schema())
+        printed, lits = _shape_print(tree, read)
+    except Exception:  # noqa: BLE001 - 认形状本身的缺陷：当作认不出，调用方按文本分组
+        logger.warning("认 SQL 的形状失败", exc_info=True)
+        return None
+    where = {tag: i for i, tag in enumerate(order)}
+    return SqlShape(hashlib.sha256(printed.encode()).hexdigest(),
+                    tuple(lit.sql(dialect=read) for lit in lits),
+                    tuple(where.get(lit.meta.get(_LIT_TAG)) if lit.meta.get(_LIT_TAG) is not None else None
+                          for lit in lits))
+
+
 __all__ = ["BINDING_LEVELS", "MAX_SQL_CHARS", "PLACEHOLDER", "Aggregate", "ColumnRef", "Computed", "FacetDiff", "Facets",
-           "JoinFacet", "LimitFacet", "NormalizedSql", "Part", "Projection", "SqlDiff", "TemplateBinding",
+           "JoinFacet", "LimitFacet", "NormalizedSql", "Part", "Projection", "SqlDiff", "SqlShape", "TemplateBinding",
            "TemplateMatch", "TemplateSlot", "TimePredicate", "bind_template", "catalog_labels", "diff_facets",
            "explain_sql_diff", "facets", "match_template", "normalize_sql", "output_names", "project_select",
-           "project_template", "render_bound"]
+           "project_template", "render_bound", "sql_shape"]

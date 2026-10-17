@@ -270,3 +270,80 @@ async def test_freezing_needs_a_matched_successful_run(client, monkeypatch):
     row = await S.explore(monkeypatch, S.ELSEWHERE, text="一共几家店，没有引用。")
     res = await client.post("/api/copilot/from-run", json={"run_id": row.id, "freeze": True})
     assert res.status_code == 409 and res.json()["detail"] == certify.NO_QUERIES
+
+
+# --------------------------------------------------------------------------
+# 确定性重复按规范形分组：条件的先后不算，条件真不同的不算一组
+# --------------------------------------------------------------------------
+
+#: 同一个形状的三种写法：条件换序、AND 两边换位、比较两边换位
+REORDERED = [
+    "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND paid_at >= '{s}' AND paid_at < '{e}'",
+    "SELECT SUM(amount) AS gmv FROM orders WHERE paid_at < '{e}' AND paid_at >= '{s}' AND status = 'paid'",
+    "SELECT SUM(amount) AS gmv FROM orders WHERE '{s}' <= paid_at AND ('paid' = status AND paid_at < '{e}')",
+]
+
+
+def test_conditions_in_another_order_are_the_same_shape_and_their_literals_line_up():
+    from app.data.sql_semantics import sql_shape
+
+    shapes = [sql_shape(sql.format(s=s, e=e), "sqlite") for sql, (s, e) in zip(REORDERED, WEEKS)]
+    assert all(sh is not None for sh in shapes)
+    assert len({sh.key for sh in shapes}) == 1
+    # 按规范形里的先后对齐：同一个位置是同一个条件里的那个字面量——变了的是两个日期，'paid' 在每一条里都落在同一个位置
+    assert len(certify.varying([sh.literals for sh in shapes])) == 2
+    assert len({sh.literals.index("'paid'") for sh in shapes}) == 1
+    starts = {sh.literals.index(f"'{s}'") for sh, (s, _) in zip(shapes, WEEKS)}
+    assert len(starts) == 1, "起始日期在每一条里都落在同一个位置"
+
+
+@pytest.mark.parametrize("other", [
+    "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND created_at >= '2026-09-01' AND paid_at < '2026-09-08'",
+    "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' OR paid_at >= '2026-09-01' AND paid_at < '2026-09-08'",
+    "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND paid_at >= '2026-09-01'",
+    "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND paid_at > '2026-09-01' AND paid_at < '2026-09-08'",
+    "SELECT SUM(amount) AS gmv FROM orders WHERE status = 1 AND paid_at >= '2026-09-01' AND paid_at < '2026-09-08'",
+    "SELECT SUM(amount) AS gmv FROM orders WHERE status IN ('paid', 'open') AND paid_at >= '2026-09-01' "
+    "AND paid_at < '2026-09-08'",
+    "SELECT COUNT(*) AS gmv FROM orders WHERE status = 'paid' AND paid_at >= '2026-09-01' AND paid_at < '2026-09-08'",
+], ids=["other-column", "or", "missing-condition", "other-operator", "number-not-string", "in-list", "other-aggregate"])
+def test_really_different_conditions_are_different_shapes(other):
+    from app.data.sql_semantics import sql_shape
+
+    base = sql_shape(REORDERED[0].format(s="2026-09-01", e="2026-09-08"), "sqlite")
+    found = sql_shape(other, "sqlite")
+    assert base is not None and found is not None and found.key != base.key
+
+
+async def test_queue_groups_reordered_conditions_and_freezing_aligns_their_parameters(client, monkeypatch):
+    a, b = await conversation(), await conversation()
+    runs = [await ask(monkeypatch, conv, sql.format(s=s, e=e))
+            for conv, sql, (s, e) in zip((a, a, b), REORDERED, WEEKS)]
+    # 条件真不同的（多筛了一个地区）不进这一组
+    other = await ask(monkeypatch, b, "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND region = 'east' "
+                                      "AND paid_at >= '2026-09-01' AND paid_at < '2026-09-08'")
+    [item] = shape_items((await client.get("/api/ledger/certify-queue")).json())
+    assert item["runs"] == 3 and {t["run_id"] for t in item["turns"]} == {r.id for r in runs}
+    assert other.id not in {t["run_id"] for t in item["turns"]}
+    assert len(item["params"]) == 2 and all(p["distinct"] == 3 for p in item["params"]) and item["constants"] == 1
+
+    rep = item["representative"]["run_id"]
+    res = await client.post("/api/copilot/from-run", json={"run_id": rep, "freeze": True, "peers": item["peers"]})
+    assert res.status_code == 200, res.text
+    made = res.json()
+    assert made["params"] == ["p1", "p2"], "条件换了序的几轮照样认得出两个日期是参数"
+    async with SessionLocal() as session:
+        wf = await session.get(Workflow, made["workflow_id"])
+    sql = {n["id"]: n for n in wf.graph["nodes"]}["fetch"]["data"]["config"]["args"]["sql"]
+    assert "'paid'" in sql and "'{{ input.p1 }}'" in sql and "'{{ input.p2 }}'" in sql
+
+
+async def test_a_not_a_caliber_recorded_by_the_old_text_id_still_counts(client, monkeypatch):
+    """以前「不是口径」按规范文本算的 id 记：分组改按规范形之后，组里任何一条的规范文本对得上就照样不进队。"""
+    await three_asks(monkeypatch)
+    [item] = shape_items((await client.get("/api/ledger/certify-queue")).json())
+    old = certify.item_id("shape", f"{S.CURRENT['source']}\n{item['shape']}")
+    assert old != item["id"]
+    res = await client.post("/api/ledger/certify-queue/dismiss", json={"item_id": old, "kind": "shape"})
+    assert res.status_code == 200
+    assert shape_items((await client.get("/api/ledger/certify-queue")).json()) == []

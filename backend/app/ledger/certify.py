@@ -5,8 +5,11 @@
 
 **认证队列**（GET /api/ledger/certify-queue，搭建者及以上）三种信号：
 - 确定性重复（shape）：问数据的探索运行里执行过、被报告引用（比对工件里标签记着的查询）、又没对上任何口径（none / related）
-  的查询，按（数据源、normalize_sql 的规范文本）分组；出现在 ≥ REPEAT_RUNS 次运行、来自 ≥ REPEAT_CONVERSATIONS 段对话的进队。
-  跨运行变化的字面量位置是参数候选，不变的是口径常量。展示的是规范文本（字面量都换成了「?」，不带取值）；
+  的查询，按（数据源、规范形）分组：sql_semantics.sql_shape 在判等价同一套规范形式上抹掉字面量、把 AND / OR 的各项、IN 列表、
+  交换律成立的比较两边重排——条件的先后不同、AND 两边换位的进同一组，条件真不同的不进；认不出规范形的按 normalize_sql 的
+  规范文本分组（只会分得细）。出现在 ≥ REPEAT_RUNS 次运行、来自 ≥ REPEAT_CONVERSATIONS 段对话的进队。跨运行变化的字面量
+  位置（按规范形里的先后对齐）是参数候选，不变的是口径常量。展示的是代表那条的规范文本（字面量都换成了「?」，不带取值）。
+  这一项的 id 按（数据源、规范形）算；以前按规范文本记的「不是口径」照样认（组里任何一条的规范文本对得上就算）；
 - 问题聚类（cluster）：app/chat/questions 全站唯一的聚类（只取问题原文、不含 history、排除系统派生的运行），≥ REPEAT_RUNS
   个问题的类；
 - 被反复用的答案（reused）：导出过 ≥ 2 次（report.exported 审计，第 2 波）、做成过应用（蓝图的来源是这次运行）、在画布里
@@ -90,22 +93,38 @@ def item_id(kind: str, key: str) -> str:
 
 @dataclass(frozen=True)
 class Shape:
-    """一条查询的形状：数据源、规范文本（字面量换成「?」）、字面量（SQL 写法，字符串带引号）、规范化失败的原因。"""
+    """一条查询的形状：数据源、规范文本（字面量换成「?」）、字面量（SQL 写法，字符串带引号）、规范化失败的原因。
+
+    key 是分组用的规范形（sql_semantics.sql_shape，「shape:」开头；认不出时退回规范文本，「text:」开头）；canonical 是按
+    规范形里的先后排的字面量（同一组的几条按位置对得上，认哪些位置跨轮变了用它），positions[i] 是它在 literals 里的位置
+    （规范化时新算出来的字面量为 None：没法写成模板参数）。"""
 
     source: str
     text: str
     literals: tuple[str, ...]
     problem: str | None = None
+    key: str = ""
+    canonical: tuple[str, ...] = ()
+    positions: tuple[int | None, ...] = ()
+
+    def params(self, canonical_positions: Sequence[int]) -> list[int]:
+        """规范形里的位置 → literals 里的位置（template_of 要的）；对不上的不要。"""
+        return sorted(p for i in canonical_positions if i < len(self.positions) and (p := self.positions[i]) is not None)
 
 
 def shape_of(snap: Any, kinds: dict[str, str | None]) -> Shape | None:
-    from app.data.sql_semantics import normalize_sql
+    from app.data.sql_semantics import normalize_sql, sql_shape
 
     if not isinstance(snap, dict) or not isinstance(snap.get("sql"), str) or not snap["sql"].strip():
         return None
     source = str(snap.get("source") or "")
     norm = normalize_sql(snap["sql"], kinds.get(source))
-    return Shape(source, norm.text, norm.literals, norm.parse_error)
+    found = sql_shape(snap["sql"], kinds.get(source)) if not norm.parse_error else None
+    if found is None:
+        return Shape(source, norm.text, norm.literals, norm.parse_error, key=f"text:{norm.text}",
+                     canonical=norm.literals, positions=tuple(range(len(norm.literals))))
+    return Shape(source, norm.text, norm.literals, None, key=f"shape:{found.key}", canonical=found.literals,
+                 positions=found.positions)
 
 
 def varying(literals: Sequence[Sequence[str]]) -> list[int]:
@@ -174,11 +193,13 @@ def template_of(shape: Shape, params: Sequence[int], dialect: str | None, *,
 class _Member:
     run_id: str
     artifact: str
+    #: 按规范形里的先后排的字面量（Shape.canonical）
     literals: tuple[str, ...]
     conversation_id: str | None
     turn_id: str | None
     question: str
     related: list[dict[str, Any]] = field(default_factory=list)
+    shape: Shape | None = None
 
 
 def referenced_queries(content: dict[str, Any]) -> list[str]:
@@ -297,31 +318,38 @@ async def queue(session: Any, *, principal: Any) -> dict[str, Any]:
                 info = turns.get(run_id) or {}
                 related = [{k: c.get(k) for k in ("caliber", "workflow_id", "version", "level")}
                            for c in row.get("candidates") or [] if c.get("status") == "related"]
-                groups.setdefault((shape.source, shape.text), []).append(_Member(
-                    run_id, query, shape.literals, info.get("conversation_id"), info.get("turn_id"),
-                    str(info.get("question") or ""), related))
+                groups.setdefault((shape.source, shape.key), []).append(_Member(
+                    run_id, query, shape.canonical, info.get("conversation_id"), info.get("turn_id"),
+                    str(info.get("question") or ""), related, shape))
         return groups
 
     groups = await asyncio.to_thread(read)
     items: list[dict[str, Any]] = []
-    for (source, text), members in groups.items():
+    for (source, key), members in groups.items():
         once = list({m.run_id: m for m in members}.values())
         conversations = {m.conversation_id or f"run:{m.run_id}" for m in once}
         if len(once) < REPEAT_RUNS or len(conversations) < REPEAT_CONVERSATIONS:
             continue
-        iid = item_id("shape", f"{source}\n{text}")
-        if iid in dismissed:
+        iid = item_id("shape", f"{source}\n{key}")
+        # 以前按规范文本记的「不是口径」：组里任何一条的规范文本对得上就照样不进队
+        legacy = {item_id("shape", f"{source}\n{m.shape.text}") for m in once if m.shape is not None}
+        if iid in dismissed or legacy & dismissed:
             continue
-        params = varying([m.literals for m in once])
-        related = list({r["caliber"]: r for m in once for r in m.related if r.get("caliber")}.values())
         rep = once[0]
+        shape = rep.shape
+        if shape is None:
+            continue
+        varied = varying([m.literals for m in once])
+        params = [(i, p) for i in varied if i < len(shape.positions) and (p := shape.positions[i]) is not None]
+        related = list({r["caliber"]: r for m in once for r in m.related if r.get("caliber")}.values())
         items.append({
-            "id": iid, "kind": "shape", "source": source, "shape": text, "runs": len(once),
+            "id": iid, "kind": "shape", "source": source, "shape": shape.text, "runs": len(once),
             "conversations": len(conversations), "question": rep.question,
             "turns": [_turn_view(m) for m in once[:TURNS_LIMIT]],
-            "params": [{"index": i, "distinct": len({m.literals[i] for m in once if len(m.literals) > i})}
-                       for i in params],
-            "constants": len(rep.literals) - len(params), "related": related,
+            # index 是代表那条规范文本里的第几个「?」；distinct 按规范形对齐了数
+            "params": [{"index": p, "distinct": len({m.literals[i] for m in once if len(m.literals) > i})}
+                       for i, p in sorted(params, key=lambda ip: ip[1])],
+            "constants": len(shape.literals) - len(params), "related": related,
             "representative": {"run_id": rep.run_id, "query": rep.artifact},
             "peers": [m.run_id for m in once[1:]],
             "frozen_into": _frozen_of([m.run_id for m in once], frozen),
@@ -447,7 +475,7 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
         raise CertifyRefused(409, NO_QUERIES)
     kinds = {n: k for n, k in (await session.execute(select(DataSource.name, DataSource.kind))).all()}
 
-    # 同组的别的运行：它们封存的查询里同形状的那一条的字面量
+    # 同组的别的运行：它们封存的查询里同形状（规范形相同，见 Shape.key）的那一条的字面量，按规范形里的先后
     peer_literals: dict[tuple[str, str], list[tuple[str, ...]]] = {}
     peer_sources: list[dict[str, Any]] = []
     peer_runs = [r for r in [await session.get(Run, p) for p in dict.fromkeys(peers) if p != run_id] if r is not None]
@@ -460,7 +488,7 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
             except ValueError:
                 continue
             if shape is not None and not shape.problem:
-                peer_literals.setdefault((shape.source, shape.text), []).append(shape.literals)
+                peer_literals.setdefault((shape.source, shape.key), []).append(shape.canonical)
     sealed = await _sealed(run_id)
     shapes: list[Shape] = []
     snaps: list[dict[str, Any]] = []
@@ -485,7 +513,7 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
     metrics: list[dict[str, Any]] = []
     multi = False
     for i, (shape, snap) in enumerate(zip(shapes, snaps)):
-        params = varying([shape.literals, *peer_literals.get((shape.source, shape.text), [])])
+        params = shape.params(varying([shape.canonical, *peer_literals.get((shape.source, shape.key), [])]))
         template, new_fields = template_of(shape, params, kinds.get(shape.source), start=len(fields) + 1)
         fields += new_fields
         nodes.append({"id": nid(i), "type": "tool", "position": {"x": 0, "y": 0},
