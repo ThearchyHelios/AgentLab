@@ -124,16 +124,44 @@ async def source_versions(session: AsyncSession, source_ids: Sequence[str]) -> d
 
 
 async def estimate(session: AsyncSession, suite_id: str, items: int) -> dict[str, Any]:
-    """开跑前的估算：按这个题集上一次结束的评测的每题平均花费 × 这次的项数。第一次评测估不出，照实写。"""
+    """开跑前的估算：按这个题集上一次结束的评测的每题平均花费 × 这次的项数。第一次评测估不出，照实写。
+
+    上一次有估不出金额的调用（模型不在价格目录里、用量没报全）时，平均花费只是估得出的那部分：一分都没估出来的照实写估不出
+    （以前写「约 $0」，像不花钱），估出了一部分的写「至少」（at_least）、带上另有几次估不出（unpriced_calls）。老总表里每题
+    平均记成 0、却有估不出的调用的，也按估不出算。"""
     row = (await session.execute(select(EvalRun).where(
         EvalRun.suite_id == suite_id, EvalRun.status.in_(("succeeded", "partial")))
         .order_by(EvalRun.created_at.desc()).limit(1))).scalar_one_or_none()
-    per_item = ((row.summary or {}).get("per_case_cost_usd") if row is not None else None)
-    if per_item is None:
+    if row is None:
         return {"items": items, "per_item_usd": None, "total_usd": None, "basis": None,
                 "note": "这个题集还没有评完过，估不出花费：按每题开评前的实际花费累计，到了上限就停"}
-    return {"items": items, "per_item_usd": round(float(per_item), 6), "total_usd": round(float(per_item) * items, 4),
-            "basis": row.id, "note": "按这个题集上一次评测的每题平均花费估算（不含估不出金额的模型）"}
+    summary = row.summary or {}
+    per_item = summary.get("per_case_cost_usd")
+    unpriced = int(summary.get("unpriced_calls") or 0)
+    if per_item is None or (unpriced and not float(per_item)):
+        if not unpriced:
+            return {"items": items, "per_item_usd": None, "total_usd": None, "basis": None,
+                    "note": "这个题集上一次评测没有评完一道题，估不出花费：按每题开评前的实际花费累计，到了上限就停"}
+        return {"items": items, "per_item_usd": None, "total_usd": None, "basis": row.id, "unpriced_calls": unpriced,
+                "note": f"上一次评测的 {unpriced} 次模型调用金额都估不出（模型不在价格目录中，或用量没有报全），估不出花费："
+                        "金额上限只管得住估得出金额的调用"}
+    out = {"items": items, "per_item_usd": round(float(per_item), 6), "total_usd": round(float(per_item) * items, 4),
+           "basis": row.id, "note": "按这个题集上一次评测的每题平均花费估算"}
+    if unpriced:
+        out.update(at_least=True, unpriced_calls=unpriced,
+                   note=f"按这个题集上一次评测的每题平均花费估算，实际至少这么多：上一次另有 {unpriced} 次调用金额估不出，没有算进去")
+    return out
+
+
+def judge_usage(judge: Mapping[str, Any], cost_usd: float) -> dict[str, Any]:
+    """按角色的用量里裁判那一份：金额、次数，和估不出金额的次数（结论裁判的模型不在价格目录里时它的每次调用都估不出；
+    文字要点按计量汇总）。以前只有金额和次数，裁判模型不在价格目录里时写成 $0。"""
+    claims = judge.get("claims") or {}
+    text = judge.get("text") or {}
+    calls = int(claims.get("calls") or 0) + int(text.get("calls") or 0)
+    unpriced = (int(claims.get("calls") or 0) if claims.get("priced") is False else 0) \
+        + int((text.get("usage") or {}).get("unpriced_calls") or 0)
+    return {"cost_usd": round(cost_usd, 6), "calls": calls, "unpriced_calls": unpriced}
 
 
 # ==========================================================================
@@ -552,9 +580,7 @@ class EvalExecution(runtime.JobRun):
         writer = await writer_usage(turn.runs)
         assistant = add_usage(turn.usage.get("assistant"), turn.usage.get("review"))
         usage = {"assistant": assistant, "writer": writer, "review": turn.usage.get("review"),
-                 "judge": {"cost_usd": round(judge_cost, 6),
-                           "calls": int((judge.get("claims") or {}).get("calls") or 0)
-                           + int((judge.get("text") or {}).get("calls") or 0)}}
+                 "judge": judge_usage(judge, judge_cost)}
         cost = float(assistant.get("cost_usd") or 0) + float(writer.get("cost_usd") or 0)
         self.spent += cost + judge_cost
         looks = {"model": sum(1 for x in turn.looks if x.get("by") == "model"),
@@ -1022,6 +1048,6 @@ async def shutdown() -> None:
 
 
 __all__ = ["EVAL_BUSY", "EVAL_FINISHED", "EVAL_INVALID", "EvalExecution", "EvalRefused", "INTERRUPTED",
-           "NOTHING_TO_RETRY", "STOPPED", "active_run", "estimate", "gold_key", "leader_of", "manager",
+           "NOTHING_TO_RETRY", "STOPPED", "active_run", "estimate", "gold_key", "judge_usage", "leader_of", "manager",
            "prompt_fingerprint", "reconcile_stale", "refresh_summary", "result_dict", "result_rows", "retry", "running",
            "shutdown", "source_versions", "start", "startup", "stop"]

@@ -347,6 +347,44 @@ async def test_the_api_starts_estimates_and_reports_progress(client, monkeypatch
     assert bad.status_code == 422 and bad.json()["code"] == "eval_variant_invalid"
 
 
+async def test_the_estimate_says_it_cannot_price_instead_of_zero():
+    """上一次评测的模型都不在价格目录里（价格目录空）：估算以前写「约 $0」，像不花钱。现在一分都没估出来的写估不出；估出了
+    一部分的写「至少」、另有几次估不出（老总表里每题平均记成 0、却有估不出的调用的，也按估不出算）。"""
+    from datetime import timedelta
+
+    suite_id = await es.make_suite("none", cases=ask_cases(1))
+    now = utcnow()
+    async with SessionLocal() as session:
+        session.add(EvalRun(suite_id=suite_id, status="succeeded", created_at=now - timedelta(minutes=2),
+                            summary={"per_case_cost_usd": 0.0, "unpriced_calls": 6}))
+        await session.commit()
+        got = await runner.estimate(session, suite_id, 3)
+    assert got["total_usd"] is None and got["per_item_usd"] is None and got["unpriced_calls"] == 6, got
+    assert "估不出" in got["note"] and got["basis"], got
+    async with SessionLocal() as session:
+        session.add(EvalRun(suite_id=suite_id, status="succeeded", created_at=now - timedelta(minutes=1),
+                            summary={"per_case_cost_usd": 0.02, "unpriced_calls": 2}))
+        await session.commit()
+        got = await runner.estimate(session, suite_id, 3)
+    assert got["total_usd"] == 0.06 and got["at_least"] is True and got["unpriced_calls"] == 2, got
+    assert "至少" in got["note"] and "2 次" in got["note"], got["note"]
+    async with SessionLocal() as session:
+        session.add(EvalRun(suite_id=suite_id, status="succeeded", created_at=now,
+                            summary={"per_case_cost_usd": 0.0, "unpriced_calls": 0}))
+        await session.commit()
+        got = await runner.estimate(session, suite_id, 3)
+    assert got["total_usd"] == 0.0 and not got.get("at_least") and not got.get("unpriced_calls"), "目录价是 0 的才是真不花钱"
+
+
+def test_the_judge_role_keeps_its_unpriced_calls():
+    """按角色的用量里裁判那一份以前只有金额和次数：裁判模型不在价格目录里时写成 $0。"""
+    usage = runner.judge_usage({"claims": {"cost_usd": 0.0, "calls": 2, "priced": False},
+                                "text": {"cost_usd": 0.0, "calls": 1, "usage": {"unpriced_calls": 1}}}, 0.0)
+    assert usage == {"cost_usd": 0.0, "calls": 3, "unpriced_calls": 3}
+    priced = runner.judge_usage({"claims": {"cost_usd": 0.01, "calls": 2, "priced": True}}, 0.01)
+    assert priced == {"cost_usd": 0.01, "calls": 2, "unpriced_calls": 0}
+
+
 async def test_results_give_the_question_actually_asked_and_the_template_apart(client, monkeypatch):
     """逐题结果的 question 是这一题实际问的（变量按这次评测的截至时间渲染好了，和作答时 Driver 收到的一字不差），模板原文
     另放 question_template（下一轮验收：以前 question 是带 {{ schedule.last_week_start }} 的原始模板）。没有变量的题两个一样。"""

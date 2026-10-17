@@ -356,6 +356,8 @@ export const EVAL_TEXT = {
     estimateText: (items: number, cases: number, repeats: number, arms: number) =>
       `${formatNumber(cases)} 道题 × 每题 ${repeats} 次${arms > 1 ? ` × ${arms} 臂` : ''}，共 ${formatNumber(items)} 项`,
     cost: (total: string, per: string) => `约 ${total}（每项约 ${per}）`,
+    /** 上一次有估不出金额的调用：估出来的只是下限 */
+    costAtLeast: (total: string, per: string) => `至少约 ${total}（每项至少约 ${per}）`,
     costNone: '估不出花费',
     budget: '生效的预算',
     parallel: (n: number) => `同时评 ${n} 题`,
@@ -416,6 +418,8 @@ export const EVAL_TEXT = {
     cost: '花费',
     costHint: '助手（建图、挑表、复核）+ 写作（答案运行里的模型调用）+ 结论裁判；算期望不调模型',
     perCase: (v: string) => `每题约 ${v}`,
+    /** 有估不出金额的调用：每题平均只是下限 */
+    perCaseAtLeast: (v: string) => `每题至少约 ${v}`,
     e1: '逐题的口径命中（E1）',
     e1Hint: '答案执行的 SQL 和期望的取数被证明等价的比例（口径账本同一个比对函数）',
     citations: '报告引用率',

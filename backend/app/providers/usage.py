@@ -12,7 +12,10 @@ async generator：with 块跨着 yield 的话，变量在两次 yield 之间留�
 在创建时拷走上下文，照样计到；调用方自己的代码一行都不在计量里。
 
 **金额。** 按 providers/catalog.estimate_cost 算，和运行的 llm.end 一个口径。估不出的调用记 unpriced_calls：模型不在价格
-目录里，或者用量没报全而目录价又不是 0。估不出的不当成 0 元，调用方据此写「≥」或「金额无法估算」。用量没报全有两种：
+目录里，或者用量没报全而目录价又不是 0。估不出的不当成 0 元，调用方据此写「≥」或「金额无法估算」。汇总的 cost_usd 永远是
+估得出的那部分（同运行的 usage，全系统一个口径），有 unpriced_calls 时它只是下限：写金额、算平均、做估算的地方都要连着
+unpriced_calls 一起看，一分都没估出来的写估不出、不写 0（评测的开跑估算、每题平均花费以前就漏了这一条，见 eval/runner.estimate、
+eval/stats.summarize）。用量没报全有两种：
 回复没带用量（有的网关流式不给）；读到一半就不读了——用量在流的末尾才报全（Anthropic 的输出 token 在最后一条，OpenAI
 兼容系开了 stream_usage 也在最后）。生成过程读到 done、look、ask 那一行之后照样把流读完再关（api/copilot_gen._drain），
 流末尾那一段用量收得到；只有模型在那一行之后还往下写超过 DRAIN_CHARS 字的闲话时才当场关流（不为闲话付钱），连接断了也一样，

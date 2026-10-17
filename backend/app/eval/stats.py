@@ -145,8 +145,10 @@ def summarize(results: Sequence[Mapping[str, Any]], *, judge_on: bool = False) -
         "timings": {k: {"p50": percentile(v, 50), "p90": percentile(v, 90), "n": len(v)} for k, v in timings.items()},
         "usage": {**usage, "gold": {"cost_usd": 0.0, "calls": 0}},
         "cost_usd": cost, "unpriced_calls": unpriced,
-        # 每题平均花费（下一次开跑前的估算按它）：只按评完了的题平均，没开评的不摊
-        "per_case_cost_usd": round(cost / len(evaluated), 6) if evaluated else None,
+        # 每题平均花费（下一次开跑前的估算按它）：只按评完了的题平均，没开评的不摊。有估不出金额的调用时 cost_usd 只是估得出
+        # 的那部分：一分都没估出来（模型都不在价格目录里）的为 None，不写成 0（像不花钱）；估出了一部分的照给，unpriced_calls
+        # 说明它只是下限
+        "per_case_cost_usd": round(cost / len(evaluated), 6) if evaluated and (cost > 0 or not unpriced) else None,
         "citations": {"numbers": numbers, "numbers_cited": cited,
                       "uncited_numbers": sum(int(s.get("uncited_numbers") or 0) for s in stats),
                       "unresolved": sum(int(s.get("unresolved") or 0) for s in stats),

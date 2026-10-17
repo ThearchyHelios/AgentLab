@@ -365,7 +365,11 @@ export interface EvalEstimate {
   arms: { label: string | null; variant: EvalVariant; models: EvalResolvedModels; text: string }[]
   cases: number
   repeats: number
-  estimate: { items: number; per_item_usd: number | null; total_usd: number | null; basis: string | null; note: string }
+  /** at_least：上一次另有 unpriced_calls 次调用金额估不出，估算只是下限；total_usd 为空、unpriced_calls 有值：一分都没估出来 */
+  estimate: {
+    items: number; per_item_usd: number | null; total_usd: number | null; basis: string | null; note: string
+    at_least?: boolean; unpriced_calls?: number
+  }
   budget: EvalBudget
   parallel: number
   spend: EvalSpend
