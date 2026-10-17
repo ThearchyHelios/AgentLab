@@ -17,7 +17,8 @@
   段对话的算重复的形状，给出这样的形状几个、有重复形状的运行占几成；问题聚类（app/chat/questions：全站唯一的聚类，只取问题
   原文、不含 history、排除系统派生的运行）里 ≥ REPEAT_RUNS 个问题的类占几成。认证队列的转化（第 3 波，ledger/certify）：固化成
   口径草稿几份（origin.freeze 的工作流）、其中发布了几份、点了「不是口径」几项。
-- E4 召回：每个口径版本被用了多少次（比对里等价已证明的运行数、这一版的正式运行数）；每次发布（口径升到某一版）召回了几组、
+- E4 召回：每个口径版本被用了多少次（比对里等价已证明的运行数、这一版的正式运行数——只算图上有源头口径卡的版本，没有口径卡
+  的普通发布工作流的正式运行不算）；每次发布（口径升到某一版）召回了几组、
   收过尾的几组、其中数变了的几组和比例、重算失败的几组（ledger/recall：召回运行和它收尾时记的 ledger.recalled，第 4 波）。
   按召回运行的发起时间筛窗口；表结构变了之后的口径试算不算召回。
 """
@@ -289,13 +290,33 @@ async def _e4(session: Any, contents: list[dict[str, Any]], **scope: Any) -> dic
         stmt = stmt.where(Run.created_at >= scope["since"])
     if scope.get("until") is not None:
         stmt = stmt.where(Run.created_at < scope["until"])
-    formal = {ledger_labels.caliber_key(w, v): int(n)
-              for w, v, n in (await session.execute(stmt.group_by(Run.workflow_id, Run.version))).all()}
+    counted = {(w, v): int(n) for w, v, n in (await session.execute(stmt.group_by(Run.workflow_id, Run.version))).all()}
+    # 只算有口径卡的那几版：没有口径卡的普通发布工作流的正式运行不是「这个口径版本被用了」
+    calibers = await _caliber_versions(session, counted)
+    formal = {ledger_labels.caliber_key(w, v): n for (w, v), n in counted.items() if (w, v) in calibers}
     recalls = int(await session.scalar(select(func.count()).select_from(Run).where(Run.origin_kind == "recall")) or 0)
     usage = [{"caliber": key, "workflow_id": key.rsplit("@", 1)[0], "version": int(key.rsplit("@", 1)[1]),
               "proven_runs": proven.get(key, 0), "formal_runs": formal.get(key, 0)}
              for key in sorted(set(proven) | set(formal))]
     return {"usage": usage, "recall_runs": recalls, "per_publish": await _per_publish(session, **scope)}
+
+
+async def _caliber_versions(session: Any, keys: Collection[tuple[str, int]]) -> set[tuple[str, int]]:
+    """这几个（工作流, 版本）里图上有源头口径卡的那些（recall.source_cards：metrics 节点、不是转抄别处的 caliber_from）。"""
+    from sqlalchemy import or_
+
+    from app.db.models import WorkflowVersion
+    from app.ledger.recall import source_cards
+
+    keys = list(keys)
+    out: set[tuple[str, int]] = set()
+    for i in range(0, len(keys), 200):
+        chunk = keys[i:i + 200]
+        rows = (await session.execute(select(WorkflowVersion.workflow_id, WorkflowVersion.version, WorkflowVersion.graph)
+                                      .where(or_(*[(WorkflowVersion.workflow_id == w) & (WorkflowVersion.version == v)
+                                                   for w, v in chunk])))).all()
+        out |= {(w, v) for w, v, graph in rows if source_cards(graph)}
+    return out
 
 
 async def _per_publish(session: Any, **scope: Any) -> dict[str, Any]:
