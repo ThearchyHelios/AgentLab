@@ -82,6 +82,11 @@ export interface LedgerQuery {
   reason?: string
   note?: string
   candidates: (LedgerRelated & { status?: string; how?: string })[]
+  /**
+   * 逐格比过的（服务端 ledger/match._cells，algo 4）：被引用的每一列各自的结论和候选。整条（按全部引用列投影）没证明、
+   * 报告引用了这条查询好几列时才有；每个数的标签已经按它那一格标好，界面照标签画，不拿它重算
+   */
+  cells?: Record<string, { status: string; reason?: string; candidates: (LedgerRelated & { status?: string; how?: string })[] }>
 }
 
 /** 整题判断（主报告）：所有带标签的数都来自同一口径的同一版、参数一致时 equivalent */

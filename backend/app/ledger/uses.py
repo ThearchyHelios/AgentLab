@@ -110,7 +110,7 @@ async def _answers(session: AsyncSession, workflow_id: str, below: int | None, o
     """问数回答：比对工件 meta 里等价已证明的那几份口径里有 W@V 的探索运行（见模块说明）。"""
     from app.engine.origin import counted_runs
     from app.ledger import store
-    from app.ledger.labels import caliber_key
+    from app.ledger.labels import caliber_key, candidates_of
 
     prefix = f"{workflow_id}@"
     rows = (await session.execute(
@@ -134,7 +134,8 @@ async def _answers(session: AsyncSession, workflow_id: str, below: int | None, o
             continue
         seen: set[tuple[int, str]] = set()
         for query in content.get("queries") or []:
-            for cand in query.get("candidates") or []:
+            # 逐格证明了的也是用了这份口径（ledger/labels.candidates_of）
+            for cand in candidates_of(query):
                 if cand.get("status") != "proven" or cand.get("workflow_id") != workflow_id:
                     continue
                 version = cand.get("version")

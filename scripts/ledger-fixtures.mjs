@@ -94,6 +94,24 @@ export const WHOLE = { equivalent: true, caliber: WEEKLY.caliber, workflow_id: W
   level_text: '受管', workflow_name: '周报口径', how: 'independent', binding: [{ field: 'week', value: '2026-W37' }],
   missing: [], missing_required: [], counts: { caliber: 3, related: 0, reasoning: 0, unknown: 0 } }
 
+/**
+ * 逐格判（服务端 ledger/match._cells，algo 4）的真实例子：同一条查询（q-gmv）报告引用了好几列，s6 销售额那一格证明了
+ * 等价于周报口径，s10 订单数那一格只是相关（差在哪先说多查了几列、再说计数对求和），整题不等价、没有出具入口
+ */
+export const CELL_DIFF = { items: [
+  { aspect: 'projection', a: null, b: null, text: '这次多查了 3 列，不影响这个数' },
+  { aspect: 'aggregate', a: 'COUNT(*)', b: 'SUM(amount)', text: '这次数的是行数，口径对 amount 求和' }],
+  fallback: false, text_diff: [] }
+export const CELL_LABELS = {
+  s6: caliberLabel(WEEKLY, 'independent', { binding: [{ field: 'start', value: '2026-10-05' }, { field: 'end', value: '2026-10-11' }],
+                                            query: 'q-gmv', node_id: 'fetch', column: 'gmv' }),
+  s10: { kind: 'related', query: 'q-gmv', related: [{ caliber: WEEKLY.caliber, workflow_id: WEEKLY.workflow_id, version: 2,
+                                                       level: 'governed', level_text: '受管', workflow_name: '周报口径',
+                                                       node_id: 'fetch', comparable: true, diff: CELL_DIFF }] },
+}
+export const CELL_WHOLE = { equivalent: false, reason: '有的数和相关口径不一致，不来自口径',
+  counts: { caliber: 1, related: 1, reasoning: 0, unknown: 0 } }
+
 /** 对过的一次账（单行：一组对照）。status 可以换 */
 export const reconciledOf = (status = 'succeeded') => ({
   run_id: 'run-rec-1', status, query: 'q-orders', caliber: ORDERS.caliber, workflow_id: ORDERS.workflow_id, version: 1,

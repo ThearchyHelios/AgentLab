@@ -576,7 +576,7 @@ class EvalExecution(runtime.JobRun):
             judge_cost += float(judge["text"].get("cost_usd") or 0)
         graded = score.score_case(case, gold_dict, answer, path=turn.path, path_reason=turn.reason,
                                   judgement=judge.get("text"))
-        match = await score.sql_match(case, gold_dict, answer)
+        match = await score.sql_match(case, gold_dict, answer, cells=score.matched_cells(graded))
         writer = await writer_usage(turn.runs)
         assistant = add_usage(turn.usage.get("assistant"), turn.usage.get("review"))
         usage = {"assistant": assistant, "writer": writer, "review": turn.usage.get("review"),

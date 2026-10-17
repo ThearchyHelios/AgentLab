@@ -613,10 +613,14 @@ async def gold_calibers(case: Mapping[str, Any], gold: Mapping[str, Any] | None)
 
 
 async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, answer: Answer, *,
-                    timeout: float = 8.0) -> dict[str, Any] | None:
-    """逐题的 E1：{status: proven|related|none|skipped, query, aspects, diff, reason, cited, basis}。没有作答运行、没有期望
-    取数的为 None。比的是哪条查询见 _answering：basis 是 cited（答案引用的）或 only_query（答案没引用、运行只查了这一条）。
-    比对在线程里跑（纯计算，和账本一样限时）。"""
+                    timeout: float = 8.0, cells: Sequence[Any] = ()) -> dict[str, Any] | None:
+    """逐题的 E1：{status: proven|related|none|skipped, query, column?, aspects, diff, reason, cited, basis}。没有作答运行、
+    没有期望取数的为 None。比的是哪条查询见 _answering：basis 是 cited（答案引用的）或 only_query（答案没引用、运行只查了
+    这一条）。比对在线程里跑（纯计算，和账本一样限时）。
+
+    和账本同一个口径逐格判（ledger/match._cells）：引用了好几列、整条比不上的查询，每一列各比一次。cells 是评分时和期望
+    配上的那几格（各项期望的 cell：{artifact, column}）：取那一格的结论（column 写是哪一列）；没给、配上的格没逐格比过时，
+    逐格证明了的取那一格，再不然照旧按整条查询。"""
     import asyncio
     import time
 
@@ -653,8 +657,9 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
     pool, basis = _answering(rows, answer)
     if isinstance(pool, dict):
         return pool
+    column, cell = _cell_of(pool, cells)
     proven = next((r for r in pool if r.get("status") == "proven"), None)
-    chosen = proven or next((r for r in pool if r.get("status") == "related"), None) or \
+    chosen = cell or proven or next((r for r in pool if r.get("status") == "related"), None) or \
         next((r for r in pool if r.get("status") == "skipped"), None) or pool[0]
     candidate = next((c for c in chosen.get("candidates") or [] if c.get("status") == chosen.get("status")), None) or \
         next(iter(chosen.get("candidates") or []), None) or {}
@@ -662,9 +667,34 @@ async def sql_match(case: Mapping[str, Any], gold: Mapping[str, Any] | None, ans
     # projection 那一条只是说「多查了几列，不影响这个数」，不是差在哪个方面（账本的 E1 差异类型也不数它）
     aspects = sorted({i.get("aspect") for i in diff.get("items") or [] if i.get("aspect") not in (None, "", "projection")})
     sql = next((q.get("sql") for q in answer.queries if q.get("artifact") == chosen.get("artifact")), None)
-    return {"status": chosen.get("status"), "query": chosen.get("artifact"), "sql": sql, "aspects": aspects,
-            "diff": diff or None, "via": candidate.get("via"), "binding": candidate.get("binding"),
-            "reason": chosen.get("reason") or candidate.get("reason"), "cited": basis == "cited", "basis": basis}
+    return {"status": chosen.get("status"), "query": chosen.get("artifact"), **({"column": column} if column else {}),
+            "sql": sql, "aspects": aspects, "diff": diff or None, "via": candidate.get("via"),
+            "binding": candidate.get("binding"), "reason": chosen.get("reason") or candidate.get("reason"),
+            "cited": basis == "cited", "basis": basis}
+
+
+def matched_cells(graded: "CaseScore") -> list[dict[str, Any]]:
+    """评分时各项期望和答案里配上的那一格（答对的、量纲不同的、答错时配对上的）：逐题 E1 取它们的逐格结论。"""
+    return [dict(item["cell"]) for item in graded.scores
+            if isinstance(item, Mapping) and isinstance(item.get("cell"), dict)]
+
+
+def _cell_of(pool: list[dict[str, Any]], cells: Sequence[Any]) -> tuple[str | None, dict[str, Any] | None]:
+    """逐格比过的格里挑一格：评分时和期望配上的那几格先（其中证明了的先），再不然逐格证明了的那一格。交回 (列名, 那一格的
+    结论，带上查询快照 artifact)；没有可挑的为 (None, None)。"""
+    hinted = [(str(c.get("artifact")), str(c.get("column"))) for c in cells
+              if isinstance(c, Mapping) and c.get("artifact") and c.get("column") is not None]
+    found: list[tuple[str, dict[str, Any]]] = []
+    for row in pool:
+        for name, entry in (row.get("cells") or {}).items() if isinstance(row.get("cells"), dict) else []:
+            if isinstance(entry, dict):
+                found.append((name, {**entry, "artifact": row.get("artifact"), "_hinted": (row.get("artifact"), name)
+                                     in hinted}))
+    ranked = sorted(found, key=lambda f: (not f[1]["_hinted"], f[1].get("status") != "proven"))
+    for name, entry in ranked:
+        if entry["_hinted"] or entry.get("status") == "proven":
+            return name, {k: v for k, v in entry.items() if k != "_hinted"}
+    return None, None
 
 
 def _answering(rows: list[dict[str, Any]], answer: Answer) -> tuple[list[dict[str, Any]] | dict[str, Any], str]:
@@ -692,4 +722,5 @@ def _answering(rows: list[dict[str, Any]], answer: Answer) -> tuple[list[dict[st
 
 
 __all__ = ["Answer", "CaseScore", "DEFAULT_TOLERANCE", "OUTCOMES", "OUTCOME_LABEL", "PATH_LABEL", "SCORER_VERSION",
-           "TEXT_LABEL", "TEXT_OUTCOMES", "VERDICT_LABEL", "gold_calibers", "read_answer", "score_case", "sql_match"]
+           "TEXT_LABEL", "TEXT_OUTCOMES", "VERDICT_LABEL", "gold_calibers", "matched_cells", "read_answer",
+           "score_case", "sql_match"]

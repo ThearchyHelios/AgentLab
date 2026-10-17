@@ -130,7 +130,10 @@ def test_without_a_projection_every_pair_is_exactly_the_old_result():
         (f"SELECT SUM(amount) AS gmv, COUNT(*) AS n FROM orders WHERE {WINDOW}", ["gmv"], {"gmv"}),  # 列数对不上
     ]
     for sql, columns, cited in cases:
-        assert compare(sql, columns, cited) == compare(sql, columns, None), sql
+        row = compare(sql, columns, cited)
+        # 逐格比（algo 4）是另加的 cells、one_row 两个键：整条查询这一层的结论和候选照旧一字不差
+        assert {k: v for k, v in row.items() if k not in ("cells", "one_row")} == compare(sql, columns, None), sql
+        assert ("cells" in row) == (len(cited) >= 2 and row["status"] == "related"), sql
 
 
 # --------------------------------------------------------------------------
@@ -185,7 +188,7 @@ async def test_last_weeks_sales_with_extra_columns_is_whole_equivalent(engine_up
     row = await S.explore(monkeypatch, sql, text="上周销售额 [[v:Q1.r0.销售额]]，共 [[v:Q1.r0.单数]] 单。")
     recorded = await store.latest(row.id)
     content = recorded.content
-    assert content["algo"] == "3"
+    assert content["algo"] == store.ALGO
     [q] = content["queries"]
     assert q["status"] == "related", "销售额、单数两列都被引用，口径只有销售额：投影之后列数对不上，照旧不等价"
 

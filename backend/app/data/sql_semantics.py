@@ -9147,6 +9147,19 @@ def project_template(template_sql: str, keep: Sequence[int], dialect: str | None
         return Projection(None, keep, refused=_PROJ_TEXT)
 
 
+def one_row(sql: str, dialect: str | None = None) -> bool:
+    """这条查询一定只出一行（或者一行都不出）：一段 SELECT、没有 GROUP BY、本身是聚合（不分组的聚合，HAVING 至多筛掉那
+    一行）。逐格比出来的结论要合起来用（一个指标用了同一条查询的好几格）时，只在这种查询上成立：多行的结果里，每一列
+    各自对得上不等于每一行的几列一起对得上。认不出的为假。"""
+    from sqlglot import exp
+
+    read = _read(dialect)
+    root, _ = _parse(_mysql_dashes(sql) if read == "mysql" and isinstance(sql, str) else sql, read)
+    if not isinstance(root, exp.Select) or root.args.get("group") is not None or root.args.get("qualify") is not None:
+        return False
+    return _aggregating(root)
+
+
 def output_names(sql: str, dialect: str | None = None, *, template: bool = False) -> list[str] | None:
     """最外层选择列表各项的输出名（按位置；同 _result_columns，不展开 *：有 * 的为 None）。template 为真时 sql 是口径
     模板，按哨兵渲染之后认。解析不了、不是一段 SELECT 的为 None。"""
@@ -9329,5 +9342,5 @@ def sql_shape(sql: str, dialect: str | None = None) -> SqlShape | None:
 __all__ = ["BINDING_LEVELS", "MAX_SQL_CHARS", "PLACEHOLDER", "Aggregate", "ColumnRef", "Computed", "FacetDiff", "Facets",
            "JoinFacet", "LimitFacet", "NormalizedSql", "Part", "Projection", "SqlDiff", "SqlShape", "TemplateBinding",
            "TemplateMatch", "TemplateSlot", "TimePredicate", "bind_template", "catalog_labels", "diff_facets",
-           "explain_sql_diff", "facets", "match_template", "normalize_sql", "output_names", "project_select",
-           "project_template", "render_bound", "sql_shape"]
+           "explain_sql_diff", "facets", "match_template", "normalize_sql", "one_row", "output_names",
+           "project_select", "project_template", "render_bound", "sql_shape"]
