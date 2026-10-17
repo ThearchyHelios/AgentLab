@@ -116,6 +116,27 @@ def test_tables_sets_none_and_ask():
     assert score_case(ask, {"status": "ok"}, Answer(run_id="r"), path="ran").verdict == "fail"
 
 
+def test_none_counts_only_numbers_as_giving_data():
+    """期望「没有数据」：只有引用了数值格、或叙述里写了数，才算答案给了数。引用的是文字格（地区名）、空值格（NULL）的，
+    答案明说没有数据就按没有数据判对。"""
+    none = _case({"id": "n", "kind": "none", "required": True})
+    gold = _gold({"n": {"kind": "none", "rows": 0}})
+    empty = [{"artifact": "q", "row_count": 0, "sql": "SELECT 1"}]
+    text_cell = {"value": "华中", "kind": "cell", "artifact": "q", "row": 0, "column": "region", "dims": {}}
+    named = score_case(none, gold, Answer(run_id="r", text="华中区没有数据", values=[text_cell], queries=empty), path="ran")
+    assert named.verdict == "pass" and named.scores[0]["outcome"] == "traced", named.scores
+    null_cell = {"value": None, "kind": "cell", "artifact": "q", "row": 0, "column": "gmv", "dims": {}}
+    null = score_case(none, gold, Answer(run_id="r", text="华中区的销售额为空，没有数据", values=[null_cell],
+                                         queries=empty), path="ran")
+    assert null.verdict == "pass", null.scores
+    number = score_case(none, gold, Answer(run_id="r", text="华中区 12 元", values=[_cell(12.0)], queries=empty),
+                        path="ran")
+    assert number.verdict == "fail" and number.scores[0]["got"] == 12.0, number.scores
+    said = score_case(none, gold, Answer(run_id="r", text="华中区 12 元", values=[text_cell], bare=_bare("12 元"),
+                                         queries=empty), path="ran")
+    assert said.verdict == "fail" and said.scores[0]["raw"] == "12", said.scores
+
+
 def test_the_path_and_the_gold_decide_before_numbers():
     case = _case(EXP)
     gold = _gold({"e1": _scalar(330.0)})

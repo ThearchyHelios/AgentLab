@@ -21,7 +21,8 @@ wrong 错、scale 量纲不同（差 10 的整数次幂，比如元和万元、�
 - table：逐行按 keys 的取值配对，每个要比的值同 scalar；ordered 时按答案里各行键值出现的先后核对顺序。
 - set：名单里每一项都要在答案里出现（ordered 时按顺序）；每一项都出现在答案查过的结果里算可追溯。
 - none：期望答「没有数据」：答案里没有数，而且查过的查询里有返回 0 行的（可追溯）；没有数、但也没有一条查询返回 0 行的
-  算「对但没引用」。
+  算「对但没引用」。「给了数」只认引用的数值格和叙述里写的数：引用文字格（地区名这种维度）、空值格（NULL）不算——「华中区
+  没有数据」引用了地区那一格，说的仍是没有数据。
 - ask：期望反问：作答路径是反问才对。
 - text：文字要点，由裁判判（covered / partial / missing / unjudged），单列「模型判断」，不进准确率（评测-D4）。
 
@@ -46,8 +47,10 @@ from app.engine.tolerance import agree, is_finite_number
 
 logger = logging.getLogger(__name__)
 
-#: 评分规则的版本：规则改了就加一，结果里记着按哪一版评的，可以按新规则重评
-SCORER_VERSION = 1
+#: 评分规则的版本：规则改了就加一，结果里记着按哪一版评的，可以按新规则重评。
+#: 2：期望「没有数据」时引用文字格、空值格不算给了数；判错时「答案里的数」给配对上的那一格；答案没引用查询时逐题 E1
+#: 不硬比第一条查询
+SCORER_VERSION = 2
 
 OUTCOMES = ("traced", "untraced", "wrong", "scale", "ungradable")
 OUTCOME_LABEL = {"traced": "对且可追溯", "untraced": "对但没引用", "wrong": "错", "scale": "量纲不同",
@@ -371,8 +374,15 @@ def _score_set(exp: Mapping[str, Any], gold: Mapping[str, Any], answer: Answer, 
 
 
 def _score_none(answer: Answer) -> dict[str, Any]:
-    if answer.values or answer.bare:
-        return {"outcome": "wrong", "reason": "期望答「没有数据」，答案里却给了数"}
+    """期望答「没有数据」。「给了数」只认引用的数值格、叙述里写的数：引用的文字格（地区名这种维度）、空值格（NULL）不是数——
+    「华中区（[[v:Q1.r0.地区]]）没有数据」说的正是没有数据，以前因为它引用了一格就判成「给了数」。"""
+    numeric = next((v for v in answer.values if is_finite_number(v.get("value"))), None)
+    if numeric is not None:
+        return {"outcome": "wrong", "got": numeric.get("value"), "cell": _cell_ref(numeric),
+                "reason": "期望答「没有数据」，答案里却引用了数"}
+    if answer.bare:
+        return {"outcome": "wrong", "got": answer.bare[0]["value"], "raw": answer.bare[0]["raw"],
+                "reason": "期望答「没有数据」，答案的叙述里却写了数"}
     if any(int(q.get("row_count") or 0) == 0 and q.get("role") != "verify" for q in answer.queries):
         return {"outcome": "traced"}
     return {"outcome": "untraced", "reason": "答案没有给数，但没有一条查询返回 0 行可以说明「没有数据」"}
