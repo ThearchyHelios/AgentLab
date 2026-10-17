@@ -147,6 +147,35 @@ async def test_schema_tool_adds_an_out_of_scope_table_instead_of_denying_it(wide
     assert "没有 nope" in await tool.coroutine(table="nope")
 
 
+async def test_schema_tool_on_demand_trail_records_who_started_the_run(wide):
+    """运行时 db_schema 按需加入范围的留痕：记上运行的发起人（by），不只是 run_id（下一轮验收：以前 by 是 null）。"""
+    from sqlalchemy import select as _select
+
+    from app.data import source_objects
+    from app.db.models import Run
+    from app.db.models_sources import SourceObject
+    from app.tools.datasource import build_datasource_tools
+    from app.tools.registry import ToolContext, Versions
+
+    sid, name = wide
+    async with SessionLocal() as session:
+        run = Run(workflow_name="按需加入", status="running", graph={"nodes": [], "edges": []}, input={},
+                  started_by="分析员甲")
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+    async with SessionLocal() as session:
+        (tool,) = await build_datasource_tools(
+            [f"db_schema__{name}"], ToolContext(run_id=run_id, node_id="ask", data_versions=Versions.CURRENT), session)
+    assert "按需加入了探查范围" in await tool.coroutine(table="t204")
+    async with SessionLocal() as session:
+        obj = (await session.execute(_select(SourceObject).where(SourceObject.source_id == sid,
+                                                                 SourceObject.name == "t204"))).scalar_one()
+    trail = source_objects.trail_dict(obj)
+    assert trail["via"] == source_objects.VIA_SCHEMA_TOOL and trail["run_id"] == run_id and trail["ref"] == "ask"
+    assert trail["by"] == "分析员甲", trail
+
+
 def test_legacy_truncated_cache_still_does_not_deny():
     """升级前只探查了前 200 张的老缓存（没有对象索引）：查一张没探查到的表照旧说「只探查了」、请查数据字典。"""
     from types import SimpleNamespace

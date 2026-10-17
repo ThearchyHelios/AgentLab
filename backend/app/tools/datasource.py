@@ -968,12 +968,18 @@ async def _on_demand(source: Any, missing: list[str], ctx: ToolContext | None) -
     from app.db.base import SessionLocal
     from app.look.base import ON_DEMAND_PER_LOOK, ON_DEMAND_PER_RUN
 
+    from app.db.models import Run
+
     out: dict[str, str] = {}
     lines: list[str] = []
+    starter: str | None = None
     try:
         async with SessionLocal() as session:
             reasons = await so.absent_reasons(session, source, missing)
             used = await so.count_added_in_run(session, ctx.run_id) if ctx is not None and ctx.run_id else 0
+            # 留痕记上运行的发起人（同 look 那条路记对话里的发起人）：不然只有 run_id，要回头去翻运行才知道是谁
+            if ctx is not None and ctx.run_id:
+                starter = await session.scalar(select(Run.started_by).where(Run.id == ctx.run_id))
     except Exception:  # noqa: BLE001 - 查不了原因就照旧说
         logger.exception("db_schema 查表不在的原因失败（数据源 %s）", getattr(source, "name", "?"))
         return out, lines
@@ -992,7 +998,7 @@ async def _on_demand(source: Any, missing: list[str], ctx: ToolContext | None) -
             out[t] = text
     if take:
         got = await so.add_to_scope(getattr(source, "id", ""), take, trail=so.Trail(
-            via=so.VIA_SCHEMA_TOOL, run_id=(ctx.run_id or None) if ctx else None,
+            via=so.VIA_SCHEMA_TOOL, actor=starter, run_id=(ctx.run_id or None) if ctx else None,
             ref=(ctx.node_id or None) if ctx else None,
             need=f"运行时 {SCHEMA_PREFIX}{getattr(source, 'name', '')} 点名：{'、'.join(take)}"))
         if got.cache is not None and got.added:
