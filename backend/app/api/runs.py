@@ -418,6 +418,8 @@ async def resume_run(
             approval = await session.get(Approval, target)
         if approval is not None and approval.run_id == run_id and approval.status == "pending":
             return await _respond_to(target, payload.response, x_actor)
+    from app.engine.runner import ContinueRefused
+
     try:
         # approval_id 以前定义了却从没传下去——一次运行里有多条待审批时，
         # 引擎无从知道这次回复的是哪一条
@@ -428,6 +430,9 @@ async def resume_run(
         )
     except KeyError as e:
         raise _missing(e) from e
+    except ContinueRefused as e:
+        # 被驳回的（run_rejected）：和 /continue 同一个机器码
+        raise CodedHTTPException(409, str(e), e.code) from e
     except ValueError as e:
         raise HTTPException(409, str(e)) from e
 

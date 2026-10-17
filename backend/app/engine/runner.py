@@ -52,6 +52,8 @@ END_REJECTED = "rejected"
 END_STOPPED = "stopped"
 #: 被驳回的运行不能继续运行：从断点重跑会读到同一个驳回答复、再停在同一处
 REJECTED_CONTINUE = "被驳回的运行不能继续运行：改好内容后重新发起"
+#: 被驳回的运行也没有可恢复的审批（恢复、继续运行同一个错误码 RUN_REJECTED）
+REJECTED_RESUME = "这次运行已被驳回，没有待处理的审批，无法恢复：改好内容后重新发起"
 #: 服务重启时还在排队的运行改成失败时写的话（run.error 和补发的 run.failed 是同一句）
 QUEUED_AT_RESTART = "服务重启时这次运行仍在排队，没有可恢复的进度，请重新发起运行"
 
@@ -355,7 +357,7 @@ class RunManager:
             if not run:
                 raise KeyError("运行记录不存在")
             if run.status not in ("interrupted",):
-                raise ValueError(_cannot_resume(run.status))
+                raise await _resume_refused(session, run)
             spec = GraphSpec.model_validate(run.graph)
             workflow_id = run.workflow_id
             carried = _carried(run)
@@ -458,8 +460,8 @@ class RunManager:
                 await session.commit()
                 run = await session.get(Run, run_id)
                 if run.status != "interrupted":
-                    # 审批没了是因为运行在这期间被放弃了：不能回一个「已记下」
-                    raise ValueError(_cannot_resume(run.status))
+                    # 审批没了是因为运行在这期间被放弃了（或被别人驳回了）：不能回一个「已记下」
+                    raise await _resume_refused(session, run)
                 return run
 
             # 齐了：正式落 resolved，然后驱动引擎。谁批的跟着交给节点，
@@ -1184,6 +1186,16 @@ _STATUS_TEXT = {
     "queued": "仍在排队", "running": "正在运行", "interrupted": "停在断点上",
     "succeeded": "已完成", "failed": "已失败", "cancelled": "已取消",
 }
+
+
+async def _resume_refused(session: Any, run: Run) -> ValueError:
+    """恢复被拒时抛什么：被驳回的（cancelled + end_reason=rejected，以及加 end_reason 之前记成 failed 的驳回）说「被驳回」、
+    带 RUN_REJECTED，和继续运行同一个错误码（以前照状态说「已取消的运行请重新发起」、对存量的还叫人点「继续运行」，
+    可继续运行也会被拒）；别的照状态说（_cannot_resume）。"""
+    if (run.status == "cancelled" and run.end_reason == END_REJECTED) or (
+            run.status == "failed" and await _rejected_before(session, run)):
+        return ContinueRefused(REJECTED_RESUME, code=RUN_REJECTED)
+    return ValueError(_cannot_resume(run.status))
 
 
 def _cannot_resume(status: str) -> str:
