@@ -105,6 +105,85 @@ async def test_metering_counts_by_model_and_prices_from_the_catalog():
     assert got["cost_usd"] == pytest.approx(estimate_cost(PRICED, 2000, 400))
 
 
+class Bare(Scripted):
+    """不报调用参数的模型（同以前的演示模型）：invocation_params 里没有 model，只在对象上有。"""
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        return {}
+
+
+async def test_the_model_name_comes_from_the_model_object_when_the_call_parameters_lack_it():
+    """评测汇总里助手用量的模型以前记成 unknown（下一轮验收）：演示模型的调用参数里没有模型名，计量也就认不出。现在
+    调用参数里没有时看 LangChain 照模型对象给回调的 ls_model_name；演示模型自己也把 model_name 报进调用参数。"""
+    from app.providers.mock_model import MockChatModel
+
+    m = usage.meter()
+    with usage.metering(m):
+        await Bare(model=PRICED + "-bare").ainvoke("你好")
+        await MockChatModel(model_name="mock-wide", latency=0).ainvoke("你好")
+    got = m.summary()["by_model"]
+    assert set(got) == {PRICED + "-bare", "mock-wide"}, got
+    assert usage.UNKNOWN_MODEL not in got
+
+
+@pytest.mark.parametrize("build", ["openai", "anthropic", "mock"])
+def test_the_call_parameters_of_each_provider_kind_carry_the_configured_model(build):
+    """三种接入（OpenAI 兼容、Anthropic、演示模型）由 providers/factory 建出来的模型：LangChain 回调时给的调用参数和
+    ls_model_name（这里照它的写法直接取，不发请求）计量都认得出，记的就是接入里配的模型 id。"""
+    import uuid as _uuid
+    from types import SimpleNamespace
+
+    from langchain_core.outputs import LLMResult
+
+    from app.providers.factory import ModelSpec, build_chat_model
+
+    provider = SimpleNamespace(kind=build, name="虚构接入", api_key=None, base_url=None, extra={},
+                               default_model=None)
+    model_id = {"openai": "gpt-made-up", "anthropic": "claude-made-up", "mock": "mock-wide"}[build]
+    import os
+    env = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}.get(build)
+    old = os.environ.get(env) if env else None
+    if env:
+        os.environ[env] = "sk-made-up"
+    try:
+        model = build_chat_model(provider, ModelSpec(model=model_id))
+    finally:
+        if env:
+            if old is None:
+                os.environ.pop(env, None)
+            else:
+                os.environ[env] = old
+    m = usage.meter()
+    run_id = _uuid.uuid4()
+    m.on_chat_model_start({}, [], run_id=run_id, invocation_params=model._get_invocation_params(),
+                          metadata=dict(model._get_ls_params()))
+    m.on_llm_end(LLMResult(generations=[[ChatGeneration(message=AIMessage(content="好"))]]), run_id=run_id)
+    assert list(m.summary()["by_model"]) == [model_id]
+    # 调用参数里本身就带着（不靠 ls_model_name 兜着）
+    params = model._get_invocation_params()
+    assert model_id in (params.get("model"), params.get("model_name")), params
+
+
+async def test_the_eval_driver_on_the_demo_model_records_its_name(monkeypatch):
+    """评测作答走演示模型时，助手用量记在演示模型的名下，不是 unknown（下一轮验收：写作用量的模型对、助手的记成 unknown）。"""
+    import app.api.copilot as copilot
+    from app.eval import answer
+    from app.providers.mock_model import MockChatModel
+
+    async def _model(*_a, **_k):
+        return MockChatModel(model_name="mock-fast", latency=0), "mock-fast"
+
+    monkeypatch.setattr(copilot, "get_chat_model", _model)
+    driver = answer.Driver("按天看销售额", datasource_ids=[], ctx=answer.TurnContext(
+        suite_id="s", suite_name="虚构题集", eval_run_id="e", case_id=None, case_seq=1, actor=None))
+    ops, refused = await driver._generate("按天看销售额", None)
+    assert refused is None
+    driver._take(ops)
+    got = driver.turn.usage["assistant"]["by_model"]
+    assert set(got) == {"mock-fast"} and got["mock-fast"]["calls"] >= 1, got
+
+
 async def test_outside_the_meter_nothing_is_counted():
     m = usage.meter()
     with usage.metering(m):
