@@ -2311,7 +2311,7 @@ export const CATALOG_TEXT = {
   missing: '表结构中已没有这张表',
   noCatalog: '没有目录',
   usage: (n: number) => `使用 ${formatNumber(n)} 次`,
-  usageHint: '被运行查询过的次数，同一次运行中结果相同的重复查询只算一次',
+  usageHint: '按查询算：被运行查询过的次数，同一次运行里查了几次算几次（结果相同的重复查询只算一次）；「用过这张表的运行」按运行算，两个数可能不一样',
   relationCount: (n: number) => `${formatNumber(n)} 个关联`,
   countTitle: (label: string, n: number) => `${label} ${formatNumber(n)} 项`,
   noMatch: '没有符合条件的表',
