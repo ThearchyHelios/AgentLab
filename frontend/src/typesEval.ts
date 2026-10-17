@@ -393,11 +393,14 @@ export interface EvalSpend {
 export type EvalStatus = 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled' | 'interrupted'
 export type EvalTrigger = 'manual' | 'schedule' | 'pair'
 
+/** 一臂的计数（服务端 runner._counts）：done 是真的跑过的（评完、出错），not_run 是停止、中断、到了上限、止损没跑的，
+ * errors 是出错的（不含没跑的）；done + not_run + running + pending = total */
 export interface EvalCounts {
   total?: number
   done?: number
   running?: number
   pending?: number
+  not_run?: number
   passed?: number
   failed?: number
   ungradable?: number
@@ -428,7 +431,9 @@ export interface EvalSummary {
   done?: number
   cases?: number
   verdicts?: Partial<Record<EvalVerdict, number>>
+  /** 没跑的（停止、中断、到了上限、止损没开评）；出错的另在 errors */
   not_run?: number
+  errors?: number
   accuracy?: EvalRate
   traced_accuracy?: EvalRate
   outcomes?: Partial<Record<EvalOutcome, number>>

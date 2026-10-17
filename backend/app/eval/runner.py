@@ -708,20 +708,26 @@ class EvalExecution(runtime.JobRun):
                                   .execution_options(synchronize_session=False))
             await session.commit()
 
+        # 停止、中断是「停下」不是「出错」：原因记 stop_reason（error 留空）；整体出错记 error
+        stopped = status in ("cancelled", "interrupted")
         try:
             await self._write(write)
             if not self.arms:
                 async def bare(session: AsyncSession) -> None:
-                    await session.execute(update(EvalRun).where(
+                    ids = list((await session.execute(select(EvalRun.id).where(
                         (EvalRun.id == self.job_id) | (EvalRun.pair_id == self.job_id),
-                        EvalRun.status.in_(runtime.ACTIVE))
-                        .values(status=status, error=error, finished_at=utcnow())
-                        .execution_options(synchronize_session=False))
+                        EvalRun.status.in_(runtime.ACTIVE)))).scalars())
+                    await session.execute(update(EvalRun).where(EvalRun.id.in_(ids))
+                                          .values(status=status, error=None if stopped else error,
+                                                  stop_reason=error if stopped else None, finished_at=utcnow())
+                                          .execution_options(synchronize_session=False))
+                    for run_id in ids:
+                        await _recount(session, run_id)
                     await session.commit()
 
                 await self._write(bare)
                 return
-            await self._conclude(status, None, error)
+            await self._conclude(status, error if stopped else None, None if stopped else error)
         except Exception:  # noqa: BLE001
             logger.exception("评测 %s 收尾时写库出错", self.job_id)
 
@@ -793,16 +799,31 @@ def _sql_shapes(answer: Any) -> list[dict[str, Any]]:
     return out
 
 
+#: 逐项结束了、却没有跑出结果的状态：cancelled 停止、中断时还没评完的，skipped 到了金额上限、止损之后没开评的
+NOT_RUN_STATUSES = ("cancelled", "skipped")
+
+
 def _counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
-    out = {"total": len(rows), "done": 0, "running": 0, "pending": 0, "passed": 0, "failed": 0, "ungradable": 0,
-           "skipped": 0, "errors": 0}
+    """一臂的计数（EvalRun.counts）。几样各管各的，加起来不重：
+
+    - done：评完了的（ok、partial）和评的时候出错的（failed）——真的跑过的；running、pending 是还在评、还没轮到的；
+    - not_run：停止、中断时还没评完，到了上限、止损之后没开评的（NOT_RUN_STATUSES）。以前这些算进 done 和 errors，停下的
+      评测就成了 done = total、一堆「出错」，读起来像全评完了、出了很多错；
+    - errors：出错的（failed：题目没了、评的时候出了意外），不含没跑的；
+    - passed / failed / ungradable / skipped：评完了的按结论分（skipped 是评了、但期望算不出、不评分，不含没开评的）。
+
+    done + not_run + running + pending = total。"""
+    out = {"total": len(rows), "done": 0, "running": 0, "pending": 0, "not_run": 0, "passed": 0, "failed": 0,
+           "ungradable": 0, "skipped": 0, "errors": 0}
     for r in rows:
         status = r.get("status")
-        if status in runtime.TASK_DONE:
+        if status in NOT_RUN_STATUSES:
+            out["not_run"] += 1
+        elif status in runtime.TASK_DONE:
             out["done"] += 1
         elif status in ("running", "pending"):
             out[status] += 1
-        if status in ("failed", "cancelled"):
+        if status == "failed":
             out["errors"] += 1
         verdict = r.get("verdict")
         if verdict == "pass":
@@ -811,9 +832,19 @@ def _counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
             out["failed"] += 1
         elif verdict == "ungradable":
             out["ungradable"] += 1
-        elif verdict == "skipped" or status == "skipped":
+        elif verdict == "skipped":
             out["skipped"] += 1
     return out
+
+
+def _closing(run_id: str, reason: str) -> runtime.Finish:
+    """runtime.close_job / cancel_queued 的 finish：同一个事务里记停下的原因（停止、中断），按改好的逐项状态重算计数。"""
+    async def finish(session: AsyncSession) -> None:
+        await session.execute(update(EvalRun).where(EvalRun.id == run_id).values(stop_reason=reason)
+                              .execution_options(synchronize_session=False))
+        await _recount(session, run_id)
+
+    return finish
 
 
 async def _recount(session: AsyncSession, run_id: str) -> None:
@@ -910,16 +941,16 @@ async def reconcile_stale(session: AsyncSession, rows: Sequence[EvalRun]) -> Non
     """读接口当场整理：记着排队、进行中，这个进程里却没在跑（服务重启过）的，照实标中断。"""
     stale = [r for r in rows if r.status in runtime.ACTIVE and not running(r)]
     for row in stale:
-        await runtime.close_job(session, EvalRun, EvalResult, row.id, "interrupted", INTERRUPTED, "cancelled",
-                                INTERRUPTED)
+        await runtime.close_job(session, EvalRun, EvalResult, row.id, "interrupted", None, "cancelled",
+                                INTERRUPTED, finish=_closing(row.id, INTERRUPTED))
         await session.refresh(row)
 
 
 async def startup() -> int:
     """服务启动时：没结束的评测标中断（没结束的项记停止），不自动续跑。"""
     async def close(session: AsyncSession, job_id: str) -> None:
-        await runtime.close_job(session, EvalRun, EvalResult, job_id, "interrupted", INTERRUPTED, "cancelled",
-                                INTERRUPTED)
+        await runtime.close_job(session, EvalRun, EvalResult, job_id, "interrupted", None, "cancelled",
+                                INTERRUPTED, finish=_closing(job_id, INTERRUPTED))
 
     return await runtime.interrupt_on_startup(EvalRun, close, running=manager.running)
 
@@ -938,7 +969,8 @@ async def stop(run_id: str) -> bool:
             (EvalRun.id == leader) | (EvalRun.pair_id == leader)))).scalars())
         done = False
         for arm in arms:
-            done = await runtime.cancel_queued(session, EvalRun, EvalResult, arm) or done
+            done = await runtime.cancel_queued(session, EvalRun, EvalResult, arm,
+                                               finish=_closing(arm, STOPPED)) or done
         return done
 
 

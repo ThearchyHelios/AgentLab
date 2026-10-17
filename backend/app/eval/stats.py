@@ -1,8 +1,8 @@
 """评测的汇总与统计（细案 01 做法 11、12；评测-D10）。所有汇总都在后端算好，界面直接显示（界面层不放逻辑：同一个数不能
 有两套算法）。纯计算，输入是一次评测的逐题结果（EvalResult 的列，result_row 的形状）。
 
-- 准确率和可追溯准确率：分母是能判的题（通过 + 不通过）；不能评分、跳过的单列，既不算对也不算错，没开评、停下、出错的
-  另列 not_run。都带 Wilson 95% 区间和样本数——题集小、模型有随机性，差两三题就可能被读成「变好了」「变差了」（评测-D10：只展示、不卡门）。
+- 准确率和可追溯准确率：分母是能判的题（通过 + 不通过）；不能评分、跳过的单列，既不算对也不算错，没跑的（停止、中断、
+  到了上限、止损没开评）另列 not_run，出错的另列 errors。都带 Wilson 95% 区间和样本数——题集小、模型有随机性，差两三题就可能被读成「变好了」「变差了」（评测-D10：只展示、不卡门）。
 - 作答路径、出具档位（声明了出具的按 formal / degraded / withheld，没声明的单列「探索问答」）、复核结论（verdict × severity）
   和自动重来的次数、复核用时超过问数据页等待（25 秒）的题数。
 - 结论裁判（打开了才有）：supported / partial / contradicted / insufficient / 未判的句数；文字要点的判断单列。
@@ -79,7 +79,7 @@ def summarize(results: Sequence[Mapping[str, Any]], *, judge_on: bool = False) -
     from app.eval.score import SCORER_VERSION
 
     done = [r for r in results if r.get("status") in ("ok", "skipped", "failed", "cancelled", "partial")]
-    #: 评完了的（status=ok）；没开评、停下、出错的单列成 not_run
+    #: 评完了的（status=ok）；没跑的（停止、中断、到了上限、止损没开评）单列成 not_run，出错的单列成 errors（同 runner._counts）
     evaluated = [r for r in done if r.get("status") == "ok"]
     verdicts = Counter(r.get("verdict") or "none" for r in done)
     graded = [r for r in done if r.get("verdict") in ("pass", "fail")]
@@ -118,7 +118,8 @@ def summarize(results: Sequence[Mapping[str, Any]], *, judge_on: bool = False) -
         "items": len(results), "done": len(done),
         "cases": len({r.get("case_id") for r in results}),
         "verdicts": {k: verdicts.get(k, 0) for k in ("pass", "fail", "ungradable", "skipped")},
-        "not_run": len(done) - len(evaluated),
+        "not_run": sum(1 for r in done if r.get("status") in ("cancelled", "skipped")),
+        "errors": sum(1 for r in done if r.get("status") == "failed"),
         "accuracy": rate(len(passed), len(graded)),
         "traced_accuracy": rate(len(traced), len(graded)),
         "outcomes": dict(outcomes),

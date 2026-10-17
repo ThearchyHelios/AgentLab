@@ -221,7 +221,8 @@ function Overview({ run }: { run: EvalRun }) {
       </div>
       <Section title={O.verdicts} attr="verdicts">
         <p>{distText(s.verdicts as Record<string, number>, T.verdict)}</p>
-        {!!s.not_run && <p className="text-dim">{O.notRun(s.not_run)}</p>}
+        {!!s.not_run && <p className="text-dim" data-eval-not-run={s.not_run}>{O.notRun(s.not_run)}</p>}
+        {!!s.errors && <p className="text-dim" data-eval-errors={s.errors}>{O.errors(s.errors)}</p>}
         <p className="text-dim">{O.outcomes}：{distText(s.outcomes as Record<string, number>, T.outcome)}</p>
         {s.text && Object.keys(s.text).length > 0 && <p className="text-dim">{O.text}：{distText(s.text as Record<string, number>, T.textOutcome)}</p>}
       </Section>

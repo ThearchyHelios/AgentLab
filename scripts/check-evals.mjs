@@ -362,7 +362,11 @@ function reply(state, method, path, url, body) {
     }
     if (method === 'POST' && rest === '/stop') {
       write()
-      Object.assign(ev, { status: 'cancelled', running: false, current: [], stop_reason: null,
+      // 服务端（runner._counts、_close）：停下的原因记 stop_reason、不当成出错；没跑的题单独计 not_run，不进 errors，done 不等于 total
+      Object.assign(ev, { status: 'cancelled', running: false, current: [], stop_reason: '评测已停止', error: null,
+        counts: { total: 3, done: 1, not_run: 2, running: 0, pending: 0, passed: 1, failed: 0, ungradable: 0, skipped: 0, errors: 0 },
+        summary: { ...clone(SUMMARY), items: 3, done: 3, verdicts: { pass: 1, fail: 0, ungradable: 0, skipped: 0 }, not_run: 2, errors: 0,
+          accuracy: RATE(1, 1), traced_accuracy: RATE(1, 1) },
         actions: { stop: false, retry: true, rescore: true, pin: false, unpin: false, open: 2, cleaned: false } })
       return { json: ev }
     }
@@ -743,6 +747,11 @@ await section('评测详情：进度、正在做什么、停止和重试、重�
   await page.locator('[data-eval-retry]').waitFor()
   check('停止之后：服务端说能重试，给「重试没做完的」，悬停写几项', (await page.locator('[data-eval-retry]').getAttribute('title')).includes('2 项')
     && writes(state, /\/stop$/).length === 1)
+  check('……停下的原因照服务端写「评测已停止」，不当成出错；没评的 2 项单列，不算出错', await until(async () =>
+    (await page.locator('[data-eval-stop-reason]').count()) === 1)
+    && (await text(page, '[data-eval-stop-reason]')).includes('评测已停止') && await page.locator('[data-eval-error]').count() === 0
+    && (await text(page, '[data-eval-not-run]')).startsWith('2 项没评') && await page.locator('[data-eval-errors]').count() === 0,
+  await text(page, '[data-eval-run-head]'))
   await page.locator('[data-eval-retry]').click()
   await until(() => writes(state, /\/retry$/).length === 1)
   check('重试：发了一次', writes(state, /\/retry$/).length === 1)

@@ -22,8 +22,9 @@
   说明源上正有别的事，接口回 409；占到了，执行期间新建的任务排在它后面。**队里的事是开放的**：运行时不认具体哪几种，
   每种在自己的模块里 register_lane_kind 登记一次（kind → 叫法），进队时只核对登记过——第 2 波的后台探查（introspect）
   登记一行就排进同一条队，不用改这里；拼错的 kind 当场报错，不会悄悄排成一种谁都不认识的事。
-- **close_job / interrupt_on_startup**：收尾（还没结束的表记成某个状态，任务记成某个状态），和服务启动时的整理：排队、
-  进行中的标 interrupted，没结束的表记 cancelled。**不自动续跑**：复制出来的数据目录（检查脚本、验收副本）启动时不能
+- **close_job / interrupt_on_startup**：收尾（还没结束的表记成某个状态，任务记成某个状态；可选的 finish 在同一个事务里
+  补一步，评测拿它按改好的逐项状态重算计数、记停下的原因），和服务启动时的整理：排队、进行中的标 interrupted，没结束的
+  表记 cancelled。**不自动续跑**：复制出来的数据目录（检查脚本、验收副本）启动时不能
   自己去调模型、查业务库，界面让人点「重试」接着做。
 
 进程内登记、进程内的队：服务端是单进程部署，多进程部署时要换成库里的锁。
@@ -243,9 +244,16 @@ lanes = SourceLanes()
 # ==========================================================================
 
 
+#: 收尾时在同一个事务里补写的那一步（close_job、cancel_queued 的 finish）：表和任务的状态已经改好、还没提交
+Finish = Callable[[AsyncSession], Awaitable[None]]
+
+
 async def close_job(session: AsyncSession, job_model: Any, task_model: Any, job_id: str, job_status: str,
-                    job_error: str | None, task_status: str, task_error: str | None) -> None:
-    """收尾：还没结束的表记 task_status（原因 task_error），任务（还没结束的话）记 job_status。提交。"""
+                    job_error: str | None, task_status: str, task_error: str | None, *,
+                    finish: Finish | None = None) -> None:
+    """收尾：还没结束的表记 task_status（原因 task_error），任务（还没结束的话）记 job_status。提交。
+
+    finish：提交前在同一个事务里再做的一步（评测按改好的逐项状态重算计数、记停下的原因）。起草、剖析、探查不传，照旧。"""
     now = utcnow()
     await session.execute(
         update(task_model).where(task_model.job_id == job_id, task_model.status.in_(OPEN))
@@ -253,12 +261,15 @@ async def close_job(session: AsyncSession, job_model: Any, task_model: Any, job_
     await session.execute(
         update(job_model).where(job_model.id == job_id, job_model.status.in_(ACTIVE))
         .values(status=job_status, error=job_error, finished_at=now).execution_options(synchronize_session=False))
+    if finish is not None:
+        await finish(session)
     await session.commit()
 
 
-async def cancel_queued(session: AsyncSession, job_model: Any, task_model: Any, job_id: str) -> bool:
+async def cancel_queued(session: AsyncSession, job_model: Any, task_model: Any, job_id: str, *,
+                        finish: Finish | None = None) -> bool:
     """停止一个排队中的任务：任务和没结束的表直接记 cancelled。已经被后台认领（开始了）返回 False，交给调用方按进行中
-    的停。"""
+    的停。finish 同 close_job（只在真停了时做）。"""
     now = utcnow()
     claimed = await session.execute(
         update(job_model).where(job_model.id == job_id, job_model.status == "queued")
@@ -269,6 +280,8 @@ async def cancel_queued(session: AsyncSession, job_model: Any, task_model: Any, 
     await session.execute(
         update(task_model).where(task_model.job_id == job_id, task_model.status.in_(OPEN))
         .values(status="cancelled", finished_at=now).execution_options(synchronize_session=False))
+    if finish is not None:
+        await finish(session)
     await session.commit()
     return True
 

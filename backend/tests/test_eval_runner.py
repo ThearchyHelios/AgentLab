@@ -146,10 +146,14 @@ async def test_stop_then_retry_only_the_unfinished(monkeypatch):
     await asyncio.sleep(0.1)
     assert await runner.stop(run.id)
     row = await get(run.id)
-    assert row.status == "cancelled" and row.error == runner.STOPPED
+    # 停止是「停下」不是「出错」：原因记在 stop_reason；没跑的题单独计 not_run，不算进 errors，done 不再等于 total
+    assert row.status == "cancelled" and row.stop_reason == runner.STOPPED and row.error is None
     before = {r.id: (r.status, r.finished_at) for r in await results(run.id)}
     done = [rid for rid, (status, _) in before.items() if status == "ok"]
     assert done and any(status == "cancelled" for status, _ in before.values())
+    assert row.counts["errors"] == 0 and row.counts["done"] == len(done)
+    assert row.counts["not_run"] == 4 - len(done) and row.counts["done"] + row.counts["not_run"] == row.counts["total"]
+    assert row.summary["not_run"] == 4 - len(done) and row.summary["errors"] == 0
     assert not await runner.stop(run.id), "已经结束的停不了"
 
     stub(monkeypatch, delay=0.01)
@@ -175,10 +179,23 @@ async def test_a_restart_marks_unfinished_evaluations_interrupted_and_does_not_r
         run_id = row.id
     assert await runner.startup() >= 1
     row = await get(run_id)
-    assert row.status == "interrupted" and row.error == runner.INTERRUPTED
+    assert row.status == "interrupted" and row.stop_reason == runner.INTERRUPTED and row.error is None
+    assert row.counts["not_run"] == 1 and row.counts["running"] == 0 and row.counts["errors"] == 0, row.counts
     [item] = await results(run_id)
     assert item.status == "cancelled"
     assert not runner.manager.running(run_id), "不自动续跑"
+
+
+async def test_stopping_a_queued_evaluation_counts_everything_as_not_run(monkeypatch):
+    """排队中就停掉（还没开始）：每一题都没跑，stop_reason 写停止，计数跟着重算（以前还是建的时候那份：pending 照旧）。"""
+    stub(monkeypatch)
+    suite_id = await es.make_suite("none", cases=ask_cases(2))
+    monkeypatch.setattr(runner.manager, "start", lambda *_a, **_k: None)  # 不让它开跑：停在排队
+    [run] = await start(suite_id)
+    assert await runner.stop(run.id)
+    row = await get(run.id)
+    assert row.status == "cancelled" and row.stop_reason == runner.STOPPED
+    assert (row.counts["not_run"], row.counts["pending"], row.counts["done"]) == (2, 0, 0), row.counts
 
 
 async def test_the_per_run_cap_stops_new_items(monkeypatch):
@@ -190,6 +207,8 @@ async def test_the_per_run_cap_stops_new_items(monkeypatch):
     items = await results(run.id)
     assert [r.status for r in items] == ["ok", "ok", "skipped"]
     assert row.status == "partial" and row.stop_reason == runner.LIMIT_RUN.format(limit=1.5)
+    assert (row.counts["done"], row.counts["not_run"], row.counts["errors"], row.counts["skipped"]) == (2, 1, 0, 0), \
+        "到了上限没开评的是没跑，不是跳过（跳过是评了、但期望算不出、不评分）"
     assert "金额上限" in items[2].error and row.summary["cost_usd"] == 2.0
 
 
