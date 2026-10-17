@@ -2171,6 +2171,19 @@ export interface EvidenceInput {
    * 不进 masked：面板底下「这些列设置了遮罩」不把它们算进去
    */
   mask_unverified?: string
+  /**
+   * via 为 metric、转抄另一张口径卡的指标（nodes.<卡>.metrics[i].value）时，运行时跨卡往下追的出处：那个指标的 id、那张卡的
+   * 指标集工件、转抄了几层、那个指标的输入是不是都追到了原始数据（服务端 engine/lineage.metric_copy）。老运行、别的输入没有
+   */
+  upstream?: EvidenceUpstreamRef | null
+}
+
+/** 转抄的输入跨卡往下追的出处（EvidenceInput.upstream） */
+export interface EvidenceUpstreamRef {
+  metric?: string
+  artifact?: string | null
+  depth?: number
+  traced?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -2319,6 +2332,14 @@ export interface EvidenceUntraced {
 
 export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   step: string
+  /**
+   * upstream：转抄另一张口径卡的指标时跨卡接上的那一步（api/evidence._upstream_steps）。of 是接在哪个输入后面（输入的路径），
+   * label 是那张卡在图里的名字，traced 是那个指标的输入都追到了原始数据，depth 是转抄了几层
+   */
+  of?: string
+  label?: string | null
+  traced?: boolean
+  depth?: number
   metric?: string
   decimals?: number | null
   format?: string

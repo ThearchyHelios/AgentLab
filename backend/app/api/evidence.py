@@ -789,8 +789,7 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
     chain = await _chain(seg, doc, sealed, chosen.node_id)
     covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
     # 遮罩列：查询步骤里遮着的，加上指标步骤里取自遮罩列的输入（按位置取的那一格可能没有对应的查询步骤）
-    masked = list(dict.fromkeys(c for step in chain if step.get("step") in ("query", "input")
-                                for c in step.get("masked") or []))
+    masked = _chain_masked(chain)
     verdict = _effective_verdicts(chosen, sealed)[0].get(str(unit.get("id")))
     challenged = _challenge_of(sealed, chosen, str(unit.get("id")))
     # 口径账本（next-round 02 做法 3）：这个数来自哪一份口径。比对在封存之后做、不在封存范围内，标签里写明；没比对过的运行
@@ -823,6 +822,14 @@ async def evidence_segment(run_id: str, segment_id: str, report: str | None = No
 METRIC_NOT_FOUND = "evidence_metric_not_found"
 
 
+def _chain_masked(chain: list[dict[str, Any]]) -> list[str]:
+    """出处链里遮着的列：查询步骤里遮着的，指标步骤里取自遮罩列的输入（按位置取的那一格可能没有对应的查询步骤），转抄的
+    上游指标那几步的输入（跨卡往下追的，见 _upstream_steps）。"""
+    steps = [*chain, *(i for step in chain if step.get("step") == "upstream" for i in step.get("inputs") or [])]
+    return list(dict.fromkeys(c for step in steps if step.get("step") in ("query", "input")
+                              for c in step.get("masked") or []))
+
+
 @router.get("/{run_id}/evidence/metrics/{node}/{metric}")
 async def evidence_metric(run_id: str, node: str, metric: str) -> dict[str, Any]:
     """点开应用页上的一个指标（应用平台 §3.6）：指标 → 输入 → 查询快照的出处链，和报告片段的指标链同一套（_metric_chain）。
@@ -847,8 +854,7 @@ async def evidence_metric(run_id: str, node: str, metric: str) -> dict[str, Any]
     chain = await _metric_chain({"text": shown}, {"kind": "metric", "locator": {"metric": metric}, "eid": eid},
                                 entry, {"catalog": {}}, sealed, masks)
     covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
-    masked = list(dict.fromkeys(c for step in chain if step.get("step") in ("query", "input")
-                                for c in step.get("masked") or []))
+    masked = _chain_masked(chain)
     return {"run_id": run_id, "node": node, "metric": metric, "rendered": shown, "eid": eid, "chain": chain,
             "seal": {"sealed": sealed.sealed, "ok": sealed.seal["ok"], "covered": covered},
             "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []}}
@@ -992,6 +998,8 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         if (found := held.get(str(item.get("path")))) is not None:
             one = _withheld(one, found)
         inputs.append(one)
+    # 转抄另一张口径卡的指标（对账卡、召回卡的「口径」那一项）：跨卡往下追，接上那个指标自己的一段出处，一直到查询格子
+    upstream = await _upstream_steps(metric or {}, sealed, masks, catalog, wanted, {(artifact, str(metric_id))})
     if withheld := {path: _held_word(found) for path, found in held.items() if found.kind != "table"}:
         # 代入式里那几处同样写「已遮罩」（遮没遮核对不了的写「无法核对」）：不然标签里遮着、代入式里亮着，同一个值换个
         # 地方照样看得到。整份结果当输入的不换：代入式里本来就只留着它的路径
@@ -1002,7 +1010,77 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         # 目录、正文里本来就是「已遮罩」。文档记着不给、这里却认不出的（数据源事后撤了遮罩），照文档不给
         step["value"] = word or MASKED
     queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
-    return [step, *inputs, *queries]
+    return [step, *inputs, *upstream, *queries]
+
+
+async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Masks", catalog: dict[str, Any],
+                          wanted: dict[str, list[tuple[Any, Any]]], seen: set[tuple[str, str]],
+                          depth: int = 1) -> list[dict[str, Any]]:
+    """指标的输入里转抄另一张口径卡的指标的（nodes.<卡>.metrics[i].value，卡上记着 upstream），每个接一步 upstream：那张
+    卡的那个指标（名字、值、式子、代入式、核对状态，取值按同一套遮罩），它自己的输入（同指标步骤的输入；落在查询快照上的
+    并进 wanted，后面照常给查询步骤），追没追到原始数据。转抄的转抄一层层接着追（防环：同一个指标只接一次；最多
+    MAX_COPY_DEPTH 层）。of 是这一步接在哪个输入后面（输入的路径）。"""
+    from app.engine.lineage import MAX_COPY_DEPTH, SNAPSHOT_VIAS
+
+    out: list[dict[str, Any]] = []
+    if depth > MAX_COPY_DEPTH:
+        return out
+    for item in metric.get("inputs") or []:
+        up = item.get("upstream") if isinstance(item, dict) and item.get("via") == "metric" else None
+        if not isinstance(up, dict) or not up.get("artifact"):
+            continue
+        artifact, metric_id = str(up["artifact"]), str(up.get("metric") or "")
+        if (artifact, metric_id) in seen:
+            continue
+        seen.add((artifact, metric_id))
+        node = str(item.get("node_id") or "")
+        card, hash_ok = _load_card(artifact)
+        found = _metric_in(card, metric_id)
+        step: dict[str, Any] = {
+            "step": "upstream", "of": item.get("path"), "node_id": node or None,
+            "label": _node_label(sealed, node) if node else None, "artifact": artifact, "metric": metric_id,
+            "traced": up.get("traced") is True, "depth": depth, "hash_ok": hash_ok and found is not None,
+            "sealed": sealed.trusted and (node, artifact) in sealed.ledger,
+        }
+        if found is None:
+            out.append(step)
+            continue
+        held, word = await _metric_masks(found, node, artifact, sealed, masks, card=card)
+        try:
+            rendered = word or render_metric(found)
+        except RenderError:
+            rendered = MISSING
+        step.update({
+            "name": found.get("name") or metric_id, "value": word if word is not None else found.get("value"),
+            "unit": found.get("unit") or "", "rendered": rendered, "caliber": (card or {}).get("caliber"),
+            "version": (card or {}).get("caliber_version"), "source": await _caliber_source((card or {}).get("source")),
+            "expression": found.get("expression"), "substituted": found.get("substituted"),
+            "recompute_ok": found.get("recompute_ok"), "status": found.get("status"),
+            **({"incomplete": True, "incomplete_reason": found.get("incomplete_reason") or ""}
+               if found.get("incomplete") else {}),
+            **({"sql_check_failed": True, "sql_check_reason": found.get("sql_check_reason") or ""}
+               if found.get("sql_check_failed") else {}),
+            "untraced": _untraced_steps(found, sealed),
+        })
+        if withheld := {path: _held_word(h) for path, h in held.items() if h.kind != "table"}:
+            step["substituted"] = recompute.substituted_without(found, withheld)
+        inputs: list[dict[str, Any]] = []
+        for sub in found.get("inputs") or []:
+            if not isinstance(sub, dict):
+                continue
+            one = {"step": "input", **sub}
+            if sub.get("artifact") and sub.get("via") in SNAPSHOT_VIAS:
+                one["query"] = _query_alias(catalog, sub["artifact"])
+                if cell := _input_cell(sub, catalog):
+                    one["cell"] = cell
+                wanted.setdefault(str(sub["artifact"]), []).extend(_located(sub.get("locator") or {}))
+            if (h := held.get(str(sub.get("path")))) is not None:
+                one = _withheld(one, h)
+            inputs.append(one)
+        step["inputs"] = inputs
+        out.append(step)
+        out += await _upstream_steps(found, sealed, masks, catalog, wanted, seen, depth + 1)
+    return out
 
 
 def _node_label(sealed: _Sealed, node_id: Any) -> str:

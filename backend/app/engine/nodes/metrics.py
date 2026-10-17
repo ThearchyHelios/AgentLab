@@ -132,12 +132,18 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         decimals = display["decimals"]
         value = round_metric(value, decimals)
         substituted = substitute(tree, values)
-        incomplete: dict[str, Any] = {}
-        if use.sources:
-            sources = list(use.sources.values())
-            incomplete = {"incomplete": True, "incomplete_reason": _incomplete_reason(sources),
-                          "truncated_sources": sources}
         inputs = [_input_of(path, values[path], state, ctx, tctx) for path in paths]
+        # 转抄另一张口径卡的指标：那个指标不完整、所依据的查询没通过 SQL 检查的，这一个照样不完整、存疑（出处是跨卡追下去
+        # 的，判档也按追到底的结果，见 engine/lineage.metric_copy）
+        carried = [m for item in inputs if (m := _copied_metric(item, tctx)) is not None]
+        truncated = list(use.sources.values())
+        for source in (s for m in carried if m.get("incomplete") for s in m.get("truncated_sources") or []):
+            if isinstance(source, dict) and source not in truncated:
+                truncated.append(source)
+        incomplete: dict[str, Any] = {}
+        if truncated:
+            incomplete = {"incomplete": True, "incomplete_reason": _incomplete_reason(truncated),
+                          "truncated_sources": truncated}
         for path, item in zip(paths, inputs):
             # 容器型的 vars.* 输入（列表、字典）另存一份完整值：卡里只记了「[12 项]」这样的大概，事后推演
             # （engine/recompute.py）要拿完整的值重算。nodes.*、input.* 的完整值在那个节点封存的产出工件里，
@@ -146,7 +152,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             if _container_var(path, values[path]) and (stored := await _store_value(path, values[path], ctx)):
                 item["value_artifact"] = stored
         sql_check: dict[str, Any] = {}
-        if failed := _failed_queries(inputs, list(use.sources.values()), paths, tctx, checked):
+        copied_checks = [str(c.get("artifact")) for m in carried for c in m.get("sql_check_sources") or []
+                         if isinstance(c, dict) and c.get("artifact")]
+        if failed := _failed_queries(inputs, truncated, paths, tctx, checked, extra=copied_checks):
             sql_check = {"sql_check_failed": True, "sql_check_reason": _sql_check_reason(failed),
                          "sql_check_sources": [{"artifact": artifact, "codes": list(dict.fromkeys(
                              code for p in found for code in p.codes))} for artifact, found in failed]}
@@ -456,18 +464,20 @@ _LAST_STEP = re.compile(r"(?:\.[^.\[\]]+|\[[^\[\]]*\])$")
 
 
 def _failed_queries(inputs: list[dict[str, Any]], truncated: list[dict[str, Any]], paths: list[str],
-                    tctx: dict[str, Any], checked: dict[str, list[QueryProblem]],
-                    ) -> list[tuple[str, list[QueryProblem]]]:
+                    tctx: dict[str, Any], checked: dict[str, list[QueryProblem]], *,
+                    extra: list[str] | tuple[str, ...] = ()) -> list[tuple[str, list[QueryProblem]]]:
     """这个指标用到的查询里，SQL 检查有 error 的：[(查询快照工件 id, 没通过检查的查询)]。合并查询的快照对应它出问题的
     那几个输入（sql_problems.query_problems）。
 
-    用到了哪些查询，三处来历合起来认：输入的出处（cell() 取的格、Agent 经 cite_fields 交来的字段都带着快照 id）、
+    用到了哪些查询，四处来历合起来认：输入的出处（cell() 取的格、Agent 经 cite_fields 交来的字段都带着快照 id）、
     截断跟踪记下的整组、取值链上的查询结果本身（数据整形解析过的 vars.res.rows[0][0]，往上找到 vars.res 那份
-    带 artifact 的结果）。检查结果从快照里读，不信内存里那份：快照按哈希寻址，就是查询当时存下的那份。
+    带 artifact 的结果），以及 extra：转抄的指标所依据、没通过检查的那几条（跨卡追下去的）。检查结果从快照里读，不信内存里那份：快照按哈希寻址，就是查询当时存下的那份。
     读不出来的快照不算（另有别的检查报快照的问题）。Agent 没开 cite_fields 时说不清数出自哪次查询，不算。
     """
     artifacts = [item.get("artifact") for item in inputs] + [s.get("artifact") for s in truncated]
     artifacts += [_result_artifact(path, tctx) for path in paths if cell_parts(path) is None]
+    # 转抄的指标所依据、没通过检查的查询（extra，跨卡追下去的那几条）
+    artifacts += list(extra)
     out = []
     for artifact in dict.fromkeys(a for a in artifacts if isinstance(a, str) and a):
         if artifact not in checked:
@@ -646,11 +656,55 @@ def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,
         # 沙箱算出来的数喂给口径卡：记下它自认是「取数」还是「计算」，治理规则按它判
         entry["role"] = str(producer.config.get("evidence_role") or "compute")
     entry["status"] = "ok" if value is not None else "missing"
+    if producer is not None and str(producer.type) == "metrics" and (up := _upstream(path, tctx or template_context(state))):
+        entry["upstream"] = up
     if producer is not None and str(producer.type) == "agent" and field:
         cited = _agent_field(state, producer.id, root if head else "", field)
         if cited is not None:
             entry.update(cited)
     return entry
+
+
+def _copied_card(path: str, tctx: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """转抄另一张口径卡一个指标的输入（engine/lineage.metric_copy 认的写法）：(那张卡这一次的产出, 那个指标)。不是这种
+    写法、产出不是指标集、下标越界的为 None。"""
+    from app.engine.lineage import metric_copy
+
+    found = metric_copy(path)
+    if found is None:
+        return None
+    root, name, index = found
+    card = _value_of(f"{root}.{name}", tctx)
+    metrics = card.get("metrics") if isinstance(card, dict) and card.get("kind") == "metric_set" else None
+    if not isinstance(metrics, list) or index >= len(metrics) or not isinstance(metrics[index], dict):
+        return None
+    return card, metrics[index]
+
+
+def _upstream(path: str, tctx: dict[str, Any]) -> dict[str, Any] | None:
+    """转抄另一张口径卡的指标时，跨卡往下追的出处：{node_id?, metric, artifact, depth, traced}。那张卡的指标集落了工件、
+    那个指标的输入都追到了原始数据（engine/lineage.untraced 为空；它自己转抄的再往下一层层追过了，记在它的输入上）、
+    层数没超过 MAX_COPY_DEPTH，才算追到。不是转抄指标的为 None（照旧停在那张卡）。"""
+    from app.engine.lineage import MAX_COPY_DEPTH, untraced
+
+    found = _copied_card(path, tctx)
+    if found is None:
+        return None
+    card, metric = found
+    inputs = [i for i in metric.get("inputs") or [] if isinstance(i, dict)]
+    depth = 1 + max([int((i.get("upstream") or {}).get("depth") or 0) for i in inputs
+                     if isinstance(i.get("upstream"), dict)] or [0])
+    artifact = card.get("artifact") if isinstance(card.get("artifact"), str) else None
+    return {"metric": metric.get("id"), "artifact": artifact, "depth": depth,
+            "traced": bool(artifact) and depth <= MAX_COPY_DEPTH and not untraced(inputs)}
+
+
+def _copied_metric(item: dict[str, Any], tctx: dict[str, Any]) -> dict[str, Any] | None:
+    """卡上的一个输入转抄了另一张口径卡的哪个指标（这一次的产出里那一项）；不是转抄的为 None。"""
+    if item.get("via") != "metric" or not isinstance(item.get("upstream"), dict):
+        return None
+    found = _copied_card(str(item.get("path") or ""), tctx)
+    return found[1] if found is not None else None
 
 
 def _field_key(field: str) -> str:

@@ -313,6 +313,15 @@ export const EVIDENCE_TEXT = {
   originChipHint: '这个数由口径卡确定性算出、复算一致，但算式用到的输入没有一路追到查询快照',
   /** 按位置取的格穿过了原样解析查询结果的整形节点 */
   through: (label: string) => `经「${label}」原样解析`,
+  /**
+   * 转抄另一张口径卡的指标（对账卡、召回卡的「口径」那一项）：出处跨卡往下追，接上那个指标自己的一段，一直到查询格子
+   */
+  upstream: '转抄的口径卡指标',
+  upstreamFrom: (card: string, metric: string) => `取自口径卡「${card}」的指标「${metric}」`,
+  gotoUpstream: (card: string) => `查看口径卡「${card}」的这个指标`,
+  upstreamTraced: '取自另一张口径卡的指标，那个指标的输入都追到了原始数据',
+  upstreamStop: '取自另一张口径卡的指标，那个指标的输入没有都追到原始数据',
+  upstreamUnreadable: '读不到那张口径卡的指标集（文件缺失或与哈希不一致），这一步不能作为证据',
   input: '运行输入',
   seal: '封存',
   sealOk: '已封存 · 核对一致',
