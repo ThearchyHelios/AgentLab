@@ -41,7 +41,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data import catalog
+from app.data import catalog, source_objects
 from app.db.models import Run
 
 #: 队列的筛选：全部、影响数字的项、名称和说明
@@ -346,7 +346,7 @@ async def review_batch(session: AsyncSession, source: Any, items: Iterable[Batch
         key = known[item.table_name]
         if key is None:
             results[i] = _result(item, ok=False, code=CODE_TABLE_MISSING,
-                                 error=f"数据源中没有表 {item.table_name}，可能已被删除或尚未探查结构")
+                                 error=await source_objects.absent_message(session, source, item.table_name))
             continue
         groups.setdefault(key, []).append(i)
     at = catalog.now_iso()

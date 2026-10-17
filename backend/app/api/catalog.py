@@ -226,12 +226,19 @@ async def _detail(session: AsyncSession, source: Any, table: str, entry: catalog
 
 
 async def _table_key(session: AsyncSession, source: Any, table: str) -> tuple[str, catalog.CatalogEntry | None]:
-    """路径里的表名 → 目录的键。表结构里有的按表结构的写法；表结构里没有、但还留着目录的也认（便于清理）。"""
+    """路径里的表名 → 目录的键。表结构里有的按表结构的写法；表结构里没有、但还留着目录的也认（便于清理）。都没有时 404，
+    说清是哪一种「不在」（_missing）。"""
     key = catalog.resolve_table_name(source.schema_cache, table)
     entry = await catalog.read_entry(session, source.id, key or table)
     if key is None and entry is None:
-        raise HTTPException(404, f"数据源中没有表 {table}，可能已被删除或尚未探查结构")
+        raise await _missing(session, source, table)
     return key or table, entry
+
+
+async def _missing(session: AsyncSession, source: Any, table: str) -> HTTPException:
+    """表结构里没有这张表的 404：表已不在、数据源里没有、在探查范围外、读不到结构、说不清，和 /schema、/catalog/search、
+    目录清单的 absent_reason 同一套（source_objects.absent_message）。"""
+    return HTTPException(404, await source_objects.absent_message(session, source, table))
 
 
 def _conflict(e: catalog.CatalogConflict) -> HTTPException:
@@ -906,7 +913,7 @@ async def catalog_table_assistant(source_id: str, table: str, payload: Assistant
     row, source = await _resolved(session, source_id)
     key = catalog.resolve_table_name(source.schema_cache, table)
     if key is None:
-        raise HTTPException(404, f"数据源中没有表 {table}，可能已被删除或尚未探查结构")
+        raise await _missing(session, source, table)
     messages = [m.model_dump() for m in payload.messages]
     if problem := catalog_assistant.conversation_problem(messages):
         raise HTTPException(422, problem)

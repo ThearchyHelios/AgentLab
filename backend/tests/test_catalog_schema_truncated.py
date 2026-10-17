@@ -157,3 +157,24 @@ def test_legacy_truncated_cache_still_does_not_deny():
                                                        "truncated": True, "total": 205})
     text = describe_table(row, "t300")
     assert "中没有" not in text and "只探查了" in text and "information_schema" in text
+
+
+async def test_catalog_detail_of_an_out_of_scope_table_says_so(client, wide):
+    """对象索引里有、在探查范围外的表：GET /catalog/{表} 的 404 说「在探查范围外」，和 /schema、/catalog/search 同一套「不在」
+    （下一轮验收：以前说「可能已被删除或尚未探查结构」）；表助手、批量审阅的同一个错误也一样。对象索引里也没有的说「没有
+    这张表」。"""
+    sid, _ = wide
+    r = await client.get(f"/api/datasources/{sid}/catalog/t200")
+    assert r.status_code == 404 and "探查范围外" in r.json()["detail"], r.text
+    assert "可能已被删除" not in r.json()["detail"]
+    found = (await client.get(f"/api/datasources/{sid}/catalog/search", params={"q": "t200"})).json()["items"]
+    assert [i["absent_reason"] for i in found if i["name"] == "t200"] in (["out_of_scope"], [None]), found
+    r = await client.post(f"/api/datasources/{sid}/catalog/t201/assistant", json={"messages": [
+        {"role": "user", "content": "这张表是干什么的"}]})
+    assert r.status_code == 404 and "探查范围外" in r.json()["detail"], r.text
+    r = await client.post(f"/api/datasources/{sid}/catalog/review/batch", json={"items": [
+        {"table_name": "t202", "path": "label", "action": "confirm", "if_version": 0}]})
+    [result] = r.json()["results"]
+    assert result["ok"] is False and "探查范围外" in result["error"], result
+    r = await client.get(f"/api/datasources/{sid}/catalog/no_such_table")
+    assert r.status_code == 404 and "没有表 no_such_table" in r.json()["detail"] and "探查范围外" not in r.json()["detail"]
