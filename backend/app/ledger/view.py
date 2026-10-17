@@ -88,6 +88,9 @@ def _query_view(query: dict[str, Any], hider: _Hide, names: dict[str, str]) -> d
             item["how"] = cand["how"]
         if cand.get("columns") is not None:
             item["columns"] = cand["columns"]
+        if isinstance(cand.get("projection"), dict):
+            # 按引用的列投影之后比的（ledger/match 的 _projected）：两边各留下了哪几列、去掉了几列（列名，不带值）
+            item["projection"] = cand["projection"]
         cands.append(item)
     out["candidates"] = cands
     return out

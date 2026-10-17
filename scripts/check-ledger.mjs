@@ -8,6 +8,8 @@
 //   - 口径对账：核对参数（推断的参数要先核对）→ 发起（认不出列怎么配时照 409 带回的选项选对照的指标，再发起）→ 结果卡片：
 //     这次 / 口径 / 差值 / 相对差四个数各自取值、点开是出处链；请求体逐项核对；做完的卡片上问「差在哪」的说明有没有帮助
 //     （说明有用 / 看不懂，统计 E2）：请求体只有 verdict，选过的按下、写各几个人，能改主意；没做完的不问；
+//   - 「按口径」那个数转抄口径卡的指标：出处链跨卡接上口径卡那个指标的一步，输入来源里点一下跳到那一步，那一步的输入
+//     点一下跳到口径的取数查询；
 //   - 可沉淀的问题：工作流列表弹窗里的抽屉，三类来源分开写；「固化成口径草稿」走 from-run 的 freeze（带同组的别的运行）、
 //     打开画布；聚类按人挑的那一轮固化；「不是口径」要写理由；
 //   - 使用者看到的入口照服务端的动作：不能出具的写原因（请搭建者出具）、不摆出具按钮，能对账的照样对账；出具过的正式运行
@@ -22,7 +24,7 @@
 import { readFileSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 import {
-  ISSUE, QUEUE, RECONCILE, RECONCILE_VALUES, WHOLE, WHOLE_LABELS, ledgerOf, metricDetail, reconciledOf,
+  ISSUE, QUEUE, RECONCILE, RECONCILE_VALUES, WHOLE, WHOLE_LABELS, copiedMetricDetail, ledgerOf, metricDetail, reconciledOf,
 } from './ledger-fixtures.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -275,6 +277,52 @@ await section('口径对账：核对参数 → 发起 → 选对照的指标 →
   const drawer = page.locator('[data-evidence-panel="side"]').last()
   const opened = await until(async () => (await drawer.innerText().catch(() => '')).includes('差值'), 5000)
   check('点差值：打开它的出处链（同应用页点数）', opened, (await drawer.innerText().catch(() => '')).slice(0, 80))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+// ---------------------------------------------------------------- 「按口径」那个数的出处跨卡追到取数查询
+
+await section('对账结果里「按口径」那个数：出处跨卡追到口径的取数查询', async () => {
+  const extra = (method, p) => {
+    const m = p.match(/^\/runs\/run-rec-1\/evidence\/metrics\/reconcile\/([^/]+)$/)
+    if (method === 'GET' && m) {
+      return { json: m[1] === 'cal_0' ? copiedMetricDetail('run-rec-1', m[1]) : metricDetail('run-rec-1', m[1]) }
+    }
+    return null
+  }
+  const { page, errors } = await open('/ui-harness.html?evidence=1', {
+    reply: evidenceReply(() => ledgerOf(RUN, { reconciled: [reconciledOf('succeeded')] }), extra) })
+  await page.waitForSelector('#evidence-wide [data-seg="s8"]', { timeout: 10000 })
+  await openSeg(page, 's8')
+  const card = page.locator('[data-evidence-panel] [data-ledger-reconciled="run-rec-1"]')
+  await card.waitFor({ timeout: 6000 })
+  await until(async () => (await card.innerText()).includes(RECONCILE_VALUES.cal_0), 5000)
+  await card.locator('[data-ledger-value="cal_0"]').click()
+  const drawer = page.locator('[data-evidence-panel="side"]').last()
+  const up = drawer.locator('[data-ev-upstream="card"]')
+  const shown = await up.waitFor({ timeout: 5000 }).then(() => true, () => false)
+  const upText = shown ? (await up.innerText()).replace(/\s+/g, ' ') : ''
+  check('点「按口径」：出处链接上口径卡的那个指标（转抄的口径卡指标）', shown && upText.includes('转抄的口径卡指标')
+    && upText.includes('取自口径卡「口径卡」的指标「订单数」') && upText.includes('1,180单'), upText)
+  check('……写那个指标的原式、它的输入追到了原始数据', upText.includes("cell(nodes.fetch, 0, 'orders')")
+    && await up.locator('[data-ev-upstream-origin="traced"]').count() === 1, upText)
+  check('指标这一步：输入都追到了原始数据，不挂「未追到原始数据」', await drawer.locator('[data-ev-untraced-chip]').count() === 0
+    && await drawer.locator('[data-ev-metric] [data-ev-origin="traced"]').count() === 1)
+  const src = drawer.locator('[data-ev-source="nodes.card.metrics[0].value"]')
+  const srcText = await src.innerText().catch(() => '')
+  check('输入来源：转抄的那一项说清取自另一张口径卡、那个指标的输入都追到了原始数据',
+    srcText.includes('取自另一张口径卡的指标，那个指标的输入都追到了原始数据')
+    && srcText.includes('查看口径卡「口径卡」的这个指标'), srcText)
+  await src.locator('[data-ev-goto]').click()
+  const focused = await until(() => page.evaluate(() => document.activeElement?.hasAttribute('data-ev-upstream-head') === true), 3000)
+  check('点「查看口径卡「口径卡」的这个指标」：焦点落到那一步、描一下边', focused
+    && await up.getAttribute('data-flash') === 'focus')
+  await up.locator(`[data-ev-input="cell(nodes.fetch, 0, 'orders')"]`).click()
+  const query = drawer.locator('[data-ev-query="q-cal-fetch"]')
+  const jumped = await until(async () => await query.getAttribute('data-flash') === 'focus', 3000)
+  check('那个指标的输入点一下：跳到口径的取数查询（SQL、被引用的那一格都在）', jumped
+    && (await query.innerText()).includes('SELECT COUNT(*) AS orders FROM orders')
+    && await query.locator('td[data-highlight="cell"]').count() === 1)
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 })
 

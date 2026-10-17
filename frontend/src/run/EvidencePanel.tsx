@@ -365,7 +365,25 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
     head.scrollIntoView({ block: 'nearest' })
     flashOnce(part)
   }, [panelId])
-  const linkOf = (inp: EvidenceInput) => {
+  // 转抄另一张口径卡的指标（对账卡、召回卡的「口径」那一项）：服务端跨卡接上的那几步，输入点一下跳到对应的那一步
+  const upstreams = chain.filter((s) => s.step === 'upstream')
+  const upstreamId = (i: number) => `${panelId}-u${i}`
+  const jumpToUpstream = useCallback((i: number) => {
+    const part = document.getElementById(`${panelId}-u${i}`)
+    const head = part?.querySelector<HTMLElement>('[data-ev-upstream-head]')
+    if (!part || !head) return
+    head.focus({ preventScroll: true })
+    head.scrollIntoView({ block: 'nearest' })
+    flashOnce(part)
+  }, [panelId])
+  /** depth：这个输入在第几层（指标自己的输入是 1，转抄的那一步里的输入是那一步的 depth + 1） */
+  const linkOf = (inp: EvidenceInput, depth = 1): InputLink => {
+    const u = inp.via === 'metric' && inp.upstream
+      ? upstreams.findIndex((s) => s.of === inp.path && (s.depth ?? 1) === depth) : -1
+    if (u >= 0) {
+      const card = host.nodeLabel?.(upstreams[u].node_id ?? '') || upstreams[u].label || upstreams[u].node_id || ''
+      return { index: u, alias: card, text: EVIDENCE_TEXT.gotoUpstream(card), go: () => jumpToUpstream(u) }
+    }
     const i = queryOf(inp, queries)
     return i >= 0 ? { index: i, alias: queries[i].alias ?? '', go: () => jumpTo(i) } : undefined
   }
@@ -492,8 +510,13 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
       )}
 
       {isMetric && inputs.some(notableInput) && (
-        <SourcesPart inputs={inputs.filter(notableInput)} linkOf={linkOf} />
+        <SourcesPart inputs={inputs.filter(notableInput)} linkOf={(inp) => linkOf(inp)} />
       )}
+
+      {isMetric && upstreams.map((u, i) => (
+        <UpstreamPart key={`${u.artifact ?? ''}-${u.metric ?? ''}-${i}`} id={upstreamId(i)} step={u} seal={seal}
+                      linkOf={(inp) => linkOf(inp, (u.depth ?? 1) + 1)} />
+      ))}
 
       {isInput && !isMetric && (
         <Part title={EVIDENCE_TEXT.input} data-ev-input-step="">
@@ -983,7 +1006,8 @@ function askError(error: unknown): string {
   return JUDGE_TEXT.failed(humanizeError(error).title)
 }
 
-type InputLink = { index: number; alias: string; go: () => void } | undefined
+/** 输入点一下跳到哪：查询步骤（alias 是查询编号），或者转抄的那一步（text 是按钮上的字，alias 是那张卡的名字） */
+type InputLink = { index: number; alias: string; go: () => void; text?: string } | undefined
 
 /**
  * 面板里提到的节点。画布右栏里是按钮：点一下在画布上选中并对准它（画布上已经没有这个节点
@@ -1557,8 +1581,8 @@ function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) 
       {link ? (
         <button type="button" className="chip mono tnum max-w-full transition-colors hover:bg-hover" style={style}
                 data-ev-input={input.path ?? ''} data-ev-input-masked={masked ? '' : undefined}
-                title={`${from ? `${from} · ` : ''}${EVIDENCE_TEXT.gotoQuery(link.alias)}`}
-                aria-label={`${shown} ← ${input.path ?? NONE}，${EVIDENCE_TEXT.gotoQuery(link.alias)}`}
+                title={`${from ? `${from} · ` : ''}${link.text ?? EVIDENCE_TEXT.gotoQuery(link.alias)}`}
+                aria-label={`${shown} ← ${input.path ?? NONE}，${link.text ?? EVIDENCE_TEXT.gotoQuery(link.alias)}`}
                 onClick={link.go}>
           {body}<CornerDownRight size={9} className="shrink-0 opacity-60" aria-hidden />
         </button>
@@ -1592,6 +1616,86 @@ const TONE: Record<SourceTone, { color: string; border: string; background?: str
 }
 
 /**
+ * 转抄的口径卡指标（对账卡、召回卡的「口径」那一项）：服务端跨卡接上的一步——那张卡的那个指标、它的值、原式和代入式，
+ * 它自己的输入（点一下跳到口径的取数查询，或者再下一层转抄的那一步），追没追到原始数据。跨卡怎么追是服务端定的
+ * （api/evidence._upstream_steps），这里只照着画
+ */
+function UpstreamPart({ id, step, seal, linkOf }: {
+  id: string; step: EvidenceStep; seal?: EvidenceSeal; linkOf: (input: EvidenceInput) => InputLink
+}) {
+  const host = useEvidenceHost()
+  const card = host.nodeLabel?.(step.node_id ?? '') || step.label || step.node_id || NONE
+  const inputs = (step.inputs ?? []).filter((i) => i && typeof i === 'object')
+  const unreadable = step.hash_ok === false || step.name == null
+  const untraced = Array.isArray(step.untraced) ? step.untraced.filter((u) => u && typeof u === 'object') : null
+  const stopAt = (u: EvidenceUntraced) => (u.node_id
+    ? EVIDENCE_TEXT.originStop(u.path,
+      EVIDENCE_TEXT.originNode(host.nodeLabel?.(u.node_id) || u.label || u.node_id, u.type ? nodeTypeLabel(u.type) : ''))
+    : EVIDENCE_TEXT.originUnknown(u.path))
+  return (
+    <div id={id} data-ev-upstream={step.node_id ?? ''} data-ev-upstream-metric={step.metric ?? ''}
+         className="rounded data-[flash]:outline data-[flash]:outline-solid data-[flash]:outline-2 data-[flash]:outline-offset-2 data-[flash=focus]:outline-[color:var(--accent)]">
+      <div className="mb-1 text-2xs font-medium text-faint">{EVIDENCE_TEXT.upstream}</div>
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span tabIndex={-1} data-ev-upstream-head=""
+              className="rounded-sm font-medium focus:outline-none focus-visible:outline focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)]">
+          {EVIDENCE_TEXT.upstreamFrom(card, step.name || step.metric || NONE)}
+        </span>
+        {!unreadable && step.rendered && <span className="mono tnum text-sm" data-ev-upstream-value="">{step.rendered}</span>}
+        {step.incomplete && (
+          <span className="chip" title={step.incomplete_reason || EVIDENCE_TEXT.incompleteFallback}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>{EVIDENCE_TEXT.incomplete}</span>
+        )}
+        {step.sql_check_failed && (
+          <span className="chip" title={step.sql_check_reason || EVIDENCE_TEXT.sqlCheckFallback}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>{EVIDENCE_TEXT.sqlCheckFailed}</span>
+        )}
+        {host.onNode && <NodeChip id={step.node_id} />}
+      </div>
+      <Integrity step={step} seal={seal} />
+      {unreadable ? (
+        <p className="mt-1" style={{ color: 'var(--st-failed)' }} data-ev-upstream-unreadable="">
+          {EVIDENCE_TEXT.upstreamUnreadable}
+        </p>
+      ) : (
+        <dl className="mt-2 space-y-1.5">
+          <div>
+            <dt className="text-2xs text-faint">{EVIDENCE_TEXT.expression}</dt>
+            <dd><code className="mono block whitespace-pre-wrap break-all rounded bg-bg px-1.5 py-1 text-2xs">
+              {step.expression || NONE}
+            </code></dd>
+          </div>
+          <div>
+            <dt className="text-2xs text-faint">{EVIDENCE_TEXT.substituted}</dt>
+            <dd>
+              <code className="mono block whitespace-pre-wrap break-all rounded bg-bg px-1.5 py-1 text-2xs">
+                {step.substituted || NONE}
+              </code>
+              {!!inputs.length && (
+                <ul className="mt-1 flex flex-wrap gap-1" aria-label={EVIDENCE_TEXT.inputs} data-ev-upstream-inputs="">
+                  {inputs.map((inp, i) => <InputChip key={`${inp.path}-${i}`} input={inp} link={linkOf(inp)} />)}
+                </ul>
+              )}
+            </dd>
+          </div>
+          {untraced && (
+            <div>
+              <dt className="text-2xs text-faint">{EVIDENCE_TEXT.origin}</dt>
+              <dd data-ev-upstream-origin={untraced.length ? 'untraced' : 'traced'}
+                  style={{ color: untraced.length ? 'var(--st-waiting)' : 'var(--st-done)' }}>
+                {untraced.length ? (
+                  <ul className="space-y-0.5">{untraced.map((u, i) => <li key={`${u.path}-${i}`}>{stopAt(u)}</li>)}</ul>
+                ) : EVIDENCE_TEXT.originTraced}
+              </dd>
+            </div>
+          )}
+        </dl>
+      )}
+    </div>
+  )
+}
+
+/**
  * 输入来源：每个能核对到快照的输入（agent 字段、cell() 取数）、代码节点的输入、缺的输入各一行——
  * 路径、从哪个节点哪一格来、核对结果。能对到查询步骤的给「看查询 Qn」
  */
@@ -1606,7 +1710,8 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
           const link = linkOf(inp)
           // 查询编号写报告目录里的全局编号（接口补的 query、对上的查询步骤）；agent 字段自己的 ref 是
           // 那个节点内部的编号，和面板里的「查询 Qn」不是一回事，不拿来写
-          const alias = link?.alias || inp.query || (typeof inp.cell === 'string' ? inp.cell.split('.')[0] : '')
+          const alias = (link && !link.text ? link.alias : '') || inp.query
+            || (typeof inp.cell === 'string' ? inp.cell.split('.')[0] : '')
           const where = [
             inp.field && (inp.via === 'agent_field' ? `字段 ${inp.field}` : inp.field),
             throughText(inp, host.nodeLabel),
@@ -1621,7 +1726,7 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
                 <span className="mono min-w-0 flex-1 truncate" title={inp.path}>{inp.path ?? NONE}</span>
                 {link && (
                   <button type="button" className="btn btn-xs btn-ghost -mr-1 shrink-0" onClick={link.go} data-ev-goto="">
-                    <CornerDownRight size={10} aria-hidden /> {EVIDENCE_TEXT.gotoQuery(link.alias)}
+                    <CornerDownRight size={10} aria-hidden /> {link.text ?? EVIDENCE_TEXT.gotoQuery(link.alias)}
                   </button>
                 )}
               </div>

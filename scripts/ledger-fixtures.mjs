@@ -112,6 +112,31 @@ export const metricDetail = (runId, metric) => ({
   seal: { sealed: true, ok: true, covered: true }, redacted: { columns: [] },
 })
 
+/**
+ * 对账卡上「按口径」那个数的出处（服务端 api/evidence._upstream_steps 的形状）：它转抄口径卡的指标
+ * （nodes.card.metrics[0].value），出处跨卡接上口径卡「订单数」那一步，再到口径的取数查询（q-cal-fetch）
+ */
+export const copiedMetricDetail = (runId, metric) => ({
+  run_id: runId, node: 'reconcile', metric, rendered: RECONCILE_VALUES[metric] ?? '—', eid: `ev:metric:${metric}`,
+  chain: [
+    { step: 'metric', alias: 'm', metric, name: '订单数 · 口径', value: 1180, rendered: RECONCILE_VALUES[metric], node_id: 'reconcile',
+      caliber: '口径对账', version: 'v1', expression: 'nodes.card.metrics[0].value', substituted: '1180', recompute_ok: true,
+      sealed: true, hash_ok: true, untraced: [],
+      inputs: [{ path: 'nodes.card.metrics[0].value', value: 1180, node_id: 'card', via: 'metric', field: 'metrics[0].value',
+                 status: 'ok', upstream: { metric: 'orders', artifact: 'ms-card', depth: 1, traced: true } }] },
+    { step: 'upstream', of: 'nodes.card.metrics[0].value', node_id: 'card', label: '口径卡', artifact: 'ms-card', metric: 'orders',
+      traced: true, depth: 1, hash_ok: true, sealed: true, name: '订单数', value: 1180, unit: '单', rendered: '1,180单',
+      caliber: '订单口径', version: 'v1', expression: "cell(nodes.fetch, 0, 'orders')", substituted: '1180', recompute_ok: true,
+      status: 'ok', untraced: [],
+      inputs: [{ step: 'input', path: "cell(nodes.fetch, 0, 'orders')", value: 1180, node_id: 'fetch', via: 'tool_cell',
+                 status: 'verified', artifact: 'q-cal-fetch', locator: { row: 0, column: 'orders' }, eid: 'ev:cell:q-cal-fetch' }] },
+    { step: 'query', alias: null, artifact: 'q-cal-fetch', node_id: 'fetch', tool: 'db_query__shop', source: 'shop',
+      sql: "SELECT COUNT(*) AS orders FROM orders WHERE status = 'paid'", columns: ['orders'], rows: [[1180]], row_offset: 0,
+      row_index: [0], total_rows: 1, highlight: { rows: [0], cols: ['orders'], cells: [[0, 'orders']] }, sealed: true, hash_ok: true },
+  ],
+  seal: { sealed: true, ok: true, covered: true }, redacted: { columns: [] },
+})
+
 /** 认证队列：三类来源各一项 */
 export const QUEUE = {
   items: [

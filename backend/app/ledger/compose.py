@@ -47,8 +47,11 @@ _NUMBER = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*$")
 #: 写给模型的拒收说明（也上界面：过程里那一行）
 NOT_LISTED = "只能选用这一轮查看到的已发布口径：「{workflow}」v{version} 不在里面（口径要先 look，版本以查看结果为准）"
 WRONG_VERSION = "「{workflow}」这一轮能选用的是 v{latest}（最新的已发布版本），不是 v{version}"
-CARD_UNKNOWN = "「{workflow}」v{version} 里没有口径卡「{card}」（有：{cards}）"
-CARD_AMBIGUOUS = "「{workflow}」v{version} 有几张口径卡（{cards}），请在 card 里写选用哪一张"
+#: card 写错时交回的原因要能一次改对：说清 card 填什么、可填哪几个（节点 id）；写成了自己起的 id 的另说一句
+CARD_UNKNOWN = ("「{workflow}」v{version} 里没有口径卡「{card}」：card 要填那一版工作流图里口径卡的节点 id，可填的有 {cards}"
+                "（照抄查看结果里 use_caliber 写法中的 card）")
+CARD_IS_OP_ID = "；「{card}」是你给这次选用起的 id，不是口径卡的节点 id"
+CARD_AMBIGUOUS = "「{workflow}」v{version} 有几张口径卡（节点 id：{cards}），请在 card 里写选用哪一张的节点 id"
 NOT_COMPOSABLE = "「{workflow}」v{version} 的口径卡「{card}」不能组合：{reason}"
 BAD_ID = "use_caliber 的 id 要写成简短的英文小写加下划线（例如 c1），它就是口径卡的节点 id，当前为「{id}」"
 ID_TAKEN = "use_caliber 的 id「{id}」和图里已有的节点「{node}」撞了，请换一个"
@@ -233,12 +236,14 @@ class Composer:
         if str(version) != str(latest):
             raise ComposeRefused(WRONG_VERSION.format(workflow=name, latest=latest, version=version))
         card = str(op.get("card") or "").strip()
-        listed = [f"{o.card}（{o.node_id}）" for o in cards]
+        listed = [f"「{o.node_id}」（口径卡「{o.card}」）" for o in cards]
         if card:
             hit = next((o for o in cards if card in (o.node_id, o.card)), None)
             if hit is None:
-                raise ComposeRefused(CARD_UNKNOWN.format(workflow=name, version=latest, card=card,
-                                                         cards=_names(listed)))
+                why = CARD_UNKNOWN.format(workflow=name, version=latest, card=card, cards=_names(listed))
+                if card == str(op.get("id") or "").strip():
+                    why += CARD_IS_OP_ID.format(card=card)
+                raise ComposeRefused(why)
             return hit
         if len(cards) > 1:
             raise ComposeRefused(CARD_AMBIGUOUS.format(workflow=name, version=latest, cards=_names(listed)))
