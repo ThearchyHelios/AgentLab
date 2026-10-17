@@ -441,7 +441,9 @@ export const EVAL_TEXT = {
     timing: { build_ms: '建图', run_wall_ms: '运行（墙钟）', run_active_ms: '运行（执行）', review_ms: '复核', total_ms: '整题' } as Record<string, string>,
     usage: '按角色的用量',
     tokens: (input: string, output: string) => `输入 ${input} · 输出 ${output}`,
-    callsN: (n: number) => `${formatNumber(n)} 次调用`,
+    /** unfinished：没做完的调用（被取消、超时，token 只计了已报的；服务端 providers/usage 的 unfinished_calls） */
+    callsN: (n: number, unfinished = 0) =>
+      `${formatNumber(n)} 次调用${unfinished > 0 ? `（其中 ${formatNumber(unfinished)} 次未完成：被取消或超时，token 只计了已报的部分）` : ''}`,
     role: { assistant: '助手', writer: '写作', judge: '结论裁判', gold: '算期望' } as Record<string, string>,
     passRates: '重复评的题的通过率',
     outcomes: '各期望的结论',

@@ -278,7 +278,7 @@ function Overview({ run }: { run: EvalRun }) {
                 <li key={role} data-eval-usage-role={role}>
                   {O.role[role]}：{usageCost(u)}
                   {u.input_tokens != null && <span className="text-faint"> · {O.tokens(formatTokens(u.input_tokens, { compact: true }), formatTokens(u.output_tokens ?? 0, { compact: true }))}</span>}
-                  {u.calls != null && <span className="text-faint"> · {O.callsN(u.calls)}</span>}
+                  {u.calls != null && <span className="text-faint"> · {O.callsN(u.calls, u.unfinished_calls ?? 0)}</span>}
                 </li>
               )
             })}

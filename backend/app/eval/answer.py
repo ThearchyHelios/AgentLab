@@ -107,19 +107,21 @@ class Turn:
                 "timings": dict(self.timings), "own_models": list(self.own_models)}
 
 
+#: 用量汇总里相加的计数（providers/usage 的 summary）：unfinished_calls 是没做完的调用（被取消、超时，token 只计了已报的）
+_COUNTED = ("input_tokens", "output_tokens", "calls", "unpriced_calls", "unfinished_calls")
+
+
 def _add_usage(into: dict[str, Any] | None, more: Mapping[str, Any] | None) -> dict[str, Any]:
     """两份 providers/usage 汇总相加（by_model 逐个模型加）。"""
-    out = copy.deepcopy(into) if into else {"by_model": {}, "input_tokens": 0, "output_tokens": 0, "calls": 0,
-                                             "cost_usd": 0.0, "unpriced_calls": 0}
+    out = copy.deepcopy(into) if into else {"by_model": {}, **dict.fromkeys(_COUNTED, 0), "cost_usd": 0.0}
     if not more:
         return out
-    for key in ("input_tokens", "output_tokens", "calls", "unpriced_calls"):
+    for key in _COUNTED:
         out[key] = int(out.get(key) or 0) + int(more.get(key) or 0)
     out["cost_usd"] = round(float(out.get("cost_usd") or 0) + float(more.get("cost_usd") or 0), 6)
     for model, row in (more.get("by_model") or {}).items():
-        mine = out["by_model"].setdefault(model, {"input_tokens": 0, "output_tokens": 0, "calls": 0, "cost_usd": 0.0,
-                                                  "unpriced_calls": 0})
-        for key in ("input_tokens", "output_tokens", "calls", "unpriced_calls"):
+        mine = out["by_model"].setdefault(model, {**dict.fromkeys(_COUNTED, 0), "cost_usd": 0.0})
+        for key in _COUNTED:
             mine[key] = int(mine.get(key) or 0) + int(row.get(key) or 0)
         mine["cost_usd"] = round(float(mine.get("cost_usd") or 0) + float(row.get("cost_usd") or 0), 6)
     return out

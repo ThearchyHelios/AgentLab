@@ -415,7 +415,10 @@ export interface EvalUsage {
   calls?: number
   cost_usd?: number | null
   unpriced_calls?: number
-  by_model?: Record<string, { input_tokens: number; output_tokens: number; calls: number; cost_usd: number; unpriced_calls: number }>
+  /** 没做完的调用（被取消、超时）：算在 calls 里，token 只计了已报的 */
+  unfinished_calls?: number
+  by_model?: Record<string, { input_tokens: number; output_tokens: number; calls: number; cost_usd: number; unpriced_calls: number
+    unfinished_calls?: number }>
 }
 
 export interface EvalTiming {

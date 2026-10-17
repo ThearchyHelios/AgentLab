@@ -174,6 +174,8 @@ export interface UsageTotal {
   cost_usd?: number | null
   unpriced_calls?: number
   calls?: number
+  /** 没做完的调用（被取消、超时）：算在 calls 里，token 只计了已报的（服务端 providers/usage 的 unfinished_calls） */
+  unfinished_calls?: number
   input_tokens?: number
   output_tokens?: number
 }
@@ -498,7 +500,7 @@ function buildMeta(t: ChatTurn): TurnMeta {
   }
 }
 
-const USAGE_KEYS = ['cost_usd', 'unpriced_calls', 'calls', 'input_tokens', 'output_tokens'] as const
+const USAGE_KEYS = ['cost_usd', 'unpriced_calls', 'calls', 'unfinished_calls', 'input_tokens', 'output_tokens'] as const
 
 /** 两份用量相加（缺的当 0）。b 不是对象时原样交回 a */
 export function addUsage(a: UsageTotal | undefined, b: UsageTotal | null | undefined): UsageTotal | undefined {
