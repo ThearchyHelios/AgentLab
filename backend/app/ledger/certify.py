@@ -11,7 +11,9 @@
   位置（按规范形里的先后对齐）是参数候选，不变的是口径常量。展示的是代表那条的规范文本（字面量都换成了「?」，不带取值）。
   这一项的 id 按（数据源、规范形）算；以前按规范文本记的「不是口径」照样认（组里任何一条的规范文本对得上就算）；
 - 问题聚类（cluster）：app/chat/questions 全站唯一的聚类（只取问题原文、不含 history、排除系统派生的运行），≥ REPEAT_RUNS
-  个问题的类；
+  个问题的类。这一项的 id 是类的 id（成员的稳定 id 排好取哈希：同一批问题两次读取一样）；「不是口径」记下当时的成员，之后
+  这一类过半的成员是那时记下的就照样不进队（来了几句新问法 id 会变，按成员认就不失效）。以前按种子问题原文算的 id 记的
+  照样认，记的成员读不懂的照实忽略；
 - 被反复用的答案（reused）：导出过 ≥ 2 次（report.exported 审计，第 2 波）、做成过应用（蓝图的来源是这次运行）、在画布里
   打开过或提取过（工作流的 origin.run_id 是这次运行）的轮次。
 每项给代表问题、轮次链接、（shape 的）SQL 形状和参数候选、有没有相关口径（可以对账的那份）、是不是已经固化过（frozen_into，
@@ -241,6 +243,27 @@ async def _dismissed(session: Any) -> set[str]:
         AuditEvent.action == DISMISS_ACTION, AuditEvent.subject_kind == SUBJECT_KIND))).all() if sid}
 
 
+async def _dismissed_members(session: Any) -> list[set[str]]:
+    """问题聚类上点过「不是口径」时记下的成员（每条一组稳定 id）。老记录没记成员、记的读不懂（不是字符串列表）的不算。"""
+    from app.db.models import AuditEvent
+
+    out: list[set[str]] = []
+    for (data,) in (await session.execute(select(AuditEvent.data).where(
+            AuditEvent.action == DISMISS_ACTION, AuditEvent.subject_kind == SUBJECT_KIND))).all():
+        members = data.get("members") if isinstance(data, dict) else None
+        if isinstance(members, list) and members and all(isinstance(m, str) and m for m in members):
+            out.append(set(members))
+    return out
+
+
+def _cluster_dismissed(cluster: Any, dismissed: set[str], members: list[set[str]]) -> bool:
+    """这一类点过「不是口径」没有：类的 id 记过；以前按种子问题原文算的 id 记过；或者过半的成员是某一次记下的。"""
+    if f"cluster:{cluster.id}" in dismissed or item_id("cluster", " ".join(cluster.members[0].text.split())) in dismissed:
+        return True
+    keys = set(cluster.keys)
+    return any(len(keys & seen) * 2 > len(keys) for seen in members)
+
+
 async def _frozen(session: Any) -> dict[str, list[dict[str, Any]]]:
     """来源运行 → 从它固化出的工作流 [{workflow_id, name, status, published_version}]（origin.sources）。"""
     from app.db.models import Workflow
@@ -279,6 +302,7 @@ async def queue(session: Any, *, principal: Any) -> dict[str, Any]:
     from app.ledger import store
 
     dismissed = await _dismissed(session)
+    dismissed_members = await _dismissed_members(session)
     frozen = await _frozen(session)
     kinds = {name: kind for name, kind in (await session.execute(select(DataSource.name, DataSource.kind))).all()}
     runs = list((await session.execute(select(Run).where(
@@ -360,8 +384,8 @@ async def queue(session: Any, *, principal: Any) -> dict[str, Any]:
         if cluster.count < REPEAT_RUNS:
             continue
         seed = cluster.members[0]
-        iid = item_id("cluster", " ".join(seed.text.split()))
-        if iid in dismissed:
+        iid = f"cluster:{cluster.id}"
+        if _cluster_dismissed(cluster, dismissed, dismissed_members):
             continue
         items.append({"id": iid, "kind": "cluster", "question": seed.text, "count": cluster.count,
                       "turns": [{"run_id": q.run_id, "turn_id": q.turn_id, "question": q.text}
@@ -415,12 +439,25 @@ async def _reused(session: Any, runs: list[Run], turns: dict[str, dict[str, Any]
     return out
 
 
-async def dismiss(session: Any, iid: str, *, kind: str | None = None, note: str | None = None) -> None:
-    """「不是口径」：写一条审计，之后这一项不再进队。"""
+async def dismiss(session: Any, iid: str, *, kind: str | None = None, note: str | None = None,
+                  principal: Any = None) -> None:
+    """「不是口径」：写一条审计，之后这一项不再进队。问题聚类另记下这一类现在的成员（服务端按同一批问题重新聚一次找到
+    这一类，不收客户端传的成员；找不到——这会儿问题又多了、聚出来的已经不是这一类——就只记 id，照实）。"""
     from app.auth.audit import record
 
+    members: list[str] = []
+    if principal is not None and (kind == "cluster" or iid.startswith("cluster:")):
+        from app.chat.questions import cluster_questions, recent_questions
+
+        try:
+            questions = await recent_questions(session, principal, limit=QUESTION_LIMIT)
+            found = next((c for c in await cluster_questions(questions) if f"cluster:{c.id}" == iid), None) \
+                if questions else None
+            members = found.keys if found is not None else []
+        except Exception:  # noqa: BLE001 - 取向量出错：只记 id，「不是口径」照样记上
+            logger.exception("「不是口径」时重新聚类出错，只按 id 记")
     await record(session, DISMISS_ACTION, SUBJECT_KIND, iid,
-                 data={k: v for k, v in {"kind": kind, "note": note}.items() if v})
+                 data={k: v for k, v in {"kind": kind, "note": note, "members": members}.items() if v})
     await session.commit()
 
 

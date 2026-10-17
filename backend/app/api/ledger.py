@@ -249,7 +249,10 @@ async def certify_dismiss(payload: DismissIn, session: AsyncSession = Depends(ge
     """「不是口径」：记一条审计（ledger.certify.dismiss），这一项之后不再进队。"""
     from app.ledger import certify
 
+    from app.api.deps import current_principal
+
     if payload.kind is not None and payload.kind not in certify.KINDS:
         raise HTTPException(422, "可沉淀的问题只有三种：确定性重复、问题聚类、被反复用的答案")
-    await certify.dismiss(session, payload.item_id, kind=payload.kind, note=payload.note)
+    await certify.dismiss(session, payload.item_id, kind=payload.kind, note=payload.note,
+                          principal=current_principal())
     return {"ok": True, "item_id": payload.item_id}

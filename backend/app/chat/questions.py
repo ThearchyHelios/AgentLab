@@ -18,6 +18,12 @@
 聚类用 memory/embeddings 的向量贪心聚：按时间从新到旧，和某一类的种子足够像就并进去，否则自立一类。本地向量是词频
 哈希、语义能力弱，结果是下限——调用方据 embedder 照实写明用的是哪个向量模型。
 
+**类的 id 由成员定。** 每个问题有稳定的 id（Question.key：问数据是那一轮，别的探索运行是那次运行），一类的 id
+（QuestionCluster.id）是成员的 id 排好之后取的哈希：同一批问题两次读取，类的 id 一样。以前按种子问题的原文算，种子是一类里
+最新的那一句，同一批问题时间相同的几句先后不定、来了一句新的问法种子就换了，「不是口径」按 id 记就失效了。同一时刻问的
+几句按 id 排出先后（recent_questions），不靠库里读出来的先后。来了新成员 id 照样会变：认证队列按成员记「不是口径」
+（ledger/certify），不只按 id。
+
 **向量只取一次。** 同一批问题会被聚很多遍：评测页「口径命中与重复度」一次打开，/api/evals/signals 按窗口调 compute_stats
 （缺省 6 个窗口，每个都聚一次），页面另调 /api/ledger/stats；认证队列、治理页的探索问题聚类也各聚一遍。配了远程向量模型时
 每聚一遍都把几百句问题重新发一次，页面慢、还花钱。所以问题原文 → 向量在进程里留一份（_vectors：最多 VECTOR_CACHE_MAX 句，
@@ -28,6 +34,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import weakref
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -55,6 +62,16 @@ class Question:
     workflow: str | None = None
     origin: str | None = None
 
+    @property
+    def key(self) -> str:
+        """稳定的 id：问数据的那一轮（turn:…），别的探索运行是那次运行（run:…）；两样都没有的按原文和时间。"""
+        if self.turn_id:
+            return f"turn:{self.turn_id}"
+        if self.run_id:
+            return f"run:{self.run_id}"
+        stamp = self.at.isoformat() if self.at is not None else ""
+        return "text:" + hashlib.sha256(f"{self.text}\n{stamp}".encode()).hexdigest()[:16]
+
 
 @dataclass
 class QuestionCluster:
@@ -65,6 +82,16 @@ class QuestionCluster:
     @property
     def count(self) -> int:
         return len(self.members)
+
+    @property
+    def keys(self) -> list[str]:
+        """成员的稳定 id，排好的。"""
+        return sorted(q.key for q in self.members)
+
+    @property
+    def id(self) -> str:
+        """类的 id：成员的稳定 id 排好之后取哈希（见模块说明）。同一批问题两次读取一样。"""
+        return hashlib.sha256("\n".join(self.keys).encode()).hexdigest()[:16]
 
 
 async def recent_questions(session: AsyncSession, principal: Any, *, limit: int) -> list[Question]:
@@ -94,7 +121,8 @@ async def recent_questions(session: AsyncSession, principal: Any, *, limit: int)
         text = (payload or {}).get("question") if isinstance(payload, dict) else None
         if isinstance(text, str) and text.strip():
             out.append(Question(text=text.strip(), at=at, run_id=run_id, workflow=workflow, origin=origin))
-    out.sort(key=lambda q: q.at.timestamp() if q.at is not None else 0.0, reverse=True)
+    # 同一时刻问的几句按稳定的 id 排：库里读出来的先后不定，种子、聚类的结果就跟着变（见模块说明）
+    out.sort(key=lambda q: (q.at.timestamp() if q.at is not None else 0.0, q.key), reverse=True)
     return out[:limit]
 
 

@@ -347,3 +347,78 @@ async def test_a_not_a_caliber_recorded_by_the_old_text_id_still_counts(client, 
     res = await client.post("/api/ledger/certify-queue/dismiss", json={"item_id": old, "kind": "shape"})
     assert res.status_code == 200
     assert shape_items((await client.get("/api/ledger/certify-queue")).json()) == []
+
+
+# --------------------------------------------------------------------------
+# 问题聚类的 id 由成员定；「不是口径」按成员记
+# --------------------------------------------------------------------------
+
+
+async def test_cluster_ids_come_from_the_members_and_do_not_change_between_reads():
+    from datetime import datetime, timezone
+
+    from app.chat.questions import Question, QuestionCluster, cluster_questions
+
+    at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    # 同一时刻问的三句（时间相同，库里读出来的先后不定）：两次读出来先后不同，种子就不同，类的 id 仍然一样
+    texts = ["仓库乙本月出库多少件", "仓库乙本月出库多少件？", "仓库乙本月出库了多少件"]
+    questions = [Question(text=t, at=at, turn_id=f"t-{i}") for i, t in enumerate(texts)]
+    first = await cluster_questions(questions)
+    again = await cluster_questions(list(reversed(questions)))
+    assert len(first) == 1 and len(again) == 1 and first[0].members[0].text != again[0].members[0].text
+    assert [c.id for c in first] == [c.id for c in again]
+    assert first[0].keys == ["turn:t-0", "turn:t-1", "turn:t-2"]
+    assert QuestionCluster(members=list(reversed(questions))).id == first[0].id
+    # 成员不同，id 就不同
+    assert QuestionCluster(members=questions[:2]).id != first[0].id
+
+
+async def test_not_a_caliber_on_a_cluster_survives_a_new_member_and_old_records_still_count(client, monkeypatch):
+    import uuid
+
+    from app.auth.audit import record
+
+    text = f"仓库甲本周入库了多少件（{uuid.uuid4().hex[:6]}）"
+    a, b = await conversation(), await conversation()
+    asked = {(await ask(monkeypatch, conv, weekly(*WEEKS[0]), question=text)).id for conv in (a, a, b)}
+
+    async def mine() -> list[dict]:
+        body = (await client.get("/api/ledger/certify-queue")).json()
+        return [i for i in body["items"] if i["kind"] == "cluster" and asked & {t["run_id"] for t in i["turns"]}]
+
+    [item] = await mine()
+    [again] = await mine()
+    assert item["id"] == again["id"], "同一批问题两次读取，类的 id 一样"
+    # 读不懂的老记录照实忽略：不报错、不把这一类藏起来
+    async with SessionLocal() as session:
+        await record(session, certify.DISMISS_ACTION, certify.SUBJECT_KIND, "cluster:0000000000000000",
+                     data={"kind": "cluster", "members": "看不懂"})
+        await session.commit()
+    assert [i["id"] for i in await mine()] == [item["id"]]
+
+    res = await client.post("/api/ledger/certify-queue/dismiss", json={"item_id": item["id"], "kind": "cluster"})
+    assert res.status_code == 200
+    assert await mine() == []
+    # 再换个说法问一句：成员多了一个、种子换成了新的这句，类的 id 变了；过半的成员是点「不是口径」时记下的，照样不进队
+    newer = await ask(monkeypatch, b, weekly(*WEEKS[1]), question=text + "？")
+    asked.add(newer.id)
+    assert await mine() == []
+
+
+async def test_a_not_a_caliber_recorded_by_the_old_seed_text_id_still_counts(client, monkeypatch):
+    import uuid
+
+    from app.auth.audit import record
+
+    text = f"仓库丙上周退货多少件（{uuid.uuid4().hex[:6]}）"
+    a, b = await conversation(), await conversation()
+    for conv in (a, a, b):
+        await ask(monkeypatch, conv, weekly(*WEEKS[0]), question=text)
+    body = (await client.get("/api/ledger/certify-queue")).json()
+    assert [i for i in body["items"] if i["kind"] == "cluster" and i["question"] == text]
+    async with SessionLocal() as session:
+        await record(session, certify.DISMISS_ACTION, certify.SUBJECT_KIND, certify.item_id("cluster", text),
+                     data={"kind": "cluster"})
+        await session.commit()
+    body = (await client.get("/api/ledger/certify-queue")).json()
+    assert not [i for i in body["items"] if i["kind"] == "cluster" and i["question"] == text]
