@@ -271,6 +271,27 @@ def test_observation_today_is_the_server_local_date(monkeypatch):
         time.tzset()
 
 
+async def test_the_profile_jobs_api_takes_the_observe_scope(client, shop):
+    """取值观察以前只能经定时维护触发：POST /catalog/profile-jobs 的 scope 只收 needed、all（下一轮验收）。现在也收 observe：
+    只观察、不剖析；12 小时内都观察过时 409 profile_nothing，说清为什么。"""
+    sid, _ = shop
+    r = await client.post(f"/api/datasources/{sid}/catalog/profile-jobs", json={"scope": "observe"})
+    assert r.status_code == 202, r.text
+    job = r.json()["job"]
+    assert job["scope"] == "observe"
+    await catalog_profile_jobs.manager.wait(job["id"], timeout=60)
+    async with SessionLocal() as session:
+        [task] = (await session.execute(select(CatalogProfileTask).where(
+            CatalogProfileTask.job_id == job["id"]))).scalars()
+    assert {c["kind"] for c in task.checks} == set(observe.OBSERVE_KINDS), "只观察：不做关系、码值、日期的剖析"
+    assert {o.kind for o in await _obs(sid)} == set(observe.OBSERVE_KINDS)
+    again = await client.post(f"/api/datasources/{sid}/catalog/profile-jobs", json={"scope": "observe"})
+    assert again.status_code == 409 and again.json()["code"] == "profile_nothing"
+    assert f"{observe.OBSERVE_EVERY_H} 小时内都观察过" in again.json()["detail"]
+    bad = await client.post(f"/api/datasources/{sid}/catalog/profile-jobs", json={"scope": "maintenance"})
+    assert bad.status_code == 422, "maintenance 是定时维护用的，接口不收"
+
+
 class _FakeCx:
     """只看拼出来的 SQL：大表、业务日期没有索引。"""
 

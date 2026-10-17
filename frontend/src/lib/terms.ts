@@ -3035,6 +3035,11 @@ export const PROFILE_TEXT = {
   scopeNeededNone: '没有需要剖析的表：都剖析过、上次都做完了，也没有新的待核实关联关系和新的码值、日期列',
   scopeAll: (n: number) => `全部 ${formatNumber(n)} 张表`,
   scopeAllHint: '有可剖析项的表，不含视图',
+  /** 取值观察（范围 observe）：只观察、不剖析。张数是有数据目录的表，其中最近观察过的服务端这次不观察 */
+  scopeObserve: (n: number) => `取值观察：有数据目录的 ${formatNumber(n)} 张表`,
+  scopeObserveHint: (hours: number) => '只观察、不剖析：码值分布、最新业务日期、按日行数和行数，和同口径的历史比出取值变化，'
+    + `列在「变化」里。最近 ${formatNumber(hours)} 小时内观察过的表这次不再观察`,
+  scopeObserveNone: '还没有有数据目录的表：取值观察只看有数据目录的表，请先起草数据目录',
   /** 已选、筛选结果里有剖析不了的表：不交给服务端，写明有几张 */
   scopeLeftOut: (n: number) => `另有 ${formatNumber(n)} 张不剖析（视图、表结构中已没有，或没有可剖析的项）`,
   scopeEmpty: '这个范围里没有可剖析的表',
@@ -3230,6 +3235,7 @@ export const PROFILE_TEXT = {
     busy: '这个数据源已有剖析任务',
     tampered: '数据文件核对未通过',
     nothing: '没有可剖析的表',
+    nothingObserve: '没有要观察的表',
     other: '无法开始剖析',
   } as Record<string, string>,
   blockedNext: {
@@ -3239,6 +3245,7 @@ export const PROFILE_TEXT = {
     busy: '同一个数据源同一时间只有一个剖析任务：可以查看它的进度，等它结束后再开始新的剖析。',
     tampered: '请重新上传表格，或联系管理员核对数据文件。',
     nothing: '可以改选「全部表」，或在表清单中选定要剖析的表。',
+    nothingObserve: '观察过的表要过一段时间才再观察；要剖析，可以回到上一步改选「需要剖析的表」或「全部表」。',
     other: '请稍后重试。',
   } as Record<string, string>,
   busyAt: (who: string | null, done: number, total: number) =>

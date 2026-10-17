@@ -692,6 +692,18 @@ async def _behind_draft(session: AsyncSession, source_id: str) -> bool:
     return catalog_jobs.sync_drafting(source_id) or await catalog_jobs.active_job(session, source_id) is not None
 
 
+async def nothing_reason(session: AsyncSession, row: Any, source: Any, scope: str) -> str | None:
+    """按此刻的表结构和目录，这个范围一张表都挑不出来时为什么（ProfileNothing 的原话）；挑得出、或者排在起草后面（开始时按
+    起草后的目录再挑，现在说不准）返回 None。定时维护建出 0 张表的任务时用它把原因记进触发记录。"""
+    if await _behind_draft(session, row.id):
+        return None
+    try:
+        await _pick(session, row, source, tables=None, scope=scope)
+    except ProfileNothing as e:
+        return str(e)
+    return None
+
+
 async def create_job(session: AsyncSession, row: Any, source: Any, *, tables: list[str] | None, scope: str,
                      settings: ProfileSettings, actor: str | None, retry_of: str | None = None,
                      trigger: str = "manual", fire_at: str | None = None, schedule_id: str | None = None,
@@ -1161,5 +1173,6 @@ __all__ = ["INTERRUPTED_ERROR", "KEEP_JOBS", "MAX_TABLES", "NOTHING_AT_ALL", "NO
            "NOTHING_TO_OBSERVE", "NothingToRetry", "OBSERVING_SCOPES", "SCOPES", "task_modes", "trigger_of",
            "ProfileBusy", "ProfileFinished", "ProfileJobs", "ProfileNothing", "THEN_PROFILE", "active_job",
            "busy_message", "cancel", "create_job", "due_reason", "ensure_free", "job_brief", "job_dict", "job_out",
-           "last_detail", "last_facts", "last_profiles", "outside_of", "latest_job", "load", "load_task", "manager", "prune", "public_last",
-           "retry_tables", "startup", "task_detail", "task_row", "task_rows", "unsaved_error", "waiting_for"]
+           "last_detail", "last_facts", "last_profiles", "outside_of", "latest_job", "load", "load_task", "manager",
+           "nothing_reason", "prune", "public_last", "retry_tables", "startup", "task_detail", "task_row", "task_rows",
+           "unsaved_error", "waiting_for"]

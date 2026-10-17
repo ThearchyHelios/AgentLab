@@ -114,8 +114,9 @@ GUIDANCE_NOT_TEXT = "起草要求要是一段文字（要清除起草要求请�
 class ProfileJobIn(BaseModel):
     #: 要剖析的表（范围 selected，按给的顺序去重）；最多 500 张（超了 422，说明是中文）
     tables: list[str] | None = None
-    #: 不指定表时的范围：needed 需要剖析的表（缺省）、all 全部表（都不含视图、没有可剖析的项的表）
-    scope: Literal["needed", "all"] | None = None
+    #: 不指定表时的范围：needed 需要剖析的表（缺省）、all 全部表（都不含视图、没有可剖析的项的表）、observe 取值观察（只观察
+    #: 有数据目录、观察到期的表，不剖析；见 data/catalog_profile_observe）。maintenance 是定时维护用的，这里不收
+    scope: Literal["needed", "all", "observe"] | None = None
 
 
 async def _resolved(session: AsyncSession, source_id: str) -> tuple[DataSource, Any]:

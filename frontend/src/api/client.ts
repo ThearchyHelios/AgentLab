@@ -530,7 +530,7 @@ export const api = {
        * 409 带机读码：profile_disabled、datasource_inactive、schema_missing、snapshot_tampered、profile_busy（这个源已有排队、
        * 进行中的剖析任务，detail 写明进行到第几张）、profile_nothing（按范围挑出 0 张表，detail 写明原因和建议）
        */
-      create: (sourceId: string, body: { tables?: string[]; scope?: 'needed' | 'all' }) =>
+      create: (sourceId: string, body: { tables?: string[]; scope?: 'needed' | 'all' | 'observe' }) =>
         post<{ job: CatalogProfileJob }>(`${catalogBase(sourceId)}/profile-jobs`, body),
       /** 排队或进行中的那个剖析任务；没有为 null */
       active: (sourceId: string, opts?: RequestOptions) =>

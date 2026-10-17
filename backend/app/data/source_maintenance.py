@@ -13,7 +13,10 @@ observe 取值观察，可多选，没设过是三步都做。
 
 **到点**（fire，持着 scheduler 的 launch_lock）：按顺序建探查任务 → 剖析任务（范围 needed / observe / maintenance，按选的
 步骤），任务上记 trigger=schedule 和 fire_at，靠 SourceLanes 串行：剖析排在同一次触发的探查后面（等探查进了同源队才建剖析
-任务），开始时按那时的表结构和目录挑表（挑出 0 张也照建，任务以 0 张表结束、提醒里写明为什么）。预算、止损照剖析设置。
+任务），开始时按那时的表结构和目录挑表（挑出 0 张也照建，任务以 0 张表结束、提醒里写明为什么）。建任务时就判断得出会是 0 张
+的（这次没有探查、也没排在起草后面，开始时表结构和目录都不会变——比如有数据目录的表都在 12 小时内观察过），原因另记进触发
+记录的 inputs.skipped 和 reason；同一次触发里有探查、或者排在起草后面时说不准（探查完、起草完可能就有了），保持现状，只在
+任务的提醒里写。预算、止损照剖析设置。
 照实记没执行的：数据源不存在、已停用、是上传表格或记录表时整次不执行（failed_to_start）；剖析没开时剖析、观察两步不执行、
 探查照做；上一次的维护（或别的探查、剖析）还没做完时这次跳过（skipped_overlap）。每次触发记下建了哪几个任务、哪几步没执行、
 为什么（触发记录的 inputs：{steps, jobs, skipped}）。
@@ -221,6 +224,11 @@ async def _start(source_id: str, steps: list[str], *, actor: str, fire_at: str,
                 table_versions.SnapshotMissing) as e:
             skipped += [{"step": s, "reason": str(e)} for s in wanted]
             return jobs, skipped
+        if not tasks and introspect_id is None and (why := await catalog_profile_jobs.nothing_reason(
+                session, row, view, scope)):
+            # 建任务时就挑不出表、这次又没有探查（开始时表结构不会变）、也没排在起草后面（目录不会变）：任务会以 0 张表
+            # 结束，原因照实记进触发记录，不只在剖析任务的提醒里。任务照建（触发照旧是 started）
+            skipped += [{"step": s, "reason": why} for s in wanted]
         catalog_profile_jobs.manager.start(job.id)
         jobs.append({"step": "+".join(wanted), "kind": "profile", "id": job.id, "scope": scope, "tables": len(tasks)})
     return jobs, skipped
