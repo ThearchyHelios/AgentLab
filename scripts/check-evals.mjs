@@ -256,6 +256,9 @@ function reply(state, method, path, url, body) {
     if (out) return out
   }
   if (path === '/auth/me' && state.me) return { json: state.me }
+  // 「提取模板」去画布之后，画布页给这张图起一段画布对话（POST /conversations）：早晚不定，以前偶尔赶在检查结束前发出去、
+  // 漏到服务端。照 check-ledger 的写法在这里接住，不进写请求的清单（不是评测页发的）
+  if (method === 'POST' && path === '/conversations') return { json: { id: 'cv-eval', kind: body?.kind ?? 'canvas', title: '', turns: [] } }
   if (method === 'GET' && path === '/datasources') return { json: [DS] }
   if (method === 'GET' && path === '/evals/suites') return { json: { suites: state.suites } }
   if (method === 'POST' && path === '/evals/suites') {
