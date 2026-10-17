@@ -17,7 +17,8 @@ wrong 错、scale 量纲不同（差 10 的整数次幂，比如元和万元、�
 - scalar：数值按「允许的相对误差」比（engine/tolerance.agree，和双盲复算同一个函数）；期望没写容差时，引用的原值按
   DEFAULT_TOLERANCE，裸写的数按它写出的精度（3.5 万 ±500）。维度配对：期望写了 where（或期望那一行本身有维度）时，答案
   那一格所在行的非数值列要有这个取值；答案那一格没有维度（按条件筛过、只剩一个数）不算对不上。期望值是 0–10 的小整数
-  又没有维度可配时标「弱匹配」（巧合的数：3 家门店正好等于期望的 3）。
+  又没有维度可配时标「弱匹配」（巧合的数：3 家门店正好等于期望的 3）。答错时「答案里的数」给和这一项配对上的那一格（列名、
+  指标、说明同名，或者维度对得上的只有一个数），配不上就不给、原因里照实写配不上，列出答案引用了哪几个数。
 - table：逐行按 keys 的取值配对，每个要比的值同 scalar；ordered 时按答案里各行键值出现的先后核对顺序。
 - set：名单里每一项都要在答案里出现（ordered 时按顺序）；每一项都出现在答案查过的结果里算可追溯。
 - none：期望答「没有数据」：答案里没有数，而且查过的查询里有返回 0 行的（可追溯）；没有数、但也没有一条查询返回 0 行的
@@ -67,6 +68,8 @@ DEFAULT_TOLERANCE = 1e-6
 SCALE_FACTORS = (10.0, 100.0, 1000.0, 1e4, 1e5, 1e6, 1e8)
 #: 弱匹配：期望是这么小的整数、又没有维度可配
 WEAK_MAX = 10
+#: 判错、又配不上时原因里列出答案引用的前几个数
+PAIR_SHOWN = 3
 
 #: 路径不对时给人看的原因
 WRONG_PATH = {
@@ -319,9 +322,48 @@ def _score_scalar(exp: Mapping[str, Any], gold: Mapping[str, Any], answer: Answe
     for token in answer.bare:
         if _scaled(expected, float(token["value"])):
             return {**out, "outcome": "scale", "got": token["value"], "raw": token["raw"]}
-    got = next((v.get("value") for v in clean), None)
-    return {**out, "outcome": "wrong", **({"got": got} if got is not None else {}),
-            "reason": "答案里没有对得上的数" if not answer.values and not answer.bare else "答案里的数和期望对不上"}
+    numeric = [v for v in clean if is_finite_number(v.get("value"))]
+    if not numeric and not answer.bare:
+        return {**out, "outcome": "wrong", "reason": "答案里没有对得上的数"}
+    paired = _paired(numeric, exp, gold, key)
+    if paired is not None:
+        return {**out, "outcome": "wrong", "got": paired.get("value"), "cell": _cell_ref(paired),
+                "reason": "答案里的数和期望对不上"}
+    if numeric:
+        shown = "、".join(f"{_value_name(v)} {_plain(v.get('value'))}" for v in numeric[:PAIR_SHOWN])
+        more = f" 等 {len(numeric)} 个" if len(numeric) > PAIR_SHOWN else ""
+        return {**out, "outcome": "wrong",
+                "reason": f"答案里的数和期望对不上：答案引用的数按列名、维度都配不上这一项（引用了 {shown}{more}）"}
+    return {**out, "outcome": "wrong", "reason": "答案里的数和期望对不上"}
+
+
+def _norm(name: Any) -> str:
+    return str(name).strip().strip('"`[]').lower() if name is not None else ""
+
+
+def _paired(numeric: Sequence[Mapping[str, Any]], exp: Mapping[str, Any], gold: Mapping[str, Any],
+            key: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """答错时答案里和这一项配对上的那一格（「答案里的数」给它）：按名字配——列名（或口径卡的指标）是期望取的那一列、
+    那个指标，或者和期望的说明（label）同名；名字配不上时按维度配——期望写了维度、答案里维度对得上的数恰好只有一个。
+    都配不上为 None：以前取答案引用的第一个值，退款金额那一项显示成了答案里的订单数，甚至显示成一格文字。"""
+    names = {_norm(n) for n in (exp.get("column"), gold.get("column"), exp.get("metric"), gold.get("metric"),
+                                gold.get("name"), exp.get("label")) if n not in (None, "")}
+    named = [v for v in numeric if _norm(v.get("column")) in names or _norm(v.get("metric")) in names]
+    if named:
+        return named[0]
+    if key:
+        on_dims = [v for v in numeric if v.get("dims") and _dims_ok(key, v["dims"])]
+        if len(on_dims) == 1:
+            return on_dims[0]
+    return None
+
+
+def _value_name(value: Mapping[str, Any]) -> str:
+    return str(value.get("column") or value.get("metric") or value.get("alias") or "（没有列名）")
+
+
+def _plain(value: Any) -> str:
+    return str(int(value)) if is_finite_number(value) and float(value).is_integer() else str(value)
 
 
 def _cell_ref(value: Mapping[str, Any]) -> dict[str, Any]:

@@ -116,6 +116,38 @@ def test_tables_sets_none_and_ask():
     assert score_case(ask, {"status": "ok"}, Answer(run_id="r"), path="ran").verdict == "fail"
 
 
+def test_a_wrong_answer_shows_the_paired_cell():
+    """判错时「答案里的数」给评分时配对上的那一格（按列名、指标、维度配），不是答案引用的第一个值；配不上照实写配不上。"""
+    case = _case({**EXP, "column": "refund", "label": "退款金额"})
+    gold = _gold({"e1": _scalar(1234.5, column="refund")})
+
+    def cell(value, column, **dims):
+        return {"value": value, "kind": "cell", "artifact": "a1", "row": 0, "column": column, "dims": dims}
+
+    question = cell("上周退款金额是多少", "问题")
+    both = score_case(case, gold, Answer(run_id="r", values=[question, cell(36, "单数"), cell(1200.0, "refund")]),
+                      path="ran")
+    assert both.verdict == "fail" and both.scores[0]["got"] == 1200.0, both.scores
+    assert both.scores[0]["cell"]["column"] == "refund"
+    labelled = score_case(case, gold, Answer(run_id="r", values=[cell(36, "单数"), cell(1200.0, "退款金额")]), path="ran")
+    assert labelled.scores[0]["got"] == 1200.0, "期望的说明（label）和答案的列名一样也算配上"
+    lone = score_case(case, gold, Answer(run_id="r", values=[question, cell(36, "单数")]), path="ran")
+    [s] = lone.scores
+    assert s["outcome"] == "wrong" and "got" not in s, "单数不是退款金额：配不上就不给「答案里的数」"
+    assert "配不上" in s["reason"] and "单数 36" in s["reason"] and "上周退款" not in s["reason"], s["reason"]
+    # 按维度配：华东那一行只有一个数时就是它；同一行有几个数、列名又都配不上时不猜
+    by_dims = _case({**EXP, "column": "refund", "where": {"region": "华东"}})
+    gold = _gold({"e1": _scalar(1234.5, column="refund", where={"region": "华东"}, dims={"region": "华东"})})
+    one = score_case(by_dims, gold, Answer(run_id="r", values=[cell(1200.0, "total", region="华东")]), path="ran")
+    assert one.scores[0]["got"] == 1200.0, one.scores
+    two = score_case(by_dims, gold, Answer(run_id="r", values=[cell(36, "单数", region="华东"),
+                                                               cell(1200.0, "total", region="华东")]), path="ran")
+    assert "got" not in two.scores[0] and "配不上" in two.scores[0]["reason"], two.scores
+    text_only = score_case(case, _gold({"e1": _scalar(1234.5, column="refund")}), Answer(run_id="r", values=[question]),
+                           path="ran")
+    assert "got" not in text_only.scores[0] and text_only.scores[0]["reason"] == "答案里没有对得上的数"
+
+
 def test_none_counts_only_numbers_as_giving_data():
     """期望「没有数据」：只有引用了数值格、或叙述里写了数，才算答案给了数。引用的是文字格（地区名）、空值格（NULL）的，
     答案明说没有数据就按没有数据判对。"""
