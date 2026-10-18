@@ -7,7 +7,7 @@ import { formatClock, formatDuration, formatLapse, formatOffset, formatSpan, for
 import { statusMeta } from '../lib/status'
 import { topology, withSubSteps, type GraphLike } from '../run/derive'
 import {
-  isActivePhase, isTerminal, lastEventAt, liveAt, project, type NodeState, type NodeTrace, type Projection,
+  isActivePhase, isTerminal, lastEventAt, liveAt, project, stepLabel, type NodeState, type NodeTrace, type Projection,
   type Segment, type Trace,
 } from '../run/trace'
 import { projectCached } from '../run/useNodeView'
@@ -341,7 +341,9 @@ function buildRows(trace: Trace, graph: TimelineGraph, at: number, labels: Map<s
   const byId = new Map(graph.nodes.map((n) => [n.id, n]))
   // 子工作流里的步骤排在子工作流那一行下面（withSubSteps），老运行里改过图的照旧排在最后
   const ids = withSubSteps(topo.order, Object.keys(trace.nodes).filter((id) => !byId.has(id)))
-  const failedLabel = trace.failedNodeId ? labels.get(trace.failedNodeId) ?? trace.failedNodeId : ''
+  const own = (id: string) => labels.get(id)
+  // 子工作流里的那一步图上没有：接上子工作流的名字（stepLabel）
+  const failedLabel = trace.failedNodeId ? stepLabel(trace, trace.failedNodeId, own) : ''
   const rows: Row[] = []
   let top = 0
   for (const id of ids) {
@@ -350,7 +352,7 @@ function buildRows(trace: Trace, graph: TimelineGraph, at: number, labels: Map<s
     const p = states?.[id]
     const state: NodeState = states ? p?.state ?? 'idle' : n?.state ?? 'idle'
     const type = nodeTypeOf(byId.get(id))
-    const label = labels.get(id) ?? id
+    const label = stepLabel(trace, id, own)
     const tokens = states ? (p?.tokensIn ?? 0) + (p?.tokensOut ?? 0) : undefined
     rows.push({
       key: id, kind: 'node', nodeId: id, label, type,
@@ -780,7 +782,7 @@ export function RunTimeline({
           <button type="button" className="tl-alert" onClick={() => onFocusNode?.(trace.failedNodeId!)}
                   title="在画布上定位到失败的节点">
             <StatusBadge status="failed" size={11} animate={false} decorative />
-            <span className="min-w-0 truncate">失败于「{labels.get(trace.failedNodeId) ?? trace.failedNodeId}」</span>
+            <span className="min-w-0 truncate">失败于「{stepLabel(trace, trace.failedNodeId, (x) => labels.get(x))}」</span>
           </button>
         )}
         {trace.phase === 'waiting' && trace.waitingNodeId && (

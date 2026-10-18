@@ -3030,6 +3030,36 @@ await section('子工作流里的每一步进了同一个运行（节点 id「�
   check('子工作流里的一步：「取数子流程 › 查订单」', title('sub/fetch') === '取数子流程 › 查订单', title('sub/fetch'))
   check('没起名字的（名字就是子图里的 id）退到节点类型', title('sub/o') === '取数子流程 › 成果', title('sub/o'))
   check('子工作流节点自己照旧', title('sub') === '取数子流程', title('sub'))
+
+  // 航迹的计数：子工作流里的步骤算在子工作流那一步里，完成数的分母是工作流里的节点数（run.started 的 nodes）
+  const trace = await import(await load('/src/run/trace.ts'))
+  const evs = [E(1, 'run.started', null, { nodes: 2 }), E(2, 'node.started', 'start', {}), E(3, 'node.finished', 'start', {}),
+    E(4, 'node.started', 'sub', { label: '取数子流程' }),
+    E(5, 'node.started', 'sub/fetch', { label: '查订单' }), E(6, 'node.finished', 'sub/fetch', {}),
+    E(7, 'node.started', 'sub/o', {})]
+  const t = evs.reduce(trace.foldEvent, trace.emptyTrace())
+  const mid = trace.project(t, 7500)
+  check('跑到子工作流里：完成数只数工作流里的节点（1/2，不是 2/2）', mid.nodesDone === 1 && mid.nodesTotal === 2,
+    `${mid.nodesDone}/${mid.nodesTotal}`)
+  check('……子工作流和它里面那一步不算成两路并行', mid.parallelNow === 1, String(mid.parallelNow))
+  check('……「当前在跑」只认子工作流那一步', Object.values(t.nodes).filter((n) => trace.isExecuting(n) && !trace.isSubStep(n.id))
+    .map((n) => n.id).join() === 'sub')
+  const done = [...evs, E(8, 'node.finished', 'sub/o', {}), E(9, 'node.finished', 'sub', {}),
+    E(10, 'run.finished', null, { output: {} })].reduce(trace.foldEvent, trace.emptyTrace())
+  const end = trace.project(done, 10000)
+  check('跑完：2/2，不是 4/2', end.nodesDone === 2 && end.nodesTotal === 2, `${end.nodesDone}/${end.nodesTotal}`)
+
+  // 子工作流里的一步出错：运行记下的出错节点是「sub/fetch」，图上没有它。失败横幅、泳道、运行胶囊照「子工作流 › 那一步」写
+  const failedRun = [...evs.slice(0, 5), E(6, 'node.failed', 'sub/fetch', { error: '查询失败' }),
+    E(7, 'node.failed', 'sub', { error: '查询失败' }),
+    E(8, 'run.failed', null, { error: '查询失败', node_id: 'sub/fetch', label: '取数子流程 › 查订单' })]
+    .reduce(trace.foldEvent, trace.emptyTrace())
+  const own = (id) => ({ start: '入口', sub: '取数子流程' })[id]
+  check('出错节点记的是子图里那一步', failedRun.failedNodeId === 'sub/fetch', failedRun.failedNodeId)
+  check('名字接上子工作流：「取数子流程 › 查订单」，不写裸 id', trace.stepLabel(failedRun, 'sub/fetch', own) === '取数子流程 › 查订单',
+    trace.stepLabel(failedRun, 'sub/fetch', own))
+  check('图上的节点照旧写图上的名字', trace.stepLabel(failedRun, 'sub', own) === '取数子流程')
+  check('没起过名字的子图步骤写子图里的 id', trace.stepLabel(t, 'sub/o', own) === '取数子流程 › o', trace.stepLabel(t, 'sub/o', own))
 })
 
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')

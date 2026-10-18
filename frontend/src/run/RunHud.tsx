@@ -14,7 +14,7 @@ import { structureSig, useStudio } from '../store/studio'
 import type { RunEvent } from '../types'
 import { topology } from './derive'
 import {
-  isActivePhase, isSettled, isTerminal, liveAt, project, type NodeState, type RunPhase, type Trace,
+  isActivePhase, isSettled, isTerminal, liveAt, project, stepLabel, type NodeState, type RunPhase, type Trace,
 } from './trace'
 import { useRunClock } from './useRunClock'
 
@@ -204,7 +204,8 @@ export function useRunGlance(active: boolean): RunGlance {
 
   const order = useMemo(() => topology({ nodes, edges }).order, [nodes, edges])
   const labels = useMemo(() => new Map(nodes.map((n) => [n.id, n.data.label || n.id])), [nodes])
-  const label = (id: string) => labels.get(id) ?? id
+  // 子工作流里的那一步（失败、被驳回在它上面）图上没有：接上子工作流的名字（stepLabel）
+  const label = (id: string) => stepLabel(trace, id, (x) => labels.get(x))
 
   const live = isActivePhase(phaseLive)
   const at = replayAt ?? (live ? liveAt(trace, now) : lastStampOf(trace))

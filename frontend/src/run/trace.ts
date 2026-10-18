@@ -91,6 +91,8 @@ export interface NodeTrace {
    */
   exited?: boolean
   exitTo?: string[]
+  /** node.started 上记的名字。子工作流里的步骤不在画布的图上，名字从这里取（stepLabel） */
+  label?: string
   /** 用量随时间的累计，回放时按游标取那一刻的 tokens 和工具数。没调过模型和工具的节点没有 */
   marks?: UsageMark[]
 }
@@ -278,6 +280,25 @@ function openIndex(segs: Segment[], kind: Segment['kind'], agent?: string): numb
 }
 
 /**
+ * 子工作流里的一步（节点 id「子工作流节点 id/…」，docs/design/orchestration-round/00-总方案.md §2）：它在子工作流节点那一步
+ * 里面跑，节点计数、并行数、「当前在跑」都算在子工作流那一步上，不另算
+ */
+export const isSubStep = (id: string): boolean => id.includes('/')
+
+/**
+ * 一个节点给人看的名字：own 是画布的图上的名字（找不到为 undefined）。子工作流里的步骤（isSubStep）图上没有，接上子工作流
+ * 那一步的名字：「取数子流程 › 查订单」——和服务端终态事件的 label 同一个拼法（runner._label_of），失败横幅、泳道、
+ * 运行胶囊不再写裸的「sub/fetch」。别的找不到的照旧写 id
+ */
+export function stepLabel(t: Trace, id: string, own: (id: string) => string | undefined): string {
+  const mine = own(id)
+  if (mine) return mine
+  if (!isSubStep(id)) return id
+  const cut = id.lastIndexOf('/')
+  return `${stepLabel(t, id.slice(0, cut), own)} › ${t.nodes[id]?.label || id.slice(cut + 1)}`
+}
+
+/**
  * 此刻同时在跑的数量。
  *
  * 有成员在跑的协作节点按成员数算，容器本身不计——三个人同时在干活，说"并行 4"
@@ -286,8 +307,7 @@ function openIndex(segs: Segment[], kind: Segment['kind'], agent?: string): numb
 function parallelOf(nodes: Record<string, NodeTrace>): number {
   let total = 0
   for (const n of Object.values(nodes)) {
-    // 子工作流里的那几步（「子工作流节点 id/…」）在子工作流节点那一格里跑，不另算一路并行
-    if (n.id.includes('/')) continue
+    if (isSubStep(n.id)) continue
     let inner = 0
     let run = 0
     for (const s of n.segments) {
@@ -521,6 +541,7 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
     case 'node.started': {
       if (!nodeId) break
       const n = node(nodeId)
+      if (typeof d.label === 'string' && d.label && n.label !== d.label) n.label = d.label
       const open = openIndex(n.segments, 'run')
       const lastSeg = n.segments[n.segments.length - 1]
       if (open >= 0) {
@@ -1012,7 +1033,8 @@ export function project(t: Trace, at: number): Projection {
         toolsRunning: state === 'running' ? m?.[5] ?? 0 : 0,
       }
     }
-    if (view.state === 'done' || view.state === 'skipped') nodesDone += 1
+    // 分母是工作流里的节点数：子工作流里的步骤算在子工作流那一步里（isSubStep），不另算完成数
+    if ((view.state === 'done' || view.state === 'skipped') && !isSubStep(n.id)) nodesDone += 1
     nodes[n.id] = view
   }
 
@@ -1039,7 +1061,7 @@ export function project(t: Trace, at: number): Projection {
 
   return {
     phase, elapsedMs, activeMs, waitMs, nodesDone,
-    nodesTotal: t.nodesTotal ?? Object.keys(t.nodes).length,
+    nodesTotal: t.nodesTotal ?? Object.keys(t.nodes).filter((id) => !isSubStep(id)).length,
     parallelNow, ...usage, nodes,
   }
 }
