@@ -15,7 +15,10 @@ from app.engine.expressions import open_template_scope, template_scope
 from app.engine.nodes import (
     challenge, control, dual_check, human, io, knowledge, llm, merge, metrics, multi, report, tools,
 )
-from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges, innermost_loops
+from app.engine.schema import (
+    GATE_TYPES, REJECT_HANDLE, GraphNode, GraphSpec, NodeType, approve_mode, back_edges, innermost_loops,
+    reject_targets,
+)
 from app.engine.state import GraphState
 from app.process.actions import ActionPending
 
@@ -103,7 +106,7 @@ def _wrap(
                             payload,
                             kind="node_output",
                             run_id=run_ctx.run_id,
-                            node_id=node.id,
+                            node_id=run_ctx.global_id(node.id),
                             meta={"type": str(node.type), "attempt": attempt + 1},
                         )
                     except Exception:  # noqa: BLE001 - 工件写失败不该毁掉运行本身
@@ -124,7 +127,7 @@ def _wrap(
                     # 这一步新记进证据台账的条目（口径卡的指标集工件等）。事件在封存范围
                     # 内，证据接口从这里出发找工件，不去读可以事后插行的 artifacts 表。
                     # 没产出证据的节点不带这个键，事件和以前一字不差
-                    **({"evidence": updates["evidence"]} if updates.get("evidence") else {}),
+                    **_own_evidence(updates, node.id),
                 )
                 trail = {
                     "node_id": node.id,
@@ -169,6 +172,11 @@ def _wrap(
                 break
 
         elapsed = int((time.perf_counter() - started) * 1000)
+        if isinstance(last_error, NodeRejected) and not last_error.stop \
+                and (targets := reject_targets(run_ctx.spec, node)):
+            # 接了「驳回」出口：驳回不让运行结束，这一步正常结束、沿驳回那条边往下走（总方案 §3）。没接的照旧往下收成
+            # node.failed（reason=rejected）+ 运行 cancelled，一字不变
+            return await _rejected_exit(node, ctx, last_error, targets, elapsed=elapsed, attempt=attempt + 1)
         message = _describe(last_error)
         # node_id 要带上：前端靠它把出错的节点从"转圈"收敛成"失败"。
         # error 是给人看的那句，原始异常放 detail，排查的人照样拿得到。
@@ -194,6 +202,48 @@ def _wrap(
         return await _execute(state)
 
     return _entry
+
+
+def _own_evidence(updates: dict[str, Any], node_id: str) -> dict[str, Any]:
+    """node.finished 上带的台账条目：这一步自己新记的。子工作流节点交回父图的条目（节点 id 是「子工作流节点 id/…」，
+    multi.run_subgraph）不带：子工作流里那几个节点自己的 node.finished 已经带着它们（节点 id 同样带前缀），再记一遍，
+    证据接口会把查询认成子工作流节点自己查的。"""
+    entries = [e for e in updates.get("evidence") or []
+               if not (isinstance(e, dict) and str(e.get("node_id") or "").startswith(f"{node_id}/"))]
+    return {"evidence": entries} if entries else {}
+
+
+async def _rejected_exit(node: GraphNode, ctx: NodeContext, error: NodeRejected, targets: list[str], *,
+                         elapsed: int, attempt: int) -> dict[str, Any]:
+    """被驳回、接了「驳回」出口：这一步正常结束（node.finished 带 outcome=rejected 和哪种关卡、结论、谁、备注、转到哪几步），
+    产出 NodeRejected.exit_payload()，路由按它的 __decision__ 走驳回那条边。
+
+    动作确认被驳回时 NodeRejected 抛在发送之前，走到这里时什么都没发（照旧「未确认（被驳回）」）。trail 上这一步记
+    outcome=rejected：运行收尾据此在 run.finished 上照实写「途经驳回」（runner._rejected_via）。审批模式写了「结果存为
+    变量」的照旧写 false（以前接了驳回边的审批就是这么写的）；别的关卡这一步没有产出值，变量不写。"""
+    from app.core.artifact_store import put_json
+
+    run_ctx = ctx.run
+    payload = error.exit_payload()
+    nodes = run_ctx.spec.node_map()
+    to = [{"node_id": run_ctx.global_id(t), "label": nodes[t].title if t in nodes else t} for t in dict.fromkeys(targets)]
+    try:
+        artifact_id: str | None = await put_json(payload, kind="node_output", run_id=run_ctx.run_id,
+                                                 node_id=run_ctx.global_id(node.id),
+                                                 meta={"type": str(node.type), "attempt": attempt, "outcome": "rejected"})
+    except Exception:  # noqa: BLE001 - 工件写失败不该毁掉运行本身
+        artifact_id = None
+    said = {"kind": error.kind, "decision": error.decision, "actor": error.actor, "note": error.note}
+    ctx.emit(EventType.NODE_FINISHED, duration_ms=elapsed, attempt=attempt,
+             preview=_preview({"nodes": {node.id: payload}}, node.id), artifact=artifact_id,
+             outcome="rejected", **said, to=to)
+    updates: dict[str, Any] = {"nodes": {node.id: payload}, "trail": [{
+        "node_id": node.id, "type": str(node.type), "duration_ms": elapsed, "attempt": attempt, "ts": time.time(),
+        "outcome": "rejected", "label": node.title, **said, "to": to}]}
+    var_name = str(node.config.get("assign_to") or "").strip()
+    if var_name and error.kind == "approve":
+        updates["vars"] = {var_name: False}
+    return updates
 
 
 def _describe(error: BaseException | None) -> str:
@@ -294,8 +344,13 @@ def _make_router(
     所以真正的判断逻辑放在节点执行阶段，这里只查表。
     """
     mapping: dict[str, list[str]] = {}
+    # 审批模式以外的关卡节点（接了驳回出口才走到这里）只有两条路：驳回出口，和其余的（普通出口 out）。正常结束时产出里
+    # 没有 __decision__（调用工具、沙箱代码、双盲复算），或者是补充输入、编辑稿件写的 approved，都落到 default
+    gate = node.type in GATE_TYPES and not approve_mode(spec, node)
     for edge in spec.outgoing(node.id):
         key = edge.sourceHandle or "default"
+        if gate:
+            key = REJECT_HANDLE if key == REJECT_HANDLE else "default"
         mapping.setdefault(key, []).append(edge.target)
 
     default_targets = mapping.get("default") or []
@@ -371,7 +426,7 @@ def compile_graph(spec: GraphSpec, run_ctx: RunContext) -> StateGraph:
         handles = {e.sourceHandle for e in outgoing if e.sourceHandle}
         needs_routing = node.type in ROUTING_TYPES or (
             node.type == NodeType.HUMAN and handles & {"approved", "rejected"}
-        )
+        ) or bool(reject_targets(spec, node))
 
         if needs_routing:
             route, path_map = _make_router(node, spec)

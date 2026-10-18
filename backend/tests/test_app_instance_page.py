@@ -191,11 +191,12 @@ async def test_the_instance_says_which_outcome_it_reached():
     await _wait(back, ("succeeded",))
     view = await _page(app_id, back, user("qianqi"))
     # 走了退回分支：运行是「已完成」，流程的结论是「已退回」。这是否定的结局（从「驳回」出口走到的成果节点），状态
-    # 标记同「未确认（被驳回）」，不画成成功；时间线上驳回的那一步同样
+    # 标记同「未确认（被驳回）」，不画成成功；时间线上驳回的那一步同样，照实写被驳回、转到了哪一步（驳回出口，
+    # docs/design/orchestration-round/00-总方案.md §3）
     assert (view["hdr"]["status_code"], view["hdr"]["status_text"]) == ("cancelled", "已退回")
     assert view["tl"]["status_code"] == "cancelled"
     review = next(s for s in view["tl"]["steps"] if s["node"] == "review")
-    assert (review["state"], review["text"]) == ("rejected", "已驳回")
+    assert (review["state"], review["text"]) == ("rejected", "被驳回，转到「已退回」")
     # 判定之后没回复的都撤回了：会签人数按判定那一刻的算，不缩成 1
     assert view["signs"]["progress"] == {"policy": "all", "voters": 2, "need": 2, "agreed": 0, "rejected": 1}
     from app.apps.resolve import list_instances

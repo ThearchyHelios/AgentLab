@@ -1379,8 +1379,8 @@ def _merge(per_input: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
 def _choices(ctx: NodeContext, response: Any, rows: list[dict[str, Any]]) -> tuple[dict[str, str], str]:
     """审核人的回复 → ({指标 id: a | b | neither}, 备注)。回复的 value 是 {choices, note}；某个指标没选、选了认不出的
     不进 choices：照实记成「没有作出选择」，不替人说「两边都不对」，也不替人认可任何一边（缺口照样记、出具照样降档）。
-    通用的输入卡送来的是一句话，所有指标都按没选记。明确驳回（approved 为否）的按人工驳回让节点失败，和人工审批节点的
-    填写模式一样：这一步没有驳回的出口。"""
+    通用的输入卡送来的是一句话，所有指标都按没选记。明确驳回（approved 为否）的抛 NodeRejected，和人工审批节点的
+    填写模式一样：画布上接了「驳回」出口的沿它往下走（engine/compiler），没接的运行收成被驳回。"""
     decision = read_decision(response)
     if isinstance(response, dict) and decision.rejected:
         raise NodeRejected.of(ctx, f"人工驳回：{decision.note or '未说明原因'}", kind="dual_check", decision=decision)

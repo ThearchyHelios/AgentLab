@@ -534,6 +534,27 @@ async def test_rejecting_the_approval_ends_the_run_as_rejected(monkeypatch, shop
     assert (ended.data["kind"], ended.data["note"]) == ("dual_check", "口径要重新对")
 
 
+async def test_rejecting_the_approval_with_a_reject_exit_goes_on_along_it(monkeypatch, shop, client):
+    """裁决接了「驳回」出口（docs/design/orchestration-round/00-总方案.md §3）：驳回时这一步正常结束、沿驳回边往下走，产出带
+    哪种关卡、结论、备注；运行照它的路径结束。"""
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    spec = graph(name, BY_ORDER_DATE)
+    spec["nodes"].append(node("redo", "output", "重新核对", fields=[{"name": "结论", "value": "{{ nodes.dual.note }}"}]))
+    spec["edges"].append({"source": "dual", "target": "redo", "sourceHandle": "rejected"})
+    run = await start(spec)
+    approval = await pending(run.id)
+    res = await client.post(f"/api/approvals/{approval.id}/decide", json={"approved": False, "note": "口径要重新对"})
+    assert res.status_code == 200, res.text
+    done = await wait(run.id, ("succeeded", "failed", "cancelled"))
+    assert (done.status, done.end_reason) == ("succeeded", None), done.error
+    assert done.output == {"结论": "口径要重新对"}
+    evs = await events(run.id)
+    [finished] = [e for e in evs if e.type == "node.finished" and e.node_id == "dual"]
+    assert (finished.data["outcome"], finished.data["kind"]) == ("rejected", "dual_check")
+    assert not [e for e in evs if e.type == "node.finished" and e.node_id == "out"], "普通出口没有走"
+
+
 async def test_on_reject_fail_stops_the_run(monkeypatch, shop, client):
     name, source_id = shop
     Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})

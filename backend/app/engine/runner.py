@@ -1039,13 +1039,13 @@ class RunManager:
                 # 切断的半截答案当成完整结论落了库
                 clipped, truncated = _clip(output)
                 data: dict[str, Any] = {"output": clipped, "usage": usage,
-                                        "duration_ms": timing["active_ms"], "timing": timing}
+                                        "duration_ms": timing["active_ms"], "timing": timing, **_rejected_via(state)}
                 if truncated:
                     data["output_truncated"] = True
                 event = self._event(run_id, EventType.RUN_FINISHED, data=data)
             elif terminal is not None:
                 kind, data = terminal
-                event = self._event(run_id, kind, data={**data, "timing": timing})
+                event = self._event(run_id, kind, data={**data, "timing": timing, **_rejected_via(state)})
 
             if run:
                 run.status = status
@@ -1344,6 +1344,16 @@ def _trust_event(tool_trust: dict[str, str] | None) -> Any:
     if tool_trust is None:
         return None
     return "formal" if tool_trust.get(FORMAL_MARK) else snapshot_levels(tool_trust)
+
+
+def _rejected_via(state: dict[str, Any]) -> dict[str, Any]:
+    """这次运行途经的驳回出口（engine/compiler._rejected_exit 记在 trail 上的 outcome=rejected）：{rejected_via: [{node_id,
+    label, kind, decision, actor, note, to}]}，按先后。终态事件带上它，运行照它的路径结束（成功结束也一样）照实说「途经
+    驳回」；没有途经的不带这个键，终态事件和以前一字不差。读的是收尾时的状态：节点出错、被驳回结束的那几种收尾拿不到
+    状态（final_state 为空），不带；子工作流里的驳回出口不在这里（它的 trail 是子工作流自己的状态）。"""
+    via = [{k: t.get(k) for k in ("node_id", "label", "kind", "decision", "actor", "note", "to")}
+           for t in state.get("trail") or [] if isinstance(t, dict) and t.get("outcome") == "rejected"]
+    return {"rejected_via": via} if via else {}
 
 
 def rejected_data(exc: NodeRejected, spec: GraphSpec) -> dict[str, Any]:
