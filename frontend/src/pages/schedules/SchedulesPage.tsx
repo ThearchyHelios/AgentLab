@@ -9,8 +9,8 @@ import type { Schedule } from '../../types'
 import { ClassChip } from '../runs/parts'
 import { ScheduleCreatePage, ScheduleDetailPage } from './ScheduleDetail'
 import {
-  EnableSwitch, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled, targetKindOf,
-  targetText,
+  EnableSwitch, EventChip, LastFire, NextRun, isUnsupported, rememberScheduleNames, removeSchedule, runNow, setEnabled,
+  targetKindOf, targetText,
 } from './parts'
 
 /**
@@ -173,6 +173,7 @@ function ScheduleRow({ s, now, busy, onToggle, onRun, onDelete }: {
             {workflow
               ? <ClassChip runClass={s.run_class} />
               : <span className="chip shrink-0" data-schedule-target-kind={kind}>{T.targetKind[kind]}</span>}
+            {s.trigger_kind === 'event' && <EventChip />}
             {!s.enabled && <span className="chip shrink-0" data-schedule-paused="">{T.pausedChip}</span>}
           </div>
           <div className="mt-0.5 truncate text-xs text-dim" title={`${target} · ${s.description_text}`} data-schedule-desc="">

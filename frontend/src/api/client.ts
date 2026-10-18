@@ -39,6 +39,8 @@ import { caliberLedger } from './caliberLedger'
 import { capabilities, endpoints, notify } from './capabilities'
 // 普通用户建应用（typesBlueprint.ts 是接口约定）
 import { blueprints, files, personal, templates } from './blueprints'
+// 问数据的一轮在服务端跑（编排完善第 1 波）：发起、看、停，实时流在 chatTurns.ts 的 streamChatTurn
+import { chatTurns } from './chatTurns'
 
 // 请求层搬到了 http.ts（见那边的说明）。原先从这里导出的照旧从这里导出，调用方不用改；
 // 请求函数也一并转出，给不在 api/ 下、又想直接发请求的地方用。api/ 下的命名空间文件请直接从 http.ts 导入
@@ -986,6 +988,9 @@ export const api = {
   templates,
   files,
   personal,
+
+  // 问数据的一轮（服务端跑整轮：发起、看、停）
+  chatTurns,
 }
 
 /**

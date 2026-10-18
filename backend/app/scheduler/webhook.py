@@ -119,6 +119,8 @@ class Notice:
     #: 运行结束在 cancelled 的原因（Run.end_reason）：rejected 时按「未出具（被驳回）」说，error_node 是驳回的那一步
     end_reason: str | None = None
     next_fire: bool = False
+    #: 事件触发的那一次（fire_kind=event）：事件的说法（scheduler/triggers.event_text），不含出口字段的值、变化的内容
+    trigger_text: str | None = None
     compare: dict[str, Any] | None = None
     compare_url: str | None = None
     fmt: str | None = None
@@ -195,6 +197,9 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
         # 立即运行不写「计划触发」：群里的人会以为报告按时出了
         if notice.fire_kind == "manual":
             lines.append(("手动触发", when))
+        elif notice.fire_kind == "event":
+            # 事件触发没有「计划」：写事件和合成这次触发的时刻（去抖结束的那一刻）
+            lines.append(("事件触发", f"{notice.trigger_text}，{when}" if notice.trigger_text else when))
         elif notice.fire_kind == "misfire":
             lines.append(("计划触发", f"{when}，错过后补发"))
         else:
@@ -546,22 +551,39 @@ async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run
         pending_approvals=pending or None,
         suspended=run is not None and run.status == "interrupted" and not pending,
         action_pending=seen.action_pending,
-        error_node=_failed_node(run) if run is not None and (run.status == "failed" or run.end_reason == "rejected")
-        else None,
+        error_node=_failed_node(run, await _end_label(session, run))
+        if run is not None and (run.status == "failed" or run.end_reason == "rejected") else None,
         end_reason=run.end_reason if run is not None else None,
-        next_fire=bool(schedule.enabled and schedule.next_run_at is not None),
+        # 事件触发的任务没有下一次「到点」，启用着就是下一次事件来了照常发起
+        next_fire=bool(schedule.enabled and (schedule.next_run_at is not None or schedule.trigger_kind == "event")),
+        trigger_text=_trigger_text(fire),
     )
 
 
-def _failed_node(run: Run) -> str | None:
-    """失败节点在图上的名字（没有名字的给节点 id）。节点名是搭图时起的，不带查询到的数据。"""
+def _trigger_text(fire: ScheduleFire) -> str | None:
+    event = fire.inputs.get("event") if isinstance(fire.inputs, dict) else None
+    text = event.get("text") if isinstance(event, dict) else None
+    return text if isinstance(text, str) and text else None
+
+
+def _failed_node(run: Run, end_label: str | None = None) -> str | None:
+    """失败节点在图上的名字（没有名字的给节点 id）。节点名是搭图时起的，不带查询到的数据。图上找不到的（子工作流里的那一步，
+    id 是「sub/x」）用终态事件上记的名字（「子工作流 › x」，apps/resolve.end_label），和实例页、通知同一个说法。"""
     if not run.error_node_id:
         return None
     for node in (run.graph or {}).get("nodes") or []:
         if isinstance(node, dict) and node.get("id") == run.error_node_id:
             label = (node.get("data") or {}).get("label") if isinstance(node.get("data"), dict) else None
             return str(label or run.error_node_id)[:80]
-    return None
+    return end_label[:80] if end_label else None
+
+
+async def _end_label(session: Any, run: Run | None) -> str | None:
+    if run is None:
+        return None
+    from app.apps.resolve import end_label
+
+    return await end_label(session, run)
 
 
 async def _issuance_of(session: Any, run: Run) -> tuple[str | None, int | None]:

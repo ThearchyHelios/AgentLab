@@ -8,6 +8,12 @@ eval_suite（跑一次评测题集）或 source_maintenance（维护一个数据
 结束、运行失败、等待审批）说的是这一次发起的那次运行，非工作流目标没有那一次运行，配上了也收不到，所以照实拒收。接口返回带
 target_kind、target_id、target_name（目标现在的名字，不在了用保存时记下的那一份）。
 
+**触发方式**（docs/design/orchestration-round/00-总方案.md §4，一套定时机制）：trigger_kind 是 cron（缺省，字段和行为一字不变）
+或 event（由数据事件触发，规则在 scheduler/triggers.py、派发在 scheduler/outbox.py）。event 时请求体写 trigger（事件种类、对象、
+过滤、去抖），目标只能是工作流，cron 存空串、下一次触发为空；核对对象、输入模板里的 {{ event.* }}、workflow.finished 串成的环
+（A→B→A 拒收，说清是哪几个）都在保存时做。触发方式建好之后不能改。Webhook 照旧可配。接口返回另带 trigger_kind、trigger、
+trigger_text（给人看的触发说明，事件触发时也是 description_text）、trigger_state（几条事件在等、去抖到什么时候、调度开没开）。
+
 形状按前后端约定（Schedule、Fire 两种对象，见 _schedule_out、_fire_outs）。Webhook 地址和签名密钥加密存放，接口
 只给主机和末 4 位（url_hint）、有没有密钥（has_secret）。请求体自己解析、自己校验：错误一律回中文 detail，表单
 据 field 把报错落到那一格（422 {detail, code, field}，同 api/coded.py）。后台的调度循环在 app/scheduler 里。
@@ -27,12 +33,12 @@ from app.api.runs import actor_of
 from app.core.crypto import decrypt, encrypt
 from app.db.base import get_session, utcnow
 from app.db.models import Run, Schedule, ScheduleFire, WebhookDelivery, Workflow, WorkflowVersion
-from app.scheduler import auto_compare, cron, service, webhook
+from app.scheduler import auto_compare, cron, outbox, service, triggers, webhook
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
 
 #: 请求不合规（422）的机器码。field 是出错的那一项：name、target_kind、target_id、workflow_id、cron、timezone、run_class、
-#: input_template、enabled、overlap、misfire_grace_s、webhook、version、limit、before
+#: input_template、enabled、overlap、misfire_grace_s、webhook、version、limit、before、trigger_kind、trigger、debounce_s
 SCHEDULE_INVALID = "schedule_invalid"
 #: 非工作流目标配了 Webhook（见模块说明）
 NO_WEBHOOK = ("目标是「{kind}」的定时任务不推 Webhook：Webhook 的事件说的是定时发起的那次运行。要收这类定时的通知，"
@@ -155,11 +161,43 @@ def _run_class(value: Any) -> str:
     return value
 
 
-def _template(value: Any) -> dict[str, str]:
+def _template(value: Any, event: str | None = None) -> dict[str, str]:
     try:
-        return service.check_template(value)
+        return service.check_template(value, event=event)
     except service.TemplateError as e:
         raise _invalid(str(e), "input_template") from e
+
+
+#: 触发方式：按 cron 到点、由数据事件触发
+TRIGGER_KINDS = ("cron", "event")
+
+
+def _trigger_kind(value: Any) -> str:
+    if value not in TRIGGER_KINDS:
+        raise _invalid(f"触发方式需要是定时或事件触发{_current(value)}", "trigger_kind")
+    return value
+
+
+def _trigger(value: Any) -> dict[str, Any]:
+    try:
+        return triggers.normalize(value)
+    except triggers.TriggerError as e:
+        raise _invalid(str(e), e.field) from e
+
+
+async def _check_trigger(session: AsyncSession, trigger: dict[str, Any], *, schedule_id: str | None,
+                         target_workflow_id: str) -> triggers.Checked:
+    """核对触发条件里的对象，再查 workflow.finished 串没串成环。不对抛 422（field=trigger）。"""
+    try:
+        checked = await triggers.check(session, trigger)
+    except triggers.TriggerError as e:
+        raise _invalid(str(e), e.field) from e
+    cycle = await triggers.find_cycle(session, schedule_id=schedule_id, trigger=trigger,
+                                      target_workflow_id=target_workflow_id)
+    if cycle:
+        names = dict((await session.execute(select(Workflow.id, Workflow.name).where(Workflow.id.in_(set(cycle))))).all())
+        raise _invalid(triggers.cycle_text([names.get(w, w) for w in cycle]), "trigger")
+    return checked
 
 
 def _current(value: Any) -> str:
@@ -328,6 +366,37 @@ def _description(row: Schedule) -> str:
         return f"按 cron 表达式 {row.cron}（{row.timezone}）"
 
 
+def _event_kind(row: Schedule) -> bool:
+    return (getattr(row, "trigger_kind", None) or "cron") == "event"
+
+
+async def _trigger_names(session: AsyncSession, rows: list[Schedule]) -> dict[str, str]:
+    """事件触发任务的对象、过滤里的应用现在叫什么：{id: 名字}。不在了的不在里面（说法里用保存时的名字）。"""
+    from app.db.models import App, DataSource
+
+    wanted: dict[str, set[str]] = {"source": set(), "workflow": set(), "app": set()}
+    for r in rows:
+        trigger = r.trigger if _event_kind(r) and isinstance(r.trigger, dict) else None
+        if not trigger:
+            continue
+        subject = triggers.subject_of(trigger)
+        wanted["workflow" if trigger.get("event") == "workflow.finished" else "source"].add(subject)
+        if trigger.get("app_id"):
+            wanted["app"].add(trigger["app_id"])
+    out: dict[str, str] = {}
+    for model, ids in ((DataSource, wanted["source"]), (Workflow, wanted["workflow"]), (App, wanted["app"])):
+        if ids:
+            out |= dict((await session.execute(select(model.id, model.name).where(model.id.in_(ids)))).all())
+    return out
+
+
+def _trigger_text(row: Schedule, names: dict[str, str]) -> str:
+    trigger = row.trigger if isinstance(row.trigger, dict) else {}
+    subject = triggers.subject_of(trigger)
+    stored = (trigger.get("subject_name") if isinstance(trigger.get("subject_name"), str) else None)
+    return triggers.describe(trigger, names.get(subject) or stored, app_name=names.get(trigger.get("app_id") or ""))
+
+
 def _webhook_out(row: Schedule) -> dict[str, Any] | None:
     if not row.webhook_url:
         return None
@@ -364,6 +433,15 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
             return None
         raw = f.inputs if isinstance(f.inputs, dict) else {}
         return {key: raw[key] for key in ("steps", "jobs", "skipped") if key in raw}
+
+    def event_of(f: ScheduleFire) -> dict[str, Any] | None:
+        """事件触发的那几次（派发的、事件触发任务的立即运行）：事件的说明（scheduler/outbox.EventFire.brief），没有为 null。"""
+        raw = f.inputs.get("event") if isinstance(f.inputs, dict) and f.schedule_id not in maintenance else None
+        if not isinstance(raw, dict):
+            return None
+        # windows / periods 只在几个过了宽限的窗口合成一条跳过时有：合了几个窗口、合掉的期次（上传表格）
+        return {key: raw.get(key) for key in ("event", "subject_id", "subject_name", "text", "merged", "first_at",
+                                              "last_at", "depth", "sample", "real", "windows", "periods")}
 
     compared = {f.id: f.compare_artifact for f in fires if f.compare_artifact and f.run_id}
     compares = await auto_compare.briefs(list(compared.values()))
@@ -405,6 +483,8 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
         # 目标是评测题集时这一次触发建的那次评测（没有运行 id）
         "eval_run_id": f.eval_run_id,
         "inputs": inputs_of(f),
+        # 事件触发的那几次：事件的说明（种类、对象、给人看的一句、合并了几次、触发深度、是不是立即运行的示例）
+        "event": event_of(f),
         "reason": None if f.id in launching else f.reason,
         "notified": notified.get(f.id, []),
         "compare": compare_of(f),
@@ -430,6 +510,16 @@ async def _schedule_outs(session: AsyncSession, rows: list[Schedule]) -> list[di
             ScheduleFire.schedule_id == newest.c.schedule_id, ScheduleFire.created_at == newest.c.at)))).scalars())
         for out, fire in zip(await _fire_outs(session, fires), fires):
             last.setdefault(fire.schedule_id, out)
+    trigger_names = await _trigger_names(session, rows) if rows else {}
+    states: dict[str, dict[str, Any]] = {}
+    if any(_event_kind(r) for r in rows):
+        from app import scheduler
+
+        on = scheduler.scheduler_enabled()
+        for r in rows:
+            if _event_kind(r):
+                states[r.id] = {**await outbox.pending_for(session, r), "scheduler_on": on}
+
     def target(r: Schedule) -> dict[str, Any]:
         kind, target_id = service.target_of(r)
         name = names.get(r.workflow_id) if kind == "workflow" else targets.get(r.id)
@@ -437,10 +527,20 @@ async def _schedule_outs(session: AsyncSession, rows: list[Schedule]) -> list[di
         return {"target_kind": kind, "target_id": target_id, "target_label": service.TARGET_LABEL.get(kind, kind),
                 "target_name": name or r.workflow_name, "target_exists": name is not None}
 
+    def trigger(r: Schedule) -> dict[str, Any]:
+        """触发方式：cron 的 trigger、trigger_text、trigger_state 为 null；事件触发的给规范化后的触发条件、说法、在等的事件。"""
+        if not _event_kind(r):
+            return {"trigger_kind": "cron", "trigger": None, "trigger_text": None, "trigger_state": None}
+        # subject_name 是保存时记下的对象名（对象删掉之后界面写它）；带回来时不认（triggers.normalize）
+        stored = dict(r.trigger or {}) if isinstance(r.trigger, dict) else {}
+        return {"trigger_kind": "event", "trigger": stored, "trigger_text": _trigger_text(r, trigger_names),
+                "trigger_state": states.get(r.id)}
+
     return [{
         "id": r.id,
         "name": r.name,
         **target(r),
+        **trigger(r),
         "workflow_id": r.workflow_id,
         # 工作流还在就给它现在的名字；删掉之后用保存时记下的那一份。非工作流目标这一项是目标的名字（同 target_name）
         "workflow_name": names.get(r.workflow_id) or targets.get(r.id) or r.workflow_name,
@@ -454,7 +554,7 @@ async def _schedule_outs(session: AsyncSession, rows: list[Schedule]) -> list[di
         "webhook": _webhook_out(r),
         "next_run_at": _iso(r.next_run_at),
         "last_fire": last.get(r.id),
-        "description_text": _description(r),
+        "description_text": _trigger_text(r, trigger_names) if _event_kind(r) else _description(r),
         "created_by": r.created_by,
         "created_at": _iso(r.created_at),
         "updated_at": _iso(r.updated_at),
@@ -479,11 +579,54 @@ async def _get(session: AsyncSession, schedule_id: str) -> Schedule:
 
 
 @router.get("/variables")
-async def list_variables(tz: str | None = Query(default=None, alias="timezone")) -> list[dict[str, str]]:
+async def list_variables(tz: str | None = Query(default=None, alias="timezone"), trigger_kind: str | None = None,
+                         event: str | None = None) -> list[dict[str, str]]:
     """输入模板能用的变量：[{name, label, example, note}]。示例按现在这一刻、timezone（默认 Asia/Shanghai）触发算；
-    note 是补充说明（ISO 周的跨年规则），没有的是空串。"""
+    note 是补充说明（ISO 周的跨年规则），没有的是空串。trigger_kind=event 时按 event（事件种类）另给 {{ event.* }}、去掉
+    上一次计划触发时间。"""
     zone = _timezone(tz) if tz is not None else service.DEFAULT_TIMEZONE
-    return service.variables(tz=zone)
+    if trigger_kind is None or _trigger_kind(trigger_kind) == "cron":
+        return service.variables(tz=zone)
+    if event not in triggers.EVENTS:
+        raise _invalid("请指明事件种类：上传表格出了新的一期、上游工作流运行成功结束、数据源有要处理的变化", "trigger")
+    return service.variables(tz=zone, event=event)
+
+
+@router.get("/trigger-options")
+async def trigger_options(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """新建、修改事件触发任务时能选的：每种事件的对象（能不能选、为什么不能，由这里判，界面不自己判）、「只认某种来源」的
+    来源、「只认某个应用」的应用、去抖的缺省值、触发链的上限。
+
+    {events: [{event, label, subject_label, objects: [{id, name, ok, reason}]}], origins: [{kind, label}],
+     apps: [{id, name}], default_debounce_s, max_debounce_s, max_depth}"""
+    from app.db.models import App, DataSource
+
+    sources = list((await session.execute(select(DataSource).order_by(DataSource.name))).scalars())
+    flows = list((await session.execute(select(Workflow).where(Workflow.is_template.is_(False))
+                                        .order_by(Workflow.name))).scalars())
+    tables = []
+    for src in sources:
+        if (src.origin or "manual") != "upload":
+            continue
+        ok = await triggers.accumulating(session, src)
+        tables.append({"id": src.id, "name": src.name, "ok": ok,
+                       "reason": None if ok else "每次上传替换整张表，没有「新的一期」：要用这个事件请在导入设置里改为按期累积"})
+    objects = {
+        "table.version": tables,
+        "workflow.finished": [{"id": w.id, "name": w.name, "ok": bool(w.published_version),
+                               "reason": None if w.published_version else "还没有发布版本：只有正式运行成功结束才算事件"}
+                              for w in flows],
+        "source.changed": [{"id": src.id, "name": src.name, "ok": True, "reason": None} for src in sources],
+    }
+    apps = (await session.execute(select(App.id, App.name).where(App.status != "archived").order_by(App.name))).all()
+    return {
+        "events": [{"event": e, "label": triggers.EVENT_LABEL[e], "subject_label": triggers.SUBJECT_LABEL[e],
+                    "objects": objects[e]} for e in triggers.EVENTS],
+        "origins": [{"kind": k, "label": triggers.ORIGIN_LABEL[k]} for k in triggers.FORMAL_ORIGINS],
+        "apps": [{"id": i, "name": n} for i, n in apps],
+        "default_debounce_s": triggers.DEFAULT_DEBOUNCE_S, "max_debounce_s": triggers.MAX_DEBOUNCE_S,
+        "max_depth": triggers.MAX_DEPTH,
+    }
 
 
 @router.post("/preview")
@@ -491,29 +634,62 @@ async def preview(request: Request, session: AsyncSession = Depends(get_session)
     """{cron, timezone, input_template?, workflow_id?, n?=5} → {description_text, next: [ISO（UTC）…], inputs}。
 
     inputs 是按下一次触发渲染的输入。带了 workflow_id 时对照入口字段的名字；必填项没填不在这里报——用户还在填。
+
+    trigger_kind=event 时带 trigger、不带 cron：description_text 是触发说明，next 为空，inputs 按一个示例事件渲染（对象最近
+    一次真实的事件，没有时是示例值），另给 event {text, real}。
     """
     body = await _body(request)
+    if _trigger_kind(body.get("trigger_kind", "cron")) == "event":
+        return await _preview_event(session, body)
     cron_expr, tz = _cron(body.get("cron")), _timezone(body.get("timezone"))
     template = _template(body.get("input_template"))
     n = body.get("n", 5)
     n = min(max(n, 1), MAX_PREVIEW) if isinstance(n, int) and not isinstance(n, bool) else 5
-    workflow_id = body.get("workflow_id")
-    if isinstance(workflow_id, str) and workflow_id.strip():
-        workflow = await session.get(Workflow, workflow_id.strip())
-        if workflow is not None:
-            # 还不知道按哪一类运行：发布版本和画布的字段都认
-            published = await _published_graph(session, workflow) if workflow.published_version else None
-            fields = service.input_fields(workflow.graph) + service.input_fields(published)
-            try:
-                service.check_fields(template, fields, workflow.name, require=False)
-            except service.TemplateError as e:
-                raise _invalid(str(e), "input_template") from e
+    await _preview_fields(session, body, template)
     upcoming = cron.preview(cron_expr, tz, n)
     first = upcoming[0] if upcoming else utcnow()
     return {
         "description_text": cron.describe(cron_expr, tz),
         "next": [_iso(m) for m in upcoming],
         "inputs": service.render_inputs(template, service.template_values(first, tz, cron_expr)),
+    }
+
+
+async def _preview_fields(session: AsyncSession, body: dict[str, Any], template: dict[str, str]) -> None:
+    """预览时带了 workflow_id：对照入口字段的名字（发布版本和画布的字段都认，还不知道按哪一类运行）。"""
+    workflow_id = body.get("workflow_id")
+    if not (isinstance(workflow_id, str) and workflow_id.strip()):
+        return
+    workflow = await session.get(Workflow, workflow_id.strip())
+    if workflow is None:
+        return
+    published = await _published_graph(session, workflow) if workflow.published_version else None
+    fields = service.input_fields(workflow.graph) + service.input_fields(published)
+    try:
+        service.check_fields(template, fields, workflow.name, require=False)
+    except service.TemplateError as e:
+        raise _invalid(str(e), "input_template") from e
+
+
+async def _preview_event(session: AsyncSession, body: dict[str, Any]) -> dict[str, Any]:
+    if not _blank(body.get("cron")):
+        raise _invalid(EVENT_NO_CRON, "cron")
+    tz = _timezone(body.get("timezone", service.DEFAULT_TIMEZONE))
+    trigger = _trigger(body.get("trigger"))
+    template = _template(body.get("input_template"), trigger["event"])
+    await _preview_fields(session, body, template)
+    try:
+        checked = await triggers.check(session, trigger)
+    except triggers.TriggerError as e:
+        raise _invalid(str(e), e.field) from e
+    sample = await triggers.sample(session, trigger)
+    fire = outbox.sample_fire(sample, tz)
+    now = utcnow().replace(microsecond=0)
+    return {
+        "description_text": triggers.describe(trigger, checked.subject_name, app_name=checked.app_name),
+        "next": [],
+        "inputs": service.render_inputs(template, service.template_values(now, tz, ""), event=fire.values),
+        "event": {"text": fire.text, "real": sample.real},
     }
 
 
@@ -540,7 +716,12 @@ def schedule_values(body: dict[str, Any]) -> dict[str, Any]:
     不碰库：发布单的预检用它「只检查」，建任务的接口和发布单建任务都先过它。
 
     target_kind 缺省 workflow：交回的键和以前一字不差。非工作流目标交回 target_kind、target_id，运行类别存探索（不用它）、
-    输入模板为空、没有 Webhook。"""
+    输入模板为空、没有 Webhook。
+
+    trigger_kind 缺省 cron：同上一字不差。event 时目标只能是工作流，不写 cron（存空串），时区缺省 Asia/Shanghai（日期变量按它算），
+    另交回 trigger_kind、trigger（规范化之后的触发条件），输入模板按事件种类核对。"""
+    if _trigger_kind(body.get("trigger_kind", "cron")) == "event":
+        return _event_values(body)
     kind = _target_kind(body.get("target_kind", "workflow"))
     if kind != "workflow":
         _target_extras(body, kind)
@@ -555,6 +736,29 @@ def schedule_values(body: dict[str, Any]) -> dict[str, Any]:
               "input_template": _template(body.get("input_template")),
               "enabled": _enabled(body.get("enabled", True)), "overlap": _overlap(body.get("overlap", "skip")),
               "misfire_grace_s": _grace(body.get("misfire_grace_s", DEFAULT_GRACE_S))}
+    return {**values, "webhook": _new_webhook(body.get("webhook"))}
+
+
+#: 事件触发的任务不写 cron
+EVENT_NO_CRON = "事件触发的定时任务不写 cron 表达式：它在事件发生时触发，不按时间"
+#: 事件触发只能指向工作流
+EVENT_WORKFLOW_ONLY = "事件触发的定时任务只能指向工作流：评测题集、数据源维护请用定时触发"
+
+
+def _event_values(body: dict[str, Any]) -> dict[str, Any]:
+    """事件触发任务的请求体 → 规范化之后的列（同 schedule_values，不碰库）。"""
+    if _target_kind(body.get("target_kind", "workflow")) != "workflow":
+        raise _invalid(EVENT_WORKFLOW_ONLY, "target_kind")
+    if not _blank(body.get("cron")):
+        raise _invalid(EVENT_NO_CRON, "cron")
+    trigger = _trigger(body.get("trigger"))
+    values = {"name": _name(body.get("name")), "workflow_id": _workflow_id(body.get("workflow_id")), "cron": "",
+              "timezone": _timezone(body.get("timezone", service.DEFAULT_TIMEZONE)),
+              "run_class": _run_class(body.get("run_class", "formal")),
+              "input_template": _template(body.get("input_template"), trigger["event"]),
+              "enabled": _enabled(body.get("enabled", True)), "overlap": _overlap(body.get("overlap", "skip")),
+              "misfire_grace_s": _grace(body.get("misfire_grace_s", DEFAULT_GRACE_S)),
+              "trigger_kind": "event", "trigger": trigger}
     return {**values, "webhook": _new_webhook(body.get("webhook"))}
 
 
@@ -591,10 +795,17 @@ async def create_schedule_row(session: AsyncSession, body: dict[str, Any], *, ac
         await session.refresh(row)
         return row
     workflow = await _check_workflow(session, values["workflow_id"], values["run_class"], values["input_template"])
+    next_run_at = None
+    if values.get("trigger_kind") == "event":
+        # 事件触发：核对对象、查环；记下对象现在的名字（对象删掉之后说法里用它）。没有下一次「到点」
+        checked = await _check_trigger(session, values["trigger"], schedule_id=None,
+                                       target_workflow_id=values["workflow_id"])
+        values["trigger"] = {**values["trigger"], "subject_name": checked.subject_name}
+    else:
+        next_run_at = service.next_run(values["cron"], values["timezone"], values["enabled"])
     # 目标的几列只经 scheduler/service 的一处封装写（工作流目标：target_id 同 workflow_id）
     values |= service.target_columns("workflow", values["workflow_id"])
-    row = Schedule(**values, workflow_name=workflow.name,
-                   next_run_at=service.next_run(values["cron"], values["timezone"], values["enabled"]),
+    row = Schedule(**values, workflow_name=workflow.name, next_run_at=next_run_at,
                    created_by=actor, **_webhook_columns(hook))
     session.add(row)
     await session.commit()
@@ -630,8 +841,13 @@ async def update_schedule(schedule_id: str, request: Request,
     kind, current_target = service.target_of(row)
     if "target_kind" in body and _target_kind(body["target_kind"]) != kind:
         raise _invalid("定时任务的目标种类建好之后不能改：请新建一个定时任务", "target_kind")
+    event = _event_kind(row)
+    if "trigger_kind" in body and _trigger_kind(body["trigger_kind"]) != ("event" if event else "cron"):
+        raise _invalid("定时任务的触发方式建好之后不能改：请新建一个定时任务", "trigger_kind")
     if kind != "workflow":
         return await _update_target_schedule(session, row, body, kind, current_target, version)
+    if event:
+        return await _update_event_schedule(session, row, body, version)
     if "name" in body:
         values["name"] = _name(body["name"])
     if "workflow_id" in body:
@@ -676,6 +892,60 @@ async def update_schedule(schedule_id: str, request: Request,
     if result.rowcount != 1:
         await session.rollback()
         raise HTTPException(409, "这个定时任务刚被别人修改过，请刷新后再保存")
+    await session.commit()
+    session.expire_all()
+    return await _schedule_out(session, await _get(session, schedule_id))
+
+
+async def _update_event_schedule(session: AsyncSession, row: Schedule, body: dict[str, Any],
+                                 version: int) -> dict[str, Any]:
+    """改一个事件触发的定时任务：名称、目标工作流、运行类别、输入模板、触发条件、时区、启用、重叠、补发宽限、Webhook。cron 不适用
+    （整份表单带回来的空串不算）；下一次触发一直为空。看值变没变（同 update_schedule）：触发条件、目标真改了才重新核对对象、查环，
+    模板、事件种类、目标、运行类别真改了才按改后的组合核对模板和入口字段。"""
+    if "cron" in body and not _blank(body["cron"]):
+        raise _invalid(EVENT_NO_CRON, "cron")
+    values: dict[str, Any] = {}
+    stored = dict(row.trigger or {}) if isinstance(row.trigger, dict) else {}
+    current = {k: v for k, v in stored.items() if k != "subject_name"}
+    trigger = _trigger(body["trigger"]) if "trigger" in body else current
+    if "name" in body:
+        values["name"] = _name(body["name"])
+    if "workflow_id" in body:
+        values |= service.target_columns("workflow", _workflow_id(body["workflow_id"]))
+    for key, check in (("timezone", _timezone), ("run_class", _run_class), ("enabled", _enabled),
+                       ("overlap", _overlap), ("misfire_grace_s", _grace)):
+        if key in body:
+            values[key] = check(body[key])
+    if "input_template" in body:
+        values["input_template"] = _template(body["input_template"], trigger.get("event"))
+    if "webhook" in body:
+        values |= _patched_webhook(row, body["webhook"])
+
+    def merged(key: str) -> Any:
+        return values.get(key, getattr(row, key))
+
+    def changed(key: str) -> bool:
+        if key not in values:
+            return False
+        return values[key] != (dict(getattr(row, key) or {}) if key == "input_template" else getattr(row, key))
+
+    trigger_changed = trigger != current
+    if trigger_changed or changed("workflow_id"):
+        checked = await _check_trigger(session, trigger, schedule_id=row.id, target_workflow_id=merged("workflow_id"))
+        values["trigger"] = {**trigger, "subject_name": checked.subject_name}
+    if trigger_changed and "input_template" not in values:
+        # 换了事件种类：原来的模板里的 {{ event.* }} 不一定还认
+        values["input_template"] = _template(dict(row.input_template or {}), trigger.get("event"))
+    if changed("workflow_id") or changed("run_class") or changed("input_template") or trigger_changed:
+        workflow = await _check_workflow(session, merged("workflow_id"), merged("run_class"), merged("input_template"))
+        values["workflow_name"] = workflow.name
+    result = await session.execute(
+        update(Schedule).where(Schedule.id == row.id, Schedule.version == version)
+        .values(**values, version=version + 1).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(409, "这个定时任务刚被别人修改过，请刷新后再保存")
+    schedule_id = row.id
     await session.commit()
     session.expire_all()
     return await _schedule_out(session, await _get(session, schedule_id))
@@ -740,7 +1010,8 @@ async def set_enabled(session: AsyncSession, row: Schedule, enabled: bool) -> Sc
         return row
     await session.execute(
         update(Schedule).where(Schedule.id == row.id)
-        .values(enabled=enabled, next_run_at=_next_after_edit(row, row.cron, row.timezone, enabled),
+        .values(enabled=enabled,
+                next_run_at=None if _event_kind(row) else _next_after_edit(row, row.cron, row.timezone, enabled),
                 version=row.version + 1).execution_options(synchronize_session=False))
     await session.commit()
     # 只重读这一行：调用方（发布单）同一个会话里还拿着别的对象，不能整个会话过期
@@ -787,9 +1058,16 @@ async def run_now(schedule_id: str, session: AsyncSession = Depends(get_session)
     发布版本发起。运行记在点按钮的人名下，没有署名时记在「定时任务：<名字>」名下。返回 {fire, run_id}；目标是评测题集的，
     发起的是一次评测，fire.eval_run_id 是它，run_id 为空。
 
-    触发时间取到秒：连点两下落在同一秒的，交回同一条触发记录，不会发起两次。"""
-    await _get(session, schedule_id)
-    fire = await service.fire_once(schedule_id, utcnow().replace(microsecond=0), "manual", actor=actor_of(x_actor))
+    触发时间取到秒：连点两下落在同一秒的，交回同一条触发记录，不会发起两次。
+
+    事件触发的任务按示例事件发起（scheduler/triggers.sample：对象最近一次真实的事件）：运行来源里记 trigger（sample=true），
+    触发链从这里起算。对象还没发生过这种事件、模板又用到 {{ event.* }} 的照实记一次未能发起。"""
+    row = await _get(session, schedule_id)
+    event = None
+    if _event_kind(row) and isinstance(row.trigger, dict):
+        event = outbox.sample_fire(await triggers.sample(session, row.trigger), row.timezone)
+    fire = await service.fire_once(schedule_id, utcnow().replace(microsecond=0), "manual", actor=actor_of(x_actor),
+                                   event=event)
     if fire is None:
         raise HTTPException(404, _GONE)
     return {"fire": (await _fire_outs(session, [fire]))[0], "run_id": fire.run_id}

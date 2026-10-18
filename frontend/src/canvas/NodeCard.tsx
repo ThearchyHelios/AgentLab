@@ -561,7 +561,11 @@ function readingOf({ state, view, type, config, skewMs, timed, fanIn, facts, sin
     }
     case 'rejected':
       // 被人驳回（node.failed 带 reason=rejected）：人的决定，不是失败。状态字已经写了「被驳回」，槽里写原话的第一句
-      // （「人工驳回：数字对不上」），整句放悬停；不按失败去归类、讲处理建议
+      // （「人工驳回：数字对不上」），整句放悬停；不按失败去归类、讲处理建议。接了「驳回」出口的（node.finished 带
+      // outcome=rejected，n.exited）这一步照常结束、运行接着走：槽里写转到了哪几步
+      if (n?.exited) {
+        return { main: formatDuration(n.lastDurationMs ?? runtime?.durationMs), note: REJECTED_TEXT.exitCard(n.exitTo ?? []) }
+      }
       return {
         main: formatDuration(n?.lastDurationMs ?? runtime?.durationMs),
         note: error ? firstSentence(error) : REJECTED_TEXT.card,

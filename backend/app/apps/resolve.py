@@ -290,7 +290,11 @@ async def _from_text(session: AsyncSession, source: Source) -> str:
             n = await session.scalar(select(func.count(Run.id)).where(
                 Run.schedule_id == run.schedule_id, Run.created_at <= run.created_at))
         name = schedule.name if schedule is not None else "已删除的定时任务"
-        return f"定时任务「{name}」第 {int(n or 1)} 次"
+        # 由数据事件触发的（scheduler/outbox：运行来源里记着 trigger）照实写是什么事件；立即运行按示例事件发起的不算
+        trigger = (run.origin or {}).get("trigger") if isinstance(run.origin, dict) else None
+        event = isinstance(trigger, dict) and trigger.get("text") and not trigger.get("sample")
+        lead = f"由事件触发：{trigger['text']}，" if event else ""
+        return f"{lead}定时任务「{name}」第 {int(n or 1)} 次"
     return "正式运行"
 
 
@@ -1503,6 +1507,12 @@ class _Trail:
     tasks: list[Any] = field(default_factory=list)
     actions: list[Any] = field(default_factory=list)
     events: list[tuple[str, str]] = field(default_factory=list)
+    #: 走了「驳回」出口、而且最后一次执行就是走的驳回出口的关卡：节点 id → 那条 node.finished 的数据（outcome=rejected，
+    #: 带 to：转到哪几步。engine/compiler._rejected_exit）。退回修改之后又批准了的不算：结局是批准
+    rejected_out: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 终态事件（run.failed / run.cancelled）上记的出错、被驳回的那一步：节点 id → 名字。子工作流里的那一步（「sub/x」）
+    #: 不在运行的图上，名字只有这里有（runner._label_of 接好的「子工作流 › x」）
+    end_labels: dict[str, str] = field(default_factory=dict)
 
 
 async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
@@ -1528,7 +1538,71 @@ async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
                 .order_by(RunEvent.seq))).all():
             if node_id:
                 out[run_id].events.append((etype, node_id))
+        await _rejected_exits(session, [r for r in runs if r.status == "succeeded"], out)
+        ended = [r.id for r in runs if r.status in ("failed", "cancelled")]
+        if ended:
+            for run_id, data in (await session.execute(select(RunEvent.run_id, RunEvent.data).where(
+                    RunEvent.run_id.in_(ended), RunEvent.type.in_(("run.failed", "run.cancelled"))))).all():
+                if isinstance(data, dict) and data.get("node_id") and isinstance(data.get("label"), str) and data["label"]:
+                    out[run_id].end_labels[str(data["node_id"])] = data["label"]
     return out
+
+
+async def end_label(session: AsyncSession, run: Run) -> str | None:
+    """运行结束在哪一步的名字，照终态事件（run.failed / run.cancelled）上记的 label：子工作流里的那一步写「子工作流 › x」。
+    图上找不到这一步（id 是「sub/x」）的地方都用它，和实例页、通知（run_node_label）同一个说法；没记的为 None。"""
+    if not run.error_node_id:
+        return None
+    data = await session.scalar(select(RunEvent.data).where(
+        RunEvent.run_id == run.id, RunEvent.type.in_(("run.failed", "run.cancelled"))).order_by(RunEvent.seq.desc()).limit(1))
+    if isinstance(data, dict) and data.get("node_id") == run.error_node_id and isinstance(data.get("label"), str):
+        return data["label"] or None
+    return None
+
+
+def run_node_label(run: Run, trail: _Trail, node_id: str) -> str:
+    """运行里一个节点给人看的名字：运行的图上的标题；图上没有的（子工作流里的那一步「sub/x」）用终态事件上记的名字
+    （「子工作流 › x」）；都没有的照旧写 id。实例页、通知（notify/service）说同一个名字。"""
+    from app.apps.tree import node_map
+
+    found = (node_map(run.graph).get(node_id) or {}).get("title")
+    return found or trail.end_labels.get(node_id) or node_id
+
+
+async def _rejected_exits(session: AsyncSession, runs: list[Run], out: dict[str, _Trail]) -> None:
+    """成功结束、途经驳回出口的运行（run.finished 带 rejected_via，engine/runner._rejected_via）：每个走过驳回出口的关卡，
+    最后一次执行是不是走的驳回出口（退回修改之后又批准的，结局是批准）。只翻途经驳回的运行里那几个关卡的 node.finished。"""
+    ids = [r.id for r in runs]
+    if not ids:
+        return
+    gates: dict[str, set[str]] = {}
+    for run_id, data in (await session.execute(select(RunEvent.run_id, RunEvent.data).where(
+            RunEvent.run_id.in_(ids), RunEvent.type == "run.finished"))).all():
+        via = data.get("rejected_via") if isinstance(data, dict) else None
+        names = {str(v.get("node_id")) for v in via or [] if isinstance(v, dict) and v.get("node_id")}
+        if names:
+            gates[run_id] = names
+    if not gates:
+        return
+    wanted = sorted({n for names in gates.values() for n in names})
+    for run_id, node_id, data in (await session.execute(select(RunEvent.run_id, RunEvent.node_id, RunEvent.data).where(
+            RunEvent.run_id.in_(list(gates)), RunEvent.type == "node.finished", RunEvent.node_id.in_(wanted))
+            .order_by(RunEvent.seq))).all():
+        if node_id not in gates[run_id]:
+            continue
+        if isinstance(data, dict) and data.get("outcome") == "rejected":
+            out[run_id].rejected_out[node_id] = data
+        else:
+            out[run_id].rejected_out.pop(node_id, None)
+
+
+def rejected_exit_text(data: dict[str, Any]) -> str:
+    """走驳回出口的那一步怎么说：「被驳回，转到「通知申请人」」；动作确认写「未确认（被驳回），转到…」，超时驳回写「超时驳回，
+    转到…」。转到哪几步取 node.finished 上记的 to（图上的名字）。"""
+    head = "未确认（被驳回）" if data.get("kind") == "action_confirm" and data.get("decision") == "reject" \
+        else "超时驳回" if data.get("decision") == "expired_reject" else "被驳回"
+    to = [str(t.get("label") or t.get("node_id")) for t in data.get("to") or [] if isinstance(t, dict)]
+    return f"{head}，转到{'、'.join(f'「{t}」' for t in to)}" if to else head
 
 
 def _decision(trail: _Trail, node_id: str) -> tuple[str | None, str | None]:
@@ -1545,15 +1619,18 @@ _REJECTIONS = ("reject", "expired_reject")
 
 
 def rejected_outputs(graph: Any) -> dict[str, set[str]]:
-    """成果节点 → 从哪几个人工节点的「驳回」出口一路走到它（中间不经过别的人工节点：再遇到人工节点，结局由那一个人
-    的决定说了算）。按图认，不按成果节点的标题猜。"""
+    """成果节点 → 从哪几个关卡（人工节点，以及接了「驳回」出口的调用工具、沙箱代码、双盲复算，engine/schema.GATE_TYPES）
+    的「驳回」出口一路走到它（中间不经过别的人工节点：再遇到人工节点，结局由那一个人的决定说了算）。按图认，不按成果
+    节点的标题猜。"""
     from app.apps.tree import node_map
+    from app.engine.schema import GATE_TYPES
 
+    gate_types = {str(t) for t in GATE_TYPES}
     nodes = node_map(graph)
     edges = [e for e in (graph or {}).get("edges") or [] if isinstance(e, dict)]
     out: dict[str, set[str]] = {}
     for gate in (e for e in edges if e.get("sourceHandle") == REJECTED_HANDLE
-                 and (nodes.get(str(e.get("source"))) or {}).get("type") == "human"):
+                 and (nodes.get(str(e.get("source"))) or {}).get("type") in gate_types):
         seen: set[str] = set()
         todo = [str(gate.get("target"))]
         while todo:
@@ -1594,7 +1671,8 @@ def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
     - 走完了：图里有几个成果节点（分支的几种结局，如「已通过」「已退回」）、恰好走到了其中一个的，写走到的那一个；只有
       一个成果节点的、几个成果节点并行都走到了的（「周报」「明细」一起出）写「已完成」——那不是哪一种结局。走到的是
       否定的那种结局——这次运行里人工节点驳回了、从它的「驳回」出口一路走到的成果节点（rejected_outputs）——code 记
-      cancelled（同「未确认（被驳回）」，是人的决定，不画成成功），文字照旧写成果节点的标题；
+      cancelled（同「未确认（被驳回）」，是人的决定，不画成成功），文字照旧写成果节点的标题；别的走了关卡「驳回」出口、
+      最后一次就是走的驳回出口的（_Trail.rejected_out），写「「x」被驳回，转到「y」」，code 同样记 cancelled；
     - 停着：有已发出、结果未知的动作，写「等待核实写入结果」；否则按在等的待办说（等待审批、等待确认发送……）；
     - 被驳回（cancelled + end_reason=rejected，engine/context.NodeRejected）：动作确认被驳回写「「付款」未确认（被驳回）」，
       审批设了驳回即终止、补充输入被驳回等写「「x」被驳回」，code 记 cancelled；手动停止的写「已取消」；
@@ -1607,7 +1685,7 @@ def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
     nodes = node_map(run.graph)
 
     def title(node_id: str) -> str:
-        return (nodes.get(node_id) or {}).get("title") or node_id
+        return (nodes.get(node_id) or {}).get("title") or trail.end_labels.get(node_id) or node_id
 
     if run.status == "interrupted":
         if any(a.state in ("sent", "unknown") for a in trail.actions):
@@ -1621,8 +1699,13 @@ def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
         reached = [nid for etype, nid in trail.events if etype == "node.finished" and nid in outputs]
         if len(outputs) > 1 and len(set(reached)) == 1:
             gates = rejected_outputs(run.graph).get(reached[0], set())
-            negative = any(_decision(trail, gate)[1] in _REJECTIONS for gate in gates)
+            # 驳回了：按待办的结论认（人工节点），或者这一步最后一次就是走的驳回出口（工具调用审批、代码执行审批没开待办）
+            negative = any(_decision(trail, gate)[1] in _REJECTIONS or gate in trail.rejected_out for gate in gates)
             return {"code": "cancelled" if negative else "succeeded", "text": title(reached[0])}
+        if trail.rejected_out:
+            # 走了「驳回」出口（总方案 §3）：运行照驳回那条路结束，照实说被驳回、转到了哪一步；是人的决定，不画成成功
+            node_id, data = list(trail.rejected_out.items())[-1]
+            return {"code": "cancelled", "text": f"「{title(node_id)}」{rejected_exit_text(data)}"}
         return {"code": "succeeded", "text": STATUS_TEXT["succeeded"]}
     if run.status == "cancelled" and run.end_reason == "rejected":
         failed = [nid for etype, nid in trail.events if etype == "node.failed"]
@@ -1745,8 +1828,11 @@ async def _timeline(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
     #: 被驳回的那一步：node.failed 上带着 reason=rejected 和结论（engine/compiler，总方案 X9）。工具调用审批、代码执行审批
     #: 这类驳回没开待办，以前只能落成「失败」；老运行的 node.failed 没有 reason，照旧按待办认
     rejected: dict[str, dict[str, Any]] = {}
+    #: 走了「驳回」出口的那一步：node.finished 带 outcome=rejected（engine/compiler._rejected_exit），节点照常结束
+    exits: dict[str, dict[str, Any]] = {}
     for etype, node_id, ts, data in rows:
-        if not node_id:
+        if not node_id or (node_id not in titles and "/" in node_id):
+            # 子工作流里的那几步（节点 id 带「子工作流节点 id/」前缀）：实例进度只说这张图上的步骤，子工作流算一步
             continue
         step = steps.setdefault(node_id, {"node": node_id, "title": titles.get(node_id, node_id), "state": "running",
                                           "started_at": datetime.fromtimestamp(ts, timezone.utc).isoformat()})
@@ -1756,6 +1842,9 @@ async def _timeline(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
             rejected[node_id] = data
         elif etype == "node.started":
             rejected.pop(node_id, None)
+            exits.pop(node_id, None)
+        if etype == "node.finished" and isinstance(data, dict) and data.get("outcome") == "rejected":
+            exits[node_id] = data
     for node_id, step in steps.items():
         text = None
         record = next((a for a in reversed(trail.actions) if a.node_id == node_id), None)
@@ -1764,6 +1853,8 @@ async def _timeline(session: AsyncSession, ctx: _Page) -> dict[str, Any]:
         said = rejected.get(node_id) if step["state"] == "failed" else None
         if record is not None and record.state in ("sent", "unknown"):
             step["state"] = "unknown"
+        elif step["state"] == "done" and node_id in exits:
+            step["state"], text = "rejected", rejected_exit_text(exits[node_id])
         elif said is not None:
             step["state"] = "rejected"
             text = "未确认（被驳回）" if said.get("kind") == "action_confirm" and said.get("decision") == "reject" \

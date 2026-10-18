@@ -27,6 +27,8 @@ from app.api import (
     blueprints as blueprints_api, copilot_blueprint, files as files_api, personal as personal_api,
     templates as templates_api,
 )
+# 编排完善第 1 波（docs/design/orchestration-round §1）：问数据的一轮在服务端跑
+from app.api import chat_turns as chat_turns_api
 from app.api.coded import CodedHTTPException, coded_handler
 from app.api.deps import chat_scope, evidence_scope, private_run_scope, require_role, role_by_method, run_scope
 from app.auth.keys import key_gate
@@ -132,6 +134,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         logger.exception("评测任务的启动整理失败，服务照常启动")
 
     await run_manager.setup()
+    # 问数据的一轮（app/chat/job.py）：在 run_manager 之后整理——服务重启时在跑的运行这时已经标成挂起。还在建图的标中断；
+    # 已经发起了运行的接着等它、照常复核收尾（和调度循环同一个开关：拷来的数据目录不替人调模型，等人打开对话时再接着收尾）
+    from app.chat import job as chat_job
+
+    try:
+        await chat_job.startup()
+    except Exception:  # noqa: BLE001
+        logger.exception("问数据的启动整理失败，服务照常启动")
     # 流程：存量的待审批补建待办（派给任何人，幂等）；上次进程没了时已发出、没拿到结果的写入收成结果未知、安排核实
     from app.process import actions as _actions, tasks as _tasks
 
@@ -163,6 +173,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await catalog_jobs.manager.shutdown()
         await catalog_profile_jobs.manager.shutdown()
         await introspect_jobs.manager.shutdown()
+        # 问数据的一轮停下不改那几行（下次启动照重启的规矩整理），也要在运行之前停
+        await chat_job.shutdown()
         # 评测要在运行之前停：它停下时会取消自己发起的作答、算期望的运行，再标中断
         await eval_runner.shutdown()
         await eval_snapshots.manager.shutdown()
@@ -262,6 +274,8 @@ for router, guard in (
     (sandbox.router, _BUILDER),
     (copilot.router, [chat_scope]),
     (conversations.router, [chat_scope]),
+    # 问数据的一轮（发起、看、停）：同问数据的门，接口里再按这一轮所属的对话核对归属
+    (chat_turns_api.router, [chat_scope]),
     # 工件：user 角色只能取能读的运行引用的、遮罩后的（api/artifacts.py）
     (artifacts.router, _USER),
     (governance.router, _BUILDER),

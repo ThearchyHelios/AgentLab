@@ -14,7 +14,8 @@
 /copilot/review 的结果带 retry_instruction（要重来时是那句话，不重来是 null）。问数据页照后端给的走；老后端没有这两个字段时退回它自己那份同样的
 规则（tests/test_chat_turn_policy.py 逐条对照两边的常量和措辞）。评测（第 3 波）用同一组函数把一轮串起来。
 
-只搬「决定」：重连、断点续看、取消、复核等多久这些仍在问数据页（把整轮编排搬到后端要重做这些，单独立项）。
+整轮编排后来也搬到了服务端（docs/design/orchestration-round §1）：流程在 chat/drive.py（问数据和评测共用），问数据的后台任务在
+chat/job.py；页面只发起、只看，不再自己判这些。老服务端那条退路（页面自己那份规则）随之去掉。
 """
 from __future__ import annotations
 
@@ -50,6 +51,12 @@ RETRY_WITH_BASE = ("这个工作流上一次运行没有成功：{reason}。\n\n
                    "改完继续回答原来的问题：{question}")
 #: 没有图可交回（上一次连图都没建出来）时：原问题后面缀上原因，从零再建
 RETRY_FROM_SCRATCH = "{question}\n\n（上一次没有成功：{reason}。请针对这个原因调整，重新给出完整的工作流。）"
+#: 用户点「重试本轮」时交给助手的话（以前在问数据页 retryTurn 里拼，一轮搬到服务端之后在这里）：有图时说的是「没有给出可用的
+#: 结果」——上一次未必是运行失败（停止了、被驳回、结论不可用都算），原因是那一次的归档说法（chat/record.attempt_reason）；
+#: 没有图的同 RETRY_FROM_SCRATCH
+RETRY_USER_WITH_BASE = ("这个工作流上一次没有给出可用的结果：{reason}。\n\n"
+                        "请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），"
+                        "改完继续回答原来的问题：{question}")
 
 
 def _blockers(final: Mapping[str, Any]) -> list[str]:
@@ -142,12 +149,18 @@ def retry_instruction(question: str, reason: str, has_base: bool) -> str:
     return template.format(question=question, reason=reason)
 
 
+def user_retry_instruction(question: str, reason: str, has_base: bool) -> str:
+    """用户点「重试本轮」时交给助手的话。has_base：有上一次建出的图可以交回去改。"""
+    template = RETRY_USER_WITH_BASE if has_base else RETRY_FROM_SCRATCH
+    return template.format(question=question, reason=reason)
+
+
 def has_nodes(graph: Any) -> bool:
     """一张图有没有节点（有才交回去改）。"""
     return isinstance(graph, Mapping) and bool(graph.get("nodes"))
 
 
 __all__ = ["EMPTY_GENERATION", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_FAIL", "NEXT_READY", "NEXT_REPLY", "NEXT_RETRY",
-           "NEXT_RUN", "NEXT_STEPS", "QUESTION_FIELD", "RETRY_ERRORS", "RETRY_FROM_SCRATCH", "RETRY_WITH_BASE",
-           "blocked_reason", "error_reason", "fill_input", "has_nodes", "next_step", "retry_after_review",
-           "retry_instruction", "review_reason"]
+           "NEXT_RUN", "NEXT_STEPS", "QUESTION_FIELD", "RETRY_ERRORS", "RETRY_FROM_SCRATCH", "RETRY_USER_WITH_BASE",
+           "RETRY_WITH_BASE", "blocked_reason", "error_reason", "fill_input", "has_nodes", "next_step", "retry_after_review",
+           "retry_instruction", "review_reason", "user_retry_instruction"]

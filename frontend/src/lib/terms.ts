@@ -313,6 +313,10 @@ export const EVIDENCE_TEXT = {
   originChipHint: '这个数由口径卡确定性算出、复算一致，但算式用到的输入没有一路追到查询快照',
   /** 按位置取的格穿过了原样解析查询结果的整形节点 */
   through: (label: string) => `经「${label}」原样解析`,
+  /** 读子工作流出口的字段，出处接上子图里的那一格（docs/design/orchestration-round/00-总方案.md §2） */
+  viaSubgraph: (label: string, field: string) => (field ? `经子工作流「${label}」的出口字段「${field}」` : `经子工作流「${label}」`),
+  /** 停在子工作流的入口：子图的运行输入是父图按「输入」模板拼出来的，不是原始数据 */
+  subgraphInput: '子工作流的运行输入',
   /**
    * 转抄另一张口径卡的指标（对账卡、召回卡的「口径」那一项）：出处跨卡往下追，接上那个指标自己的一段，一直到查询格子
    */
@@ -767,6 +771,12 @@ export function runCostText(usd: number | null | undefined, unpriced: number, ap
   if (!known) return null
   return `${(approx || unpriced > 0) && usd > 0 ? '≥ ' : ''}${formatCost(usd)}`
 }
+
+/** 问数据的一轮在服务端跑（编排完善第 1 波 W1-a）：使用者（user 角色）不能继续运行时，补救区里那句「怎么办」 */
+export const CHAT_TURN_TEXT = {
+  /** 服务重启打断的一轮：使用者没有「继续运行」，只说重新运行 */
+  suspendedHintForUser: '如需整轮重来，请点击「重新运行本轮」。',
+} as const
 
 /**
  * 问数据一轮的花费：助手建图（含挑表、接着写、自查修正）+ 运行 + 复核（next-round 细案 01 做法 3）。以前只算运行那份，
@@ -3985,11 +3995,13 @@ export const SCHEDULE_TEXT = {
   openRun: '查看运行',
 
   // ---- 触发
-  fireKind: { scheduled: '定时', manual: '手动', misfire: '补发' } as Record<import('../types').ScheduleFireKind, string>,
+  fireKind: { scheduled: '定时', manual: '手动', misfire: '补发', event: '事件' } as Record<
+    import('../types').ScheduleFireKind, string>,
   fireKindHint: {
     scheduled: '到点按计划触发',
     manual: '手动「立即运行」',
     misfire: '错过触发时间后，在补发宽限内恢复时补发的一次',
+    event: '由数据事件触发（去抖结束的时刻）',
   } as Record<import('../types').ScheduleFireKind, string>,
   /**
    * 错过、没有补发的（服务端记 kind=misfire、status=skipped_misfire）：类型按「定时」写。没有补发的原因有两种（超出
@@ -4225,9 +4237,10 @@ export const SCHEDULE_TEXT = {
   },
   /** 「还需处理」里各项的叫法 */
   problemField: {
-    name: '名称', workflow: '工作流', freq: '频率', timezone: '时区', runClass: '运行类别', inputs: '输入', url: 'Webhook 地址',
-    secret: '签名密钥', events: '通知事件',
-  } as Record<'name' | 'workflow' | 'freq' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret' | 'events', string>,
+    name: '名称', workflow: '工作流', freq: '频率', trigger: '触发事件', timezone: '时区', runClass: '运行类别', inputs: '输入',
+    url: 'Webhook 地址', secret: '签名密钥', events: '通知事件',
+  } as Record<'name' | 'workflow' | 'freq' | 'trigger' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret' | 'events',
+    string>,
 
   // ---- 相对时间（将来）
   until: {
@@ -5500,6 +5513,25 @@ export const REJECTED_TEXT = {
   },
   /** 画布节点卡上被驳回的那一步：一句话，悬停写原话 */
   card: '被驳回',
+  /**
+   * 「驳回」出口（docs/design/orchestration-round/00-总方案.md §3）：审批、补充输入、编辑稿件、动作确认、代码和工具审批、
+   * 双盲裁决接了它时，驳回之后沿它往下走。画布上出口的字
+   */
+  exit: '驳回',
+  /** 节点卡、航迹上走了驳回出口的那一步：「被驳回，转到「通知申请人」」（转到哪几步取 node.finished 的 to） */
+  exitCard: (to: string[]): string => (to.length ? `被驳回，转到${to.map((t) => `「${t}」`).join('、')}` : '被驳回，走驳回出口'),
+  /** 时间线、问数据过程里这一步的副标题：谁、备注，再接上转到哪几步 */
+  exitStep: (d: { actor?: unknown; note?: unknown; decision?: unknown; to?: unknown }): string => {
+    const to = Array.isArray(d.to) ? d.to.map((t: any) => String(t?.label || t?.node_id || '')).filter(Boolean) : []
+    return `${REJECTED_TEXT.step(d)}，${to.length ? `转到${to.map((t) => `「${t}」`).join('、')}` : '走驳回出口'}`
+  },
+  /** 运行照驳回那条路结束：终态事件的 rejected_via，一步一句「「审批」被驳回，转到「通知申请人」」 */
+  via: (items: unknown): string => (Array.isArray(items) ? items : [])
+    .map((v: any) => `${typeof v?.label === 'string' && v.label ? `「${v.label}」` : '这一步'}${REJECTED_TEXT.exitCard(
+      Array.isArray(v?.to) ? v.to.map((t: any) => String(t?.label || t?.node_id || '')).filter(Boolean) : [])}`)
+    .join('；'),
+  /** 途经驳回的那一行的标题 */
+  viaTitle: '途经驳回',
 }
 
 /** 来源标签：老运行没有来源时写「来源未记录」 */

@@ -1039,13 +1039,13 @@ class RunManager:
                 # 切断的半截答案当成完整结论落了库
                 clipped, truncated = _clip(output)
                 data: dict[str, Any] = {"output": clipped, "usage": usage,
-                                        "duration_ms": timing["active_ms"], "timing": timing}
+                                        "duration_ms": timing["active_ms"], "timing": timing, **_rejected_via(state)}
                 if truncated:
                     data["output_truncated"] = True
                 event = self._event(run_id, EventType.RUN_FINISHED, data=data)
             elif terminal is not None:
                 kind, data = terminal
-                event = self._event(run_id, kind, data={**data, "timing": timing})
+                event = self._event(run_id, kind, data={**data, "timing": timing, **_rejected_via(state)})
 
             if run:
                 run.status = status
@@ -1063,6 +1063,9 @@ class RunManager:
                     await _close_approvals(session, run_id, actor, now)
                 if event is not None:
                     await _stage(session, event, run)
+                from app.scheduler import outbox  # 数据事件触发：正式运行成功结束，同一个事务记一条待派发事件
+                # 途经驳回出口、按驳回那条路走完的也是 succeeded：照发，事件带上途经了哪几个驳回（缺省不认途经驳回的触发）
+                outbox.stage_run_finished(session, run, rejected_via=_rejected_via(state).get("rejected_via"))
                 await session.commit()
         if event is not None:
             await bus.publish(event)
@@ -1346,11 +1349,21 @@ def _trust_event(tool_trust: dict[str, str] | None) -> Any:
     return "formal" if tool_trust.get(FORMAL_MARK) else snapshot_levels(tool_trust)
 
 
+def _rejected_via(state: dict[str, Any]) -> dict[str, Any]:
+    """这次运行途经的驳回出口（engine/compiler._rejected_exit 记在 trail 上的 outcome=rejected）：{rejected_via: [{node_id,
+    label, kind, decision, actor, note, to}]}，按先后。终态事件带上它，运行照它的路径结束（成功结束也一样）照实说「途经
+    驳回」；没有途经的不带这个键，终态事件和以前一字不差。读的是收尾时的状态：节点出错、被驳回结束的那几种收尾拿不到
+    状态（final_state 为空），不带；子工作流里的驳回出口不在这里（它的 trail 是子工作流自己的状态）。"""
+    via = [{k: t.get(k) for k in ("node_id", "label", "kind", "decision", "actor", "note", "to")}
+           for t in state.get("trail") or [] if isinstance(t, dict) and t.get("outcome") == "rejected"]
+    return {"rejected_via": via} if via else {}
+
+
 def rejected_data(exc: NodeRejected, spec: GraphSpec) -> dict[str, Any]:
     """被驳回的 run.cancelled 带什么：原因（rejected）、在哪一步（节点 id 和图上的名字）、哪种关卡、结论（驳回 / 超时
     驳回）、谁、备注。进封存：谁在哪一步驳回、为什么，事后查得到。"""
     node = spec.node_map().get(exc.node_id)
-    return {"reason": END_REJECTED, "node_id": exc.node_id, "label": node.title if node else exc.node_id,
+    return {"reason": END_REJECTED, "node_id": exc.node_id, "label": _label_of(exc, node),
             "kind": exc.kind, "decision": exc.decision, "actor": exc.actor, "note": exc.note}
 
 
@@ -1380,8 +1393,16 @@ def _failure(exc: BaseException, spec: GraphSpec) -> tuple[str, tuple[EventType,
         data["detail"] = detail
     if node_id:
         node = spec.node_map().get(node_id)
-        data.update(node_id=node_id, label=node.title if node else node_id)
+        data.update(node_id=node_id, label=_label_of(exc, node))
     return message, (EventType.RUN_FAILED, data)
+
+
+def _label_of(exc: BaseException, node: Any) -> str:
+    """出错、被驳回的那一步在图上叫什么。子工作流里的那一步（节点 id「子工作流节点 id/…」）不在这张图上，名字由
+    multi.run_subgraph 接好记在异常上（「子工作流 › 那一步」）。"""
+    if node is not None:
+        return node.title
+    return str(getattr(exc, "label", None) or getattr(exc, "node_id", "") or "")
 
 
 async def _approval_default(*, run_class: str) -> str:

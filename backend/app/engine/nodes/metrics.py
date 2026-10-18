@@ -624,6 +624,9 @@ def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,
     - vars.q.rows[0][0]，q 由「只是把调用工具节点的结果原样按 JSON 解析」的整形节点写：同 cell()，via tool_cell，
       另记 through（穿过的整形节点）
     - agent 开了 cite_fields 的字段：via agent_field，接上它的 data_evidence（eid、核对状态）
+
+    读子工作流出口的一个字段（nodes.<子图>.output.<字段>、vars.<子图的 assign_to>.<字段>）：接上子图记下的那个字段的出处
+    （_subgraph_field），via 等照子图里认出的写，另记 subgraph、field；认不出的照旧记 via subgraph，停在子工作流。
     """
     if (parts := cell_parts(path)) is not None:
         return _cell_input(path, value, parts, state, ctx, tctx or template_context(state))
@@ -644,6 +647,9 @@ def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,
         else:
             node_id = _writer_of(name, state, ctx)
     producer = nodes.get(node_id) if node_id else None
+    if producer is not None and str(producer.type) == "subgraph" and head \
+            and (linked := _subgraph_field(path, value, root, field, producer.id, state)) is not None:
+        return linked
     entry: dict[str, Any] = {
         "path": path,
         "value": value if value is None or isinstance(value, (int, float, str, bool)) else _brief(value),
@@ -665,6 +671,32 @@ def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,
         if cited is not None:
             entry.update(cited)
     return entry
+
+
+def _subgraph_field(path: str, value: Any, root: str, field: str, node_id: str,
+                    state: GraphState) -> dict[str, Any] | None:
+    """读子工作流出口的一个字段：接上子图记下的那个字段的出处（multi.run_subgraph 的 provenance，节点 id 已经是这一层图里
+    的「子工作流节点 id/…」）。只认整个字段（nodes.<子图>.output.<字段>、vars.<assign_to>.<字段>，不再往里取），而且这次
+    读到的值就是子图交出的那个；别的为 None，照一般的来历记（via subgraph，停在子工作流）。
+
+    接上的出处照子图里认出的写（via、node_id、artifact、locator、eid、status、upstream），path、value 换成这里读的，另记
+    subgraph（经过的子工作流节点）、field（出口字段）：engine/lineage.traced 照常认，证据面板照常一路给到子图里的那一格。"""
+    result = (state.get("nodes") or {}).get(node_id)
+    if not isinstance(result, dict) or not isinstance(result.get("provenance"), dict):
+        return None
+    key = _field_key(field)
+    if root == "nodes":
+        if not key.startswith("output."):
+            return None
+        key = key[len("output."):]
+    elif root != "vars":
+        return None
+    output = result.get("output") if isinstance(result.get("output"), dict) else {}
+    item = result["provenance"].get(key)
+    if not key or not isinstance(item, dict) or key not in output or output[key] != value:
+        return None
+    return {**item, "path": path, "value": value if value is None or isinstance(value, (int, float, str, bool))
+            else _brief(value), "subgraph": node_id, "field": key}
 
 
 def _copied_card(path: str, tctx: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -702,9 +734,17 @@ def _upstream(path: str, tctx: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _copied_metric(item: dict[str, Any], tctx: dict[str, Any]) -> dict[str, Any] | None:
-    """卡上的一个输入转抄了另一张口径卡的哪个指标（这一次的产出里那一项）；不是转抄的为 None。"""
+    """卡上的一个输入转抄了另一张口径卡的哪个指标（这一次的产出里那一项）；不是转抄的为 None。
+
+    经子工作流出口转抄的（subgraph，子图出口字段就是子图里一张卡的指标）：那张卡以「子工作流节点 id/卡」进了这一层的
+    nodes（multi.run_subgraph），按 node_id 和 upstream 记的指标 id 找。"""
     if item.get("via") != "metric" or not isinstance(item.get("upstream"), dict):
         return None
+    if item.get("subgraph"):
+        card = (tctx.get("nodes") or {}).get(str(item.get("node_id") or ""))
+        metrics = card.get("metrics") if isinstance(card, dict) and card.get("kind") == "metric_set" else None
+        wanted = item["upstream"].get("metric")
+        return next((m for m in metrics or [] if isinstance(m, dict) and m.get("id") == wanted), None)
     found = _copied_card(str(item.get("path") or ""), tctx)
     return found[1] if found is not None else None
 

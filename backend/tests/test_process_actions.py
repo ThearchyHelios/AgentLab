@@ -473,6 +473,30 @@ async def test_a_rejected_confirmation_reads_as_a_decision_not_a_fault(erp, capa
     assert erp.requests == []
 
 
+async def test_a_rejected_confirmation_with_a_reject_exit_sends_nothing_and_goes_on(erp, capabilities):
+    """动作确认接了「驳回」出口（docs/design/orchestration-round/00-总方案.md §3）：驳回时照旧不发送写入、记「未确认（被驳回）」，
+    这一步正常结束、沿驳回边往下走（这里是通知申请人），运行照它的路径结束；实例页写「未确认（被驳回），转到「通知申请人」」。"""
+    capabilities(await _endpoint(test=True), lookup=False)
+    graph = pay_graph()
+    graph["nodes"].append(node("tell", "output", fields=[{"name": "结论", "value": "{{ nodes.pay.text }}"}]))
+    graph["nodes"][-1]["data"]["label"] = "通知申请人"
+    graph["edges"].append({"source": "pay", "target": "tell", "sourceHandle": "rejected"})
+    run_id = await _formal(graph)
+    task = await _task(run_id, "action_confirm")
+    await tasks.respond(task.id, ANN, decision="reject", note="金额不对")
+    final = await _wait(run_id, ("succeeded", "failed", "cancelled"))
+    assert (final.status, final.end_reason) == ("succeeded", None), final.error
+    assert final.output == {"结论": "「pay」未确认（被驳回），没有发送：金额不对"}
+    assert erp.requests == [], "驳回之后走出口也不发送"
+    assert await _records(run_id) == []
+    [done] = [e for e in await _events(run_id, "node.finished") if e.node_id == "pay"]
+    assert (done.data["outcome"], done.data["kind"], done.data["decision"]) == ("rejected", "action_confirm", "reject")
+    assert not [e for e in await _events(run_id, "tool.start") if e.node_id == "pay"]
+    view = await _instance_view(run_id)
+    step = next(s for s in view["tl"]["steps"] if s["node"] == "pay")
+    assert (step["state"], step["text"]) == ("rejected", "未确认（被驳回），转到「通知申请人」")
+
+
 async def test_unknown_then_reconciled_reads_as_waiting_then_a_footnote(erp, capabilities):
     capabilities(await _endpoint(test=True), lookup=True)
     erp.mode = "timeout_after_write"

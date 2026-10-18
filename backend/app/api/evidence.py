@@ -209,6 +209,9 @@ class _Sealed:
     #: 按需裁判的判定（evidence.judged 事件），按先后：(seq, 节点, 载荷)。不管落在封存前后都收——
     #: 失败后接着跑的运行会把早先追加的判定封进新的清单里，它仍然是按需裁判的批注
     judged: list[tuple[int, str | None, dict[str, Any]]] = field(default_factory=list)
+    #: 节点 id → node.started 上记的名字、类型。子工作流里的节点（「子工作流节点 id/…」）不在这次运行的图上，名字从这里取
+    labels: dict[str, str] = field(default_factory=dict)
+    types: dict[str, str] = field(default_factory=dict)
 
     @property
     def sealed(self) -> bool:
@@ -273,6 +276,11 @@ async def _sealed(run_id: str) -> _Sealed:
             out.retrievals.setdefault(str(data["artifact"]), {"node_id": node_id, "source": data.get("collection")})
         elif etype == "caliber.upgrade":
             out.upgrades[node_id] = data
+        elif etype == "node.started":
+            if isinstance(data.get("label"), str) and data["label"]:
+                out.labels.setdefault(node_id, data["label"])
+            if isinstance(data.get("node_type"), str) and data["node_type"]:
+                out.types.setdefault(node_id, data["node_type"])
         if etype != "node.finished":
             continue
         if data.get("artifact"):
@@ -280,7 +288,9 @@ async def _sealed(run_id: str) -> _Sealed:
         for entry in data.get("evidence") or []:
             if isinstance(entry, dict) and entry.get("artifact"):
                 out.ledger.add((node_id, entry["artifact"]))
-                out.entries.append({**entry, "node_id": node_id})
+                # 条目里另记的节点 id（双盲复算复算的口径卡）是那个节点所在那一层图里的 id：换成这次运行里的
+                out.entries.append({**entry, "node_id": node_id,
+                                    **({"card": _scoped(node_id, entry["card"])} if entry.get("card") else {})})
                 artifact = str(entry["artifact"])
                 if entry.get("kind") == "query":
                     out.queries[artifact] = {
@@ -313,11 +323,17 @@ class _Report:
     claims: str | None = None
 
 
-def _reports(sealed: _Sealed) -> list[_Report]:
-    """封存范围内每个报告节点最后一次的自查结果，按第一次出现的顺序。"""
+def _reports(sealed: _Sealed, *, nested: bool = False) -> list[_Report]:
+    """封存范围内每个报告节点最后一次的自查结果，按第一次出现的顺序。
+
+    默认只认这次运行的图上的报告节点：子工作流里的报告（节点 id「子工作流节点 id/…」，子图的事件和父运行在同一个流里）
+    是子工作流那一步内部的东西，父图的答案是子工作流出口的值，不是那份报告本身——证据图、取答案的评测、按成果挑报告
+    （_choose）都按父图自己的认。nested 为真时连子工作流里的一起给（按 ?report=sub/write 点开它们）。可验证报告另按全部
+    report.checked 核对（bundle/build._report_events：自查过的文档一份都不能少）。"""
     latest: dict[str, dict[str, Any]] = {}
     for _, etype, node_id, data in sealed.events:
-        if etype == "report.checked" and node_id and isinstance(data, dict) and data.get("doc_artifact"):
+        if etype == "report.checked" and node_id and isinstance(data, dict) and data.get("doc_artifact") \
+                and (nested or "/" not in node_id):
             latest[node_id] = data
     evidence = _output_evidence(sealed)
     out = []
@@ -569,11 +585,13 @@ def _metric_in(card: dict[str, Any] | None, metric_id: Any) -> dict[str, Any] | 
 
 
 def _issuance_of(sealed: _Sealed) -> dict[str, Any] | None:
-    """成果上的 _issuance；成果里取不到时退回封存范围内最后一条 issuance 事件。"""
+    """成果上的 _issuance；成果里取不到时退回封存范围内最后一条 issuance 事件。子工作流里成果节点的出具判定（节点 id
+    「子工作流节点 id/…」，子图的事件和父运行在同一个流里）说的是子工作流交出的那份，不是这次运行的，不认。"""
     output = sealed.payload_of(sealed.nodes_of("output")) or {}
     issuance = output.get("_issuance")
     if not isinstance(issuance, dict):
-        issuance = next((data for _, etype, _, data in reversed(sealed.events) if etype == "issuance"), None)
+        issuance = next((data for _, etype, node_id, data in reversed(sealed.events)
+                         if etype == "issuance" and "/" not in str(node_id or "")), None)
     return issuance if isinstance(issuance, dict) else None
 
 
@@ -863,7 +881,7 @@ async def evidence_metric(run_id: str, node: str, metric: str) -> dict[str, Any]
 def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
                   ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
     """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""
-    reports = _reports(sealed)
+    reports = _named_reports(sealed, wanted)
     if not reports:
         raise CodedHTTPException(404, "本次运行没有封存的报告文档，没有可查看的片段", REPORT_NOT_FOUND)
     chosen = _choose(reports, wanted, sealed)
@@ -875,6 +893,12 @@ def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
     if found is None:
         raise CodedHTTPException(404, "报告中没有这个片段", SEGMENT_NOT_FOUND)
     return chosen, found
+
+
+def _named_reports(sealed: _Sealed, wanted: str | None) -> list[_Report]:
+    """点名要某一份报告时从哪些里挑：点的是子工作流里的那份（「sub/write」）连子工作流里的一起给，否则只给父图上的
+    （_reports）。"""
+    return _reports(sealed, nested=bool(wanted) and "/" in str(wanted))
 
 
 def _choose(reports: list[_Report], wanted: str | None, sealed: _Sealed) -> _Report:
@@ -975,20 +999,21 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     # 期 4：这个指标做没做过双盲复算、结果如何。没有双盲复算复核过这份指标集时没有这个键，老运行一字不差
     if checked := _dual_check_of(sealed, str(entry.get("node_id") or ""), artifact, metric_id, metric):
         step["dual_check"] = checked
+    card_node = str(entry.get("node_id") or "")
     if metric is not None and metric.get("inputs"):
         # 输入追没追到原始数据（engine/lineage.py）：和「有出处」（确定性复算一致）是两件事，面板分开说。追不到的照实说
         # 出处追到哪个节点为止；卡上没有输入（常量）的没有可追的，不给这个键
-        step["untraced"] = _untraced_steps(metric, sealed)
+        step["untraced"] = _untraced_steps(metric, sealed, card_node)
     catalog = doc.get("catalog") or {}
     inputs: list[dict[str, Any]] = []
     #: 输入指到的查询快照 → 被引用的格；同一份快照只给一个查询步骤，格合在一起高亮
     wanted: dict[str, list[tuple[Any, Any]]] = {}
     held, word = await _metric_masks(metric or {}, str(entry.get("node_id") or ""), artifact, sealed, masks, card=card)
     for item in (metric or {}).get("inputs") or []:
-        one = {"step": "input", **item}
+        one = {"step": "input", **item, **_scoped_ids(item, card_node, sealed)}
         if item.get("through"):
             # 穿过原样解析查询结果的整形节点按位置取的格：面板写明经过的是哪个节点（图里的名字）
-            one["through_label"] = _node_label(sealed, item["through"])
+            one["through_label"] = _node_label(sealed, one["through"])
         artifact_of = item.get("artifact")
         if artifact_of and item.get("via") in ("tool_cell", "agent_field"):
             one["query"] = _query_alias(catalog, artifact_of)
@@ -999,7 +1024,8 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
             one = _withheld(one, found)
         inputs.append(one)
     # 转抄另一张口径卡的指标（对账卡、召回卡的「口径」那一项）：跨卡往下追，接上那个指标自己的一段出处，一直到查询格子
-    upstream = await _upstream_steps(metric or {}, sealed, masks, catalog, wanted, {(artifact, str(metric_id))})
+    upstream = await _upstream_steps(metric or {}, sealed, masks, catalog, wanted, {(artifact, str(metric_id))},
+                                     card_node=card_node)
     if withheld := {path: _held_word(found) for path, found in held.items() if found.kind != "table"}:
         # 代入式里那几处同样写「已遮罩」（遮没遮核对不了的写「无法核对」）：不然标签里遮着、代入式里亮着，同一个值换个
         # 地方照样看得到。整份结果当输入的不换：代入式里本来就只留着它的路径
@@ -1015,7 +1041,7 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
 
 async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Masks", catalog: dict[str, Any],
                           wanted: dict[str, list[tuple[Any, Any]]], seen: set[tuple[str, str]],
-                          depth: int = 1) -> list[dict[str, Any]]:
+                          depth: int = 1, *, card_node: str = "") -> list[dict[str, Any]]:
     """指标的输入里转抄另一张口径卡的指标的（nodes.<卡>.metrics[i].value，卡上记着 upstream），每个接一步 upstream：那张
     卡的那个指标（名字、值、式子、代入式、核对状态，取值按同一套遮罩），它自己的输入（同指标步骤的输入；落在查询快照上的
     并进 wanted，后面照常给查询步骤），追没追到原始数据。转抄的转抄一层层接着追（防环：同一个指标只接一次；最多
@@ -1033,7 +1059,8 @@ async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Mask
         if (artifact, metric_id) in seen:
             continue
         seen.add((artifact, metric_id))
-        node = str(item.get("node_id") or "")
+        # 卡上记的是卡所在那一层图里的 id（子工作流里的卡转抄同一张子图里的卡；经子工作流出口转抄的已经是这一层的）
+        node = str(_scoped(card_node, item.get("node_id")) or "")
         card, hash_ok = _load_card(artifact)
         found = _metric_in(card, metric_id)
         step: dict[str, Any] = {
@@ -1060,7 +1087,7 @@ async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Mask
                if found.get("incomplete") else {}),
             **({"sql_check_failed": True, "sql_check_reason": found.get("sql_check_reason") or ""}
                if found.get("sql_check_failed") else {}),
-            "untraced": _untraced_steps(found, sealed),
+            "untraced": _untraced_steps(found, sealed, node),
         })
         if withheld := {path: _held_word(h) for path, h in held.items() if h.kind != "table"}:
             step["substituted"] = recompute.substituted_without(found, withheld)
@@ -1068,7 +1095,7 @@ async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Mask
         for sub in found.get("inputs") or []:
             if not isinstance(sub, dict):
                 continue
-            one = {"step": "input", **sub}
+            one = {"step": "input", **sub, **_scoped_ids(sub, node, sealed)}
             if sub.get("artifact") and sub.get("via") in SNAPSHOT_VIAS:
                 one["query"] = _query_alias(catalog, sub["artifact"])
                 if cell := _input_cell(sub, catalog):
@@ -1079,27 +1106,57 @@ async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Mask
             inputs.append(one)
         step["inputs"] = inputs
         out.append(step)
-        out += await _upstream_steps(found, sealed, masks, catalog, wanted, seen, depth + 1)
+        out += await _upstream_steps(found, sealed, masks, catalog, wanted, seen, depth + 1, card_node=node)
+    return out
+
+
+def _scoped(card_node: Any, node_id: Any) -> Any:
+    """口径卡上记的节点 id 换成这次运行里的（engine/lineage.scoped_id：子工作流里的卡记的是子图里的 id）。"""
+    from app.engine.lineage import scoped_id
+
+    return scoped_id(card_node, node_id)
+
+
+def _scoped_ids(item: dict[str, Any], card_node: str, sealed: _Sealed) -> dict[str, Any]:
+    """输入步骤上的节点 id 换成这次运行里的（_scoped）；落在子工作流里的另给图上的名字（node_label、subgraph_label：
+    「子工作流 › 节点」），画布、记录页认不出这个 id 时照它写。最外层的输入不多带键，和以前一字不差。"""
+    out: dict[str, Any] = {}
+    for key in ("node_id", "through", "subgraph"):
+        if isinstance(item.get(key), str) and item[key]:
+            out[key] = _scoped(card_node, item[key])
+    if "/" in str(out.get("node_id") or ""):
+        out["node_label"] = _node_label(sealed, out["node_id"])
+    if out.get("subgraph"):
+        out["subgraph_label"] = _node_label(sealed, out["subgraph"])
     return out
 
 
 def _node_label(sealed: _Sealed, node_id: Any) -> str:
-    """封存的图里这个节点的名字，没有名字的写 id。"""
+    """封存的图里这个节点的名字，没有名字的写 id。子工作流里的节点（「子工作流节点 id/…」）不在图上，按 node.started 记的
+    名字一层层接上：「子工作流 › 节点」。"""
     node = next((n for n in (sealed.graph or {}).get("nodes") or [] if isinstance(n, dict) and n.get("id") == node_id), {})
-    return str((node.get("data") or {}).get("label") or node_id or "")
+    if node or not isinstance(node_id, str) or "/" not in node_id:
+        return str((node.get("data") or {}).get("label") or node_id or "")
+    parts = node_id.split("/")
+    names = [_node_label(sealed, parts[0])]
+    for i in range(2, len(parts) + 1):
+        here = "/".join(parts[:i])
+        names.append(sealed.labels.get(here) or parts[i - 1])
+    return " › ".join(names)
 
 
-def _untraced_steps(metric: dict[str, Any], sealed: _Sealed) -> list[dict[str, Any]]:
+def _untraced_steps(metric: dict[str, Any], sealed: _Sealed, card_node: str = "") -> list[dict[str, Any]]:
     """指标的输入里追不到原始数据的：[{path, node_id, label, type}]，label 是封存的图里那个节点的名字、type 是节点类型
-    （面板按它写「数据整形」「沙箱代码」）。认不出是哪个节点的，node_id、label 为 None。"""
+    （面板按它写「数据整形」「沙箱代码」）。认不出是哪个节点的，node_id、label 为 None。节点 id 按卡所在那一层认
+    （_scoped）。"""
     nodes = {n.get("id"): n for n in (sealed.graph or {}).get("nodes") or [] if isinstance(n, dict)}
     out = []
     for item in untraced(metric.get("inputs") or []):
-        node_id = item.get("node_id")
+        node_id = _scoped(card_node, item.get("node_id"))
         node = nodes.get(node_id) or {}
         out.append({"path": item.get("path"), "node_id": node_id,
                     "label": _node_label(sealed, node_id) if node_id else None,
-                    "type": node.get("type") or None})
+                    "type": node.get("type") or sealed.types.get(str(node_id or "")) or None})
     return out
 
 
@@ -1289,10 +1346,11 @@ class _CopyGraph:
                     upstream: list[Any] = []
                     # 转抄的是哪张卡：按读到的产出上记着的指标集认（经数据整形赋给变量、转了一道的也认得出是哪张卡），
                     # 认不出的按取值链上的那个节点
-                    owner = copied.node_id
+                    # 取值链上写的是卡所在那一层图里的 id（_scoped）
+                    owner = _scoped(node, copied.node_id)
                     if copied.card is not None:
                         up_art = str(copied.card.get("artifact") or "")
-                        owner = self._owner(up_art) or copied.node_id
+                        owner = self._owner(up_art) or owner
                         for index in copied.picked:
                             up_metric = copied.card["metrics"][index]
                             if isinstance(up_metric, dict) and up_metric.get("inputs"):
@@ -1495,6 +1553,8 @@ class _InputMasks:
         return None, True
 
     def _output(self, node_id: Any) -> Any:
+        # 卡的取值链里写的是卡所在那一层图里的 id（子工作流里的卡写子图里的 id），换成这次运行里的再找
+        node_id = _scoped(self._card, node_id)
         if self._given is not None:
             return self._given(node_id)
         if self._outputs is None:
@@ -2895,7 +2955,7 @@ async def export_report_html(run_id: str, report: str | None = None) -> Response
     )
 
     sealed = await _sealed(run_id)
-    reports = _reports(sealed)
+    reports = _named_reports(sealed, report)
     if not reports:
         raise CodedHTTPException(404, "本次运行没有报告文档，没有可导出的报告", REPORT_NOT_FOUND)
     chosen = _choose(reports, report, sealed)
@@ -3848,7 +3908,7 @@ def _formal_message(doc: dict[str, Any] | None, claims: str | None, verdicts: li
 def _formal_refusal(sealed: _Sealed, wanted: str | None, units: list[str] | None = None) -> str:
     """按需裁判接口拒绝正式运行时的那句话，和片段接口说的一致：按请求要的那份报告（没指定取成果里标注的那一份）、
     点的那几句结论句（不是结论句的不算）说。选不出报告、文档读不出来的，只说正式运行不能按需裁判（FORMAL_ONLY）。"""
-    reports = _reports(sealed)
+    reports = _named_reports(sealed, wanted)
     try:
         chosen = _choose(reports, wanted, sealed) if reports else None
     except CodedHTTPException:
@@ -4022,7 +4082,7 @@ async def judge_units(run_id: str, payload: Any = Body(None), report: str | None
             raise CodedHTTPException(409, UNSEALED_JUDGE, JUDGE_UNSEALED)
         if not sealed.trusted:
             raise CodedHTTPException(409, BROKEN_JUDGE, SEAL_BROKEN_CODE)
-        reports = _reports(sealed)
+        reports = _named_reports(sealed, wanted)
         if not reports:
             raise CodedHTTPException(404, "这次运行没有封存的报告文档，没有可以判断的句子", REPORT_NOT_FOUND)
         chosen = _choose(reports, wanted, sealed)

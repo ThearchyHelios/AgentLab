@@ -4,9 +4,11 @@
  * scripts/check-schedules.mjs 直接借 vite 转译后调用它们。
  */
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
+import { TRIGGER_TEXT as TT } from '../../lib/termsTrigger'
 import type {
-  Schedule, ScheduleCreate, ScheduleEvent, ScheduleMaintenanceInputs, SchedulePatch, ScheduleRunClass, ScheduleTargetCreate,
-  ScheduleTargetKind, ScheduleWebhookFormat, ScheduleWebhookIn, ScheduleWebhookTest, Workflow, WorkflowVersion,
+  Schedule, ScheduleCreate, ScheduleEvent, ScheduleEventKind, ScheduleMaintenanceInputs, SchedulePatch, ScheduleRunClass,
+  ScheduleTargetCreate, ScheduleTargetKind, ScheduleTrigger, ScheduleTriggerKind, ScheduleWebhookFormat, ScheduleWebhookIn,
+  ScheduleWebhookTest, Workflow, WorkflowVersion,
 } from '../../types'
 export * from '../../lib/freq'
 import { DEFAULT_FREQ, DEFAULT_GRACE_S, browserTimezone, cronOf, freqOf, freqProblem, type Freq } from '../../lib/freq'
@@ -31,9 +33,74 @@ export interface WebhookForm {
   events: ScheduleEvent[]
 }
 
+/**
+ * 事件触发的设置（docs/design/orchestration-round/00-总方案.md §4）。对象按事件种类：表格、数据源、上游工作流都记在 subjectId，
+ * 交上去时按种类写成 source_id / workflow_id。过滤只在对应的事件种类上交：期次给上传表格，应用、来源给上游工作流
+ */
+export interface TriggerForm {
+  event: ScheduleEventKind
+  subjectId: string
+  period: 'any' | 'new'
+  appId: string
+  originKind: string
+  /** 也认途经驳回的、也认应用补算的（只给上游工作流，缺省都不认） */
+  includeRejected: boolean
+  includeBackfill: boolean
+  debounceS: number
+}
+
+/** 应用补算的来源：选了「只认应用补算」时，「也认应用补算的」不再适用 */
+export const BACKFILL_ORIGIN = 'app_backfill'
+
+export const EVENT_KINDS: readonly ScheduleEventKind[] = ['table.version', 'workflow.finished', 'source.changed']
+export const TRIGGER_KINDS: readonly ScheduleTriggerKind[] = ['cron', 'event']
+/** 去抖的选项（秒）：不去抖、1 分钟（缺省）、5 分钟、15 分钟、1 小时 */
+export const DEBOUNCE_OPTIONS: readonly number[] = [0, 60, 300, 900, 3600]
+export const DEFAULT_DEBOUNCE_S = 60
+
+export function triggerFormOf(t: ScheduleTrigger | null | undefined): TriggerForm {
+  const event = t?.event && EVENT_KINDS.includes(t.event) ? t.event : 'table.version'
+  return {
+    event,
+    subjectId: (event === 'workflow.finished' ? t?.workflow_id : t?.source_id) ?? '',
+    period: t?.period === 'new' ? 'new' : 'any',
+    appId: t?.app_id ?? '',
+    originKind: t?.origin_kind ?? '',
+    includeRejected: t?.include_rejected === true,
+    includeBackfill: t?.include_backfill === true,
+    debounceS: typeof t?.debounce_s === 'number' ? t.debounce_s : DEFAULT_DEBOUNCE_S,
+  }
+}
+
+/** 交上去的触发条件：对象按种类写键，过滤只带对这种事件有意义、又选了的 */
+export function triggerBody(t: TriggerForm): ScheduleTrigger {
+  const out: ScheduleTrigger = { event: t.event, debounce_s: t.debounceS }
+  if (t.event === 'workflow.finished') {
+    out.workflow_id = t.subjectId
+    if (t.appId) out.app_id = t.appId
+    if (t.originKind) out.origin_kind = t.originKind
+    if (t.includeRejected) out.include_rejected = true
+    if (t.includeBackfill && t.originKind !== BACKFILL_ORIGIN) out.include_backfill = true
+  } else {
+    out.source_id = t.subjectId
+    if (t.event === 'table.version' && t.period === 'new') out.period = 'new'
+  }
+  return out
+}
+
+/** 换了事件种类：对象、过滤都不再适用，清掉；去抖留着 */
+export function switchEvent(t: TriggerForm, event: ScheduleEventKind): TriggerForm {
+  if (t.event === event) return t
+  return { event, subjectId: '', period: 'any', appId: '', originKind: '', includeRejected: false, includeBackfill: false,
+    debounceS: t.debounceS }
+}
+
 export interface ScheduleForm {
   name: string
   workflowId: string
+  /** 触发方式：只在新建时选，修改时跟着读到的定时任务（建好之后不能改） */
+  triggerKind: ScheduleTriggerKind
+  trigger: TriggerForm
   freq: Freq
   timezone: string
   runClass: ScheduleRunClass
@@ -49,15 +116,19 @@ export interface ScheduleForm {
 export function formOf(s: Schedule | null, timezone: string = browserTimezone()): ScheduleForm {
   if (!s) {
     return {
-      name: '', workflowId: '', freq: { ...DEFAULT_FREQ }, timezone, runClass: 'formal', inputs: {}, enabled: true,
-      misfireGraceS: DEFAULT_GRACE_S,
+      name: '', workflowId: '', triggerKind: 'cron', trigger: triggerFormOf(null), freq: { ...DEFAULT_FREQ }, timezone,
+      runClass: 'formal', inputs: {}, enabled: true, misfireGraceS: DEFAULT_GRACE_S,
       webhook: { on: false, format: 'generic', url: '', replaceUrl: false, secret: '', secretMode: 'keep', events: [...SCHEDULE_EVENTS] },
     }
   }
+  const event = s.trigger_kind === 'event'
   return {
     name: s.name,
     workflowId: s.workflow_id,
-    freq: freqOf(s.cron),
+    triggerKind: event ? 'event' : 'cron',
+    trigger: triggerFormOf(event ? s.trigger : null),
+    // 事件触发的任务没有 cron（存空串）：频率留缺省，不交也不比
+    freq: event ? { ...DEFAULT_FREQ } : freqOf(s.cron),
     timezone: s.timezone,
     runClass: s.run_class,
     inputs: { ...(s.input_template ?? {}) },
@@ -79,10 +150,13 @@ const sortEvents = (events: ScheduleEvent[]) => SCHEDULE_EVENTS.filter((e) => ev
 
 export function createBody(f: ScheduleForm): ScheduleCreate {
   const w = f.webhook
+  const event = f.triggerKind === 'event'
   return {
     name: f.name.trim(),
     workflow_id: f.workflowId,
-    cron: cronOf(f.freq),
+    // 事件触发：不写 cron（交空串），带触发方式和触发条件；cron 任务的请求体和以前一字不差
+    ...(event ? { trigger_kind: 'event' as const, trigger: triggerBody(f.trigger) } : {}),
+    cron: event ? '' : cronOf(f.freq),
     timezone: f.timezone,
     run_class: f.runClass,
     input_template: templateOf(f.inputs),
@@ -109,7 +183,9 @@ export function patchBody(f: ScheduleForm, initial: ScheduleForm, saved: Schedul
   const out: Omit<SchedulePatch, 'version'> = {}
   if (f.name.trim() !== initial.name.trim()) out.name = f.name.trim()
   if (f.workflowId !== initial.workflowId) out.workflow_id = f.workflowId
-  if (cronOf(f.freq) !== cronOf(initial.freq)) out.cron = cronOf(f.freq)
+  if (f.triggerKind === 'event') {
+    if (!sameJson(triggerBody(f.trigger), triggerBody(initial.trigger))) out.trigger = triggerBody(f.trigger)
+  } else if (cronOf(f.freq) !== cronOf(initial.freq)) out.cron = cronOf(f.freq)
   if (f.timezone !== initial.timezone) out.timezone = f.timezone
   if (f.runClass !== initial.runClass) out.run_class = f.runClass
   if (!sameJson(sortedEntries(templateOf(f.inputs)), sortedEntries(templateOf(initial.inputs)))) {
@@ -157,6 +233,8 @@ export function rebaseForm(cur: ScheduleForm, sent: ScheduleForm, saved: Schedul
   return {
     name: pick('name'),
     workflowId: pick('workflowId'),
+    triggerKind: pick('triggerKind'),
+    trigger: pick('trigger'),
     freq: pick('freq'),
     timezone: pick('timezone'),
     runClass: pick('runClass'),
@@ -279,6 +357,10 @@ export function serverFieldValue(field: string, f: ScheduleForm): string | null 
     case 'name': return f.name.trim()
     case 'workflow_id': return f.workflowId
     case 'cron': return cronOf(f.freq)
+    // 触发条件连带目标一起算：查环时换了目标，「会循环触发」也就不一定成立了
+    case 'trigger':
+    case 'debounce_s': return JSON.stringify([triggerBody(f.trigger), f.workflowId])
+    case 'trigger_kind': return f.triggerKind
     case 'timezone': return f.timezone
     case 'run_class': return JSON.stringify([f.runClass, f.workflowId])
     case 'input_template': return JSON.stringify([sortedEntries(templateOf(f.inputs)), f.workflowId, f.runClass])
@@ -322,7 +404,8 @@ export function inputProblems(inputs: Record<string, string>, fields: readonly I
 // 表单的问题
 // ---------------------------------------------------------------------------
 
-export type FormField = 'name' | 'workflow' | 'freq' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret' | 'events'
+export type FormField = 'name' | 'workflow' | 'freq' | 'trigger' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret'
+  | 'events'
 
 /** 判表单问题时要的、表单之外的事 */
 export interface FormContext {
@@ -345,8 +428,13 @@ export function formProblems(f: ScheduleForm, saved: Schedule | null, ctx: FormC
   const out: Partial<Record<FormField, string>> = {}
   if (!f.name.trim()) out.name = T.problem.name
   if (!f.workflowId) out.workflow = T.problem.workflow
-  const freq = freqProblem(f.freq)
-  if (freq) out.freq = freq
+  if (f.triggerKind === 'event') {
+    // 事件触发没有频率：对象要选上（能不能选、会不会成环由服务端判，保存时 422 落到这一项）
+    if (!f.trigger.subjectId) out.trigger = TT.problemSubject(TT.subject[f.trigger.event])
+  } else {
+    const freq = freqProblem(f.freq)
+    if (freq) out.freq = freq
+  }
   if (!f.timezone) out.timezone = T.problem.timezone
   if (f.workflowId && (ctx.recheck ?? !saved)) {
     if (f.runClass === 'formal' && ctx.published === null) out.runClass = T.problem.notPublished

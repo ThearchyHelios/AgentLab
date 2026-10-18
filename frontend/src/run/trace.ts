@@ -84,6 +84,15 @@ export interface NodeTrace {
   taken?: string[]
   /** 分支命中的理由 */
   reason?: string
+  /**
+   * 被驳回、走了「驳回」出口（node.finished 带 outcome=rejected，docs/design/orchestration-round/00-总方案.md §3）：这一步正常
+   * 结束了、下游照常往下走，状态记 rejected（中性色，不是失败）。exitTo 是驳回出口转到的那几步的名字（node.finished 的 to）。
+   * 下一次执行开始时清掉
+   */
+  exited?: boolean
+  exitTo?: string[]
+  /** node.started 上记的名字。子工作流里的步骤不在画布的图上，名字从这里取（stepLabel） */
+  label?: string
   /** 用量随时间的累计，回放时按游标取那一刻的 tokens 和工具数。没调过模型和工具的节点没有 */
   marks?: UsageMark[]
 }
@@ -271,6 +280,25 @@ function openIndex(segs: Segment[], kind: Segment['kind'], agent?: string): numb
 }
 
 /**
+ * 子工作流里的一步（节点 id「子工作流节点 id/…」，docs/design/orchestration-round/00-总方案.md §2）：它在子工作流节点那一步
+ * 里面跑，节点计数、并行数、「当前在跑」都算在子工作流那一步上，不另算
+ */
+export const isSubStep = (id: string): boolean => id.includes('/')
+
+/**
+ * 一个节点给人看的名字：own 是画布的图上的名字（找不到为 undefined）。子工作流里的步骤（isSubStep）图上没有，接上子工作流
+ * 那一步的名字：「取数子流程 › 查订单」——和服务端终态事件的 label 同一个拼法（runner._label_of），失败横幅、泳道、
+ * 运行胶囊不再写裸的「sub/fetch」。别的找不到的照旧写 id
+ */
+export function stepLabel(t: Trace, id: string, own: (id: string) => string | undefined): string {
+  const mine = own(id)
+  if (mine) return mine
+  if (!isSubStep(id)) return id
+  const cut = id.lastIndexOf('/')
+  return `${stepLabel(t, id.slice(0, cut), own)} › ${t.nodes[id]?.label || id.slice(cut + 1)}`
+}
+
+/**
  * 此刻同时在跑的数量。
  *
  * 有成员在跑的协作节点按成员数算，容器本身不计——三个人同时在干活，说"并行 4"
@@ -279,6 +307,7 @@ function openIndex(segs: Segment[], kind: Segment['kind'], agent?: string): numb
 function parallelOf(nodes: Record<string, NodeTrace>): number {
   let total = 0
   for (const n of Object.values(nodes)) {
+    if (isSubStep(n.id)) continue
     let inner = 0
     let run = 0
     for (const s of n.segments) {
@@ -512,6 +541,7 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
     case 'node.started': {
       if (!nodeId) break
       const n = node(nodeId)
+      if (typeof d.label === 'string' && d.label && n.label !== d.label) n.label = d.label
       const open = openIndex(n.segments, 'run')
       const lastSeg = n.segments[n.segments.length - 1]
       if (open >= 0) {
@@ -531,6 +561,8 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
         n.endedAt = undefined
         n.lastDurationMs = undefined
         n.error = undefined
+        n.exited = undefined
+        n.exitTo = undefined
         if (n.toolsRunning) { n.toolsRunning = 0; mark(n) }
         if (num(d.iteration) != null) n.iteration = num(d.iteration)
         book().dispatchFrom[nodeId] = at
@@ -572,8 +604,10 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       if (!nodeId) break
       const n = node(nodeId)
       const failed = type === 'node.failed'
-      // 被人驳回的那一步（服务端在 node.failed 上带 reason=rejected）：这一段收成「被驳回」，不是失败
-      const rejected = failed && d.reason === 'rejected'
+      // 被人驳回的那一步（服务端在 node.failed 上带 reason=rejected）：这一段收成「被驳回」，不是失败。接了「驳回」出口的
+      // 驳回是 node.finished 带 outcome=rejected：这一步正常结束、沿驳回出口往下走（exited），同样画「被驳回」
+      const exited = !failed && d.outcome === 'rejected'
+      const rejected = (failed && d.reason === 'rejected') || exited
       // 节点跑完了，决定已经生效（兜底 human.resolved 没发出来的老运行）
       if (!failed && next.book.asking[nodeId]) delete book().asking[nodeId]
       const ms = num(d.duration_ms)
@@ -604,6 +638,10 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       if (n.toolsRunning) { n.toolsRunning = 0; mark(n) }
       n.looping = looping
       n.state = rejected ? 'rejected' : failed ? 'failed' : looping ? 'running' : 'done'
+      if (exited) {
+        n.exited = true
+        n.exitTo = Array.isArray(d.to) ? d.to.map((t: any) => String(t?.label || t?.node_id || '')).filter(Boolean) : []
+      }
       if (failed) {
         // 驳回的原话照样留着（卡片、航迹悬停写得出是谁驳回、为什么），但它不是「最近一次失败」：不拿它当失败的节点
         n.error = String(d.error ?? '')
@@ -995,7 +1033,8 @@ export function project(t: Trace, at: number): Projection {
         toolsRunning: state === 'running' ? m?.[5] ?? 0 : 0,
       }
     }
-    if (view.state === 'done' || view.state === 'skipped') nodesDone += 1
+    // 分母是工作流里的节点数：子工作流里的步骤算在子工作流那一步里（isSubStep），不另算完成数
+    if ((view.state === 'done' || view.state === 'skipped') && !isSubStep(n.id)) nodesDone += 1
     nodes[n.id] = view
   }
 
@@ -1022,7 +1061,7 @@ export function project(t: Trace, at: number): Projection {
 
   return {
     phase, elapsedMs, activeMs, waitMs, nodesDone,
-    nodesTotal: t.nodesTotal ?? Object.keys(t.nodes).length,
+    nodesTotal: t.nodesTotal ?? Object.keys(t.nodes).filter((id) => !isSubStep(id)).length,
     parallelNow, ...usage, nodes,
   }
 }

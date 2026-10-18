@@ -13,7 +13,7 @@ import { catalogDrift, decodePhase, decodeRun, exitLabels, schemaDrift, summariz
 import { sourceHandles } from '../../canvas/nodeDefs'
 import { EffectsPane, RunTaskCards, useRunTasks } from './RunTasks'
 import { OriginChip } from './RunList'
-import { runStatusOf, type RunPhase } from '../../run/trace'
+import { runStatusOf, stepLabel, type RunPhase } from '../../run/trace'
 import { useCatalog } from '../../store/catalog'
 import type { Approval, Run, RunEvent } from '../../types'
 import { CatalogDriftBanner, FailedBanner, FeedbackStrip, HeldBanner, WaitingBanner, type Feedback } from './Banners'
@@ -161,9 +161,9 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
 
   const labelOf = useCallback((id?: string | null) => {
     if (!id) return undefined
-    const n = d.graph?.nodes.find((x) => x.id === id)
-    return n?.data?.label || id
-  }, [d.graph])
+    // 子工作流里的那一步（出错、被驳回在它上面时运行记下的节点是「sub/x」）图上没有：接上子工作流的名字（stepLabel）
+    return stepLabel(d.trace, id, (x) => d.graph?.nodes.find((n) => n.id === x)?.data?.label || undefined)
+  }, [d.graph, d.trace])
 
   if (!run) {
     if (d.state === 'error') {
@@ -595,7 +595,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
               </time>
               <span>·</span>
               {/* 定时任务发起的：写成到那个定时任务的链接（键盘可达；记录页的「定时」标记只能鼠标点） */}
-              {run.schedule_id ? <RunScheduleSource scheduleId={run.schedule_id} startedBy={run.started_by} /> : (
+              {run.schedule_id ? <RunScheduleSource scheduleId={run.schedule_id} startedBy={run.started_by} trigger={run.origin?.trigger} /> : (
                 <span title={run.started_by ? undefined : '发起时未设置署名'}>
                   {run.started_by || '未署名'} 发起
                 </span>

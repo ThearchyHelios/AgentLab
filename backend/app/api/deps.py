@@ -349,12 +349,14 @@ async def _chat_scope(conn: HTTPConnection) -> None:
     ensure_role("user")
     path = conn.url.path.rstrip("/")
     method = conn.scope.get("method", "GET")
-    if user_can_chat() and (path.startswith("/api/conversations") or (method, path) in _CHAT_ROUTES):
+    if user_can_chat() and (path.startswith(_CHAT_PREFIXES) or (method, path) in _CHAT_ROUTES):
         return
     raise CodedHTTPException(403, "没有权限：问数据和助手需要搭建者及以上的角色，或由管理员为使用者开启问数据",
                              CHAT_FORBIDDEN)
 
 
+#: user 角色开了问数据时能用的整组接口：对话，和服务端跑的问数据一轮（发起、看、停，app/chat/job.py）。归属在接口里按对话判
+_CHAT_PREFIXES = ("/api/conversations", "/api/chat/turns")
 #: user 角色开了问数据时能用的其余接口：问数据的生成流、读当前助手模型、问数据页选数据源用的数据源名单
 #: （GET /api/datasources/names，只有名字、说明和种类，不含连接信息）
 _CHAT_ROUTES = frozenset({("POST", "/api/copilot/generate-stream"), ("GET", "/api/copilot/model"),

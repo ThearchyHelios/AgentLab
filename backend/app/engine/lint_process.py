@@ -147,9 +147,17 @@ class Subgraphs(dict):
         self.pin_problems: list[Any] = []
 
 
+#: 嵌套的子工作流往下读几层：和运行时的嵌套上限（multi._MAX_DEPTH）一样，再深的运行时本来就拒
+_LOAD_DEPTH = 3
+
+
 async def load_subgraphs(session: Any, spec: GraphSpec) -> Subgraphs:
-    """读出图里子工作流节点引用的图（固定了版本的读那一版，没固定的读工作流现在的图）。读不到、不成形的跳过。
-    固定的版本能不能用也一并读好（Subgraphs.pin_problems）。"""
+    """读出图里子工作流节点引用的图（固定了版本的读那一版，没固定的读工作流现在的图），子图里再嵌套的一层层往下读（最多
+    _LOAD_DEPTH 层，同一张图只读一次，互相引用的不会转圈）。读不到、不成形的跳过。固定的版本能不能用也一并读好
+    （Subgraphs.pin_problems，只看这张图自己的子工作流节点）。
+
+    拿去用的：人工节点在子工作流里（_subgraph_humans）、口径卡的输入跨子工作流追到原始数据（engine/lineage 的静态认法，
+    subgraph_spec）。"""
     from sqlalchemy import select
 
     from app.apps.versions import subgraph_pin_problems
@@ -157,22 +165,37 @@ async def load_subgraphs(session: Any, spec: GraphSpec) -> Subgraphs:
 
     out = Subgraphs()
     out.pin_problems = await subgraph_pin_problems(session, spec)
-    for node in spec.nodes:
-        if node.type != NodeType.SUBGRAPH:
-            continue
-        wid, pinned = node.config.get("workflow_id"), node.config.get("workflow_version")
-        version = int(pinned) if str(pinned or "").isdigit() else None
-        if not wid or (str(wid), version) in out:
-            continue
-        query = (select(WorkflowVersion.graph).where(WorkflowVersion.workflow_id == str(wid),
-                                                     WorkflowVersion.version == version)
-                 if version is not None else select(Workflow.graph).where(Workflow.id == str(wid)))
-        graph = (await session.execute(query)).scalar_one_or_none()
-        try:
-            out[(str(wid), version)] = GraphSpec.model_validate(graph)
-        except Exception:  # noqa: BLE001 - 读不到、不成形：子工作流节点运行时自己会说清楚
-            continue
+    todo = [(spec, 0)]
+    while todo:
+        current, level = todo.pop(0)
+        for node in current.nodes:
+            if node.type != NodeType.SUBGRAPH:
+                continue
+            wid, pinned = node.config.get("workflow_id"), node.config.get("workflow_version")
+            version = int(pinned) if str(pinned or "").isdigit() else None
+            if not wid or (str(wid), version) in out:
+                continue
+            query = (select(WorkflowVersion.graph).where(WorkflowVersion.workflow_id == str(wid),
+                                                         WorkflowVersion.version == version)
+                     if version is not None else select(Workflow.graph).where(Workflow.id == str(wid)))
+            graph = (await session.execute(query)).scalar_one_or_none()
+            try:
+                out[(str(wid), version)] = GraphSpec.model_validate(graph)
+            except Exception:  # noqa: BLE001 - 读不到、不成形：子工作流节点运行时自己会说清楚
+                continue
+            if level + 1 < _LOAD_DEPTH:
+                todo.append((out[(str(wid), version)], level + 1))
     return out
+
+
+def subgraph_spec(config: Mapping[str, Any]) -> GraphSpec | None:
+    """子工作流节点（配置 config）引用的那一版图：load_subgraphs 读好、with_subgraphs 放进来的；没放进来、没读到的为 None。"""
+    graphs = _SUBGRAPHS.get()
+    if graphs is None:
+        return None
+    wid, pinned = config.get("workflow_id"), config.get("workflow_version")
+    version = int(pinned) if str(pinned or "").isdigit() else None
+    return graphs.get((str(wid or ""), version))
 
 
 @contextlib.contextmanager
@@ -222,12 +245,7 @@ def _agent_tool_sets(node: GraphNode) -> list[tuple[str, Mapping[str, Any], list
 
 
 def _subgraph_humans(spec: GraphSpec, node: GraphNode) -> list[str] | None:
-    graphs = _SUBGRAPHS.get()
-    if graphs is None:
-        return None
-    wid, pinned = node.config.get("workflow_id"), node.config.get("workflow_version")
-    version = int(pinned) if str(pinned or "").isdigit() else None
-    sub = graphs.get((str(wid or ""), version))
+    sub = subgraph_spec(node.config)
     if sub is None:
         return None
     return [n.title for n in sub.nodes if n.type == NodeType.HUMAN]

@@ -3025,6 +3025,77 @@ await section('应用平台：人工节点的流程配置、入口字段的类�
   }
 })
 
+await section('驳回出口：会被人驳回的节点多一个「驳回」出口，能连、能显示；改配置不再会被驳回时连线一并收掉（编排完善 §3）', async () => {
+  FAKES['st-reject'] = wf('st-reject', { name: '__studio_check_reject__', version: 1, graph: {
+    nodes: [
+      node('in', 'input', 0, 200, '入口', { fields: [{ name: 'q' }] }),
+      node('ask', 'human', 300, 60, '补充材料', { mode: 'input', title: '补一下' }),
+      node('ok', 'human', 300, 260, '主管审批', { mode: 'approve', title: '可以吗' }),
+      node('send', 'tool', 600, 60, '发通知', { tool: 'http_request', args: {}, approval: 'always' }),
+      node('query', 'tool', 600, 260, '查订单', { tool: 'db_query__shop', args: { sql: 'SELECT 1' } }),
+      node('run', 'code', 600, 460, '跑脚本', { code: 'print(1)', language: 'python', approval: 'always' }),
+      node('calc', 'code', 600, 660, '算一下', { code: 'print(2)', language: 'python' }),
+      node('out', 'output', 900, 200, '成果', { fields: [{ name: '结果', value: '{{ last_message }}' }] }),
+      node('back', 'output', 900, 460, '退回', { fields: [{ name: '结果', value: '退回了' }] }),
+    ],
+    edges: [edge('in', 'ask'), edge('in', 'ok'), edge('ask', 'send', 'out'), edge('ok', 'query', 'approved'),
+      edge('send', 'out', 'out'), edge('query', 'out', 'out'), edge('ok', 'run', 'rejected'), edge('run', 'out', 'out'),
+      edge('calc', 'out', 'out')],
+  } })
+  try {
+    const { ctx, page, errors } = await open({ path: '/studio/st-reject' })
+    await page.waitForTimeout(500)
+    const exits = (id) => page.evaluate((x) => [...document.querySelectorAll(
+      `.react-flow__node[data-id="${x}"] .react-flow__handle.source`)].map((h) => h.getAttribute('data-handleid')), id)
+    const labels = (id) => page.evaluate((x) => [...document.querySelectorAll(
+      `.react-flow__node[data-id="${x}"] .nc-exit`)].map((el) => el.textContent), id)
+    check('补充输入：普通出口 + 驳回', (await exits('ask')).join() === 'out,rejected', (await exits('ask')).join())
+    check('……出口上写「驳回」', (await labels('ask')).join() === '驳回', (await labels('ask')).join())
+    check('审批：批准 + 驳回（同一个 id）', (await exits('ok')).join() === 'approved,rejected', (await exits('ok')).join())
+    check('调用工具（每次审批）：普通出口 + 驳回', (await exits('send')).join() === 'out,rejected', (await exits('send')).join())
+    check('数据源查询（只读、不问人）：只有普通出口', (await exits('query')).join() === 'out', (await exits('query')).join())
+    check('沙箱代码（每次审批）：普通出口 + 驳回', (await exits('run')).join() === 'out,rejected', (await exits('run')).join())
+    check('沙箱代码（不审批）：只有普通出口', (await exits('calc')).join() === 'out', (await exits('calc')).join())
+
+    // 连：从补充输入的驳回出口连到「退回」
+    await S(page, () => window.__studio.getState().onConnect({ source: 'ask', target: 'back', sourceHandle: 'rejected', targetHandle: null }))
+    await page.waitForTimeout(300)
+    const wired = await S(page, () => window.__studio.getState().edges
+      .filter((e) => e.source === 'ask').map((e) => `${e.sourceHandle}->${e.target}`).sort())
+    check('驳回出口连上了（普通出口那条照旧）', wired.join() === 'out->send,rejected->back', wired.join())
+    const drawn = await page.evaluate(() => {
+      const e = window.__studio.getState().edges.find((x) => x.source === 'ask' && x.sourceHandle === 'rejected')
+      return !!e && !!document.querySelector(`.react-flow__edge[data-id="${CSS.escape(e.id)}"] .react-flow__edge-path`)
+    })
+    check('……画得出来', drawn)
+    // 改配置：审批策略改成从不审批，工具不再会被驳回，驳回出口和连在上面的线一起收掉
+    await S(page, () => window.__studio.getState().onConnect({ source: 'send', target: 'back', sourceHandle: 'rejected', targetHandle: null }))
+    await page.waitForTimeout(200)
+    await S(page, () => {
+      const n = window.__studio.getState().nodes.find((x) => x.id === 'send')
+      window.__studio.getState().updateNode('send', { config: { ...n.data.config, approval: 'never' } })
+    })
+    await page.waitForTimeout(300)
+    check('改成从不审批：驳回出口没了', (await exits('send')).join() === 'out', (await exits('send')).join())
+    const left = await S(page, () => window.__studio.getState().edges
+      .filter((e) => e.source === 'send').map((e) => `${e.sourceHandle}->${e.target}`))
+    check('……连在驳回出口上的线一并收掉，普通出口的线还在', left.join() === 'out->out', left.join())
+    // 补充输入改成审批：普通出口的线跟到「批准」，驳回出口的线还在
+    await S(page, () => {
+      const n = window.__studio.getState().nodes.find((x) => x.id === 'ask')
+      window.__studio.getState().updateNode('ask', { config: { ...n.data.config, mode: 'approve' } })
+    })
+    await page.waitForTimeout(300)
+    const moved = await S(page, () => window.__studio.getState().edges
+      .filter((e) => e.source === 'ask').map((e) => `${e.sourceHandle}->${e.target}`).sort())
+    check('补充输入改成审批：普通出口的线跟到批准，驳回的线还在', moved.join() === 'approved->send,rejected->back', moved.join())
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
+    await ctx.close()
+  } finally {
+    delete FAKES['st-reject']
+  }
+})
+
 await section('受管工作流在画布上改过之后：页头、版本历史、选择器照当前发布版的级别写「受管」；和发布版内容相同时不写领先', async () => {
   // 画布上改过之后 status 回到草稿，当前发布版仍是受管级（published_level）。st-govs：撤回改动后保存出来的 v8，
   // 服务端按图哈希比出和 v6 相同（same_as_published）；st-gova：真的改过、领先 2 版

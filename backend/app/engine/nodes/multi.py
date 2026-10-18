@@ -14,7 +14,8 @@ from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Workflow
-from app.engine.context import NodeContext, NodeError
+from app.engine.context import PREFIX_KEY, STREAM_KEY, NodeContext, NodeError, stream_writer
+from app.engine.lineage import whole_ref
 from app.engine.state import GraphState, message_text, template_context
 from app.engine.toolcalls import (
     TOOL_MARKUP_NUDGE,
@@ -616,8 +617,17 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     """嵌套执行另一个工作流。
 
-    子图共享同一个 run 的事件流（节点 id 会加前缀），所以在时间线上能看到它内部
-    每一步；但它有独立的状态，不会污染父图的变量池。
+    子图共享同一个 run 的事件流：节点 id 加前缀「子工作流节点 id/」（嵌套的一层层接上），事件经父运行交下来的写入口发
+    （engine/context.STREAM_KEY；以前只设了前缀没用上，子图里每一步在运行的事件里一条都没有），时间线上看得到它内部每一步，
+    封存也就覆盖了它查过的数。它有独立的状态，不会污染父图的变量池。
+
+    证据交回父图（docs/design/orchestration-round/00-总方案.md §2），三样：
+    - 台账：子图记下的条目（查询快照、口径卡的指标集……）节点 id 加上前缀并进父图的 evidence，父图报告撰写的目录据此收进
+      子图里的查询和口径卡（report.report_catalog），cell(nodes.<子图>.output.<原样交出的查询结果>, …) 也按台账认得出快照；
+    - 口径卡：子图里口径卡的产出以「子工作流节点 id/卡」为 id 进父图的 nodes（目录要卡上的指标值；父图转抄它的指标时认得
+      出那张卡、带上不完整和存疑）；
+    - 出处：出口的每个字段按出口模板认它来自哪里（_output_provenance），记在产出的 provenance 上；父图里读
+      nodes.<子图>.output.<字段> 的口径卡据此接上子图里的那一格（metrics._subgraph_field），engine/lineage 同一套认法。
     """
     from app.engine.compiler import compile_graph  # 延迟导入，避免循环依赖
     from app.engine.schema import GraphSpec, loop_steps
@@ -678,9 +688,10 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         approval_default=ctx.run.approval_default,
         tool_trust=ctx.run.tool_trust,
         agent_limits=ctx.run.agent_limits,
-        # 恢复重放的标记和签批人只属于父图的节点，不能漏进子图（节点 id 可能重名）
+        # 恢复重放的标记和签批人只属于父图的节点，不能漏进子图（节点 id 可能重名）。前缀和写入口见 engine/context：
+        # 子图里的节点经父运行的写入口发事件、节点 id 带前缀；嵌套的子图拿到的是同一个写入口、更长的前缀
         extra={**{k: v for k, v in ctx.run.extra.items() if k not in ("resumed", "actors")},
-               "node_prefix": f"{ctx.node.id}/"},
+               PREFIX_KEY: f"{ctx.run.global_id(ctx.node.id)}/", STREAM_KEY: stream_writer(ctx.run)},
     )
 
     ctx.emit(EventType.LOG, level="info",
@@ -711,6 +722,13 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             f"子工作流「{workflow.name}」已执行 {limit} 步仍未结束，已中止。可能存在没有轮数上限的环路，"
             "请在子工作流中用「循环」节点限制轮数",
         ) from e
+    except NodeError as e:
+        # 子图里的节点报的错（含被驳回）：节点 id 换成这一层图里的 id（「子工作流节点 id/…」），名字接上子工作流的名字。
+        # 以前带的是子图里的 id，运行记下的出错节点会和父图里同名的节点混在一起
+        titles = sub_spec.node_map()
+        inner = getattr(e, "label", None) or (titles[e.node_id].title if e.node_id in titles else e.node_id)
+        e.node_id, e.label = f"{ctx.node.id}/{e.node_id}", f"{ctx.node.title} › {inner}"
+        raise
 
     output = result_state.get("output") or {}
     result = {
@@ -721,13 +739,94 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "pinned": bool(pinned),
         "text": json.dumps(output, ensure_ascii=False) if output else "",
     }
+    if provenance := _output_provenance(sub_spec, sub_run, result_state, output, state, ctx):
+        # 出口每个字段的出处（没有能认的字段时不带这个键，产出和以前一字不差）
+        result["provenance"] = provenance
     ctx.emit(EventType.LOG, level="info", message=f"子工作流「{workflow.name}」完成")
 
+    sub_nodes = result_state.get("nodes") or {}
+    cards = {f"{ctx.node.id}/{nid}": payload for nid, payload in sub_nodes.items()
+             if isinstance(payload, dict) and payload.get("kind") == "metric_set"}
     updates: dict[str, Any] = {
-        "nodes": {ctx.node.id: result},
+        "nodes": {ctx.node.id: result, **cards},
         "usage": result_state.get("usage") or {},
     }
+    if ledger := [_forwarded(e, ctx.node.id) for e in result_state.get("evidence") or [] if isinstance(e, dict)]:
+        updates["evidence"] = ledger
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: output}
     return updates
+
+
+#: 台账条目里写着节点 id 的键：交回父图时一并加前缀（双盲复算的条目记着它复算的口径卡）
+_LEDGER_NODE_KEYS = ("node_id", "card")
+
+
+def _forwarded(entry: dict[str, Any], node_id: str) -> dict[str, Any]:
+    """子图台账里的一条交回父图：节点 id 加上「子工作流节点 id/」前缀，别的照抄。"""
+    out = dict(entry)
+    for key in _LEDGER_NODE_KEYS:
+        if isinstance(out.get(key), str) and out[key]:
+            out[key] = f"{node_id}/{out[key]}"
+    return out
+
+
+def _output_provenance(sub_spec: Any, sub_run: Any, sub_state: dict[str, Any], output: dict[str, Any],
+                       state: GraphState, ctx: NodeContext) -> dict[str, dict[str, Any]]:
+    """子图出口每个字段的出处：{字段: 口径卡上一个输入的样子（via、node_id、artifact、locator、status、upstream……）}。
+
+    认法和口径卡认它的输入同一个（metrics._input_of），在子图的状态里认：字段的模板整串就是一个取值链（whole_ref），而且
+    渲染出来的值正是那个值转成的文字，才算这个字段就是那个值；拼了别的字、过了过滤器的不认（不在结果里）。几个成果节点
+    写同一个字段时按最后跑的那个。认出来的节点 id 换成父图这一层的（加「子工作流节点 id/」前缀）。
+
+    出自子图运行输入的（via input）再往父图追一层：子图的输入是父图按子工作流节点的「输入」模板渲染出来的，那个模板整串
+    也是一个取值链时，按父图的状态接着认（追到父图的运行输入、查询格……）；否则记 via subgraph_input，停在子工作流的
+    入口——子图的运行输入对父图不是原始数据。"""
+    from app.engine.expressions import _stringify
+    from app.engine.nodes.metrics import _input_of, _value_of
+    from app.engine.schema import NodeType
+
+    outputs = {n.id: n for n in sub_spec.nodes if n.type == NodeType.OUTPUT}
+    fields: dict[str, tuple[Any, str]] = {}
+    for step in sub_state.get("trail") or []:
+        exit_node = outputs.get(step.get("node_id")) if "error" not in step else None
+        for field in (exit_node.config.get("fields") or []) if exit_node is not None else []:
+            if isinstance(field, dict) and field.get("name"):
+                fields[str(field["name"])] = (exit_node, field.get("value", ""))
+    tctx = template_context(sub_state)
+    out: dict[str, dict[str, Any]] = {}
+    for name, (exit_node, template) in fields.items():
+        path = whole_ref(template)
+        if path is None or name not in output:
+            continue
+        value = _value_of(path, tctx)
+        if _stringify(value) != output[name]:
+            continue
+        item = _input_of(path, value, sub_state, NodeContext(node=exit_node, run=sub_run), tctx)
+        out[name] = _lifted(item, state, ctx)
+    return out
+
+
+def _lifted(item: dict[str, Any], state: GraphState, ctx: NodeContext) -> dict[str, Any]:
+    """子图里认出的一个出处换到父图这一层：节点 id 加前缀；出自子图运行输入的，按子工作流节点的「输入」模板往父图追。"""
+    from app.engine.expressions import _stringify
+    from app.engine.nodes.metrics import _REF_HEAD, _input_of, _value_of
+
+    if item.get("via") == "input":
+        head = _REF_HEAD.match(str(item.get("path") or ""))
+        name = head.group(2) if head else ""
+        templates = ctx.cfg("input", {}) or {}
+        path = whole_ref(templates.get(name)) if isinstance(templates, dict) and name else None
+        if path is not None:
+            parent = template_context(state)
+            value = _value_of(path, parent)
+            if _stringify(value) == _stringify(item.get("value")):
+                return _input_of(path, value, state, ctx, parent)
+        return {"path": item.get("path"), "value": item.get("value"), "node_id": ctx.node.id, "via": "subgraph_input",
+                **({"field": name} if name else {}), "status": item.get("status") or "ok"}
+    out = dict(item)
+    for key in ("node_id", "through", "subgraph"):
+        if isinstance(out.get(key), str) and out[key]:
+            out[key] = f"{ctx.node.id}/{out[key]}"
+    return out

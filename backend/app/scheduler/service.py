@@ -4,6 +4,11 @@
 只有一份。发起本身走 engine/launch.py 的 launch_run，和 HTTP 发起是同一套规则——正式运行只能从当前发布版本
 发起，这一条不会在定时任务这边被绕过。
 
+**事件触发**（docs/design/orchestration-round/00-总方案.md §4）：trigger_kind=event 的任务不按 cron 到点，而是由数据事件触发
+（scheduler/triggers.py 的规则、scheduler/outbox.py 的派发）。派发到了照样调 fire_once（kind=event，带上事件 EventFire）：
+重叠跳过、记触发、发起运行还是这一份；多出来的只有三样——输入模板里能用 {{ event.* }}、运行来源里记 trigger、触发链超过
+上限不发起。触发记录的 inputs 写 {event: 事件的说明, inputs: 渲染出的输入}。
+
 **定时的目标**（docs/design/next-round/00-总方案.md X4：定时只有一套）：一个定时任务指向一个目标——工作流、评测题集
 （app/eval/scheduled.py）或数据源维护（app/data/source_maintenance.py）。认领、补跑、重叠跳过、触发记录、通知都只有这一套，
 fire_once 按目标种类分派；建任务、改目标时核对目标也按种类交给各自的模块（check_target）。
@@ -182,6 +187,7 @@ def template_values(fire_at: datetime, tz: str, cron_expr: str | cron.CronSpec) 
     按 fire_at 算而不是按「现在」：补发晚了一小时、立即运行在零点前后点下去，「昨天」都是那次触发的昨天。
     ISO 周的年份是周所在的年（isocalendar），不是日历年：2027-01-01 是 2026-W53，2025-12-29 是 2026-W01。
     last_fire_time 是按 cron 往前找的上一次计划触发，不看历史记录：同一个 (cron, 时区, fire_at) 永远渲染出同一份输入。
+    事件触发的任务没有 cron（存空串），last_fire_time 为空（这个变量在事件触发的模板里也不让用，见 check_template）。
     """
     zone = cron.zone(tz)
     local = fire_at.astimezone(zone)
@@ -190,7 +196,7 @@ def template_values(fire_at: datetime, tz: str, cron_expr: str | cron.CronSpec) 
     month_start = today.replace(day=1)
     last_month_end = month_start - timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
-    previous = cron.prev_fire(cron_expr, zone, fire_at)
+    previous = cron.prev_fire(cron_expr, zone, fire_at) if cron_expr else None
     return {
         "today": _day(today),
         "yesterday": _day(today - timedelta(days=1)),
@@ -225,17 +231,28 @@ def _month(value: date) -> str:
     return f"{value.year:04d}-{value.month:02d}"
 
 
-def render_inputs(template: dict[str, str], values: dict[str, str]) -> dict[str, str]:
-    """渲染输入模板。用项目通用的 {{ }} 渲染（engine/expressions.render_template），变量挂在 schedule 下。"""
-    ctx = {"schedule": values}
+def render_inputs(template: dict[str, str], values: dict[str, str], *,
+                  event: dict[str, Any] | None = None) -> dict[str, str]:
+    """渲染输入模板。用项目通用的 {{ }} 渲染（engine/expressions.render_template），变量挂在 schedule 下；事件触发的另有
+    event（scheduler/triggers.values）。"""
+    ctx: dict[str, Any] = {"schedule": values}
+    if event is not None:
+        ctx["event"] = event
     return {name: render_template(text, ctx) for name, text in template.items()}
 
 
-def check_template(template: Any) -> dict[str, str]:
+#: 事件触发的模板里不能用的日期变量：没有 cron，就没有「上一次计划触发」
+EVENT_UNSUPPORTED = ("schedule.last_fire_time",)
+
+
+def check_template(template: Any, *, event: str | None = None) -> dict[str, str]:
     """校验输入模板，原样返回（None 当空模板）。写错抛 TemplateError。
 
     项目的模板渲染取不到值时渲染成空串、不报错——画布上的半成品图要能运行。定时任务没人盯着，拼错的变量名
     会让每一次运行都拿到空的日期，所以保存和预览时就要说出来。
+
+    event 是事件触发任务的事件种类：这时还能用这种事件的 {{ event.* }}（scheduler/triggers），不能用 schedule.last_fire_time。
+    不给（按 cron 触发的任务）时规则一字不变。
     """
     if template is None:
         return {}
@@ -252,18 +269,20 @@ def check_template(template: Any) -> dict[str, str]:
         if not isinstance(text, str):
             raise TemplateError(f"输入「{name}」的值需要是文本（可以带 {{{{ schedule.yesterday }}}} 这样的变量）"
                                 f"{current_value(text)}")
-        _check_text(name, text)
+        _check_text(name, text, event)
         out[name] = text
     return out
 
 
-def _check_text(name: str, text: str) -> None:
+def _check_text(name: str, text: str, event: str | None = None) -> None:
     for match in _TEMPLATE_RE.finditer(text):
         expr = match.group(1).strip()
         if not expr:
             raise TemplateError(f"输入「{name}」的模板里有空的 {{{{ }}}}，请在中间写变量名，例如 schedule.yesterday")
         path, *filters = (part.strip() for part in expr.split("|"))
-        if path not in _NAMES:
+        if event is not None:
+            _check_event_path(name, path, event)
+        elif path not in _NAMES:
             raise TemplateError(f"输入「{name}」的模板里「{path}」不是可用的变量，可用的变量：{'、'.join(_NAMES)}")
         for filt in filters:
             if filt not in _FILTERS:
@@ -273,15 +292,43 @@ def _check_text(name: str, text: str) -> None:
         raise TemplateError(f"输入「{name}」的模板里 {{{{ 和 }}}} 没有成对出现，请检查是否少写了一半")
 
 
-def variables(now: datetime | None = None, tz: str = DEFAULT_TIMEZONE) -> list[dict[str, str]]:
+def _check_event_path(name: str, path: str, event: str) -> None:
+    """事件触发任务的模板里的一个变量：schedule.*（上一次计划触发时间除外）或这种事件的 event.*。"""
+    from app.scheduler import triggers
+
+    if path in _NAMES and path not in EVENT_UNSUPPORTED:
+        return
+    if path in EVENT_UNSUPPORTED:
+        raise TemplateError(f"输入「{name}」的模板里「{path}」在事件触发的任务里不可用：没有按时间排的上一次触发")
+    if triggers.allowed_path(path, event):
+        return
+    usable = [n for n in _NAMES if n not in EVENT_UNSUPPORTED] + list(triggers.names(event))
+    raise TemplateError(f"输入「{name}」的模板里「{path}」不是可用的变量，可用的变量：{'、'.join(usable)}")
+
+
+def variables(now: datetime | None = None, tz: str = DEFAULT_TIMEZONE, *,
+              event: str | None = None) -> list[dict[str, str]]:
     """变量清单：[{name, label, example, note}]。示例按 now（默认现在）这一刻触发算；上一次计划触发时间没有 cron
-    可依，示例按每天同一时刻触发算。note 是补充说明（ISO 周的跨年规则），没有的是空串。"""
+    可依，示例按每天同一时刻触发算。note 是补充说明（ISO 周的跨年规则），没有的是空串。
+
+    event 是事件触发任务的事件种类：去掉上一次计划触发时间，后面接这种事件的 {{ event.* }}（示例是写法示意）。"""
     moment = (now or utcnow()).replace(second=0, microsecond=0)
     local = moment.astimezone(cron.zone(tz))
     daily = f"{local.minute} {local.hour} * * *"
     values = template_values(moment, tz, daily)
-    return [{"name": f"schedule.{key}", "label": label, "example": values[key], "note": note}
-            for key, label, note in VARIABLES]
+    out = [{"name": f"schedule.{key}", "label": label, "example": values[key], "note": note}
+           for key, label, note in VARIABLES]
+    if event is None:
+        return out
+    from app.scheduler import triggers
+
+    kept = [({**v, "label": EVENT_FIRE_TIME} if v["name"] == "schedule.fire_time" else v)
+            for v in out if v["name"] not in EVENT_UNSUPPORTED]
+    return kept + triggers.variables(event)
+
+
+#: 事件触发的任务里 schedule.fire_time 的说法：不是「计划」的时刻，是去抖窗口结束、合成这次触发的时刻
+EVENT_FIRE_TIME = "本次触发时间（去抖结束的时刻，带时区偏移的 ISO 时间）"
 
 
 # --------------------------------------------------------------------------
@@ -368,12 +415,15 @@ def next_run(cron_expr: str, tz: str, enabled: bool, now: datetime | None = None
 
 
 async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: str | None = None,
-                    ) -> ScheduleFire | None:
+                    event: Any = None) -> ScheduleFire | None:
     """处理一次触发，返回记下的触发记录。同一 (任务, fire_at, kind) 已经有记录（两拍撞在一起、立即运行连点两下）
     时不再发起，返回已有的那一条；任务不存在返回 None。
 
     按目标种类分派（target_of）：工作流在这里发起（_fire_workflow），评测题集、数据源维护交给各自模块的 fire（同样持着
     launch_lock，触发记录用 record_fire 写）；不认识的种类记 failed_to_start、写明原因，不发起。
+
+    event 是事件触发的那一次事件（scheduler/outbox.EventFire）：派发时（kind=event）、事件触发任务的立即运行（kind=manual，
+    示例事件）带上。事件触发只能指向工作流。
     """
     async with launch_lock():
         async with SessionLocal() as session:
@@ -383,6 +433,8 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
             target_kind, target_id = target_of(schedule)
             name, run_class = schedule.name, schedule.run_class
             tz, cron_expr, template = schedule.timezone, schedule.cron, schedule.input_template
+        if target_kind != "workflow" and event is not None:
+            return await _record(schedule_id, fire_at, kind, "failed_to_start", EVENT_TARGET_ONLY, {})
         if target_kind != "workflow":
             handler = target_handler(target_kind)
             if handler is None:
@@ -391,39 +443,66 @@ async def fire_once(schedule_id: str, fire_at: datetime, kind: str, *, actor: st
             return await handler.fire(schedule_id=schedule_id, fire_at=fire_at, kind=kind, actor=actor,
                                       target_id=target_id, name=name, tz=tz, cron_expr=cron_expr)
         return await _fire_workflow(schedule_id, fire_at, kind, actor=actor, name=name, workflow_id=target_id,
-                                    run_class=run_class, tz=tz, cron_expr=cron_expr, template=template)
+                                    run_class=run_class, tz=tz, cron_expr=cron_expr, template=template, event=event)
+
+
+#: 事件触发只能指向工作流（库里被改成别的目标时照实记）
+EVENT_TARGET_ONLY = "事件触发的定时任务只能指向工作流，这次触发没有发起"
+#: 触发链超过上限（scheduler/triggers.MAX_DEPTH）
+DEPTH_REASON = ("这次运行会是事件触发链上的第 {depth} 层（上限 {limit} 层）：为防止工作流之间循环触发，没有发起。"
+                "请检查「上游工作流运行成功结束」的定时任务是不是串成了环")
+#: 立即运行事件触发的任务、对象还没发生过这种事件，模板又用到了 {{ event.* }}
+NO_SAMPLE_REASON = "还没有发生过这种事件，输入模板里的 {{ event.* }} 没有可用的值，这次立即运行没有发起"
 
 
 async def _fire_workflow(schedule_id: str, fire_at: datetime, kind: str, *, actor: str | None, name: str,
                          workflow_id: str, run_class: str, tz: str, cron_expr: str, template: Any,
-                         ) -> ScheduleFire | None:
+                         event: Any = None) -> ScheduleFire | None:
     """目标是工作流的一次触发（持着 launch_lock）。
 
     上一次运行还没结束就记 skipped_overlap；输入渲染不了、launch_run 拒绝或出错记 failed_to_start（拒绝写原话，
     其他异常写通用说明、详细信息进日志）；发起成功记 started 和运行 id。
+
+    事件触发（event 不为空）：模板按事件种类校验、渲染 {{ event.* }}；触发链超过上限先记 failed_to_start（防环的兜底，比重叠
+    跳过先判）；触发记录的 inputs 写 {event: 说明, inputs: 渲染出的输入}；运行来源里带 trigger。
     """
+    from app.scheduler import triggers
+
+    brief = event.brief() if event is not None else None
+
+    def recorded(inputs: dict[str, Any]) -> dict[str, Any]:
+        return inputs if brief is None else {"event": brief, "inputs": inputs}
+
+    if event is not None and event.depth > triggers.MAX_DEPTH:
+        return await _record(schedule_id, fire_at, kind, "failed_to_start",
+                             DEPTH_REASON.format(depth=event.depth, limit=triggers.MAX_DEPTH), recorded({}))
     try:
-        inputs = render_inputs(check_template(template), template_values(fire_at, tz, cron_expr))
+        inputs = render_inputs(check_template(template, event=event.event if event is not None else None),
+                               template_values(fire_at, tz, cron_expr),
+                               event=event.values if event is not None else None)
     except (TemplateError, cron.CronError, cron.TimezoneError) as e:
         # 存进库之后才坏掉的（手改过库、时区库升级删了时区）：照实说是哪一项，不发起
-        return await _record(schedule_id, fire_at, kind, "failed_to_start", f"无法生成这次运行的输入：{e}", {})
+        return await _record(schedule_id, fire_at, kind, "failed_to_start", f"无法生成这次运行的输入：{e}", recorded({}))
+    if event is not None and not event.real and triggers.uses_event(template):
+        return await _record(schedule_id, fire_at, kind, "failed_to_start", NO_SAMPLE_REASON, recorded({}))
     busy = await _active_run(schedule_id)
     if busy is not None:
-        return await _record(schedule_id, fire_at, kind, "skipped_overlap", overlap_reason(*busy), inputs)
-    fire = await _record(schedule_id, fire_at, kind, "failed_to_start", INTERRUPTED_REASON, inputs, fresh=True)
+        return await _record(schedule_id, fire_at, kind, "skipped_overlap", overlap_reason(*busy), recorded(inputs))
+    fire = await _record(schedule_id, fire_at, kind, "failed_to_start", INTERRUPTED_REASON, recorded(inputs), fresh=True)
     if fire is None:
         return await _existing(schedule_id, fire_at, kind)
     from app.engine.launch import LaunchRefused, launch_run
 
+    origin: dict[str, Any] = {"schedule_id": schedule_id, "schedule": name, "fire_id": fire.id, "fire_kind": kind}
+    if event is not None:
+        origin["trigger"] = event.origin()
     _LAUNCHING.add(fire.id)
     try:
         try:
             async with SessionLocal() as session:
                 run = await launch_run(session, workflow_id=workflow_id, run_class=run_class,
                                        input_payload=inputs, actor=actor or actor_label(name),
-                                       schedule_id=schedule_id, origin_kind="schedule",
-                                       origin={"schedule_id": schedule_id, "schedule": name,
-                                               "fire_id": fire.id, "fire_kind": kind})
+                                       schedule_id=schedule_id, origin_kind="schedule", origin=origin)
         except LaunchRefused as e:
             return await _finish(fire.id, status="failed_to_start", reason=e.message)
         except Exception:  # noqa: BLE001 - 发起失败不能让调度循环停下；详细信息进日志，记录上写通用说明

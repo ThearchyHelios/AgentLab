@@ -121,19 +121,63 @@ export function topology(graph: GraphLike): Topology {
   return topo
 }
 
+/**
+ * 拓扑序里插上图上没有的那几个节点：子工作流里的步骤（节点 id「子工作流节点 id/…」，docs/design/orchestration-round/00-总方案.md
+ * §2）排在它们的子工作流节点后面（嵌套的接在上一层后面），别的（老运行里改过图的）照旧排在最后。泳道、航迹的节点列表用它
+ */
+export function withSubSteps(order: string[], ids: string[]): string[] {
+  const known = new Set(order)
+  const extra = ids.filter((id) => !known.has(id))
+  if (!extra.length) return order
+  const under = new Map<string, string[]>()
+  const rest: string[] = []
+  for (const id of extra) {
+    const cut = id.lastIndexOf('/')
+    const parent = cut > 0 ? id.slice(0, cut) : ''
+    if (parent && (known.has(parent) || extra.includes(parent))) {
+      const list = under.get(parent)
+      if (list) list.push(id)
+      else under.set(parent, [id])
+    } else rest.push(id)
+  }
+  const out: string[] = []
+  const put = (id: string) => {
+    out.push(id)
+    for (const child of under.get(id) ?? []) put(child)
+  }
+  for (const id of order) put(id)
+  for (const id of rest) put(id)
+  return out
+}
+
 const continueOnError = (n: GraphLike['nodes'][number] | undefined): boolean =>
   n?.data?.config?.on_error === 'continue'
 
+/** 会被人驳回、能接「驳回」出口的节点（后端 engine/schema.GATE_TYPES）。出口 id 同 canvas/nodeDefs 的 REJECT_HANDLE */
+const GATE_TYPES = new Set(['human', 'tool', 'code', 'dual_check'])
+const REJECT = 'rejected'
+
+/**
+ * 审批模式以外的关卡接了驳回出口：只有两条路，驳回出口和其余的（普通出口）。和 compiler.py 的 _make_router 一致：
+ * 驳回出口以外的出口一律当 default
+ */
+function gateRouted(node: GraphLike['nodes'][number] | undefined, outHandles: Set<string>): boolean {
+  const type = node ? typeOf(node) : undefined
+  if (!type || !GATE_TYPES.has(type) || !outHandles.has(REJECT)) return false
+  return !(type === 'human' && (node?.data?.config?.mode ?? 'approve') === 'approve')
+}
+
 /**
  * 这个节点是不是按出口路由的。和 compiler.py 的 needs_routing 一致：分支、循环，
- * 以及出口里有通过/驳回的人工审批。图里没带类型时，看它做过的决定能不能对上
+ * 出口里有通过/驳回的人工审批，以及接了「驳回」出口的关卡。图里没带类型时，看它做过的决定能不能对上
  * 某个出口。
  */
 function isRouting(node: GraphLike['nodes'][number] | undefined, outHandles: Set<string>,
                    n: NodeTrace | undefined): boolean {
   const type = node ? typeOf(node) : undefined
   if (type === 'branch' || type === 'loop') return true
-  if (type === 'human') return outHandles.has('approved') || outHandles.has('rejected')
+  if (type === 'human') return outHandles.has('approved') || outHandles.has(REJECT)
+  if (type && GATE_TYPES.has(type)) return outHandles.has(REJECT)
   if (type) return false
   const decision = n?.takenHandle
   return decision != null && (outHandles.has(decision) || outHandles.has('default'))
@@ -166,22 +210,24 @@ function contextOf(graph: GraphLike): Ctx {
   return ctx
 }
 
-/** 出口 handle 是否放行：decision 是节点做的某一次决定（undefined = 没做决定） */
+/** 出口 handle 是否放行：decision 是节点做的某一次决定（undefined = 没做决定）。gate：接了驳回出口的关卡（gateRouted） */
 function handleOpen(e: GraphEdgeLike, routing: boolean, decision: string | undefined,
-                    outHandles: Set<string>): boolean {
+                    outHandles: Set<string>, gate = false): boolean {
   if (!routing) return true
-  const h = e.sourceHandle || 'default'
+  const raw = e.sourceHandle || 'default'
+  const h = gate && raw !== REJECT ? 'default' : raw
   // 路由节点没做出决定（被 skip_if 跳过）：路由函数拿到 None，只走 default
   if (decision == null) return h === 'default'
   if (h === decision) return true
   return h === 'default' && !outHandles.has(decision)
 }
 
-/** 源节点已经把数据送出来了：跑完、被跳过、容错失败，或者循环容器正放行 body */
+/** 源节点已经把数据送出来了：跑完、被跳过、容错失败、被驳回后走了驳回出口，或者循环容器正放行 body */
 function sourcePassed(n: NodeTrace | undefined, node: GraphLike['nodes'][number] | undefined): boolean {
   if (!n) return false
   if (n.looping) return true
   return n.state === 'done' || n.state === 'skipped'
+    || (n.state === 'rejected' && n.exited === true)
     || (n.state === 'failed' && continueOnError(node))
 }
 
@@ -192,7 +238,7 @@ export function edgeFired(trace: Trace, graph: GraphLike, e: GraphEdgeLike): boo
   const node = ctx.byId.get(e.source)
   if (!sourcePassed(src, node)) return false
   const hs = ctx.handles.get(e.source) ?? new Set<string>()
-  return handleOpen(e, isRouting(node, hs, src), src?.takenHandle, hs)
+  return handleOpen(e, isRouting(node, hs, src), src?.takenHandle, hs, gateRouted(node, hs))
 }
 
 /**
@@ -241,8 +287,13 @@ export function walkedEdges(trace: Trace, graph: GraphLike): Set<string> {
     const hs = ctx.handles.get(e.source) ?? new Set<string>()
     const node = ctx.byId.get(e.source)
     const routing = isRouting(node, hs, src)
-    const decisions = src.taken?.length ? src.taken : [undefined]
-    if (decisions.some((dec) => handleOpen(e, routing, dec, hs))) walked.add(edgeIdOf(e))
+    const gate = gateRouted(node, hs)
+    // 接了驳回出口的关卡：有时走驳回出口（taken 里有 rejected），有时正常结束（没有决定，或者补充输入写的 approved）。
+    // 「退回修改」里同一个关卡先被驳回、再被批准，两条出口都走过
+    const decisions = src.taken?.length
+      ? (gate && src.count > src.taken.filter((t) => t === REJECT).length ? [...src.taken, undefined] : src.taken)
+      : [undefined]
+    if (decisions.some((dec) => handleOpen(e, routing, dec, hs, gate))) walked.add(edgeIdOf(e))
   }
   return walked
 }

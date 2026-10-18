@@ -345,6 +345,11 @@ async def notify_after_job(source_id: str, job_id: str) -> int:
     except Exception:  # noqa: BLE001
         logger.exception("任务 %s 结束后推送数据源变化的通知时出错", job_id)
         n = 0
+    if n:
+        # 数据事件触发（scheduler/outbox）：这一批「要处理」的变化记一条 source.changed（一个任务一条）
+        from app.scheduler import outbox
+
+        await outbox.emit_source_changed(source_id, job_id, n)
     try:
         # 口径账本的召回（next-round 02 做法 7 三）：这次记下的变化里表或列被删、类型变了的，标用过它的答案「依据的表结构已变」
         from app.ledger import recall
