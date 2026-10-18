@@ -8,8 +8,8 @@
  * cron / timezone / input_template 哪一项（ApiError.field）。老服务端没有这些接口，回 404 且没有 code
  */
 import type {
-  Schedule, ScheduleCreate, ScheduleFirePage, SchedulePatch, SchedulePreview, SchedulePreviewRequest, ScheduleRunResult,
-  ScheduleTargetCreate, ScheduleVariable, ScheduleWebhookTest,
+  Schedule, ScheduleCreate, ScheduleEventKind, ScheduleFirePage, SchedulePatch, SchedulePreview, SchedulePreviewRequest,
+  ScheduleRunResult, ScheduleTargetCreate, ScheduleTriggerOptions, ScheduleVariable, ScheduleWebhookTest,
 } from '../types'
 import { del, get, patch, post, qs, request, type RequestOptions } from './http'
 
@@ -30,6 +30,14 @@ export const schedules = {
     request<SchedulePreview>('/schedules/preview', { method: 'POST', body: JSON.stringify(body), signal: opts?.signal }),
   /** 输入模板里能用的变量（schedule.yesterday 这类），按触发时间计算 */
   variables: (opts?: RequestOptions) => get<ScheduleVariable[]>('/schedules/variables', opts),
+  /**
+   * 事件触发任务的模板里能用的变量：schedule.*（上一次计划触发时间除外）加上这种事件的 event.*（docs/design/orchestration-round
+   * §4）。老服务端不认这两个参数，照旧给 cron 的那一份
+   */
+  eventVariables: (event: ScheduleEventKind, opts?: RequestOptions) =>
+    get<ScheduleVariable[]>(`/schedules/variables${qs({ trigger_kind: 'event', event })}`, opts),
+  /** 新建、修改事件触发任务时能选的对象（能不能选、为什么由服务端判）、来源、应用。老服务端没有，回 404 */
+  triggerOptions: (opts?: RequestOptions) => get<ScheduleTriggerOptions>('/schedules/trigger-options', opts),
   /** 立即运行一次：记一条手动触发，上一次还没结束时照样按重叠策略跳过 */
   run: (id: string) => post<ScheduleRunResult>(`${at(id)}/run`),
   /** 触发历史，新的在前。before 是上一页给的 next_before */

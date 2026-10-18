@@ -6,6 +6,9 @@
 
 错过的触发（服务停机、进程卡住）：只看最近应触发的那一次——在宽限内补一次（kind=misfire），超出就记一条
 skipped_misfire；更早的积压只记一条跳过，不补。下一次一律推进到现在之后，不会醒来就把积压的一口气全发起。
+
+事件触发的任务（docs/design/orchestration-round/00-总方案.md §4）不在 fire_due 里：它们没有 next_run_at。每一拍发完到点的，
+接着派待派发事件（scheduler/outbox.dispatch_due）。调度关着时这一拍不存在，事件留在表里。
 """
 from __future__ import annotations
 
@@ -112,12 +115,26 @@ def _span(first: datetime, last: datetime, tz: str) -> str:
 
 
 async def tick(now: datetime | None = None) -> None:
-    """完整的一拍：发起到点的，处理流程的时限和核实，再推送该推送的通知。测试和手动调用用；循环里分开跑（见 _Runner._loop）。"""
+    """完整的一拍：发起到点的，派发数据事件，处理流程的时限和核实，再推送该推送的通知。测试和手动调用用；循环里分开跑
+    （见 _Runner._loop）。"""
     from app.scheduler import webhook
 
     await fire_due(now)
+    await dispatch_events(now)
     await process_due(now)
     await webhook.notify_due(now)
+
+
+async def dispatch_events(now: datetime | None = None) -> None:
+    """派发待派发事件（scheduler/outbox）。出错只记日志：这一拍出错不该让调度循环停下，也不该挡着后面的流程处理。"""
+    from app.scheduler import outbox
+
+    try:
+        done = await outbox.dispatch_due(now)
+        if done:
+            logger.info("事件触发：这一拍记下了 %d 次触发", len(done))
+    except Exception:  # noqa: BLE001
+        logger.exception("派发数据事件这一拍出错，下一拍照常进行")
 
 
 async def process_due(now: datetime | None = None) -> None:
@@ -175,6 +192,7 @@ class _Runner:
         while not stopping.is_set():
             try:
                 await fire_due()
+                await dispatch_events()
                 await process_due()
                 # stop 撞在这一拍的发起当中时，收尾不再新起通知扫描：stop 只等它动手时手上的那一份
                 if not stopping.is_set() and (self.notify is None or self.notify.done()):

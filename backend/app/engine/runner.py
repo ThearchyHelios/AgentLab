@@ -1063,6 +1063,8 @@ class RunManager:
                     await _close_approvals(session, run_id, actor, now)
                 if event is not None:
                     await _stage(session, event, run)
+                from app.scheduler import outbox  # 数据事件触发：正式运行成功结束，同一个事务记一条待派发事件
+                outbox.stage_run_finished(session, run)
                 await session.commit()
         if event is not None:
             await bus.publish(event)
