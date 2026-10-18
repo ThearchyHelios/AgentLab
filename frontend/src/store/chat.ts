@@ -8,7 +8,6 @@ import type { LookEvent } from '../typesApp'
 import { errorMessage, humanizeError } from '../lib/errors'
 import { hasEvidence } from '../lib/evidence'
 import { explainRunError, explainStartError } from '../lib/explain'
-import { parseServerTime } from '../lib/format'
 import { useCatalog } from './catalog'
 import { useConversations } from './conversations'
 import type {
