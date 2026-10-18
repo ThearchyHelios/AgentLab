@@ -1043,6 +1043,27 @@ export const useChat = create<ChatState>((set, get) => ({
       await resumeTurn(conversationId, turnId)
       return
     }
+    // 重新核对一轮还没有运行的（实时流断在建图中、读不到了）：问服务端它现在怎样，在跑就接着播，收了尾就照那一行摆
+    if (turn.phase === 'checking' && turn.serverId) {
+      patch(() => ({ hydrated: 'pending' }))
+      try {
+        const res = await api.chatTurns.get(turn.serverId)
+        if (res.job && LIVE_JOB.has(res.job.status)) {
+          patch(() => ({ hydrated: 'done', job: res.job }))
+          play(flowOf(conversationId, turnId), turn.serverId, Math.max(0, res.job.attempt_seq - 1))
+        } else {
+          patch((t) => ({ ...endPatch(t, { turn: res.turn }), hydrated: 'done' }))
+        }
+      } catch (e) {
+        const failure: Failure = {
+          title: PHASE_TEXT.unknown,
+          reason: `查询本轮运行状态时出错（${errorMessage(e)}）。运行可能仍在进行，也可能已结束。`,
+          hint: '请稍后点击「重新核对」；服务端重新连接后会自动再核对一次。',
+        }
+        patch(() => ({ hydrated: undefined, phase: 'unknown', status: PHASE_TEXT.unknown, failure, error: lineOf(failure) }))
+      }
+      return
+    }
     const runId = turn.run?.id
     if (!runId) return
     // 核对期间用户点了重试或停止：拿回来的是上一次的状态，作废
@@ -1262,7 +1283,7 @@ function attemptReset(t: ChatTurn, d: Record<string, any>, ts: number): Partial<
       phase: 'running', status: PHASE_TEXT.running, attempts, scope, usage,
       events: [], run: null, output: null, review: null, reviewRaw: null, rawOutput: null, failure: null, error: '',
       lastSeq: 0, final: undefined, rejected: null, runStatus: undefined, pendingRun: false, hydrated: 'done',
-      startedAt, endedAt: undefined, writing: null, noQuery: false,
+      startedAt, endedAt: undefined, writing: null, noQuery: false, restored: false, steps: undefined,
     }
   }
   return {
@@ -1274,6 +1295,8 @@ function attemptReset(t: ChatTurn, d: Record<string, any>, ts: number): Partial<
     runStatus: undefined, clipped: undefined, pendingRun: false, steps: undefined,
     hydrated: 'done', startedAt, endedAt: undefined, attempt: 0,
     noQuery: false, thinking: '', writing: null, asked: undefined,
+    // 刷新后接着播的那一轮就是正在跑的一轮：过程照实时的样子一直摆着（不是从库里恢复、要点开才取的历史轮次）
+    restored: false,
   }
 }
 
@@ -1474,8 +1497,27 @@ function play(flow: Flow, serverId: string, after: number) {
   const stopTurn = streamChatTurn(serverId, after, (e) => {
     if (!flow.alive()) return
     apply(e)
-  }, () => {
-    // 服务端说这一轮的事件都发完了（或者这一轮读不了了）。运行的实时流还开着的让它自己收尾
+  }, (end) => {
+    // 服务端说这一轮的事件都发完了（或者这一轮读不了了）。运行的实时流还开着的让它自己收尾。
+    // 正常情况下 end 早就到了；没到（服务端那一轮出了岔子、这一轮被删了、没权限了）就别让它一直转圈：照库里那一行摆，
+    // 读不到就照实说没核对上
+    const cur = findTurn(flow.conversationId, flow.turnId)
+    if (!flow.alive() || !cur || !(BUSY_PHASES.has(cur.phase) || cur.phase === 'checking' || cur.phase === 'waiting')) return
+    const unknown = (said: string) => {
+      const failure: Failure = {
+        title: PHASE_TEXT.unknown,
+        reason: `查询本轮运行状态时出错（${said}）。运行可能仍在进行，也可能已结束。`,
+        hint: '请稍后点击「重新核对」；服务端重新连接后会自动再核对一次。',
+      }
+      patch(() => ({ phase: 'unknown', status: PHASE_TEXT.unknown, failure, error: lineOf(failure), cancel: null,
+                     writing: null, hydrated: undefined }))
+    }
+    if (end.error) return unknown(end.error)
+    void api.chatTurns.get(serverId).then((res) => {
+      if (!flow.alive()) return
+      if (res.turn && res.turn.status !== 'running') patch((t) => endPatch(t, { turn: res.turn }))
+      else if (!res.job || !LIVE_JOB.has(res.job.status)) unknown(PHASE_TEXT.unknown)
+    }, (e) => { if (flow.alive()) unknown(errorMessage(e)) })
   })
   const close = () => {
     stopTurn()

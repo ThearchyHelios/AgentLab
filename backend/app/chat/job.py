@@ -716,7 +716,8 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
     if mode not in MODES or (mode == "ask") != (retry_of is None):
         raise TurnRefused(422, "发起方式不对：新问不带 retry_of，重试、重新运行、继续运行要带上是哪一轮", TURN_INVALID)
     besides = retry_of.id if retry_of is not None else None
-    if await _busy(session, conversation.id, besides=besides):
+    # 接着收尾（resume）不建图、不发起运行，不算占着这段对话：一段对话里停在半路的几轮可以一起交给服务端收尾
+    if mode != "resume" and await _busy(session, conversation.id, besides=besides):
         raise TurnRefused(409, BUSY, TURN_BUSY)
     now_ms = int(time.time() * 1000)
     request: dict[str, Any] = {"started_ms": now_ms}

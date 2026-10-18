@@ -857,3 +857,27 @@ async def test_an_empty_generation_is_retried_once_on_the_server(client, monkeyp
     row = await _row(turn_id)
     assert row.status == "done" and row.answer == "上周没有华中区的数据" and row.meta["noQuery"] is True
     assert row.meta["usage"]["copilot"]["calls"] == 2, "两次建图都是这一轮花的"
+
+
+async def test_several_stranded_turns_of_one_conversation_can_be_resumed_together(client):
+    """一段对话里停在半路的几轮（老轮次、服务重启后停着的）一起交给服务端收尾：接着收尾不建图、不发起运行，不算占着这段对话。"""
+    conversation_id = await _conversation(client)
+    ids = []
+    for answer in ("甲", "乙"):
+        async with SessionLocal() as session:
+            run = Run(status="succeeded", output={"答案": answer}, graph={"nodes": [], "edges": []}, run_class="exploratory")
+            session.add(run)
+            await session.flush()
+            turn = ConversationTurn(conversation_id=conversation_id, seq=len(ids), question=f"问{answer}", status="running",
+                                    run_id=run.id, meta={"v": 1, "runId": run.id})
+            session.add(turn)
+            await session.commit()
+            ids.append(turn.id)
+    for turn_id in ids:
+        r = await client.post("/api/chat/turns", json={"conversation_id": conversation_id, "retry_of": turn_id,
+                                                       "mode": "resume"})
+        assert r.status_code == 202, r.text
+    for turn_id, answer in zip(ids, ("甲", "乙")):
+        await _done(turn_id)
+        row = await _row(turn_id)
+        assert row.status == "done" and row.answer == answer

@@ -2666,6 +2666,8 @@ for (const theme of THEMES) {
       check('刷新之后：这一轮还在服务端建图，照那个样子摆（不当成断了）', live, `${t1?.phase} · ${t1?.ops?.length} 条操作`)
       check('……从这一次尝试的第一条回放，已经建出的两步一步不少、一步不重',
         t1?.ops.filter((o) => o.op === 'add_node').length === 2 && t1?.ops.filter((o) => o.op === 'plan').length === 1)
+      check('……建图的过程照实时的样子摆着（不是要点开才取的历史轮次）', !t1?.restored
+        && await page.locator('[data-turn]').last().locator('button', { hasText: '规划' }).count() > 0)
       check('……刷新没有再发起一次（只发起过一次）', log.turnStarts.length - startsBefore === 1,
         `${log.turnStarts.length - startsBefore} 次`)
       check('……回放从这一次尝试开始（after 是 attempt_seq 之前）', log.streams.some((x) => x.turn === serverId && x.after === 0))
