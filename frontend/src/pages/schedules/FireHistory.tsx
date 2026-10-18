@@ -199,6 +199,8 @@ function FireRow({ fire: f, schedule, now }: { fire: ScheduleFire; schedule: Sch
 function EventFire({ event }: { event: ScheduleFireEvent }) {
   const notes = [
     event.merged > 1 ? TT.merged(event.merged) : null,
+    event.windows && event.windows > 1 ? TT.windows(event.windows) : null,
+    event.periods && event.periods.length > 1 ? TT.periods(event.periods.join('、')) : null,
     event.depth > 1 ? TT.depth(event.depth) : null,
     event.sample ? (event.real ? TT.sample : TT.sampleExample) : null,
   ].filter(Boolean)

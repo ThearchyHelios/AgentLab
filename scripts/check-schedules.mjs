@@ -326,12 +326,20 @@ await section('纯函数：事件触发的表单 ⇄ 请求体', async () => {
     body.trigger_kind === 'event' && JSON.stringify(body.trigger) === JSON.stringify({ event: 'table.version', debounce_s: 300,
       source_id: 'ds-sales', period: 'new' }) && body.cron === '' && body.name === '门店月报'
       && JSON.stringify(body.input_template) === '{"date":"{{ event.period }}"}', JSON.stringify(body))
-  const wf = m.triggerBody({ event: 'workflow.finished', subjectId: 'wf-daily', period: 'new', appId: 'app-board', originKind: '', debounceS: 0 })
-  check('上游工作流：写 workflow_id，带应用、不带期次和空的来源', JSON.stringify(wf) === JSON.stringify({ event: 'workflow.finished',
-    debounce_s: 0, workflow_id: 'wf-daily', app_id: 'app-board' }), JSON.stringify(wf))
-  const switched = m.switchEvent(ev.trigger, 'source.changed')
+  const wfForm = { event: 'workflow.finished', subjectId: 'wf-daily', period: 'new', appId: 'app-board', originKind: '',
+    includeRejected: false, includeBackfill: false, debounceS: 0 }
+  const wf = m.triggerBody(wfForm)
+  check('上游工作流：写 workflow_id，带应用、不带期次和空的来源，缺省不带「也认」两项', JSON.stringify(wf) === JSON.stringify({
+    event: 'workflow.finished', debounce_s: 0, workflow_id: 'wf-daily', app_id: 'app-board' }), JSON.stringify(wf))
+  const wide = m.triggerBody({ ...wfForm, includeRejected: true, includeBackfill: true })
+  check('勾了也认途经驳回的、应用补算的：各交 true', wide.include_rejected === true && wide.include_backfill === true, JSON.stringify(wide))
+  const onlyBackfill = m.triggerBody({ ...wfForm, originKind: 'app_backfill', includeBackfill: true })
+  check('只认应用补算的：不再另交「也认应用补算的」', onlyBackfill.origin_kind === 'app_backfill' && !('include_backfill' in onlyBackfill),
+    JSON.stringify(onlyBackfill))
+  check('表格的触发条件不带这两项', !('include_rejected' in m.triggerBody({ ...wfForm, event: 'table.version', includeRejected: true })))
+  const switched = m.switchEvent({ ...ev.trigger, includeRejected: true }, 'source.changed')
   check('换事件种类：对象、过滤清掉，去抖留着', switched.subjectId === '' && switched.period === 'any' && switched.appId === ''
-    && switched.originKind === '' && switched.debounceS === 300 && m.switchEvent(ev.trigger, 'table.version') === ev.trigger)
+    && switched.originKind === '' && switched.includeRejected === false && switched.debounceS === 300 && m.switchEvent(ev.trigger, 'table.version') === ev.trigger)
   check('问题：事件触发没选对象时说要选什么，不查频率', m.formProblems({ ...ev, trigger: switched, freq: { ...m.DEFAULT_FREQ, preset: 'weekly',
     weekdays: [] } }, null).trigger === '请选择数据源' && !m.formProblems({ ...ev, freq: { ...m.DEFAULT_FREQ, preset: 'weekly', weekdays: [] } },
     null).freq)
@@ -625,7 +633,8 @@ const TRIGGER_OPTIONS = {
       { id: 'ds-shop', name: '门店库', ok: true, reason: null },
     ] },
   ],
-  origins: [{ kind: 'launcher', label: '手动正式运行' }, { kind: 'schedule', label: '定时任务' }, { kind: 'hook', label: '入站钩子' }],
+  origins: [{ kind: 'launcher', label: '手动正式运行' }, { kind: 'schedule', label: '定时任务' },
+    { kind: 'app_backfill', label: '应用补算' }, { kind: 'hook', label: '入站钩子' }],
   apps: [{ id: 'app-board', name: '门店看板' }],
   default_debounce_s: 60, max_debounce_s: 86400, max_depth: 5,
 }
@@ -672,6 +681,10 @@ function eventFires() {
       event: { ...EVENT_BRIEF, merged: 0, sample: true, real: false } }),
     fire('fe3', { ...none, kind: 'event', status: 'skipped_overlap', fire_at: iso(NOW - 48 * H), created_at: iso(NOW - 48 * H),
       reason: '上一次运行 #a1b2c3 仍在进行中，本次触发已跳过', event: { ...EVENT_BRIEF, merged: 1, depth: 2 } }),
+    // 调度停过：三期的事件都过了补发宽限，合成一条跳过（几个窗口、合掉的期次照实写）
+    fire('fe4', { ...none, kind: 'event', status: 'skipped_misfire', fire_at: iso(NOW - 72 * H), created_at: iso(NOW - 70 * H),
+      reason: '2026-10-14 09:00 至 2026-10-14 09:20 的 3 次事件（3 个去抖窗口）：服务当时没有派发（调度未运行或已停止），已超出补发宽限（1 小时），没有发起；积压的事件不补',
+      event: { ...EVENT_BRIEF, merged: 3, windows: 3, periods: ['2026-07', '2026-08', '2026-09'] } }),
   ]
 }
 /** 由事件触发的那次运行：来源里记着 trigger（服务端发起时写下的那一句） */
@@ -2336,6 +2349,32 @@ await section('事件触发：新建的请求体', async () => {
   check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
 })
 
+await section('事件触发：上游工作流的请求体（途经驳回、应用补算）', async () => {
+  const { page, sent, errors } = await open('/schedules/new')
+  await page.locator('[data-schedule-form]').waitFor()
+  await page.locator('[data-workflow-picker] input').click()
+  await page.locator('[data-workflow-option="wf-weekly"]').click()
+  await page.locator('[data-trigger-mode="event"]').click()
+  await page.locator('[data-trigger-event="workflow.finished"]').click()
+  await page.locator('[data-trigger-subject="workflow.finished"]').selectOption('wf-daily')
+  const rej = page.locator('[data-trigger-include-rejected]')
+  const back = page.locator('[data-trigger-include-backfill]')
+  check('上游工作流：有「也认途经驳回的」「也认应用补算的」，缺省都不勾', await rej.count() === 1 && await back.count() === 1
+    && !(await rej.isChecked()) && !(await back.isChecked()))
+  check('……说明照实写不勾时这类运行不触发', (await text(page, '[data-trigger-section]')).includes('不勾时这类运行不触发'))
+  await page.locator('[data-trigger-origin]').selectOption('app_backfill')
+  check('……只认应用补算时「也认应用补算的」不再出现', await back.count() === 0)
+  await page.locator('[data-trigger-origin]').selectOption('')
+  await rej.check()
+  await page.locator('[data-input-field="date"] input').fill('{{ event.rejected }}')
+  await page.locator('[data-schedule-save]').click()
+  await until(() => writes(sent, /^POST \/schedules$/).length === 1)
+  const body = writes(sent, /^POST \/schedules$/)[0]?.body
+  check('POST 请求体：勾了的「也认途经驳回的」交 true，没勾的不交', JSON.stringify(body?.trigger) === JSON.stringify({
+    event: 'workflow.finished', debounce_s: 60, workflow_id: 'wf-daily', include_rejected: true }), JSON.stringify(body?.trigger))
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
 await section('事件触发：列表、详情与触发历史', async () => {
   const state = freshState({ schedules: [structuredClone(S1), structuredClone(S_EVENT), structuredClone(S_EVENT_OFF)], fires: eventFires() })
   const list = await open('/schedules', { state })
@@ -2375,6 +2414,9 @@ await section('事件触发：列表、详情与触发历史', async () => {
     && fe2.includes('立即运行，事件为示例值') && !fe2.includes('由事件触发')
     && (await text(page, '[data-fire-id="fe2"]')).includes('还没有发生过这种事件'), fe2)
   check('……上一次没结束跳过的写第几层', (await text(page, '[data-fire-id="fe3"] [data-fire-event]')).includes('触发链第 2 层'))
+  const fe4 = await text(page, '[data-fire-id="fe4"] [data-fire-event]')
+  check('……过了宽限合成一条跳过的：写合并了几次、几个窗口、合掉的期次', fe4.includes('合并了 3 次事件') && fe4.includes('3 个去抖窗口')
+    && fe4.includes('期次 2026-07、2026-08、2026-09'), fe4)
   await shot(page, 'event-history-dark')
   // 390px 窄屏、浅色：事件那一节（三种事件的按钮、对象下拉里带原因的长名字）不撑出横向滚动
   const narrow = await open('/schedules/s-event', { state, width: 390, height: 844, theme: 'light' })

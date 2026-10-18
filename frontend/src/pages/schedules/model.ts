@@ -43,8 +43,14 @@ export interface TriggerForm {
   period: 'any' | 'new'
   appId: string
   originKind: string
+  /** 也认途经驳回的、也认应用补算的（只给上游工作流，缺省都不认） */
+  includeRejected: boolean
+  includeBackfill: boolean
   debounceS: number
 }
+
+/** 应用补算的来源：选了「只认应用补算」时，「也认应用补算的」不再适用 */
+export const BACKFILL_ORIGIN = 'app_backfill'
 
 export const EVENT_KINDS: readonly ScheduleEventKind[] = ['table.version', 'workflow.finished', 'source.changed']
 export const TRIGGER_KINDS: readonly ScheduleTriggerKind[] = ['cron', 'event']
@@ -60,6 +66,8 @@ export function triggerFormOf(t: ScheduleTrigger | null | undefined): TriggerFor
     period: t?.period === 'new' ? 'new' : 'any',
     appId: t?.app_id ?? '',
     originKind: t?.origin_kind ?? '',
+    includeRejected: t?.include_rejected === true,
+    includeBackfill: t?.include_backfill === true,
     debounceS: typeof t?.debounce_s === 'number' ? t.debounce_s : DEFAULT_DEBOUNCE_S,
   }
 }
@@ -71,6 +79,8 @@ export function triggerBody(t: TriggerForm): ScheduleTrigger {
     out.workflow_id = t.subjectId
     if (t.appId) out.app_id = t.appId
     if (t.originKind) out.origin_kind = t.originKind
+    if (t.includeRejected) out.include_rejected = true
+    if (t.includeBackfill && t.originKind !== BACKFILL_ORIGIN) out.include_backfill = true
   } else {
     out.source_id = t.subjectId
     if (t.event === 'table.version' && t.period === 'new') out.period = 'new'
@@ -81,7 +91,8 @@ export function triggerBody(t: TriggerForm): ScheduleTrigger {
 /** 换了事件种类：对象、过滤都不再适用，清掉；去抖留着 */
 export function switchEvent(t: TriggerForm, event: ScheduleEventKind): TriggerForm {
   if (t.event === event) return t
-  return { event, subjectId: '', period: 'any', appId: '', originKind: '', debounceS: t.debounceS }
+  return { event, subjectId: '', period: 'any', appId: '', originKind: '', includeRejected: false, includeBackfill: false,
+    debounceS: t.debounceS }
 }
 
 export interface ScheduleForm {

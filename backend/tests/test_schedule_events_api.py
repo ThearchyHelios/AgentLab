@@ -369,3 +369,21 @@ async def test_trigger_options(client):
     assert flows[draft]["ok"] is False and "发布" in flows[draft]["reason"]
     assert "hook" in [o["kind"] for o in out["origins"]] and out["max_depth"] == 5
     assert out["default_debounce_s"] == 60
+
+
+async def test_include_rejected_and_backfill_through_the_api(client):
+    """复核 M1、C5：上游工作流的触发缺省不认途经驳回的、应用补算的，说法照实写；勾了「也认」的存下来、说法跟着变；
+    别的事件带这两项拒收"""
+    a, a_name = await workflow("日报")
+    b, _ = await workflow("汇总", fields=[{"name": "rej"}])
+    plain = (await client.post("/api/schedules", json=body(b, {"event": "workflow.finished", "workflow_id": a},
+                                                         input_template={"rej": "{{ event.rejected }}"}))).json()
+    assert "途经驳回、应用补算的不算" in plain["trigger_text"] and "include_rejected" not in plain["trigger"]
+    r = await client.patch(f"/api/schedules/{plain['id']}", json={
+        "trigger": {"event": "workflow.finished", "workflow_id": a, "include_rejected": True}, "version": plain["version"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["trigger"]["include_rejected"] is True and "途经驳回的也算；应用补算的不算" in r.json()["trigger_text"]
+    src = await upload_table("门店销售")
+    bad = await client.post("/api/schedules", json=body(b, {"event": "table.version", "source_id": src,
+                                                           "include_backfill": True}))
+    assert bad.status_code == 422 and bad.json()["field"] == "trigger"

@@ -4069,6 +4069,12 @@ export interface ScheduleTrigger {
   /** 只认某个应用发起的、某种来源的运行，只给 workflow.finished */
   app_id?: string
   origin_kind?: string
+  /**
+   * 也认途经驳回的（上游走了某个审批的驳回出口、按驳回那条路跑完，状态仍是成功）、也认应用补算的；缺省都不认。只给
+   * workflow.finished，不写即 false
+   */
+  include_rejected?: boolean
+  include_backfill?: boolean
   /** 去抖：同一个任务这么多秒内的几次事件合成一次 */
   debounce_s: number
   /** 保存时记下的对象名（对象删掉之后界面写它）；读出来才有，交上去不用带 */
@@ -4108,6 +4114,9 @@ export interface ScheduleFireEvent {
   /** 立即运行时按示例事件发起的（不是真来了一次事件）；real 为假时是示例值 */
   sample: boolean
   real: boolean
+  /** 几个过了补发宽限的去抖窗口合成一条跳过时才有：合了几个窗口、合掉的期次（上传表格）；老服务端不给 */
+  windows?: number | null
+  periods?: string[] | null
 }
 
 export interface ScheduleFire {

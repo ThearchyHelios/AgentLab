@@ -8,11 +8,15 @@
 - table.version：一张按期累积的上传表格启用了新的一期（data/table_versions 启用那一下）。可选只认新增的一期（period=new）：
   重传、替换已有那一期（改错数）的不算；
 - workflow.finished：一个工作流的正式运行成功结束。可选只认某个应用（app_id）发起的、某种来源（origin_kind）的；
-  下游的输入模板能引用这次运行的出口字段（{{ event.outputs.<字段> }}）；
+  下游的输入模板能引用这次运行的出口字段（{{ event.outputs.<字段> }}）。两种成功结束缺省不认：途经驳回的（审批接了驳回出口、
+  按驳回那条路走完，状态仍是 succeeded，事件里带 rejected_via）——下游会以为「A 成功出了结果」，其实那一期被驳回了，
+  include_rejected 时才认、模板里有 {{ event.rejected }}；应用补算的（app_backfill，升版后按历次输入补算，一连发好几条、
+  各是某一期的历史输入），include_backfill 或只认这种来源时才认；
 - source.changed：一个数据源出现「要处理」级的变化。按源去抖：同一次探查、剖析产生的一批只记一条事件（data/source_changes）。
 
-trigger 的形状：{event, 对象（source_id / workflow_id / source_id）, 过滤（见上）, debounce_s（缺省 60）}。同一个定时任务
-在 debounce_s 内的几次事件合成一次触发（scheduler/outbox）。
+trigger 的形状：{event, 对象（source_id / workflow_id / source_id）, 过滤（period；app_id、origin_kind、include_rejected、
+include_backfill）, debounce_s（缺省 60）}。同一个定时任务在 debounce_s 内的几次事件合成一次触发，上传表格按期次分窗口
+（window_key，scheduler/outbox）。
 
 **防环。** workflow.finished 能把工作流串起来：A 跑完触发 B、B 跑完又触发 A 就停不下来。保存时查串联成不成环（find_cycle，
 停用的任务也算：启用不该绕过这道检查）；运行时按 origin 里记的触发链深度兜底，超过 MAX_DEPTH 层不发起、照实记一次未能发起
@@ -56,7 +60,10 @@ ORIGIN_LABEL = {
 }
 #: trigger 里认得的键（多出来的拒收：拼错的过滤条件悄悄不生效，比报错更糟）。subject_name 是保存时记下的对象名（接口不给、
 #: 带回来也不认，对象删掉之后说法里用它）
-_KEYS = {"event", "source_id", "workflow_id", "period", "app_id", "origin_kind", "debounce_s", "subject_name"}
+_KEYS = {"event", "source_id", "workflow_id", "period", "app_id", "origin_kind", "debounce_s", "subject_name",
+         "include_rejected", "include_backfill"}
+#: 应用补算发起的运行的来源（engine/origin.py）
+BACKFILL_ORIGIN = "app_backfill"
 #: 示例事件里给不出真实值时写的占位说明
 EXAMPLE_NOTE = "示例值"
 
@@ -118,6 +125,18 @@ def normalize(value: Any) -> dict[str, Any]:
             labels = "、".join(ORIGIN_LABEL[o] for o in FORMAL_ORIGINS)
             raise TriggerError(f"只认的来源需要是{labels}之一")
         out[name] = text
+    for name in ("include_rejected", "include_backfill"):
+        raw = value.get(name)
+        if raw in (None, False):
+            continue
+        if event != "workflow.finished":
+            raise TriggerError("只有「上游工作流运行成功结束」能选也认途经驳回的、应用补算的")
+        if raw is not True:
+            raise TriggerError("也认途经驳回的、应用补算的需要是 true 或 false")
+        # 只认补算的：补算本来就认，不再另记
+        if name == "include_backfill" and out.get("origin_kind") == BACKFILL_ORIGIN:
+            continue
+        out[name] = True
     debounce = value.get("debounce_s", DEFAULT_DEBOUNCE_S)
     if isinstance(debounce, bool) or not isinstance(debounce, int) or not 0 <= debounce <= MAX_DEBOUNCE_S:
         raise TriggerError(f"去抖需要是 0 到 {MAX_DEBOUNCE_S} 之间的整数秒数（最长 1 天）", "debounce_s")
@@ -148,6 +167,11 @@ def matches(trigger: dict[str, Any] | None, event: str, subject_id: str, payload
         if trigger.get("app_id") and payload.get("app_id") != trigger["app_id"]:
             return False
         if trigger.get("origin_kind") and payload.get("origin_kind") != trigger["origin_kind"]:
+            return False
+        if payload.get("rejected") and not trigger.get("include_rejected"):
+            return False
+        if payload.get("origin_kind") == BACKFILL_ORIGIN and not (
+                trigger.get("include_backfill") or trigger.get("origin_kind") == BACKFILL_ORIGIN):
             return False
     return True
 
@@ -282,6 +306,15 @@ def describe(trigger: dict[str, Any], subject_name: str | None, *, app_name: str
         notes.append(f"只认应用「{app_name}」发起的" if app_name else "只认指定的应用发起的")
     if trigger.get("origin_kind"):
         notes.append(f"只认来源为「{ORIGIN_LABEL.get(trigger['origin_kind'], trigger['origin_kind'])}」的")
+    if event == "workflow.finished":
+        # 缺省不认的两种成功结束，照实写出来
+        kinds = [("途经驳回", bool(trigger.get("include_rejected")))]
+        if trigger.get("origin_kind") != BACKFILL_ORIGIN:
+            kinds.append(("应用补算", bool(trigger.get("include_backfill"))))
+        excluded = "、".join(k for k, on in kinds if not on)
+        included = "、".join(k for k, on in kinds if on)
+        notes += [f"{included}的也算"] if included else []
+        notes += [f"{excluded}的不算"] if excluded else []
     debounce = debounce_of(trigger)
     from app.scheduler.service import duration_text
 
@@ -300,7 +333,8 @@ def event_text(event: str, subject_name: str, payload: dict[str, Any] | None) ->
         return f"上传表格{name}{what}{f'（{period}）' if period else ''}"
     if event == "workflow.finished":
         run = str(payload.get("run_id") or "")
-        return f"工作流{name}的正式运行成功结束{f'（#{run[:6]}）' if run else ''}"
+        rejected = "（途经驳回）" if payload.get("rejected") else ""
+        return f"工作流{name}的正式运行成功结束{f'（#{run[:6]}）' if run else ''}{rejected}"
     if event == "source.changed":
         n = (payload.get("counts") or {}).get("new")
         return f"数据源{name}出现要处理的变化{f'（新记 {n} 条）' if isinstance(n, int) and n else ''}"
@@ -326,6 +360,7 @@ VARIABLES: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("workflow_id", "上游工作流的编号", "wf…"),
         ("run_id", "上游那次运行的编号", "run…"),
         ("finished_at", "上游运行结束的时间（带时区偏移的 ISO 时间）", "2026-10-08T09:30:00+08:00"),
+        ("rejected", "上游这次运行有没有途经驳回（true / false；缺省不认途经驳回的，勾了「也认」才会是 true）", "false"),
         ("outputs", "上游运行的出口字段（写 event.outputs.<字段名>）", "{…}"),
     ),
     "source.changed": (
@@ -396,7 +431,7 @@ def values(event: str, payload: dict[str, Any] | None, tz: str, *, outputs: dict
     if event == "workflow.finished":
         return {"workflow": payload.get("workflow") or "", "workflow_id": payload.get("workflow_id") or "",
                 "run_id": payload.get("run_id") or "", "finished_at": _zoned(payload.get("finished_at"), tz),
-                "outputs": dict(outputs or {})}
+                "rejected": "true" if payload.get("rejected") else "false", "outputs": dict(outputs or {})}
     if event == "source.changed":
         counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
         return {"source": payload.get("source") or "", "source_id": payload.get("source_id") or "",
@@ -501,11 +536,34 @@ async def sample(session: Any, trigger: dict[str, Any]) -> Sample:
         query = query.where(Run.app_id == trigger["app_id"])
     if trigger.get("origin_kind"):
         query = query.where(Run.origin_kind == trigger["origin_kind"])
-    run = (await session.execute(query.order_by(Run.finished_at.desc()).limit(1))).scalars().first() if subject else None
-    if run is None:
-        return Sample(event, subject, name, {"workflow": name or EXAMPLE_NOTE, "workflow_id": subject, "run_id": "",
-                                             "finished_at": ""}, real=False)
-    return Sample(event, subject, name, run_payload(run), outputs=dict(run.output or {}))
+    candidates = list((await session.execute(query.order_by(Run.finished_at.desc()).limit(SAMPLE_SCAN)))
+                      .scalars()) if subject else []
+    # 和真派发同一套条件（matches）：缺省不认的途经驳回、应用补算跳过，取合条件的最近一次
+    for run in candidates:
+        payload = run_payload(run, await _rejected_via_of(session, run.id))
+        if matches(trigger, event, subject, payload):
+            return Sample(event, subject, name, payload, outputs=outputs_of(run.output))
+    return Sample(event, subject, name, {"workflow": name or EXAMPLE_NOTE, "workflow_id": subject, "run_id": "",
+                                         "finished_at": "", "rejected": False}, real=False)
+
+
+#: 示例事件往回找几次成功的正式运行（找合条件的最近一次）
+SAMPLE_SCAN = 20
+
+
+async def _rejected_via_of(session: Any, run_id: str) -> list[Any] | None:
+    """这次运行途经的驳回：run.finished 事件里的 rejected_via（W1-b 的驳回出口写的），没有为 None。"""
+    from app.db.models import RunEvent
+
+    data = (await session.execute(select(RunEvent.data).where(RunEvent.run_id == run_id, RunEvent.type == "run.finished")
+                                  .order_by(RunEvent.seq.desc()).limit(1))).scalar()
+    via = data.get("rejected_via") if isinstance(data, dict) else None
+    return list(via) if isinstance(via, list) and via else None
+
+
+def outputs_of(output: Any) -> dict[str, Any]:
+    """给模板的出口字段（{{ event.outputs.* }}）：「_」开头的是系统写的（出具档位之类），不给。真派发、预览、立即运行共用。"""
+    return {k: v for k, v in output.items() if not str(k).startswith("_")} if isinstance(output, dict) else {}
 
 
 def table_payload(name: str, *, snapshot_id: str, period_start: str | None, period_end: str | None,
@@ -516,11 +574,21 @@ def table_payload(name: str, *, snapshot_id: str, period_start: str | None, peri
             "activated_at": _iso(activated_at), "replaced": bool(replaced), "seq": seq}
 
 
-def run_payload(run: Any) -> dict[str, Any]:
-    """workflow.finished 的事件内容：不含出口字段（派发时按 run_id 读成果）。"""
+def run_payload(run: Any, rejected_via: Any = None) -> dict[str, Any]:
+    """workflow.finished 的事件内容：不含出口字段（派发时按 run_id 读成果）。rejected_via 是途经了哪几个关卡的驳回（W1-b 的
+    驳回出口；runner 收尾时交进来），没途经驳回为 None。"""
+    via = (list(rejected_via) if isinstance(rejected_via, (list, tuple)) else [rejected_via]) if rejected_via else None
     return {"workflow": run.workflow_name or "", "workflow_id": run.workflow_id or "", "run_id": run.id,
             "finished_at": _iso(run.finished_at), "app_id": run.app_id, "origin_kind": run.origin_kind,
-            "version": run.version}
+            "version": run.version, "rejected": bool(via), "rejected_via": via}
+
+
+def window_key(event: str, payload: dict[str, Any] | None) -> str:
+    """去抖时按什么分窗口：上传表格按期次分（9 月、10 月连着启用，各有各的触发，不把 9 月合掉），别的不分。"""
+    if event != "table.version":
+        return ""
+    payload = payload or {}
+    return str(payload.get("period") or f"{payload.get('period_start') or ''}~{payload.get('period_end') or ''}")
 
 
 def _iso(moment: datetime | None) -> str:

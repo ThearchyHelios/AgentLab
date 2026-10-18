@@ -6,7 +6,9 @@ import { errorMessage } from '../../lib/errors'
 import { timezoneOptions } from '../../lib/freq'
 import { TRIGGER_TEXT as TT } from '../../lib/termsTrigger'
 import type { ScheduleEventKind, ScheduleTriggerKind, ScheduleTriggerOptions } from '../../types'
-import { DEBOUNCE_OPTIONS, EVENT_KINDS, TRIGGER_KINDS, graceLabel, switchEvent, type TriggerForm } from './model'
+import {
+  BACKFILL_ORIGIN, DEBOUNCE_OPTIONS, EVENT_KINDS, TRIGGER_KINDS, graceLabel, switchEvent, type TriggerForm,
+} from './model'
 import { isUnsupported } from './parts'
 
 /**
@@ -179,6 +181,21 @@ export function EventSection({ value, onChange, timezone, setTimezone, savedName
             </Field>
           </div>
           <p className="text-2xs leading-relaxed text-faint">{TT.filterHint}</p>
+          {/* 缺省不认的两种成功结束：途经驳回的、应用补算的（服务端 triggers.matches），要认的勾上 */}
+          <div className="space-y-1 pt-1">
+            <label className="flex items-start gap-2 text-xs">
+              <input type="checkbox" className="mt-0.5" checked={value.includeRejected} data-trigger-include-rejected=""
+                     onChange={(e) => set({ includeRejected: e.target.checked })} />
+              <span>{TT.includeRejected}<span className="block text-2xs leading-relaxed text-faint">{TT.includeRejectedHint}</span></span>
+            </label>
+            {value.originKind !== BACKFILL_ORIGIN && (
+              <label className="flex items-start gap-2 text-xs">
+                <input type="checkbox" className="mt-0.5" checked={value.includeBackfill} data-trigger-include-backfill=""
+                       onChange={(e) => set({ includeBackfill: e.target.checked })} />
+                <span>{TT.includeBackfill}<span className="block text-2xs leading-relaxed text-faint">{TT.includeBackfillHint}</span></span>
+              </label>
+            )}
+          </div>
           <p className="text-2xs leading-relaxed text-faint" data-trigger-chain="">{TT.chainHint(options.data.max_depth)}</p>
         </div>
       )}

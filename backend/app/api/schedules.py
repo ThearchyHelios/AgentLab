@@ -439,8 +439,9 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
         raw = f.inputs.get("event") if isinstance(f.inputs, dict) and f.schedule_id not in maintenance else None
         if not isinstance(raw, dict):
             return None
+        # windows / periods 只在几个过了宽限的窗口合成一条跳过时有：合了几个窗口、合掉的期次（上传表格）
         return {key: raw.get(key) for key in ("event", "subject_id", "subject_name", "text", "merged", "first_at",
-                                              "last_at", "depth", "sample", "real")}
+                                              "last_at", "depth", "sample", "real", "windows", "periods")}
 
     compared = {f.id: f.compare_artifact for f in fires if f.compare_artifact and f.run_id}
     compares = await auto_compare.briefs(list(compared.values()))

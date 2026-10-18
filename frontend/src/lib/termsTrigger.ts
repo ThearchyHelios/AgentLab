@@ -55,6 +55,10 @@ export const TRIGGER_TEXT = {
   originLabel: '只认来源',
   originAny: '不限来源',
   filterHint: '只在上游那次正式运行由这个应用、这种来源发起时触发',
+  includeRejected: '也认途经驳回的',
+  includeRejectedHint: '上游某个审批被驳回、按驳回那条路走完时，运行仍算成功结束。不勾时这类运行不触发；勾了以后，输入模板里的 {{ event.rejected }} 是 true',
+  includeBackfill: '也认应用补算的',
+  includeBackfillHint: '应用升版后按历次输入补算，会连着结束好几次正式运行，每次是某一期的历史输入。不勾时补算的运行不触发',
   debounce: '去抖',
   debounceHint: '这段时间内的几次事件合成一次触发，按最新的那一次渲染输入；上一次运行还没结束时仍按重叠策略跳过',
   debounceOption: (span: string) => (span ? `${span}内合成一次` : '不去抖，每次事件都触发'),
@@ -86,6 +90,9 @@ export const TRIGGER_TEXT = {
   merged: (n: number) => `合并了 ${n} 次事件`,
   depth: (n: number) => `触发链第 ${n} 层`,
   sample: '立即运行，按最近一次事件',
+  /** 几个过了补发宽限的去抖窗口合成一条跳过 */
+  windows: (n: number) => `${n} 个去抖窗口`,
+  periods: (list: string) => `期次 ${list}`,
   sampleExample: '立即运行，事件为示例值',
 
   // ---- 运行详情页头
