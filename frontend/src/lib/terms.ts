@@ -313,6 +313,10 @@ export const EVIDENCE_TEXT = {
   originChipHint: '这个数由口径卡确定性算出、复算一致，但算式用到的输入没有一路追到查询快照',
   /** 按位置取的格穿过了原样解析查询结果的整形节点 */
   through: (label: string) => `经「${label}」原样解析`,
+  /** 读子工作流出口的字段，出处接上子图里的那一格（docs/design/orchestration-round/00-总方案.md §2） */
+  viaSubgraph: (label: string, field: string) => (field ? `经子工作流「${label}」的出口字段「${field}」` : `经子工作流「${label}」`),
+  /** 停在子工作流的入口：子图的运行输入是父图按「输入」模板拼出来的，不是原始数据 */
+  subgraphInput: '子工作流的运行输入',
   /**
    * 转抄另一张口径卡的指标（对账卡、召回卡的「口径」那一项）：出处跨卡往下追，接上那个指标自己的一段，一直到查询格子
    */
@@ -5506,6 +5510,25 @@ export const REJECTED_TEXT = {
   },
   /** 画布节点卡上被驳回的那一步：一句话，悬停写原话 */
   card: '被驳回',
+  /**
+   * 「驳回」出口（docs/design/orchestration-round/00-总方案.md §3）：审批、补充输入、编辑稿件、动作确认、代码和工具审批、
+   * 双盲裁决接了它时，驳回之后沿它往下走。画布上出口的字
+   */
+  exit: '驳回',
+  /** 节点卡、航迹上走了驳回出口的那一步：「被驳回，转到「通知申请人」」（转到哪几步取 node.finished 的 to） */
+  exitCard: (to: string[]): string => (to.length ? `被驳回，转到${to.map((t) => `「${t}」`).join('、')}` : '被驳回，走驳回出口'),
+  /** 时间线、问数据过程里这一步的副标题：谁、备注，再接上转到哪几步 */
+  exitStep: (d: { actor?: unknown; note?: unknown; decision?: unknown; to?: unknown }): string => {
+    const to = Array.isArray(d.to) ? d.to.map((t: any) => String(t?.label || t?.node_id || '')).filter(Boolean) : []
+    return `${REJECTED_TEXT.step(d)}，${to.length ? `转到${to.map((t) => `「${t}」`).join('、')}` : '走驳回出口'}`
+  },
+  /** 运行照驳回那条路结束：终态事件的 rejected_via，一步一句「「审批」被驳回，转到「通知申请人」」 */
+  via: (items: unknown): string => (Array.isArray(items) ? items : [])
+    .map((v: any) => `${typeof v?.label === 'string' && v.label ? `「${v.label}」` : '这一步'}${REJECTED_TEXT.exitCard(
+      Array.isArray(v?.to) ? v.to.map((t: any) => String(t?.label || t?.node_id || '')).filter(Boolean) : [])}`)
+    .join('；'),
+  /** 途经驳回的那一行的标题 */
+  viaTitle: '途经驳回',
 }
 
 /** 来源标签：老运行没有来源时写「来源未记录」 */

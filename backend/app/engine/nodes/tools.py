@@ -302,8 +302,9 @@ async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[
         await once(ctx, EventType.HUMAN_RESOLVED, tool=name, approved=decision.approved, note=decision.note,
                    actor=ctx.actor(), payload_hash=confirmed)
         if not decision.approved:
-            # 驳回是人的决定，不是故障：运行到这里结束（没有可走的出口），收成 cancelled + end_reason=rejected
-            # （NodeRejected），说法写成「未确认（被驳回）」，实例页、通知按同一个结论说（apps/resolve.instance_state）
+            # 驳回是人的决定，不是故障：抛 NodeRejected，说法写成「未确认（被驳回）」，实例页、通知按同一个结论说
+            # （apps/resolve.instance_state）。抛在发送之前：画布上接了「驳回」出口的沿它往下走（engine/compiler），什么都
+            # 没发；没接的运行到这里结束，收成 cancelled + end_reason=rejected
             raise NodeRejected.of(ctx, f"「{ctx.node.title}」未确认（被驳回），没有发送"
                                   + (f"：{decision.note}" if decision.note else ""),
                                   kind="action_confirm", decision=decision)

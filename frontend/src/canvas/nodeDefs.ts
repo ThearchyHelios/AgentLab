@@ -4,7 +4,7 @@ import {
   Gauge, GitBranch, GitCompareArrows, Hand, Repeat, Search, ShieldAlert, Shuffle, Users, Wrench,
 } from 'lucide-react'
 import {
-  APPROVAL_POLICY_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, UPGRADE_POLICY_LABEL,
+  APPROVAL_POLICY_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, REJECTED_TEXT, UPGRADE_POLICY_LABEL,
 } from '../lib/terms'
 import type { NodeType } from '../types'
 import { dualCheckFields, dualCheckSummary } from './DualCheckFields'
@@ -323,7 +323,8 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   tool: {
     type: 'tool', label: NODE_TYPE_LABEL.tool, category: '执行', icon: Wrench,
     description: '直接调用一个指定工具',
-    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    // 出口由配置决定：会请人审批（工具调用审批、写入前的动作确认）时多一个「驳回」出口，见 sourceHandles
+    hasTarget: true, sources: null,
     fields: [
       { key: 'tool', label: '工具', type: 'tools', help: '只能选一个' },
       { key: 'args', label: '参数', type: 'json', syntax: 'template', help: '值中可用 {{ }} 引用上游数据' },
@@ -354,7 +355,8 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   code: {
     type: 'code', label: NODE_TYPE_LABEL.code, category: '执行', icon: Code2,
     description: '在 microVM 或系统沙箱中执行代码',
-    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    // 审批策略设成每次审批时多一个「驳回」出口，见 sourceHandles
+    hasTarget: true, sources: null,
     fields: [
       {
         key: 'language', label: '语言', type: 'select',
@@ -699,7 +701,8 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
   dual_check: {
     type: 'dual_check', label: NODE_TYPE_LABEL.dual_check, category: '把关', icon: GitCompareArrows,
     description: DUAL_CHECK_TEXT.description,
-    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    // 两路不一致时请人裁决，裁决可以驳回：普通出口之外有一个「驳回」出口，见 sourceHandles
+    hasTarget: true, sources: null,
     // 配置的键和缺省见 types.ts 的 DualCheckConfig（期 3 约定）。口径卡、指标、口径说明要看画布上别的节点，
     // 盲算模型是接入加模型，启用是三态，都交给 DualCheckFields 画；type 只管默认值和校验时当什么看。
     // 盲算模型不放进高级选项：时间线上「模型相同」那一行的「打开设置」要定位到它，高级选项收着时定位不到
@@ -821,10 +824,38 @@ export function sourceHandles(type: NodeType, config: Record<string, any>): Hand
     if (config.mode === 'approve') {
       return [
         { id: 'approved', label: '批准', color: 'var(--ok)' },
-        { id: 'rejected', label: '驳回', color: 'var(--err)' },
+        REJECT_EXIT,
       ]
     }
-    return [{ id: 'out', label: '' }]
+    return [{ id: 'out', label: '' }, REJECT_EXIT]
   }
+  if (canReject(type, config)) return [{ id: 'out', label: '' }, REJECT_EXIT]
   return [{ id: 'out', label: '' }]
+}
+
+/**
+ * 「驳回」出口（docs/design/orchestration-round/00-总方案.md §3）：接了它，驳回（含超时驳回）时这一步正常结束、沿它往下走；
+ * 没接，驳回让运行结束。和后端 engine/schema.REJECT_HANDLE 同一个 id。颜色是中性的：驳回是人的决定，不是故障
+ */
+export const REJECT_HANDLE = 'rejected'
+const REJECT_EXIT: HandleDef = { id: REJECT_HANDLE, label: REJECTED_TEXT.exit, color: 'var(--text-dim)' }
+
+/** 数据源的查询、看表结构：只读，不会请人审批（除非节点上明说了每次都审批） */
+const READ_ONLY_TOOL = /^db_(?:query|schema)__/
+
+/**
+ * 这个节点会不会被人驳回，画布上给不给「驳回」出口（后端认的六类关卡：engine/schema.GATE_TYPES）。人工节点、双盲复算一律
+ * 给（审批、补充输入、编辑稿件、裁决都能驳回）；沙箱代码只在审批策略是每次审批时问人；调用工具选了工具、审批策略不是
+ * 从不审批时可能问人（工具调用审批、写入前的动作确认），数据源的查询只读，只在明说了每次审批时问。不给出口的节点上连着的
+ * 驳回边，改配置时由 studio 收掉（出口跟着配置算）
+ */
+export function canReject(type: NodeType, config: Record<string, any>): boolean {
+  if (type === 'human' || type === 'dual_check') return true
+  if (type === 'code') return config.approval === 'always'
+  if (type === 'tool') {
+    if (config.approval === 'always') return true
+    const tool = String(config.tool ?? '')
+    return config.approval !== 'never' && !!tool && !READ_ONLY_TOOL.test(tool)
+  }
+  return false
 }

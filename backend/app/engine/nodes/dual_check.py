@@ -86,6 +86,8 @@ from app.engine.tolerance import agree as _agree, delta_pct as _delta_pct
 
 #: 节点产出的状态：跳过、全部一致、核成了一部分（其余无法复算）、一个都没核成、人已裁决
 SKIPPED, AGREED, PARTIAL, NONE_CHECKED, RESOLVED = "skipped", "agreed", "partial", "unchecked", "resolved"
+#: 审核人驳回了裁决、接了驳回出口沿它往下走（docs/design/orchestration-round/00-总方案.md §3）：这一步的结论
+REJECTED = "rejected"
 #: 单个指标的结果：一致、不一致、无法复算
 SAME, DIFFERENT, UNCHECKED = "agreed", "disagreed", "unchecked"
 #: 审核人的三种选择：采用原流程、采用盲算、两边都不对
@@ -133,6 +135,7 @@ NO_SQL = "有一边没有可比较的 SQL，请对照原文"
 GAP_BLIND = "指标「{name}」两路结果不一致，审核人选择了盲算结果"
 GAP_NEITHER = "指标「{name}」两路结果不一致，审核人判断两边都不对"
 GAP_UNANSWERED = "指标「{name}」两路结果不一致，审核人没有作出选择"
+GAP_REJECTED = "指标「{name}」两路结果不一致，审核人驳回了裁决"
 GAP_UNCHECKED = "指标「{name}」无法复算：{reason}"
 #: 运行时长上限将至（engine/deadline.py）：没来得及开始的盲算、时长按剩余时间收紧后到了点的盲算，都按无法复算记
 LATE = "本次运行即将达到 {seconds:g} 秒的时长上限，为保证运行按时完成，未进行盲算"
@@ -222,7 +225,17 @@ async def run_dual_check(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     response = await ask(ctx, review["payload"], **review["payload"])
     # 谁裁决的跟着事件走，和人工审批节点一样
     await once(ctx, EventType.HUMAN_RESOLVED, response=response, actor=ctx.actor())
-    choices, note = _choices(ctx, response, disagreed)
+    try:
+        choices, note = _choices(ctx, response, disagreed)
+    except NodeRejected as e:
+        # 审核人驳回了裁决。接了驳回出口时（engine/compiler._rejected_exit）这一步照常结束：两路不一致的那几个指标照样记成
+        # 出具缺口，台账照记一条结论为驳回的 dual_check——驳回不是认可，下游的出具不能把这组数完整出具（不比选「两边
+        # 都不对」宽）。没接出口的运行收成被驳回，这些用不上
+        done = _finish(state, ctx, card_id, card, checked, status=REJECTED, gaps=_rejected_gaps(rows), choices={},
+                       note=e.note, artifact=review["card_artifact"])
+        e.exit_updates = {"payload": done["nodes"][ctx.node.id], "evidence": done.get("evidence"),
+                          "usage": done.get("usage")}
+        raise
     gaps = _gaps(rows, choices)
     await once(ctx, EventType.LOG, level="info", code="dual_check_resolved", choices=choices, gaps=gaps,
                message=_resolved_text(disagreed, choices))
@@ -1040,6 +1053,13 @@ def _compare(row: dict[str, Any], metric: dict[str, Any], results: dict[str, Any
     row["differing"] = differing or [i["key"] for i in row["inputs"]]
 
 
+def _rejected_gaps(rows: list[dict[str, Any]]) -> list[str]:
+    """裁决被驳回时的出具缺口：不一致的写审核人驳回了裁决，无法复算的照旧写原因。"""
+    return [GAP_REJECTED.format(name=r["name"]) if r["status"] == DIFFERENT
+            else GAP_UNCHECKED.format(name=r["name"], reason=r.get("reason") or "原因不明")
+            for r in rows if r["status"] in (DIFFERENT, UNCHECKED)]
+
+
 def _unchecked_gaps(rows: list[dict[str, Any]]) -> list[str]:
     return [GAP_UNCHECKED.format(name=r["name"], reason=r.get("reason") or "原因不明")
             for r in rows if r["status"] == UNCHECKED]
@@ -1379,8 +1399,8 @@ def _merge(per_input: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
 def _choices(ctx: NodeContext, response: Any, rows: list[dict[str, Any]]) -> tuple[dict[str, str], str]:
     """审核人的回复 → ({指标 id: a | b | neither}, 备注)。回复的 value 是 {choices, note}；某个指标没选、选了认不出的
     不进 choices：照实记成「没有作出选择」，不替人说「两边都不对」，也不替人认可任何一边（缺口照样记、出具照样降档）。
-    通用的输入卡送来的是一句话，所有指标都按没选记。明确驳回（approved 为否）的按人工驳回让节点失败，和人工审批节点的
-    填写模式一样：这一步没有驳回的出口。"""
+    通用的输入卡送来的是一句话，所有指标都按没选记。明确驳回（approved 为否）的抛 NodeRejected，和人工审批节点的
+    填写模式一样：画布上接了「驳回」出口的沿它往下走（engine/compiler），没接的运行收成被驳回。"""
     decision = read_decision(response)
     if isinstance(response, dict) and decision.rejected:
         raise NodeRejected.of(ctx, f"人工驳回：{decision.note or '未说明原因'}", kind="dual_check", decision=decision)
@@ -1474,4 +1494,4 @@ def _finish(state: GraphState, ctx: NodeContext, card_id: str, card: dict[str, A
     return updates
 
 
-__all__ = ["AGREED", "CHOICES", "NONE_CHECKED", "PARTIAL", "RESOLVED", "SKIPPED", "run_dual_check"]
+__all__ = ["AGREED", "CHOICES", "NONE_CHECKED", "PARTIAL", "REJECTED", "RESOLVED", "SKIPPED", "run_dual_check"]

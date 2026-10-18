@@ -10,6 +10,7 @@ from app.db.base import SessionLocal
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError, NodeRejected
 from app.engine.replay import ask, once
+from app.engine.schema import reject_targets
 from app.engine.state import GraphState, merge_usage, message_text, template_context
 from app.providers import catalog
 from app.providers.factory import ModelSpec, get_chat_model
@@ -51,15 +52,20 @@ async def run_human(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             "note": decision.note,
             "__decision__": "approved" if approved else "rejected",
         }
-        if not approved and ctx.cfg("stop_on_reject", False):
-            raise NodeRejected.of(ctx, f"人工驳回：{result['note'] or '未说明原因'}", kind="approve", decision=decision)
+        # 驳回即终止：照旧收成被驳回，接没接驳回边都一样（明说了终止，那条边以前就走不到；stop=True，compiler 不接）。
+        # 画布上接了「驳回」出口的：同样交给 NodeRejected，由 compiler 接住、这一步正常结束、沿驳回边往下走，产出和别的
+        # 关卡同一种形状（engine/schema.reject_targets）。两样都没有的照旧按 __decision__ 路由（没有驳回边就结束在这里）
+        stop = bool(ctx.cfg("stop_on_reject", False))
+        if not approved and (stop or reject_targets(ctx.run.spec, ctx.node)):
+            raise NodeRejected.of(ctx, f"人工驳回：{result['note'] or '未说明原因'}", kind="approve", decision=decision,
+                                  stop=stop)
     else:  # edit / input
         # 驳回在这两种模式下以前是个摆设：__decision__ 硬编码成 approved，
         # approved 字段看都不看。界面上按钮在、toast 说"已驳回"，运行却照常
         # 往下走——比没有这个按钮更糟。
         #
-        # 这两种模式在图上只有一个 out 出口（没有 rejected 那条边），所以驳回
-        # 的正确语义是终止运行，而不是当作通过继续。缺省仍是通过：只传 value
+        # 这两种模式在图上本来只有一个 out 出口，所以驳回的语义是终止运行，而不是当作通过继续；
+        # 画布上接了「驳回」出口的，compiler 接住 NodeRejected、沿驳回边往下走。缺省仍是通过：只传 value
         # 不带 approved 的老调用方行为不变。
         #
         # 只有结构体里明说了"不"才算驳回：这两种模式下裸字符串就是内容本身，

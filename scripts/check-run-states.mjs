@@ -35,7 +35,7 @@ const SHOTS = process.env.RUN_STATES_SHOTS ?? '/tmp/agentlab-run-states'
 // 截图的像素密度：要看清卡片里 11px 的字时设成 2
 const DSF = Number(process.env.RUN_STATES_DSF ?? 1) || 1
 mkdirSync(SHOTS, { recursive: true })
-// 只跑其中几段（逗号分隔：themes, interact, team, endings, replay, history, issues, exits, reduced），调样式时省时间。
+// 只跑其中几段（逗号分隔：themes, interact, team, endings, replay, history, issues, exits, rejected, reject-exit, reduced），调样式时省时间。
 // RUN_STATES_SKIP 反过来，跳过这几段：check-all 把这个检查拆成几份分到不同的道上，最后一份用它
 // 兜住「其余全部」，以后新加的段不用改 check-all 也跑得到
 const ONLY = (process.env.RUN_STATES_ONLY ?? '').split(',').filter(Boolean)
@@ -1558,6 +1558,61 @@ await section('rejected', async () => {
   const old = await cards(page)
   check('老运行（node.failed 没有 reason）照旧画失败、下游被阻断', old.human?.state === 'failed' && old.out?.state === 'blocked',
     `${old.human?.state} / ${old.out?.state}`)
+  check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
+  await browser.close()
+})
+
+// ---------------------------------------------------------------- 驳回出口
+
+await section('reject-exit', async () => {
+  // 驳回出口（编排完善 §3）：审批接了「驳回」出口，被驳回时这一步正常结束（node.finished 带 outcome=rejected），沿驳回
+  // 那条边往下走。画布上它画「被驳回」（中性色、停止的剪影），槽里写转到哪一步；驳回出口的边走过了、下游照常跑完，
+  // 普通出口那一侧未到达；运行收成成功（途经驳回），不是取消
+  console.log('\n=== 驳回出口 ===')
+  const EXIT_TAIL = [
+    [3, 'human.resolved', 'human', { approved: false, note: '数字对不上', actor: '李工' }],
+    [0.05, 'run.resumed', null, { actor: '李工' }],
+    [0.05, 'node.started', 'human', { resumed: true }],
+    [0.1, 'node.finished', 'human', { duration_ms: 40, outcome: 'rejected', kind: 'approve', decision: 'reject',
+      actor: '李工', note: '数字对不上', to: [{ node_id: 'fix', label: '补数工单' }],
+      preview: { rejected: true, approved: false, decision: 'reject', kind: 'approve', note: '数字对不上',
+                 text: '人工驳回：数字对不上', __decision__: 'rejected' } }],
+    [0.1, 'node.started', 'fix', {}],
+    [0.1, 'node.finished', 'fix', { duration_ms: 5, preview: { 缺口清单: '退回：数字对不上' } }],
+    [0.05, 'run.finished', null, { output: { 缺口清单: '退回：数字对不上' },
+      rejected_via: [{ node_id: 'human', label: '班长审批', kind: 'approve', decision: 'reject', actor: '李工',
+                       note: '数字对不上', to: [{ node_id: 'fix', label: '补数工单' }] }],
+      timing: { wall_ms: 60000, active_ms: 40000, wait_ms: 20000 } }],
+  ]
+  const EXITED = script([...HEAD, ...TEAM_ROUND0, ...TEAM_DONE, ...LOOP_DONE, ...TO_GATE, ...EXIT_TAIL])
+  const { browser, page, errors } = await open({ theme: 'dark' })
+  await setLod(page, 'full')
+  await feed(page, EXITED(Date.now()))
+  await page.waitForTimeout(400)
+  const all = await cards(page)
+  check('走驳回出口的那一步：卡片状态是 rejected', all.human?.state === 'rejected', all.human?.state)
+  check('……剪影是停止，不是失败的三角', all.human?.shape === 'stop', all.human?.shape)
+  check('……槽里写转到哪一步', /被驳回，转到「补数工单」/.test(all.human?.text ?? ''), JSON.stringify(all.human?.text))
+  check('……不写「失败」', !/失败/.test(all.human?.text ?? ''), JSON.stringify(all.human?.text))
+  check('驳回出口那一步照常跑完', all.fix?.state === 'done', all.fix?.state)
+  check('普通出口那一步「未到达」', all.out?.state === 'unreached', all.out?.state)
+  const edges = await page.evaluate(() => Object.fromEntries(window.__studio.getState().edges
+    .filter((e) => e.source === 'human').map((e) => {
+      const el = document.querySelector(`.react-flow__edge[data-id="${CSS.escape(e.id)}"]`)
+      return [e.sourceHandle, el ? [...el.classList].filter((c) => c.startsWith('sf-e-')).join(' ') : '没画出来']
+    })))
+  check('驳回出口的边走过了，批准那条没走', /sf-e-walked/.test(edges.rejected ?? '') && /sf-e-unwalked/.test(edges.approved ?? ''),
+    JSON.stringify(edges))
+  const state = await page.evaluate(() => ({ phase: window.__studio.getState().runPhase,
+    failed: window.__studio.getState().trace.failedNodeId ?? null }))
+  check('运行收成成功（途经驳回），没有「失败的节点」', state.phase === 'succeeded' && state.failed === null, JSON.stringify(state))
+  // 出口：驳回出口是中性色，写「驳回」
+  const exit = await page.evaluate(() => {
+    const labels = [...document.querySelectorAll('.react-flow__node[data-id="human"] .nc-exit')].map((el) => el.textContent)
+    return labels
+  })
+  check('审批的两个出口：批准、驳回', exit.join() === '批准,驳回', exit.join())
+  shots.push(await shot(page, 'dark-reject-exit'))
   check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
   await browser.close()
 })

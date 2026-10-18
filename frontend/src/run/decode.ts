@@ -1892,7 +1892,12 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         // 节点类型的中文名，至少能看出这步在干嘛
         const label = String(d.label ?? '')
         const typeName = TYPE_LABEL[String(d.node_type ?? '')]
-        const title = (label && label !== nodeId ? label : typeName) || nodeId || '执行步骤'
+        // 子工作流里的一步（节点 id「子工作流节点 id/…」，docs/design/orchestration-round/00-总方案.md §2）：前面接上
+        // 子工作流那一步的名字，看得出这是哪个子工作流里的
+        const parentTitle = nodeId?.includes('/') ? nodeSteps.get(nodeId.slice(0, nodeId.lastIndexOf('/')))?.title : undefined
+        const own = (label && label !== nodeId?.slice(nodeId.lastIndexOf('/') + 1) && label !== nodeId ? label : typeName)
+          || nodeId || '执行步骤'
+        const title = parentTitle ? `${parentTitle} › ${own}` : own
         const iteration = num(d.iteration)
         if (nodeId && !spans.has(nodeId)) {
           spans.set(nodeId, { start: event.ts ?? 0, end: event.ts ?? 0, ms: 0 })
@@ -1981,11 +1986,15 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         }
         closeLlm(nodeId, 'done', at)
         const step = nodeId ? nodeSteps.get(nodeId) : undefined
+        // 被驳回、走了「驳回」出口（node.finished 带 outcome=rejected）：这一步照常结束、运行接着往下走，状态写「被驳回」，
+        // 副标题写谁、备注、转到哪几步；不画红、不当成出错
+        const exited = d.outcome === 'rejected'
         if (step) {
           const ms = num(d.duration_ms)
           const cur = execOf(nodeId)
-          if (cur) { cur.status = 'done'; if (ms != null) cur.ms = ms }
-          step.status = 'done'
+          if (cur) { cur.status = exited ? 'rejected' : 'done'; if (ms != null) cur.ms = ms }
+          step.status = exited ? 'rejected' : 'done'
+          if (exited) { step.level = undefined; step.sub = REJECTED_TEXT.exitStep(d) }
           step.artifact = d.artifact || step.artifact
           const execs = step.execs ?? []
           if (execs.length > 1) {
@@ -2801,9 +2810,13 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
         const timing = d.timing ?? {}
         const active = num(timing.active_ms) ?? num(d.duration_ms)
         const wait = num(timing.wait_ms)
+        // 途经驳回（终态事件带 rejected_via，docs/design/orchestration-round/00-总方案.md §3）：照驳回那条路走完的，照实说
+        // 在哪一步被驳回、转到了哪里。没有途经的和以前一字不差
+        const via = REJECTED_TEXT.via(d.rejected_via)
         out.push({
           id: `rd-${seq}`, seq, kind: 'lifecycle', status: 'done',
-          title: '完成', ms: active,
+          title: via ? `完成（${REJECTED_TEXT.viaTitle}）` : '完成', ms: active,
+          ...(via ? { sub: via } : {}),
           // 等人的时间单独说：审批停了三分钟的运行，"执行 1.2 s"和"用了 3 分钟"
           // 都对，混成一个数就哪个都不对了
           meta: [dur(active), wait ? `等待审批 ${formatDuration(wait)}` : ''].filter(Boolean).join(' · ')

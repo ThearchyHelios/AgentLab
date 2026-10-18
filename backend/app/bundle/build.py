@@ -58,6 +58,7 @@ from urllib.parse import quote
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.events import EventType
 from app.engine.evidence import iter_units, query_entry_fields
+from app.engine.lineage import in_scope, scoped_id
 from app.engine.masking import OPAQUE_SQL, SYSTEM_SCHEMAS, indirect_reads
 from app.engine.merge_query import MERGE_SOURCE
 from app.engine.recompute import (
@@ -300,10 +301,11 @@ class _Store:
                 if copied is not None:
                     upstream: list[Any] = []
                     # 转抄的是哪张卡：按读到的产出上记着的指标集认（经数据整形赋给变量的也认得出），认不出的按取值链上的节点
-                    owner = copied.node_id
+                    # 取值链上写的是卡所在那一层图里的 id（engine/lineage.scoped_id）
+                    owner = scoped_id(self._owner(art), copied.node_id)
                     if copied.card is not None:
                         up_card = str(copied.card.get("artifact") or "")
-                        owner = self._owner(up_card) or copied.node_id
+                        owner = self._owner(up_card) or owner
                         for index in copied.picked:
                             up_metric = copied.card["metrics"][index]
                             if isinstance(up_metric, dict) and up_metric.get("inputs"):
@@ -353,9 +355,13 @@ class _Store:
 
     def _outputs_of(self, card: str, events: Sequence[tuple[int, str, str | None, Any]]) -> Callable[[Any], Any]:
         """口径卡 card 那一次执行之前每个节点的产出（_card_outputs）：节点 id → 读出来的内容，读不出来、和 id 对不上的是
-        None。同一张卡只找一次。"""
+        None。同一张卡只找一次。
+
+        卡上的取值链按卡所在那一层图里的 id 写（engine/lineage.in_scope）：子工作流里的卡（台账记在「子工作流节点 id/卡」
+        上）只看同一张子图里的节点，按去掉前缀的 id 查，和证据面板 api/evidence._InputMasks._output 同一个认法。以前按这次
+        运行里的 id 查，子图里的卡转抄、按位置取的格一律查不到、当成核对不了整张遮住；父图里有同名的节点时还拿它当依据。"""
         if card not in self._card_outputs:
-            self._card_outputs[card] = _card_outputs(events, card)
+            self._card_outputs[card] = in_scope(_card_outputs(events, card), self._owner(card))
         outputs = self._card_outputs[card]
 
         def output(node_id: Any) -> Any:
@@ -1207,9 +1213,11 @@ def _summary(etype: str, data: Any) -> str:
 
 
 def _tier(events: Sequence[tuple[int, str, str | None, Any]]) -> dict[str, Any] | None:
-    """出具档位：封存范围内最后一条出具判定事件里的 tier，带上序号（浏览器拿那条已核对的事件对照）。"""
-    for seq, etype, _, data in reversed(events):
-        if etype == EventType.ISSUANCE and isinstance(data, dict) and isinstance(data.get("tier"), str):
+    """出具档位：封存范围内最后一条出具判定事件里的 tier，带上序号（浏览器拿那条已核对的事件对照）。子工作流里成果节点
+    的出具判定（节点 id「子工作流节点 id/…」）说的是子工作流交出的那份，不是这次运行的，不认（verifier.js 同一个认法）。"""
+    for seq, etype, node_id, data in reversed(events):
+        if etype == EventType.ISSUANCE and "/" not in str(node_id or "") and isinstance(data, dict) \
+                and isinstance(data.get("tier"), str):
             return {"value": data["tier"], "seq": seq}
     return None
 

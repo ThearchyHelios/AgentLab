@@ -7,7 +7,7 @@ import {
   NONE, formatClock, formatCost, formatDateTime, formatNumber, formatSpan, formatTime, formatTokens, shortId,
 } from '../../lib/format'
 import { type StatusCode } from '../../lib/status'
-import { isExecuting, liveAt, project, type Projection, type RunPhase, type Trace } from '../../run/trace'
+import { isExecuting, isSubStep, liveAt, project, type Projection, type RunPhase, type Trace } from '../../run/trace'
 import { useRunClock } from '../../run/useRunClock'
 import type { Approval, Run } from '../../types'
 import { BUNDLE_TEXT, COST_TEXT, REJECTED_TEXT, UNSAVED_HINT, isUnsaved, runCostText, runName } from '../../lib/terms'
@@ -96,7 +96,8 @@ export function Telemetry({ run, trace, phase, code, streaming, pending, labelOf
   const unpriced = (settled || !streaming ? (isNum(usage.unpriced_calls) ? usage.unpriced_calls : undefined) : undefined)
     ?? trace.unpricedCalls
 
-  const running = Object.values(trace.nodes).filter(isExecuting)
+  // 子工作流里的那一步算在子工作流那一步上（isSubStep），不和它一起算成两个同时在跑
+  const running = Object.values(trace.nodes).filter((n) => isExecuting(n) && !isSubStep(n.id))
   const waitingId = trace.waitingNodeId ?? pending?.[0]?.node_id
   const waitedMs = trace.waitingSince != null ? liveAt(trace, now) - trace.waitingSince
     : ageMs(pending?.[0]?.created_at, now)

@@ -129,6 +129,7 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
                      "（那里会保存取数快照）", code="governed.code_network", node_id=node.id, field="network")
 
     _lint_evidence(spec, flag, strict=strict)
+    _lint_reject_exits(spec, flag)
     _lint_sql(spec, flag, checkers)
     _load_extra_lints()
     for check in EXTRA_LINTS:
@@ -156,6 +157,41 @@ def publish_issues(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any] |
     """
     gate = lint_for_publish(spec, level=level, checkers=checkers, providers=providers).issues
     return [*_not_repeated(validate_graph(spec).issues, gate, spec), *gate]
+
+
+def _lint_reject_exits(spec: GraphSpec, flag: Callable[..., None]) -> None:
+    """「驳回」出口那条路要能走到成果节点或者结束（一个不再往下连的节点）（总方案 §3）：走不到的，驳回之后只能一直绕下去，
+    运行会在步数上限处中止。各级都报错——这不是受管才有的要求，任何一次驳回都会把运行拖到那里。
+
+    按图上的可达性认：从驳回出口连到的节点往下走，碰到成果节点或者没有出边的节点就算走得到。绕回关卡自己（「退回修改」：
+    改完再问一次）算走得到：再问一次还能批准、走普通出口。受管级里驳回路径上的出具照常判档、契约照常核对，不另立规矩。"""
+    from app.engine.schema import reject_targets
+
+    nodes = spec.node_map()
+    for gate in spec.nodes:
+        targets = [t for t in reject_targets(spec, gate) if t in nodes]
+        if not targets or _reaches_an_end(spec, targets):
+            continue
+        flag(f"{_who(gate)}的「驳回」出口接到{'、'.join(f'「{nodes[t].title}」' for t in dict.fromkeys(targets))}之后，"
+             "走不到任何成果节点或结束：驳回之后运行只能一直绕下去，会在步数上限处中止。请让驳回之后的那条路接到成果节点，"
+             "或者在一个不再往下连的节点结束",
+             code="reject_exit.no_end", node_id=gate.id, always=True)
+
+
+def _reaches_an_end(spec: GraphSpec, start: list[str]) -> bool:
+    nodes = spec.node_map()
+    seen: set[str] = set()
+    todo = list(start)
+    while todo:
+        cur = todo.pop()
+        if cur in seen or cur not in nodes:
+            continue
+        seen.add(cur)
+        outgoing = [e.target for e in spec.outgoing(cur) if e.target in nodes]
+        if nodes[cur].type == NodeType.OUTPUT or not outgoing:
+            return True
+        todo.extend(outgoing)
+    return False
 
 
 def _lint_sql(spec: GraphSpec, flag: Callable[..., None], checkers: Mapping[str, Any] | None) -> None:

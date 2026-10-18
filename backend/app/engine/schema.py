@@ -145,6 +145,37 @@ class GraphSpec(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# 驳回出口（docs/design/orchestration-round/00-总方案.md §3）
+# --------------------------------------------------------------------------
+
+#: 会被人驳回、能接「驳回」出口的节点：人工节点（审批、补充输入、编辑稿件）、调用工具（工具调用审批、写入前的动作确认）、
+#: 沙箱代码（代码执行审批）、双盲复算（裁决）。和 context.REJECTION_KINDS 的六种关卡一一对得上
+GATE_TYPES = frozenset({NodeType.HUMAN, NodeType.TOOL, NodeType.CODE, NodeType.DUAL_CHECK})
+#: 「驳回」出口的 sourceHandle（同 context.REJECT_HANDLE）
+REJECT_HANDLE = "rejected"
+
+
+def approve_mode(spec: GraphSpec, node: GraphNode) -> bool:
+    """人工节点是不是审批模式（和 NodeContext.cfg 同一个规则：节点上没写取图级 defaults，都没写是审批）。审批模式本来就有
+    「批准」「驳回」两个出口，按 __decision__ 路由；别的关卡只有一个普通出口，接了驳回出口才多一个。"""
+    if node.type != NodeType.HUMAN:
+        return False
+    mode = node.config.get("mode")
+    return (spec.defaults.get("mode") if mode in (None, "") else mode) in (None, "", "approve")
+
+
+def reject_targets(spec: GraphSpec, node: GraphNode) -> list[str]:
+    """这个关卡节点「驳回」出口连到的节点（按连线的先后）；不是关卡、没接驳回出口的为空。
+
+    接了：驳回（含超时驳回）时这一步正常结束、沿这几条边往下走（engine/compiler）；没接：驳回让运行结束（cancelled +
+    end_reason=rejected），和以前一字不差。审批模式另有一条老规矩：没设「驳回即终止」时，驳回本来就按 __decision__ 走
+    驳回边（没接就结束在这里、运行成功），那一条照旧。"""
+    if node.type not in GATE_TYPES:
+        return []
+    return [e.target for e in spec.outgoing(node.id) if e.sourceHandle == REJECT_HANDLE]
+
+
+# --------------------------------------------------------------------------
 # 校验
 # --------------------------------------------------------------------------
 
@@ -869,6 +900,14 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
             result.add(f"连线的起点节点「{edge.source}」不存在", edge_id=edge.id)
         if edge.target not in nodes:
             result.add(f"连线的终点节点「{edge.target}」不存在", edge_id=edge.id)
+        source = nodes.get(edge.source)
+        if edge.sourceHandle == REJECT_HANDLE and source is not None \
+                and source.type not in GATE_TYPES and source.type != NodeType.BRANCH:
+            # 「驳回」出口只在会被人驳回的节点上有意义：别的节点上这条线不会被路由，每次都会走（条件分支的 case 标识
+            # 可以叫 rejected，那是分支自己的出口）
+            result.add(f"「{source.title}」不会被人驳回，不能接「驳回」出口：只有人工节点（审批、补充输入、编辑稿件）、"
+                       "调用工具（工具调用审批、动作确认）、沙箱代码（代码执行审批）、双盲复算能接。请把这条连线改接到"
+                       "节点的普通出口", node_id=source.id, edge_id=edge.id, code="graph.reject_exit_invalid")
 
     if not spec.entry_nodes():
         result.add("找不到起始节点：每个节点都有上游连线，工作流中存在环路且没有起点")
@@ -911,6 +950,11 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
 
             for code, message, field in human_issues(node):
                 result.add(message, node_id=node.id, field=field, code=code)
+            if cfg.get("stop_on_reject") and approve_mode(spec, node) and reject_targets(spec, node):
+                # 驳回即终止优先（以前就是这样）：驳回出口那条线走不到。两样都写着，说明有一样不是作者的本意
+                result.add("这个审批设了「驳回即终止运行」，「驳回」出口的连线不会走到：驳回时运行直接结束。"
+                           "要让驳回之后走那条路，请关掉「驳回即终止运行」", level="warning", node_id=node.id,
+                           field="stop_on_reject", code="human.stop_on_reject_exit")
         elif node.type == NodeType.SUBGRAPH:
             if not cfg.get("workflow_id"):
                 result.add("「子工作流」节点还没有选择要嵌套的工作流", node_id=node.id,

@@ -86,7 +86,7 @@ async def evidence_whatif(run_id: str, payload: Any = Body(None)) -> dict[str, A
     # 转抄上游口径卡的输入给不给值：和证据面板同一张指标依赖图（copied_inputs → recompute.masked_closure），在事件循环里
     # 认好交进去，重算的线程里不再查库
     copied = await copied_inputs(sealed, card_node, artifact, card)
-    sources = _sources(sealed, cards, started, asyncio.get_running_loop(), copied=copied)
+    sources = _sources(sealed, cards, started, asyncio.get_running_loop(), copied=copied, card_node=card_node)
     docs = [(r.node_id, r.doc) for r in reports
             if r.doc is not None and r.hash_ok is True and (report is None or r.node_id == report)]
     try:
@@ -246,15 +246,22 @@ def _card_of(sealed: _Sealed, cards: list[tuple[str, str, dict[str, Any]]], node
 
 
 def _sources(sealed: _Sealed, cards: list[tuple[str, str, dict[str, Any]]], started: int,
-             loop: asyncio.AbstractEventLoop, *, copied: Mapping[int, Mapping[str, Any]] | None = None
-             ) -> recompute.Sources:
+             loop: asyncio.AbstractEventLoop, *, copied: Mapping[int, Mapping[str, Any]] | None = None,
+             card_node: str = "") -> recompute.Sources:
     """重算要用的东西（recompute.Sources）：封存范围内的工件、口径卡那次执行之前的节点产出和跑完的时刻、快照交回的
     时刻、用到哪份才算哪份的遮罩、转抄上游口径卡的输入给不给值（copied）。拿到的 Sources 要在工作线程里用（_Hidden
-    在线程里等事件循环查库）。"""
+    在线程里等事件循环查库）。
+
+    节点产出、跑完的时刻按口径卡所在那一层的 id 交进去（engine/lineage.in_scope）：子工作流里的卡（card_node「子工作流
+    节点 id/卡」）的取值链写的是子图里的 id，只看同一张子图里的节点，父图里同名的不算。"""
+    from app.engine.lineage import in_scope
+
     loader = _loader(sealed, cards)
     hidden = _Hidden(sealed, loader, loop)
-    return recompute.Sources(load=loader, queries=tuple(sealed.queries), outputs=_outputs_before(sealed, started),
-                             masked=hidden, returned=_returned(sealed), finished=_finished_before(sealed, started),
+    return recompute.Sources(load=loader, queries=tuple(sealed.queries),
+                             outputs=in_scope(_outputs_before(sealed, started), card_node),
+                             masked=hidden, returned=_returned(sealed),
+                             finished=in_scope(_finished_before(sealed, started), card_node),
                              secrets=hidden.secrets, copied=dict(copied or {}))
 
 

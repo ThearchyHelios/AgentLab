@@ -974,6 +974,35 @@ await section('sources', '输入来源：与快照一致、模型报 X 快照是
   check('Esc 关掉面板，焦点回到原片段', await panel(page).count() === 0 && await active(page) === qseg('8.7%'), await active(page))
 })
 
+await section('subgraph', '子工作流交回的证据：输入来源写明经哪个子工作流的哪个出口字段，子图里的节点写图上的名字（编排完善 §2）', async () => {
+  // 父图口径卡读子工作流出口的字段、出处接上子图里那一格时，证据接口在输入步骤上另给 subgraph / field、
+  // node_label / subgraph_label（api/evidence 的 _scoped_ids）。画布、记录页认不出「sub/fetch」这种 id：照接口给的名字写
+  const target = qseg('37.0元')
+  const { ctx, page: p, errors } = await probeQ((id, body) => {
+    if (id !== target) return body
+    for (const st of body.chain ?? []) {
+      if (st.step === 'input' && st.path === 'vars.kpi.gmv') {
+        Object.assign(st, { path: 'nodes.sub.output.gmv', node_id: 'sub/fetch', node_label: '取数子流程 › 查订单',
+                            subgraph: 'sub', subgraph_label: '取数子流程', field: 'gmv' })
+      }
+    }
+    return body
+  })
+  try {
+    await openQ(p, '37.0元', { wait: '[data-ev-sources]' })
+    const row = p.locator('[data-evidence-panel] [data-ev-source="nodes.sub.output.gmv"]')
+    const text = await row.innerText().catch(() => '')
+    check('写明经哪个子工作流的哪个出口字段', text.includes('经子工作流「取数子流程」的出口字段「gmv」'), text)
+    check('子图里的节点写图上的名字，不写裸 id', text.includes('取数子流程 › 查订单') && !text.includes('sub/fetch'), text)
+    check('核对状态照常（与快照一致）', text.includes('与快照一致'), text)
+    const chip = await row.locator('[data-ev-node]').first().getAttribute('title').catch(() => null)
+    check('悬停照样看得到 id', chip === 'sub/fetch', String(chip))
+    check('没有运行时报错', errors.length === 0, errors.slice(0, 3).join(' | '))
+  } finally {
+    await ctx.close()
+  }
+})
+
 await section('table', '整表：每格是可点的片段，方向键按行列走，值和数同一套线型', async () => {
   const cells = page.locator(`${Q} table td [data-seg]`)
   check('整表每个数据格都是可点的片段（3 行 × 3 列）', await cells.count() === 9, String(await cells.count()))

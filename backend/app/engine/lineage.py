@@ -13,6 +13,16 @@
 - 应用检查（apps/lint）、受管级发布检查（governance）：按 static_stops 静态地认（只有图、没有运行），追不到的给提示。
   转抄同一张图里另一张口径卡的指标，和运行时一样跨卡按那个指标的式子接着认（最多 MAX_COPY_DEPTH 层）；被抄的卡按
   caliber_from 固定在别处的版本时，静态看不到那一版的图，照旧停在那张卡。
+
+读子工作流出口的字段（nodes.<子图>.output.<字段>，docs/design/orchestration-round/00-总方案.md §2）跨子图往下追，三处同一套：
+- 运行时：子图跑完时按出口模板认每个字段的出处（multi.run_subgraph 的 provenance：模板整串就是一个取值链的字段，在子图
+  的状态里按口径卡认输入的同一套认；出自子图运行输入的再按子工作流节点的「输入」模板往父图追一层），父图口径卡读这个
+  字段时接上它（metrics._subgraph_field），卡上记的就是子图里那一格的出处（via、artifact、locator、status），另记
+  subgraph、field——traced / untraced 照常认；子图里追不到原始数据的，父图照样追不到、照样降档；
+- 证据面板：卡上记的节点 id 按卡所在的那一层认（api/evidence 的 _scoped），一路给到子图里的那一格；
+- 静态：按子工作流节点固定的那一版图（lint_process.subgraph_spec，调用方用 with_subgraphs 放进来）认出口字段的模板，接着
+  在子图里认；子图的运行输入按子工作流节点的「输入」模板回到父图认。最多 MAX_SUB_DEPTH 层（和运行时的嵌套上限一样），
+  看不到子图的（没放进来、读不到）照旧停在子工作流节点。
 """
 from __future__ import annotations
 
@@ -128,6 +138,32 @@ def untraced(inputs: Iterable[Any]) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
+# 卡上记的节点 id 在哪一层
+# --------------------------------------------------------------------------
+
+
+def scoped_id(card_node: Any, node_id: Any) -> Any:
+    """口径卡上记的节点 id（输入来自哪个节点、穿过的整形节点、转抄的卡、取值链里写的 nodes.X）是卡所在那一层图里的 id：
+    子工作流里的卡（这次运行里的 id「子工作流节点 id/卡」）记的是子图里的 id，换成这次运行里的（接上同一个前缀）。最外层
+    的卡原样；经子工作流出口接上的出处（multi.run_subgraph 记的「子工作流节点 id/…」）已经是卡这一层的 id，同样接上卡的
+    前缀就对了。证据面板、可验证报告、推演都按这一个认。"""
+    card = str(card_node or "")
+    if not isinstance(node_id, str) or not node_id or "/" not in card:
+        return node_id
+    return f"{card.rsplit('/', 1)[0]}/{node_id}"
+
+
+def in_scope(table: Mapping[str, Any], card_node: Any) -> dict[str, Any]:
+    """按这次运行里的节点 id 记的表（每个节点那一刻的产出、跑完的时刻）→ 按口径卡所在那一层的 id 记的：子工作流里的卡只看
+    同一张子图里的（去掉前缀；父图里同名的节点不算），最外层的卡原样。卡上的取值链按它这一层的 id 查（scoped_id 的反面）。"""
+    card = str(card_node or "")
+    if "/" not in card:
+        return dict(table)
+    prefix = card.rsplit("/", 1)[0] + "/"
+    return {key[len(prefix):]: value for key, value in table.items() if key.startswith(prefix)}
+
+
+# --------------------------------------------------------------------------
 # 静态地认（只有图）
 # --------------------------------------------------------------------------
 
@@ -140,20 +176,52 @@ class Stop:
     node_id: str | None
 
 
+#: 出口字段的模板整串就是一个取值链：{{ nodes.card.metrics[0].value }}（不带过滤器、不调函数、前后不带别的字）
+_WHOLE_REF = re.compile(r"^\s*\{\{\s*((?:nodes|vars|input)\.[^{}|()]+?)\s*\}\}\s*$", re.S)
+
+
+def whole_ref(template: Any) -> str | None:
+    """模板整串就是一个取值链时交回它（成果字段的值就是那个值本身，渲染只是转成文字）；别的写法为 None：拼了别的字、
+    过了过滤器的值，对不上那一格的值。子工作流出口的出处，运行时（multi._output_provenance）和静态（_exit_template）
+    都按这一个判断认。"""
+    m = _WHOLE_REF.match(template) if isinstance(template, str) else None
+    return m.group(1).strip() if m else None
+
+
+#: 静态地跨子工作流往下追的层数上限：和运行时子工作流的嵌套上限（multi._MAX_DEPTH）一样
+MAX_SUB_DEPTH = 3
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """静态地认时所在的那一层图：节点 id → {type, title?, config}。是子工作流时记着父图那一层和它在父图里的节点 id（子图的
+    运行输入按那个子工作流节点的「输入」模板回到父图认）。"""
+
+    nodes: Mapping[str, Mapping[str, Any]]
+    parent: "_Scope | None" = None
+    via: str | None = None
+    level: int = 0
+
+
 def static_stops(nodes: Mapping[str, Mapping[str, Any]], expression: str, *, _depth: int = 0) -> list[Stop]:
     """静态地认一个指标表达式里追不到原始数据的输入。nodes 是节点 id → {type, config}（apps/tree.node_map 的形状）。
 
     和运行时同一套认法，只是不看值：cell() 的第一个参数是查询结果（调用工具、合并查询的产出，或原样解析它的整形节点）、
     按位置取的格穿过原样解析的整形节点、运行输入、开了按出处核对字段的 Agent 交来的字段，算追到了；转抄同一张图里
-    另一张口径卡的指标，按那个指标的式子接着认（它的输入都追到了才算）；别的（表达式整形、沙箱代码、模型调用、转抄
-    固定在别处版本的口径卡……）停在写它的那个节点。表达式写错了的不在这里报（画布的校验报）。"""
+    另一张口径卡的指标，按那个指标的式子接着认（它的输入都追到了才算）；读子工作流出口的字段，按那一版子图的出口模板
+    接着认（_through_sub）；别的（表达式整形、沙箱代码、模型调用、转抄固定在别处版本的口径卡、看不到的子图……）停在
+    写它的那个节点。表达式写错了的不在这里报（画布的校验报）。"""
+    return _stops(_Scope(nodes), expression, _depth)
+
+
+def _stops(scope: _Scope, expression: str, depth: int) -> list[Stop]:
     try:
         tree = parse_expression(expression)[0]
     except ExpressionError:
         return []
     out: list[Stop] = []
     for path in leaf_refs(tree):
-        stop = _static_stop(nodes, path, _depth)
+        stop = _static_stop(scope, path, depth)
         if stop is not None:
             out.append(stop)
     return out
@@ -179,16 +247,17 @@ def _copied_metric(nodes: Mapping[str, Mapping[str, Any]], path: str) -> tuple[s
     return writers[0], str(metrics[index]["expression"])
 
 
-def _static_stop(nodes: Mapping[str, Mapping[str, Any]], path: str, depth: int = 0) -> Stop | None:
+def _static_stop(scope: _Scope, path: str, depth: int = 0) -> Stop | None:
+    nodes = scope.nodes
     type_of = lambda node_id: (nodes.get(node_id) or {}).get("type")  # noqa: E731
     if (copied := _copied_metric(nodes, path)) is not None:
         card_id, expression = copied
-        if depth < MAX_COPY_DEPTH and not static_stops(nodes, expression, _depth=depth + 1):
+        if depth < MAX_COPY_DEPTH and not _stops(scope, expression, depth + 1):
             return None
         return Stop(path, card_id)
     if (parts := cell_parts(path)) is not None:
         writers = _writers(nodes, parts[0])
-        bad = [w for w in writers if not _table(nodes, w, type_of)]
+        bad = [w for w in writers if not _table(nodes, w, type_of) and not _sub_table(scope, w, parts[0])]
         return Stop(path, bad[0]) if bad or not writers else None
     if (at := row_cell(path)) is not None:
         writers = _writers(nodes, at.table)
@@ -197,7 +266,7 @@ def _static_stop(nodes: Mapping[str, Mapping[str, Any]], path: str, depth: int =
             return None
     head = _REF_HEAD.match(path)
     if head and head.group(1) == "input":
-        return None
+        return None if _from_parent(scope, head.group(2), depth) else Stop(path, scope.via)
     writers = _writers(nodes, path)
     if not writers:
         return Stop(path, None)
@@ -205,11 +274,82 @@ def _static_stop(nodes: Mapping[str, Mapping[str, Any]], path: str, depth: int =
     for writer in writers:
         node = nodes[writer]
         if node.get("type") == "input":
+            if head and head.group(1) == "vars" and not _from_parent(scope, head.group(2), depth):
+                return Stop(path, scope.via)
             continue
         if node.get("type") == "agent" and _cited(node, head.group(1) if head else "", field):
             continue
+        if node.get("type") == "subgraph" and head and _through_sub(scope, writer, head, depth):
+            continue
         return Stop(path, writer)
     return None
+
+
+def _from_parent(scope: _Scope, name: str, depth: int) -> bool:
+    """运行输入的一个字段算不算原始数据：最外层的是（发起运行的人填的）；子工作流的运行输入是父图按子工作流节点的「输入」
+    模板渲染出来的，那个模板整串就是一个取值链、在父图里追得到原始数据，才算（同运行时 multi._lifted）。"""
+    if scope.parent is None:
+        return True
+    templates = ((scope.parent.nodes.get(scope.via or "") or {}).get("config") or {}).get("input")
+    path = whole_ref(templates.get(name)) if isinstance(templates, dict) and name else None
+    return path is not None and _static_stop(scope.parent, path, depth + 1) is None
+
+
+def _sub_scope(scope: _Scope, node_id: str) -> _Scope | None:
+    """子工作流节点 node_id 引用的那一版图（lint_process.subgraph_spec 读好放进来的），看不到、超过层数上限的为 None。"""
+    if scope.level >= MAX_SUB_DEPTH:
+        return None
+    from app.engine.lint_process import subgraph_spec
+
+    sub = subgraph_spec((scope.nodes.get(node_id) or {}).get("config") or {})
+    if sub is None:
+        return None
+    nodes = {n.id: {"type": str(n.type), "title": n.title, "config": n.config} for n in sub.nodes}
+    return _Scope(nodes, parent=scope, via=node_id, level=scope.level + 1)
+
+
+def _exit_template(sub: _Scope, key: str) -> str | None:
+    """子图出口字段 key 的模板整串所写的取值链（whole_ref）；没有这个字段、几个成果节点写法不一样、不是整串一个
+    取值链的为 None。"""
+    found = {whole_ref(f.get("value", "")) for node in sub.nodes.values() if node.get("type") == "output"
+             for f in (node.get("config") or {}).get("fields") or [] if isinstance(f, dict) and f.get("name") == key}
+    return found.pop() if len(found) == 1 else None
+
+
+def _sub_key(head: re.Match[str], node: Mapping[str, Any]) -> str | None:
+    """nodes.<子图>.output.<字段> / vars.<子图的 assign_to>.<字段> 读的出口字段名；不是正好一个字段的为 None。"""
+    root, name, rest = head.group(1), head.group(2), head.group(3)
+    key = re.sub(r"\[\s*['\"]([^'\"\]]+)['\"]\s*\]", r".\1", rest).strip(".")
+    if root == "nodes":
+        if not key.startswith("output."):
+            return None
+        key = key[len("output."):]
+    elif root != "vars" or str((node.get("config") or {}).get("assign_to") or "").strip() != name:
+        return None
+    return key if key and "." not in key and "[" not in key else None
+
+
+def _through_sub(scope: _Scope, writer: str, head: re.Match[str], depth: int) -> bool:
+    """读子工作流出口的一个字段：那个字段在子图里追得到原始数据（出口模板整串就是一个取值链，接着在子图里认）。"""
+    key = _sub_key(head, scope.nodes.get(writer) or {})
+    sub = _sub_scope(scope, writer) if key else None
+    inner = _exit_template(sub, key) if sub is not None and key else None
+    return inner is not None and _static_stop(sub, inner, depth + 1) is None
+
+
+def _sub_table(scope: _Scope, writer: str, source: str) -> bool:
+    """cell() 的第一个参数是子工作流出口原样交出的一份查询结果（出口字段的模板整串就是 {{ nodes.<查询节点> }}）。"""
+    head = _REF_HEAD.match(source)
+    if not head or (scope.nodes.get(writer) or {}).get("type") != "subgraph":
+        return False
+    key = _sub_key(head, scope.nodes.get(writer) or {})
+    sub = _sub_scope(scope, writer) if key else None
+    inner = _exit_template(sub, key) if sub is not None and key else None
+    if inner is None:
+        return False
+    writers = _writers(sub.nodes, inner)
+    type_of = lambda node_id: (sub.nodes.get(node_id) or {}).get("type")  # noqa: E731
+    return bool(writers) and all(_table(sub.nodes, w, type_of) or _sub_table(sub, w, inner) for w in writers)
 
 
 def _writers(nodes: Mapping[str, Mapping[str, Any]], source: str) -> list[str]:

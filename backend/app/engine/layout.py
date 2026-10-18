@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from statistics import median
 
-from app.engine.schema import GraphNode, GraphSpec, NodeType, back_edges
+from app.engine.schema import REJECT_HANDLE, GraphNode, GraphSpec, NodeType, back_edges, reject_targets
 
 #: 画布节点的宽度。前端 NodeCard 的 `width: 238` 是写死的，这里必须跟着它——
 #: 排版算出来的走廊是给连线用的，宽度估错了走廊就白留。
@@ -108,11 +108,12 @@ def _ranks(
     return rank
 
 
-def _handle_order(node: GraphNode) -> list[str]:
+def _handle_order(node: GraphNode, spec: GraphSpec | None = None) -> list[str]:
     """节点出口在画布上从上到下的顺序。分支的 yes/no 就该是这个顺序。
 
     前端 `sourceHandles()` 决定出口怎么画，这里决定它们怎么排。两份必须一致，
-    否则分支标签的上下关系会和连线对不上。
+    否则分支标签的上下关系会和连线对不上。关卡节点接了「驳回」出口的（engine/schema.reject_targets），
+    驳回排在普通出口下面；没接的只有一个出口，排不排都一样。
     """
     cfg = node.config
     if node.type == NodeType.BRANCH:
@@ -125,7 +126,9 @@ def _handle_order(node: GraphNode) -> list[str]:
     if node.type == NodeType.LOOP:
         return ["body", "done"]
     if node.type == NodeType.HUMAN and cfg.get("mode", "approve") == "approve":
-        return ["approved", "rejected"]
+        return ["approved", REJECT_HANDLE]
+    if spec is not None and reject_targets(spec, node):
+        return ["out", REJECT_HANDLE]
     return ["out"]
 
 
@@ -225,7 +228,7 @@ def _apply_handle_order(
         outgoing[e.source].append(e)
 
     for node in spec.nodes:
-        handles = _handle_order(node)
+        handles = _handle_order(node, spec)
         if len(handles) < 2 or node.id not in nodes:
             continue
         outs = outgoing.get(node.id, [])

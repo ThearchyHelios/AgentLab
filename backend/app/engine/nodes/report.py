@@ -37,6 +37,7 @@ import asyncio
 import re
 import time
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -140,16 +141,18 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
     if isinstance(sources, str) and sources != "ancestors":
         sources = [sources]
     if isinstance(sources, list):
-        # evidence_from 只管查询、检索这类证据（连同查询当时的表结构）从哪几个节点来；指标从哪来由 metrics_from 管
+        # evidence_from 只管查询、检索这类证据（连同查询当时的表结构）从哪几个节点来；指标从哪来由 metrics_from 管。
+        # 写了子工作流节点的，它交回来的（子图里的查询，节点 id「子工作流节点 id/…」）一并算
         keep = {str(s) for s in sources}
         ledger = [e for e in ledger
-                  if e.get("kind") not in ("query", "retrieval", "schema") or e.get("node_id") in keep]
+                  if e.get("kind") not in ("query", "retrieval", "schema") or _outer(e.get("node_id")) in keep]
+    nodes = state.get("nodes") or {}
     catalog = build_catalog(
-        nodes=state.get("nodes") or {},
+        nodes=nodes,
         ledger=ledger,
         inputs=state.get("input") or {},
         metrics_from=_setting(spec, node, "metrics_from") or None,
-        allowed=_ancestors(spec, node.id),
+        allowed=with_subgraphs(_ancestors(spec, node.id), [*nodes, *(e.get("node_id") for e in ledger)]),
     )
     if report_entities(spec, node) == "off":
         # 目录里没有表和字段，写作目录也就不列；compose / verify 另传 entities=False，解析不了的原因照实说
@@ -159,6 +162,20 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
     if isinstance(withheld, list) and withheld:
         catalog = withhold_metrics(catalog, [str(a) for a in withheld], _masked_word())
     return catalog
+
+
+def _outer(node_id: Any) -> str:
+    """节点 id 在这一层图上是哪个节点：子工作流交回来的「子工作流节点 id/…」是那个子工作流节点，别的原样。"""
+    return str(node_id or "").split("/", 1)[0]
+
+
+def with_subgraphs(allowed: set[str], ids: Iterable[Any]) -> set[str]:
+    """报告收证据的范围（祖先节点）加上范围里的子工作流交回来的那些（multi.run_subgraph：台账条目、口径卡的节点 id 是
+    「子工作流节点 id/…」，嵌套的一层层接上）：子工作流在报告上游，它里面查过的数、算过的口径卡也在上游
+    （docs/design/orchestration-round/00-总方案.md §2）。"""
+    out = set(allowed)
+    out.update(i for i in ids if isinstance(i, str) and "/" in i and _outer(i) in allowed)
+    return out
 
 
 def _masked_word() -> str:
@@ -603,7 +620,7 @@ async def _store(doc: dict[str, Any], ctx: NodeContext) -> str | None:
     from app.core.artifact_store import put_json
 
     try:
-        return await put_json(doc, kind="report_doc", run_id=ctx.run.run_id, node_id=ctx.node.id,
+        return await put_json(doc, kind="report_doc", run_id=ctx.run.run_id, node_id=ctx.run.global_id(ctx.node.id),
                               meta={"stats": doc.get("stats") or {}})
     except Exception as e:  # noqa: BLE001 - 工件写失败不毁掉运行，只是这份报告点不开证据
         ctx.emit(EventType.LOG, level="warn", code="evidence_store_failed",
@@ -693,7 +710,10 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 第一稿、重写稿、裁判退回的改写稿都从这里过：整篇包在代码块里的先去掉外层围栏。文档的 source 记的是去掉
         # 围栏之后的正文——markdown 由它渲染，出口契约复核取回的也是这份文档。引用了遮罩列的格子组装好之后再认
         # （_MaskedCells）：只读正文里引用到的那几份快照
-        return await masked(compose_doc(_unfenced(raw), catalog, node_id=ctx.node.id, run_id=ctx.run.run_id,
+        # 文档记这次运行里的节点 id（子工作流里的报告是「子工作流节点 id/…」）：和它的 report.checked 事件、产出工件同一个
+        # id。证据接口、可验证报告、质询都拿文档上的 id 和事件上的比，对不上就判「疑似被修改」
+        return await masked(compose_doc(_unfenced(raw), catalog, node_id=ctx.run.global_id(ctx.node.id),
+                                        run_id=ctx.run.run_id,
                                         allow_numbers=allow, cells_allowed=cells, entities=entities,
                                         absence=writer.trimmed))
 

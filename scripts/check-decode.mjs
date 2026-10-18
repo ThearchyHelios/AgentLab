@@ -2959,5 +2959,108 @@ await section('被驳回的那一步：node.failed 带 reason=rejected 时画「
     && old.nodes.out?.state === 'blocked', `${old.nodes.pay?.state} / ${old.failedNodeId} / ${old.nodes.out?.state}`)
 })
 
+await section('驳回出口：node.finished 带 outcome=rejected 时这一步画「被驳回」、写转到哪一步，下游照常往下走；终态写「途经驳回」（编排完善 §3）', async () => {
+  const trace = await import(await load('/src/run/trace.ts'))
+  const derive = await import(await load('/src/run/derive.ts'))
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: seq, data })
+  const to = [{ node_id: 'tell', label: '通知申请人' }]
+  const events = [E(1, 'run.started', null, { nodes: 4 }), E(2, 'node.started', 'pay', { label: '付款' }),
+    E(3, 'human.requested', 'pay', { title: '确认发送：付款' }), E(4, 'run.interrupted', 'pay', { payload: { node_id: 'pay' } }),
+    E(5, 'run.resumed', null, {}), E(6, 'node.started', 'pay', { label: '付款', resumed: true }),
+    E(7, 'human.resolved', 'pay', { approved: false, note: '金额不对', actor: '张工' }),
+    E(8, 'node.finished', 'pay', { duration_ms: 900, outcome: 'rejected', kind: 'action_confirm', decision: 'reject',
+      actor: '张工', note: '金额不对', to,
+      preview: { rejected: true, decision: 'reject', kind: 'action_confirm', __decision__: 'rejected',
+                 text: '「付款」未确认（被驳回），没有发送：金额不对' } }),
+    E(9, 'node.started', 'tell', { label: '通知申请人' }), E(10, 'node.finished', 'tell', { duration_ms: 5 }),
+    E(11, 'run.finished', null, { output: {}, rejected_via: [{ node_id: 'pay', label: '付款', kind: 'action_confirm',
+      decision: 'reject', actor: '张工', note: '金额不对', to }] })]
+  const steps = flatten(mod.decodeRun(events))
+  const pay = steps.find((s) => s.kind === 'node' && s.nodeId === 'pay')
+  check('这一步写「被驳回」：状态 rejected，不是 failed、不是 error', pay?.status === 'rejected' && pay?.level !== 'error',
+    `${pay?.status} / ${pay?.level}`)
+  check('副标题写谁驳回、备注、转到哪一步', pay?.sub === '张工 驳回：金额不对，转到「通知申请人」', pay?.sub)
+  check('这一次执行也记成被驳回', pay?.execs?.at(-1)?.status === 'rejected', pay?.execs?.at(-1)?.status)
+  const tell = steps.find((s) => s.kind === 'node' && s.nodeId === 'tell')
+  check('驳回出口那一步照常跑完', tell?.status === 'done', tell?.status)
+  const done = steps.find((s) => s.kind === 'lifecycle' && s.id === 'rd-11')
+  check('终态写「完成（途经驳回）」，副标题写在哪一步被驳回、转到哪', done?.title === '完成（途经驳回）'
+    && done?.sub === '「付款」被驳回，转到「通知申请人」' && done?.status === 'done', `${done?.title} / ${done?.sub}`)
+  const plain = flatten(mod.decodeRun([...events.slice(0, 10), E(11, 'run.finished', null, { output: {} })]))
+    .find((s) => s.kind === 'lifecycle' && s.id === 'rd-11')
+  check('没有途经驳回的终态和以前一字不差', plain?.title === '完成' && plain?.sub === undefined, `${plain?.title} / ${plain?.sub}`)
+
+  // 航迹与图：关卡状态 rejected、走了驳回出口；普通出口那一步没走到（未到达），驳回出口的边走过了
+  const graph = { nodes: [{ id: 'start', type: 'input' }, { id: 'pay', type: 'tool' }, { id: 'out', type: 'output' },
+                          { id: 'tell', type: 'output' }],
+    edges: [{ source: 'start', target: 'pay' }, { source: 'pay', target: 'out', sourceHandle: 'out' },
+            { source: 'pay', target: 'tell', sourceHandle: 'rejected' }] }
+  const t = derive.applyDerived(events.reduce(trace.foldEvent, trace.emptyTrace()), graph)
+  check('航迹：关卡状态 rejected、走了驳回出口', t.nodes.pay?.state === 'rejected' && t.nodes.pay?.exited === true
+    && t.nodes.pay?.takenHandle === 'rejected', `${t.nodes.pay?.state} / ${t.nodes.pay?.exited} / ${t.nodes.pay?.takenHandle}`)
+  check('航迹：转到哪一步记着（卡片照它写）', t.nodes.pay?.exitTo?.join() === '通知申请人', t.nodes.pay?.exitTo?.join())
+  check('航迹：不记成失败的节点', t.failedNodeId === undefined, t.failedNodeId)
+  check('航迹：普通出口那一步「未到达」，不是「被阻断」', t.nodes.out?.state === 'unreached', t.nodes.out?.state)
+  const walked = derive.walkedEdges(t, graph)
+  check('走过的边：驳回出口那条在，普通出口那条不在', walked.has('pay|tell|rejected') && !walked.has('pay|out|out'),
+    [...walked].join(' , '))
+  // 跑到一半（驳回出口那一步还没开始）：它在排队，普通出口那一步没有
+  const mid = derive.applyDerived(events.slice(0, 8).reduce(trace.foldEvent, trace.emptyTrace()), graph)
+  // 没有事件、推导下来也还是 idle 的节点不进航迹（applyDerived 只补变了的）
+  check('跑到一半：驳回出口那一步排队，普通出口那一步没动', mid.nodes.tell?.state === 'queued'
+    && (mid.nodes.out?.state ?? 'idle') === 'idle', `${mid.nodes.tell?.state} / ${mid.nodes.out?.state ?? 'idle'}`)
+  // 批准了：正常结束（没有 outcome），走普通出口，驳回出口那一步未到达
+  const ok = [...events.slice(0, 7), E(8, 'node.finished', 'pay', { duration_ms: 900, preview: { receipt: { id: 'R1' } } }),
+    E(9, 'node.started', 'out', { label: '成果' }), E(10, 'node.finished', 'out', {}), E(11, 'run.finished', null, { output: {} })]
+  const t2 = derive.applyDerived(ok.reduce(trace.foldEvent, trace.emptyTrace()), graph)
+  check('批准了：关卡完成、驳回出口那一步未到达', t2.nodes.pay?.state === 'done' && !t2.nodes.pay?.exited
+    && t2.nodes.tell?.state === 'unreached', `${t2.nodes.pay?.state} / ${t2.nodes.tell?.state}`)
+  const walked2 = derive.walkedEdges(t2, graph)
+  check('批准了：走过的是普通出口那条', walked2.has('pay|out|out') && !walked2.has('pay|tell|rejected'), [...walked2].join(' , '))
+})
+
+await section('子工作流里的每一步进了同一个运行（节点 id「子工作流节点 id/…」）：时间线的步骤名接上子工作流的名字（编排完善 §2）', async () => {
+  const E = (seq, type, node_id, data = {}) => ({ seq, type, node_id, ts: seq, data })
+  const steps = flatten(mod.decodeRun([E(1, 'run.started', null, { nodes: 2 }),
+    E(2, 'node.started', 'sub', { label: '取数子流程', node_type: 'subgraph' }),
+    E(3, 'node.started', 'sub/fetch', { label: '查订单', node_type: 'tool' }), E(4, 'node.finished', 'sub/fetch', {}),
+    E(5, 'node.started', 'sub/o', { label: 'o', node_type: 'output' }), E(6, 'node.finished', 'sub/o', {}),
+    E(7, 'node.finished', 'sub', {}), E(8, 'run.finished', null, { output: {} })]))
+  const title = (id) => steps.find((s) => s.kind === 'node' && s.nodeId === id)?.title
+  check('子工作流里的一步：「取数子流程 › 查订单」', title('sub/fetch') === '取数子流程 › 查订单', title('sub/fetch'))
+  check('没起名字的（名字就是子图里的 id）退到节点类型', title('sub/o') === '取数子流程 › 成果', title('sub/o'))
+  check('子工作流节点自己照旧', title('sub') === '取数子流程', title('sub'))
+
+  // 航迹的计数：子工作流里的步骤算在子工作流那一步里，完成数的分母是工作流里的节点数（run.started 的 nodes）
+  const trace = await import(await load('/src/run/trace.ts'))
+  const evs = [E(1, 'run.started', null, { nodes: 2 }), E(2, 'node.started', 'start', {}), E(3, 'node.finished', 'start', {}),
+    E(4, 'node.started', 'sub', { label: '取数子流程' }),
+    E(5, 'node.started', 'sub/fetch', { label: '查订单' }), E(6, 'node.finished', 'sub/fetch', {}),
+    E(7, 'node.started', 'sub/o', {})]
+  const t = evs.reduce(trace.foldEvent, trace.emptyTrace())
+  const mid = trace.project(t, 7500)
+  check('跑到子工作流里：完成数只数工作流里的节点（1/2，不是 2/2）', mid.nodesDone === 1 && mid.nodesTotal === 2,
+    `${mid.nodesDone}/${mid.nodesTotal}`)
+  check('……子工作流和它里面那一步不算成两路并行', mid.parallelNow === 1, String(mid.parallelNow))
+  check('……「当前在跑」只认子工作流那一步', Object.values(t.nodes).filter((n) => trace.isExecuting(n) && !trace.isSubStep(n.id))
+    .map((n) => n.id).join() === 'sub')
+  const done = [...evs, E(8, 'node.finished', 'sub/o', {}), E(9, 'node.finished', 'sub', {}),
+    E(10, 'run.finished', null, { output: {} })].reduce(trace.foldEvent, trace.emptyTrace())
+  const end = trace.project(done, 10000)
+  check('跑完：2/2，不是 4/2', end.nodesDone === 2 && end.nodesTotal === 2, `${end.nodesDone}/${end.nodesTotal}`)
+
+  // 子工作流里的一步出错：运行记下的出错节点是「sub/fetch」，图上没有它。失败横幅、泳道、运行胶囊照「子工作流 › 那一步」写
+  const failedRun = [...evs.slice(0, 5), E(6, 'node.failed', 'sub/fetch', { error: '查询失败' }),
+    E(7, 'node.failed', 'sub', { error: '查询失败' }),
+    E(8, 'run.failed', null, { error: '查询失败', node_id: 'sub/fetch', label: '取数子流程 › 查订单' })]
+    .reduce(trace.foldEvent, trace.emptyTrace())
+  const own = (id) => ({ start: '入口', sub: '取数子流程' })[id]
+  check('出错节点记的是子图里那一步', failedRun.failedNodeId === 'sub/fetch', failedRun.failedNodeId)
+  check('名字接上子工作流：「取数子流程 › 查订单」，不写裸 id', trace.stepLabel(failedRun, 'sub/fetch', own) === '取数子流程 › 查订单',
+    trace.stepLabel(failedRun, 'sub/fetch', own))
+  check('图上的节点照旧写图上的名字', trace.stepLabel(failedRun, 'sub', own) === '取数子流程')
+  check('没起过名字的子图步骤写子图里的 id', trace.stepLabel(t, 'sub/o', own) === '取数子流程 › o', trace.stepLabel(t, 'sub/o', own))
+})
+
 console.log(failed ? `\n✗ ${failed} 项未通过` : '\n✓ 解码器全部通过')
 process.exit(failed ? 1 : 0)

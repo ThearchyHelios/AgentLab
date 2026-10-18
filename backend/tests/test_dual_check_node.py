@@ -534,6 +534,61 @@ async def test_rejecting_the_approval_ends_the_run_as_rejected(monkeypatch, shop
     assert (ended.data["kind"], ended.data["note"]) == ("dual_check", "口径要重新对")
 
 
+async def test_rejecting_the_approval_with_a_reject_exit_goes_on_along_it(monkeypatch, shop, client):
+    """裁决接了「驳回」出口（docs/design/orchestration-round/00-总方案.md §3）：驳回时这一步正常结束、沿驳回边往下走，产出带
+    哪种关卡、结论、备注；运行照它的路径结束。"""
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    spec = graph(name, BY_ORDER_DATE)
+    spec["nodes"].append(node("redo", "output", "重新核对", fields=[{"name": "结论", "value": "{{ nodes.dual.note }}"}]))
+    spec["edges"].append({"source": "dual", "target": "redo", "sourceHandle": "rejected"})
+    run = await start(spec)
+    approval = await pending(run.id)
+    res = await client.post(f"/api/approvals/{approval.id}/decide", json={"approved": False, "note": "口径要重新对"})
+    assert res.status_code == 200, res.text
+    done = await wait(run.id, ("succeeded", "failed", "cancelled"))
+    assert (done.status, done.end_reason) == ("succeeded", None), done.error
+    assert done.output == {"结论": "口径要重新对"}
+    evs = await events(run.id)
+    [finished] = [e for e in evs if e.type == "node.finished" and e.node_id == "dual"]
+    assert (finished.data["outcome"], finished.data["kind"]) == ("rejected", "dual_check")
+    assert not [e for e in evs if e.type == "node.finished" and e.node_id == "out"], "普通出口没有走"
+
+
+async def test_a_rejected_arbitration_through_the_exit_still_degrades_the_issuance(monkeypatch, shop, client):
+    """驳回出口直接接到出具的成果节点：审核人驳回了裁决，那组数不能照样完整出具。走出口时这一步的产出照样带出具缺口
+    （「审核人驳回了裁决」），台账照记一条结论为驳回的 dual_check，证据面板的指标步骤据此认出复核过这份指标集；
+    不比选「两边都不对」宽。"""
+    from app.api.evidence import _dual_check_of, _sealed
+
+    name, _ = shop
+    Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
+    spec = graph(name, BY_ORDER_DATE)
+    spec["edges"].append({"source": "dual", "target": "out", "sourceHandle": "rejected"})
+    run = await start(spec)
+    approval = await pending(run.id)
+    res = await client.post(f"/api/approvals/{approval.id}/decide", json={"approved": False, "note": "口径要重新对"})
+    assert res.status_code == 200, res.text
+    done = await wait(run.id, ("succeeded", "failed", "cancelled"))
+    assert done.status == "succeeded", done.error
+    issuance = done.output["_issuance"]
+    assert issuance["tier"] == "degraded", issuance
+    assert "双盲复算「复核销售额」：指标「销售额」两路结果不一致，审核人驳回了裁决" in issuance["gaps"], issuance["gaps"]
+    evs = await events(run.id)
+    [finished] = [e for e in evs if e.type == "node.finished" and e.node_id == "dual"]
+    assert finished.data["outcome"] == "rejected"
+    [entry] = [e for e in finished.data.get("evidence") or [] if e.get("kind") == "dual_check"]
+    assert (entry["status"], entry["card"]) == ("rejected", "card") and entry["metrics"][0]["status"] == "disagreed"
+    assert finished.data["preview"]["status"] == "rejected" and finished.data["preview"]["rejected"] is True
+    sealed = await _sealed(run.id)
+    [(_, artifact, _)] = [c for c in __import__("app.api.evidence", fromlist=["_sealed_cards"])._sealed_cards(sealed)]
+    checked = _dual_check_of(sealed, "card", artifact, "gmv")
+    assert checked is not None and checked["status"] == "disagreed" and "choice" not in checked, checked
+    # 对照：同一处选「两边都不对」也是降档
+    other = await start(graph(name, BY_ORDER_DATE))
+    assert (await decide(client, other.id, {"gmv": "neither"})).output["_issuance"]["tier"] == "degraded"
+
+
 async def test_on_reject_fail_stops_the_run(monkeypatch, shop, client):
     name, source_id = shop
     Blind(monkeypatch, name, {"销售额": (RIGHT, "gmv")})
