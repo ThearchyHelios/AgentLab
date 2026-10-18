@@ -310,7 +310,8 @@ class ChatTurnExecution(runtime.JobRun):
         self.run_id = None
         await self._job(attempt=attempt, run_id=None)
         await self.save(run_id=None, meta={"runId": None, "runStatus": None, "usage": dict(self.usage)})
-        await self.emit("turn.retry", {"kind": kind, "reason": reason, "base": base, "attempt": attempt})
+        await self.emit("turn.retry", {"kind": kind, "reason": reason, "base": base, "attempt": attempt,
+                                       "usage": dict(self.usage)})
 
     # ---------------- 执行 ----------------
 
@@ -751,7 +752,8 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
                 raise TurnRefused(422, "放宽到几步要写清楚", TURN_INVALID)
             request["max_steps"] = int(max_steps)
         if mode in ("continue", "resume"):
-            if run is None:
+            # 接着收尾不要求运行还在：运行记录删了的，服务端照实收成「运行记录不见了」
+            if run is None and (mode == "continue" or not run_id):
                 raise TurnRefused(409, "这一轮没有可接着的运行，请重试本轮", TURN_INVALID)
             if mode == "continue":
                 await _continue_run(run.id, actor)
@@ -761,9 +763,10 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
             spent = meta.get("ms")
             if row.status != "running" and isinstance(spent, (int, float)):
                 request["started_ms"] = now_ms - int(spent)
-            elif run.started_at is not None:
+            elif run is not None and run.started_at is not None:
                 request["started_ms"] = int(run.started_at.timestamp() * 1000)
-            if mode == "resume" and run.status in ("succeeded", "failed", "cancelled") and run.finished_at is not None:
+            if mode == "resume" and run is not None and run.status in ("succeeded", "failed", "cancelled") \
+                    and run.finished_at is not None:
                 request["ended_ms"] = int(run.finished_at.timestamp() * 1000)
         else:
             # 重试、重新运行、放宽步数、跑一下：服务重启挂起的旧运行没人会再去续它，顺手取消（停在审批上的不算：重试不会从那里发起）
@@ -812,8 +815,15 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
 
     # 这一次尝试从这一条开始：刷新、重开页面时从这里回放
     async with SessionLocal() as s:
+        from app.db.models import ConversationTurn
+
+        fresh = await s.get(ConversationTurn, turn_id)
+        usage = ((fresh.meta or {}) if fresh is not None and isinstance(fresh.meta, dict) else {}).get("usage")
+        # 页面据此把这一轮重置成「这一次」的样子：归档、范围、到目前为止的用量、从什么时候算起（补交付的到运行结束为止）
         seq = await turn_log.append(s, turn_id, "turn.attempt", {
-            "mode": mode, "attempts": attempts, "scope": request.get("scope") or [],
+            "mode": mode, "attempts": attempts, "scope": request.get("scope") or [], "usage": usage or {},
+            "started_ms": request.get("started_ms"),
+            **({"ended_ms": request["ended_ms"]} if request.get("ended_ms") else {}),
             **({"max_steps": request["max_steps"]} if request.get("max_steps") else {})})
         await s.execute(update(ChatTurnJob).where(ChatTurnJob.id == turn_id).values(attempt_seq=seq)
                         .execution_options(synchronize_session=False))

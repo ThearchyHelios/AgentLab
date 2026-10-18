@@ -834,3 +834,26 @@ def test_attempt_records_say_what_the_page_used_to_say():
     legacy = record.attempt_record(row(status="error", error="x"), {"failure": {"title": "操作超时", "reason": "查询超时。"}}, n=1)
     assert legacy["summary"] == "操作超时：查询超时。"
     assert record.attempt_record(row(answer="字" * 5000), {}, n=1)["answer"].endswith("…")
+
+
+async def test_an_empty_generation_is_retried_once_on_the_server(client, monkeypatch):
+    """助手只写了思考、一个操作都没给（error.next=retry）：服务端带着原因重来一次（turn.retry kind=empty），不用页面在。"""
+    import app.api.copilot as copilot
+    from tests.test_usage_meter import Scripted
+
+    reply = json.dumps({"op": "reply", "text": "上周没有华中区的数据"}, ensure_ascii=False)
+    model = Scripted(model="claude-opus-5", replies=[[""], [reply]])
+
+    async def _model(*_a, **_k):
+        return model, "claude-opus-5"
+
+    monkeypatch.setattr(copilot, "get_chat_model", _model)
+    conversation_id = await _conversation(client)
+    turn_id = await _ask(client, conversation_id, "上周华中区销售额")
+    await _done(turn_id)
+    events = await _events(turn_id)
+    [retry] = [e["data"] for e in events if e["type"] == "turn.retry"]
+    assert retry["kind"] == "empty" and retry["reason"] == "模型没有给出任何修改，也没有说明原因"
+    row = await _row(turn_id)
+    assert row.status == "done" and row.answer == "上周没有华中区的数据" and row.meta["noQuery"] is True
+    assert row.meta["usage"]["copilot"]["calls"] == 2, "两次建图都是这一轮花的"
