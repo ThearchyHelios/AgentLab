@@ -1013,7 +1013,7 @@ type InputLink = { index: number; alias: string; go: () => void; text?: string }
  * 面板里提到的节点。画布右栏里是按钮：点一下在画布上选中并对准它（画布上已经没有这个节点
  * 时不给按钮，点了会落空）；别处照旧写节点 id
  */
-function NodeChip({ id, prefix }: { id?: string | null; prefix?: string }) {
+function NodeChip({ id, prefix, fallback }: { id?: string | null; prefix?: string; fallback?: string }) {
   const host = useEvidenceHost()
   if (!id) return null
   const label = host.nodeLabel?.(id)
@@ -1025,7 +1025,8 @@ function NodeChip({ id, prefix }: { id?: string | null; prefix?: string }) {
       </button>
     )
   }
-  return <span className="mono" data-ev-node={id}>{prefix}{id}</span>
+  // 画布上没有这个节点（子工作流里的那一步「子工作流节点 id/…」）：写证据接口给的名字，悬停写 id
+  return <span className="mono" data-ev-node={id} title={fallback ? id : undefined}>{prefix}{fallback || id}</span>
 }
 
 /**
@@ -1559,10 +1560,14 @@ function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) 
   const masked = !missing && (maskedOf(input).length > 0 || !!unverified)
   // Agent 交来、被截断切开的数组字段：对它计数、求和只算到了取回的那部分
   const cut = !missing && input.truncated === true
-  const node = input.node_id ? host.nodeLabel?.(input.node_id) || input.node_id : ''
+  const node = input.node_id ? host.nodeLabel?.(input.node_id) || input.node_label || input.node_id : ''
   const via = input.via ? VIA_TEXT[input.via] ?? nodeTypeLabel(input.via) : ''
   const through = throughText(input, host.nodeLabel)
-  const from = [node && `来自节点「${node}」`, via && `（${via}）`, through && ` · ${through}`,
+  // 读子工作流出口的字段：写明经过哪个子工作流的哪个字段（出处接上的是子图里的那一格）
+  const sub = input.subgraph
+    ? EVIDENCE_TEXT.viaSubgraph(host.nodeLabel?.(input.subgraph) || input.subgraph_label || input.subgraph, input.field ?? '')
+    : ''
+  const from = [node && `来自节点「${node}」`, via && `（${via}）`, sub && ` · ${sub}`, through && ` · ${through}`,
     input.role && ` · ${ROLE_TEXT[input.role] ?? input.role}`,
     cut && ` · ${EVIDENCE_TEXT.inputTruncated}`,
     masked && ` · ${unverified ? EVIDENCE_TEXT.unverifiedInput(unverified) : EVIDENCE_TEXT.maskedInput}`].filter(Boolean).join('')
@@ -1597,7 +1602,9 @@ function InputChip({ input, link }: { input: EvidenceInput; link?: InputLink }) 
 }
 
 /** 取值来源的方式：能追到快照的两种写中文，其余是产出节点的类型 */
-const VIA_TEXT: Record<string, string> = { agent_field: 'Agent 字段', tool_cell: '单元格取数' }
+const VIA_TEXT: Record<string, string> = {
+  agent_field: 'Agent 字段', tool_cell: '单元格取数', subgraph_input: EVIDENCE_TEXT.subgraphInput,
+}
 
 /** 按位置取的格穿过了原样解析查询结果的整形节点：「经「解析查询结果」原样解析」。cell() 取的格、别的输入没有 */
 function throughText(input: EvidenceInput, nodeLabel?: (id: string) => string | undefined): string {
@@ -1713,7 +1720,9 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
           const alias = (link && !link.text ? link.alias : '') || inp.query
             || (typeof inp.cell === 'string' ? inp.cell.split('.')[0] : '')
           const where = [
-            inp.field && (inp.via === 'agent_field' ? `字段 ${inp.field}` : inp.field),
+            inp.subgraph
+              ? EVIDENCE_TEXT.viaSubgraph(host.nodeLabel?.(inp.subgraph) || inp.subgraph_label || inp.subgraph, inp.field ?? '')
+              : inp.field && (inp.via === 'agent_field' ? `字段 ${inp.field}` : inp.field),
             throughText(inp, host.nodeLabel),
             [alias, locatorText(inp.locator)].filter(Boolean).join(' · '),
           ].filter(Boolean).join(' · ')
@@ -1732,7 +1741,7 @@ function SourcesPart({ inputs, linkOf }: { inputs: EvidenceInput[]; linkOf: (inp
               </div>
               {(inp.node_id || where) && (
                 <div className="mono text-2xs text-faint [overflow-wrap:anywhere]">
-                  {inp.node_id && <NodeChip id={inp.node_id} prefix="节点 " />}
+                  {inp.node_id && <NodeChip id={inp.node_id} fallback={inp.node_label} prefix="节点 " />}
                   {inp.node_id && where && ' · '}{where}
                 </div>
               )}

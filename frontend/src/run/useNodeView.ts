@@ -96,6 +96,8 @@ export function replayTraceCached(trace: Trace, at: number, graph: GraphLike): T
     nodes[id] = {
       ...n, state, count: p?.count ?? 0, iteration: p?.iteration, taken: decided,
       takenHandle: decided[decided.length - 1], looping: state === 'running' && looping,
+      // 走了驳回出口只说那一刻被驳回的那一次（游标停在它之前、它还在等人时不算）：下游据此按驳回出口放行
+      exited: state === 'rejected' ? n.exited : undefined,
     }
   }
   const out = applyDerived({ ...trace, phase: proj.phase, nodes }, graph)

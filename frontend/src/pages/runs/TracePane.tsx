@@ -12,7 +12,7 @@ import {
   NONE, formatCost, formatDateTime, formatNumber, formatOffset, formatSpan, formatTokens, shortId,
 } from '../../lib/format'
 import { COST_TEXT, REJECTED_TEXT, runClassLabel, nodeTypeLabel, runCostText } from '../../lib/terms'
-import { topology, type GraphLike } from '../../run/derive'
+import { topology, withSubSteps, type GraphLike } from '../../run/derive'
 import {
   isActivePhase, isSettled, liveAt, project, type NodeState, type Projection, type RunPhase, type Trace,
 } from '../../run/trace'
@@ -123,8 +123,8 @@ export function TracePane({
   // 回放时的节点状态要按图再推一遍（排队、阻断、未到达），和画布卡片读同一份
   const view = useMemo(() => (live ? trace : replayTraceCached(trace, replayAt!, g as GraphLike)), [live, trace, replayAt, g])
   const order = useMemo(() => {
-    const ids = topology(g as GraphLike).order
-    return [...ids, ...Object.keys(trace.nodes).filter((id) => !ids.includes(id))]
+    // 子工作流里的步骤（「子工作流节点 id/…」）排在子工作流那一步后面
+    return withSubSteps(topology(g as GraphLike).order, Object.keys(trace.nodes))
   }, [g, trace.nodes])
   const stateOf = (id: string): NodeState => view.nodes[id]?.state ?? 'idle'
   const facts = useMemo(() => factsOf(events), [events])
@@ -414,6 +414,10 @@ function momentsOf(
         }
       } else if (s.kind === 'retry') {
         out.push({ key: `${id}:t${i}`, at: s.start, status: 'running', text: `${name(id)}重试`, nodeId: id })
+      } else if (s.kind === 'run' && s.status === 'rejected' && s.end != null && n.exited) {
+        // 被驳回、走了「驳回」出口：运行接着走，这一下是路上的一个时刻（没接出口的驳回由结局那一条说）
+        out.push({ key: `${id}:x${i}`, at: s.end, status: 'rejected', nodeId: id,
+                   text: `${name(id)}${REJECTED_TEXT.exitCard(n.exitTo ?? [])}` })
       } else if (s.kind === 'run' && s.status === 'failed' && s.end != null) {
         // 让整次运行失败的那一下由结局那一条说，这里只列失败了还接着走下去的
         if (ended && trace.phase === 'failed' && id === trace.failedNodeId && i === lastFail) return
@@ -447,16 +451,20 @@ function momentsOf(
   })
   if (ended) {
     const failed = trace.phase === 'failed' ? trace.failedNodeId : undefined
+    // 照驳回出口那条路走完的：结局照实说途经驳回（和终态事件的 rejected_via 同一件事）
+    const via = order.filter((id) => trace.nodes[id]?.exited)
     const why = trace.phase === 'failed'
       ? explainRunError((failed && trace.nodes[failed]?.error) || error).title
       : code === 'rejected' ? error?.trim() || undefined
       : trace.phase === 'cancelled' ? cancelReason(error) ?? undefined
-      : trace.phase === 'suspended' ? error?.trim() || undefined : undefined
+      : trace.phase === 'suspended' ? error?.trim() || undefined
+      : via.length ? via.map((v) => `${name(v)}${REJECTED_TEXT.exitCard(trace.nodes[v]?.exitTo ?? [])}`).join('；')
+      : undefined
     out.push({
       key: 'end', at: trace.endedAt!, end: true,
       // 挂起分两种（服务重启、可续跑），详情头已经分好了，照它的说
       status: trace.phase === 'suspended' ? code : trace.phase,
-      text: trace.phase === 'succeeded' ? '运行完成'
+      text: trace.phase === 'succeeded' ? (via.length ? `运行完成（${REJECTED_TEXT.viaTitle}）` : '运行完成')
         : failed ? `失败于${name(failed)}`
         : trace.phase === 'failed' ? '运行失败'
         : code === 'rejected' ? REJECTED_TEXT.title
@@ -609,11 +617,15 @@ function NodeCard({ id, trace, proj, state, graph, facts, at, labelOf, href, gon
   const error = state === 'failed' && n?.error ? explainRunError(n.error) : null
   const rows: [string, ReactNode][] = []
   if (n?.model) rows.push(['模型', <span className="mono">{n.model}</span>])
-  if (n?.takenHandle && (state === 'done' || state === 'failed')) rows.push(['出口', <span className="mono">{n.takenHandle}</span>])
+  if (n?.takenHandle && (state === 'done' || state === 'failed' || (state === 'rejected' && n.exited))) {
+    rows.push(['出口', <span className="mono">{n.takenHandle}</span>])
+  }
   if (n?.reason) rows.push(['理由', n.reason])
   if (state === 'skipped' && n?.skippedReason) rows.push(['跳过', n.skippedReason])
-  // 被人驳回的那一步（node.failed 带 reason=rejected）：写原话（谁驳回、为什么），不按失败去讲原因和处理建议
-  if (state === 'rejected' && n?.error) rows.push([REJECTED_TEXT.title, n.error])
+  // 被人驳回的那一步（node.failed 带 reason=rejected）：写原话（谁驳回、为什么），不按失败去讲原因和处理建议。走了驳回
+  // 出口的写转到了哪几步
+  if (state === 'rejected' && n?.exited) rows.push([REJECTED_TEXT.title, REJECTED_TEXT.exitCard(n.exitTo ?? [])])
+  else if (state === 'rejected' && n?.error) rows.push([REJECTED_TEXT.title, n.error])
   // 卡片说的是游标那一刻所在的那一次执行（和画布卡片同一个划分）：循环上一轮、接着跑之前
   // 的事不挂到这一次干净的执行上；回放到更早的一次时，也不因为后面还有一件就看不到这一次的
   const since = execStart(n, at, facts)

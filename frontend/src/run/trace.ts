@@ -84,6 +84,13 @@ export interface NodeTrace {
   taken?: string[]
   /** 分支命中的理由 */
   reason?: string
+  /**
+   * 被驳回、走了「驳回」出口（node.finished 带 outcome=rejected，docs/design/orchestration-round/00-总方案.md §3）：这一步正常
+   * 结束了、下游照常往下走，状态记 rejected（中性色，不是失败）。exitTo 是驳回出口转到的那几步的名字（node.finished 的 to）。
+   * 下一次执行开始时清掉
+   */
+  exited?: boolean
+  exitTo?: string[]
   /** 用量随时间的累计，回放时按游标取那一刻的 tokens 和工具数。没调过模型和工具的节点没有 */
   marks?: UsageMark[]
 }
@@ -279,6 +286,8 @@ function openIndex(segs: Segment[], kind: Segment['kind'], agent?: string): numb
 function parallelOf(nodes: Record<string, NodeTrace>): number {
   let total = 0
   for (const n of Object.values(nodes)) {
+    // 子工作流里的那几步（「子工作流节点 id/…」）在子工作流节点那一格里跑，不另算一路并行
+    if (n.id.includes('/')) continue
     let inner = 0
     let run = 0
     for (const s of n.segments) {
@@ -531,6 +540,8 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
         n.endedAt = undefined
         n.lastDurationMs = undefined
         n.error = undefined
+        n.exited = undefined
+        n.exitTo = undefined
         if (n.toolsRunning) { n.toolsRunning = 0; mark(n) }
         if (num(d.iteration) != null) n.iteration = num(d.iteration)
         book().dispatchFrom[nodeId] = at
@@ -572,8 +583,10 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       if (!nodeId) break
       const n = node(nodeId)
       const failed = type === 'node.failed'
-      // 被人驳回的那一步（服务端在 node.failed 上带 reason=rejected）：这一段收成「被驳回」，不是失败
-      const rejected = failed && d.reason === 'rejected'
+      // 被人驳回的那一步（服务端在 node.failed 上带 reason=rejected）：这一段收成「被驳回」，不是失败。接了「驳回」出口的
+      // 驳回是 node.finished 带 outcome=rejected：这一步正常结束、沿驳回出口往下走（exited），同样画「被驳回」
+      const exited = !failed && d.outcome === 'rejected'
+      const rejected = (failed && d.reason === 'rejected') || exited
       // 节点跑完了，决定已经生效（兜底 human.resolved 没发出来的老运行）
       if (!failed && next.book.asking[nodeId]) delete book().asking[nodeId]
       const ms = num(d.duration_ms)
@@ -604,6 +617,10 @@ export function foldEvent(t: Trace, ev: RunEvent): Trace {
       if (n.toolsRunning) { n.toolsRunning = 0; mark(n) }
       n.looping = looping
       n.state = rejected ? 'rejected' : failed ? 'failed' : looping ? 'running' : 'done'
+      if (exited) {
+        n.exited = true
+        n.exitTo = Array.isArray(d.to) ? d.to.map((t: any) => String(t?.label || t?.node_id || '')).filter(Boolean) : []
+      }
       if (failed) {
         // 驳回的原话照样留着（卡片、航迹悬停写得出是谁驳回、为什么），但它不是「最近一次失败」：不拿它当失败的节点
         n.error = String(d.error ?? '')

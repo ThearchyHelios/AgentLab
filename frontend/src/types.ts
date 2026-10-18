@@ -2176,6 +2176,15 @@ export interface EvidenceInput {
    * 指标集工件、转抄了几层、那个指标的输入是不是都追到了原始数据（服务端 engine/lineage.metric_copy）。老运行、别的输入没有
    */
   upstream?: EvidenceUpstreamRef | null
+  /**
+   * 子工作流（docs/design/orchestration-round/00-总方案.md §2）：读子工作流出口的字段、接上子图里那一格的出处时，经过的子工作流
+   * 节点和出口字段（subgraph、field）；node_id 落在子工作流里（「子工作流节点 id/…」）时证据接口另给图上的名字
+   * （node_label、subgraph_label：「子工作流 › 节点」），画布、记录页认不出这个 id 时照它写。via 为 subgraph_input：停在
+   * 子工作流的入口（子图的运行输入不是父图的原始数据）
+   */
+  subgraph?: string
+  node_label?: string
+  subgraph_label?: string
 }
 
 /** 转抄的输入跨卡往下追的出处（EvidenceInput.upstream） */

@@ -5,7 +5,7 @@ import { create } from 'zustand'
 import { StatusBadge } from '../components/ui'
 import { formatClock, formatDuration, formatLapse, formatOffset, formatSpan, formatTokens, NONE } from '../lib/format'
 import { statusMeta } from '../lib/status'
-import { topology, type GraphLike } from '../run/derive'
+import { topology, withSubSteps, type GraphLike } from '../run/derive'
 import {
   isActivePhase, isTerminal, lastEventAt, liveAt, project, type NodeState, type NodeTrace, type Projection,
   type Segment, type Trace,
@@ -339,7 +339,8 @@ function buildRows(trace: Trace, graph: TimelineGraph, at: number, labels: Map<s
                    states: Projection['nodes'] | null): Row[] {
   const topo = topology(graph as GraphLike)
   const byId = new Map(graph.nodes.map((n) => [n.id, n]))
-  const ids = [...topo.order, ...Object.keys(trace.nodes).filter((id) => !byId.has(id))]
+  // 子工作流里的步骤排在子工作流那一行下面（withSubSteps），老运行里改过图的照旧排在最后
+  const ids = withSubSteps(topo.order, Object.keys(trace.nodes).filter((id) => !byId.has(id)))
   const failedLabel = trace.failedNodeId ? labels.get(trace.failedNodeId) ?? trace.failedNodeId : ''
   const rows: Row[] = []
   let top = 0
