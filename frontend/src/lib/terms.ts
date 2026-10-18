@@ -3985,11 +3985,13 @@ export const SCHEDULE_TEXT = {
   openRun: '查看运行',
 
   // ---- 触发
-  fireKind: { scheduled: '定时', manual: '手动', misfire: '补发' } as Record<import('../types').ScheduleFireKind, string>,
+  fireKind: { scheduled: '定时', manual: '手动', misfire: '补发', event: '事件' } as Record<
+    import('../types').ScheduleFireKind, string>,
   fireKindHint: {
     scheduled: '到点按计划触发',
     manual: '手动「立即运行」',
     misfire: '错过触发时间后，在补发宽限内恢复时补发的一次',
+    event: '由数据事件触发（去抖结束的时刻）',
   } as Record<import('../types').ScheduleFireKind, string>,
   /**
    * 错过、没有补发的（服务端记 kind=misfire、status=skipped_misfire）：类型按「定时」写。没有补发的原因有两种（超出
@@ -4225,9 +4227,10 @@ export const SCHEDULE_TEXT = {
   },
   /** 「还需处理」里各项的叫法 */
   problemField: {
-    name: '名称', workflow: '工作流', freq: '频率', timezone: '时区', runClass: '运行类别', inputs: '输入', url: 'Webhook 地址',
-    secret: '签名密钥', events: '通知事件',
-  } as Record<'name' | 'workflow' | 'freq' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret' | 'events', string>,
+    name: '名称', workflow: '工作流', freq: '频率', trigger: '触发事件', timezone: '时区', runClass: '运行类别', inputs: '输入',
+    url: 'Webhook 地址', secret: '签名密钥', events: '通知事件',
+  } as Record<'name' | 'workflow' | 'freq' | 'trigger' | 'timezone' | 'runClass' | 'inputs' | 'url' | 'secret' | 'events',
+    string>,
 
   // ---- 相对时间（将来）
   until: {

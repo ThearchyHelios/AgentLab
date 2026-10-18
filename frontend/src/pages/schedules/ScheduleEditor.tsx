@@ -9,19 +9,24 @@ import { errorMessage } from '../../lib/errors'
 import { parseServerTime } from '../../lib/format'
 import { useLeaveGuard } from '../../lib/leave'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
+import { TRIGGER_TEXT as TT } from '../../lib/termsTrigger'
 import { useCatalog, useCatalogListState } from '../../store/catalog'
-import type { Schedule, SchedulePreview, ScheduleRunClass, ScheduleVariable, Workflow } from '../../types'
+import type { Schedule, ScheduleEventKind, SchedulePreview, ScheduleRunClass, ScheduleTrigger, ScheduleVariable, Workflow } from '../../types'
 import {
   GRACE_OPTIONS, createBody, cronOf, formOf, formProblems, formatZoned, freqProblem, graceLabel, graphFields, patchBody,
-  rebaseForm, serverFieldValue, templateOf, type Freq, type FormField, type InputField, type ScheduleForm,
+  rebaseForm, serverFieldValue, templateOf, triggerBody, type Freq, type FormField, type InputField, type ScheduleForm,
 } from './model'
 import { isUnsupported } from './parts'
+import { EventSection, TriggerModePicker } from './TriggerEditor'
 import { WebhookFields } from './WebhookFields'
 import { WorkflowPicker } from './WorkflowPicker'
 
 /**
  * 新建、修改定时任务的表单。宽屏左边是表单、右边是接下来 5 次触发的预览（跟着滚动停在顶上）；窄屏预览排在
  * 频率下面，改了频率当场看得到。
+ *
+ * 新建时先选「定时 / 事件触发」（docs/design/orchestration-round/00-总方案.md §4）：事件触发的没有频率，那一节换成事件
+ * （TriggerEditor 的 EventSection），预览按一次事件渲染输入（不列触发时间），变量多出 {{ event.* }}。触发方式建好之后不能改。
  *
  * schedule 为 null 是新建。修改时只交改了的字段，带上 version：详情页页头的开关改过之后，version 是开关交回的
  * 新版本，表单照常保存；别人在这期间改过就 409，表单不动，给「重新载入」。
@@ -54,17 +59,20 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
   } | null>(null)
 
   const workflow = workflows.find((w) => w.id === form.workflowId)
-  const cron = cronOf(form.freq)
+  const event = form.triggerKind === 'event'
+  const cron = event ? '' : cronOf(form.freq)
   const template = useMemo(() => templateOf(form.inputs), [form.inputs])
-  const preview = usePreview(cron, form.timezone, template, form.workflowId)
+  const trigger = useMemo(() => (event ? triggerBody(form.trigger) : null), [event, form.trigger])
+  const preview = usePreview(cron, form.timezone, template, form.workflowId, trigger)
   const fieldsOf = useInputFields(workflow, form.runClass)
   // 修改时工作流列表还没取回来：输入字段是「正在读取」，不是「请先选择工作流」
   const fields: FieldsState = !workflow && form.workflowId && workflowsState !== 'ok' ? { status: 'loading' } : fieldsOf
-  const variables = useVariables()
+  const variables = useVariables(event ? form.trigger.event : null)
 
   const changes = base ? patchBody(form, initial, base) : null
   // 服务端保存时只在新建、或者改了工作流、运行类别、输入时才核对这三样：照着拦，不多拦也不少拦
-  const recheck = !base || (!!changes && ('workflow_id' in changes || 'run_class' in changes || 'input_template' in changes))
+  const recheck = !base || (!!changes && ('workflow_id' in changes || 'run_class' in changes || 'input_template' in changes
+    || 'trigger' in changes))
   const problems = formProblems(form, base, {
     published: workflow ? workflow.published_version ?? null : undefined,
     fields: fields.status === 'ok' ? fields.fields : undefined,
@@ -75,6 +83,7 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
   /** 预览判定非法、并指明是这一项时，服务端的说明 */
   const previewSays = (field: string) => (preview.status === 'invalid' && preview.field === field ? preview.message : undefined)
   const previewBlocks = previewField === 'cron' || previewField === 'timezone' || previewField === 'input_template'
+    || previewField === 'trigger' || previewField === 'debounce_s'
   const missing = (Object.keys(problems) as FormField[]).map((k) => T.problemField[k])
   const hint = missing.length ? T.missing(missing.join('、')) : previewBlocks ? T.previewBlocks : ''
   const canSave = !saving && !missing.length && !previewBlocks && dirty
@@ -178,16 +187,24 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
           <WorkflowField form={form} workflows={workflows} state={workflowsState} workflow={workflow} base={base}
                          error={shown('workflow') ?? serverError(['workflow_id'])}
                          onPick={pickWorkflow} onBlur={() => touch('workflow')} />
+          <TriggerModePicker value={form.triggerKind} fixed={!!base} onChange={(triggerKind) => set({ triggerKind })} />
         </section>
 
-        <FreqPicker freq={form.freq} timezone={form.timezone} setFreq={setFreq} setTimezone={(timezone) => set({ timezone })}
-                    freqError={freqProblem(form.freq) ?? previewSays('cron') ?? serverError(['cron'])}
-                    tzError={previewSays('timezone') ?? serverError(['timezone'])} />
+        {event ? (
+          <EventSection value={form.trigger} onChange={(t) => set({ trigger: t })} timezone={form.timezone}
+                        setTimezone={(timezone) => set({ timezone })} savedName={base?.trigger?.subject_name ?? null}
+                        error={previewSays('trigger') ?? serverError(['trigger', 'trigger_kind'])}
+                        debounceError={previewSays('debounce_s') ?? serverError(['debounce_s'])} />
+        ) : (
+          <FreqPicker freq={form.freq} timezone={form.timezone} setFreq={setFreq} setTimezone={(timezone) => set({ timezone })}
+                      freqError={freqProblem(form.freq) ?? previewSays('cron') ?? serverError(['cron'])}
+                      tzError={previewSays('timezone') ?? serverError(['timezone'])} />
+        )}
       </div>
 
       <aside className="min-w-0 lg:col-start-2 lg:row-span-2 lg:row-start-1">
         <div className="lg:sticky lg:top-4">
-          <PreviewBox preview={preview} />
+          <PreviewBox preview={preview} event={event} />
         </div>
       </aside>
 
@@ -196,13 +213,13 @@ export function ScheduleEditor({ schedule, version, onSaved, onReload }: {
                          error={serverError(['run_class'])}
                          onChange={(runClass) => { runClassTouched.current = true; set({ runClass }) }} />
         <InputsSection workflow={workflow} fields={fields} inputs={form.inputs} variables={variables}
-                       preview={preview} recheck={recheck}
+                       preview={preview} recheck={recheck} event={event}
                        error={previewSays('input_template') ?? serverError(['input_template'])}
                        onChange={(inputs) => set({ inputs })} />
         <section className="space-y-3 rounded-lg border bg-panel p-3.5" aria-labelledby="schedule-overlap-title">
           <h2 id="schedule-overlap-title" className="text-xs font-semibold">{T.overlap}</h2>
           <p className="text-xs leading-relaxed text-dim">{T.overlapText}</p>
-          <Field label={T.misfire} htmlFor="schedule-misfire" hint={T.misfireHint} error={misfireError}>
+          <Field label={T.misfire} htmlFor="schedule-misfire" hint={event ? TT.misfireHint : T.misfireHint} error={misfireError}>
             <select id="schedule-misfire" className="field w-auto max-w-full" value={form.misfireGraceS}
                     aria-invalid={!!misfireError || undefined}
                     aria-describedby={misfireError ? 'schedule-misfire-error' : 'schedule-misfire-hint'}
@@ -291,13 +308,18 @@ const PREVIEW_DEBOUNCE_MS = 400
 
 /**
  * 接下来 5 次触发和渲染出的输入（服务端算，前端不自己解析 cron）。改动中保留上一次的结果并标「正在计算」；
- * 非法时清掉上一次的时间，只留服务端的说明，免得人照着旧的时间以为新的频率没问题
+ * 非法时清掉上一次的时间，只留服务端的说明，免得人照着旧的时间以为新的频率没问题。
+ *
+ * trigger 不为空是事件触发：交触发条件、不交 cron，服务端按一次示例事件渲染输入（没有触发时间）；对象还没选时不问
  */
-export function usePreview(cron: string, timezone: string, template: Record<string, string>, workflowId: string): PreviewState {
+export function usePreview(cron: string, timezone: string, template: Record<string, string>, workflowId: string,
+  trigger: ScheduleTrigger | null = null): PreviewState {
   const [state, setState] = useState<PreviewState>({ status: 'idle' })
-  const key = JSON.stringify([cron, timezone, Object.entries(template).sort(([a], [b]) => a.localeCompare(b)), workflowId])
+  const key = JSON.stringify([cron, timezone, Object.entries(template).sort(([a], [b]) => a.localeCompare(b)), workflowId,
+    trigger])
   useEffect(() => {
-    if (!cron || !timezone) {
+    const subject = trigger ? trigger.source_id ?? trigger.workflow_id : null
+    if (trigger ? !subject || !timezone : !cron || !timezone) {
       setState({ status: 'idle' })
       return
     }
@@ -306,7 +328,7 @@ export function usePreview(cron: string, timezone: string, template: Record<stri
     const ctrl = new AbortController()
     const timer = setTimeout(() => {
       api.schedules.preview({
-        cron, timezone, n: 5,
+        ...(trigger ? { trigger_kind: 'event' as const, trigger, cron: '' } : { cron, n: 5 }), timezone,
         ...(Object.keys(template).length ? { input_template: template } : {}),
         ...(workflowId ? { workflow_id: workflowId } : {}),
       }, { signal: ctrl.signal })
@@ -324,22 +346,23 @@ export function usePreview(cron: string, timezone: string, template: Record<stri
       clearTimeout(timer)
       ctrl.abort()
     }
-    // key 已经把四项都编进去了
+    // key 已经把五项都编进去了
   }, [key])
   return state
 }
 
-export function PreviewBox({ preview }: { preview: PreviewState }) {
+export function PreviewBox({ preview, event = false }: { preview: PreviewState; event?: boolean }) {
   const data = preview.status === 'ok' || preview.status === 'loading' ? preview.data : undefined
   const tz = preview.status === 'ok' || preview.status === 'loading' ? preview.timezone : undefined
   return (
     <section className="rounded-lg border bg-panel p-3.5" aria-labelledby="schedule-preview-title" aria-live="polite"
-             data-schedule-preview="" data-status={preview.status}>
+             data-schedule-preview="" data-status={preview.status} data-preview-mode={event ? 'event' : 'cron'}>
       <div className="mb-2 flex items-center gap-2">
-        <h2 id="schedule-preview-title" className="text-xs font-semibold">{T.preview}</h2>
+        <h2 id="schedule-preview-title" className="text-xs font-semibold">{event ? TT.preview : T.preview}</h2>
         {preview.status === 'loading' && <Spinner size={11} />}
       </div>
-      {data && (
+      {data && event && <EventPreview data={data} loading={preview.status === 'loading'} />}
+      {data && !event && (
         <>
           {data.description_text && <div className="mb-2 text-xs text-dim" data-preview-desc="">{data.description_text}</div>}
           {data.next?.length ? (
@@ -362,7 +385,7 @@ export function PreviewBox({ preview }: { preview: PreviewState }) {
         </>
       )}
       {!data && preview.status === 'loading' && <p className="text-xs text-faint">{T.previewLoading}</p>}
-      {preview.status === 'idle' && <p className="text-xs text-faint">{T.previewIdle}</p>}
+      {preview.status === 'idle' && <p className="text-xs text-faint">{event ? TT.previewIdle : T.previewIdle}</p>}
       {preview.status === 'invalid' && <p className="text-xs leading-relaxed text-[var(--err)]" data-preview-error="">{preview.message}</p>}
       {preview.status === 'error' && (
         <p className="text-xs leading-relaxed text-[var(--err)]" data-preview-error="">
@@ -370,6 +393,40 @@ export function PreviewBox({ preview }: { preview: PreviewState }) {
         </p>
       )}
     </section>
+  )
+}
+
+/**
+ * 事件触发的预览：触发说明、按哪一次事件渲染（对象最近一次的事件，没有时是示例值、照实说），渲染出的输入逐项列出。
+ * 没有触发时间可列：事件什么时候来不由时间定
+ */
+function EventPreview({ data, loading }: { data: SchedulePreview; loading: boolean }) {
+  const inputs = Object.entries(data.inputs ?? {})
+  return (
+    <div className={clsx('space-y-2', loading && 'opacity-60')}>
+      {data.description_text && <div className="text-xs text-dim" data-preview-desc="">{data.description_text}</div>}
+      {data.event && (
+        <div className="text-2xs leading-relaxed" data-preview-event={data.event.real ? 'real' : 'example'}>
+          <div className="text-fg">{data.event.text}</div>
+          <div className={data.event.real ? 'text-faint' : 'text-[var(--warn)]'}>
+            {data.event.real ? TT.previewLatest : TT.previewExample}
+          </div>
+        </div>
+      )}
+      <div>
+        <div className="text-2xs text-faint">{TT.previewInputs}</div>
+        {inputs.length ? (
+          <dl className="mt-0.5 space-y-0.5 text-2xs">
+            {inputs.map(([k, v]) => (
+              <div key={k} className="flex min-w-0 gap-1.5" data-preview-input={k}>
+                <dt className="mono shrink-0 text-dim">{k}</dt>
+                <dd className="mono min-w-0 break-all text-fg">{v === '' ? T.renderedEmpty : v}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : <p className="text-2xs text-faint">{TT.previewNoInputs}</p>}
+      </div>
+    </div>
   )
 }
 
@@ -477,25 +534,34 @@ function useInputFields(workflow: Workflow | undefined, runClass: ScheduleRunCla
   return fetched?.key === key ? fetched.state : { status: 'loading' }
 }
 
-/** 输入模板里能用的变量：服务端给，各处共用一份；取不到时为空表，变量按钮照样在，只是说没有可用的 */
-let variablesOnce: Promise<ScheduleVariable[]> | null = null
-function useVariables(): ScheduleVariable[] | null {
-  const [vars, setVars] = useState<ScheduleVariable[] | null>(null)
+/**
+ * 输入模板里能用的变量：服务端给，各处共用一份（按 cron 的一份，事件触发按事件种类各一份）；取不到时为空表，变量按钮
+ * 照样在，只是说没有可用的
+ */
+const variablesOnce = new Map<string, Promise<ScheduleVariable[]>>()
+function useVariables(event: ScheduleEventKind | null = null): ScheduleVariable[] | null {
+  const [vars, setVars] = useState<{ key: string; list: ScheduleVariable[] } | null>(null)
+  const key = event ?? 'cron'
   useEffect(() => {
     let alive = true
-    variablesOnce ??= api.schedules.variables().then((v) => (Array.isArray(v) ? v : []), (e) => {
-      variablesOnce = null
-      throw e
-    })
-    variablesOnce.then((v) => { if (alive) setVars(v) }, () => { if (alive) setVars([]) })
+    let once = variablesOnce.get(key)
+    if (!once) {
+      once = (event ? api.schedules.eventVariables(event) : api.schedules.variables())
+        .then((v) => (Array.isArray(v) ? v : []), (e) => {
+          variablesOnce.delete(key)
+          throw e
+        })
+      variablesOnce.set(key, once)
+    }
+    once.then((v) => { if (alive) setVars({ key, list: v }) }, () => { if (alive) setVars({ key, list: [] }) })
     return () => { alive = false }
-  }, [])
-  return vars
+  }, [key]) // eslint-disable-line react-hooks/exhaustive-deps
+  return vars?.key === key ? vars.list : null
 }
 
 const shownValue = (v: unknown) => (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v))
 
-function InputsSection({ workflow, fields, inputs, variables, preview, recheck, error, onChange }: {
+function InputsSection({ workflow, fields, inputs, variables, preview, recheck, event = false, error, onChange }: {
   workflow: Workflow | undefined
   fields: FieldsState
   inputs: Record<string, string>
@@ -503,6 +569,8 @@ function InputsSection({ workflow, fields, inputs, variables, preview, recheck, 
   preview: PreviewState
   /** 保存时服务端会不会核对输入（新建，或者改了工作流、运行类别、输入）：会的话必填没填、字段对不上都要先处理 */
   recheck: boolean
+  /** 事件触发：模板变量另按事件计算（说明不同） */
+  event?: boolean
   error?: string
   onChange: (inputs: Record<string, string>) => void
 }) {
@@ -621,7 +689,7 @@ function InputsSection({ workflow, fields, inputs, variables, preview, recheck, 
     <section className="space-y-2.5 rounded-lg border bg-panel p-3.5" aria-labelledby="schedule-inputs-title">
       <div>
         <h2 id="schedule-inputs-title" className="text-xs font-semibold">{T.inputs}</h2>
-        <p className="mt-0.5 text-2xs leading-relaxed text-faint">{T.inputsHint}</p>
+        <p className="mt-0.5 text-2xs leading-relaxed text-faint">{event ? TT.inputsHint : T.inputsHint}</p>
         {workflow && fields.status === 'ok' && (
           <p className="mt-0.5 text-2xs text-faint" data-inputs-source="">
             {fields.version != null ? T.inputsFromVersion(fields.version) : T.inputsFromDraft}

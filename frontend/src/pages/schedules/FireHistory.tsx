@@ -5,7 +5,8 @@ import { api } from '../../api/client'
 import { EmptyState, ErrorState, Skeleton, Spinner, StatusPill, toast, useTicker } from '../../components/ui'
 import { formatDateTime, parseServerTime, shortId } from '../../lib/format'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
-import type { Schedule, ScheduleFire, ScheduleFireCompare } from '../../types'
+import { TRIGGER_TEXT as TT } from '../../lib/termsTrigger'
+import type { Schedule, ScheduleFire, ScheduleFireCompare, ScheduleFireEvent } from '../../types'
 import { comparePath, type CompareVia } from '../runs/compare/entry'
 import { maintenanceJobPath, maintenanceStepText } from './model'
 import { FireKindChip, FireStatusChip, ZonedTime, targetKindOf } from './parts'
@@ -170,6 +171,7 @@ function FireRow({ fire: f, schedule, now }: { fire: ScheduleFire; schedule: Sch
       {maintenance && (jobs.length > 0 || skipped.length > 0) && (
         <MaintenanceFire sourceId={schedule.target_id ?? ''} jobs={jobs} skipped={skipped} />
       )}
+      {f.event && <EventFire event={f.event} />}
       {reason && (
         <div className="mt-1 text-2xs leading-relaxed text-dim">
           <span className="text-faint">{T.reason}：</span>{reason}
@@ -187,6 +189,24 @@ function FireRow({ fire: f, schedule, now }: { fire: ScheduleFire; schedule: Sch
         </div>
       )}
     </li>
+  )
+}
+
+/**
+ * 事件触发的那一次（docs/design/orchestration-round/00-总方案.md §4）：由什么事件触发（服务端写好的那一句）、去抖合并了几次、
+ * 在触发链上第几层；立即运行时按示例事件发起的照实标出来（示例值的另说）
+ */
+function EventFire({ event }: { event: ScheduleFireEvent }) {
+  const notes = [
+    event.merged > 1 ? TT.merged(event.merged) : null,
+    event.depth > 1 ? TT.depth(event.depth) : null,
+    event.sample ? (event.real ? TT.sample : TT.sampleExample) : null,
+  ].filter(Boolean)
+  return (
+    <div className="mt-1 text-2xs leading-relaxed text-dim" data-fire-event={event.event}>
+      {event.sample ? TT.fireSample(event.text) : TT.fireEvent(event.text)}
+      {notes.length > 0 && <span className="text-faint">（{notes.join('；')}）</span>}
+    </div>
   )
 }
 

@@ -595,7 +595,7 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
               </time>
               <span>·</span>
               {/* 定时任务发起的：写成到那个定时任务的链接（键盘可达；记录页的「定时」标记只能鼠标点） */}
-              {run.schedule_id ? <RunScheduleSource scheduleId={run.schedule_id} startedBy={run.started_by} /> : (
+              {run.schedule_id ? <RunScheduleSource scheduleId={run.schedule_id} startedBy={run.started_by} trigger={run.origin?.trigger} /> : (
                 <span title={run.started_by ? undefined : '发起时未设置署名'}>
                   {run.started_by || '未署名'} 发起
                 </span>

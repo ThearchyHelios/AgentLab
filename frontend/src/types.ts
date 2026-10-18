@@ -3855,8 +3855,8 @@ export type ScheduleRunClass = 'formal' | 'exploratory'
 export type ScheduleWebhookFormat = 'generic' | 'feishu' | 'wecom' | 'dingtalk'
 /** 订阅的事件：运行结束、运行失败、停在人工审批上（只在真有待审批时发） */
 export type ScheduleEvent = 'finished' | 'failed' | 'awaiting_approval'
-/** 触发的来源：到点、手动「立即运行」、错过之后在宽限内补发 */
-export type ScheduleFireKind = 'scheduled' | 'manual' | 'misfire'
+/** 触发的来源：到点、手动「立即运行」、错过之后在宽限内补发、由数据事件触发（trigger_kind=event 的任务） */
+export type ScheduleFireKind = 'scheduled' | 'manual' | 'misfire' | 'event'
 /** 触发的结局：发起了运行、上一次还没结束而跳过、错过时间超出宽限而跳过、发起时被拒 */
 export type ScheduleFireStatus = 'started' | 'skipped_overlap' | 'skipped_misfire' | 'failed_to_start'
 /**
@@ -4047,6 +4047,103 @@ export interface ScheduleVariable {
 export interface ScheduleRunResult {
   fire: ScheduleFire
   run_id: string | null
+}
+
+// ---------------------------------------------------------------------------
+// 数据事件触发（docs/design/orchestration-round/00-总方案.md §4；服务端 scheduler/triggers.py、outbox.py）：一个
+// trigger_kind=event 的定时任务，目标只能是工作流。同名接口会合并，这里只往上面几个类型上补字段
+// ---------------------------------------------------------------------------
+
+/** 触发方式：按 cron 到点、由数据事件触发。老服务端不给，按 cron 看 */
+export type ScheduleTriggerKind = 'cron' | 'event'
+/** 事件种类：上传表格出了新的一期、上游工作流运行成功结束、数据源有要处理的变化 */
+export type ScheduleEventKind = 'table.version' | 'workflow.finished' | 'source.changed'
+
+/** 触发条件（服务端规范化过的那一份）。对象键按事件种类：表格、数据源写 source_id，上游工作流写 workflow_id */
+export interface ScheduleTrigger {
+  event: ScheduleEventKind
+  source_id?: string
+  workflow_id?: string
+  /** 只认新增的一期（不写即新增、替换都认），只给 table.version */
+  period?: 'new' | 'any'
+  /** 只认某个应用发起的、某种来源的运行，只给 workflow.finished */
+  app_id?: string
+  origin_kind?: string
+  /** 去抖：同一个任务这么多秒内的几次事件合成一次 */
+  debounce_s: number
+  /** 保存时记下的对象名（对象删掉之后界面写它）；读出来才有，交上去不用带 */
+  subject_name?: string
+}
+
+/** 事件触发任务现在有几条事件在等：没派发的（调度关着时一直留着）、在去抖窗口里的、窗口结束的时刻、调度开没开 */
+export interface ScheduleTriggerState {
+  events: number
+  waiting: number
+  due_at: string | null
+  scheduler_on: boolean
+}
+
+export interface Schedule {
+  trigger_kind?: ScheduleTriggerKind
+  /** 事件触发时的触发条件；cron 任务为 null */
+  trigger?: ScheduleTrigger | null
+  /** 给人看的触发说明（事件触发时同 description_text）；cron 任务为 null */
+  trigger_text?: string | null
+  trigger_state?: ScheduleTriggerState | null
+}
+
+/** 事件触发的那一次触发带的事件说明（服务端 outbox.EventFire.brief，不含出口字段的值） */
+export interface ScheduleFireEvent {
+  event: ScheduleEventKind
+  subject_id: string
+  subject_name: string
+  /** 一句说法：「上传表格「门店销售」出了新的一期（2026-09）」 */
+  text: string
+  /** 去抖合并了几次事件 */
+  merged: number
+  first_at: string | null
+  last_at: string | null
+  /** 这次运行在事件触发链上是第几层 */
+  depth: number
+  /** 立即运行时按示例事件发起的（不是真来了一次事件）；real 为假时是示例值 */
+  sample: boolean
+  real: boolean
+}
+
+export interface ScheduleFire {
+  /** 事件触发的那几次的事件说明；别的为 null，老服务端不给 */
+  event?: ScheduleFireEvent | null
+}
+
+export interface ScheduleCreate {
+  /** 不写即 cron（字段和以前一字不差） */
+  trigger_kind?: ScheduleTriggerKind
+  trigger?: Omit<ScheduleTrigger, 'debounce_s'> & { debounce_s?: number }
+}
+
+export interface SchedulePreviewRequest {
+  trigger_kind?: ScheduleTriggerKind
+  trigger?: Omit<ScheduleTrigger, 'debounce_s'> & { debounce_s?: number }
+}
+
+export interface SchedulePreview {
+  /** 事件触发时：按哪一次事件渲染的（real 为假时是示例值，对象还没发生过这种事件） */
+  event?: { text: string; real: boolean } | null
+}
+
+/** GET /api/schedules/trigger-options：每种事件能选的对象（ok 为假时不能选，reason 写为什么，由服务端判）、来源、应用 */
+export interface ScheduleTriggerOptions {
+  events: {
+    event: ScheduleEventKind
+    label: string
+    subject_label: string
+    objects: { id: string; name: string; ok: boolean; reason: string | null }[]
+  }[]
+  origins: { kind: string; label: string }[]
+  apps: { id: string; name: string }[]
+  default_debounce_s: number
+  max_debounce_s: number
+  max_depth: number
 }
 
 /** GET /api/schedules/{id}/fires 的一页，新的在前；next_before 是下一页的游标，没有更多时为 null */

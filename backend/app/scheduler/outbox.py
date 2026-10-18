@@ -148,15 +148,16 @@ class EventFire:
         return {"kind": "event", "event": self.event, "subject_id": self.subject_id, "subject_name": self.subject_name,
                 "event_id": self.event_ids[-1] if self.event_ids else None, "event_ids": self.event_ids[-MERGED_KEEP:],
                 "merged": len(self.event_ids), "depth": self.depth, "chain": self.chain[-CHAIN_KEEP:],
-                "text": self.text, "sample": self.sample}
+                "text": self.text, "sample": self.sample, "real": self.real}
 
 
 def sample_fire(sample: triggers.Sample, tz: str) -> EventFire:
-    """立即运行：按示例事件发起（触发链从这里起算，第 1 层）。"""
+    """立即运行：按示例事件发起（触发链从这里起算，第 1 层）。是不是示例值记在 real 上，说法不另加后缀：界面、印章按
+    sample / real 自己说「立即运行，按最近一次事件」「事件为示例值」。"""
     text = triggers.event_text(sample.event, sample.subject_name, sample.payload)
     return EventFire(event=sample.event, subject_id=sample.subject_id, subject_name=sample.subject_name,
                      values=triggers.values(sample.event, sample.payload, tz, outputs=sample.outputs),
-                     text=text if sample.real else f"{text}（示例值）", sample=True, real=sample.real,
+                     text=text, sample=True, real=sample.real,
                      chain=[sample.payload["run_id"]] if sample.event == "workflow.finished" and sample.payload.get(
                          "run_id") else [])
 

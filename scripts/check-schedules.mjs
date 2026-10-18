@@ -13,6 +13,12 @@
 // 别的字段时替换过的地址明文留在框里、服务端会拒的组合（未发布 + 正式运行、必填没填、已发布版本里没有的字段）
 // 照样放行、测试消息的结果把服务端的整句又套一层、错过已跳过的那条悬停另说一个原因（和本条记的原因对不上）。
 //
+// 数据事件触发（docs/design/orchestration-round/00-总方案.md §4）：新建时选「定时 / 事件触发」，事件触发的没有频率、换成事件那一节
+// （事件种类、对象、期次 / 应用 / 来源、去抖、时区），不能选的对象照服务端给的原因标出来、选不了；换事件种类时对象清掉；变量
+// 按事件种类取（{{ event.* }}）；预览按一次事件渲染输入、不列触发时间；请求体带 trigger_kind、trigger、cron 交空串。列表、
+// 详情写触发说明和在等的事件（调度没开时照实说不会派发），修改时只读地写出触发方式、只交改了的触发条件；触发历史写「由事件
+// 触发：…」和合并了几次、第几层、立即运行的示例；运行详情页头写「由事件触发：…（定时任务「X」）」。
+//
 // 浏览器的本机时区故意设成 America/Los_Angeles，和定时任务的时区（Asia/Shanghai、America/New_York）都不同：
 // 两者相同时「按定时任务时区写」和「按本机写」在页面上看不出区别，时间相关的断言一律比对按定时任务时区写出的原文。
 //
@@ -305,6 +311,48 @@ await section('纯函数：服务端会拒的组合、保存回来怎么接、�
   check(`测试结果：服务端给整句、给补充说明都只说一遍（${tests.length} 种）`, !wrong.length, wrong.map(([r]) => t(r)).join('；'))
 })
 
+await section('纯函数：事件触发的表单 ⇄ 请求体', async () => {
+  const m = await import(await load('/src/pages/schedules/model.ts'))
+  const fresh = m.formOf(null, 'Asia/Shanghai')
+  check('新建缺省按 cron 触发，事件那一份缺省是上传表格、去抖 1 分钟', fresh.triggerKind === 'cron'
+    && fresh.trigger.event === 'table.version' && fresh.trigger.debounceS === 60 && fresh.trigger.subjectId === '')
+  check('cron 任务的请求体一字不差：不带触发方式、触发条件', !('trigger_kind' in m.createBody({ ...fresh, name: 'x', workflowId: 'wf' }))
+    && !('trigger' in m.createBody({ ...fresh, name: 'x', workflowId: 'wf' })))
+  const ev = { ...fresh, name: ' 门店月报 ', workflowId: 'wf-weekly', triggerKind: 'event',
+    trigger: { ...fresh.trigger, subjectId: 'ds-sales', period: 'new', appId: 'app-x', originKind: 'hook', debounceS: 300 },
+    inputs: { date: '{{ event.period }}' } }
+  const body = m.createBody(ev)
+  check('事件触发的请求体：trigger_kind、对象按种类写 source_id、只带这种事件的过滤、cron 交空串',
+    body.trigger_kind === 'event' && JSON.stringify(body.trigger) === JSON.stringify({ event: 'table.version', debounce_s: 300,
+      source_id: 'ds-sales', period: 'new' }) && body.cron === '' && body.name === '门店月报'
+      && JSON.stringify(body.input_template) === '{"date":"{{ event.period }}"}', JSON.stringify(body))
+  const wf = m.triggerBody({ event: 'workflow.finished', subjectId: 'wf-daily', period: 'new', appId: 'app-board', originKind: '', debounceS: 0 })
+  check('上游工作流：写 workflow_id，带应用、不带期次和空的来源', JSON.stringify(wf) === JSON.stringify({ event: 'workflow.finished',
+    debounce_s: 0, workflow_id: 'wf-daily', app_id: 'app-board' }), JSON.stringify(wf))
+  const switched = m.switchEvent(ev.trigger, 'source.changed')
+  check('换事件种类：对象、过滤清掉，去抖留着', switched.subjectId === '' && switched.period === 'any' && switched.appId === ''
+    && switched.originKind === '' && switched.debounceS === 300 && m.switchEvent(ev.trigger, 'table.version') === ev.trigger)
+  check('问题：事件触发没选对象时说要选什么，不查频率', m.formProblems({ ...ev, trigger: switched, freq: { ...m.DEFAULT_FREQ, preset: 'weekly',
+    weekdays: [] } }, null).trigger === '请选择数据源' && !m.formProblems({ ...ev, freq: { ...m.DEFAULT_FREQ, preset: 'weekly', weekdays: [] } },
+    null).freq)
+  // 夹具里的定时任务在后面才定义（这一段在顶层先跑），这里另写一份
+  const saved = { id: 's-event', name: '门店月报', workflow_id: 'wf-weekly', workflow_name: '门店周报', cron: '', timezone: 'Asia/Shanghai',
+    run_class: 'formal', input_template: { date: '{{ event.period }}' }, enabled: true, overlap: 'skip', misfire_grace_s: 3600,
+    webhook: null, next_run_at: null, last_fire: null, description_text: '', created_by: null, created_at: '', updated_at: '', version: 2,
+    trigger_kind: 'event', trigger: { event: 'table.version', source_id: 'ds-sales', period: 'new', debounce_s: 300, subject_name: '门店销售' } }
+  const base = m.formOf(saved)
+  check('读出来的表单：触发方式、对象、期次、去抖', base.triggerKind === 'event' && base.trigger.subjectId === 'ds-sales'
+    && base.trigger.period === 'new' && base.trigger.debounceS === 300)
+  check('什么都没改：不发请求（不因为 cron 是空串算成改了频率）', m.patchBody(base, base, saved) === null)
+  const patch = m.patchBody({ ...base, trigger: { ...base.trigger, debounceS: 900 } }, base, saved)
+  check('只改去抖：只交触发条件（整份）', JSON.stringify(patch) === JSON.stringify({ trigger: { event: 'table.version', debounce_s: 900,
+    source_id: 'ds-sales', period: 'new' } }), JSON.stringify(patch))
+  check('服务端指 trigger 时：换了对象或目标就不再摆着那句', m.serverFieldValue('trigger', base)
+    !== m.serverFieldValue('trigger', { ...base, trigger: { ...base.trigger, subjectId: 'ds-other' } })
+    && m.serverFieldValue('trigger', base) !== m.serverFieldValue('trigger', { ...base, workflowId: 'wf-stock' })
+    && m.serverFieldValue('trigger', base) === m.serverFieldValue('trigger', { ...base, name: '别的名字' }))
+})
+
 /** 对比页写的默认基准来历（定时任务发起的）：只挑比本次先发起、成功结束并封存的运行，服务端 api/compare.py 的 pick_base */
 const REASON_SCHEDULE = '默认基准：同一定时任务上一次成功的运行'
 
@@ -559,6 +607,93 @@ const SUITES = [
   { id: 'suite-stock', name: '库存问法', description: '', archived: false },
 ]
 
+// ---------------------------------------------------------------- 数据事件触发的夹具（orchestration-round §4）
+
+/** 能选的对象（服务端 GET /api/schedules/trigger-options 的形状）：不能选的带原因，界面照它画、不自己判 */
+const ROSTER_REASON = '每次上传替换整张表，没有「新的一期」：要用这个事件请在导入设置里改为按期累积'
+const TRIGGER_OPTIONS = {
+  events: [
+    { event: 'table.version', label: '上传表格出了新的一期', subject_label: '上传表格', objects: [
+      { id: 'ds-sales', name: '门店销售', ok: true, reason: null },
+      { id: 'ds-roster', name: '门店名单', ok: false, reason: ROSTER_REASON },
+    ] },
+    { event: 'workflow.finished', label: '上游工作流运行成功结束', subject_label: '工作流', objects: [
+      { id: 'wf-daily', name: '门店日报', ok: true, reason: null },
+      { id: 'wf-stock', name: '库存日报', ok: false, reason: '还没有发布版本：只有正式运行成功结束才算事件' },
+    ] },
+    { event: 'source.changed', label: '数据源有要处理的变化', subject_label: '数据源', objects: [
+      { id: 'ds-shop', name: '门店库', ok: true, reason: null },
+    ] },
+  ],
+  origins: [{ kind: 'launcher', label: '手动正式运行' }, { kind: 'schedule', label: '定时任务' }, { kind: 'hook', label: '入站钩子' }],
+  apps: [{ id: 'app-board', name: '门店看板' }],
+  default_debounce_s: 60, max_debounce_s: 86400, max_depth: 5,
+}
+/** 事件触发的变量清单（服务端按事件种类给：去掉上一次计划触发时间，接上 event.*） */
+const EVENT_VARIABLES = {
+  'table.version': [
+    VARIABLES[0],
+    { name: 'event.table', label: '上传表格的名字', example: '门店销售', note: '' },
+    { name: 'event.period', label: '这一期（整月写 YYYY-MM，整周写 YYYY-Www，单日写 YYYY-MM-DD）', example: '2026-09', note: '' },
+    { name: 'event.period_end', label: '这一期的最后一天（YYYY-MM-DD）', example: '2026-09-30', note: '' },
+  ],
+  'workflow.finished': [
+    VARIABLES[0],
+    { name: 'event.run_id', label: '上游那次运行的编号', example: 'run…', note: '' },
+    { name: 'event.outputs.<字段名>', label: '上游运行的出口字段（写 event.outputs.<字段名>）', example: '{…}', note: '' },
+  ],
+  'source.changed': [VARIABLES[0], { name: 'event.counts.new', label: '变化的条数', example: '{…}', note: '' }],
+}
+const SALES_EVENT = '上传表格「门店销售」出了新的一期（2026-09）'
+const SALES_TRIGGER = '上传表格「门店销售」出了新的一期时触发（只认新增的一期；去抖 5 分钟）'
+const SHOP_TRIGGER = '数据源「门店库」出现要处理的变化时触发（去抖 1 分钟）'
+const EVENT_BRIEF = { event: 'table.version', subject_id: 'ds-sales', subject_name: '门店销售', text: SALES_EVENT, merged: 2,
+  first_at: iso(NOW - 25 * H), last_at: iso(NOW - 24 * H - 10 * 60e3), depth: 1, sample: false, real: true }
+/** 事件触发的定时任务：去抖中（2 次事件在等），触发历史有事件、立即运行的示例、上一次没结束跳过的 */
+const S_EVENT = {
+  ...S1, id: 's-event', name: '门店月报 · 新一期', cron: '', next_run_at: null, webhook: null,
+  trigger_kind: 'event', trigger: { event: 'table.version', source_id: 'ds-sales', period: 'new', debounce_s: 300, subject_name: '门店销售' },
+  trigger_text: SALES_TRIGGER, description_text: SALES_TRIGGER, input_template: { date: '{{ event.period_end }}' },
+  trigger_state: { events: 0, waiting: 2, due_at: iso(NOW + 4 * 60e3), scheduler_on: true },
+  last_fire: fire('fe1', { kind: 'event', event: EVENT_BRIEF }), version: 2,
+}
+/** 调度没开：3 条事件留着、不会派发 */
+const S_EVENT_OFF = {
+  ...S_EVENT, id: 's-event-off', name: '变化处理', trigger: { event: 'source.changed', source_id: 'ds-shop', debounce_s: 60, subject_name: '门店库' },
+  trigger_text: SHOP_TRIGGER, description_text: SHOP_TRIGGER, trigger_state: { events: 3, waiting: 0, due_at: null, scheduler_on: false },
+  last_fire: null, version: 1,
+}
+function eventFires() {
+  const none = { run_id: null, run_status: null }
+  return [
+    fire('fe1', { kind: 'event', event: EVENT_BRIEF }),
+    fire('fe2', { ...none, kind: 'manual', status: 'failed_to_start', fire_at: iso(NOW - 30 * H), created_at: iso(NOW - 30 * H),
+      reason: '还没有发生过这种事件，输入模板里的 {{ event.* }} 没有可用的值，这次立即运行没有发起',
+      event: { ...EVENT_BRIEF, merged: 0, sample: true, real: false } }),
+    fire('fe3', { ...none, kind: 'event', status: 'skipped_overlap', fire_at: iso(NOW - 48 * H), created_at: iso(NOW - 48 * H),
+      reason: '上一次运行 #a1b2c3 仍在进行中，本次触发已跳过', event: { ...EVENT_BRIEF, merged: 1, depth: 2 } }),
+  ]
+}
+/** 由事件触发的那次运行：来源里记着 trigger（服务端发起时写下的那一句） */
+const RUN_EVENT = { ...RUNS[0], id: 'run-event-1', schedule_id: 's-event', started_by: '定时任务：门店月报 · 新一期',
+  origin_kind: 'schedule', origin: { kind: 'schedule', schedule_id: 's-event', fire_kind: 'event',
+    trigger: { kind: 'event', event: 'table.version', subject_id: 'ds-sales', subject_name: '门店销售', text: SALES_EVENT, depth: 1 } } }
+
+/** 有人署名点了立即运行：按最近一次事件发起（sample），不是事件触发的 */
+const RUN_SAMPLE = { ...RUN_EVENT, id: 'run-event-2', started_by: '检查员甲',
+  origin: { ...RUN_EVENT.origin, fire_kind: 'manual', trigger: { ...RUN_EVENT.origin.trigger, sample: true, real: true } } }
+
+/** 事件触发的预览：按一次事件渲染输入，不列触发时间；不合用的对象回 422（field=trigger） */
+function eventPreviewReply(body) {
+  const t = body?.trigger ?? {}
+  if (t.source_id === 'ds-roster') return { status: 422, json: { detail: '「门店名单」不是按期累积的上传表格', field: 'trigger' } }
+  const tpl = body?.input_template ?? {}
+  const inputs = Object.fromEntries(Object.entries(tpl).map(([k, v]) => [k, String(v)
+    .replace(/\{\{\s*event\.period\s*\}\}/g, '2026-09').replace(/\{\{\s*event\.period_end\s*\}\}/g, '2026-09-30')]))
+  const desc = `上传表格「门店销售」出了新的一期时触发（${t.period === 'new' ? '只认新增的一期；' : ''}去抖 ${t.debounce_s === 300 ? '5 分钟' : '1 分钟'}）`
+  return { json: { description_text: desc, next: [], inputs, event: { text: SALES_EVENT, real: true } } }
+}
+
 function freshState(patch = {}) {
   return {
     schedules: [structuredClone(S1), structuredClone(S2)],
@@ -598,7 +733,7 @@ const WEBHOOK_TEST_OK = { ok: true, http_status: 200, message: '请到接收端�
 /** 照约定改假状态：PATCH 核对版本、按地址省略 / 空串改 Webhook */
 function applyPatch(s, body) {
   const out = { ...s }
-  for (const k of ['name', 'workflow_id', 'cron', 'timezone', 'run_class', 'input_template', 'enabled', 'misfire_grace_s']) {
+  for (const k of ['name', 'workflow_id', 'cron', 'timezone', 'run_class', 'input_template', 'enabled', 'misfire_grace_s', 'trigger']) {
     if (k in body) out[k] = body[k]
   }
   if ('webhook' in body) {
@@ -614,7 +749,7 @@ function applyPatch(s, body) {
   }
   out.version = s.version + 1
   out.updated_at = iso(Date.now())
-  if (!out.enabled) out.next_run_at = null
+  if (!out.enabled || s.trigger_kind === 'event') out.next_run_at = null
   else if (!s.enabled) out.next_run_at = iso(NOW + 3 * H + 5 * 60e3)
   return out
 }
@@ -635,7 +770,19 @@ async function reply(state, method, path, url, body) {
   }
   const m = path.match(/^\/schedules\/([^/]+)(\/.*)?$/)
   if (method === 'GET' && path === '/schedules') return { json: { items: state.schedules } }
+  if (method === 'POST' && path === '/schedules/preview' && body?.trigger_kind === 'event') return eventPreviewReply(body)
   if (method === 'POST' && path === '/schedules/preview') return previewReply(body, state)
+  if (method === 'GET' && path === '/schedules/trigger-options') return { json: TRIGGER_OPTIONS }
+  if (method === 'GET' && path === '/schedules/variables' && url.searchParams.get('trigger_kind') === 'event') {
+    return { json: EVENT_VARIABLES[url.searchParams.get('event')] ?? [] }
+  }
+  if (method === 'POST' && path === '/schedules' && body?.trigger_kind === 'event') {
+    const s = { ...S_EVENT, ...body, id: 's-new-event', workflow_name: WORKFLOWS.find((w) => w.id === body.workflow_id)?.name ?? '',
+      trigger: { ...body.trigger, subject_name: '门店销售' }, trigger_text: SALES_TRIGGER, description_text: SALES_TRIGGER,
+      trigger_state: { events: 0, waiting: 0, due_at: null, scheduler_on: true }, last_fire: null, version: 1, webhook: null }
+    state.schedules = [s, ...state.schedules]
+    return { status: 201, json: s }
+  }
   if (method === 'GET' && path === '/schedules/variables') return { json: VARIABLES }
   if (method === 'POST' && path === '/schedules' && body?.target_kind && body.target_kind !== 'workflow') {
     const suite = SUITES.find((x) => x.id === body.target_id)
@@ -2114,6 +2261,155 @@ await section('记录页：定时标记', async () => {
   await tag.click()
   check('点标记去那个定时任务（不打开运行）', await until(() => new URL(page.url()).pathname === '/schedules/s-weekly'), page.url())
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+// ---------------------------------------------------------------- 数据事件触发（orchestration-round §4）
+
+await section('事件触发：新建的请求体', async () => {
+  const { page, sent, errors } = await open('/schedules/new')
+  await page.locator('[data-schedule-form]').waitFor()
+  const picker = page.locator('[data-workflow-picker] input')
+  await picker.click()
+  await picker.fill('周报')
+  await page.locator('[data-workflow-option="wf-weekly"]').click()
+  await page.locator('[data-field="name"]').fill('门店月报 · 新一期')
+  check('新建时有「定时 / 事件触发」两种，缺省定时', await page.locator('[data-trigger-mode]').count() === 2
+    && await page.locator('[data-trigger-mode="cron"]').getAttribute('aria-checked') === 'true'
+    && await page.locator('[data-freq-preset]').count() > 0)
+  await page.locator('[data-trigger-mode="event"]').click()
+  await page.locator('[data-trigger-section]').waitFor()
+  check('选了事件触发：频率那一节换成事件，三种事件、缺省上传表格', await page.locator('[data-freq-preset]').count() === 0
+    && await page.locator('[data-trigger-event]').count() === 3
+    && await page.locator('[data-trigger-event="table.version"]').getAttribute('aria-checked') === 'true')
+  const subject = page.locator('[data-trigger-subject="table.version"]')
+  await subject.waitFor()
+  const roster = subject.locator('option[value="ds-roster"]')
+  check('不能选的对象照服务端的原因标出来、选不了', await roster.isDisabled()
+    && (await roster.innerText()).includes('没有「新的一期」'), await roster.innerText())
+  check('还没选对象：保存按钮禁用，说还需处理触发事件', await page.locator('[data-schedule-save]').isDisabled()
+    && (await text(page, '[data-schedule-hint]')).includes('触发事件'), await text(page, '[data-schedule-hint]').catch(() => ''))
+  await subject.selectOption('ds-sales')
+  // 换事件种类：对象清掉，换成上游工作流的对象和过滤
+  await page.locator('[data-trigger-event="workflow.finished"]').click()
+  await page.locator('[data-trigger-subject="workflow.finished"]').waitFor()
+  check('换成上游工作流：对象清掉，多出只认应用、只认来源和触发链的说明',
+    await page.locator('[data-trigger-subject="workflow.finished"]').inputValue() === ''
+      && await page.locator('[data-trigger-app]').count() === 1 && await page.locator('[data-trigger-origin]').count() === 1
+      && (await text(page, '[data-trigger-chain]')).includes('最多 5 层'), await text(page, '[data-trigger-chain]').catch(() => ''))
+  await page.locator('[data-trigger-event="table.version"]').click()
+  await page.locator('[data-trigger-subject="table.version"]').selectOption('ds-sales')
+  await page.locator('[data-trigger-period]').selectOption('new')
+  await page.locator('[data-trigger-debounce]').selectOption('300')
+  await page.locator('[data-timezone]').selectOption('Asia/Shanghai')
+  check('事件触发时「错过触发时间」说的是派发晚了', (await text(page, '[data-schedule-form]')).includes('事件在宽限内派发照常发起'))
+  // 变量按事件种类取：event.period 在、上一次计划触发时间不在
+  await page.locator('[data-input-field="date"]').waitFor()
+  await page.locator('[data-input-vars="date"]').click()
+  await page.locator('[data-input-field="date"] [data-var="event.period"]').waitFor()
+  check('变量清单按事件种类取：有 event.period', await page.locator('[data-input-field="date"] [data-var="event.table"]').count() === 1)
+  check('……请求带 trigger_kind=event、event=table.version', sent.some((x) => x.key === 'GET /schedules/variables'
+    && x.search.includes('trigger_kind=event') && x.search.includes('event=table.version')), sent.filter((x) => x.key.includes('variables'))
+    .map((x) => x.search).join(' ｜ '))
+  await page.locator('[data-input-field="date"] [data-var="event.period"]').click()
+  check('点变量插入 {{ event.period }}', await page.locator('[data-input-field="date"] input').inputValue() === '{{ event.period }}')
+  const preview = await until(async () => (await page.locator('[data-schedule-preview][data-status="ok"][data-preview-mode="event"]').count())
+    && (await page.locator('[data-preview-input="date"]').innerText().catch(() => '')).includes('2026-09'))
+  check('预览按一次事件渲染输入，不列触发时间', !!preview && await page.locator('[data-preview-time]').count() === 0
+    && (await text(page, '[data-preview-event="real"]')).includes(SALES_EVENT)
+    && (await text(page, '[data-preview-desc]')).includes('只认新增的一期'), await text(page, '[data-schedule-preview]').catch(() => ''))
+  const pv = writes(sent, /^POST \/schedules\/preview$/).at(-1)?.body
+  check('预览的请求体：trigger_kind、触发条件、cron 空串', pv?.trigger_kind === 'event' && pv?.cron === '' && pv?.trigger?.source_id === 'ds-sales'
+    && !('n' in (pv ?? {})), JSON.stringify(pv))
+  await page.locator('[data-schedule-save]').click()
+  await until(() => writes(sent, /^POST \/schedules$/).length === 1)
+  const body = writes(sent, /^POST \/schedules$/)[0]?.body
+  check('POST 请求体：trigger_kind=event、触发条件、cron 空串', body?.trigger_kind === 'event' && body?.cron === ''
+    && JSON.stringify(body?.trigger) === JSON.stringify({ event: 'table.version', debounce_s: 300, source_id: 'ds-sales', period: 'new' }),
+  JSON.stringify(body))
+  check('POST 请求体：工作流、名称、时区、输入模板', body?.workflow_id === 'wf-weekly' && body?.name === '门店月报 · 新一期'
+    && body?.timezone === 'Asia/Shanghai' && JSON.stringify(body?.input_template) === '{"date":"{{ event.period }}"}', JSON.stringify(body))
+  check('创建后进详情页', await until(() => new URL(page.url()).pathname === '/schedules/s-new-event'))
+  await page.locator('[data-trigger-mode-fixed="event"]').waitFor()
+  check('详情：触发方式只读，写明建好之后不能改', await page.locator('[data-trigger-modes]').count() === 0
+    && (await text(page, '[data-trigger-mode-fixed]')).includes('建好之后不能改'))
+  await shot(page, 'event-new-dark')
+  check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
+})
+
+await section('事件触发：列表、详情与触发历史', async () => {
+  const state = freshState({ schedules: [structuredClone(S1), structuredClone(S_EVENT), structuredClone(S_EVENT_OFF)], fires: eventFires() })
+  const list = await open('/schedules', { state })
+  await list.page.locator('[data-schedule-row="s-event"]').waitFor()
+  const row = list.page.locator('[data-schedule-row="s-event"]')
+  check('列表：事件触发的标「事件触发」，cron 的不标', await row.locator('[data-schedule-trigger-kind="event"]').count() === 1
+    && await list.page.locator('[data-schedule-row="s-weekly"] [data-schedule-trigger-kind="event"]').count() === 0)
+  check('列表：频率那里写触发说明', (await row.locator('[data-schedule-desc]').innerText()).includes(SALES_TRIGGER))
+  const wait = await row.locator('[data-schedule-event-wait="waiting"]').innerText()
+  check('列表：去抖中写收到几次、什么时候合成一次触发', wait.includes('已收到 2 次事件') && wait.includes('合成一次触发'), wait)
+  const off = await list.page.locator('[data-schedule-row="s-event-off"] [data-schedule-event-wait="pending"]').innerText()
+  check('列表：调度没开时照实说事件在等、不会派发', off.includes('3 条事件') && off.includes('调度未开启'), off)
+  check('列表：上次触发链到那次运行', await row.locator('[data-schedule-last] a[href="/runs/run-fe1"]').count() === 1)
+
+  const { page, sent, errors } = await open('/schedules/s-event', { state })
+  await page.locator('[data-trigger-section]').waitFor()
+  check('详情：页头副标题是触发说明', (await page.locator('[data-schedules-page] header').innerText()).includes(SALES_TRIGGER))
+  check('详情：读出来的对象、期次、去抖', await page.locator('[data-trigger-subject="table.version"]').inputValue() === 'ds-sales'
+    && await page.locator('[data-trigger-period]').inputValue() === 'new' && await page.locator('[data-trigger-debounce]').inputValue() === '300')
+  check('详情：没有频率、只读的触发方式', await page.locator('[data-freq-preset]').count() === 0
+    && await page.locator('[data-trigger-mode-fixed="event"]').count() === 1)
+  await page.locator('[data-trigger-debounce]').selectOption('900')
+  await page.locator('[data-schedule-save]').click()
+  await until(() => writes(sent, /^PATCH \/schedules\/s-event$/).length === 1)
+  const patch = writes(sent, /^PATCH \/schedules\/s-event$/)[0]?.body
+  check('只改去抖：PATCH 只带触发条件和版本，不带 cron', JSON.stringify(patch) === JSON.stringify({
+    trigger: { event: 'table.version', debounce_s: 900, source_id: 'ds-sales', period: 'new' }, version: 2 }), JSON.stringify(patch))
+  await saveDone(page)
+
+  await page.locator('#schedule-tab-history').click()
+  await page.locator('[data-fire-id="fe1"]').waitFor()
+  const fe1 = await text(page, '[data-fire-id="fe1"] [data-fire-event]')
+  check('触发历史：写「由事件触发：…」和合并了几次', fe1.includes(`由事件触发：${SALES_EVENT}`) && fe1.includes('合并了 2 次事件'), fe1)
+  check('……类型标「事件」', (await text(page, '[data-fire-id="fe1"] [data-fire-kind-chip]')).includes('事件'))
+  const fe2 = await text(page, '[data-fire-id="fe2"] [data-fire-event]')
+  check('……立即运行按示例值、没发起的照实写：写「按事件」，不说成由事件触发', fe2.includes(`按事件：${SALES_EVENT}`)
+    && fe2.includes('立即运行，事件为示例值') && !fe2.includes('由事件触发')
+    && (await text(page, '[data-fire-id="fe2"]')).includes('还没有发生过这种事件'), fe2)
+  check('……上一次没结束跳过的写第几层', (await text(page, '[data-fire-id="fe3"] [data-fire-event]')).includes('触发链第 2 层'))
+  await shot(page, 'event-history-dark')
+  // 390px 窄屏、浅色：事件那一节（三种事件的按钮、对象下拉里带原因的长名字）不撑出横向滚动
+  const narrow = await open('/schedules/s-event', { state, width: 390, height: 844, theme: 'light' })
+  await narrow.page.locator('[data-trigger-section]').waitFor()
+  await narrow.page.locator('[data-trigger-event="workflow.finished"]').click()
+  await narrow.page.locator('[data-trigger-app]').waitFor()
+  await sleep(300)
+  check('390px 浅色：事件那一节不横向溢出，对象、去抖、保存在屏幕里', await overflow(narrow.page) <= 1
+    && await inViewX(narrow.page, '[data-trigger-subject]') && await inViewX(narrow.page, '[data-trigger-debounce]')
+    && await inViewX(narrow.page, '[data-schedule-save]'), `${await overflow(narrow.page)}px`)
+  await shot(narrow.page, 'event-390-light')
+  const all = [...errors, ...list.errors, ...narrow.errors]
+  check('没有页面报错', !all.length, all.join(' ｜ '))
+})
+
+await section('事件触发：运行详情页头写「由事件触发」', async () => {
+  const state = freshState({ schedules: [structuredClone(S1), structuredClone(S_EVENT)], runs: [...RUNS, RUN_EVENT, RUN_SAMPLE] })
+  const { page, errors } = await open('/runs/run-event-1', { state })
+  await page.locator('[data-run-detail="run-event-1"]').waitFor({ timeout: 10000 })
+  const link = page.locator('[data-run-detail] header [data-run-schedule-link]')
+  const said = await until(async () => {
+    const t = (await link.innerText().catch(() => '')).trim()
+    return t.includes('门店月报 · 新一期') ? t : null
+  })
+  check('页头写「由事件触发：<事件>（定时任务「X」）」，是到那个定时任务的链接',
+    said === `由事件触发：${SALES_EVENT}（定时任务「门店月报 · 新一期」）` && await link.getAttribute('href') === '/schedules/s-event'
+      && await link.getAttribute('data-run-schedule-event') === '', said ?? (await link.innerText().catch(() => '没有链接')))
+  const manual = await open('/runs/run-event-2', { state })
+  await manual.page.locator('[data-run-detail="run-event-2"]').waitFor({ timeout: 10000 })
+  const mHead = manual.page.locator('[data-run-detail] header').first()
+  await until(async () => (await mHead.locator('[data-run-schedule-link]').innerText().catch(() => '')).includes('门店月报 · 新一期'))
+  const mText = oneLine([await mHead.innerText()])
+  check('立即运行按最近一次事件发起的：署名照写，写「立即运行…按事件」，不说成由事件触发', mText.includes('检查员甲 发起')
+    && mText.includes(`立即运行定时任务「门店月报 · 新一期」，按事件：${SALES_EVENT}`) && !mText.includes('由事件触发'), mText.slice(0, 200))
+  check('没有页面报错', ![...errors, ...manual.errors].length, [...errors, ...manual.errors].join(' ｜ '))
 })
 
 // ---------------------------------------------------------------- 窄屏、浅色

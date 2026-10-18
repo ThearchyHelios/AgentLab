@@ -530,8 +530,8 @@ async def _schedule_outs(session: AsyncSession, rows: list[Schedule]) -> list[di
         """触发方式：cron 的 trigger、trigger_text、trigger_state 为 null；事件触发的给规范化后的触发条件、说法、在等的事件。"""
         if not _event_kind(r):
             return {"trigger_kind": "cron", "trigger": None, "trigger_text": None, "trigger_state": None}
+        # subject_name 是保存时记下的对象名（对象删掉之后界面写它）；带回来时不认（triggers.normalize）
         stored = dict(r.trigger or {}) if isinstance(r.trigger, dict) else {}
-        stored.pop("subject_name", None)
         return {"trigger_kind": "event", "trigger": stored, "trigger_text": _trigger_text(r, trigger_names),
                 "trigger_state": states.get(r.id)}
 

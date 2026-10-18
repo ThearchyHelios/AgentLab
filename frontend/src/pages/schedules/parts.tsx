@@ -6,6 +6,7 @@ import { ApiError, api } from '../../api/client'
 import { StatusPill, confirmDialog, toast } from '../../components/ui'
 import { formatDateTime, parseServerTime } from '../../lib/format'
 import { SCHEDULE_TEXT as T } from '../../lib/terms'
+import { TRIGGER_TEXT as TT } from '../../lib/termsTrigger'
 import type { Schedule, ScheduleFire, ScheduleFireStatus, ScheduleRunResult } from '../../types'
 import { browserTimezone, formatUntil, formatZoned, maintenanceSummary } from './model'
 
@@ -71,12 +72,42 @@ export function ZonedTime({ date, tz, now, relative = false, className }: {
   )
 }
 
-/** 下次运行：暂停中、往后不再触发都照实说，不写「—」让人猜 */
+/**
+ * 下次运行：暂停中、往后不再触发都照实说，不写「—」让人猜。事件触发的任务没有「到点」：写它现在在等什么——去抖中（几次事件、
+ * 什么时候合成一次触发）、有事件等待派发（调度没开时说不会派发）、等待事件（服务端 trigger_state）
+ */
 export function NextRun({ schedule, now }: { schedule: Schedule; now: number }) {
   if (!schedule.enabled) return <span className="text-faint">{T.nextPaused}</span>
+  if (schedule.trigger_kind === 'event') return <EventWait schedule={schedule} now={now} />
   const d = parseServerTime(schedule.next_run_at)
   if (!d) return <span className="text-faint">{T.nextNone}</span>
   return <ZonedTime date={d} tz={schedule.timezone} now={now} relative className="text-dim" />
+}
+
+function EventWait({ schedule, now }: { schedule: Schedule; now: number }) {
+  const st = schedule.trigger_state
+  const due = parseServerTime(st?.due_at ?? null)
+  if (st && st.waiting > 0 && due) {
+    const when = formatZoned(due, schedule.timezone, 'short', new Date(now))
+    return <span className="text-dim" data-schedule-event-wait="waiting">{TT.waiting(st.waiting, when)}</span>
+  }
+  if (st && st.events > 0) {
+    return (
+      <span className={st.scheduler_on ? 'text-dim' : 'text-[var(--warn)]'} data-schedule-event-wait="pending">
+        {st.scheduler_on ? TT.pending(st.events) : TT.pendingOff(st.events)}
+      </span>
+    )
+  }
+  return (
+    <span className="text-faint" data-schedule-event-wait="idle" title={st && !st.scheduler_on ? TT.schedulerOff : undefined}>
+      {TT.nextEvent}
+    </span>
+  )
+}
+
+/** 列表、详情页头里「事件触发」的小标签：和运行类别的标签并排 */
+export function EventChip() {
+  return <span className="chip shrink-0" title={TT.chipTitle} data-schedule-trigger-kind="event">{TT.chip}</span>
 }
 
 // -------------------------------------------------------------------------
@@ -349,13 +380,24 @@ export function ScheduleTag({ scheduleId, name }: { scheduleId: string; name?: s
  *
  * 前面带和「定时」标记一样的日历图标：页头这一行都是灰字，不带记号看不出这一段能点。页头窄时这一行换行，链接至少留
  * 几个字宽（以前这一行不换行，只有链接能缩，窄窗口里被挤成 0 宽，Tab 停在一个看不见的链接上），再长截断，全名在悬停里。
- * 定时任务已经删除的写成纯文本（链过去只有「不存在」页），同一行的「工作流已删除」也是这样
+ * 定时任务已经删除的写成纯文本（链过去只有「不存在」页），同一行的「工作流已删除」也是这样。
+ *
+ * 由数据事件触发的（运行来源里的 trigger，发起时写进、在封存范围内）：整句写「由事件触发：<事件>（定时任务「X」）」，
+ * 事件的说法是服务端发起时写下的那一句，不在这里拼
  */
-export function RunScheduleSource({ scheduleId, startedBy }: { scheduleId: string; startedBy?: string | null }) {
+export function RunScheduleSource({ scheduleId, startedBy, trigger }: {
+  scheduleId: string; startedBy?: string | null
+  /** 运行来源里的 trigger（服务端 outbox.EventFire.origin）；不是事件触发的为空 */
+  trigger?: { text?: unknown; sample?: unknown } | null
+}) {
   const names = useScheduleNames([scheduleId])
   const recorded = startedBy?.startsWith(T.actorPrefix) ? startedBy.slice(T.actorPrefix.length).trim() : null
   const auto = !startedBy || recorded != null
   const name = names.get(scheduleId) || recorded || null
+  const eventText = typeof trigger?.text === 'string' && trigger.text ? trigger.text : null
+  const sample = !!eventText && trigger?.sample === true
+  const said = (gone: boolean) => (sample ? TT.runSourceSample(eventText, name) : gone ? TT.runSourceGone(eventText!, name)
+    : TT.runSource(eventText!, name))
   const body = (text: string) => (
     <>
       <CalendarClock size={10} aria-hidden className="shrink-0" />
@@ -365,16 +407,17 @@ export function RunScheduleSource({ scheduleId, startedBy }: { scheduleId: strin
   const source = scheduleGone(scheduleId) ? (
     <span title={T.runSourceGoneTitle} data-run-schedule-gone={scheduleId}
           className="inline-flex min-w-[7em] max-w-full items-center gap-1">
-      {body(auto ? T.runSourceGone(name) : T.runSourceManualGone(name))}
+      {body(eventText ? said(true) : auto ? T.runSourceGone(name) : T.runSourceManualGone(name))}
     </span>
   ) : (
     <Link
       to={`/schedules/${encodeURIComponent(scheduleId)}`}
-      title={T.runSourceTitle(name)}
+      title={eventText ? said(false) : T.runSourceTitle(name)}
       data-run-schedule-link={scheduleId}
+      data-run-schedule-event={eventText ? '' : undefined}
       className="inline-flex min-w-[7em] max-w-full items-center gap-1 rounded-sm text-dim outline-none hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
     >
-      {body(auto ? T.runSource(name) : T.runSourceManual(name))}
+      {body(eventText ? said(false) : auto ? T.runSource(name) : T.runSourceManual(name))}
     </Link>
   )
   if (auto || !startedBy) return source

@@ -290,9 +290,10 @@ async def _from_text(session: AsyncSession, source: Source) -> str:
             n = await session.scalar(select(func.count(Run.id)).where(
                 Run.schedule_id == run.schedule_id, Run.created_at <= run.created_at))
         name = schedule.name if schedule is not None else "已删除的定时任务"
-        # 由数据事件触发的（scheduler/outbox：运行来源里记着 trigger）照实写是什么事件
+        # 由数据事件触发的（scheduler/outbox：运行来源里记着 trigger）照实写是什么事件；立即运行按示例事件发起的不算
         trigger = (run.origin or {}).get("trigger") if isinstance(run.origin, dict) else None
-        lead = f"由事件触发：{trigger['text']}，" if isinstance(trigger, dict) and trigger.get("text") else ""
+        event = isinstance(trigger, dict) and trigger.get("text") and not trigger.get("sample")
+        lead = f"由事件触发：{trigger['text']}，" if event else ""
         return f"{lead}定时任务「{name}」第 {int(n or 1)} 次"
     return "正式运行"
 

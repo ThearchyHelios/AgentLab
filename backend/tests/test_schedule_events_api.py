@@ -124,7 +124,9 @@ async def test_create_table_version_schedule(client):
     assert r.status_code == 201, r.text
     s = r.json()
     assert (s["trigger_kind"], s["cron"], s["next_run_at"], s["target_kind"]) == ("event", "", None, "workflow")
-    assert s["trigger"] == {"event": "table.version", "source_id": table, "period": "new", "debounce_s": 60}
+    assert {k: v for k, v in s["trigger"].items() if k != "subject_name"} == {
+        "event": "table.version", "source_id": table, "period": "new", "debounce_s": 60}
+    assert s["trigger"]["subject_name"].startswith("门店销售-")             # 保存时记下的对象名
     assert s["trigger_text"].startswith("上传表格「门店销售-") and "（只认新增的一期；去抖 1 分钟）" in s["trigger_text"]
     assert s["description_text"] == s["trigger_text"]
     assert s["trigger_state"] == {"events": 0, "waiting": 0, "due_at": None, "scheduler_on": False}
@@ -282,7 +284,7 @@ async def test_preview_and_run_now_with_a_sample_event(client):
                                                            "workflow_id": b})
     assert r.status_code == 200, r.text
     p = r.json()
-    assert p["next"] == [] and p["event"]["real"] is False and "示例值" in p["event"]["text"]
+    assert p["next"] == [] and p["event"]["real"] is False and p["event"]["text"].startswith(f"工作流「{a_name}」")
     s = (await client.post("/api/schedules", json=body(b, trigger, input_template=template))).json()
     early = (await client.post(f"/api/schedules/{s['id']}/run")).json()
     assert early["run_id"] is None and early["fire"]["status"] == "failed_to_start"
@@ -303,6 +305,13 @@ async def test_preview_and_run_now_with_a_sample_event(client):
     done = await settle(run["run_id"])
     assert done.input == {"basis": f"日报完成 · {a_name}"}
     assert done.origin["trigger"]["sample"] is True and done.origin["trigger"]["event"] == "workflow.finished"
+    assert done.origin["trigger"]["real"] is True and done.origin["trigger"]["chain"] == [up.id]
+    # 应用页印章：立即运行按示例事件发起的不说「由事件触发」
+    from app.apps import resolve
+
+    async with SessionLocal() as session:
+        said = await resolve._from_text(session, resolve.Source(id="v", kind="latest_sealed", state="ok", run=done))
+    assert said.startswith("定时任务「下游汇总」第 ")
     # 触发历史：事件的说明照写
     [newest, *_] = (await client.get(f"/api/schedules/{s['id']}/fires")).json()["items"]
     assert newest["event"]["text"].startswith(f"工作流「{a_name}」的正式运行成功结束（#{up.id[:6]}）")
