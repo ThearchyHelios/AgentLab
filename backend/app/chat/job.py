@@ -8,7 +8,7 @@
 **流程和评测是同一份**（chat/drive.TurnDriver）。问数据这边的差异写在 ChatDriver：
 - 生成带着对话（历史、上一轮的图）、限定的数据源；每一条操作写进事件日志（思考按 THINKING_FLUSH_S 合并成一条，几百条增量
   不逐条落库）；
-- 发起：来源 chat（origin 记对话和这一轮），入口填问题和前几轮的问答（conversations.history_text）；开登录后 user 角色照
+- 发起：来源 chat（origin 记对话和这一轮），入口填问题和这一轮之前的几轮问答（conversations.run_history）；开登录后 user 角色照
   chat/launch.user_chat_run（白名单、自己的记忆范围、遮罩、只读）——和以前浏览器发 POST /api/runs 时一字不差；
 - 停在审批上：照旧等人（评测是取消），审批过了接着等这次运行；没有待审批的断点（服务重启挂起）这一轮收成「服务重启，本轮已
   中断」，可以「继续运行」；
@@ -32,6 +32,10 @@
 
 **并发。** 归「交互」类（总方案 §5 W2-b）：这一波还是进程内的 core/job_runtime（一个 asyncio 任务一轮，不占数据源的队），
 和以前浏览器各推各的一样不设上限；第 2 波按库里的计数认领、按类别给并发上限和优先级（问数据优先于评测），租约到期别的进程接手。
+同时来的几次发起（两个标签页、连点几下）在库里排队：发起的核对和写入在一个事务里、第一句先占住这段对话（hold_conversation），
+同一段对话只起得来一轮、同一轮只排得上一次，第一条事件也在这个事务里写；事件的 seq 由任务行上的计数器发（chat/log.add）；
+同一行的几处写入（任务、晚到的复核、下一次尝试）先占住那一行再读改写（hold_turn），用量按增量记在库里那一份上，谁也不盖掉谁；
+同一轮在这个进程里不起第二个后台任务（ChatTurnManager.start）。
 """
 from __future__ import annotations
 
@@ -43,6 +47,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chat import log as turn_log
@@ -150,14 +155,19 @@ class ChatDriver(TurnDriver):
     async def on_retry(self, reason: str, *, kind: str, base_graph: dict[str, Any] | None) -> None:
         from app.chat import turn as policy
 
+        # 换下来的那次运行交出去并进 earlier；这一次从「还没有运行」起，收尾时不再把它当这一次的运行记一遍
+        run, self.last_run = (self.last_run if kind == "review" else None), None
         await self.execution.retrying(reason, kind=kind, base=policy.has_nodes(base_graph), attempt=self.turn.attempts,
-                                      run=self.last_run if kind == "review" else None)
+                                      run=run)
 
     async def run_input(self, session: AsyncSession, graph: dict[str, Any]) -> dict[str, Any]:
-        from app.api.conversations import history_text
+        """入口填问题和这一轮之前的几轮问答（conversations.run_history，同以前页面上的 historyOf）：重试、重新运行较早的
+        一轮时，后面接着问过的几轮不算进来。"""
+        from app.api.conversations import run_history
         from app.chat import turn as policy
 
-        return policy.fill_input(graph, self.question, await history_text(session, self.execution.conversation_id))
+        history = await run_history(session, self.execution.conversation_id, before_seq=self.execution.turn_seq)
+        return policy.fill_input(graph, self.question, history)
 
     async def launch_args(self, session: AsyncSession, graph: dict[str, Any]) -> dict[str, Any]:
         from app.api.deps import restricted
@@ -265,8 +275,8 @@ class ChatTurnExecution(runtime.JobRun):
         self.actor: str | None = None
         self.mode = "ask"
         self.request: dict[str, Any] = {}
-        #: 这一轮的用量 {copilot, review, earlier, run}（UsageTotal），从库里那一行接着记
-        self.usage: dict[str, Any] = {}
+        #: 这一轮在对话里排第几（运行入口的 history 只取它之前的几轮）
+        self.turn_seq = 0
         self.run_id: str | None = None
         self.run_class: str | None = None
         self.driver: ChatDriver | None = None
@@ -282,9 +292,11 @@ class ChatTurnExecution(runtime.JobRun):
         """追加一条事件（和这一轮的库写入排在同一条队里，停止时不会写到一半）。"""
         return await self._write(turn_log.append, self.turn_id, type_, data or {})
 
-    async def save(self, *, meta: Mapping[str, Any] | None = None, **fields: Any) -> None:
-        """改 conversation_turns 那一行：fields 照写，meta 并进去（值为 None 的键删掉），顺手记 meta.at。"""
-        await self._write(_save_turn, self.turn_id, fields, dict(meta or {}))
+    async def save(self, *, meta: Mapping[str, Any] | None = None, usage: list[tuple[Any, ...]] | None = None,
+                   **fields: Any) -> dict[str, Any]:
+        """改 conversation_turns 那一行：fields 照写，meta 并进去（值为 None 的键删掉），顺手记 meta.at；usage 是对 meta.usage 的
+        几步改动（见 _apply_usage），在库里现有的那一份上做。交回改完之后的 meta.usage。"""
+        return await self._write(_save_turn, self.turn_id, fields, dict(meta or {}), list(usage or []))
 
     async def _job(self, **values: Any) -> None:
         async def go(session: AsyncSession) -> None:
@@ -297,10 +309,10 @@ class ChatTurnExecution(runtime.JobRun):
         turn_log.notify(self.turn_id)
 
     async def add_usage(self, part: str, usage: Mapping[str, Any] | None) -> None:
+        """这一轮又花了一笔（助手建图、复核）：在库里那一份上加，不拿内存里的拷贝盖回去——晚到的复核也往同一份上记"""
         if not isinstance(usage, Mapping):
             return
-        self.usage[part] = record.add_total(self.usage.get(part), usage)
-        await self.save(meta={"usage": dict(self.usage)})
+        await self.save(usage=[("add", part, dict(usage))])
 
     async def on_phase(self, phase: str) -> None:
         await self._job(stage=phase)
@@ -308,22 +320,18 @@ class ChatTurnExecution(runtime.JobRun):
 
     async def launched(self, run: Any) -> None:
         self.run_id, self.run_class = run.id, run.run_class
-        self.usage.pop("run", None)
         await self._job(run_id=run.id)
-        await self.save(run_id=run.id, status="running",
+        await self.save(run_id=run.id, status="running", usage=[("drop", "run")],
                         meta={"runId": run.id, "runClass": run.run_class, "runStatus": run.status})
         await self.emit("run", {"run_id": run.id, "status": run.status, "run_class": run.run_class})
 
     async def retrying(self, reason: str, *, kind: str, base: bool, attempt: int, run: Any = None) -> None:
         """自动重来一次：换下来的那次运行的用量并进 earlier；这一行回到「还没有运行」。"""
-        if run is not None:
-            self.usage["run"] = record.usage_total(run.usage) or {}
-        self.usage = record.retire_run(self.usage)
+        ops: list[tuple[Any, ...]] = [("set", "run", record.usage_total(run.usage) or {})] if run is not None else []
         self.run_id = None
         await self._job(attempt=attempt, run_id=None)
-        await self.save(run_id=None, meta={"runId": None, "runStatus": None, "usage": dict(self.usage)})
-        await self.emit("turn.retry", {"kind": kind, "reason": reason, "base": base, "attempt": attempt,
-                                       "usage": dict(self.usage)})
+        usage = await self.save(run_id=None, meta={"runId": None, "runStatus": None}, usage=[*ops, ("retire",)])
+        await self.emit("turn.retry", {"kind": kind, "reason": reason, "base": base, "attempt": attempt, "usage": usage})
 
     # ---------------- 执行 ----------------
 
@@ -342,8 +350,7 @@ class ChatTurnExecution(runtime.JobRun):
             return
         self.conversation_id, self.actor, self.mode = job.conversation_id, job.actor, job.mode
         self.request = dict(job.request or {})
-        meta = dict(row.meta or {}) if isinstance(row.meta, dict) else {}
-        self.usage = dict(meta.get("usage") or {})
+        self.turn_seq = row.seq
         self.run_id = job.run_id
         # 这一轮按发起的人的身份跑：answer_ops 里的 restricted()、对话归属，发起运行时的遮罩、只读都看它
         set_principal(principal_of(job.principal))
@@ -371,8 +378,8 @@ class ChatTurnExecution(runtime.JobRun):
         """按这一轮的结局写那一行、发 end、任务记成功。"""
         driver = self.driver
         assert driver is not None
-        fields, meta, outcome, output = await _settled(driver, self)
-        await self.save(meta=meta, **fields)
+        fields, meta, outcome, output, usage = await _settled(driver, self)
+        await self.save(meta=meta, usage=usage, **fields)
         await self._end(outcome, output)
         # 晚到的复核先登记、再改任务状态：实时流看到任务结束时，要知道还得等这一次复核回来
         if driver.late_review is not None:
@@ -406,7 +413,7 @@ class ChatTurnExecution(runtime.JobRun):
         if not self.ended:
             await self.save(status="error", error=record.CANCELLED,
                             meta={"outcome": "cancelled", "runStatus": "cancelled" if run_id else None,
-                                  "usage": dict(self.usage), **_timing(self.request)})
+                                  **_timing(self.request)})
             await self._end("cancelled")
         await self._job(status="cancelled", stage=None, finished_at=utcnow())
 
@@ -423,8 +430,7 @@ class ChatTurnExecution(runtime.JobRun):
         await self._settle()
         if not self.ended:
             await self.save(status="error", error=message,
-                            meta={"cause": {"kind": "crash", "message": message}, "usage": dict(self.usage),
-                                  **_timing(self.request)})
+                            meta={"cause": {"kind": "crash", "message": message}, **_timing(self.request)})
             await self._end("error")
         await self._job(status="failed", stage=None, error=message, finished_at=utcnow())
 
@@ -432,6 +438,14 @@ class ChatTurnExecution(runtime.JobRun):
 class ChatTurnManager(runtime.JobManager):
     def __init__(self) -> None:
         super().__init__(ChatTurnExecution, label="问数据的一轮", name="chat-turn")
+
+    def start(self, job_id: str) -> bool:  # type: ignore[override]
+        """同一轮在这个进程里还有一个后台任务活着就不起第二个、也不把登记换成新的（换了的话，停止只停得到后起的那个，
+        先起的那个跑完把「已取消」盖成「已完成」）。起了交回 True。"""
+        if self.running(job_id):
+            return False
+        super().start(job_id)
+        return True
 
 
 manager = ChatTurnManager()
@@ -442,32 +456,30 @@ _late: dict[str, asyncio.Task[Any]] = {}
 
 def _track_late(turn_id: str, task: asyncio.Task[Any]) -> None:
     async def finish() -> None:
+        # 先把用量记进那一行、发 review.late，再出登记、叫醒订阅方：反过来的话，开着的实时流醒来看到「不在进行中了」，
+        # 先发了 stream.end 走掉，review.late 就到不了它
         try:
-            result = await task
-        except asyncio.CancelledError:
-            return
-        except Exception:  # noqa: BLE001
-            logger.exception("问数据：晚到的复核出错")
-            return
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception("问数据：晚到的复核出错")
+                return
+            usage = (result or {}).get("usage") if isinstance(result, Mapping) else None
+            if not usage:
+                return
+            async with SessionLocal() as session:
+                # 加在库里现有的那一份上（这一轮可能已经在重试，那一次的用量也在往同一份上记）
+                await _save_turn(session, turn_id, {}, {}, [("add", "review", dict(usage))], touch_meta=False)
+            async with SessionLocal() as session:
+                await turn_log.append(session, turn_id, "review.late", {"usage": usage})
+        except Exception:  # noqa: BLE001 - 记账失败只记日志
+            logger.exception("问数据：记晚到的复核用量出错")
         finally:
             if _late.get(turn_id) is watcher:
                 _late.pop(turn_id, None)
             turn_log.notify(turn_id)
-        usage = (result or {}).get("usage") if isinstance(result, Mapping) else None
-        if not usage:
-            return
-        async with SessionLocal() as session:
-            from app.db.models import ConversationTurn
-
-            row = await session.get(ConversationTurn, turn_id)
-            if row is None:
-                return
-            meta = dict(row.meta or {}) if isinstance(row.meta, dict) else {}
-            spent = dict(meta.get("usage") or {})
-            spent["review"] = record.add_total(spent.get("review"), usage)
-            row.meta = {**meta, "usage": spent}
-            await session.commit()
-            await turn_log.append(session, turn_id, "review.late", {"usage": usage})
 
     watcher = asyncio.ensure_future(finish())
     _late[turn_id] = watcher
@@ -483,12 +495,41 @@ def late_pending(turn_id: str) -> bool:
 # --------------------------------------------------------------------------
 
 
-async def _save_turn(session: AsyncSession, turn_id: str, fields: Mapping[str, Any], meta: Mapping[str, Any]) -> None:
+def _apply_usage(usage: Mapping[str, Any] | None, ops: list[tuple[Any, ...]]) -> dict[str, Any]:
+    """在一份 meta.usage 上做几步改动：("add", 哪一份, 用量) 加上；("set", 哪一份, 用量) 换成；("drop", 哪一份) 去掉；
+    ("retire",) 当前这次运行换下来了（run 并进 earlier，同 record.retire_run）。"""
+    out = dict(usage or {})
+    for op in ops:
+        kind = op[0]
+        if kind == "add":
+            out[op[1]] = record.add_total(out.get(op[1]), op[2])
+        elif kind == "set":
+            out[op[1]] = dict(op[2] or {})
+        elif kind == "drop":
+            out.pop(op[1], None)
+        elif kind == "retire":
+            out = record.retire_run(out)
+    return out
+
+
+async def hold_turn(session: AsyncSession, turn_id: str) -> None:
+    """占住这一行再读改写（同一行的几处写入——这一轮的任务、晚到的复核、发起下一次尝试——一个接一个来，谁也不盖掉谁）：
+    第一句就写它，SQLite 上拿到写锁、PostgreSQL 上锁住这一行，别的写入等它提交。"""
     from app.db.models import ConversationTurn
 
-    row = await session.get(ConversationTurn, turn_id)
+    await session.execute(update(ConversationTurn).where(ConversationTurn.id == turn_id).values(updated_at=utcnow())
+                          .execution_options(synchronize_session=False))
+
+
+async def _save_turn(session: AsyncSession, turn_id: str, fields: Mapping[str, Any], meta: Mapping[str, Any],
+                     usage: list[tuple[Any, ...]] | None = None, *, touch_meta: bool = True) -> dict[str, Any]:
+    from app.db.models import ConversationTurn
+
+    await hold_turn(session, turn_id)
+    row = await session.get(ConversationTurn, turn_id, populate_existing=True)
     if row is None:
-        return
+        await session.rollback()
+        return {}
     for key, value in fields.items():
         setattr(row, key, value)
     merged = dict(row.meta or {}) if isinstance(row.meta, dict) else {}
@@ -497,10 +538,14 @@ async def _save_turn(session: AsyncSession, turn_id: str, fields: Mapping[str, A
             merged.pop(key, None)
         else:
             merged[key] = value
+    if usage:
+        merged["usage"] = _apply_usage(merged.get("usage"), usage)
     merged["v"] = 1
-    merged["at"] = int(time.time() * 1000)
+    if touch_meta:
+        merged["at"] = int(time.time() * 1000)
     row.meta = merged
     await session.commit()
+    return dict(merged.get("usage") or {})
 
 
 async def _snapshot(session: AsyncSession, turn_id: str, run_id: str | None) -> tuple[dict[str, Any] | None,
@@ -568,8 +613,9 @@ async def _run_failed_detail(run_id: str) -> str | None:
 
 
 async def _settled(driver: ChatDriver, execution: ChatTurnExecution
-                   ) -> tuple[dict[str, Any], dict[str, Any], str, Any]:
-    """这一轮的结局 → (那一行要写的列, 并进 meta 的, outcome, 完整成果)。和以前页面在各个结局处落库写的一一对应。"""
+                   ) -> tuple[dict[str, Any], dict[str, Any], str, Any, list[tuple[Any, ...]]]:
+    """这一轮的结局 → (那一行要写的列, 并进 meta 的, outcome, 完整成果, 对 meta.usage 的改动)。和以前页面在各个结局处落库写的
+    一一对应。用量里助手、复核那几份是随做随记的（add_usage），这里只记这次运行的那一份。"""
     from app.engine.runner import END_REJECTED
 
     t = driver.turn
@@ -583,7 +629,7 @@ async def _settled(driver: ChatDriver, execution: ChatTurnExecution
         text = t.reply or ""
         fields.update(status="done", answer=text, review={})
         meta.update(noQuery=True, runId=None)
-        return fields, {**meta, "usage": dict(execution.usage)}, "reply", {"answer": text}
+        return fields, meta, "reply", {"answer": text}, []
     if path == "asked":
         asked = t.asked or {}
         question = str(asked.get("question") or "").strip()
@@ -594,11 +640,11 @@ async def _settled(driver: ChatDriver, execution: ChatTurnExecution
             # 改了图又问了用户、或者只问不改（图原样交回）：图摆着等「运行」，问题作为这一轮的内容
             fields.update(graph=driver.graph or term.get("graph"), explanation=str(term.get("explanation") or ""))
             outcome = "ready"
-        return fields, {**meta, "usage": dict(execution.usage)}, outcome, {"answer": question} if question else None
+        return fields, meta, outcome, {"answer": question} if question else None, []
     if path == "ready":
         fields.update(status="done", graph=driver.graph, explanation=str(term.get("explanation") or ""), review={})
         meta["runId"] = None
-        return fields, {**meta, "usage": dict(execution.usage)}, "ready", None
+        return fields, meta, "ready", None, []
     if path == "build_failed":
         if driver.refusal is not None:
             message = str(getattr(driver.refusal, "detail", "") or driver.refusal)
@@ -616,15 +662,13 @@ async def _settled(driver: ChatDriver, execution: ChatTurnExecution
                 fields.update(graph=driver.graph, explanation=str(term.get("explanation") or ""))
         fields.update(status="error", error=error, review={})
         meta.update(cause={k: v for k, v in cause.items() if v is not None}, runId=None)
-        return fields, {**meta, "usage": dict(execution.usage)}, "error", None
+        return fields, meta, "error", None, []
 
-    # 发起过运行的结局
-    if run is not None:
-        execution.usage["run"] = record.usage_total(run.usage) or {}
-    usage = dict(execution.usage)
+    # 发起过运行的结局：这次运行的用量记成 run（换下来的早在重来时并进了 earlier）
+    usage: list[tuple[Any, ...]] = [("set", "run", record.usage_total(run.usage) or {})] if run is not None else []
     run_id = run.id if run is not None else execution.run_id
     meta.update(runId=run_id, runClass=getattr(run, "run_class", None) or execution.run_class,
-                runStatus=getattr(run, "status", None), queries=await _queries(run_id), usage=usage)
+                runStatus=getattr(run, "status", None), queries=await _queries(run_id))
     if path == "run_failed":
         refused = driver.launch_refused
         if refused is not None:
@@ -632,27 +676,27 @@ async def _settled(driver: ChatDriver, execution: ChatTurnExecution
             fields.update(status="error", error=message, review={})
             meta.update(cause={"kind": "start", "message": message, "code": getattr(refused, "code", None),
                                "status": getattr(refused, "status_code", None)}, runId=None, runStatus=None, queries=None)
-            return fields, meta, "error", None
+            return fields, meta, "error", None, usage
         if run is None:
             fields.update(status="error", error=record.GONE, review={})
             meta.update(cause={"kind": "gone"}, runStatus="gone")
-            return fields, meta, "error", None
+            return fields, meta, "error", None, usage
         if run.status == "cancelled" and run.end_reason != END_REJECTED:
             fields.update(status="error", error=record.CANCELLED, review={})
             meta["outcome"] = "cancelled"
-            return fields, meta, "cancelled", None
+            return fields, meta, "cancelled", None, usage
         fields.update(status="error", error=run.error or "运行失败", review={})
         meta["cause"] = {k: v for k, v in {"kind": "run", "error": run.error or "",
                                            "detail": await _run_failed_detail(run.id)}.items() if v is not None}
-        return fields, meta, "error", None
+        return fields, meta, "error", None, usage
     if path == "rejected":
         fields.update(status="error", error=record.CANCELLED, review={})
         meta.update(outcome="cancelled", rejected=await _rejected_by(run.id) or {"decision": "reject"})
-        return fields, meta, "cancelled", None
+        return fields, meta, "cancelled", None, usage
     if path == "suspended":
         fields.update(status="error", error=record.SUSPENDED, review={})
         meta.update(outcome="suspended", runStatus="interrupted")
-        return fields, meta, "suspended", None
+        return fields, meta, "suspended", None, usage
 
     # 跑完了：成果以库里那份为准（事件里那份为了推送体积被切过）
     output = run.output if isinstance(run.output, dict) else {}
@@ -661,7 +705,7 @@ async def _settled(driver: ChatDriver, execution: ChatTurnExecution
     fields.update(status="done", answer=rewritten or record.answer_text(output), review=review or {})
     meta.update(issuance=record.slim_issuance(output.get("_issuance")),
                 evidence=True if record.has_evidence(output) else None)
-    return fields, meta, "done", output
+    return fields, meta, "done", output, usage
 
 
 # --------------------------------------------------------------------------
@@ -712,43 +756,132 @@ async def _scope(session: AsyncSession, ids: list[str] | None) -> list[dict[str,
     return out
 
 
+#: 只有问数据的对话能发起一轮（画布助手、应用润色、蓝图的对话各有各的助手；启动整理也只认问数据的对话）
+NOT_CHAT = "这段对话不是问数据的对话，不能在这里发起问数据"
+#: 使用者（user 角色）不能继续运行：以前 POST /api/runs/{id}/continue 对它就是 403（api/deps._run_scope 只放行停止），说法同那边
+ROLE_ONLY = "没有权限：这项操作需要搭建者及以上的角色"
+
+
+async def hold_conversation(session: AsyncSession, conversation_id: str, *, touch: bool = True) -> None:
+    """占住这段对话：发起一轮的核对和写入（这段对话忙不忙、下一轮排第几、任务、第一条事件）在同一个事务里，第一句就写它——
+    SQLite 上拿到写锁、PostgreSQL 上锁住这一行，同一段对话同时来的几次发起一个接一个，后来的看得见先来的写下的。
+
+    touch：顺手记活跃时间（人在这里开始做事）。页面打开时自动发的「接着收尾」不算，原样写回，不然旧对话一打开就顶到列表最上面。"""
+    from app.db.models import Conversation
+
+    stamp = utcnow() if touch else Conversation.last_active_at
+    await session.execute(update(Conversation).where(Conversation.id == conversation_id)
+                          .values(last_active_at=stamp).execution_options(synchronize_session=False))
+
+
 async def start(session: AsyncSession, *, conversation: Any, question: str, datasource_ids: list[str] | None,
                 actor: str | None, mode: str | None = None, retry_of: Any = None,
                 max_steps: int | None = None) -> str:
     """发起一轮（新问，或者对已有的一轮重试、重新运行、继续运行、接着收尾）。交回这一轮的 id（conversation_turns.id）。
 
     新问：建 conversation_turns 那一行（同 POST /api/conversations/{id}/turns）和任务。已有的一轮：上一次的结局归档进
-    meta.attempts（重试、重新运行、放宽步数），那一行回到 running，任务重新排队。不发起抛 TurnRefused。"""
-    from app.api.conversations import new_turn, turn_run_id
-    from app.chat import turn as policy
-    from app.db.models import Approval, Run
-    from app.db.models_chat import ChatTurnJob
+    meta.attempts（重试、重新运行、放宽步数），那一行回到 running，任务重新排队。不发起抛 TurnRefused。
+
+    **同时来的几次发起只起得来一次。** 核对和写入在同一个事务里、先占住这段对话（hold_conversation）：同一段对话同时两次新问
+    只建一轮（另一次 409），同一轮同时几次重试、两个标签页同时请服务端接着收尾只有一次排得上队（任务按状态条件更新）；
+    这一次尝试的第一条事件（turn.attempt）也在这个事务里写，写不进去就什么都不留下。继续运行要先续上那次运行（它自己按运行的
+    状态认领，同一次运行同时只续得上一次），它用自己的会话写库，不能放进占着对话的事务里；续上了、这里却没排上队的，把续上的
+    那次运行取消掉。服务重启挂起的旧运行在提交之后才取消（只有排上队的那一次去取消）。"""
+    from app.api.coded import ROLE_REQUIRED
+    from app.api.conversations import turn_run_id
+    from app.api.deps import restricted
+    from app.db.models import Run
 
     mode = mode or ("retry" if retry_of is not None else "ask")
     if mode not in MODES or (mode == "ask") != (retry_of is None):
         raise TurnRefused(422, "发起方式不对：新问不带 retry_of，重试、重新运行、继续运行要带上是哪一轮", TURN_INVALID)
-    besides = retry_of.id if retry_of is not None else None
+    if getattr(conversation, "kind", "chat") != "chat":
+        raise TurnRefused(422, NOT_CHAT, TURN_INVALID)
+    if mode == "continue" and restricted():
+        raise TurnRefused(403, ROLE_ONLY, ROLE_REQUIRED)
+    if retry_of is None and not question.strip():
+        raise TurnRefused(422, "问题不能为空", TURN_INVALID)
+    if mode == "max_steps" and (not max_steps or max_steps < 1):
+        raise TurnRefused(422, "放宽到几步要写清楚", TURN_INVALID)
+
+    continued: str | None = None
+    if mode == "continue":
+        run_id = turn_run_id(retry_of)
+        run = await session.get(Run, run_id) if run_id else None
+        if run is None:
+            raise TurnRefused(409, "这一轮没有可接着的运行，请重试本轮", TURN_INVALID)
+        await _continue_run(run.id, actor)
+        continued = run.id
+    try:
+        turn_id, stale_run = await _claim(session, conversation=conversation, question=question,
+                                          datasource_ids=datasource_ids, actor=actor, mode=mode, retry_of=retry_of,
+                                          max_steps=max_steps)
+    except BaseException:
+        await session.rollback()
+        if continued:
+            from app.engine.runner import run_manager
+
+            with contextlib.suppress(Exception):
+                await run_manager.cancel(continued, actor=actor)
+        raise
+    if stale_run:
+        # 服务重启挂起的旧运行没人会再去续它，顺手取消（停在审批上的不算：重试不会从那里发起）
+        from app.engine.runner import run_manager
+
+        try:
+            await run_manager.cancel(stale_run, actor=actor)
+        except Exception:  # noqa: BLE001
+            logger.exception("问数据：重试时取消挂起的旧运行 %s 出错", stale_run)
+    if not manager.start(turn_id):
+        # 上一次的后台任务刚记完结局、还没退出：等它退出再起
+        await manager.wait(turn_id, timeout=STOP_GRACE_S)
+        if not manager.start(turn_id):
+            async with SessionLocal() as s2:
+                from app.db.models_chat import ChatTurnJob
+
+                await s2.execute(update(ChatTurnJob).where(ChatTurnJob.id == turn_id).values(
+                    status="failed", error="上一次的后台任务还没有退出", finished_at=utcnow())
+                    .execution_options(synchronize_session=False))
+                await s2.commit()
+            raise TurnRefused(409, BUSY, TURN_BUSY)
+    return turn_id
+
+
+async def _claim(session: AsyncSession, *, conversation: Any, question: str, datasource_ids: list[str] | None,
+                 actor: str | None, mode: str, retry_of: Any, max_steps: int | None) -> tuple[str, str | None]:
+    """在一个事务里核对、写轮次、排队、写这一次尝试的第一条事件，提交。交回 (这一轮的 id, 提交之后要取消的挂起旧运行)。"""
+    from app.api.conversations import new_turn, turn_run_id
+    from app.chat import turn as policy
+    from app.db.models import Approval, ConversationTurn, Run
+    from app.db.models_chat import ChatTurnJob
+
+    await hold_conversation(session, conversation.id, touch=mode != "resume")
+    if retry_of is not None:
+        await hold_turn(session, retry_of.id)
     # 接着收尾（resume）不建图、不发起运行，不算占着这段对话：一段对话里停在半路的几轮可以一起交给服务端收尾
+    besides = retry_of.id if retry_of is not None else None
     if mode != "resume" and await _busy(session, conversation.id, besides=besides):
         raise TurnRefused(409, BUSY, TURN_BUSY)
     now_ms = int(time.time() * 1000)
     request: dict[str, Any] = {"started_ms": now_ms}
+    stale_run: str | None = None
 
     if retry_of is None:
-        if not question.strip():
-            raise TurnRefused(422, "问题不能为空", TURN_INVALID)
         scope = await _scope(session, datasource_ids)
         row = await new_turn(session, conversation, question)
         row.meta = {"v": 1, **({"scope": scope} if scope else {}), "at": now_ms}
         request["scope"] = scope
-        session.add(ChatTurnJob(id=row.id, conversation_id=conversation.id, status="queued", mode=mode, request=request,
-                                principal=principal_snapshot(), actor=actor, started_at=None))
+        job = ChatTurnJob(id=row.id, conversation_id=conversation.id, status="queued", mode=mode, request=request,
+                          principal=principal_snapshot(), actor=actor, started_at=None)
+        session.add(job)
         await session.flush()
-        turn_id = row.id
         attempts: list[Any] = []
     else:
-        row = retry_of
-        job = await session.get(ChatTurnJob, row.id)
+        # 占住之后重读：发起之前读到的那一份可能已经被同时来的另一次发起改过了
+        row = await session.get(ConversationTurn, retry_of.id, populate_existing=True)
+        if row is None:
+            raise TurnRefused(404, "该轮对话不存在，可能已被删除")
+        job = await session.get(ChatTurnJob, row.id, populate_existing=True)
         if job is not None and job.status in runtime.ACTIVE:
             raise TurnRefused(409, BUSY, TURN_BUSY)
         meta = dict(row.meta or {}) if isinstance(row.meta, dict) else {}
@@ -761,15 +894,11 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
         if mode in ("rerun", "max_steps", "run") and not graphful:
             raise TurnRefused(409, "这一轮没有可运行的工作流，请重试本轮", TURN_INVALID)
         if mode == "max_steps":
-            if not max_steps or max_steps < 1:
-                raise TurnRefused(422, "放宽到几步要写清楚", TURN_INVALID)
-            request["max_steps"] = int(max_steps)
+            request["max_steps"] = int(max_steps or 0)
         if mode in ("continue", "resume"):
             # 接着收尾不要求运行还在：运行记录删了的，服务端照实收成「运行记录不见了」
-            if run is None and (mode == "continue" or not run_id):
+            if not run_id:
                 raise TurnRefused(409, "这一轮没有可接着的运行，请重试本轮", TURN_INVALID)
-            if mode == "continue":
-                await _continue_run(run.id, actor)
             request["follow"] = True
             # 计时：收过尾的（失败、中断之后点「继续运行」）接着上次停下的地方走——隔了一夜再点，头部不该写「已运行 14 小时」；
             # 停在半路的（页面以前没来得及收尾的）从运行开始算；运行早就结束了的（补交付）按它真正结束的时刻算，不按现在
@@ -781,18 +910,14 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
             if mode == "resume" and run is not None and run.status in ("succeeded", "failed", "cancelled") \
                     and run.finished_at is not None:
                 request["ended_ms"] = int(run.finished_at.timestamp() * 1000)
+            row.status, row.error = "running", ""
+            row.meta = {**meta, "at": now_ms}
         else:
-            # 重试、重新运行、放宽步数、跑一下：服务重启挂起的旧运行没人会再去续它，顺手取消（停在审批上的不算：重试不会从那里发起）
             if run is not None and run.status == "interrupted" and mode != "run":
                 pending = (await session.execute(select(Approval.id).where(
                     Approval.run_id == run.id, Approval.status.in_(("pending", "answered"))).limit(1))).first()
                 if pending is None:
-                    from app.engine.runner import run_manager
-
-                    try:
-                        await run_manager.cancel(run.id, actor=actor)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("问数据：重试时取消挂起的旧运行 %s 出错", run.id)
+                    stale_run = run.id
             if mode != "run":
                 archived = record.attempt_record(row, meta, n=len(attempts) + 1,
                                                  at_ms=int(row.updated_at.timestamp() * 1000) if row.updated_at else now_ms)
@@ -810,39 +935,38 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
             row.meta = {k: v for k, v in new_meta.items() if v is not None}
             row.status, row.error, row.answer, row.review = "running", "", "", {}
             row.run_id = None
-        if mode in ("continue", "resume"):
-            row.status, row.error = "running", ""
-            row.meta = {**meta, "at": now_ms}
+        values = {"status": "queued", "stage": None, "mode": mode, "request": request,
+                  "run_id": run_id if mode in ("continue", "resume") else None, "attempt": 0,
+                  "principal": principal_snapshot(), "actor": actor, "error": None, "started_at": None,
+                  "finished_at": None}
         if job is None:
-            job = ChatTurnJob(id=row.id, conversation_id=conversation.id)
-            session.add(job)
-        job.status, job.stage, job.mode, job.request = "queued", None, mode, request
-        job.run_id = run_id if mode in ("continue", "resume") else None
-        job.attempt = 0
-        job.principal, job.actor, job.error, job.started_at, job.finished_at = (
-            principal_snapshot(), actor, None, None, None)
-        conversation.last_active_at = utcnow()
+            session.add(ChatTurnJob(id=row.id, conversation_id=conversation.id, **values))
+        else:
+            # 只在它不在排队、不在跑的时候排上：同时来的另一次已经排上了的，这一次不算
+            claimed = await session.execute(update(ChatTurnJob).where(
+                ChatTurnJob.id == row.id, ChatTurnJob.status.not_in(runtime.ACTIVE)).values(**values)
+                .execution_options(synchronize_session=False))
+            if claimed.rowcount != 1:
+                raise TurnRefused(409, BUSY, TURN_BUSY)
         await session.flush()
-        turn_id = row.id
-    await session.commit()
-
-    # 这一次尝试从这一条开始：刷新、重开页面时从这里回放
-    async with SessionLocal() as s:
-        from app.db.models import ConversationTurn
-
-        fresh = await s.get(ConversationTurn, turn_id)
-        usage = ((fresh.meta or {}) if fresh is not None and isinstance(fresh.meta, dict) else {}).get("usage")
-        # 页面据此把这一轮重置成「这一次」的样子：归档、范围、到目前为止的用量、从什么时候算起（补交付的到运行结束为止）
-        seq = await turn_log.append(s, turn_id, "turn.attempt", {
-            "mode": mode, "attempts": attempts, "scope": request.get("scope") or [], "usage": usage or {},
-            "started_ms": request.get("started_ms"),
-            **({"ended_ms": request["ended_ms"]} if request.get("ended_ms") else {}),
-            **({"max_steps": request["max_steps"]} if request.get("max_steps") else {})})
-        await s.execute(update(ChatTurnJob).where(ChatTurnJob.id == turn_id).values(attempt_seq=seq)
-                        .execution_options(synchronize_session=False))
-        await s.commit()
-    manager.start(turn_id)
-    return turn_id
+    turn_id = row.id
+    usage_now = (row.meta or {}).get("usage") if isinstance(row.meta, dict) else None
+    # 这一次尝试从这一条开始：刷新、重开页面时从这里回放。页面据此把这一轮重置成「这一次」的样子：归档、范围、到目前为止的
+    # 用量、从什么时候算起（补交付的到运行结束为止）
+    seq = await turn_log.add(session, turn_id, "turn.attempt", {
+        "mode": mode, "attempts": attempts, "scope": request.get("scope") or [], "usage": usage_now or {},
+        "started_ms": request.get("started_ms"),
+        **({"ended_ms": request["ended_ms"]} if request.get("ended_ms") else {}),
+        **({"max_steps": request["max_steps"]} if request.get("max_steps") else {})})
+    await session.execute(update(ChatTurnJob).where(ChatTurnJob.id == turn_id).values(attempt_seq=seq)
+                          .execution_options(synchronize_session=False))
+    try:
+        await session.commit()
+    except IntegrityError as e:
+        # 不占锁的写入（老页面开轮）正好同时：照「这段对话正忙」答
+        raise TurnRefused(409, BUSY, TURN_BUSY) from e
+    turn_log.notify(turn_id)
+    return turn_id, stale_run
 
 
 async def _continue_run(run_id: str, actor: str | None) -> None:

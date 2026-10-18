@@ -67,19 +67,29 @@ def notify(turn_id: str) -> None:
     waiters.notify(turn_id)
 
 
-async def append(session: AsyncSession, turn_id: str, type_: str, data: dict[str, Any] | None = None) -> int:
-    """追加一条，提交，叫醒订阅方。交回它的 seq。
+async def add(session: AsyncSession, turn_id: str, type_: str, data: dict[str, Any] | None = None) -> int:
+    """在调用方的事务里加一条（不提交），交回它的 seq。
 
-    seq 按这一轮库里已有的最大值往下接：同一轮同一时刻只有一个写的人（它的后台任务；任务不在跑时才由停止、启动整理来写），
-    唯一约束 (turn_id, seq) 兜底。任务行的 last_seq 顺手跟上（GET /api/chat/turns/{id} 照它说现在到哪了）。"""
+    seq 由任务行上的计数器发：UPDATE chat_turn_jobs SET last_seq = last_seq + 1 … RETURNING 是一句原子的写，同一轮同时追加的
+    几处（这一轮的任务、停止、晚到的复核、发起下一次尝试）各拿到不同的号，唯一约束 (turn_id, seq) 兜底。以前按库里已有的最大值
+    往下接，同时两处追加就撞号。任务行的 last_seq 也就是 GET /api/chat/turns/{id} 说的「现在到哪了」。没有任务行的（不该有）
+    退回按最大值往下接。"""
     from app.db.models_chat import ChatTurnEvent, ChatTurnJob
 
-    last = int(await session.scalar(select(func.coalesce(func.max(ChatTurnEvent.seq), 0))
-                                    .where(ChatTurnEvent.turn_id == turn_id)) or 0)
-    seq = last + 1
-    session.add(ChatTurnEvent(turn_id=turn_id, seq=seq, type=type_, ts=time.time(), data=dict(data or {})))
-    await session.execute(update(ChatTurnJob).where(ChatTurnJob.id == turn_id).values(last_seq=seq)
-                          .execution_options(synchronize_session=False))
+    seq = (await session.execute(update(ChatTurnJob).where(ChatTurnJob.id == turn_id)
+                                 .values(last_seq=ChatTurnJob.last_seq + 1).returning(ChatTurnJob.last_seq)
+                                 .execution_options(synchronize_session=False))).scalar_one_or_none()
+    if seq is None:
+        seq = int(await session.scalar(select(func.coalesce(func.max(ChatTurnEvent.seq), 0))
+                                       .where(ChatTurnEvent.turn_id == turn_id)) or 0) + 1
+    session.add(ChatTurnEvent(turn_id=turn_id, seq=int(seq), type=type_, ts=time.time(), data=dict(data or {})))
+    await session.flush()
+    return int(seq)
+
+
+async def append(session: AsyncSession, turn_id: str, type_: str, data: dict[str, Any] | None = None) -> int:
+    """追加一条，提交，叫醒订阅方。交回它的 seq（见 add）。"""
+    seq = await add(session, turn_id, type_, data)
     await session.commit()
     notify(turn_id)
     return seq
@@ -134,5 +144,5 @@ async def stream(turn_id: str, after: int, *, active: Callable[[], Awaitable[str
                 yield PING
 
 
-__all__ = ["HEARTBEAT_S", "PING", "READ_BATCH", "STREAM_END", "append", "frame", "notify", "read", "stream", "waiters",
+__all__ = ["HEARTBEAT_S", "PING", "READ_BATCH", "STREAM_END", "add", "append", "frame", "notify", "read", "stream", "waiters",
            "wire"]

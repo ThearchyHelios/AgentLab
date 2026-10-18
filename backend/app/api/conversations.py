@@ -24,7 +24,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import actor_of, current_principal
@@ -531,7 +531,13 @@ async def create_turn(
 
 
 async def new_turn(session: AsyncSession, conversation: Conversation, question: str) -> ConversationTurn:
-    """开一轮（status=running，只有问题），不提交：开轮接口和服务端发起的一轮（app/chat/job.start）共用。"""
+    """开一轮（status=running，只有问题），不提交：开轮接口和服务端发起的一轮（app/chat/job.start）共用。
+
+    先记活跃时间、再数下一轮排第几：记活跃时间是这个事务的第一句写，占住这段对话（SQLite 上拿到写锁、PostgreSQL 上锁住
+    这一行），同时开的两轮一个接一个数，不会都拿到同一个 seq。"""
+    now = utcnow()
+    await session.execute(update(Conversation).where(Conversation.id == conversation.id).values(last_active_at=now)
+                          .execution_options(synchronize_session=False))
     next_seq = int((await session.execute(
         select(func.coalesce(func.max(ConversationTurn.seq), -1))
         .where(ConversationTurn.conversation_id == conversation.id)
@@ -543,7 +549,7 @@ async def new_turn(session: AsyncSession, conversation: Conversation, question: 
     )
     session.add(turn)
 
-    conversation.last_active_at = utcnow()
+    conversation.last_active_at = now
     # 第一轮的问题就是这次对话的标题。用户改过名就不要再覆盖回去
     if next_seq == 0 and conversation.title in ("", "新对话"):
         conversation.title = title_from(question)
@@ -622,6 +628,32 @@ async def recent_turns(
         .limit(limit)
     )).scalars())
     return list(reversed(rows))
+
+
+#: 运行入口的 history 里每轮的答案截到多少字（同以前问数据页 historyOf 的 slice(0, 600)）
+RUN_HISTORY_CHARS = 600
+
+
+async def run_history(session: AsyncSession, conversation_id: str | None, *, before_seq: int,
+                      limit: int = HISTORY_TURNS) -> str:
+    """问数据一轮发起运行时填进入口的 history（`{{ input.history }}`）：只取这一轮之前的（seq < before_seq），照以前问数据页
+    historyOf 的规则——答案没有就用说明，都没有的跳过，每轮截 600 字，最多 limit 轮，「问：…\n答：…」之间空一行。
+
+    以前这一份是页面按它内存里的轮次拼的；一轮搬到服务端之后在这里拼。和 history_text 不一样的地方是只看这一轮之前的：
+    重试、重新运行较早的一轮时，后面接着问过的几轮不该进它的入口——那时候它还没被问过。"""
+    if not conversation_id:
+        return ""
+    rows = list((await session.execute(
+        select(ConversationTurn.question, ConversationTurn.answer, ConversationTurn.explanation)
+        .where(ConversationTurn.conversation_id == conversation_id, ConversationTurn.seq < before_seq)
+        .order_by(ConversationTurn.seq)
+    )).all())
+    lines = []
+    for question, answer, explanation in rows:
+        text = answer or explanation or ""
+        if question and text:
+            lines.append(f"问：{question}\n答：{text[:RUN_HISTORY_CHARS]}")
+    return "\n\n".join(lines[-limit:])
 
 
 async def history_text(
