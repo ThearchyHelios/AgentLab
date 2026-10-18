@@ -279,6 +279,9 @@ async def test_debounce_merges_events_in_the_window():
     # 窗口还没过：只派、不发
     assert await outbox.dispatch_due(t0 + timedelta(seconds=40)) == []
     assert [d.status for d in await deliveries(sid)] == ["pending", "pending"]
+    async with SessionLocal() as session:
+        state = await outbox.pending_for(session, await session.get(Schedule, sid))
+    assert state == {"events": 0, "waiting": 2, "due_at": (t0 + timedelta(seconds=60)).isoformat()}
     e3 = await put_event("workflow.finished", upstream, payload("run-3"), t0 + timedelta(seconds=70))
     [fire] = await outbox.dispatch_due(t0 + timedelta(seconds=61))
     assert fire.fire_at == t0 + timedelta(seconds=60) and fire.kind == "event"
