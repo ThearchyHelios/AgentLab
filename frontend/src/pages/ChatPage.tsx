@@ -18,7 +18,7 @@ import { humanizeError } from '../lib/errors'
 import { explainRunError } from '../lib/explain'
 import { canLeave, leavePass } from '../lib/leave'
 import { formatNumber, formatTime } from '../lib/format'
-import { CHAT_BLUEPRINT_TEXT, REJECTED_TEXT, TURN_COST_TEXT, runCostText } from '../lib/terms'
+import { CHAT_BLUEPRINT_TEXT, CHAT_TURN_TEXT, REJECTED_TEXT, TURN_COST_TEXT, runCostText } from '../lib/terms'
 import { useCatalog, useCatalogListState, useDatasources, useOnReconnect, type CatalogListState } from '../store/catalog'
 import { useAtLeast } from '../store/auth'
 import { useBlueprint } from '../store/blueprint'
@@ -665,6 +665,9 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   const { retryTurn, continueTurn, ask, recheck, setScope } = useChat.getState()
   const { cap, fallback } = useStepCap()
   const [resuming, setResuming] = useState(false)
+  // 继续运行只给搭建者及以上：使用者（user 角色）续不了运行（服务端照 POST /api/runs/{id}/continue 的老规矩回 403），
+  // 摆着只会点一下报一次错；重试本轮、重新运行本轮另起一次问数据运行，照常给
+  const builder = useAtLeast('builder')
   if (!turn) return null
 
   const kind = remedyOf(turn)
@@ -674,7 +677,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
     && (!s.reason || s.reason === 'steps'))
   const current = fallback ? agentSteps(turn.graph, fallback) : null
   const target = current && cap ? Math.min(cap, Math.max(current * 2, current + 8)) : null
-  const canContinue = !!turn.run?.id && (kind === 'suspended'
+  const canContinue = builder && !!turn.run?.id && (kind === 'suspended'
     || (kind === 'failed' && turn.runStatus === 'failed' && turn.failure?.continuable !== false))
   const offNote = readOnly ? IN_TRASH : busy ? '本对话仍有一轮在运行，请等待其结束' : undefined
   const off = busy || readOnly
@@ -775,7 +778,8 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
   }
 
   // 中断、取消、没核对上在流里不出红框（它们不是故障），为什么停、停了意味着什么在这里说
-  const note = kind === 'suspended' || kind === 'unknown' ? turn.failure
+  const note = kind === 'suspended' && !builder && turn.failure ? { ...turn.failure, hint: CHAT_TURN_TEXT.suspendedHintForUser }
+    : kind === 'suspended' || kind === 'unknown' ? turn.failure
     : kind === 'cancelled' && turn.rejected ? { title: '', reason: REJECTED_TEXT.chatReason, hint: turn.rejected.sub }
     : kind === 'cancelled' ? { title: '', reason: turn.run ? '你已停止本轮，对应的运行也已一并取消。' : '你在搭建工作流时停止了本轮。' }
     : null

@@ -1189,6 +1189,23 @@ async function resumeTurn(conversationId: string, turnId: string) {
     play(flow, turn.serverId, Math.max(0, (res.turn?.job?.attempt_seq ?? 1) - 1))
   } catch (e) {
     if (!flow.alive()) return
+    // 别处（另一个标签页）刚请服务端接着收尾了这一轮：不再起一次，接着看它（服务端在跑就从这一次尝试的第一条播，收了尾就照那一行摆）
+    if (e instanceof ApiError && e.status === 409 && e.code === 'chat_turn_busy') {
+      try {
+        const res = await api.chatTurns.get(turn.serverId)
+        if (!flow.alive()) return
+        if (res.job && LIVE_JOB.has(res.job.status)) {
+          flow.patch(() => ({ hydrated: 'done', job: res.job }))
+          play(flow, turn.serverId, Math.max(0, res.job.attempt_seq - 1))
+          return
+        }
+        if (res.turn && res.turn.status !== 'running') {
+          flow.patch((t) => ({ ...endPatch(t, { turn: res.turn }), hydrated: 'done' }))
+          return
+        }
+      } catch { /* 问不到就照下面说没核对上 */ }
+      if (!flow.alive()) return
+    }
     const said = errorMessage(e)
     const raw = humanizeError(e).raw
     const failure: Failure = {

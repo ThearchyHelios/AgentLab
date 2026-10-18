@@ -46,7 +46,9 @@
 //      按新目录新出现几条错误级问题），看的人手上有说的是这个答案的召回待办时链到待办；没比对的答案照样写依据有变；做完的
 //      对账卡上写「差在哪」、问说明有没有帮助（说明有用 / 看不懂）。
 //  20. 一轮在服务端跑：实时流断了按收到的最后一个 seq 重连，补齐、不重复；刷新、关掉再打开，服务端那一轮照跑，页面从
-//      这一次尝试的第一条接着播；停止发给服务端的这一轮（建图中也停得下）；发起、重试、继续运行的请求体照实。
+//      这一次尝试的第一条接着播；停止发给服务端的这一轮（建图中也停得下）；发起、重试、继续运行的请求体照实；
+//      使用者（user 角色）不给「继续运行」（服务端照 POST /api/runs/{id}/continue 的老规矩不让它续跑）；两个标签页同时打开
+//      停在半路的一轮，服务端只接着收尾一次，后到的那个接着看同一轮。
 //
 // 所有写请求都被拦在浏览器里，不碰任何库。
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
@@ -2741,6 +2743,55 @@ for (const theme of THEMES) {
     check('页面不写这一轮的结局（不 PATCH）', log.patches.slice(patchesBefore).length === 0)
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
+  })
+
+  await section('userrole', '使用者（user 角色）：不给「继续运行」（服务端照老规矩不让使用者续跑），重试、重新运行本轮照常', async () => {
+    const { page, ctx, errors } = await open(theme)
+    // 开了登录、认出来是使用者、管理员开了问数据
+    await page.route('**/api/auth/me', (route) => route.fulfill({ json: { mode: 'local', username: 'uma', display_name: 'uma',
+      role: 'user', groups: [], verified: true, user_can_chat: true } }))
+    const continuesBefore = log.continues.length
+    await goto(page, 'c0suspo')
+    await shows(page, '服务重启，本轮已中断')
+    const card = page.locator('[data-remedy="suspended"]')
+    await card.waitFor({ timeout: 6000 }).catch(() => {})
+    const cardText = (await card.innerText().catch(() => '')).replace(/\n/g, ' / ')
+    check('中断的一轮：使用者看不到「继续运行」，说明里也不叫它去点', await card.getByRole('button', { name: '继续运行' }).count() === 0
+      && !cardText.includes('继续运行') && cardText.includes('重新运行本轮'), cardText)
+    check('……「重新运行本轮」照常给', await card.getByRole('button', { name: '重新运行本轮' }).count() === 1)
+    await goto(page, 'c0histf')
+    await shows(page, '步数用满的那一轮')
+    await page.waitForTimeout(600)
+    const failed = page.locator('[data-turn="tf2"] + * [data-remedy="failed"]')
+    check('跑挂了的一轮：使用者也看不到「继续运行」，「重试本轮」照常给',
+      await page.getByRole('button', { name: '继续运行' }).count() === 0
+        && await failed.getByRole('button', { name: /重试本轮|重新问一次/ }).count() === 1,
+      (await failed.innerText().catch(() => '')).replace(/\n/g, ' / '))
+    check('一次续跑都没发', log.continues.length === continuesBefore)
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('twotabs', '两个标签页同时打开停在半路的一轮：服务端只接着收尾一次，两边都接着看同一轮', async () => {
+    const a = await open(theme)
+    const b = await open(theme)
+    ctl.reviewDelay['run-late'] = 1200
+    const startsBefore = log.turnStarts.length
+    const postsBefore = log.patches.length
+    await Promise.all([goto(a.page, 'c0lateq'), goto(b.page, 'c0lateq')])
+    const done = (page) => page.waitForFunction(() => window.__chat.getState().byConversation.c0lateq?.[0]?.phase === 'done',
+      null, { timeout: 8000 }).then(() => true, () => false)
+    const [okA, okB] = await Promise.all([done(a.page), done(b.page)])
+    check('两边都收尾了，答案一样', okA && okB && await shows(a.page, '补交付的答案：三条记录。') && await shows(b.page, '补交付的答案：三条记录。'))
+    const resumed = log.turnStarts.slice(startsBefore).filter((x) => x.mode === 'resume' && x.retry_of === 'tq1')
+    check('服务端只接着收尾了一次（后到的那个 409，改成接着看）', resumed.length === 1, `${resumed.length} 次`)
+    const phases = await Promise.all([a.page, b.page].map((p) => p.evaluate(() => window.__chat.getState().byConversation.c0lateq?.[0]?.phase)))
+    check('后到的那个不说「无法确认本轮的当前状态」', !phases.includes('unknown'), phases.join(','))
+    check('两边都不写库（不 PATCH）', log.patches.length === postsBefore)
+    delete ctl.reviewDelay['run-late']
+    check('没有运行时报错', a.errors.length === 0 && b.errors.length === 0, a.errors[0] ?? b.errors[0] ?? '')
+    await a.ctx.close()
+    await b.ctx.close()
   })
 
   await section('steps', '历史轮次的执行过程：点开、收起', async () => {
