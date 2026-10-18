@@ -1064,7 +1064,8 @@ class RunManager:
                 if event is not None:
                     await _stage(session, event, run)
                 from app.scheduler import outbox  # 数据事件触发：正式运行成功结束，同一个事务记一条待派发事件
-                outbox.stage_run_finished(session, run)
+                # 途经驳回出口、按驳回那条路走完的也是 succeeded：照发，事件带上途经了哪几个驳回（缺省不认途经驳回的触发）
+                outbox.stage_run_finished(session, run, rejected_via=_rejected_via(state).get("rejected_via"))
                 await session.commit()
         if event is not None:
             await bus.publish(event)
