@@ -5,10 +5,11 @@
 同时服务两件事：给用户看的历史列表，和给模型看的上下文（`_history_text`
 被 copilot 拿去拼进 prompt）。
 
-轮次的写入由前端驱动，分两步：开轮（只有问题）→ 回填（图、run、答案）。
-让 copilot 或 runner 自己去写会更"自动"，但建图失败、运行失败、用户中途
-取消这三种半途而废的情况它们各自只知道一半，最后还是要在三个地方各接一次。
-前端本来就完整地知道这一轮走到哪了。
+问数据的轮次由服务端写（docs/design/orchestration-round §1）：一轮是一个后台任务（app/chat/job.py），建图、运行、复核、
+按复核重来、落库都在服务端，这一行的状态、运行 id、答案、复核、meta 由它写（app/chat/record.py 说明了每一项）；页面只发起
+（POST /api/chat/turns）、只看。以前这一行是页面写的（开轮 → 回填），页面一关就没人收尾。开轮、回填这两个接口留着：画布助手的
+对话和老页面还在用，回填也用来改标题这类事，但问数据的一轮不再依赖它们。每一轮带着它的任务现在怎样（TurnOut.job），列表判
+「还在跑」先看任务，不再只靠 15 分钟没动静来猜。
 
 对话按人隔离（D-d）：新建时记下建立人（created_by = actor_of）。开登录后 user 角色只列得出、读得到、改得动、删得掉
 自己建的对话；created_by 为空的老对话（关登录时建的）只有 builder 以上看得到。应用编辑器的助手对话（kind=app）另要
@@ -99,6 +100,8 @@ class TurnOut(BaseModel):
     created_at: Any = None
     #: 最后一次落库。列表判「建图断了」按它算（BUILD_STALE），前端用同一只钟
     updated_at: Any = None
+    #: 这一轮在服务端的任务现在怎样（app/chat/job.job_view：status、stage、last_seq、attempt_seq……）。老轮次没有任务，为 None
+    job: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -153,17 +156,35 @@ def turn_run_id(turn: Any) -> str | None:
     return turn.run_id or None
 
 
-def _turn_out(turn: ConversationTurn) -> TurnOut:
+def _turn_out(turn: ConversationTurn, job: Any = None) -> TurnOut:
+    from app.chat.job import job_view
+
     out = TurnOut.model_validate(turn)
     out.meta = turn_meta(turn)
+    out.job = job_view(job) if job is not None else None
     return out
 
 
-def _detail(row: Conversation, turns: list[ConversationTurn]) -> ConversationDetail:
+async def _jobs(session: AsyncSession, turn_ids: list[str]) -> dict[str, Any]:
+    """这几轮在服务端的任务（一次查完）。"""
+    from app.db.models_chat import ChatTurnJob
+
+    if not turn_ids:
+        return {}
+    rows = (await session.execute(select(ChatTurnJob).where(ChatTurnJob.id.in_(turn_ids)))).scalars()
+    return {j.id: j for j in rows}
+
+
+async def turn_out(session: AsyncSession, turn: ConversationTurn) -> TurnOut:
+    """一轮（带着它的任务），同 GET /api/conversations/{id} 里的一轮：服务端跑的一轮收尾时把它放进 end 事件。"""
+    return _turn_out(turn, (await _jobs(session, [turn.id])).get(turn.id))
+
+
+def _detail(row: Conversation, turns: list[ConversationTurn], jobs: dict[str, Any] | None = None) -> ConversationDetail:
     base = ConversationOut.model_validate(row)
     return ConversationDetail(
         **base.model_dump(),
-        turns=[_turn_out(t) for t in turns],
+        turns=[_turn_out(t, (jobs or {}).get(t.id)) for t in turns],
     )
 
 
@@ -174,10 +195,14 @@ BUILD_STALE = timedelta(minutes=15)
 
 def last_status(
     turn: Any, run_status: str | None, pending: bool, now: datetime | None = None, end_reason: str | None = None,
+    job_stage: str | None = None,
 ) -> str:
     """一轮停在哪。轮次状态只有 running / done / error 三种，细分要看运行和元数据。
 
-    轮次状态是前端写的：页面关掉、服务重启时它停在 running，这时要以运行的状态为准；
+    job_stage：这一轮在服务端的任务还在跑时它在哪一步（app/chat/job.py；没有任务、任务不在跑时为 None）。任务在跑就是在跑
+    （停在审批上的是 waiting），不按 15 分钟没动静去猜——建图慢的一轮，那一行要到建完才改。
+
+    没有任务的老轮次是页面写的：页面关掉、服务重启时它停在 running，这时要以运行的状态为准；
     运行也没有的，是断在了建图阶段。已经收尾的轮次以轮次自己为准——它写下的就是
     用户看到的结局（取消、服务重启挂起在 error 里分开记）。
 
@@ -186,6 +211,8 @@ def last_status(
     """
     meta = turn_meta(turn) or {}
     outcome = meta.get("outcome")
+    if job_stage is not None and turn.status == "running":
+        return "waiting" if job_stage == "waiting" else "running"
     if turn.status == "done":
         return "done"
     if turn.status == "error":
@@ -258,12 +285,17 @@ async def _statuses(
                 select(Approval.run_id).where(
                     Approval.run_id.in_(stopped), Approval.status == "pending")
             )).scalars())
+    from app.core.job_runtime import ACTIVE
+
+    jobs = await _jobs(session, [t.id for t in turns.values()])
     now = utcnow()
     out: dict[str, tuple[str, str | None]] = {}
     for cid, turn in turns.items():
         run_id = run_of[cid] if run_of[cid] in runs else None
+        job = jobs.get(turn.id)
+        stage = (job.stage or "build") if job is not None and job.status in ACTIVE else None
         out[cid] = (last_status(turn, runs.get(run_id or ""), run_id in waiting, now,
-                                end_reason=ended.get(run_id or "")),
+                                end_reason=ended.get(run_id or ""), job_stage=stage),
                     run_id)
     return out
 
@@ -437,7 +469,7 @@ async def conversation_detail(session: AsyncSession, row: Conversation) -> Conve
         .where(ConversationTurn.conversation_id == conversation_id)
         .order_by(ConversationTurn.seq)
     )).scalars())
-    out = _detail(row, turns)
+    out = _detail(row, turns, await _jobs(session, [t.id for t in turns]))
     out.turn_count = len(turns)
     out.last_question = turns[-1].question if turns else ""
     if turns:
@@ -465,9 +497,14 @@ async def patch_conversation(
 async def delete_conversation(
     conversation_id: str, session: AsyncSession = Depends(get_session)
 ) -> None:
+    from app.chat import job as chat_job
+
     row = await _get(session, conversation_id)
+    # 正在服务端跑的几轮先停下（取消各自的运行）：不然删掉之后它还在跑、还在计费，收尾时又找不到那一行
+    await chat_job.stop_conversation(conversation_id)
     # 显式删 turns 而不是只靠 ondelete=CASCADE：SQLite 的外键级联要 PRAGMA
-    # 打开才生效（base.py 里是打开的），但这条路径不该依赖一个连接级的开关
+    # 打开才生效（base.py 里是打开的），但这条路径不该依赖一个连接级的开关。任务和事件日志同理
+    await chat_job.forget(session, conversation_id)
     await session.execute(
         delete(ConversationTurn).where(ConversationTurn.conversation_id == conversation_id)
     )
@@ -487,25 +524,39 @@ async def create_turn(
     session: AsyncSession = Depends(get_session),
 ) -> TurnOut:
     conversation = await _get(session, conversation_id)
+    turn = await new_turn(session, conversation, payload.question)
+    await session.commit()
+    await session.refresh(turn)
+    return _turn_out(turn)
+
+
+async def new_turn(session: AsyncSession, conversation: Conversation, question: str) -> ConversationTurn:
+    """开一轮（status=running，只有问题），不提交：开轮接口和服务端发起的一轮（app/chat/job.start）共用。"""
     next_seq = int((await session.execute(
         select(func.coalesce(func.max(ConversationTurn.seq), -1))
-        .where(ConversationTurn.conversation_id == conversation_id)
+        .where(ConversationTurn.conversation_id == conversation.id)
     )).scalar_one()) + 1
 
     turn = ConversationTurn(
-        conversation_id=conversation_id, seq=next_seq,
-        question=payload.question, status="running",
+        conversation_id=conversation.id, seq=next_seq,
+        question=question, status="running",
     )
     session.add(turn)
 
     conversation.last_active_at = utcnow()
     # 第一轮的问题就是这次对话的标题。用户改过名就不要再覆盖回去
     if next_seq == 0 and conversation.title in ("", "新对话"):
-        conversation.title = title_from(payload.question)
+        conversation.title = title_from(question)
+    await session.flush()
+    return turn
 
-    await session.commit()
-    await session.refresh(turn)
-    return _turn_out(turn)
+
+async def turn_access(session: AsyncSession, turn_id: str) -> tuple[Conversation, ConversationTurn]:
+    """这一轮这个人能不能用（按它所属的对话判，规则同 _get：对话按人隔离）。不存在 404，不能用 403。"""
+    turn = await session.get(ConversationTurn, turn_id)
+    if turn is None:
+        raise HTTPException(404, "该轮对话不存在，可能已被删除")
+    return await _get(session, turn.conversation_id), turn
 
 
 @router.patch("/{conversation_id}/turns/{turn_id}", response_model=TurnOut)
