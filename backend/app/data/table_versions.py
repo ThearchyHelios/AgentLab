@@ -1081,6 +1081,16 @@ def _activation_row(source_id: str, snapshot: str, previous: str | None, activat
     )
 
 
+async def _version_event(session: AsyncSession, source_id: str, name: str, snap_id: str, previous: str | None,
+                         fields: dict[str, Any], seq: int | None) -> None:
+    """启用按期累积的新一期时记一条待派发事件（table.version，scheduler/outbox.stage_table_version），随这次提交一起落库。"""
+    from app.scheduler import outbox
+
+    await outbox.stage_table_version(session, source_id=source_id, source_name=name, snapshot_id=snap_id,
+                                     previous_snapshot_id=previous, period_start=fields.get("period_start"),
+                                     period_end=fields.get("period_end"), seq=seq)
+
+
 def _usable_tmp(tmp: Path) -> bool:
     """临时库在、非空、在上传目录里。不在上传目录里的一律不认：发布结束要删它，不能删到别处去。"""
     try:
@@ -1230,6 +1240,9 @@ async def publish_build(
             if before_commit is not None:
                 await before_commit(imp_id, snap_id)
             session.add(_activation_row(source_id, snap_id, previous, activation, default_import=imp_id))
+            if snap_mode == "accumulate":
+                # 数据事件触发（scheduler/outbox）：按期累积的新一期启用了，和切指针同一个事务记一条待派发事件
+                await _version_event(session, source_id, source.name, snap_id, previous, import_fields, seq)
 
             session.add(source)
             source.kind, source.origin, source.readonly = "sqlite", "upload", True
@@ -1708,6 +1721,9 @@ async def publish_snapshot(
                 await before_commit(new_import.import_id if new_import is not None else None, snap_id)
             session.add(_activation_row(source_id, snap_id, previous, activation,
                                         default_import=new_import.import_id if new_import is not None else None))
+            if mode == "accumulate" and new_import is not None:
+                # 数据事件触发（scheduler/outbox）：按期累积的新一期启用了（移除、作废没有新的一期，不算）
+                await _version_event(session, source_id, source.name, snap_id, previous, new_import.fields, seq)
             source.current_snapshot_id = snap_id
             source.schema_cache, source.schema_synced_at = cache, now
             # database 只作显示：查询一律从快照解析
