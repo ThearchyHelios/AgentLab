@@ -1360,7 +1360,7 @@ def rejected_data(exc: NodeRejected, spec: GraphSpec) -> dict[str, Any]:
     """被驳回的 run.cancelled 带什么：原因（rejected）、在哪一步（节点 id 和图上的名字）、哪种关卡、结论（驳回 / 超时
     驳回）、谁、备注。进封存：谁在哪一步驳回、为什么，事后查得到。"""
     node = spec.node_map().get(exc.node_id)
-    return {"reason": END_REJECTED, "node_id": exc.node_id, "label": node.title if node else exc.node_id,
+    return {"reason": END_REJECTED, "node_id": exc.node_id, "label": _label_of(exc, node),
             "kind": exc.kind, "decision": exc.decision, "actor": exc.actor, "note": exc.note}
 
 
@@ -1390,8 +1390,16 @@ def _failure(exc: BaseException, spec: GraphSpec) -> tuple[str, tuple[EventType,
         data["detail"] = detail
     if node_id:
         node = spec.node_map().get(node_id)
-        data.update(node_id=node_id, label=node.title if node else node_id)
+        data.update(node_id=node_id, label=_label_of(exc, node))
     return message, (EventType.RUN_FAILED, data)
+
+
+def _label_of(exc: BaseException, node: Any) -> str:
+    """出错、被驳回的那一步在图上叫什么。子工作流里的那一步（节点 id「子工作流节点 id/…」）不在这张图上，名字由
+    multi.run_subgraph 接好记在异常上（「子工作流 › 那一步」）。"""
+    if node is not None:
+        return node.title
+    return str(getattr(exc, "label", None) or getattr(exc, "node_id", "") or "")
 
 
 async def _approval_default(*, run_class: str) -> str:

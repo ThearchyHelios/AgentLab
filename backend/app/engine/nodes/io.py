@@ -351,8 +351,10 @@ def _untraced_gaps(metrics: list[dict[str, Any]], ctx: NodeContext) -> list[str]
         stops = untraced(m.get("inputs") or [])
         if not stops:
             continue
-        where = "、".join(dict.fromkeys(f"{s.get('path')}（停在「{titles.get(s.get('node_id') or '', s.get('node_id') or '未知来源')}」）"
-                                        for s in stops[:3]))
+        # 停在子工作流里的（节点 id「子工作流节点 id/…」）说停在那个子工作流：这张图上看得到的是它，静态检查也这么说
+        where = "、".join(dict.fromkeys(
+            f"{s.get('path')}（停在「{titles.get(at, at or '未知来源')}」）"
+            for s in stops[:3] for at in [str(s.get('node_id') or '').split('/', 1)[0]]))
         out.append(f"指标「{m.get('name') or m.get('id')}」的输入没追到原始数据：{where}")
     return out
 

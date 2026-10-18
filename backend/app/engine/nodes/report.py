@@ -37,6 +37,7 @@ import asyncio
 import re
 import time
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -140,16 +141,18 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
     if isinstance(sources, str) and sources != "ancestors":
         sources = [sources]
     if isinstance(sources, list):
-        # evidence_from 只管查询、检索这类证据（连同查询当时的表结构）从哪几个节点来；指标从哪来由 metrics_from 管
+        # evidence_from 只管查询、检索这类证据（连同查询当时的表结构）从哪几个节点来；指标从哪来由 metrics_from 管。
+        # 写了子工作流节点的，它交回来的（子图里的查询，节点 id「子工作流节点 id/…」）一并算
         keep = {str(s) for s in sources}
         ledger = [e for e in ledger
-                  if e.get("kind") not in ("query", "retrieval", "schema") or e.get("node_id") in keep]
+                  if e.get("kind") not in ("query", "retrieval", "schema") or _outer(e.get("node_id")) in keep]
+    nodes = state.get("nodes") or {}
     catalog = build_catalog(
-        nodes=state.get("nodes") or {},
+        nodes=nodes,
         ledger=ledger,
         inputs=state.get("input") or {},
         metrics_from=_setting(spec, node, "metrics_from") or None,
-        allowed=_ancestors(spec, node.id),
+        allowed=with_subgraphs(_ancestors(spec, node.id), [*nodes, *(e.get("node_id") for e in ledger)]),
     )
     if report_entities(spec, node) == "off":
         # 目录里没有表和字段，写作目录也就不列；compose / verify 另传 entities=False，解析不了的原因照实说
@@ -159,6 +162,20 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
     if isinstance(withheld, list) and withheld:
         catalog = withhold_metrics(catalog, [str(a) for a in withheld], _masked_word())
     return catalog
+
+
+def _outer(node_id: Any) -> str:
+    """节点 id 在这一层图上是哪个节点：子工作流交回来的「子工作流节点 id/…」是那个子工作流节点，别的原样。"""
+    return str(node_id or "").split("/", 1)[0]
+
+
+def with_subgraphs(allowed: set[str], ids: Iterable[Any]) -> set[str]:
+    """报告收证据的范围（祖先节点）加上范围里的子工作流交回来的那些（multi.run_subgraph：台账条目、口径卡的节点 id 是
+    「子工作流节点 id/…」，嵌套的一层层接上）：子工作流在报告上游，它里面查过的数、算过的口径卡也在上游
+    （docs/design/orchestration-round/00-总方案.md §2）。"""
+    out = set(allowed)
+    out.update(i for i in ids if isinstance(i, str) and "/" in i and _outer(i) in allowed)
+    return out
 
 
 def _masked_word() -> str:
