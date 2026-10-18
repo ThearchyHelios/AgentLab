@@ -988,6 +988,11 @@ class Schedule(Base, TimestampMixin):
     target_kind: Mapped[str] = mapped_column(String(20), default="workflow")
     # 目标的 id：workflow 时同 workflow_id；其余两种是题集 id、数据源 id
     target_id: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    # 怎么触发（docs/design/orchestration-round/00-总方案.md §4）：cron 按 cron 表达式到点触发（加这一列之前的都是）；
+    # event 由事件触发，trigger 写事件种类和对象（table.version / workflow.finished / source.changed，见 scheduler 的说明）。
+    # event 时 cron 存空串（老表的非空约束），下一次触发时间为空
+    trigger_kind: Mapped[str] = mapped_column(String(20), default="cron")
+    trigger: Mapped[dict[str, Any]] = mapped_column(default=dict)
     # 非空（老表的约束，只加不改的迁移放宽不了）：目标不是工作流时存空串，读写都经 scheduler/service 里的一处封装
     workflow_id: Mapped[str] = mapped_column(String(32), index=True)
     # 保存时的工作流名。工作流还在时接口给它现在的名字，删掉之后才用这一份

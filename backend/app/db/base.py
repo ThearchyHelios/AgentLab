@@ -245,6 +245,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("schedules", "target_kind", "VARCHAR(20) DEFAULT 'workflow'"),
     ("schedules", "target_id", "VARCHAR(32)"),
     ("schedule_fires", "eval_run_id", "VARCHAR(32)"),
+    # 编排完善（docs/design/orchestration-round/00-总方案.md §4）：定时任务的触发方式。存量行都是 cron
+    ("schedules", "trigger_kind", "VARCHAR(20) DEFAULT 'cron'"),
+    ("schedules", "trigger", "JSON"),
     # 第 2 波：服务账号（users.kind）；剖析上传表格源时的快照
     ("users", "kind", "VARCHAR(20) DEFAULT 'person'"),
     ("catalog_profile_tasks", "snapshot_id", "VARCHAR(32)"),
