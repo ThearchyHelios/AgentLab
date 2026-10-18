@@ -112,7 +112,6 @@ async def start_run(
     """发起规则全在 engine/launch.py（定时任务到点发起也用它），这里只把拒绝换回 HTTP 响应。"""
     from app.api.deps import restricted
     from app.engine.origin import CLIENT_ORIGINS
-    from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
 
     origin = payload.origin or "api"
     if origin not in CLIENT_ORIGINS:
@@ -133,15 +132,16 @@ async def start_run(
         # 数据源查询一律只读，写语句不交给审批（Agent 的 approval 是它自己写在图里的）
         if origin != "chat" or payload.run_class != "exploratory" or payload.workflow_id or payload.version is not None:
             raise HTTPException(403, "没有权限：使用者只能发起问数据的运行，工作流的运行需要搭建者及以上的角色")
-        from app.auth.chat_policy import SCOPE_REFUSED, chat_graph_problem, chat_memory_scope
+        from app.auth.chat_policy import SCOPE_REFUSED
+        from app.chat.launch import ChatRunRefused, user_chat_run
 
-        if problem := chat_graph_problem(payload.graph):
-            raise HTTPException(403, problem)
+        # 白名单、记忆范围、遮罩与只读这几条和服务端跑的一轮问数据（chat/job.py）共用 chat/launch.user_chat_run
+        try:
+            memory_scope, options = user_chat_run(payload.graph, actor)
+        except ChatRunRefused as e:
+            raise HTTPException(403, str(e)) from e
         if payload.memory_scope or payload.collection:
             raise HTTPException(403, SCOPE_REFUSED)
-        # 记忆固定为这位使用者自己的范围、知识库取设置里的默认值：记忆、知识库的内容不经遮罩（见 chat_policy 开头）
-        memory_scope = chat_memory_scope(actor)
-        options = {MASK_RESULTS_OPTION: True, READ_ONLY_OPTION: True}
     try:
         return await launch_run(
             session,

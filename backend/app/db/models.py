@@ -1093,4 +1093,4 @@ from app.db.models_blueprints import (  # noqa: E402,F401
 )
 # 下一轮第 2 波（docs/design/next-round）：数据源对象索引与后台探查（models_sources）、评测（models_eval）。整模块导入，
 # 各自的模型类由那两个文件自己登记，这里不逐个列名
-from app.db import models_eval, models_sources  # noqa: E402,F401
+from app.db import models_chat, models_eval, models_sources  # noqa: E402,F401

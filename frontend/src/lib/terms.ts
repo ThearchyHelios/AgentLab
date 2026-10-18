@@ -768,6 +768,12 @@ export function runCostText(usd: number | null | undefined, unpriced: number, ap
   return `${(approx || unpriced > 0) && usd > 0 ? '≥ ' : ''}${formatCost(usd)}`
 }
 
+/** 问数据的一轮在服务端跑（编排完善第 1 波 W1-a）：使用者（user 角色）不能继续运行时，补救区里那句「怎么办」 */
+export const CHAT_TURN_TEXT = {
+  /** 服务重启打断的一轮：使用者没有「继续运行」，只说重新运行 */
+  suspendedHintForUser: '如需整轮重来，请点击「重新运行本轮」。',
+} as const
+
 /**
  * 问数据一轮的花费：助手建图（含挑表、接着写、自查修正）+ 运行 + 复核（next-round 细案 01 做法 3）。以前只算运行那份，
  * 这一轮的花费是低报的

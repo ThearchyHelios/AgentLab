@@ -1,11 +1,10 @@
 """问数据一轮的「决定」（app/chat/turn.py；细案 01 做法 1）。
 
 要不要运行、输入怎么填、要不要带着原图重来、重来时说什么，从问数据页下沉到后端：final 带 next，复核带 retry_instruction，
-问数据页照它们走；老服务端没给这两个字段时，问数据页退回它自己那份同样的规则。这里守：
+问数据的一轮后来整个搬到了服务端（chat/drive.py、chat/job.py），页面只发起、只播放。这里守：
 
 - 各条决定的分支（next_step、fill_input、retry_after_review、retry_instruction 的两种措辞）；
-- 前后端对照：frontend/src/store/chat.ts 里留着的那份常量（MAX_ATTEMPTS、fillInput 认问题字段的正则、两种重来的措辞）
-  和这里逐字一致——写法同 test_frontend_type_unions.py，两边一改就对不上；
+- 页面上不再留一份同样的决定（一轮整个搬到服务端之后，frontend/src/store/chat.ts 只发起、只播放）；用户点重试本轮时的措辞；
 - /copilot/review 按这一轮试过几次给 retry_instruction：可以重来时是那句话，不重来是 null。
 
 问题、字段名都是虚构的。
@@ -112,7 +111,7 @@ def test_retry_instruction_two_wordings():
 
 
 # --------------------------------------------------------------------------
-# 前后端对照
+# 页面不再留一份同样的决定
 # --------------------------------------------------------------------------
 
 
@@ -120,30 +119,23 @@ def _ts() -> str:
     return CHAT_TS.read_text(encoding="utf-8")
 
 
-def test_max_attempts_matches_the_frontend():
-    found = re.search(r"const MAX_ATTEMPTS = (\d+)", _ts())
-    assert found and int(found.group(1)) == turn.MAX_ATTEMPTS
+def test_the_page_no_longer_keeps_its_own_copy_of_the_decisions():
+    """一轮整个搬到服务端之后（docs/design/orchestration-round §1），问数据页只发起、只播放：要不要运行、要不要重来、重来说
+    什么、入口怎么填都只在这里（和 chat/drive.py），页面上那份退路（MAX_ATTEMPTS、fillInput、retryInstruction）去掉了——
+    两份并存迟早走样，界面层也不放逻辑。以前这里逐字对照两边的常量和措辞，现在守的是页面上没有这几样。"""
+    ts = _ts()
+    for name in ("const MAX_ATTEMPTS", "function fillInput", "function retryInstruction", "streamCopilot(",
+                 "api.copilot.review(", "api.runs.start(", "patchTurn("):
+        assert name not in ts, f"chat.ts 里又出现了 {name}：这一轮的决定、发起、落库应在服务端"
 
 
-def test_the_question_field_pattern_matches_the_frontend():
-    found = re.search(r"/(question\|[^/]+)/i\.test", _ts())
-    assert found, "chat.ts 的 fillInput 里找不到认问题字段的正则"
-    assert found.group(1) == turn.QUESTION_FIELD.pattern and turn.QUESTION_FIELD.flags & re.IGNORECASE
-
-
-def _template(source: str) -> str:
-    """一段 TS 里由 + 连起来的模板字符串 → 一个 Python format 模板（${x} → {x}，\\n → 换行）。"""
-    pieces = re.findall(r"`([^`]*)`", source)
-    text = "".join(pieces).replace("\\n", "\n")
-    return re.sub(r"\$\{(\w+)\}", r"{\1}", text)
-
-
-def test_the_retry_wordings_match_the_frontend():
-    body = re.search(r"function retryInstruction\([^)]*\): string \{(.*?)\n\}", _ts(), re.S)
-    assert body, "chat.ts 里找不到 retryInstruction"
-    with_base, scratch = re.split(r"\n\s*: ", body.group(1).split("hasBase", 1)[1].split("?", 1)[1], maxsplit=1)
-    assert _template(with_base) == turn.RETRY_WITH_BASE
-    assert _template(scratch) == turn.RETRY_FROM_SCRATCH
+def test_user_retry_wordings():
+    """用户点「重试本轮」时交给助手的话（以前在页面 retryTurn 里拼）：有图时说「没有给出可用的结果」，没图的同从零重建。"""
+    with_base = turn.user_retry_instruction("上周销售额", "已手动停止", True)
+    assert with_base == ("这个工作流上一次没有给出可用的结果：已手动停止。\n\n请针对这个原因改它（比如调大最大步数、改正工具参数、"
+                         "换个查询方式），改完继续回答原来的问题：上周销售额")
+    assert turn.user_retry_instruction("上周销售额", "已手动停止", False) == turn.retry_instruction(
+        "上周销售额", "已手动停止", False)
 
 
 # --------------------------------------------------------------------------
@@ -172,12 +164,13 @@ async def _run(output: dict, graph: dict, code: str) -> str:
         return run.id
 
 
-def test_the_frontend_retries_an_error_the_server_says_to_retry():
-    """问数据页照服务端给的 next 走：error 操作带 next=retry（只写了思考、一个操作都没给）时带着原因重来一次，不再直接报
-    「助手本轮未完成」。读 chat.ts 里 error 那一支（行为另由 scripts/check-chat.mjs 的 emptyretry 一节在浏览器里守）。"""
-    branch = re.search(r"case 'error':(.*?)break\n", _ts(), re.S)
-    assert branch, "chat.ts 里找不到 error 那一支"
-    assert re.search(r"op\.next === 'retry'", branch.group(1)) and "retry(" in branch.group(1), branch.group(1)
+def test_the_page_says_the_server_is_retrying_an_empty_generation():
+    """只写了思考、一个操作都没给（error.next=retry）时，重来一次是服务端定的（chat/drive.py 照 next_step 走，问数据的一轮记一条
+    turn.retry，kind=empty）；页面照它把这一轮重置、写「助手上一次没有给出任何操作，正在重新生成工作流…」。读 chat.ts 里
+    turn.retry 那一支（行为另由 tests/test_chat_turns.py 和 scripts/check-chat.mjs 的 emptyretry 一节守）。"""
+    branch = re.search(r"function retryPatch\((.*?)\n\}", _ts(), re.S)
+    assert branch, "chat.ts 里找不到 retryPatch"
+    assert re.search(r"d\.kind === 'empty' \? CHAT_RETRY_TEXT\.empty", branch.group(1)), branch.group(1)
 
 
 async def test_answer_ops_says_to_retry_an_empty_generation(client, monkeypatch):

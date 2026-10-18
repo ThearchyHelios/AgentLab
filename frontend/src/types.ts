@@ -1646,6 +1646,22 @@ export interface ConversationTurn {
    * （conversations.BUILD_STALE），前端判断同一件事时用同一只钟。老后端没有
    */
   updated_at?: string
+  /** 这一轮在服务端的任务（问数据整轮在服务端跑，backend/app/chat/job.job_view）。这一波之前的老轮次没有，为 null */
+  job?: ChatTurnJob | null
+}
+
+/** 问数据一轮在服务端的任务现在怎样。status 用后台任务的状态词；stage 是在哪一步；attempt_seq 是这一次尝试从哪一条事件开始 */
+export interface ChatTurnJob {
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
+  stage: 'build' | 'run' | 'waiting' | 'review' | null
+  mode: string
+  run_id: string | null
+  attempt: number
+  last_seq: number
+  attempt_seq: number
+  error: string | null
+  /** 等不及的那次复核还在后台跑 */
+  late_review?: boolean
 }
 
 /**

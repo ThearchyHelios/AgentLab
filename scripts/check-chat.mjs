@@ -1,6 +1,12 @@
 // 问数据页的检查：会话、轮次、运行全部在浏览器这一侧伪造，页面走的是真的
 // chat store / ChatPage / AssistantStream，只有后端换成了脚本。
 //
+// 一轮问数据在服务端跑（docs/design/orchestration-round/00-总方案.md §1）：页面只发起（POST /api/chat/turns）、只播放
+// （GET /api/chat/turns/{id}/stream）。这里伪造的服务端（startTurn / driveTurn，照 backend/app/chat/job.py 的做法）用原来那几份
+// 剧本把一轮跑完：生成（copilotScript）→ 发起运行（launchScript）→ 等运行的剧本放完（fakeStream）→ 复核（reviewScript）→
+// 照服务端的写法拼那一行（end）。log.gens / runStarts / reviews 照旧记下服务端这一侧做了什么，log.patches 用来守「页面不再写
+// 这一轮的结局」。
+//
 // 为什么不真跑：沙箱没有模型密钥，而且要撞上的恰恰是真跑很难稳定复现的那几种
 // 时刻——两个会话同时在跑、答案超过 2000 字被事件截断、跑到一半服务重启、
 // 历史取得慢或者取失败。这里每一种都由脚本精确地摆出来。
@@ -8,7 +14,7 @@
 // 守的事：
 //   1. 忙不忙按会话算：A 在跑时 B 的按钮是「发送」，停止只停 A 自己，删除保护
 //      对准正在跑的那个；
-//   2. run.finished 的 output 被截断时，显示和落库都用 GET 运行拿到的完整版；
+//   2. run.finished 的 output 被截断时，显示用服务端按库里完整成果写的那一份；页面不 PATCH 这一轮；
 //      llm.token 不进 events；
 //   3. 服务重启：stream.end status=interrupted 且没有待审批，这一轮收成
 //      「服务重启，本轮已中断」，给「继续运行」，不再转圈；
@@ -16,10 +22,11 @@
 //   5. 已取消的、人驳回这类原样续上还会失败的轮次没有「继续运行」，续跑被拒时说人话；
 //   6. 1440×900 下长会话的输入框和发送键完整可见，整页不多滚；
 //   7. 首屏例句不拿系统表造句；可信度信息刷新后还在，且写进单独的 meta，不夹在 review 里；
-//   8. 从库里恢复的半路轮次：核对撞上 500 有出路、补交付不走实时计时、查到的终态落库；
-//   9. 长答案没取全要记进 meta，刷新后补全；2000 字按码点数，不按 UTF-16；
-//  10. 发起运行失败：报错不糊成一整行粗体，不许诺不存在的自动重试；重跑挂起的轮次
-//      顺手取消旧运行；断在建图阶段按最后一次落库算有没有动静，发起运行时 meta 跟上新运行；
+//   8. 从库里恢复的半路轮次（老轮次、服务重启后停着的）：交给服务端接着收尾（mode=resume），核对撞上 500 有出路、
+//      补交付不走实时计时，结局照服务端写的那一行摆；
+//   9. 老轮次的长答案没取全：刷新后补全；2000 字按码点数，不按 UTF-16；新轮次按库里的完整成果交付；
+//  10. 发起那一下没到服务端：报错不糊成一整行粗体，不许诺不存在的自动重试；重跑挂起的轮次
+//      顺手取消旧运行；断在建图阶段的老轮次页面不替它写库，重试本轮交给服务端；
 //  11. 左栏：没打开过的会话也标得出状态；筛选框在有筛选词时不消失；删掉的会话进回收站，
 //      能预览、恢复、彻底删除（要确认）；回收站里只能看，不发起任何运行，正在跑的不给
 //      彻底删除（清空也跳过它）；
@@ -38,6 +45,10 @@
 //  19. 答案身上的召回标记（账本接口的 recall）写在轮次底部：「已按口径「X」vN 核对，不影响」、依据有变（目录 / 表结构，几项、
 //      按新目录新出现几条错误级问题），看的人手上有说的是这个答案的召回待办时链到待办；没比对的答案照样写依据有变；做完的
 //      对账卡上写「差在哪」、问说明有没有帮助（说明有用 / 看不懂）。
+//  20. 一轮在服务端跑：实时流断了按收到的最后一个 seq 重连，补齐、不重复；刷新、关掉再打开，服务端那一轮照跑，页面从
+//      这一次尝试的第一条接着播；停止发给服务端的这一轮（建图中也停得下）；发起、重试、继续运行的请求体照实；
+//      使用者（user 角色）不给「继续运行」（服务端照 POST /api/runs/{id}/continue 的老规矩不让它续跑）；两个标签页同时打开
+//      停在半路的一轮，服务端只接着收尾一次，后到的那个接着看同一轮。
 //
 // 所有写请求都被拦在浏览器里，不碰任何库。
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
@@ -63,6 +74,8 @@ const opened = new Set()
 async function section(name, title, fn) {
   if (ONLY.length && !ONLY.includes(name)) return
   console.log(`\n=== ${title} ===`)
+  // 伪造的服务端：上一段里还在跑的几轮就此放下，不再往下写（各段互不牵连）
+  srv.gen += 1
   try {
     await fn()
   } catch (e) {
@@ -217,6 +230,10 @@ const REJECT_CONVS = {
   rejS: conv('c0rejs', '会话：没打开过的那一问', 1, 60 * 24 * 36, { last_status: 'rejected' }),
 }
 /** 只在「助手反问」那段出现：库里存着一轮以反问收尾的（answer 列里是助手问的那句话，meta.asked 标着） */
+/** 只在「刷新后接着看」那段出现：一开始是空的，问的那一轮在伪造的服务端里跑，刷新、关掉再打开时从那里取回来 */
+const REPLAY_CONVS = {
+  replay: conv('c0replay', '会话：刷新后接着看', 0, 60 * 24 * 41),
+}
 const ASKBACK_CONVS = {
   askBack: conv('c0askbk', '助手反问过的会话', 1, 60 * 24 * 34),
 }
@@ -229,6 +246,7 @@ const ASK_CONVS = {
   askZ: conv('c0askz', '问数据：各区域销售额和最大的一单', 1, 60 * 24 * 33),
 }
 const DETAIL = {
+  c0replay: [],
   c0askbk: [turn('tab1', '上周销售额是多少', { answer: '销售额按下单日还是支付日算？', meta: { v: 1, asked: true } })],
   c0ledgr: [turn('tl1', '上周的周报', {
     answer: '（周报原文）', graph: GRAPH, run_id: 'run-led',
@@ -412,6 +430,8 @@ const TABLES = {
 const log = {
   patches: [], cancels: [], continues: [], runStarts: [], archived: [], posts: [], approvalGets: [], runGets: [],
   deleted: [], gens: [], sourceGets: 0, catalogPatches: [], reviews: [],
+  /** 问数据的一轮：发起（POST /api/chat/turns 的请求体）、停止、实时流的每一次连接（从哪个 seq 之后） */
+  turnStarts: [], turnCancels: [], streams: [],
 }
 /** 新服务端复核给的重来那句话：前端得原样交回去，不自己拼 */
 const DECIDE_RETRY = '（服务端拼好的重来说法）照服务端的决定重新回答：有几家门店'
@@ -439,6 +459,20 @@ const ctl = {
   rejectConvs: false,
   /** 列表里多摆「口径账本」那段的会话（LEDGER_CONVS） */
   ledgerConvs: false,
+  /** 伪造的服务端：运行的剧本放完了（`${runId}@${after}`）、继续运行过的运行、等复核最多多久（毫秒） */
+  wsDone: {}, continued: {}, reviewWaitMs: 25_000,
+  /** POST /api/chat/turns 根本没到后端（网断了） */
+  startFail: false,
+  /** 接下来几次实时流连接直接断掉（测断线重连补齐） */
+  dropStreams: 0,
+  /** 对话详情里带上服务端写的那几行（测刷新后接着看） */
+  liveDetail: false,
+  /** 助手每条操作之间隔多久（毫秒） */
+  opGapMs: 10,
+  /** 列表里多摆「刷新后接着看」那段的会话（REPLAY_CONVS）；那段里建图、运行各停在一道闸上 */
+  replayConvs: false, replayBuildGo: false, replayRunGo: false,
+  /** 「停止」那段：建图停在一道闸上 */
+  stopBuildGo: false,
 }
 /** 会话的归档 / 删除状态。各段各自 resetDb，免得上一段删掉的会话影响下一段 */
 const db = { archived: new Set(), purged: new Set() }
@@ -449,7 +483,7 @@ const resetDb = () => {
 resetDb()
 const allConvs = () => [...Object.values(CONVS), ...Object.values(TRASHED), ...(ctl.trashMore ? Object.values(TRASH_MORE) : []),
   ...(ctl.guardConvs ? Object.values(GUARD_CONVS) : []), ...(ctl.askConvs ? Object.values(ASK_CONVS) : []),
-  ...(ctl.askBack ? Object.values(ASKBACK_CONVS) : []),
+  ...(ctl.askBack ? Object.values(ASKBACK_CONVS) : []), ...(ctl.replayConvs ? Object.values(REPLAY_CONVS) : []),
   ...(ctl.fixConvs ? Object.values(FIX_CONVS) : []), ...(ctl.rejectConvs ? Object.values(REJECT_CONVS) : []),
   ...(ctl.ledgerConvs ? Object.values(LEDGER_CONVS) : [])]
   .filter((c) => !db.purged.has(c.id))
@@ -479,8 +513,13 @@ async function fakeApi(route) {
     if (id === 'c0faile' && ctl.failE) return json({ detail: '数据库暂时不可用' }, 500)
     const known = allConvs().find((c) => c.id === id)
     if (!known && id !== 'c0new') return json({ detail: '这个对话不存在，可能已经被删了' }, 404)
-    const turns = typeof DETAIL[id] === 'function' ? DETAIL[id]() : DETAIL[id]
-    return json({ ...(known ?? conv('c0new', '新对话', 0, 0)), turns: turns ?? [] })
+    let turns = (typeof DETAIL[id] === 'function' ? DETAIL[id]() : DETAIL[id]) ?? []
+    if (ctl.liveDetail) {
+      // 服务端写的那几行（刷新、关掉再打开时取回来的就是它们）：夹具里有的换成服务端现在的，新问的接在后面
+      const live = [...srv.turns.values()].filter((T) => T.conversation_id === id && T.gen === srv.gen).map(rowOut)
+      turns = [...turns.map((t) => live.find((x) => x.id === t.id) ?? t), ...live.filter((x) => !turns.some((t) => t.id === x.id))]
+    }
+    return json({ ...(known ?? conv('c0new', '新对话', 0, 0)), turns })
   }
   if (m && method === 'PATCH') {
     const b = body()
@@ -502,109 +541,35 @@ async function fakeApi(route) {
   m = path.match(/^\/conversations\/([^/]+)\/turns\/([^/]+)$/)
   if (m && method === 'PATCH') { log.patches.push({ conv: m[1], turn: m[2], body: body() }); return json(turn(m[2], '', body())) }
 
+  // 问数据的一轮（伪造的服务端，见 startTurn / driveTurn）
+  if (path === '/chat/turns' && method === 'POST') {
+    const b = body()
+    if (ctl.startFail) {
+      log.turnStarts.push({ ...b, failed: true })
+      return route.abort('connectionrefused')
+    }
+    const got = await startTurn(b)
+    return json(got.json, got.status)
+  }
+  m = path.match(/^\/chat\/turns\/([^/]+)(\/stream|\/cancel)?$/)
+  if (m) {
+    const T = srv.turns.get(decodeURIComponent(m[1]))
+    if (!T) return json({ detail: '该轮对话不存在，可能已被删除' }, 404)
+    if (m[2] === '/stream' && method === 'GET') return streamTurn(route, T, Number(url.searchParams.get('after') ?? 0))
+    if (m[2] === '/cancel' && method === 'POST') {
+      log.turnCancels.push(T.id)
+      return cancelTurn(T) ? json({ ok: true }) : json({ detail: '这一轮已经结束，无需停止', code: 'chat_turn_finished' }, 409)
+    }
+    if (!m[2] && method === 'GET') return json({ id: T.id, conversation_id: T.conversation_id, job: { ...T.job }, turn: rowOut(T) })
+  }
   if (path === '/copilot/generate-stream' && method === 'POST') {
+    // 画布助手照旧走这条流（问数据的一轮在伪造的服务端里走同一份剧本，见 copilotScript）
     const b = body()
     log.gens.push(b)
-    if (ctl.scope400 && b.datasource_ids?.length) {
-      // 和后端 copilot._sources 同一个形状：detail 是一句话，code 是稳定的机读码
-      // reworded：后端换了说法，只剩机读码认得出来
-      return json({ detail: ctl.scope400 === 'reworded' ? '这一轮圈定的库一个也找不到了：可能已经被删掉或停用'
-        : '限定的数据源都已不可用，可能已被删除或停用。请取消限定后重试，或到「数据」页确认数据源存在且已启用', code: 'datasource_scope_empty' }, 400)
-    }
-    if (String(b.instruction ?? '').includes('建流程就失败')) {
-      // 后端的 error 操作是三段：人话、怎么办、原始异常
-      const ops = [
-        { op: 'heartbeat', phase: 'planning', elapsed_ms: 400 },
-        { op: 'error', message: '模型返回的工作流结构有误：第 2 个节点的类型「sql」不存在',
-          hint: '请重试，或把需求描述得更具体',
-          detail: "2 validation errors for GraphSpec\nnodes.1.type\n  Input should be 'input', 'output', 'llm' [type=literal_error]" },
-      ]
-      return route.fulfill({ status: 200, contentType: 'text/event-stream',
-        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
-    }
-    if (String(b.instruction ?? '').includes('自查没修好')) {
-      // 服务端自查交回模型改过、还是没过（check failed），final 带着同一批问题：前端不该再整轮重来
-      const ops = [
-        { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
-        ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
-        { op: 'check', status: 'failed', issues: ['「查数」节点还没有选择工具'] },
-        { op: 'final', graph: GRAPH, explanation: '', issues: [{ level: 'error', node_id: 'ag', message: '「查数」节点还没有选择工具' }] },
-      ]
-      return route.fulfill({ status: 200, contentType: 'text/event-stream',
-        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
-    }
-    if (String(b.instruction ?? '').includes('只写了思考')) {
-      // 生成过程一个操作都没给（deepseek 偶发只出思考）：服务端的 error 带 next=retry（backend/app/chat/turn.py 的 next_step）。
-      // 重来那一次（指令里缀了「上一次没有成功」）照常直接回答；「两次都」那一问每次都只写思考
-      const again = String(b.instruction).includes('上一次没有成功') && !String(b.instruction).includes('两次都')
-      const spent = { by_model: { m: { input_tokens: 500, output_tokens: 40, calls: 1, cost_usd: 0.001, unpriced_calls: 0 } },
-        input_tokens: 500, output_tokens: 40, calls: 1, cost_usd: 0.001, unpriced_calls: 0 }
-      const ops = again ? [
-        { op: 'heartbeat', phase: 'planning', elapsed_ms: 200 },
-        { op: 'reply', text: '已经查过了：一共 3 家门店。' },
-        { op: 'usage', ...spent },
-      ] : [
-        { op: 'heartbeat', phase: 'planning', elapsed_ms: 200 },
-        { op: 'thinking', delta: '先想一想要查哪张表……' },
-        { op: 'error', message: '助手本轮未完成：模型没有给出任何修改，也没有说明原因', hint: '画布未修改。可以重试，或把需求描述得更具体',
-          detail: '', reason: '模型没有给出任何修改，也没有说明原因', code: 'copilot_empty', next: 'retry' },
-        { op: 'usage', ...spent },
-      ]
-      return route.fulfill({ status: 200, contentType: 'text/event-stream',
-        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
-    }
-    if (String(b.instruction ?? '').includes('照服务端的决定') || String(b.instruction ?? '').includes(DECIDE_RETRY)) {
-      // 新服务端：final 带 next（backend/app/chat/turn.py），最后一条是这一轮建图的用量（answer_ops 的 usage）。
-      // 「只建不跑」那一问：autorun 没写 false，next 却是 ready——前端得照 next 走
-      const ready = String(b.instruction ?? '').includes('只建不跑')
-      const ops = [
-        { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
-        ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
-        { op: 'done', explanation: '一张三步的图' },
-        { op: 'check', status: 'passed', repaired: 0, warnings: [] },
-        { op: 'final', graph: GRAPH, issues: [], explanation: '一张三步的图', autorun: true, next: ready ? 'ready' : 'run' },
-        { op: 'usage', by_model: { m: { input_tokens: 4000, output_tokens: 300, calls: 1, cost_usd: 0.012, unpriced_calls: 0 } },
-          input_tokens: 4000, output_tokens: 300, calls: 1, cost_usd: 0.012, unpriced_calls: 0 },
-      ]
-      return route.fulfill({ status: 200, contentType: 'text/event-stream',
-        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
-    }
-    if (String(b.instruction ?? '').includes('先问清楚')) {
-      // 助手要先问清楚才能动手（服务端 copilot_gen 的 ask）：问题转出去，这一轮到此为止——没有 final，也没有 reply
-      const ops = [
-        { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
-        { op: 'ask', question: '销售额按下单日还是支付日算？' },
-      ]
-      return route.fulfill({ status: 200, contentType: 'text/event-stream',
-        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
-    }
-    if (String(b.instruction ?? '').includes('表示作废')) {
-      // 用户说了一条数据事实：服务端核对后转出目录修改提案，只回答、不建图
-      const ops = [
-        { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
-        { op: 'catalog_patch', source: 'shop', source_id: 'src-shop', table: 'orders', table_label: '订单', version: 2, changes: [
-          { path: 'columns.status.codes', before: { 1: '已支付' }, before_status: 'confirmed', after: { 1: '已支付', 9: '作废' },
-            value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' }] },
-        { op: 'reply', text: '已整理成数据目录的修改建议，确认后保存即可。' },
-      ]
-      return route.fulfill({ status: 200, contentType: 'text/event-stream',
-        body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
-    }
-    const ops = [
-      { op: 'heartbeat', phase: 'planning', elapsed_ms: 800 },
-      { op: 'heartbeat', phase: 'looking', elapsed_ms: 1000 },
-      // 助手按需查看了表（look 事件）：过程里多一行「查看了 N 张表」，查看记录存进这一轮的 meta.looks。
-      // 这个库还没有数据目录（catalog_tables: 0）：那一行下面提示先去起草目录
-      { op: 'look', id: 'L1', by: 'model', need: '查订单和明细', status: 'ok', elapsed_ms: 1200, objects: [
-        { kind: 'table', source: 'shop', source_id: 'src-shop', named: [], picked: ['orders', 'order_items'], joined: [],
-          missing: [], total: 48, catalog_tables: 0 }] },
-      { op: 'plan', summary: '查一下再回答' },
-      ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
-      { op: 'done', explanation: '一张三步的图' },
-      { op: 'final', graph: GRAPH, issues: [], explanation: '一张三步的图' },
-    ]
+    const got = copilotScript(b)
+    if (got.status) return json(got.json, got.status)
     return route.fulfill({ status: 200, contentType: 'text/event-stream',
-      body: ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
+      body: got.ops.map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') })
   }
   if (path === '/datasources/src-shop/catalog/orders/patch' && method === 'POST') {
     log.catalogPatches.push(body())
@@ -624,60 +589,12 @@ async function fakeApi(route) {
   if (path === '/datasources/src-shop/catalog/orders/impact' && method === 'GET') {
     return json({ table: 'orders', templates: [] })
   }
-  if (path === '/copilot/review' && method === 'POST') {
-    const wait = ctl.reviewDelay[body().run_id]
-    if (wait) await new Promise((r) => setTimeout(r, wait))
-    if (ctl.lateReview && String(body().run_id).startsWith('run-decide')) {
-      // 复核慢过问数据页等的上限（检查里调短成几百毫秒）：答案先交出去，这一次复核的用量晚到了照样要记进这一轮
-      await new Promise((r) => setTimeout(r, ctl.lateReview))
-      log.reviews.push(body())
-      return json({ verdict: 'ok', note: '', answer: null, retry: false, severity: '', signals: [], retry_instruction: null,
-                    usage: { cost_usd: 0.004, unpriced_calls: 0, calls: 1 } })
-    }
-    if (String(body().run_id).startsWith('run-decide')) {
-      // 新服务端：第一次判不可用、给出重来的那句话；重来之后的那次没问题、不再重来。各带复核的用量
-      log.reviews.push(body())
-      const first = body().attempt === 0
-      return json({ verdict: first ? 'annotated' : 'ok', note: first ? '查到一半就停了' : '', answer: null, retry: first,
-                    severity: first ? 'broken' : '', signals: first ? [{ kind: 'step_limit', detail: '用满了步数', severity: 'broken' }] : [],
-                    retry_instruction: first ? DECIDE_RETRY : null,
-                    usage: { cost_usd: first ? 0.003 : 0, unpriced_calls: 0, calls: first ? 1 : 0 } })
-    }
-    // 老后端的复核不认 _evidence，照样回一次改写
-    if (body().run_id === 'run-evid' || body().run_id === 'run-evq') {
-      return json({ verdict: 'rewritten', note: '检索降级过，结论请对照原始数据', answer: '改写后的答案：销售额大约四万多',
-                    original: body().run_id === 'run-evq' ? EVQ.output.answer : EVIDENCE.output['周报'], retry: false, severity: 'degraded',
-                    signals: [{ kind: 'retrieval_degraded', detail: '检索退回关键词', severity: 'degraded' }] })
-    }
-    return json({ verdict: 'ok', note: '', answer: null, retry: false, severity: '', signals: [] })
-  }
+  if (path === '/copilot/review' && method === 'POST') return json(await reviewScript(body()))
   if (path === '/runs' && method === 'POST') {
-    const b = body()
-    const conversation = String(b.input?.question ?? '')
-    // 发起请求根本没到后端（网断了、后端正在重启）
-    if (conversation.includes('启动失败') && ctl.launchFail) return route.abort('connectionrefused')
-    // 发起就被拒：绑定的工具不存在（后端 runs.TOOL_MISSING，{detail, code} 的形状）
-    if (conversation.includes('工具不在')) {
-      return json({ detail: '绑定的工具不存在：「查数」（调用工具）绑定的 db_query__nope。请到「数据」页接入，或在节点中重新选择',
-        code: 'run_tool_missing' }, 422)
-    }
-    const id = conversation.includes('整形解析失败') ? (conversation.includes('现在的说法')
-      ? (conversation.includes('上游') ? 'run-jsonup-now' : 'run-jsonerr-now')
-      : conversation.includes('节点名带超时') ? 'run-jsonslow'
-      : conversation.includes('上游') ? 'run-jsonup'
-      : conversation.includes('改写') ? 'run-jsonauth' : 'run-jsonerr')
-      : conversation.includes('问数据带证据') ? 'run-evq'
-      : conversation.includes('带证据') ? 'run-evid'
-      : conversation.includes('长答案') ? (conversation.includes('取不到运行') ? 'run-noget' : 'run-long')
-      : conversation.includes('审批') ? 'run-wait'
-      : conversation.includes('重启') ? 'run-restart'
-      : conversation.includes('正在写') ? 'run-writing'
-      : conversation.includes('强杀') ? 'run-killed'
-      : conversation.includes('步数用满') ? `run-steps-${++runSeq}`
-      : conversation.includes('照服务端的决定') ? `run-decide-${++runSeq}`
-      : `run-busy-${++runSeq}`
-    log.runStarts.push({ id, graph: b.graph, origin_ref: b.origin_ref })
-    return json({ id, status: 'queued', run_class: 'exploratory', output: {}, usage: {} })
+    const got = launchScript(body())
+    if (got.abort) return route.abort('connectionrefused')
+    if (got.status) return json(got.json, got.status)
+    return json({ id: got.id, status: 'queued', run_class: 'exploratory', output: {}, usage: {} })
   }
   m = path.match(/^\/runs\/([^/]+)\/(cancel|continue)$/)
   if (m && method === 'POST') {
@@ -688,19 +605,9 @@ async function fakeApi(route) {
   }
   m = path.match(/^\/runs\/([^/]+)$/)
   if (m && method === 'GET') {
-    const id = m[1]
-    log.runGets.push(id)
-    if (id === 'run-long') return json({ id, status: 'succeeded', run_class: 'exploratory', output: { answer: FULL }, usage: {} })
-    if (id === 'run-noget' || (id === 'run-unk' && ctl.run500)) return json({ detail: '服务端错误（500），详情请查看服务日志' }, 500)
-    if (id === 'run-unk') return json({ id, status: 'cancelled', run_class: 'exploratory', output: {}, usage: {} })
-    if (id.startsWith('run-404')) return json({ detail: '运行不存在' }, 404)
-    if (RUNS[id]) return json({ id, run_class: 'exploratory', usage: {}, ...RUNS[id] })
-    if (id.startsWith('run-c') || id === 'run-b1') return json({ id, status: 'succeeded', run_class: 'exploratory', output: {}, usage: {} })
-    if (id.startsWith('run-decide')) {
-      return json({ id, status: 'succeeded', run_class: 'exploratory', output: { answer: '三家门店。' },
-                    usage: { cost_usd: 0.02, calls: 2, input_tokens: 6000, output_tokens: 400 } })
-    }
-    return json({ id, status: 'interrupted', run_class: 'exploratory', output: {}, usage: {} })
+    log.runGets.push(m[1])
+    const got = runRecord(m[1])
+    return json(got.json, got.status)
   }
   if (path.startsWith('/approvals')) {
     log.approvalGets.push(Date.now())
@@ -730,6 +637,197 @@ async function fakeApi(route) {
 
   if (method === 'GET') return route.continue()
   return route.abort()   // 其余写操作一律不放
+}
+
+/**
+ * 复核的剧本（服务端 api/copilot.review_of_run 的结果），按运行 id 挑；有的故意慢（reviewDelay、lateReview）。问数据的一轮由伪造的
+ * 服务端（fakeTurns）调它，/copilot/review 照旧答它
+ */
+async function reviewScript(b) {
+  const wait = ctl.reviewDelay[b.run_id]
+  if (wait) await new Promise((r) => setTimeout(r, wait))
+  if (ctl.lateReview && String(b.run_id).startsWith('run-decide')) {
+    // 复核慢过问数据页等的上限（检查里调短成几百毫秒）：答案先交出去，这一次复核的用量晚到了照样要记进这一轮
+    await new Promise((r) => setTimeout(r, ctl.lateReview))
+    log.reviews.push(b)
+    return { verdict: 'ok', note: '', answer: null, retry: false, severity: '', signals: [], retry_instruction: null,
+                  usage: { cost_usd: 0.004, unpriced_calls: 0, calls: 1 } }
+  }
+  if (String(b.run_id).startsWith('run-decide')) {
+    // 新服务端：第一次判不可用、给出重来的那句话；重来之后的那次没问题、不再重来。各带复核的用量
+    log.reviews.push(b)
+    const first = b.attempt === 0
+    return { verdict: first ? 'annotated' : 'ok', note: first ? '查到一半就停了' : '', answer: null, retry: first,
+                  severity: first ? 'broken' : '', signals: first ? [{ kind: 'step_limit', detail: '用满了步数', severity: 'broken' }] : [],
+                  retry_instruction: first ? DECIDE_RETRY : null,
+                  usage: { cost_usd: first ? 0.003 : 0, unpriced_calls: 0, calls: first ? 1 : 0 } }
+  }
+  // 老后端的复核不认 _evidence，照样回一次改写
+  if (b.run_id === 'run-evid' || b.run_id === 'run-evq') {
+    return { verdict: 'rewritten', note: '检索降级过，结论请对照原始数据', answer: '改写后的答案：销售额大约四万多',
+                  original: b.run_id === 'run-evq' ? EVQ.output.answer : EVIDENCE.output['周报'], retry: false, severity: 'degraded',
+                  signals: [{ kind: 'retrieval_degraded', detail: '检索退回关键词', severity: 'degraded' }] }
+  }
+  return { verdict: 'ok', note: '', answer: null, retry: false, severity: '', signals: [] }
+}
+
+/** 发起一次运行（服务端 engine/launch.launch_run）：按问题挑这次运行的 id，记下发起时的图和来源。被拒的给 {status, json} */
+function launchScript(b) {
+  const conversation = String(b.input?.question ?? '')
+  // 发起请求根本没到后端（网断了、后端正在重启）
+  if (conversation.includes('启动失败') && ctl.launchFail) return { abort: true }
+  // 发起就被拒：绑定的工具不存在（后端 runs.TOOL_MISSING，{detail, code} 的形状）
+  if (conversation.includes('工具不在')) {
+    return { status: 422, json: { detail: '绑定的工具不存在：「查数」（调用工具）绑定的 db_query__nope。请到「数据」页接入，或在节点中重新选择',
+      code: 'run_tool_missing' } }
+  }
+  const id = conversation.includes('整形解析失败') ? (conversation.includes('现在的说法')
+    ? (conversation.includes('上游') ? 'run-jsonup-now' : 'run-jsonerr-now')
+    : conversation.includes('节点名带超时') ? 'run-jsonslow'
+    : conversation.includes('上游') ? 'run-jsonup'
+    : conversation.includes('改写') ? 'run-jsonauth' : 'run-jsonerr')
+    : conversation.includes('问数据带证据') ? 'run-evq'
+    : conversation.includes('带证据') ? 'run-evid'
+    : conversation.includes('长答案') ? (conversation.includes('取不到运行') ? 'run-noget' : 'run-long')
+    : conversation.includes('刷新后接着看') ? 'run-replay'
+    : conversation.includes('审批') ? 'run-wait'
+    : conversation.includes('重启') ? 'run-restart'
+    : conversation.includes('正在写') ? 'run-writing'
+    : conversation.includes('强杀') ? 'run-killed'
+    : conversation.includes('步数用满') ? `run-steps-${++runSeq}`
+    : conversation.includes('照服务端的决定') ? `run-decide-${++runSeq}`
+    : `run-busy-${++runSeq}`
+  log.runStarts.push({ id, graph: b.graph, origin_ref: b.origin_ref })
+  return { id }
+}
+
+/** 库里的运行（GET /api/runs/{id}）：{status, json} */
+function runRecord(id) {
+  if (id === 'run-long') return { status: 200, json: { id, status: 'succeeded', run_class: 'exploratory', output: { answer: FULL }, usage: {} } }
+  if (id === 'run-noget' || (id === 'run-unk' && ctl.run500)) return { status: 500, json: { detail: '服务端错误（500），详情请查看服务日志' } }
+  if (id === 'run-unk') return { status: 200, json: { id, status: 'cancelled', run_class: 'exploratory', output: {}, usage: {} } }
+  if (id.startsWith('run-404')) return { status: 404, json: { detail: '运行不存在' } }
+  if (RUNS[id]) return { status: 200, json: { id, run_class: 'exploratory', usage: {}, ...RUNS[id] } }
+  if (id.startsWith('run-c') || id === 'run-b1') return { status: 200, json: { id, status: 'succeeded', run_class: 'exploratory', output: {}, usage: {} } }
+  if (id.startsWith('run-decide')) {
+    return { status: 200, json: { id, status: 'succeeded', run_class: 'exploratory', output: { answer: '三家门店。' },
+                  usage: { cost_usd: 0.02, calls: 2, input_tokens: 6000, output_tokens: 400 } } }
+  }
+  return { status: 200, json: { id, status: 'interrupted', run_class: 'exploratory', output: {}, usage: {} } }
+}
+
+/**
+ * 助手生成过程的剧本（服务端 api/copilot.answer_ops 交出的那一串操作），按问法挑。开流之前就被拒的给 {status, json}。
+ * 画布助手经 /copilot/generate-stream 收它；问数据的一轮由伪造的服务端（fakeTurns）照它跑
+ */
+function copilotScript(b) {
+  if (ctl.scope400 && b.datasource_ids?.length) {
+    // 和后端 copilot._sources 同一个形状：detail 是一句话，code 是稳定的机读码
+    // reworded：后端换了说法，只剩机读码认得出来
+    return { status: 400, json: { detail: ctl.scope400 === 'reworded' ? '这一轮圈定的库一个也找不到了：可能已经被删掉或停用'
+      : '限定的数据源都已不可用，可能已被删除或停用。请取消限定后重试，或到「数据」页确认数据源存在且已启用', code: 'datasource_scope_empty' } }
+  }
+  if (String(b.instruction ?? '').includes('建流程就失败')) {
+    // 后端的 error 操作是三段：人话、怎么办、原始异常
+    const ops = [
+      { op: 'heartbeat', phase: 'planning', elapsed_ms: 400 },
+      { op: 'error', message: '模型返回的工作流结构有误：第 2 个节点的类型「sql」不存在',
+        hint: '请重试，或把需求描述得更具体',
+        detail: "2 validation errors for GraphSpec\nnodes.1.type\n  Input should be 'input', 'output', 'llm' [type=literal_error]" },
+    ]
+    return { ops }
+  }
+  if (String(b.instruction ?? '').includes('自查没修好')) {
+    // 服务端自查交回模型改过、还是没过（check failed），final 带着同一批问题：前端不该再整轮重来
+    const ops = [
+      { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+      ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
+      { op: 'check', status: 'failed', issues: ['「查数」节点还没有选择工具'] },
+      { op: 'final', graph: GRAPH, explanation: '', issues: [{ level: 'error', node_id: 'ag', message: '「查数」节点还没有选择工具' }] },
+    ]
+    return { ops }
+  }
+  if (String(b.instruction ?? '').includes('只写了思考')) {
+    // 生成过程一个操作都没给（deepseek 偶发只出思考）：服务端的 error 带 next=retry（backend/app/chat/turn.py 的 next_step）。
+    // 重来那一次（指令里缀了「上一次没有成功」）照常直接回答；「两次都」那一问每次都只写思考
+    const again = String(b.instruction).includes('上一次没有成功') && !String(b.instruction).includes('两次都')
+    const spent = { by_model: { m: { input_tokens: 500, output_tokens: 40, calls: 1, cost_usd: 0.001, unpriced_calls: 0 } },
+      input_tokens: 500, output_tokens: 40, calls: 1, cost_usd: 0.001, unpriced_calls: 0 }
+    const ops = again ? [
+      { op: 'heartbeat', phase: 'planning', elapsed_ms: 200 },
+      { op: 'reply', text: '已经查过了：一共 3 家门店。' },
+      { op: 'usage', ...spent },
+    ] : [
+      { op: 'heartbeat', phase: 'planning', elapsed_ms: 200 },
+      { op: 'thinking', delta: '先想一想要查哪张表……' },
+      { op: 'error', message: '助手本轮未完成：模型没有给出任何修改，也没有说明原因', hint: '画布未修改。可以重试，或把需求描述得更具体',
+        detail: '', reason: '模型没有给出任何修改，也没有说明原因', code: 'copilot_empty', next: 'retry' },
+      { op: 'usage', ...spent },
+    ]
+    return { ops }
+  }
+  if (String(b.instruction ?? '').includes('照服务端的决定') || String(b.instruction ?? '').includes(DECIDE_RETRY)) {
+    // 新服务端：final 带 next（backend/app/chat/turn.py），最后一条是这一轮建图的用量（answer_ops 的 usage）。
+    // 「只建不跑」那一问：autorun 没写 false，next 却是 ready——前端得照 next 走
+    const ready = String(b.instruction ?? '').includes('只建不跑')
+    const ops = [
+      { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+      ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
+      { op: 'done', explanation: '一张三步的图' },
+      { op: 'check', status: 'passed', repaired: 0, warnings: [] },
+      { op: 'final', graph: GRAPH, issues: [], explanation: '一张三步的图', autorun: true, next: ready ? 'ready' : 'run' },
+      { op: 'usage', by_model: { m: { input_tokens: 4000, output_tokens: 300, calls: 1, cost_usd: 0.012, unpriced_calls: 0 } },
+        input_tokens: 4000, output_tokens: 300, calls: 1, cost_usd: 0.012, unpriced_calls: 0 },
+    ]
+    return { ops }
+  }
+  if (/刷新后接着看|停止测试/.test(String(b.instruction ?? ''))) {
+    // 建到一半停在闸上：刷新、关掉再打开、停止都要在建图中途发生
+    const gate = String(b.instruction).includes('停止测试') ? 'stopBuildGo' : 'replayBuildGo'
+    const ops = [
+      { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+      { op: 'plan', summary: '查一下再回答' },
+      ...GRAPH.nodes.slice(0, 2).map((n) => ({ op: 'add_node', node: n })),
+      { gate },
+      { op: 'add_node', node: GRAPH.nodes[2] },
+      { op: 'done', explanation: '一张三步的图' },
+      { op: 'final', graph: GRAPH, issues: [], explanation: '一张三步的图', autorun: true, next: 'run' },
+    ]
+    return { ops }
+  }
+  if (String(b.instruction ?? '').includes('先问清楚')) {
+    // 助手要先问清楚才能动手（服务端 copilot_gen 的 ask）：问题转出去，这一轮到此为止——没有 final，也没有 reply
+    const ops = [
+      { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+      { op: 'ask', question: '销售额按下单日还是支付日算？' },
+    ]
+    return { ops }
+  }
+  if (String(b.instruction ?? '').includes('表示作废')) {
+    // 用户说了一条数据事实：服务端核对后转出目录修改提案，只回答、不建图
+    const ops = [
+      { op: 'heartbeat', phase: 'planning', elapsed_ms: 300 },
+      { op: 'catalog_patch', source: 'shop', source_id: 'src-shop', table: 'orders', table_label: '订单', version: 2, changes: [
+        { path: 'columns.status.codes', before: { 1: '已支付' }, before_status: 'confirmed', after: { 1: '已支付', 9: '作废' },
+          value: { 9: '作废' }, reason: '用户说明 status=9 表示作废', state: 'change' }] },
+      { op: 'reply', text: '已整理成数据目录的修改建议，确认后保存即可。' },
+    ]
+    return { ops }
+  }
+  const ops = [
+    { op: 'heartbeat', phase: 'planning', elapsed_ms: 800 },
+    { op: 'heartbeat', phase: 'looking', elapsed_ms: 1000 },
+    // 助手按需查看了表（look 事件）：过程里多一行「查看了 N 张表」，查看记录存进这一轮的 meta.looks。
+    // 这个库还没有数据目录（catalog_tables: 0）：那一行下面提示先去起草目录
+    { op: 'look', id: 'L1', by: 'model', need: '查订单和明细', status: 'ok', elapsed_ms: 1200, objects: [
+      { kind: 'table', source: 'shop', source_id: 'src-shop', named: [], picked: ['orders', 'order_items'], joined: [],
+        missing: [], total: 48, catalog_tables: 0 }] },
+    { op: 'plan', summary: '查一下再回答' },
+    ...GRAPH.nodes.map((n) => ({ op: 'add_node', node: n })),
+    { op: 'done', explanation: '一张三步的图' },
+    { op: 'final', graph: GRAPH, issues: [], explanation: '一张三步的图' },
+  ]
+  return { ops }
 }
 
 /** 每条运行的事件剧本。done=true 时剧本放完就发 stream.end */
@@ -810,6 +908,19 @@ function script(runId, after = 0) {
         ...Array.from({ length: 60 }, (_, i) => ev(3 + i, 'llm.token', 'ag', { delta: '字' })),
         ev(70, 'node.finished', 'ag', { duration_ms: 1200 }),
         ev(71, 'run.finished', null, { output: { answer: FULL.slice(0, 2000) }, output_truncated: true }),
+      ],
+      end: 'succeeded',
+    }
+  }
+  if (runId === 'run-replay') {
+    // 跑到一半停在闸上：关掉再打开时运行还在跑
+    return {
+      events: [
+        ev(1, 'run.started', null, { nodes: 3 }),
+        ev(2, 'node.started', 'ag', { node_type: 'agent', label: '查数' }),
+        { gate: 'replayRunGo' },
+        ev(3, 'node.finished', 'ag', { duration_ms: 900 }),
+        ev(4, 'run.finished', null, { output: { answer: '刷新之后接着跑完了：两家门店。' } }),
       ],
       end: 'succeeded',
     }
@@ -905,7 +1016,8 @@ function script(runId, after = 0) {
 async function fakeStream(ws) {
   const runId = new URL(ws.url()).pathname.split('/')[3]
   ctl.wsClosed[runId] = false
-  ws.onClose(() => { ctl.wsClosed[runId] = true })
+  let closed = false
+  ws.onClose(() => { closed = true; ctl.wsClosed[runId] = true })
   const after = Number(new URL(ws.url()).searchParams.get('after') ?? 0)
   const { events, end } = script(runId, after)
   for (const e of events) {
@@ -914,6 +1026,7 @@ async function fakeStream(ws) {
       continue
     }
     if (e.seq <= after) continue
+    if (closed) return
     if (runId === 'run-writing' && e.type === 'llm.token' && !ctl.writingAt) ctl.writingAt = Date.now()
     // 审批和中断同时产生：后端在停下的那一刻才建出这条待审批
     if (runId === 'run-wait' && e.type === 'run.interrupted') {
@@ -923,8 +1036,474 @@ async function fakeStream(ws) {
     ws.send(JSON.stringify(e))
     await new Promise((r) => setTimeout(r, 15))
   }
+  if (closed) return
   if (end === 'close') ws.close()
   else if (end) ws.send(JSON.stringify({ type: 'stream.end', status: end, data: { status: end } }))
+  // 剧本放完了：伪造的服务端据此认这次运行到了终态（真服务端按库里的状态，事件先落库）
+  if (end) ctl.wsDone[`${runId}@${after}`] = true
+}
+
+// ---------------------------------------------------------------- 伪造的服务端一轮
+
+/**
+ * 问数据的一轮在服务端跑（backend/app/chat/job.py；接口 backend/app/api/chat_turns.py）。页面只发起（POST /api/chat/turns）、
+ * 只看（GET /api/chat/turns/{id}/stream 先回放、再推实时，断了按 seq 重连），这里照服务端的做法把一轮跑完：
+ *   生成（copilotScript 的剧本，原样记进 log.gens）→ final.next → 发起运行（launchScript，记进 log.runStarts）→ 等运行的剧本放完
+ *   （fakeStream）→ 复核（reviewScript，最多等 ctl.reviewWaitMs，晚到的照记用量）→ 按复核重来一次 → 照服务端的写法拼那一行（end）。
+ * 实时流是长轮询：没有新事件就等一会儿再答，答完连接就关；页面按收到的最后一个 seq 马上接着连（和服务端断线时一样）。
+ */
+const srv = { turns: new Map(), seq: 0, launched: new Set(), gen: 0 }
+const ACTIVE_JOB = new Set(['queued', 'running'])
+const turnActive = (T) => ACTIVE_JOB.has(T.job.status) || !!T.late
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const BUSY_TEXT = '这段对话正有一轮在进行：等它结束或先停止，再提问'
+
+function emit(T, type, data = {}) {
+  const e = { seq: T.events.length + 1, type, data, ts: Date.now() / 1000 }
+  T.events.push(e)
+  T.job.last_seq = e.seq
+  return e.seq
+}
+
+/** 那一行（GET /api/conversations/{id} 里的一轮、end 里带的 turn） */
+const rowOut = (T) => ({ ...T.row, meta: T.row.meta ? { ...T.row.meta } : T.row.meta, job: { ...T.job } })
+
+const addTotal = (a, b) => {
+  const out = { ...(a ?? {}) }
+  for (const k of ['cost_usd', 'unpriced_calls', 'calls', 'unfinished_calls', 'input_tokens', 'output_tokens']) {
+    const v = Number(b?.[k] ?? 0)
+    if (Number.isFinite(v) && v) out[k] = Math.round((Number(out[k] ?? 0) + v) * 1e6) / 1e6
+  }
+  return out
+}
+const retireRun = (usage) => {
+  const { run, ...rest } = usage ?? {}
+  return run && Object.keys(run).length ? { ...rest, earlier: addTotal(rest.earlier, run) } : rest
+}
+const answerText = (output) => Object.entries(output ?? {})
+  .filter(([k, v]) => !k.startsWith('_') && v != null && v !== '').map(([, v]) => (typeof v === 'string' ? v : JSON.stringify(v))).join('\n')
+
+/** 用户点重试：上一次的结局归档（同服务端 chat/record.attempt_record） */
+function attemptRecord(row, n) {
+  const meta = row.meta ?? {}
+  const review = row.review ?? {}
+  const base = { n, at: Date.now(), runId: meta.runId !== undefined ? meta.runId : row.run_id ?? null,
+                 ...(row.answer ? { answer: row.answer.length > 4000 ? `${row.answer.slice(0, 4000)}…` : row.answer } : {}) }
+  const signals = (review.signals ?? []).map((x) => x.detail).join('\n') || undefined
+  if (meta.outcome === 'cancelled' && meta.rejected) {
+    const sub = meta.rejected.sub ?? ''
+    return { ...base, outcome: 'rejected', summary: `被驳回${sub ? `：${sub}` : ''}` }
+  }
+  if (meta.outcome === 'cancelled' || (row.status === 'error' && row.error === '已取消')) return { ...base, outcome: 'cancelled', summary: '已手动停止' }
+  if (meta.outcome === 'suspended') return { ...base, outcome: 'suspended', summary: '服务重启，运行中断' }
+  if (row.status === 'error') {
+    const f = meta.failure
+    return { ...base, outcome: 'failed', summary: f ? (f.reason ? `${f.title}：${f.reason}` : f.title) : row.error || '发生错误',
+             ...(meta.cause ? { cause: meta.cause } : {}) }
+  }
+  if (review.severity === 'broken') return { ...base, outcome: 'unusable', summary: `结论不可用：${review.note ?? ''}`, detail: signals }
+  if (review.severity === 'degraded') return { ...base, outcome: 'partial', summary: `存在缺口：${review.note ?? ''}`, detail: signals }
+  return { ...base, outcome: 'done', summary: '已给出答案' }
+}
+const attemptReason = (a) => (a.detail ? `${a.summary}（${String(a.detail).slice(0, 300)}）` : a.summary)
+
+/** 种一轮：库里已经有的（夹具里的那一行），或者新问的 */
+function seedTurn(conversationId, id, row) {
+  const T = {
+    id, conversation_id: conversationId, row: { ...row, meta: row.meta ? { ...row.meta } : null },
+    job: { status: 'succeeded', stage: null, mode: 'ask', run_id: null, attempt: 0, last_seq: 0, attempt_seq: 0, error: null },
+    events: [], cancelled: false, late: null, runId: null, usage: {}, looks: [],
+  }
+  srv.turns.set(id, T)
+  return T
+}
+function knownRow(conversationId, turnId) {
+  const rows = typeof DETAIL[conversationId] === 'function' ? DETAIL[conversationId]() : DETAIL[conversationId] ?? []
+  return rows.find((t) => t.id === turnId) ?? null
+}
+const scopeOf = (ids) => (ids ?? []).map((id) => {
+  const hit = [...SOURCES, EXTRA_SOURCE].find((x) => x.id === id || x.name === id)
+  return hit ? { id: hit.id, name: hit.name } : { id, name: id }
+})
+
+/** 这一轮还在跑时每一步之间看一眼：停了、这一段检查结束了，就不再往下写 */
+const gone = (T, epoch) => T.cancelled || T.epoch !== epoch || T.gen !== srv.gen
+
+async function startTurn(b) {
+  const mode = b.mode ?? (b.retry_of ? 'retry' : 'ask')
+  let T
+  if (mode === 'ask') {
+    log.posts.push(b.conversation_id)
+    const id = `srv-${b.conversation_id}-${++srv.seq}`
+    const scope = scopeOf(b.datasource_ids)
+    T = seedTurn(b.conversation_id, id, turn(id, b.question, { status: 'running', meta: { v: 1, ...(scope.length ? { scope } : {}) } }))
+  } else {
+    T = srv.turns.get(b.retry_of)
+    // 夹具里的那一行：每一段检查从库里原样的那一行起（上一段、上一套主题对它做过什么都不算）
+    const row = !T || T.gen !== srv.gen ? knownRow(b.conversation_id, b.retry_of) : null
+    if (row) T = seedTurn(b.conversation_id, b.retry_of, row)
+    if (!T) return { status: 404, json: { detail: '该轮对话不存在，可能已被删除' } }
+  }
+  const others = [...srv.turns.values()].filter((x) => x !== T && x.conversation_id === b.conversation_id
+    && ACTIVE_JOB.has(x.job.status) && x.job.stage !== 'waiting' && x.gen === srv.gen)
+  if (mode !== 'resume' && others.length) return { status: 409, json: { detail: BUSY_TEXT, code: 'chat_turn_busy' } }
+  if (mode !== 'ask' && ACTIVE_JOB.has(T.job.status)) return { status: 409, json: { detail: BUSY_TEXT, code: 'chat_turn_busy' } }
+  const meta = { ...(T.row.meta ?? {}) }
+  const runId = meta.runId !== undefined ? meta.runId : T.row.run_id ?? null
+  const now = Date.now()
+  const request = { mode, started_ms: now }
+  let attempts = [...(meta.attempts ?? [])]
+  const scope = b.datasource_ids ? scopeOf(b.datasource_ids) : meta.scope ?? []
+  if (mode === 'continue') {
+    log.continues.push(runId)
+    if (runId !== 'run-restart' && runId !== 'run-susp') {
+      return { status: 409, json: { detail: '这次运行已完成，无需继续运行：只有失败的运行或被服务重启打断的运行可以继续运行。如需再次运行，请重新发起。' } }
+    }
+    ctl.continued[runId] = true
+    delete ctl.wsDone[`${runId}@4`]
+  }
+  if (mode === 'resume' && ctl.run500 && runId === 'run-unk') {
+    // 服务端核对那一下出错（查库超时之类）：页面说没核对上，给「重新核对」
+    return { status: 500, json: { detail: '服务端错误（500），详情请查看服务日志' } }
+  }
+  if (mode === 'continue' || mode === 'resume') {
+    request.follow = runId
+    if (T.row.status !== 'running' && typeof meta.ms === 'number') request.started_ms = now - meta.ms
+    const rec = runRecord(String(runId ?? ''))
+    if (T.row.status === 'running' && rec.json?.started_at) request.started_ms = Date.parse(rec.json.started_at)
+    if (mode === 'resume' && ['succeeded', 'failed', 'cancelled'].includes(rec.json?.status) && rec.json?.finished_at) {
+      request.ended_ms = Date.parse(rec.json.finished_at)
+    }
+    T.row = { ...T.row, status: 'running', error: '', meta: { ...meta, scope: scope.length ? scope : undefined } }
+  } else {
+    if (['rerun', 'max_steps', 'run'].includes(mode) && !(T.row.graph?.nodes?.length)) {
+      return { status: 409, json: { detail: '这一轮没有可运行的工作流，请重试本轮', code: 'chat_turn_invalid' } }
+    }
+    if (runId && mode !== 'run') {
+      // 服务重启挂起的旧运行没人会再去续它：顺手取消（停在审批上的不算）
+      const rec = runRecord(runId)
+      const pending = ctl.approvals.some((a) => a.run_id === runId && a.status === 'pending')
+      if (rec.json?.status === 'interrupted' && !pending) log.cancels.push(runId)
+    }
+    if (mode !== 'run') {
+      const archived = attemptRecord(T.row, attempts.length + 1)
+      attempts.push(archived)
+      if (mode === 'retry') {
+        const reason = attemptReason(archived)
+        request.base = !!T.row.graph?.nodes?.length
+        request.instruction = request.base
+          ? `这个工作流上一次没有给出可用的结果：${reason}。\n\n请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），改完继续回答原来的问题：${T.row.question}`
+          : `${T.row.question}\n\n（上一次没有成功：${reason}。请针对这个原因调整，重新给出完整的工作流。）`
+      }
+      if (mode === 'max_steps') request.max_steps = b.max_steps
+    }
+    const usage = mode === 'run' ? meta.usage : retireRun(meta.usage)
+    T.row = { ...T.row, status: 'running', error: '', answer: mode === 'run' ? T.row.answer : '', review: {}, run_id: null,
+              meta: mode === 'run' ? { ...meta, runId: null } : { v: 1, ...(attempts.length ? { attempts } : {}),
+                ...(scope.length ? { scope } : {}), ...(usage && Object.keys(usage).length ? { usage } : {}), runId: null } }
+  }
+  T.epoch = (T.epoch ?? 0) + 1
+  T.gen = srv.gen
+  T.cancelled = false
+  T.late = null
+  T.request = request
+  T.scope = scope
+  T.job = { status: 'running', stage: null, mode, run_id: request.follow ?? null, attempt: 0, last_seq: T.events.length,
+            attempt_seq: 0, error: null }
+  T.job.attempt_seq = emit(T, 'turn.attempt', {
+    mode, attempts, scope, usage: T.row.meta?.usage ?? {}, started_ms: request.started_ms,
+    ...(request.ended_ms ? { ended_ms: request.ended_ms } : {}), ...(request.max_steps ? { max_steps: request.max_steps } : {}),
+  })
+  log.turnStarts.push({ ...b, _turn: T.id })
+  void driveTurn(T, T.epoch).catch((e) => console.log(`  · 伪造的服务端出错：${e?.stack ?? e}`))
+  return { status: 202, json: { turn_id: T.id, turn: rowOut(T) } }
+}
+
+function stage(T, name) {
+  T.job.stage = name
+  emit(T, 'stage', { stage: name })
+}
+
+function saveRow(T, fields, meta) {
+  const merged = { ...(T.row.meta ?? {}), v: 1 }
+  for (const [k, v] of Object.entries(meta ?? {})) {
+    if (v === undefined || v === null) delete merged[k]
+    else merged[k] = v
+  }
+  merged.at = Date.now()
+  T.row = { ...T.row, ...fields, meta: merged }
+}
+
+/** 这一轮到此为止：写那一行、发 end（同服务端 ChatTurnExecution._conclude） */
+function settle(T, outcome, fields, meta, output = null, run = null) {
+  const ms = Math.max(0, (T.request.ended_ms ?? Date.now()) - T.request.started_ms)
+  saveRow(T, fields, { looks: T.looks.length ? T.looks : undefined, ms, ...meta })
+  emit(T, 'end', { outcome, turn: rowOut(T), output, run })
+  T.job = { ...T.job, status: 'succeeded', stage: null }
+}
+
+async function driveTurn(T, epoch) {
+  const req = T.request
+  const mode = req.mode
+  const autoRetry = mode === 'ask' || mode === 'retry'
+  let attempts = 0
+  let instruction = req.instruction ?? T.row.question
+  let base = req.base ? T.row.graph : null
+  let direct = ['rerun', 'max_steps', 'run'].includes(mode) ? T.row.graph : null
+  if (mode === 'max_steps') {
+    direct = { ...direct, nodes: direct.nodes.map((n) => (n.type === 'agent'
+      ? { ...n, data: { ...n.data, config: { ...(n.data?.config ?? {}), max_steps: req.max_steps } } } : n)) }
+    T.row = { ...T.row, graph: direct }
+  }
+  let follow = req.follow ?? null
+  T.usage = { ...(T.row.meta?.usage ?? {}) }
+  T.looks = []
+  while (true) {
+    if (!direct && !follow) {
+      stage(T, 'build')
+      const gen = { instruction, base_graph: base, intent: 'answer', conversation_id: T.conversation_id,
+                    ...(T.scope?.length ? { datasource_ids: T.scope.map((x) => x.id) } : {}) }
+      log.gens.push(gen)
+      const got = copilotScript(gen)
+      if (got.status) {
+        const message = got.json.detail
+        return settle(T, 'error', { status: 'error', error: message, review: {} },
+          { cause: { kind: 'refused', message, code: got.json.code ?? null }, runId: null, usage: T.usage })
+      }
+      const ops = []
+      for (const op of got.ops) {
+        if (op.gate) { await until(() => ctl[op.gate] || gone(T, epoch), 15000); continue }
+        if (gone(T, epoch)) return
+        emit(T, 'op', op)
+        if (op.op !== 'thinking' && op.op !== 'heartbeat') ops.push(op)
+        if (op.op === 'look') T.looks.push(op)
+        if (op.op === 'usage') T.usage.copilot = addTotal(T.usage.copilot, op)
+        if (op.op === 'final' && !op.asked) T.row = { ...T.row, graph: op.graph, explanation: op.explanation ?? '' }
+        await sleep(ctl.opGapMs ?? 10)
+      }
+      if (gone(T, epoch)) return
+      const terminal = ops.filter((o) => ['final', 'reply', 'error'].includes(o.op)).at(-1)
+      if (!terminal) {
+        const ask = ops.filter((o) => o.op === 'ask').at(-1)
+        const q = String(ask?.question ?? '')
+        return settle(T, 'asked', { status: 'done', answer: q, review: {} },
+          { asked: { question: q, options: ask?.options ?? [] }, runId: null, usage: T.usage }, q ? { answer: q } : null)
+      }
+      if (terminal.op === 'error') {
+        if (terminal.next === 'retry' && attempts + 1 < 2) {
+          attempts += 1
+          const reason = terminal.reason ?? String(terminal.message ?? '').replace(/^助手本轮未完成：/, '')
+          instruction = base ? `这个工作流上一次运行没有成功：${reason}。\n\n请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），改完继续回答原来的问题：${T.row.question}`
+            : `${T.row.question}\n\n（上一次没有成功：${reason}。请针对这个原因调整，重新给出完整的工作流。）`
+          emit(T, 'turn.retry', { kind: 'empty', reason, base: !!base, attempt: attempts, usage: T.usage })
+          continue
+        }
+        const message = String(terminal.message ?? '助手本轮未完成')
+        return settle(T, 'error', { status: 'error', error: message, review: {} },
+          { cause: { kind: 'copilot', message, hint: terminal.hint, detail: terminal.detail }, runId: null, usage: T.usage })
+      }
+      if (terminal.op === 'reply') {
+        const text = String(terminal.text ?? '')
+        return settle(T, 'reply', { status: 'done', answer: text, review: {} }, { noQuery: true, runId: null, usage: T.usage },
+          { answer: text })
+      }
+      const blockers = (terminal.issues ?? []).filter((i) => i.level === 'error').map((i) => i.message)
+      const selfChecked = ops.some((o) => o.op === 'check')
+      const asked = ops.filter((o) => o.op === 'ask').at(-1)
+      const next = terminal.next ?? (blockers.length ? (selfChecked ? 'fail' : 'retry') : terminal.autorun === false ? 'ready' : 'run')
+      if (next === 'fail' || next === 'retry') {
+        return settle(T, 'error', { status: 'error', error: `生成的工作流没有通过校验：${blockers.join('；')}`, graph: terminal.graph,
+                                    explanation: terminal.explanation ?? '', review: {} },
+          { cause: { kind: 'blocked', issues: blockers, self_checked: selfChecked }, runId: null, usage: T.usage })
+      }
+      if (next === 'ready') {
+        const q = String(asked?.question ?? '').trim()
+        return settle(T, 'ready', { status: 'done', graph: terminal.graph, explanation: terminal.explanation ?? '', review: {},
+                                    ...(q ? { answer: q } : {}) },
+          { runId: null, usage: T.usage, ...(q ? { asked: { question: q, options: [] } } : {}) }, q ? { answer: q } : null)
+      }
+      direct = terminal.graph
+    }
+
+    stage(T, 'run')
+    let runId = follow
+    if (!runId) {
+      const launched = launchScript({ graph: direct, input: { question: T.row.question, history: '' }, origin: 'chat',
+                                      origin_ref: { conversation_id: T.conversation_id, turn_id: T.id } })
+      if (launched.abort || launched.status) {
+        const message = launched.json?.detail ?? '运行没有发起'
+        return settle(T, 'error', { status: 'error', error: message, review: {} },
+          { cause: { kind: 'start', message, code: launched.json?.code ?? null, status: launched.status ?? 0 }, runId: null, usage: T.usage })
+      }
+      runId = launched.id
+      srv.launched.add(runId)
+      // 同一个运行 id 各段、各套主题会再用：这一次从头算（剧本还没放、没有接着跑过）
+      delete ctl.wsDone[`${runId}@0`]
+      delete ctl.continued[runId]
+      delete T.usage.run
+      T.runId = runId
+      T.job.run_id = runId
+      saveRow(T, { run_id: runId, status: 'running' }, { runId, runClass: 'exploratory', runStatus: 'queued' })
+      emit(T, 'run', { run_id: runId, status: 'queued', run_class: 'exploratory' })
+    } else {
+      T.runId = runId
+    }
+    const graphRun = direct
+    direct = follow = null
+    const result = await followRun(T, epoch, runId)
+    if (gone(T, epoch)) return
+    const rec = runRecord(runId)
+    const run = { id: runId, status: result.status, run_class: 'exploratory', usage: rec.json?.usage ?? {},
+                  error: result.error ?? null, end_reason: result.endReason ?? null }
+    T.usage.run = addTotal({}, rec.json?.usage)
+    const meta = { runId, runClass: 'exploratory', runStatus: result.status, usage: T.usage }
+    if (result.status === 'gone') {
+      return settle(T, 'error', { status: 'error', error: '运行记录不见了', review: {} }, { ...meta, cause: { kind: 'gone' }, runStatus: 'gone' })
+    }
+    if (result.status === 'rejected') {
+      return settle(T, 'cancelled', { status: 'error', error: '已取消', review: {} },
+        { ...meta, runStatus: 'cancelled', outcome: 'cancelled', rejected: result.rejected }, null, { ...run, status: 'cancelled' })
+    }
+    if (result.status === 'cancelled') {
+      return settle(T, 'cancelled', { status: 'error', error: '已取消', review: {} }, { ...meta, outcome: 'cancelled' }, null, run)
+    }
+    if (result.status === 'suspended') {
+      return settle(T, 'suspended', { status: 'error', error: '服务重启，本轮已中断', review: {} },
+        { ...meta, outcome: 'suspended', runStatus: 'interrupted' }, null, { ...run, status: 'interrupted' })
+    }
+    if (result.status === 'failed') {
+      return settle(T, 'error', { status: 'error', error: result.error ?? '运行失败', review: {} },
+        { ...meta, cause: { kind: 'run', error: result.error ?? '', ...(result.detail ? { detail: result.detail } : {}) } }, null, run)
+    }
+
+    stage(T, 'review')
+    // 成果带逐段证据时复核只能加说明（服务端 review_of_run 按 locked 不改写）：剧本里老后端那种改写在这里收成「加说明」
+    const locked = !!(result.output ?? {})._evidence
+    const reviewing = reviewScript({ run_id: runId, question: T.row.question, attempt: attempts }).then((r) => (locked && r?.answer
+      ? { ...r, answer: null, original: null, verdict: r.verdict === 'rewritten' ? 'annotated' : r.verdict } : r))
+    const review = await Promise.race([reviewing, sleep(ctl.reviewWaitMs ?? 25_000).then(() => null)])
+    if (gone(T, epoch)) return
+    if (review) {
+      emit(T, 'review', { result: review })
+      T.usage.review = addTotal(T.usage.review, review.usage)
+      if (autoRetry && review.retry_instruction) {
+        attempts += 1
+        T.usage = retireRun(T.usage)
+        T.runId = null
+        saveRow(T, { run_id: null }, { runId: null, runStatus: null, usage: T.usage })
+        const reason = (review.signals ?? []).map((x) => x.detail).join('；') || review.note
+        emit(T, 'turn.retry', { kind: 'review', reason, base: !!graphRun?.nodes?.length, attempt: attempts, usage: T.usage })
+        instruction = review.retry_instruction
+        base = graphRun?.nodes?.length ? graphRun : null
+        continue
+      }
+    } else {
+      // 等不及：先交原答案；那一次复核晚到了照样把用量记进这一轮
+      T.late = reviewing.then((r) => {
+        if (T.epoch !== epoch) return
+        if (r?.usage) {
+          const usage = { ...(T.row.meta?.usage ?? {}), review: addTotal(T.row.meta?.usage?.review, r.usage) }
+          saveRow(T, {}, { usage })
+          emit(T, 'review.late', { usage: r.usage })
+        }
+      }).finally(() => { if (T.epoch === epoch) T.late = null })
+    }
+    const output = result.output ?? {}
+    const rewritten = review && review.verdict !== 'ok' && !output._evidence ? review.answer : null
+    const issuance = output._issuance
+    return settle(T, 'done', { status: 'done', answer: rewritten || answerText(output), review: review ?? {} },
+      { ...meta, runStatus: 'succeeded', queries: result.queries,
+        ...(issuance ? { issuance } : {}), ...(output._evidence ? { evidence: true } : {}) }, output, { ...run, status: 'succeeded' })
+  }
+}
+
+/**
+ * 等这次运行到终态（同服务端 _follow：停在审批上照旧等人，没有待审批的断点收成中断）。这一段检查里发起的运行按它的剧本：
+ * 剧本有结局的等实时流放完再收尾，没结局的（在跑、等审批、出字中）一直等到被停止；库里早就有的运行（老轮次接着收尾）按
+ * GET 运行的状态
+ */
+async function followRun(T, epoch, runId) {
+  const after = ctl.continued[runId] ? 4 : 0
+  const sc = script(runId, after)
+  const rec = runRecord(runId)
+  if (rec.status === 404) return { status: 'gone' }
+  const pending = () => ctl.approvals.some((a) => a.run_id === runId && a.status === 'pending')
+  const terminal = (status) => {
+    const fin = sc.events.filter((e) => e.type === 'run.finished').at(-1)?.data?.output
+    const failed = sc.events.filter((e) => e.type === 'run.failed').at(-1)?.data
+    const queries = sc.events.filter((e) => e.type === 'tool.start' && String(e.data?.tool ?? '').startsWith('db_query')).length
+    const db = rec.status === 200 && rec.json.status === 'succeeded' && Object.keys(rec.json.output ?? {}).length ? rec.json.output : null
+    if (status === 'succeeded') {
+      // 成果以库里那份为准（事件里那份为了推送体积被切过）
+      return { status, queries, output: db ?? (runId === 'run-noget' ? { answer: FULL, note: '附注' } : fin ?? {}) }
+    }
+    if (status === 'failed') return { status, error: failed?.error ?? rec.json?.error ?? '', detail: failed?.detail }
+    if (status === 'cancelled' && rec.json?.end_reason === 'rejected') {
+      return { status: 'rejected', endReason: 'rejected', rejected: { sub: rec.json?.error || '被驳回' } }
+    }
+    return { status }
+  }
+  /** 停在审批上：等人（stage waiting），审批过了接着等 */
+  const waitApproval = async () => {
+    if (T.job.stage !== 'waiting') stage(T, 'waiting')
+    while (!gone(T, epoch) && pending()) await sleep(80)
+    if (!gone(T, epoch)) stage(T, 'run')
+  }
+  const deadline = Date.now() + 120_000
+  if (srv.launched.has(runId) || ctl.continued[runId]) {
+    const ended = sc.end === 'close' ? 'interrupted' : sc.end
+    if (ended) {
+      await until(() => ctl.wsDone[`${runId}@${after}`] || gone(T, epoch), 3000)
+      if (ended !== 'interrupted') return terminal(ended)
+      if (!pending()) return { status: 'suspended' }
+    }
+    // 剧本里不结束的：一直在跑，停在审批上的等人
+    while (!gone(T, epoch) && Date.now() < deadline) {
+      if (pending()) await waitApproval()
+      await sleep(80)
+    }
+    return { status: 'running' }
+  }
+  // 库里早就有的运行
+  while (!gone(T, epoch) && Date.now() < deadline) {
+    const status = runRecord(runId).json?.status
+    if (['succeeded', 'failed', 'cancelled'].includes(status)) return terminal(status)
+    if (status === 'interrupted') {
+      if (!pending()) return { status: 'suspended' }
+      await waitApproval()
+    }
+    await sleep(80)
+  }
+  return { status: 'running' }
+}
+
+/** 停止（服务端 chat/job.cancel）：取消生成、取消运行，那一行收成已取消 */
+function cancelTurn(T) {
+  if (!ACTIVE_JOB.has(T.job.status)) return false
+  T.cancelled = true
+  if (T.runId) log.cancels.push(T.runId)
+  saveRow(T, { status: 'error', error: '已取消', review: {} }, { outcome: 'cancelled', runStatus: T.runId ? 'cancelled' : undefined })
+  emit(T, 'end', { outcome: 'cancelled', turn: rowOut(T), output: null,
+                   run: T.runId ? { id: T.runId, status: 'cancelled', run_class: 'exploratory', usage: {} } : null })
+  T.job = { ...T.job, status: 'cancelled', stage: null }
+  return true
+}
+
+/** 实时流（长轮询）：没有新事件就等一会儿；这一轮不在进行中、也都给完了，补一条 stream.end */
+async function streamTurn(route, T, after) {
+  log.streams.push({ turn: T.id, after })
+  if (ctl.dropStreams > 0) {
+    // 断线：这一次连接什么都没给就断了（网络抖一下）。页面按收到的最后一个 seq 退避重连
+    ctl.dropStreams -= 1
+    return route.abort('connectionreset')
+  }
+  await until(() => T.events.length > after || !turnActive(T) || T.gen !== srv.gen, 6000)
+  const fresh = T.events.filter((e) => e.seq > after)
+  let body = fresh.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('')
+  if (!turnActive(T) && after + fresh.length >= T.events.length) {
+    body += `data: ${JSON.stringify({ type: 'stream.end', status: T.job.status, data: { status: T.job.status } })}\n\n`
+  }
+  return route.fulfill({ status: 200, contentType: 'text/event-stream', body: body || ': ping\n\n' })
 }
 
 // ---------------------------------------------------------------- 浏览器
@@ -945,7 +1524,7 @@ async function open(theme = 'light', { width = 1440, height = 900, reducedMotion
     return route.fulfill({ json: { ui: { theme }, run: {}, limits: { max_agent_steps: 25 }, copilot: {}, embedding: {},
       ...(settings ?? {}) } })
   })
-  await page.route(/\/api\/(conversations|copilot\/(generate-stream|review)|runs|approvals|datasources)(\/|\?|$)/, fakeApi)
+  await page.route(/\/api\/(conversations|chat\/turns|copilot\/(generate-stream|review)|runs|approvals|datasources)(\/|\?|$)/, fakeApi)
   await page.routeWebSocket(/\/api\/runs\/[^/]+\/stream/, fakeStream)
   return { page, ctx, errors }
 }
@@ -1192,25 +1771,20 @@ for (const theme of THEMES) {
     const t = (await chatState(page)).byConversation.c0trunc.at(-1)
     check('显示的是完整答案', String(t.output?.answer ?? '').length === FULL.length, `${String(t.output?.answer ?? '').length} / ${FULL.length}`)
     check('llm.token 没进 events', !t.events.some((e) => e.type === 'llm.token'), `${t.events.length} 条`)
-    const saved = log.patches.slice(patchesBefore).filter((p) => typeof p.body.answer === 'string' && p.body.answer)
-    check('落库的也是完整答案', saved.length > 0 && saved.every((p) => p.body.answer.length === FULL.length),
-      saved.map((p) => p.body.answer.length).join(','))
-    // 落库是排队异步发的，交付之后再等它一下
-    await until(() => log.patches.slice(patchesBefore).some((p) => p.body.meta))
-    const metas = log.patches.slice(patchesBefore).map((p) => p.body.meta).filter(Boolean)
-    const meta = metas.at(-1)
-    check('可信度信息跟着落库（运行、类别、查库次数）', meta?.runId === 'run-long' && meta?.runClass === 'exploratory',
-      JSON.stringify(metas))
+    // 一轮在服务端跑（docs/design/orchestration-round §1）：那一行由服务端写，页面不再 PATCH 这一轮的结局
+    check('页面不写这一轮的结局（不 PATCH 轮次）', log.patches.slice(patchesBefore).length === 0,
+      JSON.stringify(log.patches.slice(patchesBefore).map((p) => Object.keys(p.body))))
+    const meta = t.meta
+    check('服务端写的那一行带着可信度信息（运行、类别），页面照它摆', meta?.runId === 'run-long' && meta?.runClass === 'exploratory',
+      JSON.stringify(meta))
     // 后端有了单独的 meta 列：review 只放复核结论，不再夹带
-    check('meta 单独写，不再塞进 review', log.patches.slice(patchesBefore)
-      .every((p) => !p.body.review || !('meta' in p.body.review)),
-      JSON.stringify(log.patches.slice(patchesBefore).map((p) => Object.keys(p.body.review ?? {}))))
+    check('meta 单独存，不夹在 review 里', !t.reviewRaw || !('meta' in t.reviewRaw), JSON.stringify(Object.keys(t.reviewRaw ?? {})))
     check('完整答案取到了，meta 里没有「没取全」', !meta?.clipped, JSON.stringify(meta?.clipped))
     await page.getByText('展开全部').first().click().catch(() => {})
     check('完整结尾在页面上', await shows(page, '【完整结尾】'))
     // 建图时助手查看了哪些表：收在「规划」里，点开是一行，再点开看表名
     check('建图的 look 事件原样记进这一轮', t.ops.some((o) => o.op === 'look'))
-    check('查看记录存进这一轮的 meta.looks（look §2.5.8）', Array.isArray(meta?.looks) && meta.looks.length === 1
+    check('查看记录随那一行存进 meta.looks（look §2.5.8）', Array.isArray(meta?.looks) && meta.looks.length === 1
       && meta.looks[0].objects?.[0]?.source === 'shop', JSON.stringify(meta?.looks))
     const turnCard = page.locator('[data-turn]').last()
     await turnCard.locator('button', { hasText: '规划' }).first().click()
@@ -1252,12 +1826,8 @@ for (const theme of THEMES) {
     check('页面上是逐段可点的报告，不是改写后的文字', await page.locator('[data-evidence-doc] [data-seg]').count() > 0
       && !(await shows(page, '改写后的答案')))
     check('没有「复核改写过此答案」的对照', await page.getByText('复核改写过此答案').count() === 0)
-    await until(() => log.patches.slice(patchesBefore).some((p) => p.body.meta))
-    const saved = log.patches.slice(patchesBefore)
-    check('落库的是报告原文，不是改写', saved.filter((p) => typeof p.body.answer === 'string' && p.body.answer)
-      .every((p) => p.body.answer === EVIDENCE.output['周报']), saved.map((p) => String(p.body.answer ?? '').slice(0, 12)).join(' | '))
-    check('meta 记下这一轮有证据（刷新后回运行那里取标注）', saved.map((p) => p.body.meta).filter(Boolean).at(-1)?.evidence === true)
-    check('落库的复核也不带改写', saved.filter((p) => p.body.review?.verdict).every((p) => !p.body.review.answer))
+    check('页面不写这一轮的结局（不 PATCH 轮次）', log.patches.slice(patchesBefore).length === 0)
+    check('meta 记下这一轮有证据（刷新后回运行那里取标注）', t.meta?.evidence === true, JSON.stringify(t.meta))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })
@@ -1304,10 +1874,8 @@ for (const theme of THEMES) {
       await page.waitForTimeout(300)
       await page.screenshot({ path: `${SHOTS}/askdata-evidence-${theme}.png` })
       await page.keyboard.press('Escape')
-      await until(() => log.patches.slice(patchesBefore).some((p) => p.body.meta))
-      const saved = log.patches.slice(patchesBefore)
-      check('落库的是报告原文，meta 记下这一轮有证据', saved.filter((p) => typeof p.body.answer === 'string' && p.body.answer)
-        .every((p) => p.body.answer === EVQ.output.answer) && saved.map((p) => p.body.meta).filter(Boolean).at(-1)?.evidence === true)
+      check('页面不写这一轮的结局；服务端写的 meta 记下这一轮有证据', log.patches.slice(patchesBefore).length === 0
+        && t.meta?.evidence === true, JSON.stringify(t.meta))
       check('没有运行时报错（实时）', errors.length === 0, errors[0] ?? '')
       await ctx.close()
     }
@@ -1429,6 +1997,9 @@ for (const theme of THEMES) {
       () => window.__chat.getState().byConversation.c0resti?.at(-1)?.phase === 'done', null, { timeout: 8000 })
       .then(() => true, () => false), (await chatState(page)).byConversation.c0resti.at(-1).phase)
     check('续跑发给的是这一轮自己的运行', log.continues.at(-1) === 'run-restart', log.continues.join(','))
+    const cont = log.turnStarts.filter((b) => b.mode === 'continue').at(-1)
+    check('继续运行的请求：带着这一轮（retry_of、mode=continue），不带图', cont?.conversation_id === 'c0resti'
+      && cont?.retry_of === t.serverId && !cont?.graph, JSON.stringify(cont))
     check('续上之后答案出来了', await shows(page, '接着跑完了：三条记录。'))
     check('续上之后补救按钮收起', await page.getByRole('button', { name: '继续运行' }).count() === 0)
     await page.waitForTimeout(300)
@@ -1508,6 +2079,9 @@ for (const theme of THEMES) {
       (n) => window.__chat.getState().byConversation.c0histf.at(-1).phase === 'done'
         && window.__chat.getState().byConversation.c0histf.at(-1).attempts?.length === 1, startsBefore, { timeout: 8000 })
       .then(() => true, () => false))
+    const asked = log.turnStarts.filter((b) => b.retry_of === 'tf4').at(-1)
+    check('放宽步数的请求：带着这一轮、方式和目标步数（mode=max_steps、max_steps=24），图由服务端改',
+      asked?.conversation_id === 'c0histf' && asked?.mode === 'max_steps' && asked?.max_steps === 24 && !asked?.graph, JSON.stringify(asked))
     const started = log.runStarts.slice(startsBefore).at(-1)
     check('发起的图里 agent 步数是 24', started?.graph?.nodes?.find((n) => n.type === 'agent')?.data?.config?.max_steps === 24,
       JSON.stringify(started?.graph?.nodes?.map((n) => n.data?.config)))
@@ -1844,9 +2418,9 @@ for (const theme of THEMES) {
     check('不标「本条未查询数据库」（这不是回答）', !(await card.innerText()).includes('本条未查询数据库'))
     const box = page.getByRole('textbox', { name: '向数据提问' })
     check('输入框提示回答助手的问题', (await box.getAttribute('placeholder')).includes('回答助手的问题'))
-    const saved = await until(() => log.patches.slice(patches).some((x) => x.body.answer === '销售额按下单日还是支付日算？'))
-    const body = log.patches.slice(patches).find((x) => x.body.answer)?.body
-    check('问题落库进历史（answer 列），meta 标着反问', saved && body.status === 'done' && body.meta?.asked === true, JSON.stringify(body))
+    // 那一行由服务端写（答案列是助手问的那句话，meta 标着反问）：页面不 PATCH，照 end 带来的那一行摆
+    check('页面不写这一轮的结局；服务端写的那一行 meta 标着反问', log.patches.slice(patches).length === 0
+      && !!turn.meta?.asked, JSON.stringify(turn.meta?.asked))
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
 
@@ -1924,7 +2498,8 @@ for (const theme of THEMES) {
     check('重来时交回去的就是服务端给的那句话', log.gens.at(-1)?.instruction === DECIDE_RETRY, log.gens.at(-1)?.instruction)
     check('第二次复核带着这一轮试过的次数', log.reviews.slice(reviews).map((r) => r.attempt).join(',') === '0,1',
       JSON.stringify(log.reviews.slice(reviews)))
-    const last = log.patches.filter((x) => x.body?.meta?.usage).at(-1)?.body?.meta?.usage
+    // 服务端写的那一行（end 带来的）
+    const last = turn.meta?.usage
     check('meta.usage 记下助手、复核、换下来的运行和这一次运行', !!last && Math.abs(last.copilot?.cost_usd - 0.024) < 1e-9
       && Math.abs(last.review?.cost_usd - 0.003) < 1e-9 && Math.abs(last.earlier?.cost_usd - 0.02) < 1e-9
       && Math.abs(last.run?.cost_usd - 0.02) < 1e-9, JSON.stringify(last))
@@ -1936,7 +2511,8 @@ for (const theme of THEMES) {
 
     // 复核慢过等待上限：答案先交出去，复核这一次的用量晚到了照记（这一轮的花费照实是助手 + 运行 + 复核，复核不落下）
     ctl.lateReview = 900
-    await page.evaluate(() => window.__chatReviewWait(200))
+    // 服务端最多等复核这么久（检查里调短）
+    ctl.reviewWaitMs = 200
     const patchesBefore = log.patches.length
     await send(page, '照服务端的决定：复核晚到的那一轮')
     const delivered = await page.waitForFunction(() => {
@@ -1947,12 +2523,13 @@ for (const theme of THEMES) {
     check('复核没等到：答案先交出去，这时还没有复核的用量', delivered && !early.usage?.review, JSON.stringify(early.usage))
     await page.waitForTimeout(1200)
     const lateTurn = (await chatState(page)).byConversation.c0emptg.at(-1)
-    const lateMeta = log.patches.slice(patchesBefore).filter((x) => x.body?.meta?.usage).at(-1)?.body?.meta?.usage
-    check('复核晚到：它的用量照记进这一轮并落库', Math.abs((lateTurn.usage?.review?.cost_usd ?? 0) - 0.004) < 1e-9
+    const lateMeta = lateTurn.meta?.usage
+    check('页面不写这一轮的结局', log.patches.slice(patchesBefore).length === 0)
+    check('复核晚到：它的用量照记进这一轮（服务端并进那一行的 meta.usage）', Math.abs((lateTurn.usage?.review?.cost_usd ?? 0) - 0.004) < 1e-9
       && Math.abs((lateMeta?.review?.cost_usd ?? 0) - 0.004) < 1e-9 && Math.abs((lateMeta?.copilot?.cost_usd ?? 0) - 0.012) < 1e-9,
       JSON.stringify(lateMeta))
     ctl.lateReview = 0
-    await page.evaluate(() => window.__chatReviewWait(25_000))
+    ctl.reviewWaitMs = 25_000
 
     // 只建不跑：autorun 没写 false，next 是 ready，前端照 next 走、不发起运行
     const before = log.runStarts.length
@@ -2026,6 +2603,195 @@ for (const theme of THEMES) {
     ctl.approvals = []
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
+  })
+
+  await section('reconnect', '实时流断了：按收到的最后一个 seq 重连，补齐、不重复（一轮在服务端照跑）', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0emptg')
+    ctl.opGapMs = 120
+    const streamsBefore = log.streams.length
+    const patchesBefore = log.patches.length
+    await send(page, '断线重连：查一下订单和明细')
+    await page.waitForFunction(() => (window.__chat.getState().byConversation.c0emptg?.at(-1)?.ops.length ?? 0) >= 2,
+      null, { timeout: 6000 }).catch(() => {})
+    // 接下来两次连接都直接断掉（网络抖了两下）：这一轮在服务端照跑，页面退避着重连
+    ctl.dropStreams = 2
+    const ran = await page.waitForFunction(() => {
+      const t = window.__chat.getState().byConversation.c0emptg?.at(-1)
+      return !!t?.run?.id && t.phase === 'running'
+    }, null, { timeout: 12000 }).then(() => true, () => false)
+    ctl.opGapMs = 10
+    await page.waitForTimeout(300)
+    const t = (await chatState(page)).byConversation.c0emptg.at(-1)
+    const T = srv.turns.get(t.serverId)
+    const afters = log.streams.slice(streamsBefore).filter((x) => x.turn === t.serverId).map((x) => x.after)
+    const resumedAt = afters.findIndex((a, i) => i >= 2 && a > 0 && afters[i - 1] === a && afters[i - 2] === a)
+    check('断了之后接着连：每次都带上收到的最后一个 seq（断掉的那两次和接上的那一次是同一个）', ran && resumedAt > 0,
+      afters.join(','))
+    check('从不往回要：重连的 seq 只增不减', afters.every((a, i) => i === 0 || a >= afters[i - 1]), afters.join(','))
+    check('补齐：服务端这一轮记下的事件，页面一条不少地收到了', !!T && t.turnSeq === T.events.length,
+      `${t.turnSeq} / ${T?.events.length}`)
+    const ops = T?.events.filter((e) => e.type === 'op').length ?? -1
+    check('不重复：助手的操作一条只收一份', t.ops.length === ops && t.ops.filter((o) => o.op === 'add_node').length === 3,
+      `${t.ops.length} / ${ops}`)
+    check('画布边收边长到收尾：图有 3 个节点，运行接上了', t.graph?.nodes?.length === 3 && !!t.run?.id)
+    check('页面不写这一轮的结局（不 PATCH）', log.patches.slice(patchesBefore).length === 0)
+    await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('replay', '刷新、关掉再打开：服务端那一轮照跑，页面从这一次尝试的第一条接着播', async () => {
+    resetDb()
+    ctl.replayConvs = true
+    ctl.liveDetail = true
+    ctl.replayBuildGo = false
+    ctl.replayRunGo = false
+    try {
+      const patchesBefore = log.patches.length
+      let { page, ctx, errors } = await open(theme)
+      await goto(page, 'c0replay')
+      const startsBefore = log.turnStarts.length
+      await send(page, '刷新后接着看：各门店的订单数')
+      await page.waitForFunction(() => (window.__chat.getState().byConversation.c0replay?.at(-1)?.ops
+        .filter((o) => o.op === 'add_node').length ?? 0) === 2, null, { timeout: 6000 }).catch(() => {})
+      const serverId = (await chatState(page)).byConversation.c0replay.at(-1).serverId
+
+      // 刷新：库里那一行是 running、带着服务端的任务（建图中）
+      await page.reload()
+      await ready(page, () => !!window.__chat, '问数据页的 store（window.__chat）')
+      const live = await page.waitForFunction((id) => {
+        const t = window.__chat.getState().byConversation.c0replay?.find((x) => x.serverId === id)
+        return !!t && (t.phase === 'planning' || t.phase === 'building') && t.ops.filter((o) => o.op === 'add_node').length === 2
+      }, serverId, { timeout: 6000 }).then(() => true, () => false)
+      const t1 = (await chatState(page)).byConversation.c0replay?.find((x) => x.serverId === serverId)
+      check('刷新之后：这一轮还在服务端建图，照那个样子摆（不当成断了）', live, `${t1?.phase} · ${t1?.ops?.length} 条操作`)
+      check('……从这一次尝试的第一条回放，已经建出的两步一步不少、一步不重',
+        t1?.ops.filter((o) => o.op === 'add_node').length === 2 && t1?.ops.filter((o) => o.op === 'plan').length === 1)
+      check('……建图的过程照实时的样子摆着（不是要点开才取的历史轮次）', !t1?.restored
+        && await page.locator('[data-turn]').last().locator('button', { hasText: '规划' }).count() > 0)
+      check('……刷新没有再发起一次（只发起过一次）', log.turnStarts.length - startsBefore === 1,
+        `${log.turnStarts.length - startsBefore} 次`)
+      check('……回放从这一次尝试开始（after 是 attempt_seq 之前）', log.streams.some((x) => x.turn === serverId && x.after === 0))
+
+      ctl.replayBuildGo = true
+      const running = await page.waitForFunction((id) => {
+        const t = window.__chat.getState().byConversation.c0replay?.find((x) => x.serverId === id)
+        return t?.phase === 'running' && t.run?.id === 'run-replay' && t.graph?.nodes?.length === 3
+      }, serverId, { timeout: 6000 }).then(() => true, () => false)
+      check('接着播：建完、服务端发起了运行，画布长全', running)
+      await page.screenshot({ path: `${SHOTS}/replay-running-${theme}.png` })
+      check('没有运行时报错（刷新后）', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+
+      // 关掉再打开：运行还在跑（停在闸上）
+      ;({ page, ctx, errors } = await open(theme))
+      await goto(page, 'c0replay')
+      const reopened = await page.waitForFunction((id) => {
+        const t = window.__chat.getState().byConversation.c0replay?.find((x) => x.serverId === id)
+        return t?.phase === 'running' && t.run?.id === 'run-replay' && t.ops.filter((o) => o.op === 'add_node').length === 3
+      }, serverId, { timeout: 6000 }).then(() => true, () => false)
+      check('关掉再打开：照样接着看（运行中，建图的过程还在）', reopened,
+        JSON.stringify((await chatState(page)).byConversation.c0replay?.map((x) => x.phase)))
+      check('……运行的过程也接回来了', await page.waitForFunction((id) =>
+        (window.__chat.getState().byConversation.c0replay?.find((x) => x.serverId === id)?.events.length ?? 0) >= 2,
+      serverId, { timeout: 4000 }).then(() => true, () => false))
+      ctl.replayRunGo = true
+      const done = await page.waitForFunction((id) =>
+        window.__chat.getState().byConversation.c0replay?.find((x) => x.serverId === id)?.phase === 'done',
+      serverId, { timeout: 8000 }).then(() => true, () => false)
+      check('跑完、复核完：答案出来了', done && await shows(page, '刷新之后接着跑完了：两家门店。'))
+      check('页面一个结局都没写（不 PATCH）', log.patches.slice(patchesBefore).length === 0)
+      await page.screenshot({ path: `${SHOTS}/replay-done-${theme}.png` })
+      check('没有运行时报错（重新打开后）', errors.length === 0, errors[0] ?? '')
+      await ctx.close()
+    } finally {
+      ctl.replayConvs = false
+      ctl.liveDetail = false
+      ctl.replayBuildGo = true
+      ctl.replayRunGo = true
+    }
+  })
+
+  await section('stopreq', '停止：建图中也停得下，停止请求发给服务端的这一轮', async () => {
+    const { page, ctx, errors } = await open(theme)
+    await goto(page, 'c0emptg')
+    ctl.stopBuildGo = false
+    const patchesBefore = log.patches.length
+    const startsBefore = log.turnStarts.length
+    const runsBefore = log.runStarts.length
+    await send(page, '停止测试：各门店的订单数')
+    await page.waitForFunction(() => (window.__chat.getState().byConversation.c0emptg?.at(-1)?.ops.length ?? 0) >= 2,
+      null, { timeout: 6000 }).catch(() => {})
+    const asked = log.turnStarts.slice(startsBefore).at(-1)
+    check('发起的请求：这段对话、这个问题，不限数据源时不带 datasource_ids', asked?.conversation_id === 'c0emptg'
+      && asked?.question === '停止测试：各门店的订单数' && !asked?.retry_of && !('datasource_ids' in (asked ?? {})), JSON.stringify(asked))
+    const t0 = (await chatState(page)).byConversation.c0emptg.at(-1)
+    await page.getByRole('button', { name: '停止这一轮' }).click()
+    await until(() => log.turnCancels.includes(t0.serverId), 3000)
+    check('停止请求发给服务端的这一轮（POST /api/chat/turns/{id}/cancel）', log.turnCancels.at(-1) === t0.serverId,
+      `${log.turnCancels.at(-1)} / ${t0.serverId}`)
+    await page.waitForTimeout(300)
+    const t = (await chatState(page)).byConversation.c0emptg.at(-1)
+    check('这一轮收成已取消，不画红', t.phase === 'cancelled' && !t.failure, t.phase)
+    ctl.stopBuildGo = true
+    await page.waitForTimeout(400)
+    const T = srv.turns.get(t0.serverId)
+    check('服务端那一轮也停了：不再往下建、不发起运行', T?.job.status === 'cancelled' && log.runStarts.length === runsBefore
+      && T.events.filter((e) => e.type === 'op' && e.data.op === 'add_node').length === 2, `${T?.job.status} · ${log.runStarts.length - runsBefore} 次运行`)
+    check('建图中停止：补救区说「你在搭建工作流时停止了本轮」', await shows(page, '你在搭建工作流时停止了本轮'))
+    check('页面不写这一轮的结局（不 PATCH）', log.patches.slice(patchesBefore).length === 0)
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('userrole', '使用者（user 角色）：不给「继续运行」（服务端照老规矩不让使用者续跑），重试、重新运行本轮照常', async () => {
+    const { page, ctx, errors } = await open(theme)
+    // 开了登录、认出来是使用者、管理员开了问数据
+    await page.route('**/api/auth/me', (route) => route.fulfill({ json: { mode: 'local', username: 'uma', display_name: 'uma',
+      role: 'user', groups: [], verified: true, user_can_chat: true } }))
+    const continuesBefore = log.continues.length
+    await goto(page, 'c0suspo')
+    await shows(page, '服务重启，本轮已中断')
+    const card = page.locator('[data-remedy="suspended"]')
+    await card.waitFor({ timeout: 6000 }).catch(() => {})
+    const cardText = (await card.innerText().catch(() => '')).replace(/\n/g, ' / ')
+    check('中断的一轮：使用者看不到「继续运行」，说明里也不叫它去点', await card.getByRole('button', { name: '继续运行' }).count() === 0
+      && !cardText.includes('继续运行') && cardText.includes('重新运行本轮'), cardText)
+    check('……「重新运行本轮」照常给', await card.getByRole('button', { name: '重新运行本轮' }).count() === 1)
+    await goto(page, 'c0histf')
+    await shows(page, '步数用满的那一轮')
+    await page.waitForTimeout(600)
+    const failed = page.locator('[data-turn="tf2"] + * [data-remedy="failed"]')
+    check('跑挂了的一轮：使用者也看不到「继续运行」，「重试本轮」照常给',
+      await page.getByRole('button', { name: '继续运行' }).count() === 0
+        && await failed.getByRole('button', { name: /重试本轮|重新问一次/ }).count() === 1,
+      (await failed.innerText().catch(() => '')).replace(/\n/g, ' / '))
+    check('一次续跑都没发', log.continues.length === continuesBefore)
+    check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+    await ctx.close()
+  })
+
+  await section('twotabs', '两个标签页同时打开停在半路的一轮：服务端只接着收尾一次，两边都接着看同一轮', async () => {
+    const a = await open(theme)
+    const b = await open(theme)
+    ctl.reviewDelay['run-late'] = 1200
+    const startsBefore = log.turnStarts.length
+    const postsBefore = log.patches.length
+    await Promise.all([goto(a.page, 'c0lateq'), goto(b.page, 'c0lateq')])
+    const done = (page) => page.waitForFunction(() => window.__chat.getState().byConversation.c0lateq?.[0]?.phase === 'done',
+      null, { timeout: 8000 }).then(() => true, () => false)
+    const [okA, okB] = await Promise.all([done(a.page), done(b.page)])
+    check('两边都收尾了，答案一样', okA && okB && await shows(a.page, '补交付的答案：三条记录。') && await shows(b.page, '补交付的答案：三条记录。'))
+    const resumed = log.turnStarts.slice(startsBefore).filter((x) => x.mode === 'resume' && x.retry_of === 'tq1')
+    check('服务端只接着收尾了一次（后到的那个 409，改成接着看）', resumed.length === 1, `${resumed.length} 次`)
+    const phases = await Promise.all([a.page, b.page].map((p) => p.evaluate(() => window.__chat.getState().byConversation.c0lateq?.[0]?.phase)))
+    check('后到的那个不说「无法确认本轮的当前状态」', !phases.includes('unknown'), phases.join(','))
+    check('两边都不写库（不 PATCH）', log.patches.length === postsBefore)
+    delete ctl.reviewDelay['run-late']
+    check('没有运行时报错', a.errors.length === 0 && b.errors.length === 0, a.errors[0] ?? b.errors[0] ?? '')
+    await a.ctx.close()
+    await b.ctx.close()
   })
 
   await section('steps', '历史轮次的执行过程：点开、收起', async () => {
@@ -2396,26 +3162,35 @@ for (const theme of THEMES) {
     check('补交付完成', await shows(page, '补交付的答案：三条记录。', 5000))
     delete ctl.reviewDelay['run-late']
 
-    // 停在半路的几轮：各自的终态查到之后要落库，下次进来不再核对
+    // 停在半路的几轮（这一波之前页面推的老轮次，服务端没有它们的任务）：页面不再自己收尾、不写库，请服务端接着等各自的
+    // 那次运行、照常收尾（POST /api/chat/turns mode=resume），结局照服务端写的那一行摆
     ctl.approvals = [{ id: 'ap-t', run_id: 'run-t-wait', node_id: 'ag', mode: 'approve', title: '确认一下',
       payload: {}, status: 'pending', response: {}, created_at: new Date().toISOString() }]
     const patchesBefore = log.patches.length
+    const resumesBefore = log.turnStarts.length
     await goto(page, 'c0termr')
-    await until(() => ['tr1', 'tr2', 'tr3', 'tr4', 'tr6'].every((id) =>
-      log.patches.slice(patchesBefore).some((p) => p.turn === id && p.body.status === 'error')), 6000)
-    await page.waitForTimeout(300)
-    const saved = (id) => log.patches.slice(patchesBefore).filter((p) => p.turn === id).at(-1)?.body
-    check('在别处取消的：落库成已取消', saved('tr1')?.status === 'error' && saved('tr1')?.error === '已取消'
-      && saved('tr1')?.meta?.outcome === 'cancelled', JSON.stringify(saved('tr1')))
-    check('在别处失败的：落库成失败，原因跟着写', saved('tr2')?.status === 'error' && /鉴权/.test(saved('tr2')?.error ?? ''),
-      JSON.stringify(saved('tr2'))?.slice(0, 160))
-    check('服务重启挂起的：落库成中断', saved('tr3')?.status === 'error' && saved('tr3')?.meta?.outcome === 'suspended',
-      JSON.stringify(saved('tr3'))?.slice(0, 160))
-    check('运行被删掉的：落库成「上次未完成」', saved('tr4')?.status === 'error' && saved('tr4')?.error === '上次未完成',
-      JSON.stringify(saved('tr4'))?.slice(0, 160))
-    check('……后端现在的说法（鉴权失败（401））：同样认成鉴权失败落库', saved('tr6')?.status === 'error'
-      && (saved('tr6')?.error ?? '').startsWith('模型鉴权失败'), JSON.stringify(saved('tr6'))?.slice(0, 160))
-    check('还在等审批的不落库（它还没结束）', !saved('tr5'), JSON.stringify(saved('tr5')))
+    const phaseOf = async (id) => (await chatState(page)).byConversation.c0termr?.find((t) => t.id === id)
+    for (let i = 0; i < 80; i++) {
+      const turns = (await chatState(page)).byConversation.c0termr ?? []
+      if (['tr1', 'tr2', 'tr3', 'tr4', 'tr5', 'tr6'].every((id) => ['cancelled', 'error', 'suspended', 'waiting']
+        .includes(turns.find((t) => t.id === id)?.phase))) break
+      await page.waitForTimeout(100)
+    }
+    const resumed = log.turnStarts.slice(resumesBefore).filter((b) => b.mode === 'resume').map((b) => b.retry_of)
+    check('停在半路的几轮都交给服务端接着收尾（mode=resume，带着各自这一轮）',
+      ['tr1', 'tr2', 'tr3', 'tr4', 'tr5', 'tr6'].every((id) => resumed.includes(id))
+        && log.turnStarts.slice(resumesBefore).every((b) => b.conversation_id === 'c0termr'), resumed.join(','))
+    check('页面不写这几轮的结局（不 PATCH 轮次）', log.patches.slice(patchesBefore).length === 0,
+      JSON.stringify(log.patches.slice(patchesBefore).map((p) => p.turn)))
+    const tr = Object.fromEntries(await Promise.all(['tr1', 'tr2', 'tr3', 'tr4', 'tr5', 'tr6'].map(async (id) => [id, await phaseOf(id)])))
+    check('在别处取消的：收成已取消', tr.tr1?.phase === 'cancelled', tr.tr1?.phase)
+    check('在别处失败的：收成失败，原因说人话', tr.tr2?.phase === 'error' && /鉴权/.test(tr.tr2?.error ?? ''), tr.tr2?.error)
+    check('服务重启挂起的：收成中断', tr.tr3?.phase === 'suspended', tr.tr3?.phase)
+    check('运行被删掉的：收成「上次未完成」', tr.tr4?.phase === 'error' && tr.tr4?.failure?.title === '上次未完成',
+      JSON.stringify(tr.tr4?.failure))
+    check('……后端现在的说法（鉴权失败（401））：同样认成鉴权失败', tr.tr6?.phase === 'error'
+      && (tr.tr6?.error ?? '').startsWith('模型鉴权失败'), tr.tr6?.error)
+    check('还在等审批的：照旧等人（它还没结束）', tr.tr5?.phase === 'waiting', tr.tr5?.phase)
     ctl.approvals = []
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
@@ -2428,10 +3203,10 @@ for (const theme of THEMES) {
     await send(page, '一份取不到运行的长答案')
     await page.waitForFunction(() => window.__chat.getState().byConversation.c0clips?.at(-1)?.phase === 'done', null, { timeout: 10000 }).catch(() => {})
     const t = (await chatState(page)).byConversation.c0clips.at(-1)
-    check('GET 运行失败：先交截断的那份并标出来', t.clipped === 'partial', t.clipped)
-    await until(() => log.patches.slice(patchesBefore).some((p) => p.body.meta?.clipped === 'partial'))
-    check('「没取全」写进 meta，刷新后还认得出来', log.patches.slice(patchesBefore).some((p) => p.body.meta?.clipped === 'partial'),
-      JSON.stringify(log.patches.slice(patchesBefore).map((p) => p.body.meta?.clipped)))
+    // 一轮在服务端跑：交付读的是库里的完整成果，页面 GET 运行失败也不影响，新轮次不会再有「没取全」
+    check('服务端按库里的完整成果交付：答案完整、不标「没取全」', !t.clipped && String(t.output?.answer ?? '').length === FULL.length,
+      `${t.clipped} · ${String(t.output?.answer ?? '').length} / ${FULL.length}`)
+    check('页面不写这一轮的结局（不 PATCH 轮次）', log.patches.slice(patchesBefore).length === 0)
 
     const runGetsBefore = log.runGets.length
     await goto(page, 'c0clipt')
@@ -2453,9 +3228,12 @@ for (const theme of THEMES) {
     await ctx.close()
   })
 
-  await section('launch', '发起运行失败：报错分得清标题和原因，补救说真话', async () => {
+  await section('launch', '发起那一下没到服务端：报错分得清标题和原因，补救说真话', async () => {
+    // 一轮在服务端跑之后，发起运行是服务端的事，「发起运行的请求没到后端」不会再发生；会断的是发起这一轮的那一下
+    //（POST /api/chat/turns）。这时服务端那边还没有这一轮，补救就是原样再问一次
     const { page, ctx, errors } = await open(theme)
-    ctl.launchFail = true
+    ctl.startFail = true
+    ctl.launchFail = false
     await goto(page, 'c0launu')
     await send(page, '一个启动失败的问题')
     const alert = page.locator('[data-turn] [role="alert"]').first()
@@ -2464,17 +3242,19 @@ for (const theme of THEMES) {
     check('标题只是「无法连接服务」，原因不糊进粗体', title === '无法连接服务', title)
     const text = await alert.innerText().catch(() => '')
     check('不许诺页面上不存在的自动重试', !text.includes('自动重试'), text.replace(/\n/g, ' / '))
-    const rerun = page.locator('[data-remedy="failed"]').getByRole('button', { name: '重新运行本轮' })
-    check('流程已经搭好：给「重新运行本轮」，不让它重新搭', await rerun.count() === 1)
-    check('说出怎么办：连上之后点「重新运行本轮」', text.includes('重新运行本轮'), text.replace(/\n/g, ' / '))
+    const retry = page.locator('[data-remedy="failed"]').getByRole('button', { name: '重试本轮' })
+    check('给「重试本轮」', await retry.count() === 1)
+    check('说出怎么办：连上之后点「重试本轮」', text.includes('重试本轮'), text.replace(/\n/g, ' / '))
     await page.screenshot({ path: `${SHOTS}/launch-failed-${theme}.png` })
-    ctl.launchFail = false
+    ctl.startFail = false
     const gensBefore = log.gens.length
-    const startsBefore = log.runStarts.length
-    await rerun.click().catch(() => {})
-    await until(() => log.runStarts.length > startsBefore, 5000)
-    check('重跑：原图直接发起，不再去问助手', log.runStarts.length > startsBefore && log.gens.length === gensBefore,
-      `${log.runStarts.length - startsBefore} 次发起 · ${log.gens.length - gensBefore} 次建图`)
+    const startsBefore = log.turnStarts.length
+    await retry.click().catch(() => {})
+    await until(() => log.gens.length > gensBefore, 5000)
+    const again = log.turnStarts.slice(startsBefore).at(-1)
+    check('重试：服务端还没有这一轮，原样再问一次（同一个问题，不带 retry_of）', again?.question === '一个启动失败的问题'
+      && !again?.retry_of && again?.conversation_id === 'c0launu', JSON.stringify(again))
+    check('这一次照常建图', log.gens.length > gensBefore, `${log.gens.length - gensBefore} 次建图`)
     await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
     ctl.launchFail = true
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
@@ -2542,39 +3322,45 @@ for (const theme of THEMES) {
     await until(() => log.runStarts.length > startsBefore, 5000)
     await until(() => log.cancels.slice(before).includes('run-susp'), 2000)
     check('挂起的旧运行被取消，不会一直挂在记录里', log.cancels.slice(before).includes('run-susp'), log.cancels.slice(before).join(','))
+    const rerun = log.turnStarts.filter((b) => b.retry_of === 'to1').at(-1)
+    check('重新运行本轮的请求：带着这一轮、mode=rerun', rerun?.mode === 'rerun' && rerun?.conversation_id === 'c0suspo',
+      JSON.stringify(rerun))
     check('新的一次照常发起', log.runStarts.length > startsBefore)
     await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
   })
 
-  await section('stale', '断在建图阶段：按最后一次落库算有没有动静；发起运行时 meta 跟上新运行', async () => {
+  await section('stale', '断在建图阶段的老轮次：页面不替它写库；重试本轮交给服务端', async () => {
+    // 这一波之前页面推的老轮次停在 running、又没有运行：建图那条流随页面、随上次的进程一起没了。以前页面按「多久没动静」
+    // 替它写回 error；现在服务端启动时整理它们（chat/job.startup），页面只照实摆「上次未完成」，不写库。
+    // 服务端还在建图的一轮带着任务（ConversationTurn.job），照它在跑的样子接着播（见「刷新后接着看」那一段）
     const { page, ctx, errors } = await open(theme)
     const patchesBefore = log.patches.length
     await goto(page, 'c0buildx')
     await shows(page, '重试之后二十分钟没动静的问题')
-    await until(() => log.patches.slice(patchesBefore).some((p) => p.turn === 'tx8'), 3000)
-    await page.waitForTimeout(400)
-    const mine = () => log.patches.slice(patchesBefore)
-    check('两天前问的、两分钟前刚重试过：不当成断了写回 error',
-      !mine().some((p) => p.turn === 'tx7' && p.body.status === 'error'), JSON.stringify(mine().filter((p) => p.turn === 'tx7')))
-    check('重试之后二十分钟没动静的：认定断了，写回 error',
-      mine().some((p) => p.turn === 'tx8' && p.body.status === 'error'), JSON.stringify(mine().filter((p) => p.turn === 'tx8')).slice(0, 200))
+    await page.waitForTimeout(600)
+    const turns = (await chatState(page)).byConversation.c0buildx ?? []
+    check('页面不替老轮次写库（不 PATCH）', log.patches.slice(patchesBefore).length === 0,
+      JSON.stringify(log.patches.slice(patchesBefore).map((p) => p.turn)))
+    check('断在建图阶段的老轮次：照实说上次未完成', turns.every((t) => t.phase === 'error' && t.failure?.title === '上次未完成'),
+      turns.map((t) => `${t.id}:${t.phase}`).join(','))
 
-    // 重试一次：搭好图时连 meta 一起写（有动静的凭据），发起运行时 meta.runId 换成新运行
+    // 重试一次：交给服务端（带着这一轮、mode=retry），这一次的运行挂在这一轮上
     const startsBefore = log.runStarts.length
-    const retryAt = log.patches.length
-    await page.locator('[data-remedy="failed"]').getByRole('button', { name: '重试本轮' }).click()
+    const turnStarts = log.turnStarts.length
+    await page.locator('[data-remedy="failed"]').last().getByRole('button', { name: '重试本轮' }).click()
     await until(() => log.runStarts.length > startsBefore, 6000)
+    const body = log.turnStarts.slice(turnStarts).at(-1)
+    check('重试本轮：请求带着这一轮和方式（retry_of、mode=retry）', body?.retry_of === 'tx8' && body?.mode === 'retry'
+      && body?.conversation_id === 'c0buildx', JSON.stringify(body))
     const newRun = log.runStarts.at(-1)?.id
-    await until(() => log.patches.slice(retryAt).some((p) => p.turn === 'tx8' && p.body.run_id === newRun), 3000)
-    const ps = log.patches.slice(retryAt).filter((p) => p.turn === 'tx8').map((p) => p.body)
-    const graphSave = ps.find((b) => b.graph)
-    check('搭好图时连 meta 一起写，带上此刻', !!graphSave?.meta && Math.abs(Date.now() - (graphSave.meta.at ?? 0)) < 30_000,
-      JSON.stringify(graphSave?.meta ?? null)?.slice(0, 120))
-    const started = ps.find((b) => b.run_id === newRun)
-    check('发起运行：run_id 列和 meta.runId 一起换成新运行，状态是 running',
-      !!newRun && started?.meta?.runId === newRun && started?.status === 'running', JSON.stringify(started ?? null)?.slice(0, 160))
+    await page.waitForFunction((id) => window.__chat.getState().byConversation.c0buildx?.find((t) => t.id === 'tx8')?.run?.id === id,
+      newRun, { timeout: 4000 }).catch(() => {})
+    const tx8 = (await chatState(page)).byConversation.c0buildx.find((t) => t.id === 'tx8')
+    check('服务端发起的这次运行挂在这一轮上，照常在跑', !!newRun && tx8?.run?.id === newRun && tx8?.phase === 'running',
+      `${tx8?.run?.id} · ${tx8?.phase}`)
+    check('页面照旧不写库', log.patches.slice(patchesBefore).length === 0)
     await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()
