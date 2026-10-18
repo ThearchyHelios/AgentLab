@@ -551,8 +551,8 @@ async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run
         pending_approvals=pending or None,
         suspended=run is not None and run.status == "interrupted" and not pending,
         action_pending=seen.action_pending,
-        error_node=_failed_node(run) if run is not None and (run.status == "failed" or run.end_reason == "rejected")
-        else None,
+        error_node=_failed_node(run, await _end_label(session, run))
+        if run is not None and (run.status == "failed" or run.end_reason == "rejected") else None,
         end_reason=run.end_reason if run is not None else None,
         # 事件触发的任务没有下一次「到点」，启用着就是下一次事件来了照常发起
         next_fire=bool(schedule.enabled and (schedule.next_run_at is not None or schedule.trigger_kind == "event")),
@@ -566,15 +566,24 @@ def _trigger_text(fire: ScheduleFire) -> str | None:
     return text if isinstance(text, str) and text else None
 
 
-def _failed_node(run: Run) -> str | None:
-    """失败节点在图上的名字（没有名字的给节点 id）。节点名是搭图时起的，不带查询到的数据。"""
+def _failed_node(run: Run, end_label: str | None = None) -> str | None:
+    """失败节点在图上的名字（没有名字的给节点 id）。节点名是搭图时起的，不带查询到的数据。图上找不到的（子工作流里的那一步，
+    id 是「sub/x」）用终态事件上记的名字（「子工作流 › x」，apps/resolve.end_label），和实例页、通知同一个说法。"""
     if not run.error_node_id:
         return None
     for node in (run.graph or {}).get("nodes") or []:
         if isinstance(node, dict) and node.get("id") == run.error_node_id:
             label = (node.get("data") or {}).get("label") if isinstance(node.get("data"), dict) else None
             return str(label or run.error_node_id)[:80]
-    return None
+    return end_label[:80] if end_label else None
+
+
+async def _end_label(session: Any, run: Run | None) -> str | None:
+    if run is None:
+        return None
+    from app.apps.resolve import end_label
+
+    return await end_label(session, run)
 
 
 async def _issuance_of(session: Any, run: Run) -> tuple[str | None, int | None]:

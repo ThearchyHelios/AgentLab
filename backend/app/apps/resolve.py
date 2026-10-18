@@ -1548,6 +1548,18 @@ async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
     return out
 
 
+async def end_label(session: AsyncSession, run: Run) -> str | None:
+    """运行结束在哪一步的名字，照终态事件（run.failed / run.cancelled）上记的 label：子工作流里的那一步写「子工作流 › x」。
+    图上找不到这一步（id 是「sub/x」）的地方都用它，和实例页、通知（run_node_label）同一个说法；没记的为 None。"""
+    if not run.error_node_id:
+        return None
+    data = await session.scalar(select(RunEvent.data).where(
+        RunEvent.run_id == run.id, RunEvent.type.in_(("run.failed", "run.cancelled"))).order_by(RunEvent.seq.desc()).limit(1))
+    if isinstance(data, dict) and data.get("node_id") == run.error_node_id and isinstance(data.get("label"), str):
+        return data["label"] or None
+    return None
+
+
 def run_node_label(run: Run, trail: _Trail, node_id: str) -> str:
     """运行里一个节点给人看的名字：运行的图上的标题；图上没有的（子工作流里的那一步「sub/x」）用终态事件上记的名字
     （「子工作流 › x」）；都没有的照旧写 id。实例页、通知（notify/service）说同一个名字。"""

@@ -380,7 +380,9 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
     elif is_trial_of(trial, bp) and trial.status == "cancelled" and trial.end_reason == "rejected":
         # 搭建者在试运行里驳回了写入、审批：那是他的决定，不是图出了错，不说成「试运行失败了」、也不挡发布；只照实说
         # 没走完——驳回之后的步骤没用真数看过
-        where = _node_title(trial.graph, trial.error_node_id)
+        from app.apps.resolve import end_label
+
+        where = _node_title(trial.graph, trial.error_node_id, await end_label(session, trial))
         out.append(_problem(TRIAL_REJECTED, f"最近一次试运行{f'在「{where}」' if where else ''}被驳回、没有走完",
                             "warning", source="plan"))
     elif not is_trial_of(trial, bp) or trial.status != "succeeded":
@@ -390,15 +392,16 @@ async def _preflight(session: AsyncSession, bp: Blueprint, target: _Target, *, l
     return [_with_who(p) for p in out]
 
 
-def _node_title(graph: Any, node_id: str | None) -> str | None:
-    """节点在图上的名字（没有名字的给 id）；没有节点时为 None。"""
+def _node_title(graph: Any, node_id: str | None, end_label: str | None = None) -> str | None:
+    """节点在图上的名字（没有名字的给 id）；没有节点时为 None。图上找不到的（子工作流里的那一步「sub/x」）用终态事件上记的
+    名字（「子工作流 › x」，apps/resolve.end_label），没记的照旧给 id。"""
     if not node_id:
         return None
     for node in (graph or {}).get("nodes") or []:
         if isinstance(node, dict) and node.get("id") == node_id:
             data = node.get("data") if isinstance(node.get("data"), dict) else {}
             return str(data.get("label") or node_id)
-    return node_id
+    return end_label or node_id
 
 
 def _with_who(issue: dict[str, Any]) -> dict[str, Any]:
