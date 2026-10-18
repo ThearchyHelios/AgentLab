@@ -1568,11 +1568,12 @@
       }
     }
 
-    // 出具档位：封存范围内最后一条记下了档位的出具判定（和服务端 build._tier 同一个认法），还要是元信息指的那一条
+    // 出具档位：封存范围内最后一条记下了档位的出具判定（和服务端 build._tier 同一个认法），还要是元信息指的那一条。
+    // 子工作流里成果节点的出具判定（节点 id「子工作流节点 id/…」）说的是子工作流交出的那份，不是这次运行的，不认
     const tierClaim = isObj(meta.tier) ? label(TIER_LABEL, meta.tier.value) : '—'
     let found = null
     for (const ev of [...order].reverse()) {
-      if (ev.type !== 'issuance') continue
+      if (ev.type !== 'issuance' || String(ev.node_id ?? '').includes('/')) continue
       if (typeof ev.canonical !== 'string') found = { result: FAIL, reason: T.tierAbsent(ev.seq) }
       else if (!out.checked.has(ev)) found = { result: NA, reason: T.tierUnchecked(ev.seq) }
       else if (typeof own(out.checked.get(ev), 'tier') === 'string') found = { ev, value: out.checked.get(ev).tier }

@@ -443,7 +443,8 @@ def _check_citations(
     if not isinstance(doc, dict):
         gaps.append(f"无法读取报告「{node.title}」的文档，未执行引用核对")
         return out
-    if doc.get("node_id") != report_from or doc.get("run_id") != ctx.run.run_id \
+    # 文档记的是这次运行里的节点 id（子工作流里的报告带前缀，nodes/report 的 compose）
+    if doc.get("node_id") != ctx.run.global_id(str(report_from)) or doc.get("run_id") != ctx.run.run_id \
             or doc.get("markdown") != payload.get("text"):
         gaps.append(f"报告「{node.title}」的文档与本次运行中的产出不一致，未执行引用核对")
         return out
@@ -899,7 +900,8 @@ def _declare_citations(
     declared_at: Any, ctx: NodeContext, sql_checks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """引用模式的 _issuance。旧字段一个不少（老前端照常显示），另加 mode、report、unresolved。"""
-    report = {"node_id": report_from, "doc_artifact": cited["doc_artifact"]}
+    # 节点 id 和报告文档、report.checked 事件上记的同一个（这次运行里的，子工作流里的带前缀）
+    report = {"node_id": ctx.run.global_id(report_from), "doc_artifact": cited["doc_artifact"]}
     issuance = {
         "mode": "citations",
         "tier": tier,

@@ -218,13 +218,17 @@ async def _rejected_exit(node: GraphNode, ctx: NodeContext, error: NodeRejected,
     """被驳回、接了「驳回」出口：这一步正常结束（node.finished 带 outcome=rejected 和哪种关卡、结论、谁、备注、转到哪几步），
     产出 NodeRejected.exit_payload()，路由按它的 __decision__ 走驳回那条边。
 
+    节点在驳回之前已经算出的（NodeRejected.exit_updates）并进产出、台账和用量：双盲复算的裁决被驳回时，复算比出的不一致
+    照样记成出具缺口、台账照记一条结论为驳回的 dual_check，下游的出具不会把审核人驳回的那组数完整出具。
     动作确认被驳回时 NodeRejected 抛在发送之前，走到这里时什么都没发（照旧「未确认（被驳回）」）。trail 上这一步记
     outcome=rejected：运行收尾据此在 run.finished 上照实写「途经驳回」（runner._rejected_via）。审批模式写了「结果存为
     变量」的照旧写 false（以前接了驳回边的审批就是这么写的）；别的关卡这一步没有产出值，变量不写。"""
     from app.core.artifact_store import put_json
 
     run_ctx = ctx.run
-    payload = error.exit_payload()
+    extra = error.exit_updates or {}
+    # 节点在驳回之前已经算出的（NodeRejected.exit_updates：双盲复算的出具缺口、台账条目）照样交出；驳回的那几个键在上面
+    payload = {**(extra.get("payload") or {}), **error.exit_payload()}
     nodes = run_ctx.spec.node_map()
     to = [{"node_id": run_ctx.global_id(t), "label": nodes[t].title if t in nodes else t} for t in dict.fromkeys(targets)]
     try:
@@ -234,12 +238,17 @@ async def _rejected_exit(node: GraphNode, ctx: NodeContext, error: NodeRejected,
     except Exception:  # noqa: BLE001 - 工件写失败不该毁掉运行本身
         artifact_id = None
     said = {"kind": error.kind, "decision": error.decision, "actor": error.actor, "note": error.note}
+    ledger = [e for e in extra.get("evidence") or [] if isinstance(e, dict)]
     ctx.emit(EventType.NODE_FINISHED, duration_ms=elapsed, attempt=attempt,
              preview=_preview({"nodes": {node.id: payload}}, node.id), artifact=artifact_id,
-             outcome="rejected", **said, to=to)
+             outcome="rejected", **said, to=to, **({"evidence": ledger} if ledger else {}))
     updates: dict[str, Any] = {"nodes": {node.id: payload}, "trail": [{
         "node_id": node.id, "type": str(node.type), "duration_ms": elapsed, "attempt": attempt, "ts": time.time(),
         "outcome": "rejected", "label": node.title, **said, "to": to}]}
+    if ledger:
+        updates["evidence"] = ledger
+    if extra.get("usage"):
+        updates["usage"] = dict(extra["usage"])
     var_name = str(node.config.get("assign_to") or "").strip()
     if var_name and error.kind == "approve":
         updates["vars"] = {var_name: False}

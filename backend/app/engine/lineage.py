@@ -138,6 +138,32 @@ def untraced(inputs: Iterable[Any]) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
+# 卡上记的节点 id 在哪一层
+# --------------------------------------------------------------------------
+
+
+def scoped_id(card_node: Any, node_id: Any) -> Any:
+    """口径卡上记的节点 id（输入来自哪个节点、穿过的整形节点、转抄的卡、取值链里写的 nodes.X）是卡所在那一层图里的 id：
+    子工作流里的卡（这次运行里的 id「子工作流节点 id/卡」）记的是子图里的 id，换成这次运行里的（接上同一个前缀）。最外层
+    的卡原样；经子工作流出口接上的出处（multi.run_subgraph 记的「子工作流节点 id/…」）已经是卡这一层的 id，同样接上卡的
+    前缀就对了。证据面板、可验证报告、推演都按这一个认。"""
+    card = str(card_node or "")
+    if not isinstance(node_id, str) or not node_id or "/" not in card:
+        return node_id
+    return f"{card.rsplit('/', 1)[0]}/{node_id}"
+
+
+def in_scope(table: Mapping[str, Any], card_node: Any) -> dict[str, Any]:
+    """按这次运行里的节点 id 记的表（每个节点那一刻的产出、跑完的时刻）→ 按口径卡所在那一层的 id 记的：子工作流里的卡只看
+    同一张子图里的（去掉前缀；父图里同名的节点不算），最外层的卡原样。卡上的取值链按它这一层的 id 查（scoped_id 的反面）。"""
+    card = str(card_node or "")
+    if "/" not in card:
+        return dict(table)
+    prefix = card.rsplit("/", 1)[0] + "/"
+    return {key[len(prefix):]: value for key, value in table.items() if key.startswith(prefix)}
+
+
+# --------------------------------------------------------------------------
 # 静态地认（只有图）
 # --------------------------------------------------------------------------
 

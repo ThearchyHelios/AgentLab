@@ -436,7 +436,7 @@ async def notify_run(run_id: str, event: str) -> int:
     发起人是认证过的身份（run.origin.actor_verified）时，他自己订阅了这件事的个人渠道也收得到（「我发起的实例完成 / 失败」，
     04-对外集成与触达 B1）。以前这里给 _channels 的 users 是空的，个人渠道勾了这两项永远收不到。自报的署名不算：关登录
     时谁都能填别人的名字。"""
-    from app.apps.resolve import _trails, instance_state
+    from app.apps.resolve import _trails, instance_state, run_node_label
 
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
@@ -448,12 +448,14 @@ async def notify_run(run_id: str, event: str) -> int:
             return 0
         base = await _base_url(session)
         where = await _where(session, run)
-        state = instance_state(run, (await _trails(session, [run]))[run.id])
+        trail = (await _trails(session, [run]))[run.id]
+        state = instance_state(run, trail)
     finished = event == "run.finished"
     ok = state["code"] == "succeeded"
     lines = [("状态", state["text"]), ("实例", f"#{run_id[:6]}")]
     if not finished and run.error_node_id and state["code"] == "failed":
-        lines.append(("失败节点", f"「{_label(run.graph, run.error_node_id)}」"))
+        # 子工作流里的那一步（「sub/x」）图上没有：照终态事件上记的名字写，和实例页同一个（apps/resolve.run_node_label）
+        lines.append(("失败节点", f"「{run_node_label(run, trail, run.error_node_id)[:80]}」"))
     head = ("已完成" if ok else "已结束") if finished else ("已结束" if state["code"] == "cancelled" else "失败")
     message = {"event": event, "status": run.status, "ok": ok,
                "title": f"{where or '应用'}的实例{head}", "lines": lines,

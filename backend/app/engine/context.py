@@ -167,6 +167,9 @@ class NodeRejected(NodeError):
         self.actor = actor
         self.note = note
         self.stop = stop
+        #: 走驳回出口时这一步另外交出的：{payload: 产出里的其余字段, evidence: 台账条目, usage: 用量}。节点在抛之前按需填：
+        #: 驳回之前已经算出、下游要据此判档的东西不能跟着驳回丢掉（双盲复算的出具缺口和台账条目）。没接出口时用不上
+        self.exit_updates: dict[str, Any] | None = None
 
     @classmethod
     def of(cls, ctx: Any, message: str, *, kind: str, decision: Any, stop: bool = False) -> NodeRejected:

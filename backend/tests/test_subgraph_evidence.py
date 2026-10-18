@@ -119,6 +119,49 @@ async def test_the_subgraph_steps_are_in_the_run_with_prefixed_ids():
     assert row.output == {"数": "246.5"}
 
 
+async def test_a_step_inside_the_subgraph_is_named_by_its_label_not_its_id():
+    """子图里的一步被驳回、出错时，运行记下的出错节点是「sub/x」：实例页、通知照终态事件里的名字写「子工作流 › x」，
+    不露出内部 id。"""
+    from app.apps.resolve import _trails, instance_state, run_node_label
+    from app.db.models import Run
+
+    sub = S.chain(node("s", "input"),
+                  node("gate", "tool", "算一下", tool="calculator", args={"expression": "1+1"}, approval="always"),
+                  node("o", "output", fields=[{"name": "x", "value": "{{ nodes.gate }}"}]))
+    sub_id = await publish(sub)
+    graph = S.chain(node("start", "input"), node("sub", "subgraph", "取数子流程", workflow_id=sub_id, workflow_version=1),
+                    node("out", "output", fields=[{"name": "x", "value": "{{ nodes.sub.output.x }}"}]))
+    started = await run_manager.start(graph=graph, input_payload={})
+    for _ in range(200):
+        async with SessionLocal() as session:
+            if (await session.get(Run, started.id)).status == "interrupted" and not run_manager.is_active(started.id):
+                break
+        await __import__("asyncio").sleep(0.05)
+    await run_manager.resume(started.id, {"approved": False, "note": "不对"}, actor="张工")
+    for _ in range(200):
+        async with SessionLocal() as session:
+            row = await session.get(Run, started.id)
+        if row.status == "cancelled" and not run_manager.is_active(started.id):
+            break
+        await __import__("asyncio").sleep(0.05)
+    assert (row.status, row.end_reason, row.error_node_id) == ("cancelled", "rejected", "sub/gate")
+    async with SessionLocal() as session:
+        trail = (await _trails(session, [row]))[row.id]
+    assert instance_state(row, trail) == {"code": "cancelled", "text": "「取数子流程 › 算一下」被驳回"}
+    assert run_node_label(row, trail, "sub/gate") == "取数子流程 › 算一下"
+
+    failing = await publish(fetch_card_graph(sql="SELECT nope FROM nowhere"), "出错的")
+    started = await run_manager.start(graph=parent(failing, contract_from=None,
+                                                   out=[{"name": "数", "value": "{{ nodes.sub.output.gmv }}"}]),
+                                      input_payload={})
+    row = await S.wait(started.id)
+    assert row.status == "failed" and row.error_node_id == "sub/fetch"
+    async with SessionLocal() as session:
+        trail = (await _trails(session, [row]))[row.id]
+    assert run_node_label(row, trail, row.error_node_id) == "取数子流程 › fetch"
+    assert run_node_label(row, trail, "sub") == "取数子流程"
+
+
 async def test_the_instance_timeline_counts_the_subgraph_as_one_step():
     """应用的实例进度只说这张图上的步骤：子图里的那几步（「sub/…」）不单列，子工作流算一步。"""
     from types import SimpleNamespace
@@ -354,6 +397,141 @@ async def test_the_parent_report_cites_the_subgraph_query_and_card(client, monke
     assert (await verify_manifest(row.id))["ok"] is True
     res = await client.get(f"/api/runs/{row.id}/report.html")
     assert res.status_code == 200 and "246.5" in res.text
+
+
+#: 载入可验证报告的核对脚本，交回引用链上每份报告文档的核对结果（同 tests/test_bundle_rejected.py 的做法）
+VERIFY_CHAIN = r"""
+const fs = require('fs')
+const { createHash } = require('crypto')
+const input = JSON.parse(fs.readFileSync(0, 'utf8'))
+const mod = { exports: {} }
+new Function('module', fs.readFileSync(process.argv[1], 'utf8'))(mod)
+const digest = async (bytes) => createHash('sha256').update(bytes).digest('hex')
+mod.exports.verify(input.data, digest, input.data.meta.manifest_hash).then((out) => {
+  process.stdout.write(JSON.stringify(out.chain.filter((c) => c.kind === 'report_doc')
+    .map((c) => ({ node: c.report && c.report.node_id, result: c.result, reason: c.reason || '' }))))
+}, (e) => { console.error((e && e.stack) || String(e)); process.exit(1) })
+"""
+
+
+async def test_a_report_inside_the_subgraph_is_not_tampered_and_not_the_parents_answer(client, monkeypatch):
+    """子图里有报告撰写节点：它的 report.checked 进了父运行（节点 id「sub/write」），报告文档记的也是这次运行里的 id，
+    不被认成「疑似被修改」。父图自己没有报告：父图的答案是子图出口的值，不是子图那份报告——证据图、评测读答案都按父图
+    自己认（和子图事件进运行之前一样：没有报告），子图的报告按 ?report=sub/write 点得开，可验证报告里核对通过。"""
+    import json
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import app.bundle
+    from app.api.evidence import _reports, _sealed
+    from app.eval.score import read_answer
+
+    sub = S.chain(node("s", "input"), node("fetch", "tool", tool=S.tool(), args={"sql": PAID}),
+                  node("write", "report", instructions="写答案"),
+                  node("o", "output", fields=[{"name": "答案", "value": "{{ nodes.write.text }}"}],
+                       contract={"report_from": "write"}))
+    sub_id = await publish(sub)
+    graph = S.chain(node("start", "input"), node("sub", "subgraph", "取数子流程", workflow_id=sub_id, workflow_version=1),
+                    node("out", "output", fields=[{"name": "答案", "value": "{{ nodes.sub.output.答案 }}"}]))
+    S.script(monkeypatch, "子流程里查到的销售额 [[v:Q1.r0.gmv]]。")
+    started = await run_manager.start(graph=graph, input_payload={})
+    row = await S.wait(started.id)
+    assert row.status == "succeeded", row.error
+
+    body = (await client.get(f"/api/runs/{row.id}/evidence")).json()
+    # 父图没有报告、没有契约：照没有契约的答案按数值猜候选（legacy_text，写明是猜的）。子图查过的数如今在封存范围里，
+    # 猜得到它；不再把子图的报告当成父图的、更不说它被改过
+    assert (body["mode"], body["reports"]) == ("legacy_text", []), body
+    [guessed] = [c for f in body["legacy"]["fields"] for seg in f["segments"] for c in seg.get("candidates") or []]
+    assert (guessed["node_id"], guessed["value"]) == ("sub/fetch", 246.5)
+    # 子图自己的出具契约照常核对它那份报告（文档上记的 id 和这一层的报告节点对得上）
+    from app.core.artifact_store import load
+
+    inner_issuance = load((await _sealed(row.id)).outputs["sub"])["output"]["_issuance"]
+    assert inner_issuance["tier"] == "formal" and inner_issuance["report"]["node_id"] == "sub/write", inner_issuance
+    answer = await read_answer(row.id)
+    assert answer.problem is None and answer.report is None and "246.5" in row.output["答案"], answer
+    # 子图的报告本身：这次运行里的 id、哈希核对通过、点得开
+    [inner] = _reports(await _sealed(row.id), nested=True)
+    assert (inner.node_id, inner.hash_ok, (inner.doc or {}).get("node_id")) == ("sub/write", True, "sub/write")
+    seg = next(s["id"] for b in inner.doc["blocks"] for u in b["units"] for s in u["segments"]
+               if (s.get("cite") or {}).get("kind") == "cell")
+    res = await client.get(f"/api/runs/{row.id}/evidence/segments/{seg}", params={"report": "sub/write"})
+    assert res.status_code == 200, res.text
+    [query] = [st for st in res.json()["chain"] if st["step"] == "query"]
+    assert query["node_id"] == "sub/fetch" and query["sealed"] is True
+    # 可验证报告：子图那份报告的文档在引用链上核对通过（文档记的节点 id 和自查事件对得上）
+    node_bin = shutil.which("node")
+    if node_bin:
+        html = (await client.get(f"/api/runs/{row.id}/bundle.html")).text
+        data = json.loads(re.search(r'<script type="application/json" id="bundle-data">(.*?)</script>', html, re.S).group(1))
+        verifier = Path(app.bundle.__file__).parent / "verifier.js"
+        done = subprocess.run([node_bin, "-e", VERIFY_CHAIN, str(verifier)], input=json.dumps({"data": data}),
+                              capture_output=True, text=True, timeout=120)
+        assert done.returncode == 0, done.stderr[-2000:]
+        assert json.loads(done.stdout) == [{"node": "sub/write", "result": "pass", "reason": ""}]
+        # 这次运行没有出具判定（子图成果节点的那条是子图自己的）：元信息不写档位
+        assert data["meta"]["tier"] is None, data["meta"]["tier"]
+
+
+@pytest.mark.parametrize("namesake", [False, True])
+async def test_the_bundle_and_whatif_read_a_subgraph_card_in_its_own_layer(client, monkeypatch, namesake):
+    """子图里一张卡转抄同一张子图里的另一张（card1 ← card0），父图报告引用 [[m:g1]]，全程没设遮罩：卡上记的是子图里的 id
+    （nodes.card0…），可验证报告、推演都按卡所在的那一层找产出——找得到，不当成「核对不了」整张遮住；父图里另有一个同名的
+    card0（namesake）时，也不拿它当依据（推演还原转抄来的值，还原成子图那张的 246.5，不是父图那张的 1）。"""
+    import json
+    import re
+
+    # card0 另有一个按位置取的格（vars.rows.rows[0][0]，经原样解析查询结果的 parse）：可验证报告、推演都要顺着取值链从
+    # parse 那一次的产出走
+    sub = S.chain(node("s", "input"), node("fetch", "tool", tool=S.tool(), args={"sql": PAID}),
+                  node("parse", "transform", mode="json", template="{{ nodes.fetch }}", assign_to="rows"),
+                  node("card0", "metrics", caliber="子口径", caliber_version="v1",
+                       metrics=[GMV, metric("first", "vars.rows.rows[0][0]"),
+                                metric("cnt", "len(nodes.parse.rows)")]),
+                  node("card1", "metrics", caliber="转抄", caliber_version="v1",
+                       metrics=[metric("g1", "nodes.card0.metrics[0].value")]),
+                  node("o", "output", fields=[{"name": "gmv", "value": "{{ nodes.card1.metrics[0].value }}"}]))
+    sub_id = await publish(sub)
+    parts = [node("start", "input")]
+    if namesake:
+        parts += [node("card0", "metrics", caliber="父口径", caliber_version="v1", metrics=[metric("one", "1")]),
+                  node("parse", "transform", mode="json", template='{"rows": [[1], [2]]}', assign_to="other")]
+    parts += [node("sub", "subgraph", "取数子流程", workflow_id=sub_id, workflow_version=1),
+              node("write", "report", instructions="写答案"),
+              node("out", "output", fields=[{"name": "答案", "value": "{{ nodes.write.text }}"}])]
+    S.script(monkeypatch, "转抄的口径 [[m:g1]]，第一行 [[m:first]]。")
+    started = await run_manager.start(graph=S.chain(*parts), input_payload={})
+    row = await S.wait(started.id)
+    assert row.status == "succeeded", row.error
+    card1 = next(e["artifact"] for e in (await card_entries(row.id)) if e["node_id"] == "sub/card1")
+    html = (await client.get(f"/api/runs/{row.id}/bundle.html")).text
+    data = json.loads(re.search(r'<script type="application/json" id="bundle-data">(.*?)</script>', html, re.S).group(1))
+    entry = next(a for a in data["artifacts"] if a["id"] == card1)
+    assert "masked" not in entry and entry.get("b64"), entry
+    # 推演：转抄的那个输入按子图里 card0 那次的产出还原，什么都不改时值不变、没有推演不了的
+    res = await client.post(f"/api/runs/{row.id}/evidence/whatif", json={"card": "sub/card1"})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["unsupported"] == [], body["unsupported"]
+    [g1] = [m for m in body["metrics"] if m.get("id") == "g1"]
+    assert g1.get("changed") in (False, None) and g1.get("new") == g1.get("old") == 246.5, g1
+    card0 = next(e["artifact"] for e in (await card_entries(row.id)) if e["node_id"] == "sub/card0")
+    entry = next(a for a in data["artifacts"] if a["id"] == card0)
+    assert "masked" not in entry and entry.get("b64"), entry
+    res = await client.post(f"/api/runs/{row.id}/evidence/whatif", json={"card": "sub/card0"})
+    assert res.status_code == 200 and res.json()["unsupported"] == [], res.json()
+    # nodes.parse.rows 这种整份产出的输入从 parse 那一次的产出还原：子图里的 parse（1 行），不是父图里同名的那个（2 行）
+    [cnt] = [m for m in res.json()["metrics"] if m.get("id") == "cnt"]
+    assert cnt.get("new") == cnt.get("old") == 1, cnt
+
+
+async def card_entries(run_id: str) -> list[dict]:
+    from app.api.evidence import _sealed
+
+    return [e for e in (await _sealed(run_id)).entries if e.get("kind") == "metric_set"]
 
 
 async def test_masks_inside_the_subgraph_follow_the_parent_run(client, monkeypatch, tmp_path):

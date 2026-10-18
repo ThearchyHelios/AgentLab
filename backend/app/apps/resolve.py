@@ -1506,6 +1506,9 @@ class _Trail:
     #: 走了「驳回」出口、而且最后一次执行就是走的驳回出口的关卡：节点 id → 那条 node.finished 的数据（outcome=rejected，
     #: 带 to：转到哪几步。engine/compiler._rejected_exit）。退回修改之后又批准了的不算：结局是批准
     rejected_out: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 终态事件（run.failed / run.cancelled）上记的出错、被驳回的那一步：节点 id → 名字。子工作流里的那一步（「sub/x」）
+    #: 不在运行的图上，名字只有这里有（runner._label_of 接好的「子工作流 › x」）
+    end_labels: dict[str, str] = field(default_factory=dict)
 
 
 async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
@@ -1532,7 +1535,22 @@ async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
             if node_id:
                 out[run_id].events.append((etype, node_id))
         await _rejected_exits(session, [r for r in runs if r.status == "succeeded"], out)
+        ended = [r.id for r in runs if r.status in ("failed", "cancelled")]
+        if ended:
+            for run_id, data in (await session.execute(select(RunEvent.run_id, RunEvent.data).where(
+                    RunEvent.run_id.in_(ended), RunEvent.type.in_(("run.failed", "run.cancelled"))))).all():
+                if isinstance(data, dict) and data.get("node_id") and isinstance(data.get("label"), str) and data["label"]:
+                    out[run_id].end_labels[str(data["node_id"])] = data["label"]
     return out
+
+
+def run_node_label(run: Run, trail: _Trail, node_id: str) -> str:
+    """运行里一个节点给人看的名字：运行的图上的标题；图上没有的（子工作流里的那一步「sub/x」）用终态事件上记的名字
+    （「子工作流 › x」）；都没有的照旧写 id。实例页、通知（notify/service）说同一个名字。"""
+    from app.apps.tree import node_map
+
+    found = (node_map(run.graph).get(node_id) or {}).get("title")
+    return found or trail.end_labels.get(node_id) or node_id
 
 
 async def _rejected_exits(session: AsyncSession, runs: list[Run], out: dict[str, _Trail]) -> None:
@@ -1651,7 +1669,7 @@ def instance_state(run: Run, trail: _Trail) -> dict[str, str]:
     nodes = node_map(run.graph)
 
     def title(node_id: str) -> str:
-        return (nodes.get(node_id) or {}).get("title") or node_id
+        return (nodes.get(node_id) or {}).get("title") or trail.end_labels.get(node_id) or node_id
 
     if run.status == "interrupted":
         if any(a.state in ("sent", "unknown") for a in trail.actions):

@@ -323,11 +323,17 @@ class _Report:
     claims: str | None = None
 
 
-def _reports(sealed: _Sealed) -> list[_Report]:
-    """封存范围内每个报告节点最后一次的自查结果，按第一次出现的顺序。"""
+def _reports(sealed: _Sealed, *, nested: bool = False) -> list[_Report]:
+    """封存范围内每个报告节点最后一次的自查结果，按第一次出现的顺序。
+
+    默认只认这次运行的图上的报告节点：子工作流里的报告（节点 id「子工作流节点 id/…」，子图的事件和父运行在同一个流里）
+    是子工作流那一步内部的东西，父图的答案是子工作流出口的值，不是那份报告本身——证据图、取答案的评测、按成果挑报告
+    （_choose）都按父图自己的认。nested 为真时连子工作流里的一起给（按 ?report=sub/write 点开它们）。可验证报告另按全部
+    report.checked 核对（bundle/build._report_events：自查过的文档一份都不能少）。"""
     latest: dict[str, dict[str, Any]] = {}
     for _, etype, node_id, data in sealed.events:
-        if etype == "report.checked" and node_id and isinstance(data, dict) and data.get("doc_artifact"):
+        if etype == "report.checked" and node_id and isinstance(data, dict) and data.get("doc_artifact") \
+                and (nested or "/" not in node_id):
             latest[node_id] = data
     evidence = _output_evidence(sealed)
     out = []
@@ -579,11 +585,13 @@ def _metric_in(card: dict[str, Any] | None, metric_id: Any) -> dict[str, Any] | 
 
 
 def _issuance_of(sealed: _Sealed) -> dict[str, Any] | None:
-    """成果上的 _issuance；成果里取不到时退回封存范围内最后一条 issuance 事件。"""
+    """成果上的 _issuance；成果里取不到时退回封存范围内最后一条 issuance 事件。子工作流里成果节点的出具判定（节点 id
+    「子工作流节点 id/…」，子图的事件和父运行在同一个流里）说的是子工作流交出的那份，不是这次运行的，不认。"""
     output = sealed.payload_of(sealed.nodes_of("output")) or {}
     issuance = output.get("_issuance")
     if not isinstance(issuance, dict):
-        issuance = next((data for _, etype, _, data in reversed(sealed.events) if etype == "issuance"), None)
+        issuance = next((data for _, etype, node_id, data in reversed(sealed.events)
+                         if etype == "issuance" and "/" not in str(node_id or "")), None)
     return issuance if isinstance(issuance, dict) else None
 
 
@@ -873,7 +881,7 @@ async def evidence_metric(run_id: str, node: str, metric: str) -> dict[str, Any]
 def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
                   ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
     """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""
-    reports = _reports(sealed)
+    reports = _named_reports(sealed, wanted)
     if not reports:
         raise CodedHTTPException(404, "本次运行没有封存的报告文档，没有可查看的片段", REPORT_NOT_FOUND)
     chosen = _choose(reports, wanted, sealed)
@@ -885,6 +893,12 @@ def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
     if found is None:
         raise CodedHTTPException(404, "报告中没有这个片段", SEGMENT_NOT_FOUND)
     return chosen, found
+
+
+def _named_reports(sealed: _Sealed, wanted: str | None) -> list[_Report]:
+    """点名要某一份报告时从哪些里挑：点的是子工作流里的那份（「sub/write」）连子工作流里的一起给，否则只给父图上的
+    （_reports）。"""
+    return _reports(sealed, nested=bool(wanted) and "/" in str(wanted))
 
 
 def _choose(reports: list[_Report], wanted: str | None, sealed: _Sealed) -> _Report:
@@ -1097,13 +1111,10 @@ async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Mask
 
 
 def _scoped(card_node: Any, node_id: Any) -> Any:
-    """口径卡上记的节点 id（输入来自哪个节点、穿过的整形节点、转抄的卡）是卡所在那一层图里的 id：子工作流里的卡
-    （节点 id「子工作流节点 id/卡」）记的是子图里的 id，换成这次运行里的（接上同一个前缀）。最外层的卡原样；经子工作流
-    出口接上的出处（multi.run_subgraph 记的）已经是卡这一层的 id，同样接上卡的前缀就对了。"""
-    card = str(card_node or "")
-    if not isinstance(node_id, str) or not node_id or "/" not in card:
-        return node_id
-    return f"{card.rsplit('/', 1)[0]}/{node_id}"
+    """口径卡上记的节点 id 换成这次运行里的（engine/lineage.scoped_id：子工作流里的卡记的是子图里的 id）。"""
+    from app.engine.lineage import scoped_id
+
+    return scoped_id(card_node, node_id)
 
 
 def _scoped_ids(item: dict[str, Any], card_node: str, sealed: _Sealed) -> dict[str, Any]:
@@ -1335,10 +1346,11 @@ class _CopyGraph:
                     upstream: list[Any] = []
                     # 转抄的是哪张卡：按读到的产出上记着的指标集认（经数据整形赋给变量、转了一道的也认得出是哪张卡），
                     # 认不出的按取值链上的那个节点
-                    owner = copied.node_id
+                    # 取值链上写的是卡所在那一层图里的 id（_scoped）
+                    owner = _scoped(node, copied.node_id)
                     if copied.card is not None:
                         up_art = str(copied.card.get("artifact") or "")
-                        owner = self._owner(up_art) or copied.node_id
+                        owner = self._owner(up_art) or owner
                         for index in copied.picked:
                             up_metric = copied.card["metrics"][index]
                             if isinstance(up_metric, dict) and up_metric.get("inputs"):
@@ -2943,7 +2955,7 @@ async def export_report_html(run_id: str, report: str | None = None) -> Response
     )
 
     sealed = await _sealed(run_id)
-    reports = _reports(sealed)
+    reports = _named_reports(sealed, report)
     if not reports:
         raise CodedHTTPException(404, "本次运行没有报告文档，没有可导出的报告", REPORT_NOT_FOUND)
     chosen = _choose(reports, report, sealed)
@@ -3896,7 +3908,7 @@ def _formal_message(doc: dict[str, Any] | None, claims: str | None, verdicts: li
 def _formal_refusal(sealed: _Sealed, wanted: str | None, units: list[str] | None = None) -> str:
     """按需裁判接口拒绝正式运行时的那句话，和片段接口说的一致：按请求要的那份报告（没指定取成果里标注的那一份）、
     点的那几句结论句（不是结论句的不算）说。选不出报告、文档读不出来的，只说正式运行不能按需裁判（FORMAL_ONLY）。"""
-    reports = _reports(sealed)
+    reports = _named_reports(sealed, wanted)
     try:
         chosen = _choose(reports, wanted, sealed) if reports else None
     except CodedHTTPException:
@@ -4070,7 +4082,7 @@ async def judge_units(run_id: str, payload: Any = Body(None), report: str | None
             raise CodedHTTPException(409, UNSEALED_JUDGE, JUDGE_UNSEALED)
         if not sealed.trusted:
             raise CodedHTTPException(409, BROKEN_JUDGE, SEAL_BROKEN_CODE)
-        reports = _reports(sealed)
+        reports = _named_reports(sealed, wanted)
         if not reports:
             raise CodedHTTPException(404, "这次运行没有封存的报告文档，没有可以判断的句子", REPORT_NOT_FOUND)
         chosen = _choose(reports, wanted, sealed)
