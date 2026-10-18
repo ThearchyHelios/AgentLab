@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Mapping
@@ -172,6 +173,17 @@ class ChatDriver(TurnDriver):
             except ChatRunRefused as e:
                 raise LaunchRefused(403, str(e)) from e
         return args
+
+    async def _launch(self, graph: dict[str, Any], payload: dict[str, Any] | None = None) -> str | None:
+        """发起那一下不让停止打断到一半：运行建好了、这一轮却不知道它，就成了没人管、照样计费的运行。停止正好落在这时，
+        等它发起完、记下运行（on_launched），再照常去取消它（_stopped）。"""
+        task = asyncio.ensure_future(super()._launch(graph, payload))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await task
+            raise
 
     async def on_launched(self, run: Any) -> None:
         await self.execution.launched(run)

@@ -104,6 +104,17 @@ async def _stage(turn_id: str, stage: str) -> None:
     await _until(hit)
 
 
+async def _launched(turn_id: str) -> str:
+    """等这一轮发起了运行，交回运行 id（stage=run 在发起之前就记下了，要等的是任务上的 run_id）。"""
+    async def hit() -> bool:
+        async with SessionLocal() as session:
+            job = await session.get(ChatTurnJob, turn_id)
+        return job is not None and bool(job.run_id)
+    await _until(hit)
+    async with SessionLocal() as session:
+        return (await session.get(ChatTurnJob, turn_id)).run_id
+
+
 def _sse(text: str) -> list[dict[str, Any]]:
     return [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")]
 
@@ -303,9 +314,7 @@ async def test_stop_while_running_cancels_the_run(client, monkeypatch, source):
     monkeypatch.setattr(mock_model.MockChatModel, "_astream", slow_stream)
     conversation_id = await _conversation(client)
     turn_id = await _ask(client, conversation_id, datasource_ids=[source["id"]])
-    await _stage(turn_id, "run")
-    async with SessionLocal() as session:
-        run_id = (await session.get(ChatTurnJob, turn_id)).run_id
+    run_id = await _launched(turn_id)
     assert (await client.post(f"/api/chat/turns/{turn_id}/cancel")).status_code == 200
     job = await _done(turn_id)
     assert job.status == "cancelled"
@@ -881,3 +890,48 @@ async def test_several_stranded_turns_of_one_conversation_can_be_resumed_togethe
         await _done(turn_id)
         row = await _row(turn_id)
         assert row.status == "done" and row.answer == answer
+
+
+async def test_a_stop_that_lands_while_launching_still_cancels_the_run(client, monkeypatch, source):
+    """停止正好落在发起运行的那一下：发起不能被打断到一半（运行建好了、这一轮却不知道它，就成了没人管的运行）——等它发起完、
+    记下运行，再照常取消它，那一行收成已取消。"""
+    import app.engine.launch as launch
+    from app.providers import mock_model
+
+    es.use_copilot(monkeypatch, es.Copilot(source["name"]))
+    hold = asyncio.Event()
+
+    async def slow(self, messages, stop=None, run_manager=None, **kwargs):
+        await hold.wait()
+        raise AssertionError("不该放行")
+
+    async def slow_stream(self, messages, stop=None, run_manager=None, **kwargs):
+        await hold.wait()
+        raise AssertionError("不该放行")
+        yield  # noqa: unreachable - 让它成为异步生成器
+
+    monkeypatch.setattr(mock_model.MockChatModel, "_agenerate", slow)
+    monkeypatch.setattr(mock_model.MockChatModel, "_astream", slow_stream)
+    entered, release = asyncio.Event(), asyncio.Event()
+    real = launch.launch_run
+
+    async def gated(session, **kw):
+        entered.set()
+        await release.wait()
+        return await real(session, **kw)
+
+    monkeypatch.setattr(launch, "launch_run", gated)
+    conversation_id = await _conversation(client)
+    turn_id = await _ask(client, conversation_id, datasource_ids=[source["id"]])
+    await asyncio.wait_for(entered.wait(), timeout=20)
+    stopping = asyncio.ensure_future(client.post(f"/api/chat/turns/{turn_id}/cancel"))
+    await asyncio.sleep(0.2)
+    release.set()
+    assert (await stopping).status_code == 200
+    job = await _done(turn_id)
+    assert job.status == "cancelled" and job.run_id, "发起完了才停：运行记在这一轮上"
+    await run_manager.wait_idle(job.run_id)
+    async with SessionLocal() as session:
+        assert (await session.get(Run, job.run_id)).status == "cancelled", "这次运行跟着取消了，没有没人管的运行"
+    row = await _row(turn_id)
+    assert row.status == "error" and row.error == "已取消" and row.meta["runId"] == job.run_id
