@@ -77,10 +77,14 @@ ENTITY_SYNTAXES = frozenset({1, 2})
 #: - 1：照快照里的原样显示，ISO 日期时间带 T（2026-06-30T08:21:39）。没有这个字段的老文档按它复核
 #: - 2：ISO 日期时间显示成「2026-06-30 08:21:39」（小数秒、时区照留）。只改显示：快照里的值、引用记下的 value、
 #:   eid、证据下钻都不变
-#: 新组装的文档里真有日期时间被改写时才记 cell_display: 2（参与内容哈希），没有的文档和以前一字不差。复核必须按
+#: - 3：整表标记 rows= 的结束行越界、起始行在范围内时，截到最后一行（以前整张表算解析不了）。截完照样展开成一格格的
+#:   单元格引用、按格复核，所以这一条只影响组装；复核 3 版以前的文档时，没展开的整表标记照老规矩判，不然老文档里那句
+#:   「没有第 N 行」重新解析得了，会被当成文档被改过（render_mismatch）
+#: 新组装的文档里真有格子因为显示规则改了写法时才记 cell_display（参与内容哈希），记的是渲染得出这些格子的最低一版
+#: （只有日期时间被改写的记 2：3 版只多了组装时的整表截行，不改格子的写法），没有的文档和以前一字不差。复核必须按
 #: 文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过（render_mismatch）
-CELL_DISPLAY = 2
-CELL_DISPLAYS = frozenset({1, 2})
+CELL_DISPLAY = 3
+CELL_DISPLAYS = frozenset({1, 2, 3})
 _ISO_DATETIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)$")
 
 
@@ -1314,13 +1318,14 @@ class _Snapshots:
         self.syntax = ENTITY_SYNTAX if syntax is None else syntax
         #: 单元格按哪一版显示规则渲染（CELL_DISPLAY）：组装、流式渲染用当前版，复核按文档记下的版本
         self.display = CELL_DISPLAY if display is None else display
-        #: 这一次解析里有没有哪一格因为显示规则改了写法：组装时据此决定文档记不记 cell_display
-        self.reformatted = False
+        #: 这一次解析里的单元格要按哪一版显示规则才渲染得出来（有格子因为某一版的规则改了写法，就至少是那一版）：
+        #: 组装时据此决定文档记不记、记哪一版 cell_display
+        self.needed = 1
 
     def shown(self, raw: Any) -> Any:
         """按显示规则要显示的原值：2 版起 ISO 日期时间的 T 换成空格。没改就是原值本身。"""
         if self.display >= 2 and isinstance(raw, str) and (m := _ISO_DATETIME.match(raw.strip())):
-            self.reformatted = True
+            self.needed = max(self.needed, 2)
             return f"{m.group(1)} {m.group(2)}"
         return raw
 
@@ -1509,12 +1514,15 @@ def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapsho
         if last < first:
             return fail(f"整表引用的行号范围格式有误，当前为「{options['rows']}」",
                         f"rows 要写成 0-4 这样从小到大的行号范围（从 0 数），写的是 {options['rows']}")
+        if first >= len(rows) or (last >= len(rows) and snaps.display < 3):
+            # 3 版以前结束行越界也算解析不了：复核老文档里没展开的整表标记照老规矩判（见 CELL_DISPLAY）
+            return fail(f"{alias} 只有 {len(rows)} 行，没有第 {first if first >= len(rows) else last} 行（行号从 0 开始）")
+        # 结束行写过了头（写作者以为有 5 行、其实只有 3 行）：起始行在范围内，就截到最后一行，不加注——表格照实只有这几行
+        last = min(last, len(rows) - 1)
         if last - first + 1 > TABLE_MAX_ROWS:
             return fail(f"整表最多 {TABLE_MAX_ROWS} 行，当前选了 {last - first + 1} 行",
                         f"整表最多 {TABLE_MAX_ROWS} 行，rows={options['rows']} 是 {last - first + 1} 行："
                         "挑出要的行，或者分成几张表")
-        if last >= len(rows):
-            return fail(f"{alias} 只有 {len(rows)} 行，没有第 {last} 行（行号从 0 开始）")
     else:
         first, last = 0, min(TABLE_DEFAULT_ROWS, len(rows)) - 1
     for c in wanted:
@@ -2905,10 +2913,11 @@ def compose_doc(
     # entity_syntax：这份文档按哪一版实体语法组装，复核照它走（verify_doc）。在文档顶层，参与内容哈希
     # provenance：期 4 的文档标记（P4-SPEC 1.4）。带它的文档才有查询步骤的提示字段、推断来源、裁判摘录的新行；
     # 没有它的（期 4 之前组装的）一律按原样展示。写在顶层、参与内容哈希，事后补不上：补了哈希就变，封存链就断
-    # cell_display：有单元格因为显示规则改了写法（ISO 日期时间）才记，复核照它渲染；没有的文档和以前一字不差
+    # cell_display：有单元格因为显示规则改了写法（ISO 日期时间）才记，记的是渲染得出这些格子的最低一版，复核照它渲染；
+    # 没有的文档和以前一字不差
     doc: dict[str, Any] = {
         "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "provenance": DOC_PROVENANCE,
-        **({"cell_display": snaps.display} if snaps.reformatted and snaps.display != 1 else {}),
+        **({"cell_display": snaps.needed} if snaps.needed > 1 else {}),
         "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
