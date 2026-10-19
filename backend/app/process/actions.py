@@ -244,6 +244,51 @@ class Prepared:
         return f"{self.key}:{self.attempt}"
 
 
+#: 按自己的键找到别人的那一笔时换用的键的前缀（prepare）：节点 id 里不会有这个字符
+OWN_KEY_MARK = "\x1e"
+#: 带 action_id 的那几种事件：认一条记录是哪个节点写的（_owner）
+_ACTION_EVENTS = (EventType.ACTION_PREPARED, EventType.ACTION_SENT, EventType.ACTION_CONFIRMED, EventType.ACTION_FAILED,
+                  EventType.ACTION_UNKNOWN, EventType.ACTION_SIMULATED)
+
+
+async def _owner(session: AsyncSession, rec: ActionRecord) -> str | None:
+    """这条记录是哪个节点写的（这次运行里的 id，子工作流里的带前缀）：按它的 action.* 事件上记的 node_id。记录上的 node_id
+    升级前子工作流里记的是子图里的 id，和父图同名的节点分不开；事件一向按这次运行里的 id 记。认不出（事件没写上）为 None。"""
+    from app.db.models import RunEvent
+
+    rows = (await session.execute(select(RunEvent.node_id, RunEvent.data).where(
+        RunEvent.run_id == rec.run_id, RunEvent.type.in_([str(t) for t in _ACTION_EVENTS])))).all()
+    return next((str(node) for node, data in rows if node and isinstance(data, dict) and data.get("action_id") == rec.id),
+                None)
+
+
+def _same_payload(rec: ActionRecord, capability: Any, args: dict[str, Any]) -> bool | None:
+    """这条记录是不是这一次要发的内容：能力相同、内容指纹等于这一次参数收好类型之后的指纹。收不成类型（参数定义改了）的
+    比不了，为 None。"""
+    name = capability.name
+    if rec.capability != name:
+        return False
+    try:
+        typed = typed_args(capability, args)
+    except ActionFailed:
+        return None
+    return rec.payload_hash == payload_hash(name, typed)
+
+
+async def _belongs(session: AsyncSession, rec: ActionRecord, node_id: str, capability: Any, args: dict[str, Any], *,
+                   strict: bool = False) -> bool:
+    """这条记录是不是这个节点（node_id，这次运行里的 id）的。事件认得出是谁写的就按事件；认不出的按内容（能力、内容指纹），
+    比不了的当是（以前就是这样认的）。strict（认升级前的旧键时）：事件说是这个节点的，内容也要对得上——循环跨了升级时，
+    同一个节点第二轮按老算法同样是第 1 次执行，找到的是第一轮那一笔；比不了内容（参数定义改了）的照事件认。"""
+    owner = await _owner(session, rec)
+    same = _same_payload(rec, capability, args)
+    if owner is not None and owner != node_id:
+        return False
+    if owner is not None and not strict:
+        return True
+    return same is not False
+
+
 async def latest(session: AsyncSession, key: str) -> ActionRecord | None:
     return await session.scalar(select(ActionRecord).where(ActionRecord.action_key == key)
                                 .order_by(ActionRecord.attempt.desc()).limit(1))
@@ -268,12 +313,20 @@ async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, a
         run = await session.get(Run, run_id)
         endpoint = await _endpoint(session, capability)
         prev = await latest(session, key)
+        if prev is not None and not await _belongs(session, prev, node_id, capability, args):
+            # 按自己的键找到的是别的节点的那一笔：升级前子工作流里同名的节点按子图里的 id 记的键，和父图这个节点的一样。
+            # 那一笔不是这个节点的，换一个只属于这个节点的键（同样的输入永远算出同一个）
+            key = action_key(run_id, f"{OWN_KEY_MARK}{node_id}", exec_no)
+            prev = await latest(session, key)
         if prev is None and legacy_node_id:
-            # 升级前子工作流里的写入按子图里的节点 id 记幂等键（node_id 也记成它）：恢复时整个子图重跑，照那个键认出已经
-            # 记下的那一笔，接着用它的键（不重发、第几次发送接着数）。新记的子图写入 node_id 带前缀，认不到这里来
+            # 升级前子工作流里的写入按子图里的节点 id 记幂等键（node_id 也记成它）：写入节点本身重新执行时（结果未知核实之后、
+            # 失败后接着跑）照那个键认出已经记下的那一笔，接着用它的键（不重发、第几次发送接着数）。只认这个节点的、这一次的：
+            # 那一笔的事件记着是这个节点写的（父图里同名的节点按同一个键写过），内容指纹也和这一次的一样（循环跨了升级时，
+            # 第二轮按老算法同样是第 1 次执行，找到的是第一轮那一笔）
             old_key = action_key(run_id, legacy_node_id, exec_no)
             old = await latest(session, old_key)
-            if old is not None and old.node_id == legacy_node_id:
+            if old is not None and old.node_id == legacy_node_id \
+                    and await _belongs(session, old, node_id, capability, args, strict=True):
                 key, prev, node_id = old_key, old, legacy_node_id
     facts = {"app_id": run.app_id, "workflow_id": run.workflow_id, "workflow_version": run.version,
              "graph_hash": run.version_hash, "started_by": run.started_by} if run is not None else {}

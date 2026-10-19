@@ -137,22 +137,144 @@ async def test_a_namesake_in_the_parent_does_not_share_the_key(monkeypatch, erp)
 
 
 async def test_a_write_recorded_before_the_upgrade_is_still_found(monkeypatch, erp):
-    """升级前子图里的写入按子图里的 id（pay）记幂等键。停在子图里的运行恢复时整个子图重跑：照旧按那个键找到已经生效的
-    记录、交回回执，不重发。父图里有同名节点时不这样认（那一条可能是父图那个节点的）。"""
+    """升级前子图里的写入按子图里的 id（pay）记幂等键、记录上的 node_id 也是它；事件一向按这次运行里的 id（sub/pay）记。
+    写入节点本身重新执行时（结果未知核实之后接着跑）：事件说是这个节点的、内容指纹也是这一次的，照旧按那个键交回回执、不重发；
+    事件说是父图同名节点的、或者内容不一样（跨升级的循环，第二轮按老算法也是第 1 次执行）的不认。"""
+    from app.core.events import EventType
+    from app.db.models import RunEvent
+
     caps = install(monkeypatch, erp, await endpoint_row(test=True), lookup=False)
-    async with SessionLocal() as session:
-        run = Run(graph={"nodes": [node("sub", "subgraph")], "edges": []}, status="running", run_class="exploratory")
-        session.add(run)
-        await session.flush()
-        legacy = actions.action_key(run.id, "pay", 1)
-        session.add(ActionRecord(action_key=legacy, attempt=1, idem_key=f"{legacy}:1", run_id=run.id, node_id="pay",
-                                 exec_no=1, capability=PAY, environment="test", payload_hash="0" * 64, state="confirmed",
-                                 receipt={"summary": {"id": "PAY-OLD"}}))
-        await session.commit()
-        run_id = run.id
     args = {"amount": "5", "card": "6222020200112233"}
+    digest = actions.payload_hash(PAY, actions.typed_args(caps[PAY], args))
+
+    async def old_record(writer: str, payload: str) -> tuple[str, str]:
+        async with SessionLocal() as session:
+            run = Run(graph={"nodes": [node("sub", "subgraph")], "edges": []}, status="running", run_class="exploratory")
+            session.add(run)
+            await session.flush()
+            legacy = actions.action_key(run.id, "pay", 1)
+            rec = ActionRecord(action_key=legacy, attempt=1, idem_key=f"{legacy}:1", run_id=run.id, node_id="pay",
+                               exec_no=1, capability=PAY, environment="test", payload_hash=payload, state="confirmed",
+                               receipt={"summary": {"id": "PAY-OLD"}})
+            session.add(rec)
+            await session.flush()
+            session.add(RunEvent(run_id=run.id, seq=1, type=str(EventType.ACTION_PREPARED), node_id=writer, ts=0.0,
+                                 data={"action_id": rec.id, "capability": PAY, "payload_hash": payload}))
+            await session.commit()
+            return run.id, legacy
+
+    run_id, legacy = await old_record("sub/pay", digest)
     found = await actions.prepare(run_id=run_id, node_id="sub/pay", exec_no=1, capability=caps[PAY], args=args,
                                   legacy_node_id="pay")
     assert found.key == legacy and found.receipt is not None
     fresh = await actions.prepare(run_id=run_id, node_id="sub/pay", exec_no=1, capability=caps[PAY], args=args)
     assert fresh.key != legacy and fresh.receipt is None
+    # 父图里同名的 pay 按自己的键（和旧键一样）找到这一笔：事件说是 sub/pay 的，不是自己的，换一个只属于自己的键
+    mine = await actions.prepare(run_id=run_id, node_id="pay", exec_no=1, capability=caps[PAY], args=args)
+    assert mine.key != legacy and mine.receipt is None
+    # 内容不一样（这一次是 7）：不当成这一次已经生效
+    other = await actions.prepare(run_id=run_id, node_id="sub/pay", exec_no=1, capability=caps[PAY],
+                                  args={**args, "amount": "7"}, legacy_node_id="pay")
+    assert other.key != legacy and other.receipt is None
+    # 那一笔是父图 pay 写的（事件说 pay）：子图里的 pay 不认
+    run_id, legacy = await old_record("pay", digest)
+    theirs = await actions.prepare(run_id=run_id, node_id="sub/pay", exec_no=1, capability=caps[PAY], args=args,
+                                   legacy_node_id="pay")
+    assert theirs.key != legacy and theirs.receipt is None
+    own = await actions.prepare(run_id=run_id, node_id="pay", exec_no=1, capability=caps[PAY], args=args)
+    assert own.key == legacy and own.receipt is not None
+
+
+# --------------------------------------------------------------------------
+# 跨升级：升级前的运行按老算法记的键，升级后接着跑
+# --------------------------------------------------------------------------
+
+
+def _old_code(monkeypatch):
+    """装成升级前的代码：子工作流里的写入按子图里的 id 算幂等键、不认旧键，子图跑过的步骤不交回父图（exec 每次从 1 数）。
+    交回一个函数，调了就换回现在的代码（同一个进程里接力跑，等于升级后重启接着跑；能力登记的替身要重新装）。"""
+    from app.engine.nodes import multi, tools
+
+    monkeypatch.setattr(tools, "_action_ids", lambda ctx: (ctx.node.id, None))
+    monkeypatch.setattr(multi, "_forwarded_trail", lambda ran, prefix: [])
+    return monkeypatch.undo
+
+
+def _amounts(erp) -> list[str]:
+    return [str((w.get("body") or {}).get("amount")) for w in erp.writes("test")]
+
+
+async def _until_status(run_id: str, statuses: tuple[str, ...]) -> Run:
+    for _ in range(600):
+        await asyncio.sleep(0.05)
+        async with SessionLocal() as session:
+            row = await session.get(Run, run_id)
+        if row.status in statuses and not run_manager.is_active(run_id):
+            return row
+    raise AssertionError(f"运行 {run_id} 停在 {row.status}")
+
+
+async def test_an_unknown_write_inside_a_subworkflow_with_a_namesake_in_the_parent_survives_the_upgrade(monkeypatch, erp):
+    """升级前：子工作流里的 pay（1）发出去、结果未知、运行挂起，键按子图里的 id（pay）记——和父图里同名的 pay 一样。升级后
+    核实为已生效、接着跑：子图里的 pay 认出自己那一笔（事件记着是「sub/pay」写的），不再发；父图的 pay（99）按自己的键找到
+    的是子图那一笔、不是自己的，换用自己的键照常发。1 和 99 各只发一次。"""
+    from app.db.models import Task
+    from app.process import tasks
+    from tests.test_process_actions import ANN
+
+    await _unattended(monkeypatch, erp)
+    inner = S.chain(node("s", "input", fields=[{"name": "n"}]), pay(),
+                    node("o", "output", fields=[{"name": "r", "value": "x"}]))
+    sub_id = await S.publish("付款子流程", graph=inner, level="draft")
+    graph = S.chain(node("start", "input", fields=[{"name": "n"}]),
+                    node("sub", "subgraph", "子流程", workflow_id=sub_id, workflow_version=1, input={"n": "1"}),
+                    pay(), node("out", "output", fields=[{"name": "r", "value": "完成"}]))
+    upgrade = _old_code(monkeypatch)
+    erp.mode = "timeout_after_write"
+    run = await run_manager.start(graph=graph, input_payload={"n": 99})
+    parked = await _until_status(run.id, ("interrupted", "failed", "succeeded"))
+    assert parked.status == "interrupted", parked.error
+    assert _amounts(erp) == ["1"]
+    upgrade()
+    await _unattended(monkeypatch, erp)       # undo 连能力登记的替身一起撤了：重新装上
+    erp.mode = "ok"
+    async with SessionLocal() as session:
+        task = (await session.execute(select(Task).where(Task.run_id == run.id, Task.kind == "reconcile",
+                                                         Task.status == "pending"))).scalars().first()
+    assert task is not None
+    await tasks.respond(task.id, ANN, decision="confirmed", values={"external_id": "PAY-1"})
+    final = await _until_status(run.id, ("succeeded", "failed"))
+    assert final.status == "succeeded", final.error
+    assert sorted(_amounts(erp)) == ["1", "99"], _amounts(erp)
+
+
+async def test_a_loop_across_the_upgrade_sends_the_second_round(monkeypatch, erp):
+    """升级前跑完第一轮（子图里 pay 发了 1）、停在父图的审批上；升级后批准，第二轮按老算法同样是第 1 次执行，找到第一轮那一笔：
+    内容指纹不一样（这一轮是 2），不当成已经生效，照常发；也不记「已经生效」的提示。"""
+    await _unattended(monkeypatch, erp)
+    inner = S.chain(node("s", "input", fields=[{"name": "n"}]), pay(),
+                    node("o", "output", fields=[{"name": "r", "value": "x"}]))
+    sub_id = await S.publish("付款子流程", graph=inner, level="draft")
+    nodes = [node("start", "input"),
+             node("each", "loop", "逐项", mode="foreach", items="[1, 2]", item_var="it", max_iterations=5),
+             node("sub", "subgraph", "子流程", workflow_id=sub_id, workflow_version=1, input={"n": "{{ vars.it }}"}),
+             node("gate", "human", "把关", mode="approve", title="下一轮？"),
+             node("out", "output", fields=[{"name": "r", "value": "完成"}])]
+    edges = [edge("start", "each"), edge("each", "sub", "body"), edge("sub", "gate"), edge("gate", "each", "approved"),
+             edge("each", "out", "done")]
+    upgrade = _old_code(monkeypatch)
+    run = await run_manager.start(graph={"nodes": nodes, "edges": edges}, input_payload={})
+    parked = await _until_status(run.id, ("interrupted", "failed", "succeeded"))
+    assert parked.status == "interrupted", parked.error
+    assert _amounts(erp) == ["1"]
+    upgrade()
+    await _unattended(monkeypatch, erp)
+    await run_manager.resume(run.id, {"approved": True})
+    parked = await _until_status(run.id, ("interrupted", "failed", "succeeded"))
+    assert parked.status == "interrupted", parked.error
+    assert _amounts(erp) == ["1", "2"], "第二轮照发，不交回第一轮的回执"
+    assert not [e for e in await _events(run.id, "log") if e.data.get("code") == "action_already_applied"]
+    await run_manager.resume(run.id, {"approved": True})
+    final = await _until_status(run.id, ("succeeded", "failed"))
+    assert final.status == "succeeded", final.error
+    assert _amounts(erp) == ["1", "2"]
