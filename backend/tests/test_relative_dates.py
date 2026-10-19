@@ -58,3 +58,6 @@ async def test_the_report_prompt_carries_the_run_day(monkeypatch):
     await finish(graph)
     prompt = "\n".join(str(m.content) for m in seen[0])
     assert "今天是 2031-03-12（周三）" in prompt and "上周是 2031-03-03 至 2031-03-09" in prompt
+    from app.engine.evidence import UNIT_RULE
+
+    assert UNIT_RULE in prompt, "[[m:]] 自带单位的那条也在写作规则里"

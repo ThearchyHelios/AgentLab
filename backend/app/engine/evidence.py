@@ -1869,6 +1869,10 @@ _UNIT_GAP = 2
 _UNIT_MAX = 10
 UNIT_LOOKAHEAD = _UNIT_GAP + _UNIT_MAX + 1
 _UNIT_KINDS = frozenset({"m", "i", "v"})
+#: 以一个字的单位打头的更长的单位：口径卡是「人」、正文紧跟着写「人次」，是另一个单位，不当重复的去掉（_tidy）
+_LONGER_UNIT = re.compile(
+    r"人次|人天|人日|人月|人年|人份|件次|台次|台套|台时|车次|架次|班次|户次|批次|个月|个季度|个工作日|个百分点"
+    r"|小时|分钟|吨公里|公里|公斤|千克|千米|千瓦|万元|亿元|美元|港元|欧元|日元|元/")
 #: 渲染结果末尾的单位：最后一个数字后面的字（12,345人次 → 人次，4.57万元 → 万元，12.5% → %）
 _UNIT_TAIL = re.compile(r"\d([^\d\s][^\d]*)$")
 _BLANK = " \t\u3000"
@@ -1924,8 +1928,9 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
     """渲染前收拾两处排版，数和引用都不动：
 
     - 数字标记后面重复写的单位去掉。[[m:visits]] 渲染出来已经带单位（12,345人次），写作者常常
-      还跟着写一遍（[[m:visits]] 人次），读者看到的是「12,345人次 人次」。单字的单位后面紧跟着字时
-      不动：写作者写的可能是另一个单位（口径卡是「人」，正文写「人次」），硬删会把不一致藏起来；
+      还跟着写一遍（[[m:visits]] 人次），读者看到的是「12,345人次 人次」。单字的单位后面紧跟着字、和它
+      连起来是一个更长的单位时（_LONGER_UNIT）不动：写作者写的是另一个单位（口径卡是「人」，正文写「人次」），
+      硬删会把不一致藏起来；连起来不是单位的（「覆盖 [[m:lines]] 条产线」，口径卡的单位是「条」）照样去掉；
     - [[see:…]] 渲染成空，它周围留下的空白、括号、标点去掉（_voids、_see_cuts）：「最高月份 [[see:Q2]]。」会剩下
       「最高月份 。」，「结果一致（[[see:Q3]]，原报告…）」会剩下「结果一致（，原报告…）」。依据（连同去掉的字）两边
       挨上的字会读成一串的，补一个空格（_glue）：「4,919.5[[see:Q1]]212 笔」会读成「4,919.5212 笔」。
@@ -1942,7 +1947,8 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
         hit = re.compile(f"[{_BLANK}]{{0,{_UNIT_GAP}}}" + re.escape(unit)).match(text, marker["end"])
         if hit:
             after = text[hit.end():hit.end() + 1]
-            if len(unit) > 1 or not after.isalnum():
+            longer = _LONGER_UNIT.match(text, hit.end() - len(unit))
+            if len(unit) > 1 or not after.isalnum() or not (longer and len(longer.group(0)) > len(unit)):
                 cuts.append((marker["end"], hit.end()))
     see: list[tuple[int, int]] = []
     spaces: set[int] = set()
@@ -3389,6 +3395,11 @@ SEE_AND_CODE_RULES = (
     "- 涉及码值（状态、类型这类用数字编码的取值）时，写它的含义，比如「作废记录」「有效记录」，不要写码值本身"
     "（「状态为 9」「类型 1」）：码值是没有出处的数字，系统会当成裸数字打回重写。"
 )
+
+#: [[m:]]、[[v:]] 渲染出来自带单位（部署上撞过「覆盖 8条 条产线」：口径卡的单位是「条」，写作者照着助手的指令又写了一个）。
+#: 渲染时紧跟着的同一个单位会去掉（_tidy），这里先说给写作者听
+UNIT_RULE = ("数字标记渲染出来自带单位（[[m:…]] 是口径卡里的单位，比如「8条」「12,345人次」），后面不要再写一遍单位："
+             "写「覆盖 [[m:line_count]] 产线」，不写「覆盖 [[m:line_count]] 条产线」。")
 
 #: 相对日期（「今天、昨天、上周、本月、去年」）一律按运行当天算（period_rule）。部署上撞过：数据只更新到两周前，查库时拿表里
 #: 最大的日期往前推七天当「上周」，写作者照着写成「上周产量……」。写作者不知道今天是哪天，就分不出数据有没有覆盖问的那段，

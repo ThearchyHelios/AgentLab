@@ -57,7 +57,7 @@ from app.engine.evidence import (
     ENTITY_KINDS,
     MARKER_RULES,
     SEE_AND_CODE_RULES,
-    period_rule,
+    UNIT_RULE,
     StreamRenderer,
     WriterCatalog,
     build_catalog,
@@ -65,6 +65,7 @@ from app.engine.evidence import (
     compose_doc,
     describe_violations,
     ledger_enabled,
+    period_rule,
     withhold_metrics,
     writer_catalog,
 )
@@ -646,7 +647,7 @@ def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
-    rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}\n{period_rule(run_today())}"
+    rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}\n{UNIT_RULE}\n{period_rule(run_today())}"
     if writer.guarded:
         # 写作者看不全证据（目录有省略、有来源的结构化结论为空）：「没有查到」这类结论没有依据
         rules = f"{rules}\n{ABSENCE_RULE}"
