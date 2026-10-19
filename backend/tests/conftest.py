@@ -19,11 +19,18 @@ from pathlib import Path
 
 _TMP = Path(tempfile.mkdtemp(prefix="agentlab-tests-"))
 os.environ["AGENTLAB_DATA_DIR"] = str(_TMP)
+# 下面这几项也都要在任何 app.* 导入之前设（两种库同一个顺序）：PostgreSQL 分支要先导入 app.db.base 装连接池，settings 在那一刻
+# 就按当时的环境定下来了——以前这两项写在那之后，PostgreSQL 上 AGENTLAB_SCHEDULER 没生效（scheduler_on 成了 True）
+# 别把真实的 key 带进测试环境
+os.environ.setdefault("AGENTLAB_SECRET_KEY", "test-only-not-a-real-key")
+# 定时任务的调度循环不在测试里起：走 lifespan 的测试不该到点替人发起运行。要测调度的直接调它
+os.environ.setdefault("AGENTLAB_SCHEDULER", "0")
 
 
 def _postgres_database(admin_url: str) -> str:
     """AGENTLAB_TEST_DATABASE_URL 给的是管理用的库：每个 xdist 进程在同一台服务器上建一个自己的空库（库名加进程号后缀，
-    已有的同名库先删掉），进程退出时删掉。返回这个库的地址。scripts/test-postgres.sh 起临时容器、设好这个变量。"""
+    已有的同名库先删掉），进程退出时删掉。返回这个库的地址。scripts/test-postgres.sh 起临时容器、设好这个变量。
+    这里导入的 app.db.urls 只用 SQLAlchemy 的地址解析，不碰 settings（settings 要等环境变量都设好）。"""
     import psycopg
     from sqlalchemy.engine import make_url
 
@@ -64,10 +71,6 @@ if _TEST_PG:
     from tests.pgpool import install as _loop_local_pool  # noqa: E402
 
     _loop_local_pool(_app_engine)
-# 别把真实的 key 带进测试环境
-os.environ.setdefault("AGENTLAB_SECRET_KEY", "test-only-not-a-real-key")
-# 定时任务的调度循环不在测试里起：走 lifespan 的测试不该到点替人发起运行。要测调度的直接调它
-os.environ.setdefault("AGENTLAB_SCHEDULER", "0")
 
 import pytest  # noqa: E402
 
