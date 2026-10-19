@@ -333,8 +333,9 @@ async def test_stop_while_running_cancels_the_run(client, monkeypatch, source):
 # --------------------------------------------------------------------------
 
 
-async def _stranded(conversation_id: str, *, run: Run | None, stage: str, mode: str = "ask") -> str:
-    """造一轮「上次进程没了时还在跑」的：那一行 running、任务 running（不在这个进程里）。"""
+async def _stranded(conversation_id: str, *, run: Run | None, stage: str, mode: str = "ask",
+                    principal: dict[str, Any] | None = None) -> str:
+    """造一轮「上次进程没了时还在跑」的：那一行 running、任务 running（不在这个进程里）。principal 是发起时的身份快照。"""
     async with SessionLocal() as session:
         if run is not None:
             session.add(run)
@@ -344,7 +345,7 @@ async def _stranded(conversation_id: str, *, run: Run | None, stage: str, mode: 
         session.add(turn)
         await session.flush()
         session.add(ChatTurnJob(id=turn.id, conversation_id=conversation_id, status="running", stage=stage, mode=mode,
-                                run_id=run.id if run else None, request={"started_ms": 0}, principal={}))
+                                run_id=run.id if run else None, request={"started_ms": 0}, principal=principal or {}))
         await session.commit()
         return turn.id
 
@@ -1064,3 +1065,89 @@ async def test_the_cleanup_runs_in_the_background_tick(monkeypatch):
     again = await _finished_turn(days_ago=turn_log.RETAIN_DAYS + 2)
     await loop.process_due(utcnow())
     assert len(await _events(again)) == 3, "一小时内不再清第二次"
+
+
+# --------------------------------------------------------------------------
+# 服务重启后接着收尾：按接手时的账号重新核对
+# --------------------------------------------------------------------------
+
+
+async def _snapshot_of(name: str) -> dict[str, Any]:
+    from app.db.models_identity import User
+
+    async with SessionLocal() as session:
+        user = (await session.execute(select(User).where(User.username == name))).scalar_one()
+    return {"username": user.username, "role": user.role, "display_name": user.display_name, "user_id": user.id,
+            "groups": [], "verified": True, "mode": "local", "via": "session"}
+
+
+async def _set_user(name: str, **values: Any) -> None:
+    from sqlalchemy import update as sa_update
+
+    from app.db.models_identity import User
+
+    async with SessionLocal() as session:
+        await session.execute(sa_update(User).where(User.username == name).values(**values))
+        await session.commit()
+
+
+def _finished_run(by: str) -> Run:
+    return Run(status="succeeded", output={"答案": "华东 300。"}, graph={"nodes": [], "edges": []}, run_class="exploratory",
+               origin_kind="chat", started_by=by)
+
+
+async def test_resuming_after_a_restart_checks_the_account_again(people, monkeypatch, source):
+    """服务重启后接着收尾一轮（已发起运行的接着等、复核），按接手这一刻的账号重新核对，不再照发起时的身份快照接着做：
+    发起之后账号被停用的，照实标中断、写清原因；那一行不再往下改答案。"""
+    es.use_copilot(monkeypatch, es.Copilot(source["name"]))
+    es.use_report(monkeypatch)
+    mine = await _conversation(people["uma"], "uma 的对话")
+    turn_id = await _stranded(mine, run=_finished_run("uma"), stage="review", principal=await _snapshot_of("uma"))
+    await _set_user("uma", disabled=True)
+    await chat_job.startup(resume=True)
+    await chat_job.manager.wait(turn_id, timeout=30)
+    row = await _row(turn_id)
+    assert row.status == "error" and row.meta["cause"]["kind"] == "identity", row.meta
+    assert row.error == "发起这一轮的账号「uma」已停用，本轮没有接着收尾" and not row.answer
+    async with SessionLocal() as session:
+        assert (await session.get(ChatTurnJob, turn_id)).status == "interrupted"
+    assert (await _events(turn_id))[-1]["data"]["outcome"] == "error"
+
+
+async def test_a_downgraded_account_without_chat_is_interrupted(people, monkeypatch, source):
+    """发起时是搭建者，之后被降成使用者、管理员又没给使用者开问数据：已经没有权限了，照实标中断。"""
+    es.use_copilot(monkeypatch, es.Copilot(source["name"]))
+    es.use_report(monkeypatch)
+    theirs = await _conversation(people["bob"], "bob 的对话")
+    turn_id = await _stranded(theirs, run=_finished_run("bob"), stage="review", principal=await _snapshot_of("bob"))
+    await _set_user("bob", role="user")
+    assert (await people["admin"].put("/api/auth/settings", json={"user_can_chat": False})).status_code == 200
+    await chat_job.startup(resume=True)
+    await chat_job.manager.wait(turn_id, timeout=30)
+    row = await _row(turn_id)
+    assert row.status == "error" and row.meta["cause"]["kind"] == "identity"
+    assert row.error == "发起这一轮的账号「bob」已经没有问数据的权限，本轮没有接着收尾"
+
+
+async def test_a_downgraded_account_that_can_still_chat_finishes_as_who_they_are_now(people, monkeypatch, source):
+    """降了角色、但仍然用得了问数据（使用者开着问数据）：照常收尾，按现在的身份（角色、组）接着做，不按快照里的搭建者。"""
+    es.use_copilot(monkeypatch, es.Copilot(source["name"]))
+    es.use_report(monkeypatch)
+    seen: list[Any] = []
+    real = chat_job.ChatDriver.drive
+
+    async def spy(self, *a, **k):
+        from app.api.deps import current_principal
+
+        seen.append(current_principal())
+        return await real(self, *a, **k)
+
+    monkeypatch.setattr(chat_job.ChatDriver, "drive", spy)
+    theirs = await _conversation(people["bob"], "bob 的对话")
+    turn_id = await _stranded(theirs, run=_finished_run("bob"), stage="review", principal=await _snapshot_of("bob"))
+    await _set_user("bob", role="user")
+    await chat_job.startup(resume=True)
+    await chat_job.manager.wait(turn_id, timeout=30)
+    row = await _row(turn_id)
+    assert row.status == "done" and row.answer == "华东 300。"
+    assert seen and seen[-1].username == "bob" and seen[-1].role == "user"

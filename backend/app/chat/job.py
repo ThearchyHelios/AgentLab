@@ -100,6 +100,34 @@ def principal_of(snapshot: Mapping[str, Any] | None) -> Any:
                      mode=str(s.get("mode") or "off"), via=str(s.get("via") or "session"))
 
 
+async def current_principal(snapshot: Mapping[str, Any] | None) -> tuple[Any, str | None]:
+    """发起时的身份快照 → 接手这一刻的身份：(身份, 不能接着做的原因)。
+
+    关着登录时发起的（快照里 mode 是 off、没有用户名）照快照：没有账号可核对。开着登录的按用户名读现在的账号：不在了、
+    停用了交回原因；角色、组、显示名换成现在的（降了角色就按降了之后的做）；按现在的身份已经用不了问数据（使用者、管理员
+    没开问数据，同 api/deps._chat_scope）也交回原因。认证方式、是否核实过照快照。"""
+    from app.api.deps import Principal
+    from app.auth import user_can_chat
+    from app.auth.sessions import groups_of
+    from app.db.models_identity import User
+
+    s = dict(snapshot or {})
+    name = s.get("username")
+    if not s or str(s.get("mode") or "off") == "off" or not name:
+        return principal_of(snapshot), None
+    async with SessionLocal() as session:
+        user = (await session.execute(select(User).where(User.username == name))).scalar_one_or_none()
+        if user is None or user.disabled:
+            return None, f"发起这一轮的账号「{name}」已{'停用' if user is not None else '不存在'}，本轮没有接着收尾"
+        groups = await groups_of(session, user.id)
+    principal = Principal(username=user.username, role=user.role, display_name=user.display_name or user.username,
+                          user_id=user.id, groups=groups, verified=bool(s.get("verified")),
+                          mode=str(s.get("mode") or "off"), via=str(s.get("via") or "session"))
+    if not principal.at_least("builder") and not (principal.at_least("user") and user_can_chat()):
+        return None, f"发起这一轮的账号「{name}」已经没有问数据的权限，本轮没有接着收尾"
+    return principal, None
+
+
 # --------------------------------------------------------------------------
 # 驱动：问数据和评测不一样的那几项
 # --------------------------------------------------------------------------
@@ -362,8 +390,13 @@ class ChatTurnExecution(runtime.JobRun):
         self.request = dict(job.request or {})
         self.turn_seq = row.seq
         self.run_id = job.run_id
-        # 这一轮按发起的人的身份跑：answer_ops 里的 restricted()、对话归属，发起运行时的遮罩、只读都看它
-        set_principal(principal_of(job.principal))
+        # 这一轮按发起的人的身份跑：answer_ops 里的 restricted()、对话归属，发起运行时的遮罩、只读都看它。按这一刻的账号重新核对
+        # （current_principal）：服务重启后接着收尾时，快照是发起那一刻的，之后停用了、降了角色的不能照快照接着做
+        principal, refused = await current_principal(job.principal)
+        if refused is not None:
+            await self._identity_refused(refused)
+            return
+        set_principal(principal)
         scope = [s.get("id") for s in self.request.get("scope") or [] if isinstance(s, Mapping) and s.get("id")]
         driver = self.driver = ChatDriver(self, question=row.question, datasource_ids=scope)
         driver.turn.attempts = int(job.attempt or 0)
@@ -426,6 +459,16 @@ class ChatTurnExecution(runtime.JobRun):
                                   **_timing(self.request)})
             await self._end("cancelled")
         await self._job(status="cancelled", stage=None, finished_at=utcnow())
+
+    async def _identity_refused(self, reason: str) -> None:
+        """发起这一轮的账号接手时已经停用、或者已经没有问数据的权限：照实标中断、写清原因，不再往下做（不建图、不等运行、
+        不复核）。已经发起的那次运行不动——停在审批上的照旧等人，在记录页照常看得到；这一轮不替一个已经无权的人收它的尾。"""
+        await self._settle()
+        if not self.ended:
+            await self.save(status="error", error=reason,
+                            meta={"cause": {"kind": "identity", "message": reason}, **_timing(self.request)})
+            await self._end("error")
+        await self._job(status="interrupted", stage=None, error=reason, finished_at=utcnow())
 
     async def _failed(self, reason: str) -> None:
         await self._crash_out(reason)
@@ -1166,5 +1209,5 @@ async def shutdown() -> None:
 
 __all__ = ["APPROVAL_POLL_S", "AUTO_RETRY_MODES", "BUSY", "CONCURRENCY_CLASS", "ChatDriver", "ChatTurnExecution",
            "MODES", "REVIEW_WAIT_S", "TURN_BUSY", "TURN_FINISHED", "TURN_INVALID", "TurnRefused", "cancel", "forget",
-           "job_view", "late_pending", "manager", "principal_of", "principal_snapshot", "shutdown", "start", "startup",
-           "state", "stop_conversation", "stream_status"]
+           "current_principal", "job_view", "late_pending", "manager", "principal_of", "principal_snapshot", "shutdown",
+           "start", "startup", "state", "stop_conversation", "stream_status"]

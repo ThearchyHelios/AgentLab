@@ -136,6 +136,8 @@ export type TurnCause =
   | { kind: 'run'; error?: string; detail?: string | null }
   | { kind: 'gone' }
   | { kind: 'build_interrupted' }
+  /** 服务重启后接着收尾时，发起这一轮的账号已停用、或者已经没有问数据的权限（服务端 chat/job.current_principal） */
+  | { kind: 'identity'; message?: string }
   | { kind: 'crash'; message?: string }
 
 /**
@@ -649,6 +651,12 @@ function causeFailure(cause: TurnCause, scope?: ScopeSource[]): Failure {
       return GONE
     case 'build_interrupted':
       return BUILD_INTERRUPTED
+    case 'identity':
+      return {
+        title: '上次未完成',
+        reason: cause.message || '发起这一轮的账号已无法接着收尾，本轮没有接着做。',
+        hint: '如需继续，请由现在有问数据权限的人重新提问。',
+      }
     case 'crash':
       return failureOf(cause.message || '发生错误')
   }
