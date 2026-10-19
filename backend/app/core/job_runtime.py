@@ -78,6 +78,11 @@ class SerialWriter:
         self._lock = asyncio.Lock()
 
     async def __call__(self, fn: Callable[..., Awaitable[Any]], *args: Any) -> Any:
+        from app.cluster import fence
+
+        # 本进程续不上租约了（cluster/fence.py）：这个任务可能已经被别的进程接手，不再写
+        fence.check()
+
         async def go() -> Any:
             async with self._lock:
                 async with SessionLocal() as session:
@@ -509,14 +514,22 @@ class JobRun:
         await self.writer.settle()
 
     async def run(self) -> None:
+        from app.cluster import fence
+
+        fence.bind()
         try:
             try:
                 await self._queue()
                 await self._run()
+            except fence.Fenced:
+                # 本进程续不上租约了：停手、不写收尾（这个任务由接手的进程按「属主不在了」处理）
+                logger.error("%s %s：本进程续不上租约，停手、不写收尾", self.kind, self.job_id)
             except asyncio.CancelledError:
                 current = asyncio.current_task()
                 if current is not None:
                     current.uncancel()
+                if fence.fenced_here():
+                    return
                 await self._stopped()
             except JobFailed as e:
                 await self._failed(str(e))
@@ -568,9 +581,18 @@ class JobManager:
         self._factory = factory
         self.label = label
         self.name = name
-        from app.cluster import requests
+        from app.cluster import fence, requests
 
         requests.handle("stop", name)(self._stop_requested)
+        fence.on_trip(self._stop_fenced)
+
+    def _stop_fenced(self) -> None:
+        """本进程隔离了（cluster/fence.py）：停掉手上的任务，停的时候不写收尾。"""
+        for job_id in list(self._runs):
+            run = self._runs.get(job_id)
+            if run is not None and run.task is not None and not run.task.done():
+                run.stop_reason = run.stop_reason or "fenced"
+                run.task.cancel()
 
     def model(self) -> Any:
         """任务表（停止时读属主用）：缺省取 factory 上的 model。"""

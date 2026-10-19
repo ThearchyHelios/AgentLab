@@ -32,10 +32,16 @@ class Leadership:
         self.until: datetime | None = None
         self.epoch = 0
 
+    def single(self) -> None:
+        """只有本进程（SQLite）：直接算当班，不写库。"""
+        self.until = datetime.max.replace(tzinfo=None)
+
     def held(self, now: datetime | None = None) -> bool:
         """本地看：还在当班（租约离到期还有余量）。"""
         if self.until is None:
             return False
+        if self.until.tzinfo is None:
+            return True   # single()：只有本进程
         # 余量不超过租约的四分之一：租约调得很短（验收脚本）时也留得出当班的时间
         margin = min(MARGIN_S, lease_s() / 4)
         return (now or utcnow()) + timedelta(seconds=margin) < self.until
@@ -85,7 +91,10 @@ class Leadership:
 
         if self.until is None:
             return
+        single = self.until.tzinfo is None
         self.until = None
+        if single:
+            return
         async with SessionLocal() as session:
             await session.execute(update(ClusterLease).where(
                 ClusterLease.name == self.name, ClusterLease.owner == identity.owner())

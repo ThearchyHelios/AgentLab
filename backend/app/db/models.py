@@ -721,7 +721,9 @@ class RunEvent(Base):
     """完整事件流落库 —— 这既是 trace，也是页面刷新后重建时间线的依据。"""
 
     __tablename__ = "run_events"
-    __table_args__ = (Index("ix_run_events_run_seq", "run_id", "seq"),)
+    # (run_id, seq) 唯一（编排完善第 2 波 W2-b）：撞号时报错，不悄悄写两条——封存按 seq 排序算哈希，撞了号核对时对时不对。
+    # 存量库由 db/base._migrate 补建（先查有没有重复，有就照实记日志、不建）
+    __table_args__ = (Index("ux_run_events_run_seq", "run_id", "seq", unique=True),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))

@@ -80,12 +80,30 @@ async def _drain() -> int:
         if fn is None:
             logger.warning("收到不认识的进程间请求 %s/%s，不办", row.kind, row.target)
             continue
-        try:
-            await fn(row.target_id, row.actor, dict(row.payload or {}))
-            done += 1
-        except Exception:  # noqa: BLE001
-            logger.exception("办进程间请求 %s/%s %s 出错", row.kind, row.target, row.target_id)
+        # 各办各的、另起任务：停止要等执行收尾（最多十来秒），不能拖住心跳和后面几件
+        task = asyncio.ensure_future(_handle(fn, row.kind, row.target, row.target_id, row.actor, dict(row.payload or {})))
+        _running.add(task)
+        task.add_done_callback(_running.discard)
+        done += 1
     return done
+
+
+#: 正在办的请求（另起的任务要有人拿着引用）
+_running: set[asyncio.Future[Any]] = set()
+
+
+async def _handle(fn: Callable[..., Awaitable[Any]], kind: str, target: str, target_id: str, actor: str | None,
+                  payload: dict[str, Any]) -> None:
+    try:
+        await fn(target_id, actor, payload)
+    except Exception:  # noqa: BLE001
+        logger.exception("办进程间请求 %s/%s %s 出错", kind, target, target_id)
+
+
+async def settle(timeout: float = 5.0) -> None:
+    """等手上正在办的请求办完（测试、关停用）。"""
+    if _running:
+        await asyncio.wait(list(_running), timeout=timeout)
 
 
 async def discard_for(owners: set[str]) -> int:

@@ -33,6 +33,14 @@ def owner() -> str:
     return OWNER
 
 
+def regenerate() -> str:
+    """换一个身份（隔离之后重新登记用，cluster/fence.py）：同一个 pid、新的随机串。之前认领的行算「属主不在了」。"""
+    global OWNER, _PID
+    _PID = os.getpid()
+    OWNER = _make(_PID)
+    return OWNER
+
+
 def host() -> str:
     return _HOST
 
@@ -45,4 +53,4 @@ def describe(value: str | None) -> str:
     return f"{parts[0]} 上的进程 {parts[1]}" if len(parts) >= 2 else value
 
 
-__all__ = ["OWNER", "describe", "host", "owner"]
+__all__ = ["OWNER", "describe", "host", "owner", "regenerate"]

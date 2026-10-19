@@ -399,6 +399,10 @@ async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, ex
              else "演练：探索运行里端点没有测试环境，没有发送请求")
         return _output(action_id, prep, "simulated", None, receipt)
 
+    # 本进程续不上租约了（cluster/fence.py）就不发：这次运行可能已经被别的进程接手
+    from app.cluster import fence
+
+    fence.check()
     # 先记 sent 再发：发到一半进程没了，重启后看到的是 sent，只能核实，不会当成没发过再发一次
     if not await _set(action_id, ("pending",), state="sent", request_at=utcnow()):
         raise ActionPending(action_id)

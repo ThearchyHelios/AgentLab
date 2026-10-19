@@ -571,6 +571,7 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
         cols = columns.get(table) or set()
         if all(c in cols for c in wanted):
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({', '.join(wanted)})"))
+    _unique_run_event_seq(conn, columns)
     for name, table, wanted, where, dedupe in _UNIQUE_INDEX_MIGRATIONS:
         cols = columns.get(table) or set()
         if not all(c in cols for c in wanted):
@@ -581,6 +582,29 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
         conn.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({', '.join(wanted)})"
                           + (f" WHERE {where.format(**literals)}" if where else "")))
     _backfill_not_null(conn, columns)
+
+
+def _unique_run_event_seq(conn: Any, columns: dict[str, set[str]]) -> None:  # pragma: no cover - 同步回调
+    """run_events 的 (run_id, seq) 补唯一索引（ux_run_events_run_seq，换掉原来不唯一的 ix_run_events_run_seq）。存量库里可能已经
+    有撞了号的（多进程之前的进程内计数、按需裁判的老写法）：先数一数，有就照实记日志、这一次不建（照旧用不唯一的索引），不让启动
+    失败——那几次运行的封存核对本来就对不上，删哪一条都不对，要人看。"""
+    from sqlalchemy import inspect, text
+
+    if "run_events" not in columns:
+        return
+    names = {ix["name"] for ix in inspect(conn).get_indexes("run_events")}
+    if "ux_run_events_run_seq" in names:
+        return
+    dupes = conn.execute(text("SELECT run_id, seq, COUNT(*) FROM run_events GROUP BY run_id, seq HAVING COUNT(*) > 1 "
+                              "LIMIT 20")).all()
+    if dupes:
+        runs = sorted({str(r[0]) for r in dupes})
+        logger.warning("run_events 里有撞了号的事件（%d 处以上，涉及运行 %s）：这一次不建 (run_id, seq) 的唯一索引。"
+                       "这几次运行的封存核对对不上，请人工核对后处理", len(dupes), "、".join(runs[:5]))
+        return
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_run_events_run_seq ON run_events (run_id, seq)"))
+    if "ix_run_events_run_seq" in names:
+        conn.execute(text("DROP INDEX IF EXISTS ix_run_events_run_seq"))
 
 
 #: init_db 在 PostgreSQL 上拿的会话级咨询锁的号：几个进程同时启动时，建表和迁移一个一个来（同一个号别处别用）

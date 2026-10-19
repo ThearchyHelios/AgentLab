@@ -15,7 +15,8 @@ from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from sqlalchemy import case, func, select, update
 
-from app.cluster import identity
+from app.cluster import fence, identity
+from app.cluster.fence import Fenced
 from app.core.bus import bus
 from app.core.config import settings
 from app.core.errors import describe_exception, raw_detail
@@ -92,7 +93,7 @@ class RunManager:
         from app.engine.checkpoints import open_saver
 
         self._cm = open_saver()
-        self._checkpointer = await self._cm.__aenter__()
+        self._checkpointer = _fenced_saver(await self._cm.__aenter__())
         # 上次进程被强杀时留下的记录。running 和 queued 要分开处理：
         # running 至少跑过一步、有 checkpoint，可以续；queued 还在排队，
         # 一个 checkpoint 都没写过，"恢复"它只会从 START 用默认值重跑一遍，
@@ -209,6 +210,8 @@ class RunManager:
         persist: bool = True,
         ts: float | None = None,
     ) -> None:
+        # 执行这次运行的那段（cluster/fence 绑定过世代的）写之前问一句：租约续晚了就不写（可能已经被别的进程接手）
+        fence.check()
         event = self._event(run_id, event_type, node_id=node_id, data=data, ts=ts)
         # 先落库，再广播。顺序反过来会漏事件，而且是结构性的漏：
         #
@@ -791,6 +794,11 @@ class RunManager:
         # 等待从 run.interrupted 算起——以前执行一直计到 finally，收尾那一截执行和等待两边都算，
         # active + wait 比墙钟还长（机器一忙就差出几十毫秒）
         paused: float | None = None
+        # 这段执行属于现在这一世代（cluster/fence.py）：本进程隔离之后，它不再写
+        fence.bind()
+        mine = identity.owner()
+        #: 被隔离了（续不上租约）：停手，不写终态（这次运行由接手的进程按「属主不在了」处理）
+        fenced = False
         # 先要并发名额（app/cluster/slots.py）。等名额的时候被停止（或者关停）也要照实收尾，见 _stopped_in_queue
         slot = slots.hold(run_id, origin_kind)
         try:
@@ -806,7 +814,7 @@ class RunManager:
                     row = await session.get(Run, run_id)
                     if row is not None:
                         row.status = "running"
-                        row.owner = identity.owner()
+                        row.owner = mine
                         # started_at 只在第一次开始时写。以前每段 _drive 都覆盖它，
                         # 审批恢复、接着跑之后，运行的"开始时间"就成了最后一段的开始
                         if row.started_at is None:
@@ -891,7 +899,13 @@ class RunManager:
                 elif snapshot.next:
                     status = "interrupted"
 
+            except Fenced:
+                fenced = True
+                logger.error("运行 %s：本进程续不上租约，停手、不写终态（由接手的进程按「属主不在了」处理）", run_id)
             except asyncio.CancelledError:
+                if fence.fenced_here():
+                    fenced = True
+                    raise
                 if self._closing:
                     # 服务关停（dev.sh 的 --reload 改一个文件就是一次）不是用户取消。
                     # checkpoint 完好，记成中断、重启后从断点接着跑——和强杀后启动
@@ -956,11 +970,12 @@ class RunManager:
                 elapsed = int((stop - started) * 1000)
                 self._finalizing.add(run_id)
                 try:
-                    await self._finalize(run_id, status, error, final_state, elapsed,
-                                         terminal=terminal, error_node=error_node, end_reason=end_reason)
+                    if not fenced:
+                        await self._finalize(run_id, status, error, final_state, elapsed, terminal=terminal,
+                                             error_node=error_node, end_reason=end_reason, owner=mine)
                     # 记 action.unknown、安排核实也算收尾：做完才把自己摘掉。以前摘掉之后才做，等运行「不在跑了」
                     # 再去读事件的一方（接口、测试）有一小段读不到这一条；库慢一点（PostgreSQL 满载时）就读不到
-                    if pending_action is not None:
+                    if pending_action is not None and not fenced:
                         from app.process.actions import on_unknown
 
                         try:
@@ -978,7 +993,7 @@ class RunManager:
                 # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），
                 # 而且没有任何自动回收路径会碰它——闲置回收只在"下次有人执行
                 # 代码"时才触发。interrupted 要留着，人回来还得接着跑。
-                if status in ("succeeded", "failed", "cancelled"):
+                if status in ("succeeded", "failed", "cancelled") and not fenced:
                     with contextlib.suppress(Exception):
                         from app.sandbox.manager import sandbox_manager
 
@@ -992,11 +1007,13 @@ class RunManager:
         try:
             if self._closing:
                 return
+            if fence.fenced_here():
+                return
             actor = self._stopped_by.pop(run_id, None)
             self._finalizing.add(run_id)
             await self._finalize(run_id, "cancelled", "用户取消", {}, 0,
                                  terminal=(EventType.RUN_CANCELLED, {"reason": END_STOPPED, "actor": actor}),
-                                 end_reason=END_STOPPED)
+                                 end_reason=END_STOPPED, owner=identity.owner())
         finally:
             self._finalizing.discard(run_id)
             self._tasks.pop(run_id, None)
@@ -1021,6 +1038,7 @@ class RunManager:
         interrupts = chunk.get("__interrupt__")
         if not interrupts:
             return False
+        fence.check()
 
         for item in interrupts:
             value = getattr(item, "value", item)
@@ -1082,7 +1100,9 @@ class RunManager:
         terminal: tuple[EventType, dict[str, Any]] | None = None,
         error_node: str | None = None,
         end_reason: str | None = None,
+        owner: str | None = None,
     ) -> None:
+        """收尾。owner：执行这一段的属主——运行那一行的属主已经不是它（被别的进程当成没了接手了，cluster/fence.py）就什么都不写。"""
         usage = dict(state.get("usage") or {})
         output = dict(state.get("output") or {})
         now = datetime.now(timezone.utc)
@@ -1100,7 +1120,13 @@ class RunManager:
         run_class: str | None = None
         origin_kind: str | None = None
         async with SessionLocal() as session:
-            run = await session.get(Run, run_id)
+            # 先占住这一行再看属主（PostgreSQL 上 FOR UPDATE；SQLite 只有一个进程）：接手的进程改属主用的是带条件的 UPDATE，
+            # 两边一个接一个，被接手了的这边不写
+            run = (await session.execute(select(Run).where(Run.id == run_id).with_for_update())).scalar_one_or_none()
+            if run is not None and owner is not None and run.owner != owner:
+                logger.error("运行 %s 已经被别的进程接手（属主 %s），本进程不写终态", run_id, identity.describe(run.owner))
+                await session.rollback()
+                return
             if run:
                 app_id = run.app_id
                 run_class, origin_kind = run.run_class, run.origin_kind
@@ -1757,6 +1783,31 @@ async def _timing(session: Any, run: Run, elapsed_ms: int, now: datetime) -> dic
 
 
 run_manager = RunManager()
+
+
+def _fenced_saver(saver: BaseCheckpointSaver) -> BaseCheckpointSaver:
+    """断点库的写也要过 cluster/fence：本进程续不上租约之后，手上的执行不再写断点（接手的进程会从断点接着跑，两边都写就分叉了）。"""
+    for name in ("aput", "aput_writes"):
+        original = getattr(saver, name, None)
+        if original is None:
+            continue
+
+        def guarded(*args: Any, __original: Any = original, **kwargs: Any) -> Any:
+            fence.check()
+            return __original(*args, **kwargs)
+
+        setattr(saver, name, guarded)
+    return saver
+
+
+def _stop_fenced() -> None:
+    """隔离了：停掉本进程在执行的运行（停的时候不写终态，见 _drive 的 fenced）。"""
+    for task in list(run_manager._tasks.values()):
+        if not task.done():
+            task.cancel()
+
+
+fence.on_trip(_stop_fenced)
 
 
 def _register_requests() -> None:

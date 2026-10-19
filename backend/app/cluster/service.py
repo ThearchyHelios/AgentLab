@@ -1,7 +1,11 @@
 """本进程在协调里的那一份：启动时登记、起心跳，关停时交班、删登记。
 
-心跳每一拍（AGENTLAB_WORKER_HEARTBEAT_S，缺省 5 秒）：
-1. 续自己的租约（登记不见了就重新登记）；
+续租约在单独的任务、单独的连接上（不走连接池，不被同一拍别的活拖住）；续晚了（离上次续上超过一个租约时长）就隔离：停掉手上的
+执行、不写终态，换一个身份重新登记（cluster/fence.py）。SQLite 只有一个进程：登记只写一次、不续租、本进程直接当班、接手只在
+启动时做，心跳只做本进程自己攒着的活。
+
+心跳每一拍（AGENTLAB_WORKER_HEARTBEAT_S，缺省 5 秒；PostgreSQL）：
+1. （续租约另有任务）；
 2. 刷新「别的进程谁还活着」；
 3. 取走发给本进程的请求照办（停止、往运行里记事件，cluster/requests.py）；
 4. 本进程自己的周期活（on_beat 登记的：访问密钥的请求记录写库……——这些是每个进程攒在自己内存里的，只能自己写）；
@@ -52,36 +56,48 @@ def leading() -> bool:
 class _Service:
     def __init__(self) -> None:
         self.task: asyncio.Task[None] | None = None
+        self.lease_task: asyncio.Task[None] | None = None
         self.wake: asyncio.Event | None = None
         self.reap_now = False
         self.last_reap = 0.0
         self.others: frozenset[str] = frozenset()
         self.started = False
+        #: SQLite：守卫已经确认只有本进程——登记只写一次、不续租、本进程直接当班、接手只在启动时做（不为协调多写库）
+        self.single = False
+        self._lease_conn: Any = None
 
     async def start(self) -> None:
         """登记、开始收发通知、起心跳。SQLite 时先取单进程的守卫（拿不到抛 guard.SingleProcessOnly）。"""
         if self.started:
             return
         guard.acquire()
-        exclusive = settings.db_dialect == "sqlite"
-        await workers.register(exclusive=exclusive)
+        self.single = settings.db_dialect == "sqlite"
+        await workers.register(exclusive=self.single)
         live = await workers.liveness()
         state.remember(live)
         self.others = live.others
         await signals.start()
         signals.on("q", self._on_request)
         signals.on("gone", self._on_gone)
-        if settings.db_dialect == "postgresql":
+        if not self.single:
             await signals.ready(timeout=5.0)
         self.wake = asyncio.Event()
         self.started = True
-        from app.cluster import caches
+        from app.cluster import caches, fence
 
         await caches.start()
-        await self._lead()
-        self.task = asyncio.create_task(self._loop(), name="agentlab-cluster-heartbeat")
+        if self.single:
+            # 只有本进程：当班不用争（不写库），心跳只做本进程自己攒着的活（访问密钥的请求记录）
+            leader.scheduler.single()
+            self.task = asyncio.create_task(self._light_loop(), name="agentlab-cluster-beats")
+        else:
+            await self._lead()
+            fence.activate()
+            fence.on_trip(self._on_fenced)
+            self.lease_task = asyncio.create_task(self._lease_loop(), name="agentlab-cluster-lease")
+            self.task = asyncio.create_task(self._loop(), name="agentlab-cluster-heartbeat")
         logger.info("工作进程 %s 已登记（%s，租约 %g 秒、心跳 %g 秒；现在另有 %d 个进程）", identity.describe(identity.owner()),
-                    "PostgreSQL，可以多进程" if settings.db_dialect == "postgresql" else "SQLite，单进程",
+                    "SQLite，单进程" if self.single else "PostgreSQL，可以多进程",
                     workers.lease_s(), workers.heartbeat_s(), len(live.others))
 
     def _on_request(self, parts: list[str]) -> None:
@@ -92,6 +108,75 @@ class _Service:
         self.reap_now = True
         if self.wake is not None:
             self.wake.set()
+
+    # ---------------- 续租约：单独的任务、单独的连接 ----------------
+
+    async def _lease_conn_open(self) -> Any:
+        import asyncpg
+
+        from app.cluster.signal import listen_dsn
+        from app.db.base import APPLICATION_NAME
+
+        if self._lease_conn is None or self._lease_conn.is_closed():
+            self._lease_conn = await asyncpg.connect(listen_dsn(), server_settings={"application_name": APPLICATION_NAME},
+                                                     timeout=max(1.0, workers.heartbeat_s()))
+        return self._lease_conn
+
+    async def renew(self) -> bool:
+        """续一拍租约（在专用连接上，不走连接池：池子被占满时取连接要等，等得比租约还长）。续晚了（离上次续上超过一个租约时长）
+        就不续这个身份了：隔离（cluster/fence.py），换身份重新登记。交回续没续上。"""
+        from datetime import timedelta
+
+        from app.cluster import fence
+        from app.db.base import utcnow
+
+        if fence.stale():
+            fence.trip("续租约的时候发现已经续晚了")
+            return False
+        now = utcnow()
+        until = now + timedelta(seconds=workers.lease_s())
+        try:
+            conn = await self._lease_conn_open()
+            done = await asyncio.wait_for(conn.execute(
+                "UPDATE cluster_workers SET heartbeat_at = $2, lease_until = $3 WHERE id = $1",
+                identity.owner(), now.replace(tzinfo=None), until.replace(tzinfo=None)), timeout=workers.heartbeat_s())
+        except Exception:  # noqa: BLE001 - 库一时连不上：这一拍没续上，下一拍再试（续晚了的话下一拍隔离）
+            logger.warning("续租约没续上，下一拍再试", exc_info=True)
+            with contextlib.suppress(Exception):
+                if self._lease_conn is not None:
+                    await self._lease_conn.close()
+            self._lease_conn = None
+            return False
+        if done.endswith(" 0"):
+            logger.warning("本进程的登记不见了（可能被当成没了），重新登记")
+            await workers.register()
+        fence.renewed()
+        return True
+
+    async def _lease_loop(self) -> None:
+        while True:
+            await self.renew()
+            await asyncio.sleep(workers.heartbeat_s())
+
+    def _on_fenced(self) -> None:
+        """隔离了：手上的执行由各处自己停（runner、job_runtime 登记的处理），这里换身份重新登记。"""
+        asyncio.ensure_future(self._reidentify())
+
+    async def _reidentify(self) -> None:
+        from app.cluster import fence
+
+        old = identity.owner()
+        new = identity.regenerate()
+        leader.scheduler.until = None
+        try:
+            await workers.register()
+            fence.renewed()
+            logger.warning("隔离之后换了身份重新登记：%s → %s（之前认领的行由当班进程按「属主不在了」接手）",
+                           identity.describe(old), identity.describe(new))
+        except Exception:  # noqa: BLE001
+            logger.exception("隔离之后重新登记失败，下一拍再试")
+
+    # ---------------- 当班、心跳的其余活 ----------------
 
     async def _lead(self) -> bool:
         was = leader.scheduler.held()
@@ -113,10 +198,10 @@ class _Service:
         return now_leading
 
     async def beat(self) -> None:
-        """心跳的一拍（测试里直接调）。"""
-        if not await workers.renew():
-            logger.warning("本进程的登记不见了（可能被当成没了），重新登记")
-            await workers.register()
+        """心跳的一拍（续租约另在 _lease_loop；测试里直接调）。SQLite 只做本进程自己攒着的活。"""
+        if self.single:
+            await self._own_work()
+            return
         live = await workers.liveness()
         state.remember(live)
         if self.others - live.others:
@@ -132,14 +217,17 @@ class _Service:
             await caches.poll()
         except Exception:  # noqa: BLE001
             logger.exception("读别的进程的缓存变化时出错")
+        await self._own_work()
+        if await self._lead() and (self.reap_now or time.monotonic() - self.last_reap >= workers.lease_s()):
+            # 隔一会儿的这一次信得过自己：属主是本进程的行（刚建、还没交给后台任务的）不当成没人管
+            await self.reap(live.trusting())
+
+    async def _own_work(self) -> None:
         for name, fn in list(_beats):
             try:
                 await fn()
             except Exception:  # noqa: BLE001
                 logger.exception("心跳里的「%s」出错，下一拍再试", name)
-        if await self._lead() and (self.reap_now or time.monotonic() - self.last_reap >= workers.lease_s()):
-            # 隔一会儿的这一次信得过自己：属主是本进程的行（刚建、还没交给后台任务的）不当成没人管
-            await self.reap(live.trusting())
 
     async def reap(self, live: workers.Liveness | None = None) -> dict[str, Any]:
         self.reap_now = False
@@ -173,20 +261,33 @@ class _Service:
             except Exception:  # noqa: BLE001 - 一拍出错（库一时不通）不该让心跳停下
                 logger.exception("心跳这一拍出错，下一拍照常进行")
 
+    async def _light_loop(self) -> None:
+        while True:
+            await asyncio.sleep(workers.heartbeat_s())
+            await self._own_work()
+
     async def stop(self) -> None:
         """关停：停心跳、交班、删登记（别的进程马上接手本进程留下的行），停收发通知。"""
         if not self.started:
             return
         self.started = False
-        if self.task is not None:
-            self.task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.task
-        self.task = None
+        from app.cluster import fence
+
+        for task in (self.lease_task, self.task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        self.task = self.lease_task = None
+        fence.deactivate()
         with contextlib.suppress(Exception):
             await leader.scheduler.release()
         with contextlib.suppress(Exception):
             await workers.unregister()
+        if self._lease_conn is not None:
+            with contextlib.suppress(Exception):
+                await self._lease_conn.close()
+            self._lease_conn = None
         signals.publish("gone", identity.owner())
         await signals.stop()
         state.forget()
