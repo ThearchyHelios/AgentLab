@@ -66,6 +66,18 @@
       "text": "钉钉",
       "rule": "钉",
       "reason": "「钉钉」是 Webhook 通知的产品名（定时任务的消息格式：通用 / 飞书 / 企业微信 / 钉钉），不是「钉住」的意思"
+    },
+    {
+      "file": "backend/app/db/urls.py",
+      "text": "postgresql+asyncpg://用户:密码@主机:5432/库名",
+      "rule": "半角标点",
+      "reason": "AGENTLAB_DATABASE_URL 写错时启动报错里给的地址示例：://、:、@ 是地址语法，用户照着改环境变量，换成全角就成了错的地址；中文占位让人一眼看出哪段填什么"
+    },
+    {
+      "file": "backend/app/db/urls.py",
+      "text": "postgresql://用户:密码@主机:5432/库名",
+      "rule": "半角标点",
+      "reason": "同上：AGENTLAB_CHECKPOINT_URL 写错时报错里给的 libpq 地址示例"
     }
   ]
 }
