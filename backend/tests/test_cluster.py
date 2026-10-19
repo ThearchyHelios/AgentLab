@@ -47,9 +47,11 @@ async def _peer(owner: str = PEER, *, alive: bool = True) -> None:
     state.forget()
 
 
-def _policy(monkeypatch, total: int, **classes: tuple[int, int]) -> None:
-    value = slots.values({"max_total": total, "classes": {k: {"limit": lim, "priority": pri}
-                                                          for k, (lim, pri) in classes.items()}})
+def _policy(monkeypatch, total: int, reserve: int | None = None, **classes: tuple[int, int]) -> None:
+    stored: dict = {"max_total": total, "classes": {k: {"limit": lim, "priority": pri} for k, (lim, pri) in classes.items()}}
+    if reserve is not None:
+        stored["interactive_reserve"] = reserve
+    value = slots.values(stored)
 
     async def fixed(*, fresh: bool = False):  # noqa: ARG001
         return value
@@ -113,6 +115,60 @@ async def test_a_class_at_its_cap_does_not_hold_up_the_others(monkeypatch):
     assert len({"e1", "e2"} & set(got)) == 1, "系统类到了上限：另一个等着"
     snapshot = await slots.snapshot()
     assert snapshot["classes"]["system"] == {"running": 1, "waiting": 1}
+    gate.set()
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+
+
+def test_the_defaults_keep_a_reserve_for_interactive_and_lend_the_rest():
+    pol = slots.defaults(20)
+    assert pol["interactive_reserve"] == 5 and pol["classes"]["interactive"]["limit"] == 20
+    assert {pol["classes"][k]["limit"] for k in ("app", "schedule", "system")} == {15}, "别的类缺省借满到 全站 − 留底"
+    assert slots.defaults(2)["interactive_reserve"] == 1 and slots.defaults(1)["interactive_reserve"] == 0, \
+        "至少留 1 个；全站只有 1 个名额时不留（别的类才跑得起来）"
+    assert slots.values({"max_total": 8})["classes"]["system"]["limit"] == 6, "缺省按存着的全站上限现算"
+    assert slots.problem({"max_total": 4, "interactive_reserve": 4}) is not None
+
+
+async def _holders(names_origins: list[tuple[str, str]], got: list[str], gate: asyncio.Event) -> list[asyncio.Task]:
+    async def run(name: str, origin: str) -> None:
+        async with slots.hold(f"run-{name}", origin):
+            got.append(name)
+            await gate.wait()
+
+    tasks = []
+    for name, origin in names_origins:
+        tasks.append(asyncio.create_task(run(name, origin)))
+        await asyncio.sleep(0.05)
+    return tasks
+
+
+async def test_idle_system_runs_borrow_all_but_the_interactive_reserve(monkeypatch):
+    """全站 4 个、留底 1 个：没人问数据时评测能同时跑 3 个（全站 − 留底），第 4 个等着。"""
+    _policy(monkeypatch, 4, reserve=1)
+    got: list[str] = []
+    gate = asyncio.Event()
+    tasks = await _holders([(f"e{i}", "eval") for i in range(4)], got, gate)
+    await _until(lambda: len(got) == 3)
+    await asyncio.sleep(0.3)
+    assert len(got) == 3, "留底那一个不借给评测"
+    assert (await slots.snapshot())["classes"]["system"] == {"running": 3, "waiting": 1}
+    gate.set()
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+
+
+async def test_interactive_takes_the_reserve_at_once_and_it_is_never_lent(monkeypatch):
+    """评测借满了（3 个在跑），应用类的再来也借不到留底（全站还空着 1 个）；问数据一来马上拿到留底，不用等评测跑完。"""
+    _policy(monkeypatch, 4, reserve=1)
+    got: list[str] = []
+    gate = asyncio.Event()
+    tasks = await _holders([("e1", "eval"), ("e2", "eval"), ("e3", "eval")], got, gate)
+    await _until(lambda: len(got) == 3)
+    tasks += await _holders([("app", "app_view")], got, gate)
+    await asyncio.sleep(0.3)
+    assert "app" not in got, "留底不借给应用类"
+    tasks += await _holders([("chat", "chat")], got, gate)
+    await _until(lambda: "chat" in got)
+    assert "app" not in got and set(got) == {"e1", "e2", "e3", "chat"}
     gate.set()
     await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
 

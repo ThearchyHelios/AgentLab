@@ -10,12 +10,15 @@
   定时 schedule：定时任务（含事件触发）
   系统 system：评测、口径召回、对账、补算、按口径正式出具——服务端替人跑的
 
-每类有全站的并发上限和优先级（设置里「运行并发」一组，管理员可调），另有全站总上限。名额按库里的计数发：等着的按
-优先级高的先、同一优先级先来先得，只要它那一类没到上限、全站没到总上限就发给它。所以评测再多也只占得到系统那一类的
-几个名额，问数据不用等它；全站满了的时候，空出来的名额先给交互。已经在跑的不抢。
+每类有全站的并发上限和优先级（设置里「运行并发」一组，管理员可调），另有全站总上限，和一个**交互留底**：
 
-缺省（总上限取 AGENTLAB_MAX_CONCURRENT_RUNS）：交互 = 总上限、应用 2/5、定时 1/5、系统 1/5（至少各 1），优先级 40 / 30 / 20 / 10。
-应用、定时、系统三类加起来不到总上限：交互总留得出名额。单进程时总上限和以前的信号量一样大，问数据、试跑不再被评测挤占。
+- 留底：全站名额里永远留给交互类的那几个（缺省全站上限的 1/4、至少 1；至多全站上限减 1）。应用、定时、系统三类合起来
+  永远用不到这一部分——有人问数据、试跑时总有名额，不用等评测、召回跑完。
+- 借用：没人问数据时，别的类可以借满到「全站上限 − 留底」（三类各自的上限缺省就是这个数，设置里可以调小）。评测照旧跑得快。
+- 交互自己的上限缺省 = 全站上限：留底之外空着的名额它也能用。
+
+等着的按优先级高的先、同一优先级先来先得（缺省交互 40 > 应用 30 > 定时 20 > 系统 10）；已经在跑的不抢。单进程时总上限和以前的
+信号量一样大。
 
 **怎么发。** 要名额的一方先在本进程登记、再插一行「等着」，然后自己去发一次（grant：把所有等着的按规矩过一遍，谁够格就
 改成「已发」）；没轮到就等叫醒（本进程放名额时叫醒，PostgreSQL 上别的进程放名额时 NOTIFY slot 叫醒），另隔一会儿自己再
@@ -70,33 +73,45 @@ def class_of(origin_kind: str | None) -> str:
     return ORIGIN_CLASS.get(origin_kind or "", "interactive")
 
 
-def defaults(total: int | None = None) -> dict[str, Any]:
-    """缺省的设置（总上限取 AGENTLAB_MAX_CONCURRENT_RUNS）。"""
+def _reserve_of(total: int, reserve: int | None) -> int:
+    """生效的交互留底：缺省全站上限的 1/4、至少 1；至多全站上限减 1（全站只有 1 个名额时没有留底，别的类才跑得起来）。"""
+    wanted = max(1, total // 4) if reserve is None else int(reserve)
+    return max(0, min(wanted, total - 1))
+
+
+def defaults(total: int | None = None, reserve: int | None = None) -> dict[str, Any]:
+    """缺省的设置（总上限取 AGENTLAB_MAX_CONCURRENT_RUNS）：交互上限 = 全站上限，别的三类 = 全站上限 − 交互留底。"""
     total = max(1, int(total if total is not None else settings.max_concurrent_runs))
-    share = {"interactive": total, "app": max(1, total * 2 // 5), "schedule": max(1, total // 5),
-             "system": max(1, total // 5)}
-    return {"max_total": total,
-            "classes": {k: {"limit": share[k], "priority": DEFAULT_PRIORITY[k]} for k in CLASSES}}
+    kept = _reserve_of(total, reserve)
+    others = max(1, total - kept)
+    return {"max_total": total, "interactive_reserve": kept,
+            "classes": {k: {"limit": total if k == "interactive" else others, "priority": DEFAULT_PRIORITY[k]}
+                        for k in CLASSES}}
+
+
+def _int_in(value: Any, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
 
 
 def values(stored: Any) -> dict[str, Any]:
-    """存着的（可能缺项、存坏了）→ 生效的：缺的、坏的补缺省。"""
-    base = defaults()
-    out = {"max_total": base["max_total"], "classes": {k: dict(v) for k, v in base["classes"].items()}}
-    if not isinstance(stored, dict):
-        return out
-    total = stored.get("max_total")
-    if isinstance(total, int) and not isinstance(total, bool) and 1 <= total <= LIMIT_MAX:
-        out["max_total"] = total
+    """存着的（可能缺项、存坏了）→ 生效的：缺的、坏的补缺省（缺省按存着的全站上限、留底算）。"""
+    stored = stored if isinstance(stored, dict) else {}
+    total = stored.get("max_total") if _int_in(stored.get("max_total"), 1, LIMIT_MAX) else None
+    reserve = stored.get("interactive_reserve") if _int_in(stored.get("interactive_reserve"), 0, LIMIT_MAX) else None
+    out = defaults(total, reserve)
     classes = stored.get("classes") if isinstance(stored.get("classes"), dict) else {}
     for k in CLASSES:
         item = classes.get(k) if isinstance(classes.get(k), dict) else {}
-        limit, prio = item.get("limit"), item.get("priority")
-        if isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= LIMIT_MAX:
-            out["classes"][k]["limit"] = limit
-        if isinstance(prio, int) and not isinstance(prio, bool) and 0 <= prio <= PRIORITY_MAX:
-            out["classes"][k]["priority"] = prio
+        if _int_in(item.get("limit"), 1, LIMIT_MAX):
+            out["classes"][k]["limit"] = item["limit"]
+        if _int_in(item.get("priority"), 0, PRIORITY_MAX):
+            out["classes"][k]["priority"] = item["priority"]
     return out
+
+
+def borrowable(pol: dict[str, Any]) -> int:
+    """应用、定时、系统三类合起来最多用几个名额：全站上限 − 交互留底。"""
+    return max(0, int(pol["max_total"]) - int(pol.get("interactive_reserve") or 0))
 
 
 def problem(sent: Any) -> str | None:
@@ -106,6 +121,11 @@ def problem(sent: Any) -> str | None:
     total = sent.get("max_total")
     if total is not None and (not isinstance(total, int) or isinstance(total, bool) or not 1 <= total <= LIMIT_MAX):
         return f"全站同时运行的上限需要是 1 到 {LIMIT_MAX} 之间的整数"
+    reserve = sent.get("interactive_reserve")
+    if reserve is not None and not _int_in(reserve, 0, LIMIT_MAX):
+        return f"给交互留底的名额需要是 0 到 {LIMIT_MAX} 之间的整数"
+    if reserve is not None and isinstance(total, int) and total > 1 and reserve >= total:
+        return "给交互留底的名额要小于全站同时运行的上限：留底占满了，应用、定时、系统就一个都运行不了"
     classes = sent.get("classes")
     if classes is None:
         return None
@@ -125,14 +145,18 @@ def problem(sent: Any) -> str | None:
 
 
 def merged(saved: Any, sent: dict[str, Any]) -> dict[str, Any]:
-    """只给了一部分的（只改一类的上限）补上存着的另几项。"""
-    out = values(saved)
-    if "max_total" in sent and sent["max_total"] is not None:
-        out["max_total"] = sent["max_total"]
+    """只给了一部分的（只改一类的上限）补上存着的另几项。存的是原样（没给的类别上限不写，按全站上限、留底现算缺省）。"""
+    base = dict(saved) if isinstance(saved, dict) else {}
+    out: dict[str, Any] = {k: base[k] for k in ("max_total", "interactive_reserve") if k in base}
+    for key in ("max_total", "interactive_reserve"):
+        if sent.get(key) is not None:
+            out[key] = sent[key]
+    classes = {k: dict(v) for k, v in (base.get("classes") or {}).items() if k in CLASSES and isinstance(v, dict)}
     for k, item in (sent.get("classes") or {}).items():
         for field_ in ("limit", "priority"):
             if item.get(field_) is not None:
-                out["classes"][k][field_] = item[field_]
+                classes.setdefault(k, {})[field_] = item[field_]
+    out["classes"] = classes
     return out
 
 
@@ -219,6 +243,9 @@ async def grant() -> list[str]:
             rows = [r for r in rows if r.run_id not in set(dead)]
             used = Counter(r.klass for r in rows if r.granted)
             total = sum(used.values())
+            # 交互以外的三类合起来用了几个：到了「全站上限 − 交互留底」就不再发给它们（留底永远给交互）
+            others = total - used["interactive"]
+            others_cap = borrowable(pol)
             limits = {k: int(v["limit"]) for k, v in pol["classes"].items()}
             granted: list[str] = []
             waiting = sorted((r for r in rows if not r.granted),
@@ -229,8 +256,12 @@ async def grant() -> list[str]:
                     break
                 if used[row.klass] >= limits.get(row.klass, int(pol["max_total"])):
                     continue
+                if row.klass != "interactive" and others >= others_cap:
+                    continue
                 used[row.klass] += 1
                 total += 1
+                if row.klass != "interactive":
+                    others += 1
                 granted.append(row.run_id)
             if granted:
                 await session.execute(update(RunSlot).where(RunSlot.run_id.in_(granted))
@@ -316,5 +347,5 @@ async def snapshot() -> dict[str, Any]:
     return {"policy": await policy(), "classes": out}
 
 
-__all__ = ["CLASSES", "CLASS_LABEL", "ORIGIN_CLASS", "SETTING_KEY", "class_of", "defaults", "forget_policy", "grant",
+__all__ = ["CLASSES", "CLASS_LABEL", "ORIGIN_CLASS", "SETTING_KEY", "borrowable", "class_of", "defaults", "forget_policy", "grant",
            "hold", "merged", "policy", "problem", "snapshot", "values", "wake_local"]

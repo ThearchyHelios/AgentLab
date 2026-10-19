@@ -6,8 +6,9 @@
    进程只执行一次；两边的事件流都按 seq 递增、不重不漏，封存核对得上；
 3. 在 A 上跑的运行，从 B 停止：照本进程的停止办（run.cancelled 带上是谁停的）；
 4. 定时任务到点只触发一次（两个进程都起着调度循环，只有当班的做）；
-5. 评测和问数据并发时优先级生效：全站只给 1 个名额，评测的作答运行（系统类，由本测试进程作为第三个登记的工作进程以评测的
-   来源发起——工作进程里发起评测要真的去调模型建图）排着队时，后来的问数据运行（交互类，经 A 的接口发起）先拿到名额；
+5. 评测和问数据并发时优先级生效：全站只给 1 个名额（没有留底），评测的作答运行（系统类，由本测试进程作为第三个登记的工作进程
+   以评测的来源发起——工作进程里发起评测要真的去调模型建图）排着队时，后来的问数据运行（交互类，经 A 的接口发起）先拿到名额；
+   全站 2 个、给交互留底 1 个：评测借满了别的名额、还有题排着，问数据一来马上拿到留底，不等评测跑完；
 6. 每日花费上限跨进程不越过：两个进程同时往同一本账上记，记下的合计不超过上限；
 7. 强杀 B：租约过期后，B 上在跑的运行被照实标中断（可从断点继续），停在审批上的运行照常能在 A 上批、接着跑完；B 当着调度班的
    话 A 接班。
@@ -397,6 +398,54 @@ async def test_5_chat_goes_before_queued_evaluation_runs(workers, monkeypatch):
             assert e2.created_at < chat.created_at and e3.created_at < chat.created_at, "评测的两题先来、排着队"
             assert e1.started_at < chat.started_at < e2.started_at < e3.started_at, \
                 [(r.origin_kind, r.created_at, r.started_at) for r in rows]
+        finally:
+            await run_manager.shutdown()
+            await relay.stop()
+            await cluster.stop()
+            await client.put(f"{a.base}/api/settings", json={"values": {"concurrency": slots.defaults()}})
+
+
+async def test_5b_the_interactive_reserve_is_there_when_evaluations_fill_the_rest(workers, monkeypatch):
+    """全站 2 个名额、留底 1 个：评测（系统类）只借得到 1 个，第二题排着；问数据一来马上拿到留底，评测的第一题还在跑。"""
+    from app import cluster
+    from app.cluster import slots
+    from app.cluster.relay import relay
+    from app.core.config import settings
+    from app.db.base import SessionLocal
+    from app.db.models import Run
+    from app.engine.runner import run_manager
+
+    a = workers["A"]
+    async with await _client() as client:
+        put = await client.put(f"{a.base}/api/settings", json={"values": {"concurrency": {
+            "max_total": 2, "interactive_reserve": 1, "classes": {}}}})
+        assert put.status_code == 200, put.text
+        assert put.json()["concurrency"]["classes"]["system"]["limit"] == 1, "别的类缺省借满到 全站 − 留底"
+        slots.forget_policy()
+        monkeypatch.setattr(settings, "sandbox_backend", "local")
+        await cluster.start()
+        await relay.start()
+        await run_manager.setup()
+        try:
+            evals = [await run_manager.start(graph=slow_graph(3), input_payload={"question": f"评测 {i}"},
+                                             origin_kind="eval", origin={"kind": "eval"}) for i in range(2)]
+
+            async def first_running() -> Any:
+                async with SessionLocal() as session:
+                    return (await session.get(Run, evals[0].id)).status == "running"
+
+            await _until(first_running, what="第一题的作答运行拿到名额")
+            chat_id = (await client.post(f"{a.base}/api/runs", json={
+                "graph": slow_graph(0.2), "input": {"question": "问数据"}, "origin": "chat"})).json()["id"]
+
+            async def all_done() -> Any:
+                async with SessionLocal() as session:
+                    rows = [await session.get(Run, rid, populate_existing=True) for rid in [*[e.id for e in evals], chat_id]]
+                return rows if all(r.status in ("succeeded", "failed") for r in rows) else None
+
+            e1, e2, chat = await _until(all_done, timeout=60, what="都跑完")
+            assert chat.started_at < e1.finished_at, "问数据拿到的是留底：评测的第一题还没跑完它就开始了"
+            assert e2.started_at >= e1.finished_at, "评测的第二题借不到留底，等第一题跑完"
         finally:
             await run_manager.shutdown()
             await relay.stop()
