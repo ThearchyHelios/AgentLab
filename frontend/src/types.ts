@@ -4172,6 +4172,8 @@ export interface ScheduleTriggerOptions {
     label: string
     subject_label: string
     objects: { id: string; name: string; ok: boolean; reason: string | null }[]
+    /** 一页没给完（对象按名字排、一页有上限）：界面按关键字再查。老服务端不给，当作给完了 */
+    more?: boolean
   }[]
   origins: { kind: string; label: string }[]
   apps: { id: string; name: string }[]
