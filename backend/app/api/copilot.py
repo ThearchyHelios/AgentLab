@@ -289,6 +289,10 @@ NODE_REFERENCE = """\
 4. 不要用 transform 解析 agent / llm 的文字：口径卡读 cell(nodes.查库节点id, 行, '列名') 或 vars.<agent 的 assign_to>.字段
 5. 数据在两个库、要按行对齐时：两个 tool 节点各自聚合到相同的键和粒度 → merge 按键合并 → 口径卡算派生指标 → report。
    同一个库写成一条 SQL；只组合几个单值用口径卡的 cell()；不要用 code 节点合并（出处会断，喂给口径卡时核对不了）
+6. 问题里的「今天、昨天、上周、本月、去年」这类相对日期一律按运行当天算：SQL 用数据源方言里取当天的写法（CURRENT_DATE、
+   CURDATE()、date('now')、SYSDATE），agent 先调 current_time 拿到当天日期再写条件（agent 的 prompt 里写明这一点、tools 绑上
+   current_time）。不要用表里最大的日期（MAX(日期)）去推「上周」「本月」：数据没更新到那段时间时，推出来的是另一段，报告还会
+   把它当成上周来写。想让报告说清数据最新到哪天，另取一列 MAX(日期) AS 数据最新日期
 
 模型字段（llm / agent / supervisor / report 的 config.model）：
 - **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。

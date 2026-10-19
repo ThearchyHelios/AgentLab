@@ -38,6 +38,7 @@ import re
 import time
 from collections import Counter
 from collections.abc import Iterable, Mapping
+from datetime import date, datetime
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -56,6 +57,7 @@ from app.engine.evidence import (
     ENTITY_KINDS,
     MARKER_RULES,
     SEE_AND_CODE_RULES,
+    period_rule,
     StreamRenderer,
     WriterCatalog,
     build_catalog,
@@ -634,12 +636,17 @@ def _repair_request(violations: list[dict[str, Any]], failed_rule: str | None = 
     )
 
 
+def run_today() -> date:
+    """写作规则里的「今天」（period_rule）：服务端所在时区的日期，和查库时 CURRENT_DATE 一类按运行当天现算的写法同一天。"""
+    return datetime.now().astimezone().date()
+
+
 def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims: str = "off",
               failed: str | None = None) -> list[BaseMessage]:
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
-    rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}"
+    rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}\n{period_rule(run_today())}"
     if writer.guarded:
         # 写作者看不全证据（目录有省略、有来源的结构化结论为空）：「没有查到」这类结论没有依据
         rules = f"{rules}\n{ABSENCE_RULE}"

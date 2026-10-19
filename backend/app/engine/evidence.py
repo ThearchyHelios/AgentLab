@@ -50,6 +50,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any, Literal, TypedDict
 
@@ -3305,6 +3306,24 @@ SEE_AND_CODE_RULES = (
     "- 涉及码值（状态、类型这类用数字编码的取值）时，写它的含义，比如「作废记录」「有效记录」，不要写码值本身"
     "（「状态为 9」「类型 1」）：码值是没有出处的数字，系统会当成裸数字打回重写。"
 )
+
+#: 相对日期（「今天、昨天、上周、本月、去年」）一律按运行当天算（period_rule）。部署上撞过：数据只更新到两周前，查库时拿表里
+#: 最大的日期往前推七天当「上周」，写作者照着写成「上周产量……」。写作者不知道今天是哪天，就分不出数据有没有覆盖问的那段，
+#: 所以把运行当天和上周的起止日期直接告诉它：没覆盖时先照实说、写明数据最新到哪天；最近一段的数可以给，但写具体起止日期
+PERIOD_RULE = (
+    "相对日期：今天是 {today}（{weekday}），上周是 {week_start} 至 {week_end}。问题里的「今天、昨天、上周、本月、去年」"
+    "这类说法一律按今天算，不按数据里最新的日期推。查到的数据没覆盖问的那段时间时，先照实说没覆盖、数据最新到哪天"
+    "（写具体日期）；可以接着给出数据里最近一段的数，但写明它的起止日期，不要把它叫作「上周」「本月」这类相对的说法。"
+)
+_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def period_rule(today: date) -> str:
+    """写作规则里讲相对日期的那一条（PERIOD_RULE），按运行当天 today 填好：上周是上周一到上周日。"""
+    monday = today - timedelta(days=today.weekday() + 7)
+    return PERIOD_RULE.format(today=today.isoformat(), weekday=_WEEKDAYS[today.weekday()],
+                              week_start=monday.isoformat(), week_end=(monday + timedelta(days=6)).isoformat())
+
 
 #: 句中的 [[see:]]：前面是介词、后面接着句子的写法（「以 [[see:Q1]] 为依据」「根据 [[see:Q1]]，」「详见 [[see:Q1]]」）。
 #: 只认这几种拿得准的：「以」前面是「所、可、加……」的是另一个词（所以、可以），不算；「依据 [[see:…]]。」可能是
