@@ -813,7 +813,7 @@ def test_env_example_lists_every_database_pool_and_multiprocess_setting():
     names = {f"AGENTLAB_{name.upper()}" for name in Settings.model_fields if name.startswith(prefixes)}
     assert {"AGENTLAB_DATABASE_URL", "AGENTLAB_DATABASE_DIRECT_URL", "AGENTLAB_DB_PGBOUNCER", "AGENTLAB_WORKERS",
             "AGENTLAB_WORKER_LEASE_S", "AGENTLAB_DB_STARTUP_TIMEOUT", "AGENTLAB_SCHEDULER_TICK_S"} <= names
-    dev = set(re.findall(r"dev_pg_setting (AGENTLAB_DEV_PG_[A-Z_]+)", (REPO / "scripts" / "dev.sh").read_text()))
+    dev = set(re.findall(r"dotenv_setting (AGENTLAB_DEV_PG_[A-Z_]+)", (REPO / "scripts" / "dev.sh").read_text()))
     assert len(dev) == 4
     example = (REPO / ".env.example").read_text(encoding="utf-8")
     listed = set(re.findall(r"^# (AGENTLAB_[A-Z_]+)=", example, re.M))
@@ -827,9 +827,12 @@ def test_dev_script_reads_its_postgres_settings_from_dotenv(tmp_path):
     (root / "scripts").mkdir(parents=True)
     (root / "frontend" / "node_modules").mkdir(parents=True)
     shutil.copy(REPO / "scripts" / "dev.sh", root / "scripts" / "dev.sh")
-    (root / "backend").symlink_to(REPO / "backend")
-    (root / ".env").write_text("AGENTLAB_DEV_PG_CONTAINER=from-root-env\nAGENTLAB_DEV_PG_PORT=55491\n"
-                               "AGENTLAB_DEV_PG_VOLUME='quoted-vol'  \n")
+    (root / ".env").write_text("AGENTLAB_DEV_PG_CONTAINER=from-root-env\nAGENTLAB_DEV_PG_PORT = 55491  # 注释\n"
+                               "export AGENTLAB_DEV_PG_VOLUME = 'quoted-vol'  \nAGENTLAB_DATA_DIR=from-root\n")
+    # backend/.env 比 .env 优先（同后端）：数据目录写相对路径，按后端的工作目录 backend/ 算
+    (root / "backend").mkdir()
+    (root / "backend" / ".env").write_text("AGENTLAB_DATA_DIR = ../devdata\n")
+    (root / "backend" / "app").symlink_to(REPO / "backend" / "app")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "docker.log"
@@ -839,7 +842,7 @@ def test_dev_script_reads_its_postgres_settings_from_dotenv(tmp_path):
                                     'container) exit 1 ;; run) exit 1 ;; esac\nexit 0\n')
     for f in bin_dir.iterdir():
         f.chmod(0o755)
-    env = {"PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(tmp_path), "AGENTLAB_DATA_DIR": str(tmp_path / "data"),
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(tmp_path),
            "AGENTLAB_DEV_PG_IMAGE": "postgres:from-env", "AGENTLAB_PORT": "18799", "LANG": "C.UTF-8"}
     out = subprocess.run(["bash", str(root / "scripts" / "dev.sh"), "--postgres"], capture_output=True, text=True, env=env,
                          timeout=60)
@@ -848,7 +851,10 @@ def test_dev_script_reads_its_postgres_settings_from_dotenv(tmp_path):
     assert "--name from-root-env" in run and "127.0.0.1:55491:5432" in run, ".env 里的生效"
     assert "quoted-vol:/var/lib/postgresql/data" in run, "引号和行尾空白去掉"
     assert run.endswith("postgres:from-env"), "环境变量优先"
-    (root / "backend").unlink()
+    data = root / "backend" / ".." / "devdata"
+    assert f"{data}/.postgres-dev/password:/run/agentlab/password:ro" in run, "密码放在后端实际用的数据目录里"
+    assert (root / "devdata" / ".postgres-dev" / "pgpass").exists()
+    (root / "backend" / "app").unlink()
 
 
 def test_dev_script_refuses_unknown_arguments_and_documents_postgres():
