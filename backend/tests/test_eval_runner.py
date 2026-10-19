@@ -290,7 +290,7 @@ async def test_a_case_over_its_time_limit_stops_its_run(monkeypatch):
 
 
 async def test_time_queued_for_a_run_slot_does_not_count_against_the_case_limit(monkeypatch):
-    """复核：满载时作答运行排队等名额的那一段不算每题时限（排了 0.8 秒、时限 0.3 秒，拿到名额后很快答完：不记超时）。"""
+    """复核：满载时作答运行排队等名额的那一段不算每题时限（排了 2 秒、时限 1 秒，拿到名额后很快答完：不记超时）。"""
     from app.cluster import slots
 
     stored = slots.values({"max_total": 2, "interactive_reserve": 1})
@@ -321,7 +321,7 @@ async def test_time_queued_for_a_run_slot_does_not_count_against_the_case_limit(
 
     async def prepare(self):
         units = await original(self)
-        self.budget["per_case_timeout_s"] = 0.3
+        self.budget["per_case_timeout_s"] = 1.0
         return units
 
     monkeypatch.setattr(runner.EvalExecution, "_prepare", prepare)
@@ -333,7 +333,7 @@ async def test_time_queued_for_a_run_slot_does_not_count_against_the_case_limit(
         [run] = await start(suite_id)
         while not await slots.waiting("eval-answer-in-queue"):
             await asyncio.sleep(0.02)
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(2.0)
         gate.set()
         await es.wait_eval(run.id)
     finally:

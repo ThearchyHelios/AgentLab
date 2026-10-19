@@ -976,19 +976,24 @@ async def _queued(driver: Any) -> bool:
 
 async def within(coro: Any, budget: float, paused: Any, *, tick: float = 0.5) -> Any:
     """同 asyncio.wait_for(coro, budget)，只是 paused() 为真的那几段不算时间（复核：满载时排队等名额不该算进每题时限、触发止损）。
-    超时取消 coro、抛 TimeoutError。"""
+    超时取消 coro、抛 TimeoutError。每隔一小段（tick，且不超过时限的 1/20）看一次；一段的头尾有一头在暂停就整段不算——
+    宁可少算一点，不把排队的时间算进去。"""
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(coro)
+    step_s = max(0.005, min(tick, budget / 20))
     spent, last = 0.0, loop.time()
+    was_paused = await paused()
     try:
         while True:
-            done, _ = await asyncio.wait({task}, timeout=max(0.02, min(tick, budget - spent)))
+            done, _ = await asyncio.wait({task}, timeout=max(0.005, min(step_s, budget - spent)))
             if task in done:
                 return task.result()
             now = loop.time()
             step, last = now - last, now
-            if not await paused():
+            is_paused = await paused()
+            if not (was_paused or is_paused):
                 spent += step
+            was_paused = is_paused
             if spent >= budget:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
