@@ -1993,7 +1993,7 @@ async def _release_raws_locked(session: AsyncSession, shas: set[str]) -> set[str
 async def _expire_stagings_locked(session: AsyncSession, now: datetime) -> list[str]:
     """（持锁）过期的暂存区 → expired、瘦身、删试运行库、放掉没人要的原件；结束超过 90 天的行删掉（提交）。"""
     expired = list((await session.execute(
-        select(ImportStaging).where(_expiry_due(now)).order_by(ImportStaging.created_at)
+        select(ImportStaging).where(_expiry_due(now)).order_by(ImportStaging.created_at, ImportStaging.id)
     )).scalars())
     ids, shas = [s.id for s in expired], {s.raw_sha256 for s in expired}
     trials = [close_staging(s, "expired", now=now) for s in expired]
@@ -2174,7 +2174,7 @@ async def purge_import_raw(
         stagings = list((await session.execute(
             select(ImportStaging).where(
                 ImportStaging.raw_sha256 == sha, ImportStaging.status.in_(STAGING_OPEN),
-            ).order_by(ImportStaging.created_at)
+            ).order_by(ImportStaging.created_at, ImportStaging.id)
         )).scalars()) if sha else []
         now = utcnow()
         record = {

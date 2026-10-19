@@ -334,7 +334,7 @@ async def _confirmed_by(run_id: str, node_id: str) -> str | None:
     async with SessionLocal() as session:
         return await session.scalar(select(Task.resolved_by).where(
             Task.run_id == run_id, Task.node_id == node_id, Task.kind == "action_confirm",
-            Task.status == "resolved").order_by(Task.created_at.desc()).limit(1))
+            Task.status == "resolved").order_by(Task.created_at.desc(), Task.id.desc()).limit(1))
 
 
 def _write_updates(ctx: NodeContext, result: dict[str, Any]) -> dict[str, Any]:

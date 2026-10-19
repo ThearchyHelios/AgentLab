@@ -83,7 +83,7 @@ async def clean_suite(suite_id: str, *, keep: int | None = None) -> dict[str, An
         if keep is None:
             keep = int((await eval_settings(session))["keep_runs"])
         runs = list((await session.execute(select(EvalRun).where(EvalRun.suite_id == suite_id)
-                                           .order_by(EvalRun.created_at.desc()))).scalars())
+                                           .order_by(EvalRun.created_at.desc(), EvalRun.id.desc()))).scalars())
         kept = keep_set(runs, keep)
         targets = [r for r in runs if r.id not in kept and r.cleaned_at is None]
         results = removed = 0

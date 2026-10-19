@@ -148,7 +148,7 @@ async def reference() -> dict[str, Any]:
 async def list_service_accounts(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     _require_admin()
     rows = list((await session.execute(select(User).where(User.kind == keys.SERVICE_KIND)
-                                       .order_by(User.created_at))).scalars())
+                                       .order_by(User.created_at, User.id))).scalars())
     counts: dict[str, int] = {}
     for owner_id in (await session.execute(select(AccessKey.owner_user_id).where(
             AccessKey.owner_user_id.in_([r.id for r in rows] or [""]), AccessKey.revoked_at.is_(None)))).scalars():
@@ -229,7 +229,7 @@ async def list_keys(session: AsyncSession = Depends(get_session)) -> dict[str, A
     principal = current_principal()
     if principal.mode == "off" or not principal.user_id:
         return {"items": []}
-    query = select(AccessKey).order_by(AccessKey.created_at.desc())
+    query = select(AccessKey).order_by(AccessKey.created_at.desc(), AccessKey.id.desc())
     if not _is_admin():
         query = query.where(AccessKey.owner_user_id == principal.user_id)
     rows = list((await session.execute(query)).scalars())

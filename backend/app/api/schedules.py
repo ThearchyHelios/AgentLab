@@ -467,7 +467,7 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
     if fires:
         rows = (await session.execute(
             select(WebhookDelivery).where(WebhookDelivery.fire_id.in_([f.id for f in fires]))
-            .order_by(WebhookDelivery.created_at)
+            .order_by(WebhookDelivery.created_at, WebhookDelivery.id)
         )).scalars()
         for d in rows:
             notified.setdefault(d.fire_id, []).append({"event": d.event, "status": d.status, "at": _iso(d.created_at)})
@@ -603,7 +603,7 @@ async def trigger_options(session: AsyncSession = Depends(get_session)) -> dict[
 
     sources = list((await session.execute(select(DataSource).order_by(DataSource.name))).scalars())
     flows = list((await session.execute(select(Workflow).where(Workflow.is_template.is_(False))
-                                        .order_by(Workflow.name))).scalars())
+                                        .order_by(Workflow.name, Workflow.id))).scalars())
     tables = []
     for src in sources:
         if (src.origin or "manual") != "upload":
@@ -618,7 +618,7 @@ async def trigger_options(session: AsyncSession = Depends(get_session)) -> dict[
                               for w in flows],
         "source.changed": [{"id": src.id, "name": src.name, "ok": True, "reason": None} for src in sources],
     }
-    apps = (await session.execute(select(App.id, App.name).where(App.status != "archived").order_by(App.name))).all()
+    apps = (await session.execute(select(App.id, App.name).where(App.status != "archived").order_by(App.name, App.id))).all()
     return {
         "events": [{"event": e, "label": triggers.EVENT_LABEL[e], "subject_label": triggers.SUBJECT_LABEL[e],
                     "objects": objects[e]} for e in triggers.EVENTS],
@@ -700,7 +700,7 @@ async def _preview_event(session: AsyncSession, body: dict[str, Any]) -> dict[st
 
 @router.get("")
 async def list_schedules(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    rows = list((await session.execute(select(Schedule).order_by(Schedule.created_at.desc()))).scalars())
+    rows = list((await session.execute(select(Schedule).order_by(Schedule.created_at.desc(), Schedule.id.desc()))).scalars())
     return {"items": await _schedule_outs(session, rows)}
 
 

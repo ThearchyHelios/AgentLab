@@ -142,7 +142,7 @@ async def active_job(session: AsyncSession, source_id: str) -> CatalogDraftJob |
     """排队或进行中的那个（同一个源最多一个）。"""
     return (await session.execute(
         select(CatalogDraftJob).where(CatalogDraftJob.source_id == source_id, CatalogDraftJob.status.in_(ACTIVE))
-        .order_by(CatalogDraftJob.created_at.desc()).limit(1)
+        .order_by(CatalogDraftJob.created_at.desc(), CatalogDraftJob.id.desc()).limit(1)
     )).scalar_one_or_none()
 
 
@@ -150,7 +150,7 @@ async def latest_job(session: AsyncSession, source_id: str) -> CatalogDraftJob |
     """最近建的一个（任何状态）。"""
     return (await session.execute(
         select(CatalogDraftJob).where(CatalogDraftJob.source_id == source_id)
-        .order_by(CatalogDraftJob.created_at.desc()).limit(1)
+        .order_by(CatalogDraftJob.created_at.desc(), CatalogDraftJob.id.desc()).limit(1)
     )).scalar_one_or_none()
 
 
@@ -288,7 +288,7 @@ async def last_drafts(session: AsyncSession, source_id: str) -> dict[str, dict[s
     中断了、而且没有写进新内容（parts_written 为 0）时照样带着，界面据此继续提示留空的列；之后有起草写进了新内容（停止
     前已经写了几段、或者正在写）就是 null：以前的留空列数可能已经不对了。不用模型的起草不改模型留空的列，不算。"""
     recent = (select(CatalogDraftJob.id).where(CatalogDraftJob.source_id == source_id)
-              .order_by(CatalogDraftJob.created_at.desc()).limit(LAST_DRAFT_JOBS)).scalar_subquery()
+              .order_by(CatalogDraftJob.created_at.desc(), CatalogDraftJob.id.desc()).limit(LAST_DRAFT_JOBS)).scalar_subquery()
 
     def ranked() -> Any:
         return func.row_number().over(partition_by=CatalogDraftTask.table_name,

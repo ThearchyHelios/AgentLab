@@ -221,7 +221,7 @@ async def list_documents(
     collection: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> list[Document]:
-    stmt = select(Document).order_by(Document.created_at.desc()).limit(300)
+    stmt = select(Document).order_by(Document.created_at.desc(), Document.id.desc()).limit(300)
     if collection:
         stmt = stmt.where(Document.collection == collection)
     return list((await session.execute(stmt)).scalars())
@@ -635,7 +635,7 @@ class SkillOut(SkillIn):
 
 @skills_router.get("", response_model=list[SkillOut])
 async def list_skills(session: AsyncSession = Depends(get_session)) -> list[Skill]:
-    return list((await session.execute(select(Skill).order_by(Skill.created_at.desc()))).scalars())
+    return list((await session.execute(select(Skill).order_by(Skill.created_at.desc(), Skill.id.desc()))).scalars())
 
 
 @skills_router.post("", response_model=SkillOut, status_code=201)

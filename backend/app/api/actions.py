@@ -25,7 +25,7 @@ async def list_actions(
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict[str, Any]:
     ensure_role("builder")
-    stmt = select(ActionRecord).order_by(ActionRecord.created_at.desc()).limit(limit)
+    stmt = select(ActionRecord).order_by(ActionRecord.created_at.desc(), ActionRecord.id.desc()).limit(limit)
     if run_id:
         stmt = stmt.where(ActionRecord.run_id == run_id)
     if app_id:

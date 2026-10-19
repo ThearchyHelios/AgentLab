@@ -79,7 +79,7 @@ async def upkeep(session: AsyncSession = Depends(get_session)) -> dict[str, Any]
     counts = await sc.counts_by_source(session, ids)
     schedules: dict[str, list[dict[str, Any]]] = {}
     for r in (await session.execute(select(Schedule).where(Schedule.target_kind == "source_maintenance")
-                                    .order_by(Schedule.created_at))).scalars():
+                                    .order_by(Schedule.created_at, Schedule.id))).scalars():
         schedules.setdefault(r.target_id or "", []).append({
             "id": r.id, "enabled": r.enabled, "cron": r.cron, "timezone": r.timezone,
             "description_text": _describe(r.cron, r.timezone),
@@ -249,7 +249,7 @@ async def get_maintenance(source_id: str, session: AsyncSession = Depends(get_se
     row = await _source(session, source_id)
     rows = list((await session.execute(select(Schedule).where(
         Schedule.target_kind == "source_maintenance", Schedule.target_id == row.id)
-        .order_by(Schedule.created_at))).scalars())
+        .order_by(Schedule.created_at, Schedule.id))).scalars())
     outs = await _schedule_outs(session, rows)
     fire_ids = [o["last_fire"]["id"] for o in outs if o.get("last_fire")]
     inputs = dict((await session.execute(select(ScheduleFire.id, ScheduleFire.inputs).where(

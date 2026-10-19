@@ -782,7 +782,7 @@ async def backfill(*, days: int = BACKFILL_DAYS, limit: int = BACKFILL_LIMIT) ->
             select(Run.id).where(Run.status == "succeeded", Run.run_class != "formal",
                                  Run.origin_kind.in_(EXPLORE_ORIGINS), Run.manifest_hash.is_not(None),
                                  Run.finished_at >= since)
-            .order_by(Run.finished_at.desc()).limit(limit))).all()]
+            .order_by(Run.finished_at.desc(), Run.id.desc()).limit(limit))).all()]
         done = await store.matched_run_ids(session, ids)
     count = 0
     for run_id in ids:

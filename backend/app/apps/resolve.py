@@ -163,7 +163,7 @@ async def sealed_runs(session: AsyncSession, workflow_id: Any, version: Any, gra
                               or_(Run.origin_kind.is_(None), Run.origin_kind.in_(SEALED_ORIGINS)))
     if isinstance(origin, str) and origin.startswith("schedule:"):
         query = query.where(Run.schedule_id == origin[len("schedule:"):])
-    rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc())
+    rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc(), Run.id.desc())
                                        .limit(max(n, 1) * 3 + 5))).scalars())
     out: list[Run] = []
     for run in rows:
@@ -213,7 +213,7 @@ async def trend_runs(session: AsyncSession, app_id: str | None, workflow_id: Any
         rows = (await session.execute(select(Run).where(
             Run.app_id == app_id, Run.origin_kind == BACKFILL_ORIGIN, Run.workflow_id == workflow_id,
             Run.version == version, Run.version_hash == graph_hash, Run.run_class == "formal",
-            Run.status == "succeeded").order_by(Run.created_at.desc()).limit(max(n, 1) * 3 + 5))).scalars()
+            Run.status == "succeeded").order_by(Run.created_at.desc(), Run.id.desc()).limit(max(n, 1) * 3 + 5))).scalars()
         seen = {input_key(r.input) for r in own}
         for run in rows:
             key = input_key(run.input)
@@ -1062,7 +1062,7 @@ async def _task_states(session: AsyncSession, run: Run) -> dict[str, Any]:
     from app.db.models_process import Task
 
     rows = (await session.execute(select(Task.node_id, Task.status).where(Task.run_id == run.id)
-                                  .order_by(Task.created_at))).all()
+                                  .order_by(Task.created_at, Task.id))).all()
     return {str(node): {"status": status} for node, status in rows if node}
 
 
@@ -1523,7 +1523,7 @@ async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
     if not ids:
         return out
     for row in (await session.execute(select(Task.run_id, Task.node_id, Task.kind, Task.status, Task.outcome)
-                                      .where(Task.run_id.in_(ids)).order_by(Task.created_at))).all():
+                                      .where(Task.run_id.in_(ids)).order_by(Task.created_at, Task.id))).all():
         out[row.run_id].tasks.append(row)
     for row in (await session.execute(select(ActionRecord).where(ActionRecord.run_id.in_(ids))
                                       .order_by(ActionRecord.created_at, ActionRecord.attempt))).scalars():
@@ -1755,7 +1755,7 @@ async def list_instances(session: AsyncSession, app_id: str, *, mine: str | None
         query = query.where(Run.started_by == mine)
     if status:
         query = query.where(Run.status == status)
-    rows = list((await session.execute(query.order_by(Run.created_at.desc()).limit(max(1, min(limit, 200)) * 2)))
+    rows = list((await session.execute(query.order_by(Run.created_at.desc(), Run.id.desc()).limit(max(1, min(limit, 200)) * 2)))
                 .scalars())
     if entry:
         rows = [r for r in rows if (r.origin or {}).get("entry") == entry]
@@ -1906,7 +1906,7 @@ async def _task_list(session: AsyncSession, ctx: _Page, props: dict[str, Any]) -
                 | ((TaskAssignment.principal_kind == "user") & (TaskAssignment.principal == (p.username or "")))
                 | ((TaskAssignment.principal_kind == "group") & TaskAssignment.principal.in_(list(p.groups) or [""])))
             query = query.where(Task.id.in_(mine))
-    rows = list((await session.execute(query.order_by(Task.created_at.desc()).limit(100))).scalars())
+    rows = list((await session.execute(query.order_by(Task.created_at.desc(), Task.id.desc()).limit(100))).scalars())
     runs = {run_id: str((origin or {}).get("title") or name or "") for run_id, origin, name in (await session.execute(
         select(Run.id, Run.origin, Run.workflow_name).where(Run.id.in_({t.run_id for t in rows})))).all()}
     return {"scope": scope, "items": [_task_row(t, runs.get(t.run_id)) for t in rows]}
@@ -1964,11 +1964,11 @@ async def _process_data(session: AsyncSession, ctx: _Page, ctype: Any, kind: str
         return {"state": "empty"}
     if kind == "task":
         task = (await session.execute(select(Task).where(Task.run_id == run.id, Task.node_id == node_id)
-                                      .order_by(Task.created_at.desc()))).scalars().first()
+                                      .order_by(Task.created_at.desc(), Task.id.desc()))).scalars().first()
         if task is None:
             return {"state": "empty", "node": node_id}
         rows = list((await session.execute(select(TaskAssignment).where(TaskAssignment.task_id == task.id)
-                                           .order_by(TaskAssignment.created_at))).scalars())
+                                           .order_by(TaskAssignment.created_at, TaskAssignment.id))).scalars())
         reader = principal_with_actor(ctx.principal, ctx.actor)
         resolved_at = _aware(task.resolved_at).isoformat() if task.resolved_at else None
         signoffs = ctype == "task_form" and any(

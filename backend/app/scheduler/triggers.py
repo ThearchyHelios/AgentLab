@@ -536,7 +536,7 @@ async def sample(session: Any, trigger: dict[str, Any]) -> Sample:
         query = query.where(Run.app_id == trigger["app_id"])
     if trigger.get("origin_kind"):
         query = query.where(Run.origin_kind == trigger["origin_kind"])
-    candidates = list((await session.execute(query.order_by(Run.finished_at.desc()).limit(SAMPLE_SCAN)))
+    candidates = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.id.desc()).limit(SAMPLE_SCAN)))
                       .scalars()) if subject else []
     # 和真派发同一套条件（matches）：缺省不认的途经驳回、应用补算跳过，取合条件的最近一次
     for run in candidates:

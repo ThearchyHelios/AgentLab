@@ -922,7 +922,7 @@ async def tick(now: datetime | None = None) -> list[str]:
                 and_(Task.remind_at.is_not(None), Task.remind_at <= now),
                 and_(Task.due_at.is_not(None), Task.due_at <= now, action == "reject"),
                 and_(Task.due_at.is_not(None), Task.due_at <= now, action == "escalate", Task.escalation_level == 0),
-            )).order_by(Task.due_at))).scalars())
+            )).order_by(Task.due_at, Task.id))).scalars())
     done: list[str] = []
     for task_id in due:
         try:
@@ -1094,7 +1094,8 @@ async def _assignments(session: AsyncSession, task_ids: list[str], *, fresh: boo
                        ) -> dict[str, list[TaskAssignment]]:
     if not task_ids:
         return {}
-    stmt = select(TaskAssignment).where(TaskAssignment.task_id.in_(task_ids)).order_by(TaskAssignment.created_at)
+    stmt = (select(TaskAssignment).where(TaskAssignment.task_id.in_(task_ids))
+            .order_by(TaskAssignment.created_at, TaskAssignment.id))
     if fresh:
         stmt = stmt.execution_options(populate_existing=True)
     out: dict[str, list[TaskAssignment]] = {}
@@ -1125,7 +1126,7 @@ def _mine(principal: Any) -> Any:
 async def list_tasks(principal: Any, *, assigned: str = "me", statuses: list[str] | None = None,
                      app_id: str | None = None, run_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     async with SessionLocal() as session:
-        stmt = select(Task).order_by(Task.created_at.desc()).limit(limit)
+        stmt = select(Task).order_by(Task.created_at.desc(), Task.id.desc()).limit(limit)
         if statuses:
             stmt = stmt.where(Task.status.in_(statuses))
         if app_id:

@@ -147,7 +147,7 @@ async def reconciled_runs(session: Any, run_id: str) -> list[Run]:
 
     rows = (await session.execute(select(Run).where(
         Run.origin_kind == ORIGIN, json_eq(Run.origin, "source_run", run_id))
-        .order_by(Run.created_at.desc()))).scalars()
+        .order_by(Run.created_at.desc(), Run.id.desc()))).scalars()
     return list(rows)
 
 

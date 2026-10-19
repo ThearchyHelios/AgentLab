@@ -541,7 +541,7 @@ async def started_before(principal: Any, idem_key: str) -> str | None:
         return await session.scalar(select(Run.id).where(
             Run.origin_kind == "app_entry", Run.started_by == principal.username,
             json_eq(Run.origin, "idempotency_key", idem_key),
-            json_eq(Run.origin, "via", "key")).order_by(Run.created_at.desc()).limit(1))
+            json_eq(Run.origin, "via", "key")).order_by(Run.created_at.desc(), Run.id.desc()).limit(1))
 
 
 # ---------------------------------------------------------------- 请求记录（A6）
@@ -650,7 +650,8 @@ async def recent_requests(session: Any, key_id: str, limit: int = 100) -> list[d
     except Exception:  # noqa: BLE001 - 写不进去只是少几条最新的，照常给库里有的
         logger.exception("访问密钥的请求记录写库失败")
     rows = (await session.execute(select(AccessKeyRequest).where(AccessKeyRequest.key_id == key_id)
-                                  .order_by(AccessKeyRequest.at.desc()).limit(max(1, min(limit, 200))))).scalars()
+                                  .order_by(AccessKeyRequest.at.desc(), AccessKeyRequest.id.desc())
+                                  .limit(max(1, min(limit, 200))))).scalars()
     return [{"at": r.at.isoformat() if r.at else None, "method": r.method, "route": r.route, "status": r.status,
              "run_id": r.run_id, "ip": r.ip} for r in rows]
 

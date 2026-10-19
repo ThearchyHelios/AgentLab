@@ -120,7 +120,7 @@ async def pick_base(session: Any, target: Run, *, schedule_only: bool = False) -
                    Run.created_at < target.created_at)
         base = (await session.execute(
             select(Run).where(*earlier, Run.status == "succeeded", Run.manifest_hash.is_not(None))
-            .order_by(Run.created_at.desc()).limit(1))).scalars().first()
+            .order_by(Run.created_at.desc(), Run.id.desc()).limit(1))).scalars().first()
         if base is None:
             continue
         between = await session.scalar(select(func.count()).select_from(Run).where(

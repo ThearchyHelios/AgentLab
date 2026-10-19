@@ -70,7 +70,7 @@ class VersionKind:
         from app.db.models import Workflow
 
         items: list[VersionView] = []
-        for wf in (await session.execute(select(Workflow).order_by(Workflow.name))).scalars().all():
+        for wf in (await session.execute(select(Workflow).order_by(Workflow.name, Workflow.id))).scalars().all():
             for v in await app_versions.published_versions(session, wf.id):
                 items.append(VersionView(workflow_id=wf.id, workflow_name=wf.name,
                                          description=wf.description or "", version=v))
