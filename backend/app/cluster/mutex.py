@@ -45,6 +45,40 @@ class ClusterLock:
     def _waiters(self) -> Any:
         return self._local._waiters
 
+    async def try_take(self) -> bool:
+        """不等：本进程、别的进程都没人占着就占上，交回占没占到。占到了用 give_back 放（可以在另一个任务里放：后台任务做完才放）。"""
+        if self._local.locked():
+            return False
+        await self._local.acquire()
+        if settings.db_dialect != "postgresql":
+            return True
+        try:
+            from sqlalchemy import text
+
+            from app.db.base import engine
+
+            conn = await engine.connect()
+            try:
+                conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+                got = bool(await conn.scalar(text("SELECT pg_try_advisory_lock(:k)"), {"k": self.key}))
+            except BaseException:
+                await conn.close()
+                raise
+            if not got:
+                await conn.close()
+                self._local.release()
+                return False
+            self._conn = conn
+        except BaseException:
+            if self._local.locked() and self._conn is None:
+                self._local.release()
+            raise
+        return True
+
+    async def give_back(self) -> None:
+        """放掉 try_take 占到的。"""
+        await self.__aexit__(None, None, None)
+
     async def __aenter__(self) -> ClusterLock:
         await self._local.acquire()
         if settings.db_dialect != "postgresql":

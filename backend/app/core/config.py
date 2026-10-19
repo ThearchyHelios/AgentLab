@@ -135,6 +135,8 @@ class Settings(BaseSettings):
     # （检查脚本的 --stacks、沙箱）必须关：库里的定时任务会照常到点发起运行、发出 webhook，
     # 拷贝里的任务和原库的是同一批，等于同一件事做两遍
     scheduler: bool = True
+    # 调度循环一拍的间隔（秒）：定时认领、事件派发、流程的时限和核实都按它查一次。缺省 15；验收脚本（多进程端到端）调小
+    scheduler_tick_s: float = 15.0
 
     # --- 工具 ---
     http_tool_timeout: int = 20

@@ -792,6 +792,8 @@ class RunManager:
         # active + wait 比墙钟还长（机器一忙就差出几十毫秒）
         paused: float | None = None
         async with slots.hold(run_id, origin_kind):
+            # 执行时长从拿到名额算起：排队等名额的那一段不算执行（墙钟从 started_at 算，started_at 也是拿到名额之后才写）
+            started = time.perf_counter()
             try:
                 async with SessionLocal() as session:
                     row = await session.get(Run, run_id)

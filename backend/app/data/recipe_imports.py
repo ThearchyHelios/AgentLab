@@ -1703,8 +1703,9 @@ def _adopt_ai_work(p: Pipeline, book: _Book, snap: _Snap, work: Any) -> _Eval:
     return _evaluate(p, book, snap, work)
 
 
-#: 正在 AI 起草的暂存区（进程内）：同一暂存区不并发起草，否则两次发送各花一份钱，同意记录、用量还会互相覆盖
-#: （SE-11）。事件循环单线程，查和加之间没有 await，不会有两个请求同时通过；进程重启后自然清空
+#: 正在 AI 起草的暂存区（本进程里）：同一暂存区不并发起草，否则两次发送各花一份钱，同意记录、用量还会互相覆盖
+#: （SE-11）。事件循环单线程，查和加之间没有 await，不会有两个请求同时通过；进程重启后自然清空。多进程时另取跨进程的锁
+#: （run_ai_draft）
 _AI_RUNNING: set[str] = set()
 
 
@@ -1716,9 +1717,18 @@ async def run_ai_draft(session: AsyncSession, staging: ImportStaging, *, consent
         raise ImportRefused(422, "ai_consent_required", "需要先查看并同意发送的内容，才能让 AI 起草")
     if staging.id in _AI_RUNNING:
         raise ImportRefused(409, "ai_in_progress", "这次导入正在由 AI 起草，请等它完成后再试")
+    # 多进程：另一个进程上正在起草同一个暂存区的，跨进程的锁占不到，同样回 409（app/cluster/mutex）
+    from app.cluster import mutex
+
+    lock = mutex.lock(f"recipe-ai:{staging.id}")
     _AI_RUNNING.add(staging.id)
     try:
-        return await _run_ai_draft(session, staging, preview_sha256=preview_sha256, signed_by=signed_by)
+        if not await lock.try_take():
+            raise ImportRefused(409, "ai_in_progress", "这次导入正在由 AI 起草，请等它完成后再试")
+        try:
+            return await _run_ai_draft(session, staging, preview_sha256=preview_sha256, signed_by=signed_by)
+        finally:
+            await lock.give_back()
     finally:
         _AI_RUNNING.discard(staging.id)
 

@@ -914,7 +914,8 @@ def _internal(key: str) -> bool:
     """通知自己记的账（每天汇总的认领行、自动建过邮件渠道的人，notify/digest.STATE_PREFIX）：不是用户设置，不列、不收。"""
     from app.notify.digest import STATE_PREFIX
 
-    return key.startswith(STATE_PREFIX)
+    # cluster: 开头的是多进程协调自己记的（重建索引的进度之类，app/cluster），同样不是用户设置
+    return key.startswith(STATE_PREFIX) or key.startswith("cluster:")
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
