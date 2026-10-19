@@ -1050,9 +1050,9 @@ AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agen
   30 分钟换一次；断点库另有一个小池子。前面有 PgBouncer（事务模式）时：`AGENTLAB_DB_POOL_SIZE` 设成 0（不用连接池）、
   地址后加 `?prepared_statement_cache_size=0`；断点库用预备语句，要 PgBouncer 1.21 以上开 `max_prepared_statements`，
   或者用 `AGENTLAB_CHECKPOINT_URL` 让它直连 PostgreSQL。
-- 和 SQLite 上的行为一致：字符串列不限长（SQLite 本来就不查长度，模型里写的长度只是示意）、整数列是 BIGINT、JSON 列存原文
-  （PostgreSQL 的 json，不是 JSONB：JSONB 会重排对象里的键）、时间存不带时区的 UTC、排序时可空列的 NULL 照 SQLite 的位置
-  （升序在前、降序在后）。两处 SQLite 照存而 PostgreSQL 不收的值会被换掉：JSON 里的 NaN / Infinity 写成 null，字符串里的
+- 和 SQLite 上的行为一致：字符串列不限长（SQLite 本来就不查长度，模型里写的长度只是示意）、文本按字节比大小和排序
+  （列上带 COLLATE "C"，同 SQLite，不看建库时选的区域设置）、整数列是 BIGINT、JSON 列存原文（PostgreSQL 的 json，不是 JSONB：
+  JSONB 会重排对象里的键）、时间存不带时区的 UTC、排序时可空列的 NULL 照 SQLite 的位置（升序在前、降序在后）。两处 SQLite 照存而 PostgreSQL 不收的值会被换掉：JSON 里的 NaN / Infinity 写成 null，字符串里的
   NUL 字符去掉。
 - `AGENTLAB_DATA_DIR` 照旧要设：工件、上传表格的版本库、原件、附件、记录表、沙箱工作区、`.secret_key` 都还是文件。
 

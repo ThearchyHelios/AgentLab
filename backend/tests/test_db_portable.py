@@ -59,13 +59,14 @@ def test_checkpoint_tables_do_not_clash_with_app_tables():
 
 
 def test_postgres_columns_are_unbounded_varchar_bigint_and_json():
-    """应用库上 String(n) 建成不限长的 VARCHAR、Integer 是 BIGINT（自增主键 BIGSERIAL）、JSON 是 json（不是 JSONB：
-    JSONB 会重排对象里的键）、时间是不带时区的 TIMESTAMP。SQLite 上的建表语句不变。"""
+    """应用库上 String(n) 建成不限长的 VARCHAR、文本列按字节比（COLLATE "C"，同 SQLite）、Integer 是 BIGINT（自增主键
+    BIGSERIAL）、JSON 是 json（不是 JSONB：JSONB 会重排对象里的键）、时间是不带时区的 TIMESTAMP。SQLite 上的建表语句不变。"""
     from sqlalchemy.dialects.sqlite.aiosqlite import dialect as sqlite_dialect
 
     runs = Base.metadata.tables["runs"]
     pg = CreateTable(runs).compile(dialect=_pg_dialect()).string
-    assert "id VARCHAR NOT NULL" in pg and "VARCHAR(" not in pg
+    assert 'id VARCHAR COLLATE "C" NOT NULL' in pg and "VARCHAR(" not in pg
+    assert 'error TEXT COLLATE "C"' in pg
     assert "last_seq BIGINT" in pg and "INTEGER" not in pg
     assert "input JSON NOT NULL" in pg and "JSONB" not in pg
     assert "created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL" in pg
@@ -73,6 +74,7 @@ def test_postgres_columns_are_unbounded_varchar_bigint_and_json():
     assert "seq BIGSERIAL NOT NULL" in changes
     lite = CreateTable(runs).compile(dialect=sqlite_dialect()).string
     assert "id VARCHAR(32) NOT NULL" in lite and "last_seq INTEGER" in lite and "input JSON NOT NULL" in lite
+    assert "COLLATE" not in lite
 
 
 def test_postgres_casts_keep_their_length():
@@ -274,6 +276,23 @@ async def test_order_by_puts_nulls_where_sqlite_does():
                                       .order_by(Run.started_at.desc()))).scalars().all()
     assert [n[-1] for n in up] == ["1", "2", "0"]          # 升序：NULL 在前
     assert [n[-1] for n in down] == ["0", "2", "1"]        # 降序：NULL 在后
+
+
+async def test_text_sorts_and_compares_byte_by_byte_like_sqlite():
+    """大写在小写前、标点按码位：两种库排出来一样（PostgreSQL 上不看建库时的区域设置）。"""
+    tag = uuid.uuid4().hex[:12]
+    names = ["b", "B", "a-c", "ab", "_z", "Z", "中"]
+    async with SessionLocal() as session:
+        for name in names:
+            session.add(Run(workflow_name=f"字节-{tag}-{name}"))
+        await session.commit()
+    async with SessionLocal() as session:
+        got = (await session.execute(select(Run.workflow_name).where(Run.workflow_name.like(f"字节-{tag}-%"))
+                                     .order_by(Run.workflow_name))).scalars().all()
+        lower = (await session.execute(select(func.count()).select_from(Run).where(
+            Run.workflow_name.like(f"字节-{tag}-%"), Run.workflow_name < f"字节-{tag}-a"))).scalar_one()
+    assert [g.removeprefix(f"字节-{tag}-") for g in got] == sorted(names)
+    assert lower == sum(1 for n in names if n < "a")
 
 
 async def test_timestamps_read_back_as_aware_utc():

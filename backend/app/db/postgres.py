@@ -9,6 +9,11 @@ VARCHAR(n) 超长直接报错、INTEGER 只有 32 位。模型里的 String(n) �
 检查）。CAST(x AS VARCHAR(n)) 这种查询里的写法不动——那是截断的意思。Integer 列在 PostgreSQL 上是 BIGINT：
 那是在模型这一层换的（db/base._portable_integer），绑定参数的类型转换跟着列走，大数不在半路溢出。
 
+**文本怎么比大小、怎么排序。** SQLite 缺省按字节比（BINARY）；PostgreSQL 按建库时的区域设置（常见的 en_US.UTF-8 不分
+大小写地先比字母、忽略标点），同一列排出来的先后、`key < '…'` 这种比较的结果都会变。应用库上的文本列建表时一律带
+COLLATE "C"（按字节比），和 SQLite 一致，不看建库时选了什么区域；LIKE 'xx%' 这种前缀匹配也因此用得上普通索引。
+ILIKE、lower() 照旧按库的字符集分大小写。
+
 **ORDER BY 里 NULL 的位置。** SQLite 升序 NULL 在前、降序 NULL 在后，PostgreSQL 正好相反。应用里两百多处排序，
 可空的列（开始时间、到期时间、发布时间……）排出来的先后要和 SQLite 一致：可空列上没写 nulls_first / nulls_last
 的 ASC 补 NULLS FIRST、DESC 补 NULLS LAST，ORDER BY 里直接写列名（隐含 ASC）的同样补上。不可空的列不动——
@@ -34,11 +39,19 @@ def _nullable(element: Any) -> bool:
     return isinstance(element, Column) and bool(element.nullable) and not element.primary_key
 
 
+#: 建表时文本列的排序规则：按字节比，同 SQLite 的 BINARY（见模块说明）
+_COLLATE = ' COLLATE "C"'
+
+
 class AppTypeCompiler(PGTypeCompiler):
     def visit_string(self, type_: Any, **kw: Any) -> str:
-        if type_.length and isinstance(kw.get("type_expression"), Column):
-            return "VARCHAR"
+        if isinstance(kw.get("type_expression"), Column):
+            return ("VARCHAR" if type_.length else super().visit_string(type_, **kw)) + _COLLATE
         return super().visit_string(type_, **kw)
+
+    def visit_text(self, type_: Any, **kw: Any) -> str:
+        text = super().visit_text(type_, **kw)
+        return text + _COLLATE if isinstance(kw.get("type_expression"), Column) else text
 
 
 def _ordered(clauses: Any) -> list[Any]:
