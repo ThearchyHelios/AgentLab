@@ -23,7 +23,13 @@ pending writes 按条数核对，逐项打印；有来源的行目标上没有�
 
 **值的转换。** 读写都按模型的列类型走：时间是不带时区的 UTC、布尔是真布尔、JSON 原文照搬（SQL 的 NULL 和 JSON 的
 null 分开，不混）。SQLite 不查类型、PostgreSQL 查：整数列里的整数值的浮点、数字字符串换成整数，文本列里的非文本换成
-字符串；文本里的 NUL 字符（PostgreSQL 不收）去掉，JSON 里的 NaN / Infinity 写成 null，各自计数打印。
+字符串；文本里的 NUL 字符（PostgreSQL 不收）去掉，JSON 里的 NaN / Infinity 写成 null；模型里 NOT NULL、有缺省值的列，
+老库补列时没带缺省值留下的 NULL 填成缺省值（启动时的迁移在 SQLite 上也这么填）；各自计数打印。
+
+**孤儿行。** 外键指向已经不在的行（SQLite 当时没强制外键留下的）：外键是 SET NULL 的置空、计入转换；别的从快照里拿掉、
+不导入，按表列出条数，不算核对失败（settle_orphans）。
+
+**自增主键。** 导入后序列接在已用过的最大号后面：目标表的 MAX、SQLite 的 AUTOINCREMENT 计数器（删过的号不复用）取大的。
 """
 
 from __future__ import annotations
@@ -53,8 +59,10 @@ DEFAULT_BATCH = 1000
 @dataclass
 class TableResult:
     name: str
-    #: 来源的行数
+    #: 来源的行数（不含孤儿行）
     source: int = 0
+    #: 外键指向已不存在的行、又不能置空的（外键是 CASCADE 或不可空）：SQLite 当时没强制外键留下的，没导入
+    orphans: int = 0
     #: 来源的这些主键，目标上导入前已经有的（--dry-run 时就是「不用补的」）、导入后有的
     present_before: int = 0
     present_after: int = 0
@@ -77,6 +85,8 @@ class Report:
     checkpoints_written: int = 0
     threads: int = 0
     fixed: dict[str, int] = field(default_factory=dict)
+    #: 没导入的孤儿行，按表（见 settle_orphans）
+    orphans: dict[str, int] = field(default_factory=dict)
     dry_run: bool = False
 
     @property
@@ -139,6 +149,49 @@ def snapshot(db: Path, into: Path) -> Path:
     return out
 
 
+def settle_orphans(path: Path, *, fixed: dict[str, int]) -> dict[str, int]:
+    """快照上按模型的外键找孤儿行：外键列有值、指向的行却不在（SQLite 当时没强制外键：老版本、或者那时外键还没加上）。
+    PostgreSQL 一律拒收，重跑也补不上，所以导入前在快照上（来源不动）先处理：
+
+    - 外键是 ON DELETE SET NULL、列可空的：置空，计入「转换」——父行被删时本来就该这样；
+    - 别的（CASCADE、不可空）：从快照里拿掉、不导入，按表计数交回——父行被删时本来就该跟着删。拿掉一行可能让下一层又成了
+      孤儿，反复扫到没有为止。
+
+    这些不算核对失败：报告里照实列出哪张表、几行。"""
+    from sqlalchemy import and_, delete, exists, update
+
+    from app.db import models  # noqa: F401
+    from app.db.base import Base
+
+    orphans: dict[str, int] = {}
+    engine = create_sync_engine(f"sqlite:///{path}")
+    try:
+        while True:
+            removed = 0
+            with engine.begin() as conn:
+                for table in Base.metadata.sorted_tables:
+                    for fk in table.foreign_key_constraints:
+                        parent = fk.referred_table.alias("parent")
+                        pairs = [(el.parent, parent.c[el.column.name]) for el in fk.elements]
+                        lost = and_(*(child.is_not(None) for child, _ in pairs),
+                                    ~exists(select(1).select_from(parent).where(
+                                        and_(*(p == child for child, p in pairs)))))
+                        n = int(conn.execute(select(func.count()).select_from(table).where(lost)).scalar() or 0)
+                        if not n:
+                            continue
+                        if (fk.ondelete or "").upper() == "SET NULL" and all(c.nullable for c, _ in pairs):
+                            conn.execute(update(table).where(lost).values({c.name: None for c, _ in pairs}))
+                            fixed["外键指向已不存在的行，置空"] = fixed.get("外键指向已不存在的行，置空", 0) + n
+                        else:
+                            conn.execute(delete(table).where(lost))
+                            orphans[table.name] = orphans.get(table.name, 0) + n
+                            removed += n
+            if not removed:
+                return orphans
+    finally:
+        engine.dispose()
+
+
 def upgrade_snapshot(path: Path) -> None:
     """在快照上跑一遍启动时的建表补列：老版本的库按当前的表结构读。"""
     from app.db import models  # noqa: F401
@@ -173,7 +226,7 @@ class _Fixer:
 
     def value(self, column: Any, value: Any) -> Any:
         if value is None:
-            return None
+            return self.missing(column)
         if _is_json(column):
             return self.json(value)
         kind = column.type
@@ -200,6 +253,19 @@ class _Fixer:
             self._count("文本里的 NUL 字符")
             value = value.replace("\x00", "")
         return value
+
+    def missing(self, column: Any) -> Any:
+        """SQL 的 NULL。模型列 NOT NULL、又有缺省值的（老版本补列时没带缺省值，存量行留着 NULL；SQLite 的 ADD COLUMN
+        不带 NOT NULL，照存）填成缺省值：PostgreSQL 的表照模型建，带 NOT NULL，不填就整行插不进。"""
+        from app.db.base import model_default, pg_json_dumps
+
+        if column.nullable or column.primary_key:
+            return None
+        known, default = model_default(column)
+        if not known:
+            return None
+        self._count("NOT NULL 列的空值填成缺省值")
+        return pg_json_dumps(default) if _is_json(column) else default
 
     def json(self, raw: Any) -> str:
         """JSON 原文 → 写进 PostgreSQL 的原文。平常的原样照搬（键的先后不变）；有 NaN / NUL 的才重写一遍。"""
@@ -252,7 +318,7 @@ async def _write_batch(target: Any, statement: Any, rows: list[dict[str, Any]], 
             from app.core.errors import first_line
 
             ident = ", ".join(f"{k}={row.get(k)!r}" for k in keys)
-            refused.append(f"{ident}：{first_line(e.orig or e)}")
+            refused.append(f"{ident}：{first_line(e)}")
 
 
 def _present(table: Any, keys: list[tuple[Any, ...]]) -> Any:
@@ -276,8 +342,12 @@ async def copy_tables(snapshot_db: Path, target: Any, *, batch: int, dry_run: bo
     source = create_sync_engine(f"sqlite:///{snapshot_db}")
     try:
         with source.connect() as src:
+            # AUTOINCREMENT 表的计数器（删过最后几行时比 MAX 大）：PostgreSQL 的序列要接在它后面，不复用删掉的号——
+            # 召回按 source_changes.seq 当游标往后拉，复用了就跳过新变化
+            counters = dict(src.execute(text("SELECT name, seq FROM sqlite_sequence")).all()) if src.execute(text(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'")).first() else {}
             for table in Base.metadata.sorted_tables:
-                result = TableResult(table.name)
+                result = TableResult(table.name, orphans=report.orphans.get(table.name, 0))
                 report.tables.append(result)
                 result.source = int(src.execute(select(func.count()).select_from(table)).scalar() or 0)
                 async with target.connect() as conn:
@@ -306,7 +376,7 @@ async def copy_tables(snapshot_db: Path, target: Any, *, batch: int, dry_run: bo
                 if dry_run:
                     result.present_after, result.target_after = result.present_before, result.target_before
                     continue
-                await _reset_sequences(target, table)
+                await _reset_sequences(target, table, int(counters.get(table.name) or 0))
                 async with target.connect() as conn:
                     result.target_after = await _count(conn, table)
     finally:
@@ -319,15 +389,22 @@ def _has_table(sync: Any, name: str) -> bool:
     return inspect(sync).has_table(name)
 
 
-async def _reset_sequences(target: Any, table: Any) -> None:
-    """自增主键的序列接到已有的最大值后面：导入时写的是来源的主键值，序列自己没动过，不改的话下一条撞主键。"""
+async def _reset_sequences(target: Any, table: Any, floor: int = 0) -> None:
+    """自增主键的序列接到已用过的最大号后面：导入时写的是来源的主键值，序列自己没动过，不改的话下一条撞主键。
+    已用过的取三者最大：目标表里的 MAX、SQLite 的 AUTOINCREMENT 计数器（floor）、序列现在的值（重跑时不往回拨）。"""
     for column in table.primary_key.columns:
         if column is not table.autoincrement_column:
             continue
         async with target.begin() as conn:
-            await conn.execute(text(
-                f"SELECT setval(pg_get_serial_sequence(:t, :c), GREATEST(COALESCE(MAX({column.name}), 0), 1), "
-                f"MAX({column.name}) IS NOT NULL) FROM {table.name}"), {"t": table.name, "c": column.name})
+            name = (await conn.execute(text("SELECT pg_get_serial_sequence(:t, :c)"),
+                                       {"t": table.name, "c": column.name})).scalar()
+            if not name:
+                continue
+            top = int((await conn.execute(select(func.max(column)))).scalar() or 0)
+            last, called = (await conn.execute(text(f"SELECT last_value, is_called FROM {name}"))).one()
+            used = max(top, floor, int(last) if called else int(last) - 1)
+            await conn.execute(text("SELECT setval(:n, :v, :called)"),
+                               {"n": name, "v": max(used, 1), "called": used >= 1})
 
 
 async def services_on(target: Any) -> int:
@@ -425,6 +502,7 @@ async def copy_to_postgres(source: str | Path, target_url: str, *, checkpoint_ur
         with tempfile.TemporaryDirectory(prefix="agentlab-copy-", dir=work_dir) as tmp:
             snap = snapshot(db, Path(tmp))
             upgrade_snapshot(snap)
+            report.orphans = settle_orphans(snap, fixed=report.fixed)
             if not dry_run:
                 await create_schema(target)
             await copy_tables(snap, target, batch=batch, dry_run=dry_run, report=report, progress=progress)
@@ -451,8 +529,14 @@ def render(report: Report) -> list[str]:
         else:
             verdict = "一致" + (f"（这次补了 {t.present_after - t.present_before} 行）"
                                if t.present_after > t.present_before else "（都已经有了）")
+        if t.orphans:
+            verdict += f"；另有 {t.orphans} 行孤儿行没导入"
         lines.append(f"{t.name:<28}{t.source:>10}{t.present_before:>10}{t.present_after:>10}{t.target_after:>10}"
                      f"  {verdict}")
+    if report.orphans:
+        total = sum(report.orphans.values())
+        lines.append(f"孤儿行（SQLite 当时没强制外键，外键指向的行已经不在）：{total} 行没导入，不算核对失败——"
+                     + "、".join(f"{name} {n} 行" for name, n in report.orphans.items()))
     for t in report.tables:
         for item in t.refused[:20]:
             lines.append(f"  {t.name} 没插进去：{item}")

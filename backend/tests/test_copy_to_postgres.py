@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
 from app.core.config import settings
 from app.db import to_postgres
@@ -68,6 +69,11 @@ async def main():
         s.add(source)
         await s.flush()
         s.add(SourceChange(source_id=source.id, kind="column_added", fingerprint="f" * 64, table_name="订单"))
+        dropped = SourceChange(source_id=source.id, kind="column_removed", fingerprint="d" * 64, table_name="订单")
+        s.add(dropped)
+        await s.flush()
+        # 删掉最后一条：SQLite 的 AUTOINCREMENT 计数器停在 2，表里的 MAX 是 1。导过去之后新的变化要从 3 编起
+        await s.delete(dropped)
         long = Run(workflow_name="长" * 300, last_seq=5_000_000_000, origin={"b": 2, "a": 1})
         sql_null = Run(workflow_name="SQL 的空", origin={"x": 1})
         json_null = Run(workflow_name="JSON 的空", origin=None)
@@ -263,7 +269,7 @@ async def test_a_waiting_run_is_imported_and_finishes_on_postgresql(source_dir):
         seqs = done["seqs"]
         assert seqs == sorted(set(seqs)) and seqs[-1] > made["last_seq"], "接着导入前的序号往下编"
         assert done["artifact"] == {"区域": "虚构", "数": 1}
-        assert done["new_change_seq"] > 1, "自增主键的序列接在导入的最大值后面"
+        assert done["new_change_seq"] == 3, "序列接在 SQLite 的 AUTOINCREMENT 计数器后面，删过的号不复用（召回按它当游标）"
 
 
 @needs_pg
@@ -294,3 +300,137 @@ async def test_a_target_with_the_service_still_connected_is_refused(source_dir):
             with pytest.raises(CopyRefused, match="服务的连接"):
                 await copy_to_postgres(data, target, progress=lambda _: None)
         assert _sql(target, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'runs'") == [(0,)]
+
+
+# --------------------------------------------------------------------------
+# 老库：补列时没带缺省值的 NOT NULL 列、SQLite 当时没强制外键留下的孤儿行
+# --------------------------------------------------------------------------
+
+
+def _legacy_source(folder: Path) -> Path:
+    """照模型建一个 SQLite 应用库，再做旧：定时任务的 trigger 列删掉、按第一版迁移（不带缺省值）补回来，存量行是 NULL；
+    关着外键写几行孤儿行（对话轮次指向已删的运行、事件指向已删的运行、轮次指向已删的对话）。"""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import create_engine, insert
+
+    from app.db import models  # noqa: F401
+    from app.db.base import Base
+
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "agentlab.db"
+    engine = create_engine(f"sqlite:///{path}")
+    tables = Base.metadata.tables
+    try:
+        Base.metadata.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(insert(tables["schedules"]).values(id="s1", workflow_id="w1", cron="0 9 * * *",
+                                                             timezone="Asia/Shanghai"))
+            conn.execute(insert(tables["schedule_fires"]).values(
+                id="f1", schedule_id="s1", fire_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+            conn.execute(insert(tables["conversations"]).values(id="c1", title="虚构的对话"))
+            conn.execute(insert(tables["conversation_turns"]).values(id="t1", conversation_id="c1", seq=0,
+                                                                     run_id="run-gone"))
+            conn.execute(insert(tables["conversation_turns"]).values(id="t2", conversation_id="conv-gone", seq=0))
+            conn.execute(insert(tables["run_events"]).values(id="e1", run_id="run-gone", seq=1, type="log", ts=0.0,
+                                                             data={}))
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE schedules DROP COLUMN \"trigger\""))
+            conn.execute(text("ALTER TABLE schedules ADD COLUMN \"trigger\" JSON"))
+    finally:
+        engine.dispose()
+    return path
+
+
+def test_old_sqlite_databases_get_null_not_null_columns_filled(tmp_path):
+    """SQLite 这边：启动时的迁移把老版本补列留下的 NULL 填成模型的缺省值，两种库存的一样。"""
+    from sqlalchemy import create_engine
+
+    from app.db.base import _migrate
+
+    path = _legacy_source(tmp_path / "old")
+    engine = create_engine(f"sqlite:///{path}")
+    try:
+        with engine.begin() as conn:
+            assert conn.execute(text("SELECT \"trigger\" FROM schedules")).scalar_one() is None
+            _migrate(conn)
+            assert conn.execute(text("SELECT \"trigger\" FROM schedules")).scalar_one() == "{}"
+    finally:
+        engine.dispose()
+
+
+def test_orphan_rows_are_nulled_or_left_out_on_the_snapshot(tmp_path):
+    path = _legacy_source(tmp_path / "old")
+    fixed: dict[str, int] = {}
+    orphans = to_postgres.settle_orphans(path, fixed=fixed)
+    assert fixed == {"外键指向已不存在的行，置空": 1}
+    assert orphans == {"conversation_turns": 1, "run_events": 1}
+    import sqlite3
+
+    db = sqlite3.connect(path)
+    try:
+        assert db.execute("SELECT id, run_id FROM conversation_turns").fetchall() == [("t1", None)]
+        assert db.execute("SELECT count(*) FROM run_events").fetchone() == (0,)
+    finally:
+        db.close()
+
+
+@needs_pg
+async def test_an_old_database_with_nulls_and_orphans_imports_cleanly(tmp_path):
+    """真实开发库上核对不过的那两种：定时任务 trigger 为 NULL（NOT NULL 列），对话轮次指向已删的运行。导入照样核对通过，
+    孤儿行照实列出、不算失败，重跑也一样。"""
+    from tests.appdb import fresh_postgres_database
+
+    folder = tmp_path / "old"
+    _legacy_source(folder)
+    with fresh_postgres_database("legacy") as target:
+        report = await copy_to_postgres(folder, target, progress=lambda _: None)
+        lines = to_postgres.render(report)
+        assert report.ok, "\n".join(lines)
+        assert report.orphans == {"conversation_turns": 1, "run_events": 1}
+        assert report.fixed.get("外键指向已不存在的行，置空") == 1
+        assert any("孤儿行" in line and "run_events 1 行" in line for line in lines)
+        assert _sql(target, "SELECT CAST(\"trigger\" AS TEXT) FROM schedules") == [("{}",)]
+        assert _sql(target, "SELECT count(*) FROM schedule_fires") == [(1,)]
+        assert _sql(target, "SELECT run_id FROM conversation_turns") == [(None,)]
+        again = await copy_to_postgres(folder, target, progress=lambda _: None)
+        assert again.ok and again.orphans == report.orphans
+
+
+def test_null_not_null_values_fall_back_to_the_model_default():
+    from app.db.base import Base
+
+    schedules = Base.metadata.tables["schedules"]
+    fixed: dict[str, int] = {}
+    fix = to_postgres._Fixer(fixed)
+    assert fix.value(schedules.c["trigger"], None) == "{}"          # JSON 列按原文绑定
+    assert fix.value(schedules.c["trigger_kind"], None) == "cron"
+    assert fix.value(schedules.c["target_id"], None) is None        # 可空的照旧是 NULL
+    assert fix.value(schedules.c["cron"], None) is None             # 没有缺省值的：照实交给库去拒
+    assert fixed == {"NOT NULL 列的空值填成缺省值": 2}
+
+
+# --------------------------------------------------------------------------
+# 停服务之后数据目录里不留 -wal（导入按它认服务停没停）
+# --------------------------------------------------------------------------
+
+START_STOP = r'''
+from fastapi.testclient import TestClient
+from app.main import app
+
+with TestClient(app) as client:
+    assert client.get("/api/health").status_code == 200
+'''
+
+
+def test_stopping_the_service_leaves_no_wal_behind(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    env = {**os.environ, "AGENTLAB_DATA_DIR": str(data), "AGENTLAB_DATABASE_URL": "", "AGENTLAB_CHECKPOINT_URL": "",
+           "AGENTLAB_SCHEDULER": "0", "PYTHONPATH": str(BACKEND)}
+    done = subprocess.run([sys.executable, "-c", START_STOP], env=env, capture_output=True, text=True, timeout=180,
+                          cwd=str(data))
+    assert done.returncode == 0, done.stderr[-4000:]
+    assert (data / "agentlab.db").is_file() and (data / "checkpoints.db").is_file()
+    assert sorted(p.name for p in data.iterdir() if p.name.endswith(("-wal", "-shm"))) == []
+    assert to_postgres.source_in_use(data / "agentlab.db", data / "checkpoints.db") is None

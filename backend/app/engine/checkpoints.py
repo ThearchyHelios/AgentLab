@@ -32,6 +32,9 @@ def _pool_size() -> int:
 async def open_postgres_saver(conninfo: str, *, max_size: int | None = None,
                               application_name: str = "agentlab") -> AsyncIterator[BaseCheckpointSaver]:
     """PostgreSQL 的断点库：开连接池、建表（幂等），退出时关池子。application_name 同应用库（db/base.APPLICATION_NAME）。"""
+    from app.db.base import _require_postgres_driver
+
+    _require_postgres_driver("psycopg", "psycopg_pool", "langgraph.checkpoint.postgres")
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
     from psycopg.rows import dict_row
     from psycopg_pool import AsyncConnectionPool

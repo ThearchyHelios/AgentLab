@@ -182,6 +182,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         from app.sandbox.manager import sandbox_manager
 
         await sandbox_manager.close()
+        # 应用库的连接全关掉：SQLite 最后一个连接关掉时才把 -wal 并回、删掉（copy-to-postgres 按它认服务停没停），
+        # PostgreSQL 的连接池也正常关
+        from app.db.base import engine as db_engine
+
+        await db_engine.dispose()
         logger.info("已停止")
 
 
