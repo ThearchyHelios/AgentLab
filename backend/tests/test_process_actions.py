@@ -168,6 +168,11 @@ async def test_unknown_result_with_lookup_is_reconciled_automatically_and_sent_o
     await _confirm(run_id)
     held = await _wait(run_id, ("interrupted", "failed", "succeeded"))
     assert held.status == "interrupted" and held.manifest_hash is None
+    # 运行先挂起、runner 再安排核实（actions.on_unknown）：等排上查询（记下 action.unknown）再看记录
+    for _ in range(100):
+        if await _events(run_id, "action.unknown"):
+            break
+        await asyncio.sleep(0.05)
     [rec] = await _records(run_id)
     assert rec.state == "unknown" and rec.next_lookup_at is not None
     assert len(await _events(run_id, "action.unknown")) == 1
