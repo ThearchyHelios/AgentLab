@@ -487,7 +487,8 @@ async def run_view(session: AsyncSession, *, app: Any, version: AppVersion, view
             return int(await s.scalar(select(func.count(Run.id)).where(
                 Run.app_id == app.id, Run.origin_kind == "app_view", Run.created_at >= start)) or 0)
 
-        if not await quota.take(f"app_view:{app.id}", limit, seed=used_today):
+        day = await quota.take(f"app_view:{app.id}", limit, seed=used_today)
+        if day is None:
             raise ViewRefused(429, f"这个应用今天的按需运行已达到上限（{limit} 次），请明天再试，或请管理员调整上限",
                               DAILY_LIMIT)
         try:
@@ -498,7 +499,7 @@ async def run_view(session: AsyncSession, *, app: Any, version: AppVersion, view
                 origin={"view": view_id, "spec_hash": version.spec_hash, "actor_verified": principal.verified,
                         "auth_mode": principal.mode, **_key_trace(principal)})
         except BaseException:
-            await quota.give_back(f"app_view:{app.id}")
+            await quota.give_back(f"app_view:{app.id}", day=day)
             raise
         ttl = source.get("ttl_s")
         if ttl is None and await reads_live(session, state.graph):

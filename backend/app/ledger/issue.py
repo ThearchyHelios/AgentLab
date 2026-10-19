@@ -379,17 +379,18 @@ async def issue(run_id: str, workflow_id: str, version: int, *, principal: Any, 
             from app.cluster import quota
 
             limit = int((await ledger_settings(session))["issue_daily_limit"])
-            if not await quota.take(QUOTA, limit, seed=issued_today):
+            day = await quota.take(QUOTA, limit, seed=issued_today)
+            if day is None:
                 raise IssueRefused(429, OVER_LIMIT.format(limit=limit), DAILY_LIMIT)
             try:
                 launched = await launch_run(session, workflow_id=workflow_id, run_class="formal", version=int(version),
                                             input_payload=plan.inputs, actor=actor, origin_kind=ORIGIN, origin=origin,
                                             expect_hash=plan.expect_hash)
             except LaunchRefused as e:
-                await quota.give_back(QUOTA)
+                await quota.give_back(QUOTA, day=day)
                 raise IssueRefused(e.status_code, e.message, e.code or REFUSED) from e
             except BaseException:
-                await quota.give_back(QUOTA)
+                await quota.give_back(QUOTA, day=day)
                 raise
             return launched, True
 

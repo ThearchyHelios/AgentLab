@@ -526,10 +526,25 @@ async def test_a_daily_quota_is_taken_up_to_the_limit_by_concurrent_callers():
         return 2   # 今天已经做过 2 次
 
     got = await asyncio.gather(*(quota.take(name, 5, seed=seed) for _ in range(10)))
-    assert sum(got) == 3 and await quota.used(name) == 5
+    assert sum(1 for g in got if g) == 3 and await quota.used(name) == 5
     assert not await quota.take(name, 5)
     await quota.give_back(name)
     assert await quota.take(name, 5) and not await quota.take(name, 5)
+
+
+async def test_a_quota_is_given_back_to_the_day_it_was_taken(monkeypatch):
+    """复核 R-b11：23:59:59 占、00:00:01 发起失败——退回前一天那一份，第二天的不动。"""
+    from app.cluster import quota
+
+    name = f"test-quota-{new_id()[:8]}"
+    days = iter(["2026-10-18", "2026-10-19", "2026-10-19", "2026-10-19"])
+    monkeypatch.setattr(quota, "today", lambda: next(days))
+    day = await quota.take(name, 5)
+    assert day == "2026-10-18"
+    assert await quota.take(name, 5) == "2026-10-19"   # 过了零点又占了一份
+    await quota.give_back(name, day=day)                 # 前一天占的那一份发起失败
+    assert await quota.used(name, day="2026-10-18") == 0
+    assert await quota.used(name, day="2026-10-19") == 1, "第二天的那一份不动"
 
 
 def test_a_daily_quota_holds_across_two_processes():
@@ -540,7 +555,7 @@ def test_a_daily_quota_holds_across_two_processes():
               "from app.cluster import quota\n"
               "async def main():\n"
               f"    got = await asyncio.gather(*(quota.take({name!r}, 10) for _ in range(15)))\n"
-              "    print(sum(got))\n"
+              "    print(sum(1 for g in got if g))\n"
               "asyncio.run(main())\n")
     env = {**os.environ, "PYTHONPATH": str(backend), "AGENTLAB_DB_POOL_SIZE": "5"}
     procs = [subprocess.Popen([sys.executable, "-c", script], cwd=str(backend), env=env, stdout=subprocess.PIPE,
