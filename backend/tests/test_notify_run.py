@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 
 import httpx
 import pytest
@@ -21,6 +20,7 @@ from app.db.base import SessionLocal
 from app.db.models import App, AppVersion, NotifyChannel, NotifyDelivery, Run, User
 from app.engine.runner import run_manager
 from app.notify import core, service
+from tests.fixtures.names import letters
 
 URL = "https://hooks.example.com/agentlab/run-3b8e1f"
 
@@ -68,9 +68,9 @@ def flow(**human):
 
 async def _app(events: list[str]) -> tuple[str, str]:
     async with SessionLocal() as session:
-        channel = NotifyChannel(name=f"群-{uuid.uuid4().hex[:6]}", format="generic", url=encrypt(URL), events=[])
+        channel = NotifyChannel(name=f"群-{letters(6)}", format="generic", url=encrypt(URL), events=[])
         session.add(channel)
-        app = App(name=f"报销-{uuid.uuid4().hex[:6]}", published_version=1)
+        app = App(name=f"报销-{letters(6)}", published_version=1)
         session.add(app)
         await session.flush()
         session.add(AppVersion(app_id=app.id, version=1, spec_hash="h" * 64, bindings={},
@@ -180,7 +180,7 @@ async def _finished_instance(app_id: str, *, started_by: str, verified: bool) ->
 async def test_the_initiator_s_personal_channel_receives_my_instance_finished(received):
     """B1：个人渠道订阅了 run.finished，发起人自己发起的实例结束了收得到；应用自己没订阅也一样。"""
     app_id, _ = await _app([])
-    name = f"uma{uuid.uuid4().hex[:6]}"
+    name = f"uma{letters(6)}"
     mine = await _personal(name, ["run.finished"])
     run_id = await _finished_instance(app_id, started_by=name, verified=True)
     assert await service.notify_run(run_id, "run.finished") == 1
@@ -192,7 +192,7 @@ async def test_the_initiator_s_personal_channel_receives_my_instance_finished(re
 async def test_a_self_declared_initiator_does_not_reach_a_personal_channel(received):
     """关登录时署名是自己填的，谁都能填别人的名字：不按它推给那个人的个人渠道。"""
     app_id, _ = await _app([])
-    name = f"vic{uuid.uuid4().hex[:6]}"
+    name = f"vic{letters(6)}"
     mine = await _personal(name, ["run.finished"])
     run_id = await _finished_instance(app_id, started_by=name, verified=False)
     assert await service.notify_run(run_id, "run.finished") == 0

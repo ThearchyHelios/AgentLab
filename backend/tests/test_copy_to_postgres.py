@@ -409,6 +409,7 @@ async def test_an_old_database_with_nulls_and_orphans_imports_cleanly(tmp_path):
 
 
 def test_null_not_null_values_fall_back_to_the_model_default():
+    from app.db import models  # noqa: F401  表登记进元数据（这个进程里之前没有测试导入过模型时 schedules 还不在）
     from app.db.base import Base
 
     schedules = Base.metadata.tables["schedules"]

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 
 import httpx
 import pytest
@@ -19,6 +18,7 @@ from app.db.base import SessionLocal
 from app.db.models import App, AppVersion, NotifyChannel, NotifyDelivery, Run, Setting
 from app.engine.runner import run_manager
 from app.notify import core, service
+from tests.fixtures.names import letters
 
 URL = "https://hooks.example.com/agentlab/inbox-7f3a9c2e1b"
 
@@ -141,7 +141,7 @@ async def test_task_opened_is_pushed_to_the_app_subscription_without_numbers(rec
     async with SessionLocal() as session:
         channel = NotifyChannel(name="财务群", format="generic", url=core_encrypt(URL), events=[])
         session.add(channel)
-        app = App(name=f"报销-{uuid.uuid4().hex[:6]}", published_version=1)
+        app = App(name=f"报销-{letters(6)}", published_version=1)
         session.add(app)
         await session.flush()
         session.add(AppVersion(app_id=app.id, version=1, spec_hash="h" * 64, bindings={},

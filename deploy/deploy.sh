@@ -901,6 +901,7 @@ migrate_rollback() {
 
 copy_to_pg() {
   # --assume-stopped：服务是这里刚停的（强杀留下的 -wal 也不挡）；快照放数据目录里（和库同一块盘，空间够）。
+  # 内置库是直连（没有 PgBouncer），断点跟着目标地址走，不用 --direct-url。
   # 逐表的结果里来源是空表的几十行不列（没什么可核对的），别的原样打出来；退出码照 copy-to-postgres 的（pipefail）
   docker run --rm --network "$DOCKER_NETWORK" -v "$DATA_ABS:/data" -e "PGPASSFILE=$PG_PASSFILE" \
     --entrypoint python "$IMAGE" -m app.db copy-to-postgres /data \

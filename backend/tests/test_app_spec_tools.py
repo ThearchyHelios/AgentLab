@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import copy
-import uuid
 
 import pytest
 
@@ -21,6 +20,7 @@ from app.apps.spec import empty_spec, parse_spec
 from app.core.artifact_store import graph_hash
 from app.db.base import SessionLocal, utcnow
 from app.db.models import DataSource, Schedule, Workflow, WorkflowVersion
+from tests.fixtures.names import letters
 
 
 def node(nid, ntype, label=None, **config):
@@ -57,7 +57,7 @@ def approval():
 
 async def make_workflow(graph, *, versions=((1, "governed"),), current=1, status="governed") -> tuple[str, dict]:
     async with SessionLocal() as session:
-        wf = Workflow(name=f"周报-{uuid.uuid4().hex[:6]}", graph=graph, status=status, published_version=current,
+        wf = Workflow(name=f"周报-{letters(6)}", graph=graph, status=status, published_version=current,
                       version=max(v for v, _ in versions))
         session.add(wf)
         await session.flush()
@@ -281,7 +281,7 @@ async def test_process_pins(monkeypatch):
 
 
 async def test_on_demand_views_on_live_sources_need_a_ttl(tmp_path):
-    name = f"live_{uuid.uuid4().hex[:6]}"
+    name = f"live_{letters(6)}"
     async with SessionLocal() as session:
         session.add(DataSource(name=name, kind="sqlite", database=str(tmp_path / "x.db"), enabled=True))
         await session.commit()
