@@ -76,8 +76,13 @@ CATALOG_DRAFT_GUIDANCE_OPTION = "catalog_draft_guidance"
 # mask_columns：证据面板遮罩的列，驱动不认识它，拼进连接串会被当成未知参数拒掉
 # catalog_profile：数据剖析设置，同上；它还是个对象，拼进去连 URL 都不成形
 # catalog_draft_guidance：数据目录的起草要求，一段中文，拼进去连接直接失败
+# introspect_scope：探查范围的规则（data/source_objects.SCOPE_OPTION），运行时按需把范围外的表加进来时也会自动写；
+# catalog_maintenance：定时维护的步骤（data/source_maintenance.MAINTENANCE_OPTION）。这两项都是对象，以前漏在名单外，
+# 设过之后驱动 connect() 收到不认识的关键字参数，这个数据源上每一条查询都失败。
+# 在别的模块声明的两项这里写字面量（那两个模块反过来要用数据层，导入会成环）；tests/test_datasource_option_keys.py 把
+# app/data 下所有 *_OPTION 常量扫出来核对，新加的配置项忘了进这份名单，那条测试先报
 _NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION, CATALOG_PROFILE_OPTION,
-                                 CATALOG_DRAFT_GUIDANCE_OPTION})
+                                 CATALOG_DRAFT_GUIDANCE_OPTION, "introspect_scope", "catalog_maintenance"})
 
 _MASK_SPLIT = re.compile(r"[,，、;；\n]+")
 
