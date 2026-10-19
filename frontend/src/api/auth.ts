@@ -14,8 +14,10 @@ export const auth = {
   logout: () => post<void>('/auth/logout'),
   /** OIDC：浏览器整页跳转到这里 */
   oidcStartUrl: (next?: string) => `/api/auth/oidc/start${qs({ next })}`,
-  settings: () => get<{ mode: AuthMode; env_locked: boolean; oidc: Record<string, any>; user_can_chat: boolean }>(
-    '/auth/settings'),
+  /** local_admins：没停用、能用密码登录的管理员；passwordless_admins：没停用、还没设密码的管理员（切到账号密码登录时据此
+   *  决定要不要同时建第一个管理员） */
+  settings: () => get<{ mode: AuthMode; env_locked: boolean; oidc: Record<string, any>; user_can_chat: boolean;
+    local_admins?: { username: string; display_name: string }[]; passwordless_admins?: string[] }>('/auth/settings'),
   saveSettings: (body: { mode?: AuthMode; oidc?: Record<string, any>; user_can_chat?: boolean;
     bootstrap?: { username: string; password: string; display_name?: string } }) => put<any>('/auth/settings', body),
 }

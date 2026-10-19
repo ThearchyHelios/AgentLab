@@ -5706,6 +5706,11 @@ export const IDENTITY_TEXT = {
   envLocked: '登录方式由服务端环境变量指定，这里不能修改',
   bootstrap: '第一个管理员',
   bootstrapHint: '切换到本地账号时必须同时建出第一个管理员，否则切换后没有人能登录',
+  /** 已经有能用密码登录的管理员：切过去不用再建，保存后回登录页用他登录 */
+  existingAdmins: (names: string) => `已有能用密码登录的管理员：${names}。切换后用其中一个账号登录，保存后会回到登录页`,
+  /** 有管理员、但都没设密码（关登录时新建用户可以不填密码） */
+  passwordlessAdmins: (names: string) =>
+    `已有的管理员 ${names} 还没设密码，切换后不能用来登录：可以在下面的用户列表里给其中一位重设密码，或者在这里新建一个管理员`,
   oidcTitle: '单点登录设置',
   oidcIssuer: '签发方地址',
   oidcClientId: '客户端标识',

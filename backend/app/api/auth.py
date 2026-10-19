@@ -196,12 +196,29 @@ async def jwks() -> dict[str, Any]:
 # ---------------------------------------------------------------- 设置与引导
 
 
-def _settings_out(value: dict[str, Any]) -> dict[str, Any]:
+#: 设置页列出的管理员最多几个（只拿来说「切过去用谁登录」「谁还没设密码」，不是用户列表）
+ADMINS_SHOWN = 10
+
+
+async def _admin_accounts(session: AsyncSession) -> dict[str, Any]:
+    """没停用的管理员里，哪些能用口令登录、哪些还没设口令。
+
+    设置页据此决定切到账号密码登录时要不要建第一个管理员：已经有能登录的就不用建（切过去用它登录），只有没设口令的
+    要说清是谁——关登录时新建用户可以不填密码，这样的管理员切过去登录不了。判据和 _local_admin_exists 同一个。
+    """
+    rows = (await session.execute(select(User.username, User.display_name, User.password_hash).where(
+        User.role == "admin", User.disabled.is_(False)).order_by(User.username, User.id))).all()
+    login = [{"username": r.username, "display_name": r.display_name or r.username} for r in rows if r.password_hash]
+    passwordless = [r.username for r in rows if not r.password_hash]
+    return {"local_admins": login[:ADMINS_SHOWN], "passwordless_admins": passwordless[:ADMINS_SHOWN]}
+
+
+async def _settings_out(session: AsyncSession, value: dict[str, Any]) -> dict[str, Any]:
     config = {k: v for k, v in (value.get("oidc") or {}).items() if k in _OIDC_FIELDS}
     if config.get("client_secret"):
         config["client_secret"] = crypto.mask(config["client_secret"])
     return {"mode": current_mode(), "env_locked": env_mode() is not None, "oidc": config,
-            "user_can_chat": bool(value.get("user_can_chat"))}
+            "user_can_chat": bool(value.get("user_can_chat")), **await _admin_accounts(session)}
 
 
 def _require_admin() -> None:
@@ -211,9 +228,9 @@ def _require_admin() -> None:
 
 
 @router.get("/settings")
-async def get_settings() -> dict[str, Any]:
+async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     _require_admin()
-    return _settings_out(await load_settings())
+    return await _settings_out(session, await load_settings())
 
 
 class BootstrapIn(BaseModel):
@@ -321,7 +338,7 @@ async def put_settings(payload: SettingsIn, request: Request, response: Response
     from app.cluster import caches
 
     await caches.broadcast("auth_settings")
-    out = _settings_out(value)
+    out = await _settings_out(session, value)
     if token is not None and created is not None:
         _login_response(request, response, token)
         out["principal"] = await principal_full(session, await sessions.principal_of(session, created, current_mode()))
