@@ -58,6 +58,9 @@ REJECTED_CONTINUE = "被驳回的运行不能继续运行：改好内容后重�
 REJECTED_RESUME = "这次运行已被驳回，没有待处理的审批，无法恢复：改好内容后重新发起"
 #: 服务重启时还在排队的运行改成失败时写的话（run.error 和补发的 run.failed 是同一句）
 QUEUED_AT_RESTART = "服务重启时这次运行仍在排队，没有可恢复的进度，请重新发起运行"
+#: 本进程隔离（续不上租约）之后没能重新登记，这一段执行没有开始（cluster/fence.ready 等不到）
+NOT_REREGISTERED_QUEUED = "本进程隔离后没能重新登记，这次运行没有开始执行，请重新发起运行"
+NOT_REREGISTERED_RESUMABLE = "本进程隔离后没能重新登记，这次运行没有接着执行，已挂起，可从断点继续运行"
 
 
 class ContinueRefused(ValueError):
@@ -798,7 +801,7 @@ class RunManager:
         try:
             await fence.ready()
         except Fenced:
-            logger.error("运行 %s：本进程隔离之后一直没重新登记上，不开始执行（由别的进程按「属主不在了」处理）", run_id)
+            await self._not_reregistered(run_id)
             return
         fence.bind()
         mine = identity.owner()
@@ -1005,6 +1008,45 @@ class RunManager:
                         await sandbox_manager.cleanup(run_id)
         finally:
             await slot.__aexit__(None, None, None)
+
+    async def _not_reregistered(self, run_id: str) -> None:
+        """隔离之后新身份一直没登记上、这一段执行不开始了（fence.ready 等不到，复核 R-b15）：照实收尾，不留给别的进程按「服务
+        重启时还在排队」去标。排队中的（一步都没执行过）收成失败；已经执行过、停在断点上又要接着执行的收成中断（断点完好，可以
+        继续运行）。条件更新：状态、属主还是刚才看到的才改（别的进程先接手了就不动）。"""
+        from app.cluster.claims import same
+
+        logger.error("运行 %s：本进程隔离之后一直没重新登记上，这一段执行不开始", run_id)
+        try:
+            event: RunEventModel | None = None
+            async with SessionLocal() as session:
+                seen = (await session.execute(select(Run.status, Run.owner).where(Run.id == run_id))).first()
+                if seen is None or seen.status not in ("queued", "running"):
+                    return
+                if seen.status == "queued":
+                    values: dict[str, Any] = {"status": "failed", "error": NOT_REREGISTERED_QUEUED}
+                else:
+                    values = {"status": "interrupted", "error": NOT_REREGISTERED_RESUMABLE}
+                claimed = await session.execute(update(Run).where(
+                    Run.id == run_id, Run.status == seen.status, same(Run.owner, seen.owner))
+                    .values(owner=None, **values).execution_options(synchronize_session=False))
+                if claimed.rowcount != 1:
+                    await session.rollback()
+                    return
+                run = await session.get(Run, run_id)
+                bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq if run else 0))
+                event = (self._event(run_id, EventType.RUN_FAILED, data={"error": NOT_REREGISTERED_QUEUED})
+                         if seen.status == "queued" else
+                         self._event(run_id, EventType.LOG, data={"level": "warn", "code": "not_reregistered",
+                                                                  "message": NOT_REREGISTERED_RESUMABLE}))
+                await _stage(session, event, run)
+                await session.commit()
+            await bus.publish(event)
+            await bus.close(run_id)
+        except Exception:  # noqa: BLE001 - 收不了尾的留给别的进程按「属主不在了」处理
+            logger.exception("运行 %s：收尾时出错，留给别的进程按属主不在了处理", run_id)
+        finally:
+            self._tasks.pop(run_id, None)
+            self._stopped_by.pop(run_id, None)
 
     async def _stopped_in_queue(self, run_id: str) -> None:
         """还在等并发名额时被取消。关停：什么都不写（还是排队中 / 刚认领的样子），照「属主不在了」的规矩由下次启动或别的

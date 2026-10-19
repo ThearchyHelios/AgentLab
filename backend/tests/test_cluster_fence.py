@@ -170,6 +170,29 @@ async def test_a_wall_clock_jump_does_not_fence_a_running_run(slow, monkeypatch,
     assert fence.generation() == before, "没有隔离"
 
 
+async def test_a_run_that_cannot_start_after_fencing_is_failed_with_the_real_reason(monkeypatch):
+    """复核 R-b15：隔离之后新身份一直没登记上，新发起的运行等不到（fence.ready）——这一行照实收成失败（写明是隔离后没能重新
+    登记，不是「服务重启时还在排队」），run.failed 记下来，执行任务也从 run_manager 里摘掉。"""
+    from app.cluster import workers
+    from app.engine.runner import NOT_REREGISTERED_QUEUED
+
+    monkeypatch.setattr(workers, "lease_s", lambda: 0.3)
+    fence.trip("测试")                                 # 隔离了，新身份还没登记上
+    run = await run_manager.start(graph=GRAPH, input_payload={"question": "q"})
+    for _ in range(100):
+        if run.id not in run_manager._tasks:
+            break
+        await asyncio.sleep(0.05)
+    assert run.id not in run_manager._tasks, "执行任务摘掉了"
+    async with SessionLocal() as session:
+        row = await session.get(Run, run.id)
+    assert row.status == "failed" and row.error == NOT_REREGISTERED_QUEUED and row.owner is None
+    events = await _events(run.id)
+    assert [e.type for e in events if e.type == "run.failed"] == ["run.failed"]
+    assert events[-1].data["error"] == NOT_REREGISTERED_QUEUED
+    fence.renewed()
+
+
 async def test_the_final_write_checks_the_owner():
     async with SessionLocal() as session:
         run = Run(status="running", owner="peer-host:1:abcd", graph={}, input={})
