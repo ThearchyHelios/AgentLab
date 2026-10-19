@@ -79,6 +79,8 @@ export function RecallPreviewRow({ workflowId, version }: { workflowId: string; 
 
 const STATE_COLOR: Record<string, string | undefined> = {
   changed: 'var(--st-waiting)', failed: 'var(--err)', not_recomputable: 'var(--text-faint)', unchanged: 'var(--ok)',
+  // 核对不了（行序不定）：要人去核对，和「数变了」同一种提醒色
+  row_order: 'var(--st-waiting)',
 }
 /** 列表先列几组，其余收起 */
 const SHOWN = 6

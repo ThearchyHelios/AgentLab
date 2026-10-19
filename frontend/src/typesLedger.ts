@@ -220,6 +220,8 @@ export interface LedgerRecallMarks {
     recall_run?: string | null
     changed?: boolean
     at?: string | null
+    /** 行序不定、没能核对的那几项（服务端 ledger/recall.settle）：不算进「不影响」 */
+    row_order_metrics?: string[]
   }[]
   /** 依据有变：kind 是 catalog（目录里影响数字的项被驳回或修改）/ structure（表结构）/ values（新码值）/ catalog_edit */
   basis?: { kind?: string | null; items?: number; new_errors?: number; at?: string | null }[]

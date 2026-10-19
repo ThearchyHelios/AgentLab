@@ -133,6 +133,8 @@ export const LEDGER_UI = {
   recall: {
     /** 口径升版后在同一份数据上重算过、数没变 */
     checked: (caliber: string) => `已按口径${caliber} 核对，不影响`,
+    /** 部分指标行序不定：那几项没能核对，照实列出 */
+    checkedRowOrder: (names: string[]) => `其中${names.map((x) => `「${x}」`).join('、')}行序不定，没能核对`,
     /** 依据有变：目录里影响数字的项被驳回或修改、出现新码值、处理变化时改了目录（目录类），表或列被删、类型变了（表结构） */
     basis: (what: 'catalog' | 'structure' | 'other', items: number) =>
       `${what === 'structure' ? '依据的表结构有变' : what === 'catalog' ? '依据的数据目录有变' : '答案的依据有变'}`

@@ -409,7 +409,9 @@ async def notify_recall(task_id: str, users: list[str]) -> int:
 
         def message(answers: str, tasks: int, link: tuple[str, str] | None) -> dict[str, Any]:
             return {"event": event, "status": "pending", "ok": False,
-                    "title": recall.CHANGED_TITLE.format(name=name[:80] or "口径", version=origin.get("to_version")),
+                    # 待办开出来时按结论起的标题（数变了 / 行序不定、没能核对）：通知和待办说同一句
+                    "title": (recall.ROW_ORDER_TITLE if "行序不定" in (task.title or "") else recall.CHANGED_TITLE)
+                    .format(name=name[:80] or "口径", version=origin.get("to_version")),
                     "lines": [*head, ("答案", answers), *([("待办", f"{tasks} 条")] if tasks > 1 else []), *tail],
                     "links": [link] if base and link else [],
                     "subject": {"task_id": task_id, "run_id": task.run_id, "workflow_id": origin.get("workflow_id")}}

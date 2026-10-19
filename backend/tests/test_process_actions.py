@@ -96,7 +96,9 @@ async def _events(run_id: str, kind: str) -> list[RunEvent]:
 
 
 async def _confirm(run_id: str) -> Task:
-    """等确认卡出来，按卡上的内容指纹确认。"""
+    """等运行停到确认上、确认卡出来，按卡上的内容指纹确认。待办和审批同一个事务开出来，那一刻运行可能还没收成 interrupted、
+    还在跑——这时去确认会被拒（「运行正在运行，没有待处理的审批」）：先等运行停下来，再取待办。"""
+    await _wait(run_id, ("interrupted",))
     task = await _task(run_id, "action_confirm")
     card = (await tasks.detail(task.id, ANN))["payload"]
     out = await tasks.respond(task.id, ANN, decision="approve", payload_hash=card["payload_hash"])
@@ -166,6 +168,11 @@ async def test_unknown_result_with_lookup_is_reconciled_automatically_and_sent_o
     await _confirm(run_id)
     held = await _wait(run_id, ("interrupted", "failed", "succeeded"))
     assert held.status == "interrupted" and held.manifest_hash is None
+    # 运行先挂起、runner 再安排核实（actions.on_unknown）：等排上查询（记下 action.unknown）再看记录
+    for _ in range(100):
+        if await _events(run_id, "action.unknown"):
+            break
+        await asyncio.sleep(0.05)
     [rec] = await _records(run_id)
     assert rec.state == "unknown" and rec.next_lookup_at is not None
     assert len(await _events(run_id, "action.unknown")) == 1
