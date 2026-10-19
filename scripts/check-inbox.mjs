@@ -13,6 +13,8 @@
 //     待办箱一行写所属实例，同标题的分得开；
 //   - 补充输入带表单的：本地校验，服务端 422 的错误挂回字段；表单里的选人控件按这条待办的候选池取候选（使用者读不到
 //     整份名录），不在池里的服务端 422（code=principal）挂回那个字段（05-已知遗留 (b)）；
+//   - 驳回之后去哪（中断内容的 reject_route）：接了驳回出口的提示、驳回后的提示、处理过的结果写「转到「x」」，子工作流里的
+//     写「子工作流 › x」、不露内部 id；补充输入接了出口的按钮写「驳回」，没接出口的工具审批写「驳回并终止」；
 //   - 关登录时签批人一行写本机署名；会签只记下一票（resolved 为假）时提示「等待其他人处理」；
 //   - 审核个人应用（kind=review，payload 同服务端 blueprints/personal.review_payload）：写提交人（显示名）、目的、说明；没有
 //     「同意」——「取副本，去发布」调 POST /api/blueprints/{id}/copy 后进副本蓝图；取过的给「打开我的副本」（只认自己取的那
@@ -203,6 +205,24 @@ const TASKS = {
     form: { format: 'agentlab.form/1', type: 'object', required: ['reviewer'], properties: {
       reviewer: { type: 'string', title: '复核人', 'x-widget': 'principal' } } },
     payload: { kind: 'human_node', message: '请指定复核人' },
+  },
+  // 驳回之后去哪（中断内容的 reject_route，服务端 engine/replay.reject_route）：接了驳回出口的写转到哪一步，没接的写运行终止
+  routed: {
+    ...base, id: 'routed', approval_id: 'ap9', kind: 'approve', title: '主管审批（接了驳回出口）',
+    payload: { kind: 'human_node', message: '王五报销 800 元', reject_route: { to: [{ node_id: 'tell', label: '通知申请人' }] } },
+  },
+  routedInput: {
+    ...base, id: 'routedInput', approval_id: 'ap10', kind: 'input', title: '补填用途（接了驳回出口）',
+    payload: { kind: 'human_node', message: '请补填用途', reject_route: { to: [{ node_id: 'sub/back', label: '复核子流程 › 退回' }] } },
+  },
+  stopTool: {
+    ...base, id: 'stopTool', approval_id: 'ap11', kind: 'tool', title: '调用工具：erp_query',
+    payload: { kind: 'tool_approval', tool: 'erp_query', args: { q: 1 }, reject_route: { ends: 'run' } },
+  },
+  rejectedDone: {
+    ...base, id: 'rejectedDone', approval_id: 'ap12', kind: 'approve', title: '主管审批（已驳回）', status: 'resolved',
+    can_respond: false, outcome: { decision: 'reject' }, resolved_by: 'zhangsan', resolved_at: ago(300_000),
+    payload: { kind: 'human_node', message: '赵六报销 50 元', reject_route: { to: [{ node_id: 'tell', label: '通知申请人' }] } },
   },
   input: {
     ...base, id: 'input', approval_id: 'ap5', kind: 'input', title: '补填发票信息',
@@ -610,6 +630,38 @@ await section('口径召回：后台的系统通知点开去待办页（不去�
       .then(() => true, () => false))
     check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
   }
+})
+
+await section('驳回之后去哪：提示、按钮、驳回后的提示、处理过的结果', async () => {
+  const state = { writes: [] }
+  const page = await open(state)
+  await page.goto(`${WEB}/apps/inbox/routed`)
+  await card(page).waitFor({ timeout: 15000 })
+  let text = await card(page).innerText()
+  check('接了驳回出口的审批：提示写驳回后转到哪一步', text.includes('驳回：转到「通知申请人」'), text.slice(-80))
+  check('……不再写「转入「驳回」分支」', !text.includes('转入「驳回」分支'))
+  await page.locator('[data-task-reject]').click()
+  check('驳回之后提示转到哪一步', await page.getByText('已驳回，转到「通知申请人」').waitFor({ timeout: 3000 }).then(() => true, () => false))
+  check('驳回照约定交给待办接口', state.writes.some((w) => w.path === '/api/tasks/routed/respond' && w.body?.decision === 'reject'))
+
+  await page.goto(`${WEB}/apps/inbox/routedInput`)
+  await card(page).waitFor({ timeout: 15000 })
+  text = await card(page).innerText()
+  check('补充输入接了驳回出口：按钮写「驳回」，不写「驳回并终止」', (await page.locator('[data-task-reject]').innerText()).trim() === '驳回')
+  check('……提示写子工作流里的那一步', text.includes('驳回：转到「复核子流程 › 退回」'), text.slice(-80))
+  check('……不露内部 id', !text.includes('sub/back'))
+
+  await page.goto(`${WEB}/apps/inbox/stopTool`)
+  await card(page).waitFor({ timeout: 15000 })
+  text = await card(page).innerText()
+  check('没接驳回出口的工具审批：按钮写「驳回并终止」', (await page.locator('[data-task-reject]').innerText()).trim() === '驳回并终止')
+  check('……提示写本次运行终止', text.includes('驳回：本次运行终止'), text.slice(-80))
+
+  await page.goto(`${WEB}/apps/inbox/rejectedDone`)
+  await card(page).waitFor({ timeout: 15000 })
+  const resolved = await page.locator('[data-task-resolved]').first().innerText()
+  check('处理过的：结果写驳回之后去了哪', resolved.includes('结果：驳回，转到「通知申请人」'), resolved)
+  check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
 })
 
 await section('待办箱：列表和徽标', async () => {

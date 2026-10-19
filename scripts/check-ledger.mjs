@@ -306,6 +306,39 @@ await section('口径对账：核对参数 → 发起 → 选对照的指标 →
 
 // ---------------------------------------------------------------- 「按口径」那个数的出处跨卡追到取数查询
 
+await section('口径对账：逐格证明了的列预选上对照，人可以改', async () => {
+  // 服务端按逐格比对（ledger/match._cells）证明了的那一列给出预选（options.suggested），界面照它预选、标「预选」
+  const posts = []
+  const extra = (method, p, body) => {
+    if (method === 'POST' && p === `/ledger/answers/${RUN}/reconcile`) {
+      posts.push(body)
+      if (!body?.pairs) {
+        return { status: 409, json: { detail: '认不出这次的哪一列对应口径的哪个指标，请选择要对照的指标', code: 'ledger_reconcile_needs_pairs',
+                                      options: { columns: ['orders', 'refunds'], metrics: [{ id: 'orders', name: '订单数', unit: '单' }],
+                                                 suggested: [{ ours: 'orders', metric: 'orders' }] } } }
+      }
+      return { status: 201, json: { run_id: 'run-rec-9', reconciled: reconciledOf('running') } }
+    }
+    return null
+  }
+  const { page, errors } = await open('/ui-harness.html?evidence=1', { reply: evidenceReply(() => ledgerOf(RUN, {}), extra) })
+  await page.waitForSelector('#evidence-wide [data-seg="s8"]', { timeout: 10000 })
+  await openSeg(page, 's8')
+  await page.locator('[data-evidence-panel] [data-ledger-reconcile-open]').click()
+  await page.locator('[data-ledger-reconcile-dialog]').waitFor({ timeout: 4000 })
+  await page.locator('[data-ledger-reconcile-launch]').click()
+  await page.locator('[data-ledger-pairs]').waitFor({ timeout: 4000 })
+  check('证明了的那一列预选上对照的指标', await page.locator('[data-ledger-pair="orders"]').inputValue() === 'orders')
+  check('……标「预选」，说明可以改选', await page.locator('[data-ledger-pair-suggested="orders"]').count() === 1
+    && (await page.locator('[data-ledger-pairs]').innerText()).includes('可以改选'))
+  check('没证明的那一列不替人猜', await page.locator('[data-ledger-pair="refunds"]').inputValue() === '')
+  await page.locator('[data-ledger-reconcile-launch]').click()
+  await until(() => posts.length === 2)
+  check('直接发起：带上预选的对照', JSON.stringify(posts[1]?.pairs) === JSON.stringify([{ ours: 'orders', metric: 'orders' }]),
+    JSON.stringify(posts[1]))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
 await section('对账结果里「按口径」那个数：出处跨卡追到口径的取数查询', async () => {
   const extra = (method, p) => {
     const m = p.match(/^\/runs\/run-rec-1\/evidence\/metrics\/reconcile\/([^/]+)$/)

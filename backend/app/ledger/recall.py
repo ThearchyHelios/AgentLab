@@ -364,13 +364,46 @@ def recall_card(pairs: Sequence[Pair]) -> tuple[dict[str, Any], list[dict[str, A
                         _metric(f"new_{k}", f"{name} · 新版 v{pair.new.version}", new_expr, nm),
                         _metric(f"diff_{k}", f"{name} · 两版之差", f"({new_expr}) - ({old_expr})", nm)]
             # 旧版的式子（定义，不是数）一并记下：问数回答当时的值要按它找到答案里对应的那一格（original_values）
-            meta.append({"k": k, "card": pair.old.node_id, "metric": m["id"], "name": name,
-                         "unit": str(nm.get("unit") or ""), "decimals": nm.get("decimals"), "format": nm.get("format"),
-                         "expression": str(m.get("expression") or "")})
+            item = {"k": k, "card": pair.old.node_id, "metric": m["id"], "name": name,
+                    "unit": str(nm.get("unit") or ""), "decimals": nm.get("decimals"), "format": nm.get("format"),
+                    "expression": str(m.get("expression") or "")}
+            if not (_rows_stable(pair.old, m) and _rows_stable(pair.new, nm)):
+                # 两版都按行号取多行结果里的一格、查询又没有 ORDER BY：两次查询交回的行序可能不同，第几行不一定是同一行，
+                # 按位置比出来的「变了 / 没变」都不可信（compare 照实记行序不定）
+                item["row_order"] = "unstable"
+            meta.append(item)
             k += 1
     node = derive._node(derive.RECALL_CARD, "metrics", "召回卡", caliber="口径召回", caliber_version="v1",
                         on_missing="null", metrics=metrics)
     return node, meta
+
+
+def _rows_stable(pinned: Any, metric: Mapping[str, Any]) -> bool:
+    """这个指标按行号取的每一格（cell(nodes.<取数>, 行, '列')），在那一版的取数 SQL 上重跑时还是同一行（sql_semantics.row_stable）。
+    行号、SQL 认不出来的照旧当认得住（以前就是按位置比的，不凭猜测改结论）。"""
+    import ast
+
+    from app.data.sql_semantics import row_stable
+    from app.engine.expressions import ExpressionError, cell_parts, leaf_refs, parse_expression
+
+    sql_of = {str(n.get("id")): ((n.get("data") or {}).get("config") or {}).get("args", {}).get("sql")
+              for n in pinned.fetches if isinstance(n, dict)}
+    try:
+        leaves = leaf_refs(parse_expression(str(metric.get("expression") or ""))[0])
+    except ExpressionError:
+        return True
+    for leaf in leaves:
+        parts = cell_parts(str(leaf))
+        if parts is None or not parts[0].startswith("nodes."):
+            continue
+        sql = sql_of.get(parts[0].removeprefix("nodes."))
+        try:
+            row = ast.literal_eval(parts[1].strip())
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(sql, str) and isinstance(row, int) and not row_stable(sql, row):
+            return False
+    return True
 
 
 def build_graph(group: Group, pairs: Sequence[Pair]) -> tuple[Any, list[dict[str, Any]]]:
@@ -606,11 +639,14 @@ def compare(meta: Sequence[Mapping[str, Any]], values: Mapping[str, Mapping[str,
     for item in meta:
         k = item.get("k")
         old, new, diff = (values.get(f"{p}_{k}") or {} for p in ("old", "new", "diff"))
-        changed = str(old.get("rendered")) != str(new.get("rendered"))
+        unstable = item.get("row_order") == "unstable"
+        # 行序不定的（recall_card 记的）：按位置比不出变没变，changed 为空，照实记 row_order，不假装对上
+        changed = None if unstable else str(old.get("rendered")) != str(new.get("rendered"))
         out.append({"k": k, "card": item.get("card"), "metric": item.get("metric"), "name": item.get("name"),
                     "unit": item.get("unit"), "old": old.get("value"), "new": new.get("value"),
                     "diff": diff.get("value"), "old_text": old.get("rendered"), "new_text": new.get("rendered"),
-                    "diff_text": diff.get("rendered"), "changed": changed})
+                    "diff_text": diff.get("rendered"), "changed": changed,
+                    **({"row_order": "unstable"} if unstable else {})})
     return out
 
 
@@ -809,6 +845,7 @@ async def task_payload(session: Any, task: Any, principal: Any) -> dict[str, Any
             cells[side] = {"value": None if masked else value, "text": "已遮罩" if masked else text,
                            "metric": f"{side}_{item['k']}", "masked": masked}
         metrics.append({"k": item["k"], "name": item["name"], "unit": item["unit"], "changed": item["changed"],
+                        **({"row_order": item["row_order"]} if item.get("row_order") else {}),
                         "card": item["card"], "metric": item["metric"], **cells})
     answers = []
     for use in _uses_of(origin, _owner_of_key(key)):
@@ -1489,11 +1526,16 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
                 if answer is not None:
                     latest, inputs_from = dict(answer.binding), "answer"
             for card in caliber.cards[:1]:
+                pinned = None
                 try:
                     pinned = await derive.load_pinned(session, caliber.workflow_id, caliber.version, card)
                     names = {str(f.get("name")) for f in pinned.entry_fields}
-                    inputs = compose.check_inputs(pinned, {k: v for k, v in (latest or {}).items() if k in names})
-                except (derive.NotDerivable, compose.ComposeRefused):
+                    given = {k: v for k, v in (latest or {}).items() if k in names}
+                    inputs = compose.check_inputs(pinned, given)
+                except (derive.NotDerivable, compose.ComposeRefused) as e:
+                    # 凑不齐参数（这一版没有正式运行、也没有等价的问数回答，必填的入口字段又没有缺省值）或者派生不了：不试算，
+                    # 照实记一条缺哪几个参数——日志里一条，变化记录的影响里一条（变化页照它写），不再一声不响地跳过
+                    await _probe_skipped(change, caliber, pinned, latest, inputs_from, e.message)
                     continue
                 probe = derive.caliber_probe(pinned)
                 origin = {"probe": 1, "workflow_id": caliber.workflow_id, "version": caliber.version,
@@ -1511,6 +1553,46 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
                     continue
                 launched.append(run.id)
     return launched
+
+
+#: 变化记录 affects 里试算情况的键（data/source_changes 再次探查到同一条变化时保留它）
+PROBES_KEY = "probes"
+
+
+def missing_inputs(pinned: Any, given: Mapping[str, Any] | None) -> list[str]:
+    """口径入口里必填、又没给值也没有缺省值的字段（按入口字段的先后）。"""
+    out = []
+    for f in pinned.entry_fields if pinned is not None else ():
+        name = str(f.get("name") or "").strip()
+        if not name or not f.get("required") or f.get("default") not in (None, ""):
+            continue
+        if (given or {}).get(name) in (None, ""):
+            out.append(name)
+    return out
+
+
+async def _probe_skipped(change: Mapping[str, Any], caliber: Any, pinned: Any, given: Mapping[str, Any] | None,
+                         inputs_from: str, reason: str) -> None:
+    """表结构变了、这一版口径没能试算：记一条日志，写进变化记录的 affects.probes（同一版只记一条，换成最新的说法）。"""
+    from app.db.models_sources import SourceChange
+
+    missing = missing_inputs(pinned, given)
+    name = getattr(pinned, "workflow_name", None) or caliber.workflow_id
+    said = f"缺少参数 {'、'.join(missing)}" if missing else reason
+    logger.info("表结构变了之后口径「%s」v%s 没有试算：%s（参数来自%s）", name, caliber.version, said,
+                {"formal": "最近一次正式运行", "answer": "等价的问数回答", "defaults": "入口的缺省值"}.get(inputs_from, inputs_from))
+    note = {"workflow_id": caliber.workflow_id, "version": caliber.version, "name": str(name), "outcome": "skipped",
+            "missing": missing, "reason": reason, "inputs_from": inputs_from}
+    async with SessionLocal() as session:
+        row = (await session.execute(select(SourceChange).where(SourceChange.id == change.get("id")))).scalar_one_or_none()
+        if row is None:
+            return
+        affects = dict(row.affects or {})
+        kept = [p for p in affects.get(PROBES_KEY) or [] if isinstance(p, dict)
+                and (p.get("workflow_id"), p.get("version")) != (caliber.workflow_id, caliber.version)]
+        affects[PROBES_KEY] = [*kept, note]
+        row.affects = affects
+        await session.commit()
 
 
 async def _settle_probe(run: Run) -> str:

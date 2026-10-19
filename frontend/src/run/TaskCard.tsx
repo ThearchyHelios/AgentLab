@@ -39,7 +39,7 @@ import {
   ACTION_CONFIRM_TEXT, ACTION_ENV_LABEL, INQUIRY_TEXT, RECONCILE_TEXT, SIGNAL_TEXT, TASK_KIND_LABEL, TASK_STATUS_LABEL,
   TASK_TEXT, TOOL_TRUST_TEXT, TRIAL_TEXT, runName,
 } from '../lib/terms'
-import { REVIEW_TASK_TEXT } from '../lib/termsApp'
+import { REJECT_ROUTE_TEXT, REVIEW_TASK_TEXT, rejectRouteOf } from '../lib/termsApp'
 import { RECALL_TEXT } from '../lib/termsRecall'
 import { blueprintPath } from '../pages/blueprints/shared'
 import type { Approval, ApprovalReport } from '../types'
@@ -102,6 +102,9 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
   const runClass: 'formal' | 'exploratory' | null = task.run_class ?? (task.app_id ? 'formal'
     : payload.run_class === 'formal' || payload.run_class === 'exploratory' ? payload.run_class : null)
   const binary = kind === 'approve' || kind === 'tool' || kind === 'code'
+  // 驳回之后去哪（中断内容的 reject_route）：带了的照实说转到哪一步、运行终止还是这一路到此为止；老待办没带的照原来的说法
+  const route = rejectRouteOf(payload)
+  const stops = route ? 'ends' in route && route.ends === 'run' : !binary
   const trustKey: string | undefined = kind === 'tool' && runClass !== 'formal'
     ? (typeof payload.trust_key === 'string' && payload.trust_key) || undefined : undefined
   const reports: ApprovalReport[] = Array.isArray(payload.reports)
@@ -140,7 +143,8 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
     if (binary) void respond({ decision: 'approve' }, TASK_TEXT.doneApprove)
     else void respond({ decision: 'submit', values: { value: text } }, TASK_TEXT.doneSubmit)
   }
-  const reject = () => void respond({ decision: 'reject' }, binary ? TASK_TEXT.doneReject : TASK_TEXT.doneRejectStop)
+  const reject = () => void respond({ decision: 'reject' }, route ? TASK_TEXT.doneRejectRoute(REJECT_ROUTE_TEXT.goes(route))
+    : binary ? TASK_TEXT.doneReject : TASK_TEXT.doneRejectStop)
 
   /** 「始终允许」：批准这一次，并让服务端把这个工具设成门控把关（工具页的信任档跟着变，目录重拉一次） */
   const always = async () => {
@@ -209,7 +213,8 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
       {kind === 'action_confirm' && (
         <ActionConfirm task={task} canAct={canAct} busy={busy || inquiring} note={note} setNote={setNote}
                        onConfirm={(hash) => void respond({ decision: 'approve', payload_hash: hash }, ACTION_CONFIRM_TEXT.done)}
-                       onReject={() => void respond({ decision: 'reject' }, ACTION_CONFIRM_TEXT.rejected)} />
+                       onReject={() => void respond({ decision: 'reject' }, route && 'to' in route
+                         ? ACTION_CONFIRM_TEXT.rejectedRoute(REJECT_ROUTE_TEXT.goes(route)) : ACTION_CONFIRM_TEXT.rejected)} />
       )}
       {kind === 'reconcile' && (
         <Reconcile task={task} canAct={canAct} busy={busy} note={note} setNote={setNote}
@@ -260,7 +265,7 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
             <button type="button" className="btn btn-danger flex-1 justify-center" disabled={busy || inquiring}
                     data-task-reject="" onClick={reject}>
               <Ban size={12} aria-hidden />{' '}
-              {binary ? (trial ? TRIAL_TEXT.reject : TASK_TEXT.reject) : (trial ? TRIAL_TEXT.rejectStop : TASK_TEXT.rejectStop)}
+              {stops ? (trial ? TRIAL_TEXT.rejectStop : TASK_TEXT.rejectStop) : (trial ? TRIAL_TEXT.reject : TASK_TEXT.reject)}
             </button>
           </div>
           {inquiring && (
@@ -272,7 +277,8 @@ export function TaskCard({ task, onResolved, compact = false, send, showOwner = 
           )}
           {!compact && (
             <div className="mt-1.5 text-2xs leading-relaxed text-dim">
-              {binary ? TASK_TEXT.approveHint : TASK_TEXT.inputHint}
+              {route ? (binary ? TASK_TEXT.approveHintRoute : TASK_TEXT.inputHintRoute)(REJECT_ROUTE_TEXT.goes(route))
+                : binary ? TASK_TEXT.approveHint : TASK_TEXT.inputHint}
             </div>
           )}
           {/* 「始终允许」会改工具的信任档、影响之后的运行：常显同一句旁注，不只藏在悬停里 */}
@@ -429,8 +435,14 @@ export function Due({ dueAt, now }: { dueAt: string | null; now: number }) {
 }
 
 /** 处理过的：谁、什么时候、结果（实例页上不是处理人的人看这一步的状态也用它） */
-export function Resolved({ task }: { task: Pick<Task, 'status' | 'outcome' | 'resolved_by' | 'resolved_at' | 'people'> }) {
-  const decision = typeof task.outcome?.decision === 'string' ? TASK_TEXT.decision[task.outcome.decision] ?? task.outcome.decision : null
+export function Resolved({ task }: {
+  task: Pick<Task, 'status' | 'outcome' | 'resolved_by' | 'resolved_at' | 'people'> & { payload?: Task['payload'] }
+}) {
+  const raw = typeof task.outcome?.decision === 'string' ? task.outcome.decision : null
+  const said = raw ? TASK_TEXT.decision[raw] ?? raw : null
+  // 驳回了的写驳回之后去了哪（中断内容的 reject_route）：「驳回，转到「通知申请人」」，不只写「驳回」
+  const route = raw === 'reject' || raw === 'expired_reject' ? rejectRouteOf(task.payload) : null
+  const decision = said && route ? REJECT_ROUTE_TEXT.outcome(said, route) : said
   const at = task.resolved_at ? formatDateTime(task.resolved_at) : ''
   return (
     <div className="mb-2 flex flex-wrap items-center gap-x-1.5 text-2xs text-dim" data-task-resolved="">

@@ -110,6 +110,11 @@ export const SOURCE_CHANGE_TEXT = {
   impactNeeds: '人工确认过、还说着被删的列',
   impactRules: '有效记录条件用到了这一列：取值有变时，按它过滤的结果可能漏掉新状态的行',
   impactTemplates: (n: number) => `用到这张表的已发布模板 ${formatNumber(n)} 个`,
+  /** 表结构变了之后没能试算的口径：缺参数的写缺哪几个，别的写原因原话 */
+  probesTitle: '没有试算的口径',
+  probeSkipped: (name: string, version: number, missing: string[], reason: string) =>
+    `「${name}」v${version}：${missing.length ? `缺少参数 ${missing.join('、')}，没有试算` : `没有试算（${reason}）`}`,
+  probeFrom: { formal: '参数按最近一次正式运行取', answer: '参数按等价的问数回答取', defaults: '这一版还没有正式运行，只能用入口的缺省值' } as Record<string, string>,
   templateImpact: { direct: '写死的 SQL 直接引用', possible: '可能涉及' } as Record<string, string>,
   templateVersion: (v: number) => `v${v}`,
   breaks: (cols: string[]) => (cols.length

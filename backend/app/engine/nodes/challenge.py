@@ -811,8 +811,10 @@ class _Review:
         # 没能反查的句数：没派出去、派出去却没查成的（unreviewed 里各有原因），运行时长上限将至没开始的，加上触顶时没能给出
         # 结论的。都记为无法判断，可「无法判断 2 句」既可能是查了、数据不够，也可能是根本没查：审批卡要分开说
         missed = len(unreviewed) + overdue + sum(skipped for _, skipped in hit.values())
-        artifact = await self._store({"report": self.report_id, "doc_artifact": self.doc_artifact, "claims": claims,
-                                      "model": model})
+        # 报告按这次运行里的 id 记（子工作流里的写「子工作流节点 id/报告」，同 report.checked、报告文档上的 node_id）：
+        # 证据面板、可验证报告按它认审的是哪份报告
+        artifact = await self._store({"report": self.ctx.run.global_id(self.report_id), "doc_artifact": self.doc_artifact,
+                                      "claims": claims, "model": model})
         for limit, (touched, skipped) in hit.items():
             words = self._limit_words(limit)
             message = f"已达上限（{words}），{skipped} 句未反查" if limit == "daily_max_usd" else \
@@ -872,7 +874,8 @@ class _Review:
     async def _store(self, record: dict[str, Any]) -> str | None:
         try:
             return await artifact_store.put_json(record, kind="challenge", run_id=self.ctx.run.run_id,
-                                                 node_id=self.ctx.node.id, meta={"report": self.report_id})
+                                                 node_id=self.ctx.run.global_id(self.ctx.node.id),
+                                                 meta={"report": self.ctx.run.global_id(self.report_id)})
         except Exception as e:  # noqa: BLE001 - 记录写失败不毁掉运行：结论照常处置，只是理由和查询点不开
             self.ctx.emit(EventType.LOG, level="warn", code="evidence_store_failed",
                           message=f"反方审稿记录保存失败（{describe_exception(e)}），审稿的理由和查询将无法查看")

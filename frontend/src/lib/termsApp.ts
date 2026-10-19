@@ -110,7 +110,7 @@ export const TASK_TEXT = {
     group: (name: string) => `组「${name}」`,
   },
   assignmentStatus: { pending: '待回复', responded: '已回复', withdrawn: '已撤回' },
-  decision: { approve: '同意', reject: '驳回', submit: '已提交', confirmed: '已生效', not_applied_resend: '重新发送',
+  decision: { approve: '同意', reject: '驳回', expired_reject: '超时驳回', submit: '已提交', confirmed: '已生效', not_applied_resend: '重新发送',
     not_applied_abandon: '放弃' } as Record<string, string>,
   verified: '已登录核实',
   unverified: '自报署名',
@@ -125,9 +125,13 @@ export const TASK_TEXT = {
   editedContent: '修改后的内容',
   approveHint: '批准：继续运行；驳回：转入「驳回」分支',
   inputHint: '提交：以你填写的内容继续运行；驳回：终止本次运行',
+  /** 驳回之后去哪（中断内容的 reject_route，见 REJECT_ROUTE_TEXT）：带了的按它说，老待办没带的照上面两句 */
+  approveHintRoute: (goes: string) => `批准：继续运行；驳回：${goes}`,
+  inputHintRoute: (goes: string) => `提交：以你填写的内容继续运行；驳回：${goes}`,
   doneApprove: '已批准，运行继续',
   doneReject: '已驳回，转入驳回分支',
   doneRejectStop: '已驳回，本次运行终止',
+  doneRejectRoute: (goes: string) => `已驳回，${goes}`,
   doneSubmit: '已提交，运行继续',
   doneVote: '已记下你的意见，等待其他人处理',
   formInvalid: (n: number) => `有 ${n} 项需要修改`,
@@ -154,6 +158,34 @@ export const TASK_TEXT = {
   code: '代码',
 }
 
+/**
+ * 驳回之后去哪：待办的中断内容带着 reject_route（服务端 engine/replay.reject_route，总方案 §3 的驳回出口）。
+ * - to：接了驳回出口，驳回后转到这几步（名字是这次运行里的说法：子工作流里的写「子工作流 › x」）；
+ * - ends=run：没接驳回出口（审批设了驳回即终止的也是），驳回后运行就此结束、记为被驳回；
+ * - ends=path：审批没接驳回出口、没设驳回即终止，这一路到审批为止，不再往下走。
+ * 老待办没带的为 null，各处照原来的说法
+ */
+export type RejectRoute = { to: string[] } | { ends: 'run' | 'path' }
+
+export function rejectRouteOf(payload: Record<string, unknown> | null | undefined): RejectRoute | null {
+  const raw = payload?.reject_route
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as { to?: unknown; ends?: unknown }
+  if (Array.isArray(r.to)) {
+    const to = r.to.map((t: any) => String(t?.label || t?.node_id || '')).filter(Boolean)
+    return to.length ? { to } : null
+  }
+  return r.ends === 'run' || r.ends === 'path' ? { ends: r.ends } : null
+}
+
+export const REJECT_ROUTE_TEXT = {
+  /** 「转到「通知申请人」」/「本次运行终止」/「这一路到此为止，不再往下走」 */
+  goes: (r: RejectRoute): string => ('to' in r ? `转到${r.to.map((t) => `「${t}」`).join('、')}`
+    : r.ends === 'run' ? '本次运行终止' : '这一路到此为止，不再往下走'),
+  /** 处理过的待办「结果」那一格：驳回之后去了哪 */
+  outcome: (decision: string, r: RejectRoute): string => `${decision}，${REJECT_ROUTE_TEXT.goes(r)}`,
+}
+
 /** 动作确认的哈希卡（§3.8：确认时看过的就是发出去的） */
 export const ACTION_CONFIRM_TEXT = {
   head: '确认后发送',
@@ -171,6 +203,8 @@ export const ACTION_CONFIRM_TEXT = {
   noHash: '缺少内容哈希，无法确认发送',
   done: '已确认，按此内容发送',
   rejected: '已驳回，不发送',
+  /** 驳回之后去哪（reject_route）：「已驳回，不发送，转到「通知申请人」」 */
+  rejectedRoute: (goes: string) => `已驳回，不发送，${goes}`,
 }
 
 /** 核实结果未知的动作：三个选项（§2.5 A5 第 4 条） */

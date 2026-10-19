@@ -10,6 +10,7 @@ import { Spinner, useToast } from '../components/ui'
 import { segmentState } from '../lib/evidence'
 import { NONE } from '../lib/format'
 import { CATALOG_TABLE_FIELD_LABEL, DUAL_CHECK_TEXT } from '../lib/terms'
+import { REJECT_ROUTE_TEXT, TASK_TEXT, rejectRouteOf } from '../lib/termsApp'
 import { patchValueText } from './catalogPatch'
 import { RationaleDoc } from './ChallengeSummary'
 import type {
@@ -421,6 +422,9 @@ export function DualCheckApproval({ approval, onResolved, decide }: DualCheckApp
   const summary = useMemo(() => summaryOf(payload.summary), [payload.summary])
   const cardId = str(payload.card_artifact) ?? ''
   const onReject = useOnReject(approval.run_id, str(payload.node_id) ?? str(approval.node_id), payload.on_reject)
+  // 驳回之后去哪（中断内容的 reject_route）：接了驳回出口的，驳回后转到那一步，不是「本次运行终止」
+  const route = rejectRouteOf(payload)
+  const routed = route && 'to' in route ? REJECT_ROUTE_TEXT.goes(route) : null
 
   const [card, setCard] = useState<{ id: string; data?: Card | null } | null>(null)
   useEffect(() => {
@@ -468,7 +472,7 @@ export function DualCheckApproval({ approval, onResolved, decide }: DualCheckApp
       }
       // 采用盲算、两边都不对时，节点设为「判为失败」就会让运行终止：提示照节点的设置说，读不到设置时不替它下结论
       const rejected = Object.values(value.choices).some((c) => c !== 'a')
-      toast(!approved ? T.rejected : !rejected || onReject === 'degrade' ? T.done : onReject === 'fail' ? T.doneFail : T.doneUnknown, 'ok')
+      toast(!approved ? (routed ? TASK_TEXT.doneRejectRoute(routed) : T.rejected) : !rejected || onReject === 'degrade' ? T.done : onReject === 'fail' ? T.doneFail : T.doneUnknown, 'ok')
     } catch (e) {
       toast.error(e)
     } finally {
@@ -514,9 +518,11 @@ export function DualCheckApproval({ approval, onResolved, decide }: DualCheckApp
             {noteField}
             <button type="button" className="btn btn-danger w-full justify-center" disabled={busy} aria-describedby={`${uid}-reject`}
                     data-dual-reject="" onClick={() => void send(false)}>
-              {busy ? <Spinner size={11} /> : <Ban size={12} aria-hidden />} {T.reject}
+              {busy ? <Spinner size={11} /> : <Ban size={12} aria-hidden />} {routed ? TASK_TEXT.reject : T.reject}
             </button>
-            <div id={`${uid}-reject`} className="text-2xs leading-relaxed text-dim">{T.emptyReject}</div>
+            <div id={`${uid}-reject`} className="text-2xs leading-relaxed text-dim">
+              {routed ? T.emptyRejectRoute(routed) : T.emptyReject}
+            </div>
           </>
         )
       ) : (

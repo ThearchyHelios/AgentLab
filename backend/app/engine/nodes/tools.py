@@ -274,9 +274,14 @@ async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[
     from app.process import actions
 
     exec_no = next_exec(state, ctx.node.id)
+    # 幂等键按这次运行里的节点 id 算（子工作流里的写「sub/pay」）：以前按子图里的 id（pay）算，父图里同名的节点、套同一个
+    # 工作流的两个子工作流节点撞同一个键，后发的那一笔交回先发的回执、不发送。升级前停在子图里的运行按子图里的 id 记过，
+    # 恢复时整个子图重跑：照旧认那个键（legacy_node_id），已经生效的不重发；父图里有同名节点时不认（那一条可能是它的）
+    node_id = ctx.run.global_id(ctx.node.id)
+    legacy = ctx.node.id if node_id != ctx.node.id and ctx.node.id not in ctx.run.root_ids else None
     try:
-        prep = await actions.prepare(run_id=ctx.run.run_id, node_id=ctx.node.id, exec_no=exec_no,
-                                     capability=capability, args=args)
+        prep = await actions.prepare(run_id=ctx.run.run_id, node_id=node_id, exec_no=exec_no,
+                                     capability=capability, args=args, legacy_node_id=legacy)
     except actions.ActionFailed as e:
         raise NodeError(ctx.node.id, str(e)) from e
     if prep.receipt is not None:
@@ -317,8 +322,8 @@ async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[
     # 外部系统会把审批人当成申请人；无人值守的写入没有人确认，不写 act
     on_behalf = {"sub": prep.run.get("started_by"), "act": confirmer}
     try:
-        result = await actions.send(prep, capability, run_id=ctx.run.run_id, node_id=ctx.node.id,
-                                    exec_no=exec_no, emit=ctx.emit, on_behalf=on_behalf)
+        result = await actions.send(prep, capability, run_id=ctx.run.run_id, node_id=node_id,
+                                    exec_no=exec_no, emit=ctx.emit, on_behalf=on_behalf, confirm_node=ctx.node.id)
     except actions.ActionFailed as e:
         raise NodeError(ctx.node.id, str(e)) from e
     return _write_updates(ctx, result)

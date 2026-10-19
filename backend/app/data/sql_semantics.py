@@ -9387,6 +9387,30 @@ def one_row(sql: str, dialect: str | None = None) -> bool:
     return _aggregating(root)
 
 
+def ordered(sql: str, dialect: str | None = None) -> bool:
+    """这条查询最外层带 ORDER BY（一段 SELECT 或 UNION 整体的）：结果的行序由查询定，按行号取的那一格重跑时还是那一行（排序键
+    相同的几行之间的先后另说，按位置认）。认不出的为假。"""
+    from sqlglot import exp
+
+    read = _read(dialect)
+    try:
+        root, _ = _parse(_mysql_dashes(sql) if read == "mysql" and isinstance(sql, str) else sql, read)
+    except Exception:  # noqa: BLE001 - 解析不了就是认不出
+        return False
+    if not isinstance(root, (exp.Select, exp.Union)):
+        return False
+    order = root.args.get("order")
+    return order is not None and bool(order.expressions)
+
+
+def row_stable(sql: str, row: int, dialect: str | None = None) -> bool:
+    """按行号取这条查询的第 row 行，重跑、核对时还是不是同一行：最外层带 ORDER BY 的按位置认；一定只出一行的（one_row）第 0 行
+    认得住；别的（多行、又没有 ORDER BY）行序不定——库可以按任何顺序交回这些行，第 2 行重跑时可能是另一行。"""
+    if ordered(sql, dialect):
+        return True
+    return row == 0 and one_row(sql, dialect)
+
+
 def output_names(sql: str, dialect: str | None = None, *, template: bool = False) -> list[str] | None:
     """最外层选择列表各项的输出名（按位置；同 _result_columns，不展开 *：有 * 的为 None）。template 为真时 sql 是口径
     模板，按哨兵渲染之后认。解析不了、不是一段 SELECT 的为 None。"""

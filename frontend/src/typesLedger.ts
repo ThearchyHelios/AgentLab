@@ -305,6 +305,11 @@ export interface LedgerReconcileOut {
 export interface LedgerPairOptions {
   columns: string[]
   metrics: { id: string; name: string; unit?: string }[]
+  /**
+   * 预选的对照（服务端 ledger/reconcile._suggested）：这一列单独比和口径取数的某一列等价（逐格证明了），口径卡上只读那一格的
+   * 指标。界面照它预选、人可以改；老服务端不给
+   */
+  suggested?: { ours: string; metric: string }[]
 }
 
 // ---------------------------------------------------------------- 认证队列（可沉淀的问题）

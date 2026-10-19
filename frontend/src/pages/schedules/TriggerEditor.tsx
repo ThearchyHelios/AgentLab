@@ -73,6 +73,28 @@ function useTriggerOptions(): OptionsState {
   return state
 }
 
+/**
+ * 对象太多、一页没列完（服务端的 more）时按名字查：输入停一下再查，结果只换这一种事件的对象；当前选中的那一个总带上
+ * （selected），不被分页挤掉、不显示成已不存在
+ */
+function useObjectSearch(kind: ScheduleEventKind, selected: string, enabled: boolean) {
+  const [q, setQ] = useState('')
+  const [found, setFound] = useState<{ key: string; objects: ScheduleTriggerOptions['events'][number]['objects'] } | null>(null)
+  const words = q.trim()
+  const key = `${kind}\u0000${words}`
+  useEffect(() => {
+    if (!enabled || !words) return
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      api.schedules.triggerOptions({ event: kind, q: words, selected: selected || undefined }, { signal: controller.signal })
+        .then((data) => setFound({ key, objects: data.events.find((e) => e.event === kind)?.objects ?? [] }))
+        .catch(() => {})
+    }, 300)
+    return () => { clearTimeout(timer); controller.abort() }
+  }, [enabled, kind, words, selected, key])
+  return { q, setQ, objects: words && found?.key === key ? found.objects : null }
+}
+
 export function EventSection({ value, onChange, timezone, setTimezone, savedName, error, debounceError }: {
   value: TriggerForm
   onChange: (t: TriggerForm) => void
@@ -91,7 +113,9 @@ export function EventSection({ value, onChange, timezone, setTimezone, savedName
   const kind = value.event
   const label = TT.subject[kind]
   const entry = options.status === 'ok' ? options.data.events.find((e) => e.event === kind) : undefined
-  const objects = entry?.objects ?? []
+  const paged = !!entry?.more
+  const search = useObjectSearch(kind, value.subjectId, paged)
+  const objects = search.objects ?? entry?.objects ?? []
   const listed = objects.some((o) => o.id === value.subjectId)
 
   let picker
@@ -112,7 +136,10 @@ export function EventSection({ value, onChange, timezone, setTimezone, savedName
               aria-describedby={error ? 'schedule-trigger-subject-error' : undefined}
               onChange={(e) => set({ subjectId: e.target.value })}>
         <option value="">{objects.length ? TT.subjectPlaceholder(label) : TT.subjectEmpty[kind]}</option>
-        {value.subjectId && !listed && <option value={value.subjectId}>{TT.subjectGone(savedName || value.subjectId)}</option>}
+        {/* 一页没列完时不在列表里不等于不存在：写保存时记下的名字，不标「已不存在」 */}
+        {value.subjectId && !listed && (
+          <option value={value.subjectId}>{paged ? savedName || value.subjectId : TT.subjectGone(savedName || value.subjectId)}</option>
+        )}
         {objects.map((o) => (
           <option key={o.id} value={o.id} disabled={!o.ok && o.id !== value.subjectId} data-trigger-object-ok={String(o.ok)}>
             {o.ok || !o.reason ? o.name : TT.subjectNotOk(o.name, o.reason)}
@@ -140,7 +167,17 @@ export function EventSection({ value, onChange, timezone, setTimezone, savedName
       </div>
 
       <Field label={label} htmlFor="schedule-trigger-subject" required>
+        {paged && (
+          <input type="search" className="field mb-1.5" value={search.q} data-trigger-subject-search=""
+                 placeholder={TT.subjectSearch(label)} aria-label={TT.subjectSearch(label)}
+                 aria-describedby="schedule-trigger-subject-search-hint" onChange={(e) => search.setQ(e.target.value)} />
+        )}
         {picker}
+        {paged && (
+          <p id="schedule-trigger-subject-search-hint" className="mt-1 text-2xs leading-relaxed text-faint">
+            {search.objects && !search.objects.length ? TT.subjectSearchNone : TT.subjectSearchHint}
+          </p>
+        )}
       </Field>
       {error && (
         <div id="schedule-trigger-subject-error" className="-mt-1.5 text-2xs leading-relaxed text-[var(--err)]" role="alert"

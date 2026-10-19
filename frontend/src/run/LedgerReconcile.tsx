@@ -84,7 +84,12 @@ export function ReconcileDialog({ runId, action, related, onClose }: {
     } catch (e) {
       if (e instanceof ApiError && e.code === NEEDS_PAIRS) {
         const raw = (e.body as { options?: LedgerPairOptions } | undefined)?.options
-        if (raw && Array.isArray(raw.columns) && Array.isArray(raw.metrics)) setOptions(raw)
+        if (raw && Array.isArray(raw.columns) && Array.isArray(raw.metrics)) {
+          setOptions(raw)
+          // 逐格证明了的那几列预选上（人可以改）；已经选过的不盖掉
+          const picks = (raw.suggested ?? []).filter((s) => raw.columns.includes(s.ours) && raw.metrics.some((m) => m.id === s.metric))
+          if (picks.length) setPairs((p) => ({ ...Object.fromEntries(picks.map((s) => [s.ours, s.metric])), ...p }))
+        }
         setProblem(e.message)
       } else if (e instanceof ApiError && e.code === CHECK_INPUTS) {
         setEditing(true)
@@ -152,7 +157,9 @@ export function ReconcileDialog({ runId, action, related, onClose }: {
         {options && (
           <section data-ledger-pairs="">
             <div className="mb-1 text-2xs font-medium text-faint">{LEDGER_UI.reconcile.pairs}</div>
-            <p className="mb-1.5 text-2xs text-dim">{LEDGER_UI.reconcile.pairsHint}</p>
+            <p className="mb-1.5 text-2xs text-dim">
+              {options.suggested?.length ? LEDGER_UI.reconcile.pairsSuggested : LEDGER_UI.reconcile.pairsHint}
+            </p>
             <div className="space-y-1.5">
               {options.columns.map((col) => (
                 <label key={col} className="flex items-center gap-2 text-2xs">
@@ -165,6 +172,9 @@ export function ReconcileDialog({ runId, action, related, onClose }: {
                       <option key={m.id} value={m.id}>{m.name}{m.unit ? `（${m.unit}）` : ''}</option>
                     ))}
                   </select>
+                  {options.suggested?.some((s) => s.ours === col && s.metric === pairs[col]) && (
+                    <span className="chip shrink-0" data-ledger-pair-suggested={col}>{LEDGER_UI.reconcile.pairSuggestedTag}</span>
+                  )}
                 </label>
               ))}
             </div>

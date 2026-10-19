@@ -121,12 +121,17 @@ function Metrics({ payload, onOpen }: { payload: Partial<RecallTaskPayload>; onO
         </thead>
         <tbody>
           {metrics.map((m) => (
-            <tr key={m.k} className="border-t" data-recall-metric={m.metric} data-changed={m.changed ? 'true' : 'false'}>
+            <tr key={m.k} className="border-t" data-recall-metric={m.metric}
+                data-changed={m.row_order === 'unstable' ? 'unknown' : m.changed ? 'true' : 'false'}>
               <td className="px-2 py-1">
                 {m.name}
-                <span className="ml-1 text-faint" style={m.changed ? { color: 'var(--st-waiting)' } : undefined}>
-                  {m.changed ? T.changed : T.same}
-                </span>
+                {m.row_order === 'unstable' ? (
+                  <span className="ml-1 text-faint" title={T.rowOrderHint} data-recall-row-order="">{T.rowOrder}</span>
+                ) : (
+                  <span className="ml-1 text-faint" style={m.changed ? { color: 'var(--st-waiting)' } : undefined}>
+                    {m.changed ? T.changed : T.same}
+                  </span>
+                )}
               </td>
               {(['old', 'new', 'diff'] as const).map((side, i) => (
                 <td key={side} className="px-2 py-1 text-right">

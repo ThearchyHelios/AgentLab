@@ -1431,3 +1431,56 @@ def test_values_the_agent_found_are_masked_in_the_rationale_when_the_report_fill
                             rationale=doc, usage={}, masked_values=seen.pooled())
     masked = challenge_mod._masked_rationale(outcome, secrets, given=[])
     assert masked.result["rationale"] == "号码 已遮罩 的客户在华南。"
+
+
+# --------------------------------------------------------------------------
+# 子工作流里的反方审稿
+# --------------------------------------------------------------------------
+
+
+async def _in_subworkflow(spec: dict) -> dict:
+    """把 spec 发布成子工作流，父图：开始 → 子工作流 → 成果。"""
+    from tests import ledger_samples as S
+
+    sub_id = await S.publish("周报子流程", graph=spec, level="draft")
+    return chain(node("start", "input"), node("sub", "subgraph", "周报子流程", workflow_id=sub_id, workflow_version=1),
+                 node("top", "output", fields=[{"name": "周报", "value": "{{ nodes.sub.output.周报 }}"}]))
+
+
+async def test_a_challenge_inside_a_subworkflow_names_the_report_by_its_run_id(monkeypatch, shop):
+    """子工作流里的报告在父运行里按全局 id（「sub/write」）记（report.checked、报告文档）：审稿记录也按它记，证据面板点开
+    子图里那份报告的句子时认得出审它的那次审稿，不再因为记的是子图里的 id（write）对不上、什么都不显示。"""
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import app
+
+    Models(monkeypatch, shop)
+    row = await finish(await _in_subworkflow(graph(shop, contract=False)), run_class="exploratory")
+    assert row.status == "succeeded", row.error
+    out = await output_of(row.id, "sub/chal")
+    record = artifact_store.load(out["challenge_artifact"])
+    [checked] = await events(row.id, "report.checked", "sub/write")
+    assert (record["report"], record["doc_artifact"]) == ("sub/write", checked.data["doc_artifact"])
+    doc = artifact_store.load(checked.data["doc_artifact"])
+    south = unit_of(doc, SOUTH)
+    seg = next(s for _, u in iter_units(doc) if u["id"] == south
+               for s in u.get("segments") or [] if s.get("kind") != "structural")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.get(f"/api/runs/{row.id}/evidence/segments/{seg['id']}?report=sub/write")
+    assert res.status_code == 200, res.text
+    challenge = res.json()["unit"].get("challenge") or {}
+    assert (challenge.get("verdict"), challenge.get("node_id")) == ("refuted", "sub/chal")
+
+
+async def test_an_approval_inside_a_subworkflow_points_at_the_report_by_its_run_id(monkeypatch, shop):
+    """子工作流里「报告 → 反方审稿 → 人工审批」：审批卡上的报告按这次运行里的 id 记（「sub/write」），审批卡据此打开证据面板，
+    反方审稿的概况照样带上。"""
+    Models(monkeypatch, shop)
+    row = await finish(await _in_subworkflow(gated(shop)), run_class="exploratory",
+                       statuses=("interrupted", "failed", "succeeded"))
+    assert row.status == "interrupted", row.error
+    async with SessionLocal() as session:
+        approval = (await session.execute(select(Approval).where(Approval.run_id == row.id))).scalar_one()
+    [report] = approval.payload["reports"]
+    assert report["node_id"] == "sub/write"
+    assert report["challenge"]["counts"]["refuted"] == 1

@@ -223,9 +223,13 @@ class _Sealed:
         当「已封存」展示——只看 sealed 的消费方会把一条断掉的封存链画成绿的。"""
         return self.sealed and self.seal["ok"] is True
 
-    def nodes_of(self, node_type: str) -> list[str]:
-        return [str(n.get("id")) for n in self.graph.get("nodes") or []
-                if isinstance(n, dict) and n.get("type") == node_type]
+    def nodes_of(self, node_type: str, *, nested: bool = False) -> list[str]:
+        """这次运行的图上这一类的节点；nested 为真时连子工作流里跑过的一起给（「子工作流节点 id/…」，类型照 node.started 记的）。"""
+        out = [str(n.get("id")) for n in self.graph.get("nodes") or []
+               if isinstance(n, dict) and n.get("type") == node_type]
+        if nested:
+            out += [nid for nid, kind in self.types.items() if "/" in nid and kind == node_type]
+        return out
 
     def payload_of(self, node_ids: list[str]) -> dict[str, Any] | None:
         """这几个节点里最后跑完的那个的产出，从封存的事件指向的工件里取。"""
@@ -1764,7 +1768,8 @@ def _reviews(sealed: _Sealed, report: _Report
     审稿记录和计数，按它认（只认审稿记录存上了的），产出拼成 {challenge_artifact, counts, on_refuted: fail}。运行因此
     失败了，被推翻的是哪几句、反方凭什么，证据面板里照样看得到。
     """
-    reviewers = set(sealed.nodes_of("challenge"))
+    # 子工作流里的反方审稿也认（「sub/chal」）：它审的是子工作流里那份报告（审稿记录按全局 id 记，「sub/write」）
+    reviewers = set(sealed.nodes_of("challenge", nested=True))
     if not reviewers:
         return
     spec: GraphSpec | None = None
@@ -1843,7 +1848,8 @@ def _challenge_of(sealed: _Sealed, report: _Report, unit_id: str) -> dict[str, A
         unreviewed = output.get("unreviewed")
         found = {"verdict": verdict, "node_id": node_id, "artifact": artifact,
                  "on_refuted": str(output.get("on_refuted") or "degrade"),
-                 "report_label": writer.title if writer else report.node_id,
+                 # 子工作流里的报告（「sub/write」）不在运行的图上：写「子工作流 › 报告」，不写内部 id
+                 "report_label": writer.title if writer else _node_label(sealed, report.node_id),
                  "counts": _challenge_counts(output.get("counts"), claims),
                  **({"unreviewed": unreviewed} if isinstance(unreviewed, int) and not isinstance(unreviewed, bool)
                     and unreviewed >= 0 else {})}

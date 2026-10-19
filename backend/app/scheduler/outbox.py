@@ -273,12 +273,10 @@ async def route(now: datetime | None = None) -> int:
                                              .limit(ROUTE_BATCH))).scalars())
         if not events:
             return 0
-        rows = (await session.execute(select(Schedule.id, Schedule.trigger, Schedule.target_kind).where(
-            Schedule.trigger_kind == "event", Schedule.enabled.is_(True)))).all()
-    listeners = [(sid, trigger) for sid, trigger, kind in rows if (kind or "workflow") == "workflow"]
+        listening = await listeners(session, events)
     routed = 0
     for ev in events:
-        matched = [sid for sid, trigger in listeners if triggers.matches(trigger, ev.event, ev.subject_id, ev.payload)]
+        matched = [sid for sid, trigger in listening if triggers.matches(trigger, ev.event, ev.subject_id, ev.payload)]
         try:
             async with SessionLocal() as session:
                 # 条件 UPDATE 认领：两拍撞在一起（以后多开了进程）只有一拍改得动这一行
@@ -296,6 +294,28 @@ async def route(now: datetime | None = None) -> int:
         except Exception:  # noqa: BLE001 - 一条出错（任务刚被删掉、外键）不拖住别的，下一拍再派
             logger.exception("派发事件 %s 时出错", ev.id)
     return routed
+
+
+def _listening_to(pairs: Any) -> Any:
+    """触发条件监听着这几对（事件种类, 对象）的事件触发任务的 WHERE 条件：按触发条件里的事件种类和对象筛（SQLAlchemy 的通用
+    JSON 访问，各库都能用），不把全部事件触发任务读出来。pairs 是 {事件种类: {对象 id…}}。"""
+    from sqlalchemy import and_, false, or_
+
+    conds = [and_(Schedule.trigger["event"].as_string() == kind,
+                  Schedule.trigger[triggers.SUBJECT_KEY[kind]].as_string().in_(sorted(subjects)))
+             for kind, subjects in pairs.items() if kind in triggers.SUBJECT_KEY and subjects]
+    return or_(*conds) if conds else false()
+
+
+async def listeners(session: Any, events: list[TriggerEvent]) -> list[tuple[str, dict[str, Any]]]:
+    """这几条事件可能派给的任务：启用着的、指向工作流的事件触发任务里，触发条件的事件种类和对象对得上的 [(任务 id, 触发条件)]。
+    过滤条件（应用、来源、期次……）由 triggers.matches 逐条再判。"""
+    pairs: dict[str, set[str]] = {}
+    for ev in events:
+        pairs.setdefault(ev.event, set()).add(ev.subject_id)
+    rows = (await session.execute(select(Schedule.id, Schedule.trigger, Schedule.target_kind).where(
+        Schedule.trigger_kind == "event", Schedule.enabled.is_(True), _listening_to(pairs)))).all()
+    return [(sid, trigger) for sid, trigger, kind in rows if (kind or "workflow") == "workflow"]
 
 
 async def fire_waiting(now: datetime | None = None) -> list[ScheduleFire]:
@@ -382,6 +402,7 @@ async def _drain(schedule_id: str, now: datetime) -> list[ScheduleFire]:
         missed = [w for w in due if (now - w.due).total_seconds() > limit]
         timely = [w for w in due if w not in missed]
         outputs = {id(w): await _outputs_of(session, w.events[-1]) for w in timely}
+    await _clear_of_earlier_fires(schedule_id, timely)
     out: list[ScheduleFire] = []
     if missed:
         fire = await _skip_missed(schedule_id, missed, tz, grace)
@@ -394,6 +415,32 @@ async def _drain(schedule_id: str, now: datetime) -> list[ScheduleFire]:
             out.append(fire)
             await _close_window([w], fire.id)
     return out
+
+
+async def _clear_of_earlier_fires(schedule_id: str, wins: list[_Window]) -> None:
+    """要发起的窗口的结束时刻（fire_at）和这个任务已经有的另一次事件触发撞在同一刻（别的期次的窗口早一拍发了，结束时刻相同）
+    时往后挪 1 微秒，直到不撞：service.fire_once 按 (任务, fire_at, kind) 认「已经处理过」，撞上了就交回已有的那一条，这个
+    窗口的几条事件会被记到别人的触发上、不再发起。已有的那次触发里有这个窗口的事件（两拍撞在一起处理了同一个窗口）的不挪：
+    那就是同一次，交回已有的那一条是对的。"""
+    from app.scheduler import service
+
+    if not wins:
+        return
+    lo, hi = min(w.due for w in wins), max(w.due for w in wins) + timedelta(seconds=1)
+    async with SessionLocal() as session:
+        rows = (await session.execute(select(ScheduleFire.fire_at, ScheduleFire.inputs).where(
+            ScheduleFire.schedule_id == schedule_id, ScheduleFire.kind == "event",
+            ScheduleFire.fire_at >= lo, ScheduleFire.fire_at <= hi))).all()
+    taken: dict[datetime, set[str]] = {}
+    for at, inputs in rows:
+        brief = (inputs or {}).get("event") if isinstance(inputs, dict) else None
+        ids = brief.get("event_ids") if isinstance(brief, dict) else None
+        taken.setdefault(service.as_utc(at), set()).update(str(i) for i in ids or [])
+    for w in sorted(wins, key=lambda w: w.due):
+        mine = {ev.id for ev in w.events}
+        while w.due in taken and not taken[w.due] & mine:
+            w.due += timedelta(microseconds=1)
+        taken.setdefault(w.due, set()).update(mine)
 
 
 def _event_fire(events: list[TriggerEvent], tz: str, outputs: dict[str, Any]) -> EventFire:
@@ -491,17 +538,57 @@ async def _clean(now: datetime) -> None:
 
 
 async def pending_for(session: Any, schedule: Schedule) -> dict[str, Any]:
-    """一个事件触发任务现在有几条事件在等：events 还没派发的（调度关着时一直留在这里）、waiting 已经派给它、在去抖窗口里的；
-    due_at 是窗口结束、会合成一次触发的时刻（没有在等的为空）。"""
-    trigger = schedule.trigger if isinstance(schedule.trigger, dict) else {}
-    subject, event = triggers.subject_of(trigger), trigger.get("event") or ""
-    rows = (await session.execute(select(TriggerEvent.payload).where(
-        TriggerEvent.status == "pending", TriggerEvent.event == event, TriggerEvent.subject_id == subject)
-        .limit(ROUTE_BATCH))).scalars() if subject else []
-    unrouted = sum(1 for payload in rows if triggers.matches(trigger, event, subject, payload))
-    waiting, first = (await session.execute(select(func.count(), func.min(TriggerDelivery.occurred_at)).where(
-        TriggerDelivery.schedule_id == schedule.id, TriggerDelivery.status == "pending"))).one()
+    """一个事件触发任务现在有几条事件在等（见 pending_for_many）。"""
+    return (await pending_for_many(session, [schedule]))[schedule.id]
+
+
+async def pending_for_many(session: Any, schedules: list[Schedule]) -> dict[str, dict[str, Any]]:
+    """几个事件触发任务各有几条事件在等，一次查齐（定时任务列表每行都要，不再每行各查一次）：任务 id → {events, waiting, due_at}。
+
+    events 是还没派发的（调度关着时一直留在这里）；waiting 是已经派给它、在去抖窗口里的；due_at 是最早那个窗口结束、会合成
+    一次触发的时刻（没有在等的为空）。等着的时候任务改了条件、已经不合条件的（下一拍会标 dropped、不再派发）不算：窗口按剩下的
+    最早一条起算，和派发时（_drain）切的窗口一样。待派发数按任务分组一条 SQL 算；窗口要看事件内容，等着的那几条一次读出来。"""
     from app.scheduler import service
 
-    due = service.as_utc(first) + timedelta(seconds=triggers.debounce_of(trigger)) if first is not None else None
-    return {"events": unrouted, "waiting": int(waiting or 0), "due_at": due.isoformat() if due else None}
+    rows = [s for s in schedules if s is not None]
+    out = {s.id: {"events": 0, "waiting": 0, "due_at": None} for s in rows}
+    if not rows:
+        return out
+    trig = {s.id: s.trigger if isinstance(s.trigger, dict) else {} for s in rows}
+    ids = list(out)
+    counts = dict((await session.execute(select(TriggerDelivery.schedule_id, func.count()).where(
+        TriggerDelivery.schedule_id.in_(ids), TriggerDelivery.status == "pending")
+        .group_by(TriggerDelivery.schedule_id))).all())
+    waiting = (await session.execute(
+        select(TriggerDelivery.schedule_id, TriggerDelivery.id, TriggerDelivery.created_at, TriggerEvent)
+        .join(TriggerEvent, TriggerEvent.id == TriggerDelivery.event_id)
+        .where(TriggerDelivery.schedule_id.in_([i for i in ids if counts.get(i)]), TriggerDelivery.status == "pending")
+        .order_by(TriggerDelivery.occurred_at, TriggerEvent.created_at).limit(DRAIN_BATCH))).all() if counts else []
+    by: dict[str, list[tuple[str, TriggerEvent, datetime]]] = {}
+    stale: dict[str, int] = {}
+    for sid, did, routed, ev in waiting:
+        if triggers.matches(trig[sid], ev.event, ev.subject_id, ev.payload):
+            by.setdefault(sid, []).append((did, ev, service.as_utc(routed)))
+        else:
+            stale[sid] = stale.get(sid, 0) + 1
+    for sid in ids:
+        out[sid]["waiting"] = max(int(counts.get(sid) or 0) - stale.get(sid, 0), 0)
+        wins = windows(by.get(sid, []), triggers.debounce_of(trig[sid]))
+        if wins:
+            out[sid]["due_at"] = min(w.due for w in wins).isoformat()
+    pairs: dict[str, set[str]] = {}
+    for sid in ids:
+        if subject := triggers.subject_of(trig[sid]):
+            pairs.setdefault(str(trig[sid].get("event") or ""), set()).add(subject)
+    if pairs:
+        from sqlalchemy import and_, or_
+
+        cond = or_(*[and_(TriggerEvent.event == kind, TriggerEvent.subject_id.in_(sorted(subs)))
+                     for kind, subs in pairs.items()])
+        unrouted = (await session.execute(select(TriggerEvent.event, TriggerEvent.subject_id, TriggerEvent.payload)
+                                          .where(TriggerEvent.status == "pending", cond).limit(ROUTE_BATCH))).all()
+        for kind, subject, payload in unrouted:
+            for sid in ids:
+                if triggers.matches(trig[sid], kind, subject, payload):
+                    out[sid]["events"] += 1
+    return out
