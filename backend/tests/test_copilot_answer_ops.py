@@ -151,7 +151,14 @@ async def test_the_sse_output_is_unchanged_but_for_a_trailing_usage(client, monk
     assert [(op.pop("next"), op.pop("code", None)) for op in errors] == \
         ([ERROR_NEXT[name]] if name in ERROR_NEXT else [])
     for op in errors:
-        assert op["message"] == f"助手本轮未完成：{op.pop('reason')}", op
+        reason = op.pop("reason")
+        if name == "no_ops":
+            # 一个操作都没给：原因是重来时交给助手的那句纠正，诊断（不含原文）写进 detail、diagnostics，别的照旧
+            assert "每个操作单独一行" in reason and op.pop("diagnostics")["dropped"] == {"不是 JSON 对象": 1}, op
+            assert op["detail"].startswith("结束原因"), op
+            op["detail"] = ""
+        else:
+            assert op["message"] == f"助手本轮未完成：{reason}", op
     assert got[:-1] == expected
 
 

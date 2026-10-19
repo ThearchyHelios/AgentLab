@@ -191,13 +191,14 @@ class ChatDriver(TurnDriver):
         finally:
             await self._flush_thinking()
 
-    async def on_retry(self, reason: str, *, kind: str, base_graph: dict[str, Any] | None) -> None:
+    async def on_retry(self, reason: str, *, kind: str, base_graph: dict[str, Any] | None,
+                       detail: str | None = None) -> None:
         from app.chat import turn as policy
 
         # 换下来的那次运行交出去并进 earlier；这一次从「还没有运行」起，收尾时不再把它当这一次的运行记一遍
         run, self.last_run = (self.last_run if kind == "review" else None), None
         await self.execution.retrying(reason, kind=kind, base=policy.has_nodes(base_graph), attempt=self.turn.attempts,
-                                      run=run)
+                                      run=run, detail=detail)
 
     async def run_input(self, session: AsyncSession, graph: dict[str, Any]) -> dict[str, Any]:
         """入口填问题和这一轮之前的几轮问答（conversations.run_history，同以前页面上的 historyOf）：重试、重新运行较早的
@@ -364,13 +365,16 @@ class ChatTurnExecution(runtime.JobRun):
                         meta={"runId": run.id, "runClass": run.run_class, "runStatus": run.status})
         await self.emit("run", {"run_id": run.id, "status": run.status, "run_class": run.run_class})
 
-    async def retrying(self, reason: str, *, kind: str, base: bool, attempt: int, run: Any = None) -> None:
-        """自动重来一次：换下来的那次运行的用量并进 earlier；这一行回到「还没有运行」。"""
+    async def retrying(self, reason: str, *, kind: str, base: bool, attempt: int, run: Any = None,
+                       detail: str | None = None) -> None:
+        """自动重来一次：换下来的那次运行的用量并进 earlier；这一行回到「还没有运行」。detail：生成过程一个操作都没给时的
+        诊断（结束原因、正文和思考的长度、跳过的行……，不含原文），随 turn.retry 事件记下。"""
         ops: list[tuple[Any, ...]] = [("set", "run", record.usage_total(run.usage) or {})] if run is not None else []
         self.run_id = None
         await self._job(attempt=attempt, run_id=None)
         usage = await self.save(run_id=None, meta={"runId": None, "runStatus": None}, usage=[*ops, ("retire",)])
-        await self.emit("turn.retry", {"kind": kind, "reason": reason, "base": base, "attempt": attempt, "usage": usage})
+        await self.emit("turn.retry", {"kind": kind, "reason": reason, "base": base, "attempt": attempt, "usage": usage,
+                                       **({"detail": detail} if detail else {})})
 
     # ---------------- 执行 ----------------
 

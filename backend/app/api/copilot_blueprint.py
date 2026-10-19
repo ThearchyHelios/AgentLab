@@ -321,8 +321,7 @@ async def blueprint_stream(payload: BlueprintStreamIn, session: AsyncSession = D
                                   meta={"looks": looks.records})
                 return
             if gen.asked is None and gen.done is None and not applier.effective:
-                raise copilot.CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
-                                                hint="蓝图未修改。可以重试，或把需求描述得更具体")
+                raise gen.empty(hint="蓝图未修改。可以重试，或把需求描述得更具体")
             async for op in copilot._with_heartbeat(gen.repair(), phase="repairing", started=started):
                 yield _sse(op)
             remaining = await checker.issues() if gen.asked is None else []

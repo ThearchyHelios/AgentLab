@@ -163,15 +163,27 @@ async def test_a_cut_in_the_middle_of_the_ops_is_not_delivered_as_done(client, m
 
 
 async def test_output_that_parses_to_nothing_is_an_error(client, monkeypatch):
-    """格式跑偏（整段放进 markdown 围栏、JSON 分了行），每一行都被跳过：一个操作都没有，也没有 done。"""
-    pretty = "```json\n" + json.dumps({"op": "add_node", "node": {"id": "yoy", "type": "llm"}}, indent=2) + "\n```\n"
-    model = _Scripted([AIMessageChunk(content=pretty),
+    """格式跑偏（只写了说明文字、没有一行是操作），每一行都被跳过：一个操作都没有，也没有 done。诊断写明跳过了几行。"""
+    model = _Scripted([AIMessageChunk(content="先看一下表结构，\n再决定怎么搭。\n"),
                        AIMessageChunk(content="", response_metadata={"finish_reason": "stop"})])
     events = await _events(client, monkeypatch, model)
     kinds = _kinds(events)
     assert "final" not in kinds
     [err] = [e for e in events if e["op"] == "error"]
     assert err["message"].startswith("助手本轮未完成：") and "画布未修改" in err["hint"]
+    assert "跳过 2 行：2 行不是完整的 JSON" in err["detail"] and "先看一下表" not in err["detail"], err
+
+
+async def test_a_pretty_printed_op_in_a_fence_is_read(client, monkeypatch):
+    """整段放进 markdown 围栏、JSON 分了行：以前每一行都被跳过、报一个操作都没有；现在攒成一个操作照常落地。"""
+    pretty = "```json\n" + json.dumps({"op": "add_node", "node": {"id": "yoy", "type": "llm", "label": "同比",
+                                                                   "config": {"prompt": "算同比"}}},
+                                        indent=2, ensure_ascii=False) + "\n```\n"
+    model = _Scripted([AIMessageChunk(content=pretty),
+                       AIMessageChunk(content="", response_metadata={"finish_reason": "stop"})])
+    events = await _events(client, monkeypatch, model)
+    assert "error" not in _kinds(events), events
+    assert any(e["op"] == "add_node" and e["node"]["id"] == "yoy" for e in events)
 
 
 async def test_a_model_that_says_done_without_changes_is_still_unchanged(client, monkeypatch):

@@ -163,7 +163,8 @@ class TurnDriver:
     async def on_op(self, op: dict[str, Any]) -> None:
         """生成过程的每一条操作（含思考、心跳），收下之前先交给这里。"""
 
-    async def on_retry(self, reason: str, *, kind: str, base_graph: dict[str, Any] | None) -> None:
+    async def on_retry(self, reason: str, *, kind: str, base_graph: dict[str, Any] | None,
+                       detail: str | None = None) -> None:
         """要自动重来一次了（kind：empty 生成过程一个操作都没给、blocked 没过检查、review 复核判不可用）。"""
 
     def prepare_graph(self, graph: dict[str, Any]) -> dict[str, Any]:
@@ -338,11 +339,14 @@ class TurnDriver:
                         # 生成过程一个操作都没给（只写了思考）：按重来一次的规矩带着原因重来（chat/turn.next_step）
                         step = terminal.get("next") or policy.next_step(terminal)
                         if step == policy.NEXT_RETRY and t.attempts + 1 < policy.MAX_ATTEMPTS:
+                            # 原因是生成过程给的那句纠正（只写了思考、格式跑偏、用了工具调用……），附在问题后面重来，
+                            # 不原样重发；诊断（error 的 detail）随重来的事件记下
                             reason = policy.error_reason(terminal)
                             t.attempts += 1
                             t.retries.append(reason)
-                            instruction = policy.retry_instruction(self.question, reason, policy.has_nodes(base_graph))
-                            await self.on_retry(reason, kind="empty", base_graph=base_graph)
+                            instruction = policy.empty_retry_instruction(self.question, reason)
+                            await self.on_retry(reason, kind="empty", base_graph=base_graph,
+                                                detail=str(terminal.get("detail") or "") or None)
                             continue
                         t.path, t.reason, t.copilot_failed = "build_failed", str(terminal.get("message") or "助手本轮未完成"), True
                         return t

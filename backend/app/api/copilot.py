@@ -933,9 +933,11 @@ async def generate(
         async for _op in gen.draft(human):
             pass
         if applier.replied is None and gen.asked is None and all(o.get("op") == "plan" for o in applier.seen):
-            raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因")
+            raise gen.empty()
     except Exception as e:  # noqa: BLE001
         reason, _ = explain_error(e)
+        if isinstance(e, CopilotIncomplete) and e.detail:
+            reason = f"{reason}；{e.detail}"
         raise HTTPException(
             502, f"模型未返回可用的工作流（{reason}）。请换一种描述重试；如反复出现，"
                  "请在输入框的「助手使用的模型」中换用指令遵循能力更强的模型",
@@ -1770,11 +1772,13 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
             if gen.asked is None and all(o.get("op") == "plan" for o in applier.seen):
                 # 只写了思考（deepseek 这类推理模型偶发）、或者格式跑偏：带机读码，问数据页和评测按 chat/turn 的规矩自动
                 # 重来一次（error.next = retry），还不行再照实报
-                raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
-                                        hint="画布未修改。可以重试，或把需求描述得更具体", code=turn.EMPTY_GENERATION)
+                # 错误详情里记诊断（结束原因、正文和思考的长度、跳过的行和原因、工具调用……，不记原文），重来时交给助手的
+                # 原因换成一句纠正（Generation.empty）
+                raise gen.empty(hint="画布未修改。可以重试，或把需求描述得更具体")
         except CopilotIncomplete as e:
             failed = {"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail,
-                      "reason": str(e), **({"code": e.code} if e.code else {})}
+                      "reason": e.correction or str(e), **({"code": e.code} if e.code else {}),
+                      **({"diagnostics": e.diagnostics} if e.diagnostics else {})}
             yield {**failed, "next": turn.next_step(failed)}
             return
         except Exception as e:  # noqa: BLE001
@@ -2456,8 +2460,7 @@ async def app_stream(payload: AppStreamIn, session: AsyncSession = Depends(get_s
                 return
             if gen.asked is None and gen.done is None and not applier.effective:
                 # 流正常结束，却没有 done、也没有一个操作落地：不能按「无需修改」交付
-                raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
-                                        hint="应用草稿未修改。可以重试，或把要求描述得更具体")
+                raise gen.empty(hint="应用草稿未修改。可以重试，或把要求描述得更具体")
             async for op in _with_heartbeat(gen.repair(), phase="repairing"):
                 yield _sse(op)
             remaining = await checker.issues()
