@@ -766,7 +766,19 @@ ensure_pg_image() {
 ensure_network() {
   docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 && return 0
   say "创建 docker 网络 ${DOCKER_NETWORK}（PostgreSQL 只在这个网络里可见，端口不对外）"
-  docker network create "$DOCKER_NETWORK" >/dev/null
+  docker network create --label agentlab.role=network --label "agentlab.deployment=$DEPLOY_ID" "$DOCKER_NETWORK" >/dev/null
+}
+
+# 网络是不是这个部署建的：标签和部署编号对得上；早先建的没有标签，按数据目录里记着的网络名认
+network_is_ours() {
+  local role dep
+  role="$(docker network inspect -f '{{index .Labels "agentlab.role"}}' "$DOCKER_NETWORK" 2>/dev/null || true)"
+  dep="$(docker network inspect -f '{{index .Labels "agentlab.deployment"}}' "$DOCKER_NETWORK" 2>/dev/null || true)"
+  if [ -n "$role$dep" ]; then
+    [ "$role" = network ] && [ -n "$DEPLOY_ID" ] && [ "$dep" = "$DEPLOY_ID" ]
+  else
+    [ -n "$DATA_ABS" ] && [ "$(state_value network)" = "$DOCKER_NETWORK" ]
+  fi
 }
 
 pg_secrets() {
@@ -1271,8 +1283,12 @@ cmd_uninstall() {
     fi
   fi
   if docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
-    docker network rm "$DOCKER_NETWORK" >/dev/null 2>&1 && say "删除 docker 网络 $DOCKER_NETWORK" \
-      || warn "docker 网络 $DOCKER_NETWORK 没删掉（可能还有别的容器连着）"
+    if network_is_ours; then
+      docker network rm "$DOCKER_NETWORK" >/dev/null 2>&1 && say "删除 docker 网络 $DOCKER_NETWORK" \
+        || warn "docker 网络 $DOCKER_NETWORK 没删掉（可能还有别的容器连着）"
+    else
+      echo "docker 网络 $DOCKER_NETWORK 不是这个部署建的（没有这个部署的标签，数据目录里也没记着它），没有删"
+    fi
   fi
   if [ -n "$PURGE_IMAGE" ]; then
     if image_present; then

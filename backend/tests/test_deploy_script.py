@@ -701,6 +701,35 @@ def test_an_unlabelled_container_is_recognised_by_its_password_mount(tmp_path):
     assert PG in a.containers() and "没有删它" in out.stderr
 
 
+def test_uninstall_removes_only_its_own_network(tmp_path):
+    """复核 R-d3：网络带着部署编号的标签，卸载时只删自己建的；早先建的没标签，按数据目录里记着的网络名认。"""
+    a = Deploy(tmp_path / "a")
+    a("install", "--postgres")
+    dep = a.state_values()["id"]
+    assert a.state()["networks"][NET] == {"agentlab.role": "network", "agentlab.deployment": dep}
+    # 别人建的、名字正好一样的网络（没有这个部署的标签）：不删
+    state = a.state()
+    state["networks"][NET] = {"agentlab.role": "network", "agentlab.deployment": "someone-else"}
+    a.state_file.write_text(json.dumps(state))
+    out = a("uninstall")
+    assert NET in a.state()["networks"] and "不是这个部署建的" in out.stdout
+    # 早先建的、没标签的：数据目录里记着这个名字就是自己的
+    state = a.state()
+    state["networks"][NET] = {}
+    a.state_file.write_text(json.dumps(state))
+    a("install")
+    a("uninstall")
+    assert NET not in a.state()["networks"]
+    # 没标签、数据目录里也没记着的（比如这是个 SQLite 部署，同名网络是别人的）：不删
+    b = Deploy(tmp_path / "b", name="agl-b", share=a)
+    b("install")
+    state = b.state()
+    state["networks"]["agl-b-net"] = {}
+    b.state_file.write_text(json.dumps(state))
+    b("uninstall")
+    assert "agl-b-net" in b.state()["networks"]
+
+
 def test_upgrade_with_a_new_image_does_not_recreate_another_deployments_container(tmp_path):
     a = Deploy(tmp_path / "a")
     a("install", "--postgres")
