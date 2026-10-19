@@ -159,11 +159,14 @@ class Relay:
                                                    .order_by(RunEvent.seq))).scalars())
             last_log = None
             for row in rows:
-                event = RunEventModel(id=row.id, run_id=run_id, seq=row.seq, type=EventType(row.type),
-                                      node_id=row.node_id, ts=row.ts, data=row.data or {})
-                await bus.publish(event, relayed=True)
                 self._cursor[run_id] = max(self._cursor.get(run_id, 0), int(row.seq or 0))
                 last_log = row
+                try:
+                    event = RunEventModel(id=row.id, run_id=run_id, seq=row.seq, type=EventType(row.type),
+                                          node_id=row.node_id, ts=row.ts, data=row.data or {})
+                except ValueError:
+                    continue   # 不认识的事件种类（更新的版本写的）：回放时照样读得到，这里不转
+                await bus.publish(event, relayed=True)
             ended = status is None or status in _TERMINAL or (
                 status == "interrupted" and last_log is not None and last_log.type == EventType.LOG
                 and (last_log.data or {}).get("code") == "server_shutdown")

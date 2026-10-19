@@ -45,7 +45,6 @@ export AGENTLAB_MULTIPROCESS_E2E=1
 echo "测试库：127.0.0.1:${PORT}/${DB}（容器 ${NAME}，结束后删除）"
 
 cd "$ROOT/backend"
-args=("$@")
 # 不并行（-p no:xdist）：工作进程、端口、库都是这一组共用的；-s 让工作进程的日志在失败时看得到
 env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u OPENAI_API_KEY \
-  "$PY" -m pytest tests/test_multiprocess_e2e.py -p no:xdist -p no:randomly -rA "${args[@]}"
+  "$PY" -m pytest tests/test_multiprocess_e2e.py -p no:xdist -p no:randomly -rA "$@"
