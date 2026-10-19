@@ -337,6 +337,63 @@ async def test_stopping_a_run_whose_owner_is_gone_takes_it_over_and_abandons_it(
     assert row.status == "cancelled" and row.end_reason == "stopped"
 
 
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="SQLite 只有一个进程，名额在进程里（复核 R-b3）")
+async def test_a_slot_is_released_under_the_identity_it_was_taken_with(monkeypatch):
+    """复核 R-b10：拿着名额的时候隔离换了身份，放名额照样删得到那一行（按要名额时的身份删），不用等旧身份过期才收回。"""
+    _policy(monkeypatch, 2, interactive=(2, 40))
+    monkeypatch.setattr(identity, "OWNER", identity.OWNER)
+    async with slots.hold("rb10-run", "chat"):
+        identity.regenerate()
+    async with SessionLocal() as session:
+        left = list((await session.execute(select(RunSlot).where(RunSlot.run_id == "rb10-run"))).scalars())
+    assert left == []
+
+
+async def test_registering_again_tidies_up_what_the_retired_identity_left(monkeypatch):
+    """复核 R-b10：隔离之后新身份登记上，旧身份的登记、名额、同源队的位置删掉，当班租约交出，发给它的请求转到新身份名下照办——
+    停止请求对停在断点上的那次运行照停止的规矩收成 cancelled。"""
+    from app.cluster import requests, version
+    from app.cluster import service as service_mod
+    from app.cluster.fence import now as fence_now
+
+    monkeypatch.setattr(identity, "OWNER", identity.OWNER)
+    old = identity.owner()
+    now = utcnow()
+    async with SessionLocal() as session:
+        session.add(ClusterWorker(id=old, host="this-host", pid=1, started_at=now, heartbeat_at=now,
+                                  lease_until=now + timedelta(seconds=60), code_version=version.code_version(),
+                                  schema_version=version.schema_version()))
+        session.add(RunSlot(run_id="retired-slot", klass="interactive", priority=40, owner=old, granted=True,
+                            requested_at=now))
+        session.add(LaneTicket(source_id="src-retired", kind="profile", job_id="retired-job", owner=old, granted=True))
+        session.add(ClusterLease(name="test-retired", owner=old, lease_until=now + timedelta(seconds=60), epoch=1))
+        run = Run(status="interrupted", owner=old, graph={}, input={})
+        session.add(run)
+        await session.flush()
+        session.add(ClusterRequest(owner=old, kind="stop", target="run", target_id=run.id, actor="张工", payload={}))
+        await session.commit()
+    svc = service_mod._Service()
+    svc.retired = [old]
+    identity.regenerate()
+    svc.pending_since = fence_now()
+    await svc.register_again()
+    new = identity.owner()
+    async with SessionLocal() as session:
+        ids = set((await session.execute(select(ClusterWorker.id))).scalars())
+        slot_rows = list((await session.execute(select(RunSlot).where(RunSlot.owner == old))).scalars())
+        lane_rows = list((await session.execute(select(LaneTicket).where(LaneTicket.owner == old))).scalars())
+        lease = await session.get(ClusterLease, "test-retired")
+        sent = list((await session.execute(select(ClusterRequest.owner).where(ClusterRequest.target_id == run.id))).scalars())
+    assert old not in ids and new in ids, "旧身份的登记删掉：别的进程马上按属主不在了接手"
+    assert slot_rows == [] and lane_rows == [] and lease.owner is None
+    assert sent == [new], "发给旧身份的请求转到新身份名下"
+    await requests.drain()
+    await requests.settle()
+    async with SessionLocal() as session:
+        row = await session.get(Run, run.id)
+    assert row.status == "cancelled" and row.end_reason == "stopped", "停止请求照停止的规矩落下了"
+
+
 async def test_leadership_is_handed_over_when_the_lease_runs_out():
     me = leader_mod.Leadership("test-lead")
     assert await me.claim() and me.held()

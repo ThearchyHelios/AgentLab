@@ -196,6 +196,8 @@ class _Holder:
     woke: asyncio.Event = field(default_factory=asyncio.Event)
     #: 还在排队等名额（发下来之前）
     queued: bool = True
+    #: 要名额时本进程的身份（名额行记的属主）：放的时候按它删——隔离之后换了身份也删得到（复核 R-b10）
+    owner: str = ""
 
 
 _holders: dict[str, _Holder] = {}
@@ -341,27 +343,30 @@ async def _granted(run_id: str) -> bool | None:
         return await session.scalar(select(RunSlot.granted).where(RunSlot.run_id == run_id))
 
 
-async def _request(run_id: str, klass: str, priority: int) -> None:
+async def _request(run_id: str, klass: str, priority: int) -> str:
+    """排进名额的队。交回这一行记的属主（本进程此刻的身份）。"""
+    me = identity.owner()
     if _in_memory():
-        _mem[run_id] = _MemRow(run_id, klass, priority, utcnow(), identity.owner())
-        return
+        _mem[run_id] = _MemRow(run_id, klass, priority, utcnow(), me)
+        return me
     from app.db.models_cluster import RunSlot
 
     async with SessionLocal() as session:
         await session.execute(delete(RunSlot).where(RunSlot.run_id == run_id))
-        session.add(RunSlot(run_id=run_id, klass=klass, priority=priority, owner=identity.owner(), granted=False,
+        session.add(RunSlot(run_id=run_id, klass=klass, priority=priority, owner=me, granted=False,
                             requested_at=utcnow()))
         await session.commit()
+    return me
 
 
-async def _release(run_id: str) -> None:
+async def _release(run_id: str, owner: str) -> None:
     if _in_memory():
         _mem.pop(run_id, None)
         return
     from app.db.models_cluster import RunSlot
 
     async with SessionLocal() as session:
-        await session.execute(delete(RunSlot).where(RunSlot.run_id == run_id, RunSlot.owner == identity.owner()))
+        await session.execute(delete(RunSlot).where(RunSlot.run_id == run_id, RunSlot.owner == owner))
         await session.commit()
 
 
@@ -375,7 +380,7 @@ async def hold(run_id: str, origin_kind: str | None) -> AsyncIterator[str]:
     _holders[run_id] = holder
     poll = POLL_S.get(settings.db_dialect, 5.0)
     try:
-        await _request(run_id, klass, priority)
+        holder.owner = await _request(run_id, klass, priority)
         while True:
             holder.woke.clear()
             await grant()
@@ -384,7 +389,7 @@ async def hold(run_id: str, origin_kind: str | None) -> AsyncIterator[str]:
                 holder.queued = False
                 break
             if got is None:
-                await _request(run_id, klass, priority)
+                holder.owner = await _request(run_id, klass, priority)
                 continue
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(holder.woke.wait(), timeout=poll)
@@ -393,7 +398,7 @@ async def hold(run_id: str, origin_kind: str | None) -> AsyncIterator[str]:
         if _holders.get(run_id) is holder:
             _holders.pop(run_id, None)
         try:
-            await asyncio.shield(_release(run_id))
+            await asyncio.shield(_release(run_id, holder.owner or identity.owner()))
         except Exception:  # noqa: BLE001 - 放不掉的名额下次发的时候按「本进程里已经没人用」收回
             logger.exception("运行 %s 的名额没放掉，下次发名额时收回", run_id)
         wake_local()

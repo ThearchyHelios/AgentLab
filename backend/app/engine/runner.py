@@ -1825,8 +1825,9 @@ def _register_requests() -> None:
 
     @requests.handle("stop", "run")
     async def _stop(run_id: str, actor: str | None, _payload: dict[str, Any]) -> None:
-        if run_manager.is_active(run_id):
-            await run_manager.cancel(run_id, actor=actor)
+        # 不在本进程执行的也照停止的规矩办（cancel 自己看属主）：在别的活着的进程里执行就转给它，属主不在了就接手、放弃，停在
+        # 断点上的收成 cancelled，已经结束的什么都不做。隔离之后转到新身份名下的停止请求就是这样落下的（复核 R-b10）
+        await run_manager.cancel(run_id, actor=actor)
 
     @requests.handle("note", "run")
     async def _note(run_id: str, _actor: str | None, payload: dict[str, Any]) -> None:

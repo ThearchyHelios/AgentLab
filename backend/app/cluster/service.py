@@ -221,6 +221,48 @@ class _Service:
         fence.renewed()
         logger.warning("隔离之后换了身份重新登记：%s → %s（之前认领的行由当班进程按「属主不在了」接手）",
                        "、".join(retired), identity.owner())
+        try:
+            await self.tidy_retired(retired)
+        except Exception:  # noqa: BLE001 - 收拾不了的等旧身份的租约过期、按「属主不在了」处理
+            logger.exception("收拾旧身份留下的登记、名额、请求时出错（等它们的租约过期再按属主不在了处理）")
+
+    async def tidy_retired(self, retired: list[str]) -> dict[str, int]:
+        """新身份登记上之后，收拾旧身份留下的（复核 R-b10）：它的执行都已停下、写不了了，不必等它的租约过期——删掉它的登记（别的
+        进程马上按「属主不在了」接手它认领的运行、任务）、它占着的运行名额和同源队的位置，交出它拿着的当班租约；发给它的请求转到
+        新身份名下照办（停止请求对已经不在本进程执行的运行照停止的规矩办：属主不在了就接手、放弃）。"""
+        from sqlalchemy import delete, update
+
+        from app.db.base import SessionLocal
+        from app.db.models_cluster import ClusterLease, ClusterRequest, ClusterWorker, LaneTicket, RunSlot
+
+        if not retired:
+            return {}
+        me = identity.owner()
+        async with SessionLocal() as session:
+            out = {
+                "workers": (await session.execute(delete(ClusterWorker).where(ClusterWorker.id.in_(retired)))).rowcount,
+                "slots": (await session.execute(delete(RunSlot).where(RunSlot.owner.in_(retired)))).rowcount,
+                "lanes": (await session.execute(delete(LaneTicket).where(LaneTicket.owner.in_(retired)))).rowcount,
+                "requests": (await session.execute(update(ClusterRequest).where(ClusterRequest.owner.in_(retired))
+                                                   .values(owner=me).execution_options(synchronize_session=False))).rowcount,
+                "leases": (await session.execute(update(ClusterLease).where(ClusterLease.owner.in_(retired))
+                                                 .values(owner=None, lease_until=None)
+                                                 .execution_options(synchronize_session=False))).rowcount,
+            }
+            await session.commit()
+        out = {k: int(v or 0) for k, v in out.items()}
+        for old in retired:
+            signals.publish("gone", old)
+        if out["slots"]:
+            signals.publish("slot")
+        if out["lanes"]:
+            signals.publish("lane")
+        if out["requests"]:
+            signals.publish("q", me)
+        self.reap_now = True
+        logger.warning("收拾旧身份 %s：删了登记 %d 条、运行名额 %d 个、同源队的位置 %d 个，%d 条发给它的请求转给 %s，交出当班租约 %d 份",
+                       "、".join(retired), out["workers"], out["slots"], out["lanes"], out["requests"], me, out["leases"])
+        return out
 
     # ---------------- 当班、心跳的其余活 ----------------
 
