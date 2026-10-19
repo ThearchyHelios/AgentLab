@@ -59,9 +59,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # （app/cluster/guard.py）。PostgreSQL 可以多进程，什么都不做
     guard.acquire()
     # PgBouncer 事务模式（AGENTLAB_DB_PGBOUNCER=1）要另给直连地址，没给就拒绝启动（db/base.check_pgbouncer）
-    from app.db.base import check_pgbouncer
+    from app.db.base import check_pgbouncer, wait_for_database
 
     check_pgbouncer()
+    # 库还没起来（和 PostgreSQL 容器一起起、库还在初始化）时先按退避等它：下面的版本检查就要连库，不等的话一上来就崩
+    await wait_for_database()
     # 不许新旧版本混跑（app/cluster/version.py）：库里还有活着的、版本不同的进程就不启动——在补列之前看
     from app.cluster import version
 

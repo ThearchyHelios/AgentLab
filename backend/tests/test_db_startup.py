@@ -135,3 +135,27 @@ async def test_a_missing_database_on_a_real_server_is_raised_at_once():
         await engine.dispose()
     assert clock.slept == [], caught.value
     assert "agentlab_no_such_database" in str(caught.value)
+
+
+async def test_startup_waits_for_the_database_before_the_version_check(monkeypatch):
+    """lifespan 里第一次连库的是版本检查（cluster/version.preflight）：等库要在它前面，库的容器晚一步起来时服务不至于直接崩。"""
+    from app.cluster import guard, version
+    from app.db import base
+    from app.main import app, lifespan
+
+    calls: list[str] = []
+
+    async def waited(*_a, **_k) -> None:
+        calls.append("wait")
+
+    async def checked(*_a, **_k) -> None:
+        calls.append("preflight")
+        raise RuntimeError("到这里就够了")
+
+    monkeypatch.setattr(guard, "acquire", lambda: None)
+    monkeypatch.setattr(base, "wait_for_database", waited)
+    monkeypatch.setattr(version, "preflight", checked)
+    with pytest.raises(RuntimeError, match="到这里就够了"):
+        async with lifespan(app):
+            pass
+    assert calls == ["wait", "preflight"]
