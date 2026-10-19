@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from app.core import atomic
 from app.core.config import sanitize_session, settings
 from app.core.errors import describe_exception, raw
 from app.sandbox import interpreter
@@ -194,18 +195,18 @@ class SeatbeltSandbox(Sandbox):
         ext, cmd_of = _LANG[language]
         entry = entry_name(ext)
         workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}")
-        (workdir / entry).write_text(code)
+        atomic.write_text(workdir / entry, code)
 
         for rel, content in (files or {}).items():
             target = (workdir / rel).resolve()
             if not str(target).startswith(str(workdir.resolve())):
                 return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
+            atomic.write_text(target, content)
 
         self._policies.mkdir(parents=True, exist_ok=True)
         policy_file = self._policies / f"{workdir.name}-{language}.sb"
-        policy_file.write_text(build_policy(workdir, language=language, network=limits.network))
+        atomic.write_text(policy_file, build_policy(workdir, language=language, network=limits.network))
 
         argv = [SANDBOX_EXEC, "-f", str(policy_file), *cmd_of(), entry]
 

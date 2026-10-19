@@ -23,6 +23,7 @@ from typing import Any
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from app.core import atomic
 from app.core.config import settings
 
 #: 断言放在这个请求头里
@@ -35,14 +36,13 @@ _KEY_FILE = ".assertion_ed25519.pem"
 @lru_cache(maxsize=1)
 def _private_key() -> Ed25519PrivateKey:
     path = settings.data_dir / _KEY_FILE
-    if path.exists():
-        key = serialization.load_pem_private_key(path.read_bytes(), password=None)
-        assert isinstance(key, Ed25519PrivateKey)
-        return key
-    key = Ed25519PrivateKey.generate()
-    path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                                       serialization.NoEncryption()))
-    path.chmod(0o600)
+    if not path.exists():
+        # 只建一次（core/atomic.create_bytes）：几个进程同时第一次签名，后到的读先到的那一把，验签的一方只认得一把
+        fresh = Ed25519PrivateKey.generate()
+        atomic.create_bytes(path, fresh.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                      serialization.NoEncryption()), mode=0o600)
+    key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+    assert isinstance(key, Ed25519PrivateKey)
     return key
 
 

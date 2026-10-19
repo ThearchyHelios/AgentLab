@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.core import atomic
 from app.core.config import settings
 
 # --------------------------------------------------------------------------
@@ -62,10 +63,9 @@ async def put_json(
     artifact_id = content_hash(text)
     path = _path_of(artifact_id)
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        tmp.rename(path)  # 原子落盘，写一半崩了不会留下半个工件
+        # 原子落盘（core/atomic）：写一半崩了不会留下半个工件；临时文件名带随机后缀，两个进程同时写同一份内容
+        # 各写各的，不会一个把另一个写到一半的截断（以前共用 <id>.tmp，后到的会把先到的半成品改名成正式文件）
+        atomic.write_text(path, text)
 
     async with SessionLocal() as session:
         existing = await session.get(Artifact, (artifact_id, run_id or ""))

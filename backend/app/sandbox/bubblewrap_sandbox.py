@@ -11,6 +11,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+from app.core import atomic
 from app.core.config import settings, sanitize_session
 from app.core.errors import describe_exception, raw
 from app.sandbox import interpreter
@@ -176,13 +177,13 @@ class BubblewrapSandbox(Sandbox):
         entry = entry_name(ext)
         cmd = [*cmd_prefix, f"/work/{entry}"]
         workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}")
-        (workdir / entry).write_text(code)
+        atomic.write_text(workdir / entry, code)
         for rel, content in (files or {}).items():
             target = (workdir / rel).resolve()
             if not str(target).startswith(str(workdir.resolve())):
                 return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
+            atomic.write_text(target, content)
 
         argv = self._argv(workdir, limits, cmd)
         for key, value in (env or {}).items():
