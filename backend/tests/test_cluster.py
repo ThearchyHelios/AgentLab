@@ -640,6 +640,109 @@ async def test_preflight_refuses_a_beating_peer_and_waits_out_a_stale_one():
         await workers.register()
 
 
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="preflight 只在 PostgreSQL 上看")
+async def test_preflight_names_every_live_process_of_another_version():
+    """复核 R-b13：一个心跳在走、一个心跳停着——报错两个都列出来（只点名先看到心跳的那个，人停掉它再起还会被另一个拦下）。"""
+    from app.cluster import version
+
+    await _peer_version(PEER, "0.0.9+old+aaaaaaaaaaaa")
+    await _peer_version(GHOST, "0.0.8+older+bbbbbbbbbbbb")
+
+    async def beat() -> None:
+        for _ in range(15):
+            await asyncio.sleep(0.1)
+            async with SessionLocal() as session:
+                row = await session.get(ClusterWorker, PEER)
+                row.heartbeat_at = utcnow()
+                await session.commit()
+
+    beating = asyncio.create_task(beat())
+    with pytest.raises(version.VersionMismatch) as e:
+        await version.preflight(observe_s=0.5)
+    await beating
+    text = str(e.value)
+    assert "2 个版本不同" in text and "aaaaaaaaaaaa" in text and "bbbbbbbbbbbb" in text
+    assert "心跳在走" in text and "心跳停着" in text
+
+
+def test_the_fingerprint_changes_with_the_dependency_lock(monkeypatch, tmp_path):
+    """复核 R-b13：依赖锁文件变了（升了依赖）源码指纹跟着变；锁文件取不到时换成几个关键包的版本。"""
+    from app.cluster import version
+
+    lock = tmp_path / "requirements.lock"
+    monkeypatch.setattr(version, "LOCK_FILE", lock)
+
+    def fingerprint() -> str:
+        version.source_fingerprint.cache_clear()
+        return version.source_fingerprint()
+
+    try:
+        lock.write_text("sqlalchemy==2.0.40\n")
+        first = fingerprint()
+        assert fingerprint() == first
+        lock.write_text("sqlalchemy==2.0.41\n")
+        assert fingerprint() != first, "升了一个依赖：指纹不同"
+        lock.unlink()
+        assert version.dependency_marker().startswith(b"packages:") and b"sqlalchemy==" in version.dependency_marker()
+        assert fingerprint() not in (first,)
+    finally:
+        version.source_fingerprint.cache_clear()
+
+
+async def test_a_known_seq_collision_is_not_rescanned_on_every_start(tmp_path, caplog):
+    """复核 R-b13：存量库里有撞了号的事件——第一次启动整表数一遍、记下结果、不建唯一索引；之后启动只核对记下的那几处，不再整表
+    GROUP BY；撞号处理掉之后再数一遍、建索引、删掉记录。用一个单独的 SQLite 库（两种库的测试里都跑）。"""
+    import logging
+
+    from sqlalchemy import event, inspect, text
+
+    from app.db import base as db_base
+    from app.db.models import Setting
+
+    target = db_base.make_engine(f"sqlite+aiosqlite:///{tmp_path / 'seq.db'}")
+    scans: list[str] = []
+    event.listen(target.sync_engine, "before_cursor_execute",
+                 lambda conn, cursor, statement, *a: scans.append(statement) if "GROUP BY run_id, seq" in statement else None)
+    try:
+        await db_base.create_schema(target)
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+
+        async with target.begin() as conn:
+            await conn.execute(text("DROP INDEX ux_run_events_run_seq"))
+            await conn.execute(text("CREATE INDEX ix_run_events_run_seq ON run_events (run_id, seq)"))
+        async with async_sessionmaker(target, expire_on_commit=False)() as session:
+            session.add(Run(id="r1", status="succeeded", graph={}, input={}))
+            await session.flush()
+            session.add_all([RunEvent(id=eid, run_id="r1", seq=seq, type="log", ts=0, data={})
+                             for eid, seq in (("e1", 1), ("e2", 1), ("e3", 2))])
+            await session.commit()
+
+        async def start() -> set[str]:
+            async with target.begin() as conn:
+                def run(sync_conn):
+                    cols = {t: {c["name"] for c in inspect(sync_conn).get_columns(t)} for t in ("run_events", "settings")}
+                    db_base._unique_run_event_seq(sync_conn, cols)
+                    return {ix["name"] for ix in inspect(sync_conn).get_indexes("run_events")}
+                return await conn.run_sync(run)
+
+        caplog.set_level(logging.INFO, logger="app.db.base")
+        assert "ux_run_events_run_seq" not in await start() and len(scans) == 1
+        async with target.connect() as conn:
+            marker = (await conn.execute(text(f"SELECT value FROM settings WHERE key = '{db_base.SEQ_DUPLICATES_KEY}'"))).scalar()
+        assert '"r1"' in str(marker) and "1" in str(marker)
+        assert "ux_run_events_run_seq" not in await start() and len(scans) == 1, "第二次启动不再整表 GROUP BY"
+        assert any("还有撞了号的事件" in r.getMessage() for r in caplog.records)
+        async with target.begin() as conn:
+            await conn.execute(text("DELETE FROM run_events WHERE id = 'e2'"))
+        assert "ux_run_events_run_seq" in await start() and len(scans) == 2, "处理掉之后再数一遍、建上索引"
+        async with target.connect() as conn:
+            left = (await conn.execute(text(f"SELECT COUNT(*) FROM settings WHERE key = '{db_base.SEQ_DUPLICATES_KEY}'"))).scalar()
+        assert left == 0
+        assert Setting.__tablename__ == "settings"
+    finally:
+        await target.dispose()
+
+
 @pytest.mark.sqlite_only
 async def test_an_idle_single_process_writes_nothing_for_coordination(monkeypatch):
     """复核 R-b3：SQLite（只有一个进程）空闲时协调不写库——不续租约、不写当班、不周期接手；要名额、放名额也不落库。用另一条连接

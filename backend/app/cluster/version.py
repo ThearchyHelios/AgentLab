@@ -4,7 +4,8 @@
 规矩（认领、租约、接手的说法），两边各按各的写同一批行。以前只在 README 里写「升级要先停掉全部进程」，现在代码里拦住。
 
 - 代码版本 code_version：包版本 + 构建号（AGENTLAB_BUILD，Docker 镜像构建时写进去）或 git 提交 + 源码指纹（app/ 下全部 .py
-  的内容哈希）。比的是源码指纹：同一份代码一定相同，改了一行就不同，取不到 git、没有构建号时也区分得开。
+  的内容，加上依赖锁文件 requirements.lock 的内容；Docker 镜像里也留着这个文件）。比的是源码指纹：同一份代码、同一套依赖一定相同，
+  改了一行、升了一个依赖就不同，取不到 git、没有构建号时也区分得开。锁文件取不到（不是从仓库或镜像装的）时换成几个关键包的版本。
 - 库结构版本 schema_version：模型里各表各列（名字、类型、可空）加迁移清单的哈希。
 
 怎么拦：PostgreSQL 时，补列之前先看一眼（preflight）——还有活着的、版本不同的进程就不启动；它的心跳停着（多半是强杀之后留下的、
@@ -33,6 +34,30 @@ class VersionMismatch(RuntimeError):
     """库里还有活着的、版本不同的进程。"""
 
 
+#: 依赖锁文件（仓库里 backend/requirements.lock；Docker 镜像里 /app/backend/requirements.lock）
+LOCK_FILE = _APP_DIR.parent / "requirements.lock"
+#: 锁文件取不到时拿这几个包的版本代替（升级时最容易带出行为差别的那几个）
+KEY_PACKAGES = ("fastapi", "pydantic", "sqlalchemy", "asyncpg", "psycopg", "langgraph", "langgraph-checkpoint",
+                "langgraph-checkpoint-postgres", "langchain-core", "starlette", "uvicorn")
+
+
+def dependency_marker() -> bytes:
+    """依赖这一份进指纹的样子：锁文件的内容；取不到就是几个关键包的版本。"""
+    try:
+        return b"lock:" + LOCK_FILE.read_bytes()
+    except OSError:
+        pass
+    from importlib.metadata import PackageNotFoundError, version
+
+    parts = []
+    for name in KEY_PACKAGES:
+        try:
+            parts.append(f"{name}=={version(name)}")
+        except PackageNotFoundError:
+            parts.append(f"{name}==")
+    return ("packages:" + ";".join(parts)).encode()
+
+
 @lru_cache(maxsize=1)
 def source_fingerprint() -> str:
     digest = hashlib.sha256()
@@ -44,6 +69,8 @@ def source_fingerprint() -> str:
             digest.update(path.read_bytes())
         except OSError:
             continue
+    # 依赖升级（锁文件变了）也算版本不同：代码一行没改、换了一版 SQLAlchemy / LangGraph 的进程同样不许混进来（复核 R-b13）
+    digest.update(b"\0deps\0" + dependency_marker())
     return digest.hexdigest()[:12]
 
 
@@ -115,10 +142,13 @@ async def _peers(conn: Any) -> list[dict[str, Any]] | None:
     return [dict(r) for r in rows]
 
 
-def _describe(peer: dict[str, Any]) -> str:
+def _describe(peer: dict[str, Any], beating: set[str] | None = None) -> str:
     code = peer.get("code_version") or "（升级前的版本，没有记版本）"
     schema = peer.get("schema_version") or "未知"
-    return f"{identity.describe(peer['id'])}（代码 {code}，库结构 {schema}）"
+    state = ""
+    if beating is not None:
+        state = "，心跳在走" if peer["id"] in beating else "，心跳停着、等租约过期"
+    return f"{identity.describe(peer['id'])}（代码 {code}，库结构 {schema}{state}）"
 
 
 async def preflight(*, observe_s: float | None = None) -> None:
@@ -141,11 +171,12 @@ async def preflight(*, observe_s: float | None = None) -> None:
             return
         for peer in mismatched:
             first_beats.setdefault(peer["id"], peer.get("heartbeat_at"))
-        # 心跳还在走：真活着，照实报错。心跳停着的（强杀、断电留下的登记）等它们的租约过期
-        beating = [p for p in mismatched if p.get("heartbeat_at") != first_beats.get(p["id"])]
+        # 心跳还在走：真活着，照实报错。心跳停着的（强杀、断电留下的登记）等它们的租约过期。报错时列出全部活着的、版本不同的
+        # 进程（复核 R-b13：只点名心跳在走的那个，人停掉它再起又会被另一个拦下）
+        beating = {p["id"] for p in mismatched if p.get("heartbeat_at") != first_beats.get(p["id"])}
         waited = loop.time() - started
         if beating or waited >= lease_s() * 2 + observe:
-            raise VersionMismatch(_message(beating or mismatched))
+            raise VersionMismatch(_message(mismatched, beating=beating))
         if waited >= observe and not warned:
             warned = True
             logger.warning("库里登记着 %d 个版本不同的进程，心跳停着（多半是强杀之后留下的）：等它们的租约过期再启动",
@@ -174,8 +205,8 @@ def _naive(moment: Any) -> Any:
     return moment.replace(tzinfo=None) if getattr(moment, "tzinfo", None) else moment
 
 
-def _message(peers: list[dict[str, Any]]) -> str:
-    listed = "；".join(_describe(p) for p in peers)
+def _message(peers: list[dict[str, Any]], *, beating: set[str] | None = None) -> str:
+    listed = "；".join(_describe(p, beating) for p in peers)
     return (f"库里还有 {len(peers)} 个版本不同的 AgentLab 进程活着：{listed}。本进程是代码 {code_version()}、库结构 "
             f"{schema_version()}。不支持新旧版本同时运行：先停掉这些进程再启动新版本（升级步骤见 README「多进程」的「升级」）")
 
