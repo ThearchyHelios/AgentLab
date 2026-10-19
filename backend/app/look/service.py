@@ -46,6 +46,8 @@ GUIDE_HEAD_PROMPT = (
     "按需查看（look）：要看{labels}的详情时，单独输出一行\n"
     '  {{"op":"look","need":"一句话说要查什么","targets":[{example}]}}\n'
     "  输出这一行就停下，系统把查看结果作为下一条消息交回来，你接着往下写（已经输出的不要重复）。\n"
+    "  · 这里没有工具调用接口：look 和别的操作一样写成正文里单独一行的 JSON，不要写成工具调用的格式"
+    "（<invoke>、<tool_call>、DSML 这类标记）——那样系统认不出\n"
     "  · need 必填。targets 里写了 name 的直接取那几个；只写 kind（可以加 source）不写 name 的，按 need 在这一类里挑；"
     "整个不写 targets 时按 need 挑{default}。sources 可选：限定在哪几个来源（数据源名、工作流名……）里挑\n"
     "  · kind 只能是：{kinds}\n"

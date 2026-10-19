@@ -93,10 +93,13 @@ async def test_a_native_tool_call_named_after_an_op_becomes_that_op():
     assert diag.dropped == {"工具调用的名字不认识": 1, "工具调用的参数解析不了": 1}, diag.dropped
 
 
-async def test_tool_call_markup_in_text_is_diagnosed():
-    ops, diag = await _ops([AIMessageChunk(content='<tool_call>{"name": "look", "arguments": {}}</tool_call>\n')])
+async def test_tool_call_markup_that_is_not_an_op_is_diagnosed():
+    # 名字是操作名的照操作读（tests/test_copilot_markup_ops.py）；不是的照实记进诊断
+    ops, diag = await _ops([AIMessageChunk(content='<tool_call>{"name": "run_sql", "arguments": {}}</tool_call>\n')])
     assert ops == [] and diag.markup == 1
+    assert diag.dropped == {"工具调用标记的名字不认识": 1}, diag.dropped
     assert "不走工具调用" in diag.correction()
+    assert diag.headline() == "模型把操作写成了工具调用的格式，没有按约定逐行输出，系统认不出"
 
 
 async def test_the_empty_error_carries_the_diagnosis_and_a_correction(client, monkeypatch):  # noqa: F811
@@ -107,9 +110,13 @@ async def test_the_empty_error_carries_the_diagnosis_and_a_correction(client, mo
     got = await _sse(client, BODY)
     [error] = [op for op in got if op["op"] == "error"]
     assert error["code"] == "copilot_empty" and error["next"] == "retry"
-    assert error["message"] == "助手本轮未完成：模型没有给出任何修改，也没有说明原因"
-    assert "正文 0 字" in error["detail"] and "思考 6 字" in error["detail"] and "结束原因 stop" in error["detail"]
-    assert error["diagnostics"]["text_chars"] == 0 and error["diagnostics"]["thinking_chars"] == 6
+    # 说法按诊断照实写，不再一律是「没有给出任何修改，也没有说明原因」
+    assert error["message"] == "助手本轮未完成：模型只写了思考，没有给出任何操作"
+    # 起草时当场纠正过一次（同一个模型又只写了思考）：诊断是两次的
+    assert "正文 0 字" in error["detail"] and "思考 12 字" in error["detail"] and "结束原因 stop" in error["detail"]
+    assert "共调用模型 2 次" in error["detail"] and "当场带纠正重写过一次" in error["detail"], error["detail"]
+    assert error["diagnostics"]["text_chars"] == 0 and error["diagnostics"]["thinking_chars"] == 12
+    assert error["diagnostics"]["nudged"] is True
     assert "只写了思考" in error["reason"]
     # 重来时交给助手的话：问题后面附这句纠正，不是原样重发
     again = policy.empty_retry_instruction("上周各条线的产量", policy.error_reason(error))

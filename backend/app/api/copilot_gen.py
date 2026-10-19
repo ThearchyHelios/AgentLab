@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 import time
 from collections.abc import AsyncIterator
@@ -35,6 +36,8 @@ from app.engine.schema import NodeType
 from app.look.base import LOOK_LIMIT, REPAIR_LOOK_LIMIT, Applied, Applier, Checker, LookBudget
 from app.look.service import LookService
 from app.providers.budget import cut_off as _cut_off
+
+logger = logging.getLogger(__name__)
 
 #: 自查最多交回去改几轮。一轮只花一次"只输出改动"的调用；两轮还改不好，多半是需求本身有歧义，该让人看了
 SELF_CHECK_ROUNDS = 2
@@ -106,7 +109,9 @@ class StreamDiagnosis:
 
     finish 是最后一次调用的结束原因（finish_reason / stop_reason）；text_chars、thinking_chars 是正文（不算空白）和思考的
     字数；dropped 是跳过的行按原因数；tool_calls 是原生工具调用的
-    名字（按操作读了的也记）；markup 是正文里写成文字的工具调用标记（<tool_call>、DeepSeek 的 DSML……）出现了几次调用。"""
+    名字（按操作读了的也记）；markup 是正文里写成文字的工具调用（<invoke>、<tool_call>、DeepSeek 的 DSML……）有几次——读得出
+    的按操作读（ops 里也算），读不出、只认出了标记的记 1；nudged：起草时一个操作都没认出、当场带纠正请它重写过一次
+    （Generation._converse）。"""
 
     calls: int = 0
     finish: str = ""
@@ -116,14 +121,40 @@ class StreamDiagnosis:
     tool_calls: list[str] = field(default_factory=list)
     dropped: dict[str, int] = field(default_factory=dict)
     markup: int = 0
+    nudged: bool = False
 
     def drop(self, reason: str) -> None:
         self.dropped[reason] = self.dropped.get(reason, 0) + 1
 
+    def absorb(self, other: StreamDiagnosis) -> None:
+        """把一次调用的诊断并进这一轮的（结束原因取最后一次的）。"""
+        self.calls += other.calls
+        self.finish = other.finish or self.finish
+        self.text_chars += other.text_chars
+        self.thinking_chars += other.thinking_chars
+        self.ops += other.ops
+        self.tool_calls.extend(other.tool_calls)
+        for reason, n in other.dropped.items():
+            self.dropped[reason] = self.dropped.get(reason, 0) + n
+        self.markup += other.markup
+
     def as_dict(self) -> dict[str, Any]:
         return {"calls": self.calls, "finish": self.finish or None, "text_chars": self.text_chars,
                 "thinking_chars": self.thinking_chars, "ops": self.ops, "tool_calls": list(self.tool_calls),
-                "dropped": dict(self.dropped), "markup": self.markup}
+                "dropped": dict(self.dropped), "markup": self.markup, "nudged": self.nudged}
+
+    def headline(self) -> str:
+        """报错的那一句（「助手本轮未完成：」后面）：按交回了什么照实说。以前一律是「模型没有给出任何修改，也没有说明原因」，
+        可模型多半是说了想干什么、只是格式不对（部署上撞过：把 look 写成了工具调用的格式）。"""
+        if self.tool_calls or self.markup:
+            return "模型把操作写成了工具调用的格式，没有按约定逐行输出，系统认不出"
+        if not self.text_chars and self.thinking_chars:
+            return "模型只写了思考，没有给出任何操作"
+        if not self.text_chars:
+            return "模型什么都没有输出"
+        if self.dropped:
+            return "模型的输出格式不对，没有一行能认出的操作"
+        return "模型只说了打算，没有给出任何修改"
 
     def summary(self) -> str:
         """给人看的一句：「结束原因 stop；正文 0 字，思考 11 字；认出 0 行操作；……」。"""
@@ -137,6 +168,8 @@ class StreamDiagnosis:
             parts.append("正文里有写成文字的工具调用标记")
         if self.calls > 1:
             parts.append(f"共调用模型 {self.calls} 次")
+        if self.nudged:
+            parts.append("当场带纠正重写过一次，仍然没有操作")
         return "；".join(parts)
 
     def correction(self) -> str:
@@ -184,29 +217,46 @@ async def _drain(stream: Any, already: int) -> None:
             return
 
 
+def _call_op(name: str, fields: Any, diag: StreamDiagnosis, *, what: str) -> dict[str, Any] | None:
+    """一次工具调用 → 操作：名字是操作名的，参数就是操作的字段。名字不认识、参数解析不了的照实记进诊断（what：「工具调用」
+    「工具调用标记」）。"""
+    if name not in OP_NAMES:
+        diag.drop(f"{what}的名字不认识")
+        return None
+    if not isinstance(fields, dict):
+        diag.drop(f"{what}的参数解析不了")
+        return None
+    return {"op": name, **{k: v for k, v in fields.items() if k != "op"}}
+
+
 def _tool_ops(calls: dict[int, dict[str, str]], diag: StreamDiagnosis) -> list[dict[str, Any]]:
-    """原生工具调用（流里的 tool_call_chunks，按 index 拼好的 {name, args}）→ 操作：名字是操作名的，参数就是操作的字段。
-    名字不认识、参数解析不了的照实记进诊断——以前整个工具调用一声不响就丢了。"""
+    """原生工具调用（流里的 tool_call_chunks，按 index 拼好的 {name, args}）→ 操作。以前整个工具调用一声不响就丢了。"""
     out: list[dict[str, Any]] = []
     for index in sorted(calls):
         name, args = calls[index].get("name") or "", calls[index].get("args") or ""
         diag.tool_calls.append(name or "（没有名字）")
-        if name not in OP_NAMES:
-            diag.drop("工具调用的名字不认识")
-            continue
         try:
             fields = json.loads(args) if args.strip() else {}
         except json.JSONDecodeError:
             fields = None
-        if not isinstance(fields, dict):
-            diag.drop("工具调用的参数解析不了")
-            continue
-        out.append({**{k: v for k, v in fields.items() if k != "op"}, "op": name})
+        if (op := _call_op(name, fields, diag, what="工具调用")) is not None:
+            out.append(op)
+    return out
+
+
+def _markup_ops(calls: list[Any], diag: StreamDiagnosis) -> list[dict[str, Any]]:
+    """写成文字的工具调用（engine/toolcalls.take_leaked_calls 读出来的）→ 操作，和原生工具调用同一个规矩。"""
+    out: list[dict[str, Any]] = []
+    for call in calls:
+        diag.markup += 1
+        if (op := _call_op(call.name, call.args, diag, what="工具调用标记")) is not None:
+            diag.ops += 1
+            out.append(op)
     return out
 
 
 async def _iter_ops(model: Any, messages: list[Any], *, lines: list[str] | None = None,
-                    diag: StreamDiagnosis | None = None):
+                    diag: StreamDiagnosis | None = None, raw: list[str] | None = None):
     """流式读模型输出，按行切出操作。done、look、ask 之后即停——后面就算有闲话也不要了；look 之后停下也就是
     「读到这一行就停止本次输出」。停下之后不马上关流：交出那一行、调用方接着要下一条时先把流读完（_drain，内容丢掉，最多
     DRAIN_CHARS 字），流末尾那一段用量才收得到——以前读到这一行就关流，输出 token 一个都拿不到，问数据这一轮的花费多半是下限
@@ -217,21 +267,25 @@ async def _iter_ops(model: Any, messages: list[Any], *, lines: list[str] | None 
 
     格式跑偏的几种写法照样认（以前一声不响就丢了）：一个操作分成多行写的 JSON（以「{」开头的一行读不成，就接着往后攒，
     攒到读得成为止；中途来了一行自己就读得成的，攒着的那段算跳过）、和围栏写在同一行的操作、原生工具调用里名字是操作名
-    的（_tool_ops，流读完再按先后交出）。diag 给了的话，交回了什么（长度、个数、跳过的原因）记进去，不记原文。
+    的（_tool_ops，流读完再按先后交出）、写成文字的工具调用（DSML、<invoke>、<tool_call>……：从有标记的那一行起攒，一次调用
+    写完就按名字读成操作，见 engine/toolcalls.take_leaked_calls）。diag 给了的话，交回了什么（长度、个数、跳过的原因）记进去，
+    不记原文。raw 给了的话，流读完时把正文的开头一段（最多 4000 字）记进去：一个操作都没认出时当场交回模型纠正用。
 
     没等到 done 就因为额度用完停下的，抛 CopilotIncomplete：截断之前的操作照常转出去，由调用方决定整轮作废。
     """
     from app.engine.state import message_text as _text
     from app.engine.state import thinking_text
-    from app.engine.toolcalls import leaked_markup
+    from app.engine.toolcalls import has_markup, leaked_markup, take_leaked_calls
 
     diag = diag if diag is not None else StreamDiagnosis()
     diag.calls += 1
     buffer = ""
     cut = ""
     pending: list[str] = []
+    markup = ""                     # 写成文字的工具调用里还没写完的那一段
+    markup_before = diag.markup
     calls: dict[int, dict[str, str]] = {}
-    head = ""                       # 正文的开头一段：只用来认写成文字的工具调用标记，不进诊断
+    head = ""                       # 正文的开头一段：认写成文字的工具调用标记、交给 raw 用，不进诊断
 
     def read(line: str) -> dict[str, Any] | None:
         """一行 → 操作（认出来了）或 None；多行的 JSON 攒在 pending 里。"""
@@ -265,6 +319,16 @@ async def _iter_ops(model: Any, messages: list[Any], *, lines: list[str] | None 
             diag.ops += 1
         return op
 
+    def take(line: str) -> list[dict[str, Any]]:
+        """一行 → 这一行读出来的操作。写成文字的工具调用从有标记的那一行起攒着，一次调用写完才交出（一行里可能写完好几个）；
+        攒着的时候来的行都归它，外层包装和调用之间的说明文字不算跳过。"""
+        nonlocal markup
+        if markup or (not pending and has_markup(line)):
+            leaked, markup = take_leaked_calls(markup + line + "\n")
+            return _markup_ops(leaked, diag)
+        op = read(line)
+        return [op] if op else []
+
     def record(op: dict[str, Any]) -> None:
         if lines is not None:
             lines.append(json.dumps(op, ensure_ascii=False))
@@ -290,17 +354,24 @@ async def _iter_ops(model: Any, messages: list[Any], *, lines: list[str] | None 
             buffer += text
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                op = read(line)
-                if op:
+                for op in take(line):
                     record(op)
                     yield op
                     if op.get("op") in _STOP_OPS:
                         await _drain(stream, len(buffer))
                         return
             cut = _cut_off(chunk) or cut
-    if leaked_markup(head):
-        diag.markup += 1
-    tail = [op for op in [read(buffer)] if op]
+    if raw is not None:
+        raw.append(head)
+    tail = take(buffer)
+    if markup:
+        # 流读完了，最后一次调用还差结尾：补上结尾再读一次，还读不出的算跳过
+        leaked, markup = take_leaked_calls(markup, final=True)
+        tail += _markup_ops(leaked, diag)
+        if markup:
+            diag.drop("工具调用标记没写完")
+    if diag.markup == markup_before and leaked_markup(head):
+        diag.markup += 1            # 认出了标记、一次调用都读不出来
     if pending:
         diag.drop("不是完整的 JSON")
         pending.clear()
@@ -863,6 +934,14 @@ class AppChecker:
 # 生成过程
 # ==========================================================================
 
+#: 起草时一次调用读完、到这时还没有一个能落地的操作（只写了思考、写成了工具调用的格式、夹着说明文字、只写了 plan、查看完
+#: 接着写却什么都没认出……）：同一轮里把它的原话交回去、附上这句纠正（correction 是 StreamDiagnosis.correction），请它按格式
+#: 重写一次。只补一次，还不行就照实报 copilot_empty。
+#: 部署上撞过：模型想先 look，却写成了 DSML，整轮当场报「没有给出任何修改」，用户点重试还是同样的几率
+FORMAT_NUDGE_PROMPT = "上面这次输出里没有一行能认出的操作：{correction}。请按输出格式重新给出这一轮的操作。"
+#: 交回去的原话最多多少字
+NUDGE_ECHO_CHARS = 2000
+
 
 class Generation:
     """一轮生成：起草（draft）→ 自查修正（repair）。两段之间调用方可以插自己的判断（只回答了一句、兜底重放……）。
@@ -889,13 +968,18 @@ class Generation:
         self.calls = 0
         #: 起草阶段模型交回了什么（只记长度、个数和原因）：一个操作都没认出来时写进错误详情
         self.diagnosis = StreamDiagnosis()
+        #: 起草阶段交出过能落地的操作（改动、回答、反问、收尾……；plan、look 不算：它们不改任何东西，查看完什么都没写的这一轮
+        #: 照样是空的）。一次调用读完还没有时当场纠正一次（FORMAT_NUDGE_PROMPT）
+        self.moved = False
 
-    def empty(self, message: str = "模型没有给出任何修改，也没有说明原因", *, hint: str = "") -> CopilotIncomplete:
-        """一个操作都没给（copilot_empty）的报错：带诊断（detail、diagnostics）和重来时交给助手的纠正（correction）。"""
+    def empty(self, message: str = "", *, hint: str = "") -> CopilotIncomplete:
+        """一个操作都没给（copilot_empty）的报错：说法按诊断照实写（StreamDiagnosis.headline），带诊断（detail、
+        diagnostics）和重来时交给助手的纠正（correction）。"""
         from app.chat.turn import EMPTY_GENERATION
 
-        return CopilotIncomplete(message, hint=hint, code=EMPTY_GENERATION, detail=self.diagnosis.summary(),
-                                 correction=self.diagnosis.correction(), diagnostics=self.diagnosis.as_dict())
+        return CopilotIncomplete(message or self.diagnosis.headline(), hint=hint, code=EMPTY_GENERATION,
+                                 detail=self.diagnosis.summary(), correction=self.diagnosis.correction(),
+                                 diagnostics=self.diagnosis.as_dict())
 
     async def draft(self, request: str) -> AsyncIterator[dict[str, Any]]:
         async for op in self._converse(request, LookBudget(self.look_limit), repair=False):
@@ -932,34 +1016,56 @@ class Generation:
         return int((time.monotonic() - self.started) * 1000)
 
     async def _converse(self, request: str, budget: LookBudget, *, repair: bool) -> AsyncIterator[dict[str, Any]]:
-        """一段对话：请模型写，读到 look 就停下、查看、把结果作为下一条消息交回，再请它接着写，直到 done / ask / 流结束。"""
+        """一段对话：请模型写，读到 look 就停下、查看、把结果作为下一条消息交回，再请它接着写，直到 done / ask / 流结束。
+
+        起草时一次调用读完、到这时还没有一个能落地的操作（格式跑偏，包括查看完接着写的那一次），先不收场：把它的原话交回去、
+        附一句纠正，请它当场重写一次（FORMAT_NUDGE_PROMPT，每轮一次）。以前直接报「没有给出任何修改」，画布上没有自动重来，
+        点重试也是同样的几率。"""
         messages: list[tuple[str, str]] = [("system", self.system), ("human", request)]
         idle = 0
         while True:
             lines: list[str] = []
+            raw: list[str] = []
             look: dict[str, Any] | None = None
             self.calls += 1
-            async with aclosing(_iter_ops(self.model, messages, lines=lines,
-                                          diag=None if repair else self.diagnosis)) as ops:
-                async for op in ops:
-                    kind = op.get("op")
-                    if kind == "thinking":
-                        yield op
-                    elif kind == "look":
-                        look = op
-                    elif kind in _ASK_OPS:
-                        self.asked = op
-                        yield op
-                    elif repair and kind in ("plan", "done"):
-                        # 修补轮自己的开场和收尾，不是新方案，不覆盖原来的说明
-                        continue
-                    else:
-                        if kind == "done":
-                            self.done = op
-                        if self.applier.apply(op).forward:
+            call = StreamDiagnosis()
+            try:
+                async with aclosing(_iter_ops(self.model, messages, lines=lines, diag=call, raw=raw)) as ops:
+                    async for op in ops:
+                        kind = op.get("op")
+                        if kind not in ("thinking", "plan", "look"):
+                            self.moved = True
+                        if kind == "thinking":
                             yield op
+                        elif kind == "look":
+                            look = op
+                        elif kind in _ASK_OPS:
+                            self.asked = op
+                            yield op
+                        elif repair and kind in ("plan", "done"):
+                            # 修补轮自己的开场和收尾，不是新方案，不覆盖原来的说明
+                            continue
+                        else:
+                            if kind == "done":
+                                self.done = op
+                            if self.applier.apply(op).forward:
+                                yield op
+            finally:
+                if not repair:
+                    self.diagnosis.absorb(call)
+            if call.markup and call.ops:
+                logger.info("助手把 %d 处操作写成了工具调用的格式，已按操作读出 %d 个", call.markup, call.ops)
             if look is None:
-                return
+                if repair or self.moved or self.diagnosis.nudged:
+                    return
+                # 还没有能落地的操作：当场纠正一次。说过话的把原话交回去；什么都没写的（只有思考）把纠正接在最后那条消息后面
+                logger.info("助手起草时一个操作都没认出（%s），当场纠正一次", call.summary())
+                self.diagnosis.nudged = True
+                nudge = FORMAT_NUDGE_PROMPT.format(correction=call.correction())
+                said = raw[0].strip() if raw else ""
+                messages = [*messages, ("ai", said[:NUDGE_ECHO_CHARS]), ("human", nudge)] if said \
+                    else [*messages[:-1], ("human", f"{messages[-1][1]}\n\n{nudge}")]
+                continue
             # 查看可能要等挑选模型：心跳的阶段换成「正在查看」
             yield {"op": "heartbeat", "phase": "looking", "elapsed_ms": self._elapsed()}
             result = await self.looks.look(look, budget)

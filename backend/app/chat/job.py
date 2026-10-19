@@ -755,7 +755,8 @@ async def _settled(driver: ChatDriver, execution: ChatTurnExecution
             error = message
         elif term.get("op") == "error":
             error = str(term.get("message") or "助手本轮未完成")
-            cause = {"kind": "copilot", "message": error, "hint": term.get("hint"), "detail": term.get("detail")}
+            cause = {"kind": "copilot", "message": error, "hint": term.get("hint"), "detail": term.get("detail"),
+                     "code": term.get("code"), "diagnostics": term.get("diagnostics")}
         else:
             issues = [str(i.get("message") or "") for i in term.get("issues") or []
                       if isinstance(i, Mapping) and i.get("level") == "error"]

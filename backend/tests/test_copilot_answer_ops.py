@@ -154,7 +154,10 @@ async def test_the_sse_output_is_unchanged_but_for_a_trailing_usage(client, monk
         reason = op.pop("reason")
         if name == "no_ops":
             # 一个操作都没给：原因是重来时交给助手的那句纠正，诊断（不含原文）写进 detail、diagnostics，别的照旧
-            assert "每个操作单独一行" in reason and op.pop("diagnostics")["dropped"] == {"不是 JSON 对象": 1}, op
+            # 起草时当场带纠正重写过一次（同一个剧本再吐一遍），跳过的行是两次的
+            diagnostics = op.pop("diagnostics")
+            assert "每个操作单独一行" in reason and diagnostics["dropped"] == {"不是 JSON 对象": 2}, op
+            assert diagnostics["calls"] == 2 and diagnostics["nudged"] is True, diagnostics
             assert op["detail"].startswith("结束原因"), op
             op["detail"] = ""
         else:
