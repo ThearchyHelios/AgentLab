@@ -15,7 +15,7 @@ usage() {
   --gzip             另外再产出一份 .tar.gz。docker 用 containerd 镜像存储时镜像层本身已经压缩过，.tar.gz 小不了多少。
   --no-microvm       不在镜像里带 microVM 运行时和沙箱镜像，镜像小约 150 MB。目标机没有 KVM 时用不上它们。
                      默认带上：目标机有 KVM 时，deploy.sh 会自动启用 microVM，而且不用联网。
-  --no-postgres      不带内置 PostgreSQL 的镜像（postgres-image.tar，约 150 MB）。只用 SQLite 或外接 PostgreSQL 时用不上；
+  --no-postgres      不带内置 PostgreSQL 的镜像（postgres-image.tar，约 160 MB）。只用 SQLite 或外接 PostgreSQL 时用不上；
                      不带的包在目标机上 install --postgres 要先 docker pull 到同一个标签。默认带上，标签取 deploy.sh 里的
                      POSTGRES_IMAGE（只在那一处定）。
   -h, --help         显示这段说明。

@@ -22,7 +22,7 @@
 - **架构要一致**：这个包是 `linux/__AGENTLAB_ARCH__`。在目标机上运行 `uname -m`：
   `aarch64` 对应 arm64（ARM 单板机要装 64 位系统），`x86_64` 对应 amd64。不一致的镜像跑不起来，
   deploy.sh 会在导入前就报出来；
-- 磁盘：镜像导入后约 0.8～1 GB（看 Docker 用的存储方式），另留数据目录的空间；用内置 PostgreSQL 再加约 0.4 GB 的镜像
+- 磁盘：镜像导入后约 0.8～1 GB（看 Docker 用的存储方式），另留数据目录的空间；用内置 PostgreSQL 再加约 0.7 GB 的镜像
   和库本身的空间（在 docker 的数据卷里）；
 - 可选：宿主机支持 KVM（有 `/dev/kvm`）时，代码会在 microVM 里执行，隔离最强，见下面的「代码沙箱」；
 - 当前用户能用 docker（在 `docker` 组里），或者用 `sudo` 运行 deploy.sh。
