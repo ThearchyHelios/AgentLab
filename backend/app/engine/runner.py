@@ -1786,15 +1786,19 @@ run_manager = RunManager()
 
 
 def _fenced_saver(saver: BaseCheckpointSaver) -> BaseCheckpointSaver:
-    """断点库的写也要过 cluster/fence：本进程续不上租约之后，手上的执行不再写断点（接手的进程会从断点接着跑，两边都写就分叉了）。"""
+    """断点库的写也要过 cluster/fence：本进程续不上租约之后，手上的执行不再写断点（接手的进程会从断点接着跑，两边都写就分叉了）。
+
+    包成协程、在协程里查（复核 R-b8）：LangGraph 在节点的完成回调里调 aput_writes 拿协程交给后台任务——同步包装在回调里就抛了，
+    每次隔离 asyncio 都记一条「Exception in callback … FuturesDict.on_done」；在协程里抛，异常留在写断点的那个任务里，由 LangGraph
+    照常收走。"""
     for name in ("aput", "aput_writes"):
         original = getattr(saver, name, None)
         if original is None:
             continue
 
-        def guarded(*args: Any, __original: Any = original, **kwargs: Any) -> Any:
+        async def guarded(*args: Any, __original: Any = original, **kwargs: Any) -> Any:
             fence.check()
-            return __original(*args, **kwargs)
+            return await __original(*args, **kwargs)
 
         setattr(saver, name, guarded)
     return saver

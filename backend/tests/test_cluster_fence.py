@@ -111,8 +111,17 @@ async def _stall_and_take_over(slow) -> str:
     return run.id
 
 
-async def test_a_stalled_executor_does_not_overwrite_the_takeover(slow):
+async def test_a_stalled_executor_does_not_overwrite_the_takeover(slow, caplog):
+    import gc
+    import logging
+
+    caplog.set_level(logging.ERROR, logger="asyncio")
     run_id = await _stall_and_take_over(slow)
+    await asyncio.sleep(0.1)
+    gc.collect()
+    await asyncio.sleep(0)
+    noisy = [r.getMessage() for r in caplog.records if r.name == "asyncio"]
+    assert noisy == [], f"隔离时 asyncio 不该记回调异常、没人取的任务异常（复核 R-b8）：{noisy}"
     async with SessionLocal() as session:
         row = await session.get(Run, run_id)
     assert row.status == "interrupted" and row.owner is None, "接手之后的样子没被盖掉"
