@@ -141,8 +141,13 @@ POSTGRES_CONTAINER=""
 DOCKER_NETWORK=""
 POSTGRES_VOLUME=""
 BACKUP_KEEP="5"
-# agentlab.env 里设了外接的库（AGENTLAB_DATABASE_URL）没有：只记有没有，值（带密码）不读进来
+# agentlab.env 里设了外接的库（AGENTLAB_DATABASE_URL 等）没有：只记设了哪一项，值（带密码）不读进来
 EXTERNAL_DB=""
+EXTERNAL_URL_SET=""
+DIRECT_URL_SET=""
+# 这两项要看值：PgBouncer 事务模式的开关（内置库是直连，开了就拦下）、工作进程数（SQLite 只能是 1）。都原样经 --env-file 进容器
+PGBOUNCER_VALUE=""
+WORKERS_VALUE=""
 # 内置 PostgreSQL 里的库名、用户名（PostgreSQL 容器第一次初始化时按它建）
 PG_DB="agentlab"
 PG_USER="agentlab"
@@ -163,8 +168,16 @@ read_env() {
       HOST_PORT|BIND_ADDR|DATA_DIR|CONTAINER_NAME|ENABLE_BWRAP|ENABLE_MICROVM|POSTGRES_IMAGE|POSTGRES_CONTAINER|\
       DOCKER_NETWORK|POSTGRES_VOLUME|BACKUP_KEEP)
         printf -v "$key" '%s' "$(unquote "$(trim "$val")")" ;;
-      AGENTLAB_DATABASE_URL|AGENTLAB_CHECKPOINT_URL)
-        [ -z "$(trim "$val")" ] || EXTERNAL_DB="$key" ;;
+      AGENTLAB_DATABASE_URL|AGENTLAB_CHECKPOINT_URL|AGENTLAB_DATABASE_DIRECT_URL)
+        if [ -n "$(trim "$val")" ]; then
+          [ -n "$EXTERNAL_DB" ] || EXTERNAL_DB="$key"
+          case "$key" in
+            AGENTLAB_DATABASE_URL) EXTERNAL_URL_SET=1 ;;
+            AGENTLAB_DATABASE_DIRECT_URL) DIRECT_URL_SET=1 ;;
+          esac
+        fi ;;
+      AGENTLAB_DB_PGBOUNCER) PGBOUNCER_VALUE="$(unquote "$(trim "$val")")" ;;
+      AGENTLAB_WORKERS) WORKERS_VALUE="$(unquote "$(trim "$val")")" ;;
       AGENTLAB_DATA_DIR|AGENTLAB_WEB_DIST|AGENTLAB_PORT|AGENTLAB_HOST)
         die "agentlab.env 第 $n 行：不要设 ${key}。容器里的路径和端口是固定的，改宿主机这边用 DATA_DIR、HOST_PORT、BIND_ADDR" ;;
       *)
@@ -606,12 +619,38 @@ PostgreSQL，运行 ./deploy.sh migrate-to-postgres"
   else
     MODE="sqlite"
   fi
+  check_db_settings
   DB_OPTS=()
   if [ "$MODE" = builtin ]; then
     DB_OPTS=(--network "$DOCKER_NETWORK"
       -e "AGENTLAB_DATABASE_URL=postgresql+asyncpg://$PG_USER@$POSTGRES_CONTAINER:5432/$PG_DB"
       -e "PGPASSFILE=$PG_PASSFILE")
   fi
+}
+
+# agentlab.env 里和库有关的几项是否和用的哪种库对得上（resolve_mode 定了 MODE 之后查；migrate-to-postgres 按切过去的内置库查）
+pgbouncer_on() {
+  case "$(printf '%s' "$PGBOUNCER_VALUE" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|on) return 0 ;; *) return 1 ;; esac
+}
+
+check_db_settings() {
+  local mode="${1:-$MODE}"
+  if [ -n "$DIRECT_URL_SET" ] && [ -z "$EXTERNAL_URL_SET" ]; then
+    die "agentlab.env 里设了 AGENTLAB_DATABASE_DIRECT_URL，却没设 AGENTLAB_DATABASE_URL：直连地址是给外接 PostgreSQL 配 PgBouncer 用的，
+要和 AGENTLAB_DATABASE_URL 一起设。不用外接的库就把它删掉"
+  fi
+  if [ "$mode" = builtin ] && pgbouncer_on; then
+    die "agentlab.env 里 AGENTLAB_DB_PGBOUNCER=${PGBOUNCER_VALUE}，但内置 PostgreSQL 是直连、中间没有 PgBouncer。把这一行删掉或改成 0"
+  fi
+  case "$WORKERS_VALUE" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$mode" = sqlite ] && [ "$WORKERS_VALUE" -gt 1 ]; then
+        die "agentlab.env 里 AGENTLAB_WORKERS=${WORKERS_VALUE}，但库是 SQLite：SQLite 只支持单进程，服务会拒绝启动。
+  - 改回 1（或删掉这一行）；
+  - 要多进程，先换成 PostgreSQL：./deploy.sh migrate-to-postgres（内置）或设 AGENTLAB_DATABASE_URL（外接）"
+      fi ;;
+  esac
 }
 
 mode_label() {
@@ -918,6 +957,8 @@ cmd_migrate_to_postgres() {
   check_existing
   [ -z "$EXTERNAL_DB" ] || die "agentlab.env 里设了 ${EXTERNAL_DB}（外接 PostgreSQL）。内置和外接只能选一种：要切到内置的，先删掉那一行；
 要搬进外接的库，用镜像里的 python -m app.db copy-to-postgres（见 README「用 PostgreSQL」）"
+  # 切过去就是内置库：和它对不上的设置（PgBouncer 开关）先拦下，别停了服务才发现
+  check_db_settings builtin
   local state
   state="$(stored_state)"
   if [ "$state" = builtin ]; then

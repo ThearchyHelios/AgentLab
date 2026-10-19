@@ -1079,7 +1079,7 @@ AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agen
 `postgres:16` 容器 `agentlab-dev-postgres`，只开在 `127.0.0.1:55432`，数据在 docker 数据卷 `agentlab-dev-pgdata`，密码第一次
 自动生成在 `data/.postgres-dev/`（后端按 `PGPASSFILE` 读），后端照它设 `AGENTLAB_DATABASE_URL`；Ctrl-C 只停前后端，库的容器
 留着下次复用。容器名、端口、数据卷、镜像用 `AGENTLAB_DEV_PG_CONTAINER`、`AGENTLAB_DEV_PG_PORT`、`AGENTLAB_DEV_PG_VOLUME`、
-`AGENTLAB_DEV_PG_IMAGE` 改。不加 `--postgres` 和原来一样：SQLite，不用 docker。
+`AGENTLAB_DEV_PG_IMAGE` 改（环境变量，或写在 `.env` 里，环境变量优先；`.env.example` 列着应用库、连接池、PgBouncer、多进程和这几项）。不加 `--postgres` 和原来一样：SQLite，不用 docker。
 
 **从 SQLite 搬过来。** `python -m app.db copy-to-postgres` 把数据目录里的 `agentlab.db` 和 `checkpoints.db` 导进 PostgreSQL，
 停在审批上的、中断了的运行导过去之后照样能接着跑：

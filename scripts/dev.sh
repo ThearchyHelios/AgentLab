@@ -13,7 +13,8 @@ usage() {
   --postgres   应用库用 PostgreSQL：起（已经有就复用）一个本地开发用的 PostgreSQL 容器，端口只开在 127.0.0.1，
                后端照它设 AGENTLAB_DATABASE_URL。密码第一次自动生成，在 data/.postgres-dev/ 里；库的数据在 docker
                数据卷里，Ctrl-C 只停前后端，库的容器留着下次复用（不要了：docker rm -f 容器名 && docker volume rm 卷名）。
-               不加就和原来一样：SQLite，不用 docker。下面几个环境变量可以改缺省：
+               不加就和原来一样：SQLite，不用 docker。下面几项可以改缺省（环境变量，或者写在 .env / backend/.env 里，
+               环境变量优先）：
                  AGENTLAB_DEV_PG_CONTAINER  容器名，缺省 agentlab-dev-postgres
                  AGENTLAB_DEV_PG_PORT       本机端口，缺省 55432
                  AGENTLAB_DEV_PG_VOLUME     数据卷，缺省 agentlab-dev-pgdata
@@ -72,11 +73,40 @@ fi
 export AGENTLAB_PORT="$API_PORT"
 
 # ---- --postgres：本地开发用的 PostgreSQL ----
+# 这几项（AGENTLAB_DEV_PG_*）只有这个脚本用。和后端的配置一样认 .env：环境变量 > backend/.env > .env > 缺省（后端的 settings
+# 读这两个文件，后一个优先）。不 source：.env 是给后端按 KEY=VALUE 读的，不是 shell（值里的 $、空格、反引号不该被执行）
+dotenv_value() {
+  local key="$1" file line val="" found=""
+  for file in "$ROOT/.env" "$ROOT/backend/.env"; do
+    [ -f "$file" ] || continue
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$'\r'}"
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line#export }"
+      case "$line" in
+        "$key="*) val="${line#*=}"; found=1 ;;
+      esac
+    done < "$file"
+  done
+  [ -n "$found" ] || return 1
+  val="${val%"${val##*[![:space:]]}"}"
+  case "$val" in
+    \"*\"|\'*\') val="${val:1:${#val}-2}" ;;
+    *) val="${val%%[[:space:]]#*}"; val="${val%"${val##*[![:space:]]}"}" ;;
+  esac
+  printf '%s' "$val"
+}
+dev_pg_setting() {
+  local value
+  value="$(printenv "$1" 2>/dev/null || true)"
+  [ -n "$value" ] || value="$(dotenv_value "$1" || true)"
+  printf '%s' "${value:-$2}"
+}
 if [ -n "$WITH_PG" ]; then
-  PG_CONTAINER="${AGENTLAB_DEV_PG_CONTAINER:-agentlab-dev-postgres}"
-  PG_PORT="${AGENTLAB_DEV_PG_PORT:-55432}"
-  PG_VOLUME="${AGENTLAB_DEV_PG_VOLUME:-agentlab-dev-pgdata}"
-  PG_IMAGE="${AGENTLAB_DEV_PG_IMAGE:-postgres:16}"
+  PG_CONTAINER="$(dev_pg_setting AGENTLAB_DEV_PG_CONTAINER agentlab-dev-postgres)"
+  PG_PORT="$(dev_pg_setting AGENTLAB_DEV_PG_PORT 55432)"
+  PG_VOLUME="$(dev_pg_setting AGENTLAB_DEV_PG_VOLUME agentlab-dev-pgdata)"
+  PG_IMAGE="$(dev_pg_setting AGENTLAB_DEV_PG_IMAGE postgres:16)"
   DEV_DATA="${AGENTLAB_DATA_DIR:-$ROOT/data}"
   case "$PG_PORT" in ''|*[!0-9]*) echo "AGENTLAB_DEV_PG_PORT 要是端口号：$PG_PORT"; exit 2 ;; esac
   command -v docker >/dev/null || { echo "--postgres 要用 docker，没找到它"; exit 1; }

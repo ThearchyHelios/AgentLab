@@ -216,7 +216,9 @@ AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@<数据库地址>:5
 
 容器里的 `127.0.0.1` 是容器自己：数据库在别的机器上就写那台的地址；就在这台机器上，写宿主机在 docker 网桥上的地址
 （一般是 `172.17.0.1`），并让 PostgreSQL 监听这个地址、`pg_hba.conf` 放行容器的网段。执行断点也进同一个库。
-表结构和默认数据同样在每次启动时自动补齐，库暂时连不上时同样按退避重试。
+表结构和默认数据同样在每次启动时自动补齐，库暂时连不上时同样按退避重试。`agentlab.env` 末尾「外接 PostgreSQL 与多进程（可选）」
+一段列着这几项（地址、断点库、PgBouncer、工作进程、连接池、启动时等库），都注释着，要用的去掉行首的 `#`；它们和别的 `AGENTLAB_*`
+一样经 `--env-file` 原样进容器。
 
 已经在用 SQLite 的，先把数据导过去（同一个镜像里带着导入命令；`--dry-run` 只核对、不写）：
 
@@ -241,7 +243,8 @@ docker run --rm --user 10001:10001 -v "$(pwd)/data:/data" --env-file agentlab.en
 问数据和后台任务（规矩见仓库 README「多进程」）。SQLite 时设大于 1 会启动失败（照实报错：SQLite 只支持单进程）。
 几台机器、几个容器指着同一个库也行，但数据目录要放在共享存储上、每台挂在同一个路径，限制见仓库 README「多进程」。
 
-内置 PostgreSQL 是直连（中间没有 PgBouncer），多进程时什么都不用另设（不用 `AGENTLAB_DATABASE_DIRECT_URL`）。新旧版本的进程不能同时
+内置 PostgreSQL 是直连（中间没有 PgBouncer），多进程时什么都不用另设（不用 `AGENTLAB_DATABASE_DIRECT_URL`；设了它、或者
+`AGENTLAB_DB_PGBOUNCER=1`，deploy.sh 照实拦下）。库还是 SQLite 时 `AGENTLAB_WORKERS` 大于 1，deploy.sh 在起容器之前就拦下。新旧版本的进程不能同时
 连着一个库（代码里拦着：新版本发现库里还有活着的旧版本进程就拒绝启动）。`./deploy.sh upgrade` 就是按这个顺序做的：先停掉旧容器
 （里面的全部工作进程一起停）、备份，再起新版本；旧进程要是被强杀、登记还没过期，新版本启动时会等它过期（最多半分钟左右）。
 同一个库还接着别处的 AgentLab 进程（另一台机器、另一个容器）的，升级前先把它们也停掉。

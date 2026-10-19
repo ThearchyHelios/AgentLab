@@ -238,6 +238,60 @@ def test_install_postgres_on_a_sqlite_data_dir_points_to_migrate(deploy):
     assert deploy.containers() == {} and deploy.mode() == "sqlite"
 
 
+def test_agentlab_settings_reach_the_container_through_the_env_file(tmp_path):
+    """agentlab.env 里的 AGENTLAB_*（多进程、连接池……）经 --env-file 原样进应用容器；内置库的地址、密码文件另用 -e 给。"""
+    deploy = Deploy(tmp_path, env_lines=["AGENTLAB_WORKERS=3", "AGENTLAB_DB_POOL_SIZE=5", "AGENTLAB_WORKER_LEASE_S=40"])
+    deploy("install", "--postgres")
+    calls = deploy.calls()
+    app_args = calls[index_of(calls, runs_named(APP))]
+    env_file = Path(app_args[app_args.index("--env-file") + 1])
+    assert env_file == deploy.pkg / "agentlab.env"
+    lines = env_file.read_text().splitlines()
+    assert {"AGENTLAB_WORKERS=3", "AGENTLAB_DB_POOL_SIZE=5", "AGENTLAB_WORKER_LEASE_S=40"} <= set(lines)
+
+
+@pytest.mark.parametrize("line", ["AGENTLAB_DATABASE_URL=postgresql+asyncpg://u:p@db.example:5432/agentlab",
+                                  "AGENTLAB_CHECKPOINT_URL=postgresql://u:p@db.example:5432/ckpt"])
+def test_any_external_database_setting_conflicts_with_builtin(tmp_path, line):
+    deploy = Deploy(tmp_path, env_lines=[line])
+    out = deploy("install", "--postgres", ok=False)
+    assert "两种库只能选一种" in out.stderr and line.split("=")[0] in out.stderr
+    assert deploy.containers() == {}
+
+
+def test_direct_url_needs_the_external_url(tmp_path):
+    deploy = Deploy(tmp_path, env_lines=["AGENTLAB_DATABASE_DIRECT_URL=postgresql+asyncpg://u:p@db.example:5432/agentlab"])
+    out = deploy("install", ok=False)
+    assert "AGENTLAB_DATABASE_DIRECT_URL" in out.stderr and "要和 AGENTLAB_DATABASE_URL 一起设" in out.stderr
+    assert deploy.containers() == {}
+    out = deploy("install", "--postgres", ok=False)
+    assert "两种库只能选一种" in out.stderr, "和内置库一起：照互斥报"
+
+
+def test_pgbouncer_switch_is_refused_for_the_builtin_database(tmp_path):
+    deploy = Deploy(tmp_path, env_lines=["AGENTLAB_DB_PGBOUNCER=1"])
+    out = deploy("install", "--postgres", ok=False)
+    assert "内置 PostgreSQL 是直连" in out.stderr and deploy.containers() == {}
+    make_sqlite_data(deploy.pkg / "data")
+    out = deploy("migrate-to-postgres", ok=False)
+    assert "内置 PostgreSQL 是直连" in out.stderr
+    assert not any(a[:1] == ["stop"] for a in deploy.calls()), "切换之前就拦下，服务没停"
+    # 外接的库配 PgBouncer：照常
+    deploy.write_env(["AGENTLAB_DB_PGBOUNCER=1", "AGENTLAB_DATABASE_URL=postgresql+asyncpg://u:p@bouncer.example:6432/agentlab",
+                      "AGENTLAB_DATABASE_DIRECT_URL=postgresql+asyncpg://u:p@db.example:5432/agentlab"])
+    deploy("install")
+    assert "外接 PostgreSQL" in deploy("status").stdout
+
+
+def test_more_than_one_worker_needs_postgres(tmp_path):
+    deploy = Deploy(tmp_path, env_lines=["AGENTLAB_WORKERS=4"])
+    out = deploy("install", ok=False)
+    assert "SQLite 只支持单进程" in out.stderr and "migrate-to-postgres" in out.stderr
+    assert deploy.containers() == {}
+    deploy("install", "--postgres")
+    assert deploy.containers()[APP]["state"] == "running", "内置 PostgreSQL 时可以多进程"
+
+
 def test_install_postgres_refuses_a_leftover_volume(deploy):
     deploy.state_file.write_text(json.dumps({"images": {}, "containers": {}, "networks": [], "volumes": [VOL]}))
     out = deploy("install", "--postgres", ok=False)
@@ -553,14 +607,39 @@ def test_package_script_takes_the_postgres_image_from_deploy_sh():
 def test_env_template_lists_the_postgres_settings_commented_out_with_the_defaults():
     """agentlab.env 模板末尾的「内置 PostgreSQL（可选）」：几项都注释着（不改任何人的部署），缺省值和 deploy.sh 里的一致。"""
     template = (REPO / "deploy" / "agentlab.env").read_text(encoding="utf-8")
-    section = template[template.index("# ---- 内置 PostgreSQL（可选）----"):]
-    assert template.rstrip().endswith(section.rstrip()), "追加在文件末尾"
+    start = template.index("# ---- 内置 PostgreSQL（可选）----")
+    tail = template[start:]
+    assert template.rstrip().endswith(tail.rstrip()), "追加在文件末尾"
+    section = tail.split("\n# ---- 外接 PostgreSQL 与多进程（可选）----")[0]
     commented = dict(line[2:].split("=", 1) for line in section.splitlines()
                      if line.startswith("# ") and "=" in line and line[2:3].isupper())
     assert commented == {"POSTGRES_IMAGE": PG_IMAGE, "POSTGRES_CONTAINER": "agentlab-postgres",
                          "DOCKER_NETWORK": "agentlab-net", "POSTGRES_VOLUME": "agentlab-pgdata", "BACKUP_KEEP": "5"}
     assert not any(line.split("=", 1)[0] in commented for line in template.splitlines() if not line.startswith("#")), \
         "都是注释"
+
+
+def test_env_template_ends_with_the_external_postgres_and_multiprocess_settings():
+    """模板最后一段「外接 PostgreSQL 与多进程（可选）」：要的几项都在、都注释着，缺省值和代码里的一致。"""
+    from app.core.config import Settings
+
+    template = (REPO / "deploy" / "agentlab.env").read_text(encoding="utf-8")
+    section = template[template.index("# ---- 外接 PostgreSQL 与多进程（可选）----"):]
+    commented = dict(line[2:].split("=", 1) for line in section.splitlines()
+                     if line.startswith("# AGENTLAB_") and "=" in line)
+    assert set(commented) == {
+        "AGENTLAB_DATABASE_URL", "AGENTLAB_CHECKPOINT_URL", "AGENTLAB_DB_PGBOUNCER", "AGENTLAB_DATABASE_DIRECT_URL",
+        "AGENTLAB_WORKERS", "AGENTLAB_WORKER_LEASE_S", "AGENTLAB_WORKER_HEARTBEAT_S", "AGENTLAB_DB_POOL_SIZE",
+        "AGENTLAB_DB_MAX_OVERFLOW", "AGENTLAB_DB_POOL_TIMEOUT", "AGENTLAB_DB_POOL_RECYCLE", "AGENTLAB_DB_STARTUP_TIMEOUT"}
+    assert "172.17.0.1" in commented["AGENTLAB_DATABASE_URL"] and "172.17.0.0/16" in section
+    fields = Settings.model_fields
+    for key, shown in commented.items():
+        default = fields[key.removeprefix("AGENTLAB_").lower()].default
+        if isinstance(default, bool):
+            assert shown == str(int(default)), key
+        elif isinstance(default, (int, float)):
+            assert float(shown) == float(default), key
+    assert not any(line.startswith("AGENTLAB_") for line in section.splitlines()), "都是注释"
 
 
 def test_settings_written_in_agentlab_env_take_effect(tmp_path):
@@ -570,6 +649,55 @@ def test_settings_written_in_agentlab_env_take_effect(tmp_path):
     assert set(deploy.containers()) == {APP, "agl-db"}
     assert deploy.containers()["agl-db"]["mounts"]["/var/lib/postgresql/data"] == "agl-v"
     assert deploy.containers()[APP]["network"] == "agl-n"
+
+
+def test_env_example_lists_every_database_pool_and_multiprocess_setting():
+    """core/config.py 里应用库、连接池、PgBouncer、多进程、调度这几类配置，每一项都在 .env.example 里有一行（注释掉的示例）；
+    dev.sh --postgres 读的 AGENTLAB_DEV_PG_* 也在。以后加了配置忘了写，这里会报出来。"""
+    import re
+
+    from app.core.config import Settings
+
+    prefixes = ("database_", "checkpoint_", "db_", "worker", "scheduler")
+    names = {f"AGENTLAB_{name.upper()}" for name in Settings.model_fields if name.startswith(prefixes)}
+    assert {"AGENTLAB_DATABASE_URL", "AGENTLAB_DATABASE_DIRECT_URL", "AGENTLAB_DB_PGBOUNCER", "AGENTLAB_WORKERS",
+            "AGENTLAB_WORKER_LEASE_S", "AGENTLAB_DB_STARTUP_TIMEOUT", "AGENTLAB_SCHEDULER_TICK_S"} <= names
+    dev = set(re.findall(r"dev_pg_setting (AGENTLAB_DEV_PG_[A-Z_]+)", (REPO / "scripts" / "dev.sh").read_text()))
+    assert len(dev) == 4
+    example = (REPO / ".env.example").read_text(encoding="utf-8")
+    listed = set(re.findall(r"^# (AGENTLAB_[A-Z_]+)=", example, re.M))
+    assert names | dev <= listed, f".env.example 里缺：{sorted((names | dev) - listed)}"
+
+
+def test_dev_script_reads_its_postgres_settings_from_dotenv(tmp_path):
+    """dev.sh --postgres 的几项：环境变量优先，没设时读 .env / backend/.env（后一个优先），和后端的配置同一个规矩。
+    在一份拷出来的脚本上跑，假的 conda、pnpm、docker：docker run 记下参数就失败退出，不真起容器、不起前后端。"""
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    (root / "frontend" / "node_modules").mkdir(parents=True)
+    shutil.copy(REPO / "scripts" / "dev.sh", root / "scripts" / "dev.sh")
+    (root / "backend").symlink_to(REPO / "backend")
+    (root / ".env").write_text("AGENTLAB_DEV_PG_CONTAINER=from-root-env\nAGENTLAB_DEV_PG_PORT=55491\n"
+                               "AGENTLAB_DEV_PG_VOLUME='quoted-vol'  \n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "docker.log"
+    (bin_dir / "conda").write_text(f'#!/bin/sh\ncase "$1" in env) echo "agentlab /x" ;; run) echo "{sys.executable}" ;; esac\n')
+    (bin_dir / "pnpm").write_text("#!/bin/sh\nexit 0\n")
+    (bin_dir / "docker").write_text(f'#!/bin/sh\necho "$*" >> "{log}"\ncase "$1" in version) echo 27 ;; '
+                                    'container) exit 1 ;; run) exit 1 ;; esac\nexit 0\n')
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(tmp_path), "AGENTLAB_DATA_DIR": str(tmp_path / "data"),
+           "AGENTLAB_DEV_PG_IMAGE": "postgres:from-env", "AGENTLAB_PORT": "18799", "LANG": "C.UTF-8"}
+    out = subprocess.run(["bash", str(root / "scripts" / "dev.sh"), "--postgres"], capture_output=True, text=True, env=env,
+                         timeout=60)
+    assert out.returncode != 0, "假的 docker run 失败，脚本停在这里"
+    [run] = [line for line in log.read_text().splitlines() if line.startswith("run ")]
+    assert "--name from-root-env" in run and "127.0.0.1:55491:5432" in run, ".env 里的生效"
+    assert "quoted-vol:/var/lib/postgresql/data" in run, "引号和行尾空白去掉"
+    assert run.endswith("postgres:from-env"), "环境变量优先"
+    (root / "backend").unlink()
 
 
 def test_dev_script_refuses_unknown_arguments_and_documents_postgres():
