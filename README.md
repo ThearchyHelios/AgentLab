@@ -19,7 +19,7 @@
 - [快速开始](#快速开始) · [生产部署](#生产部署) · [核心能力](#核心能力) · [受限动态编排](#受限动态编排模板定骨架agent-填关节)
 - [可点击证据](#可点击证据报告里的每个数都点得开出处) · [评测与口径账本](#回归评测与口径账本) · [应用](#应用已发布版本的使用面) · [身份与权限](#身份与权限) · [能力登记与端点](#能力登记与端点)
 - [数据目录](#数据目录让助手和-agent-看懂业务数据) · [工作流形态](#工作流形态) · [节点类型](#节点类型) · [架构](#架构)
-- [关键设计决策](#关键设计决策) · [运行环境](#运行环境) · [常见问题](#常见问题) · [开发与验证](#开发与验证)
+- [关键设计决策](#关键设计决策) · [运行环境](#运行环境) · [用 PostgreSQL](#用-postgresql) · [常见问题](#常见问题) · [开发与验证](#开发与验证)
 
 ---
 
@@ -64,7 +64,8 @@ Mock 不会写引用标记：探索运行里报告撰写节点照样跑完，但
 http://127.0.0.1:8000 。前端产物不存在或比源码旧时才重新构建，`--build` / `--no-build` 强制构建或跳过。
 `--port`（或 `AGENTLAB_PORT`）改端口；`--host` 监听所有网卡，默认同样**不开登录**，多人使用请开登录
 （[身份与权限](#身份与权限)）。
-数据目录默认为仓库下的 `data/`，`AGENTLAB_DATA_DIR` 可改。只能单进程运行：运行管理器在进程内、数据库是 SQLite；后台任务
+数据目录默认为仓库下的 `data/`，`AGENTLAB_DATA_DIR` 可改。应用库默认是数据目录里的 SQLite，也可以换成 PostgreSQL
+（[用 PostgreSQL](#用-postgresql)），但目前仍只能单进程运行：运行管理器在进程内；后台任务
 （探查、起草、剖析、评测、影子起草、口径比对与召回）的排队、限流和按需探查的锁也都在进程内，多进程部署要先换成库里的锁。
 上传表格的版本存储同样只支持单进程运行（不要给 uvicorn 加 `--workers`）：启动时会锁住数据目录，同一个数据目录
 起了第二个进程时，后起的那个不做任何清理，上传、启用版本等写操作一律返回 503。
@@ -739,8 +740,8 @@ flowchart TB
         B5["sandbox<br/>microVM / Seatbelt / bubblewrap"]
     end
     subgraph ST["存储"]
-        S1[("agentlab.db<br/>业务数据")]
-        S2[("checkpoints.db<br/>执行断点")]
+        S1[("agentlab.db 或 PostgreSQL<br/>业务数据")]
+        S2[("checkpoints.db 或同一个 PostgreSQL<br/>执行断点")]
         S3[("artifacts/<br/>内容寻址工件库")]
     end
     FE <-->|REST + WebSocket| BE
@@ -991,6 +992,7 @@ sudo setfacl -m u:$USER:rw /dev/kvm      # 当前会话立即可用
 pip install -e 'backend[docs]' -c backend/requirements.lock     # PDF / Word / PowerPoint / Excel 解析
 pip install -e 'backend[db]' -c backend/requirements.lock       # MySQL / PostgreSQL / Oracle 驱动
 pip install -e 'backend[microvm]' -c backend/requirements.lock  # microVM 沙箱
+pip install -e 'backend[postgres]' -c backend/requirements.lock # 应用库用 PostgreSQL（asyncpg、psycopg 3、官方断点库）
 pip install -e 'backend[dev]' -c backend/requirements.lock      # pytest
 ```
 
@@ -1001,8 +1003,16 @@ pip install -e 'backend[dev]' -c backend/requirements.lock      # pytest
 装包时以它为约束，所以换一台机器装到的也是同一套。
 
 LangGraph / LangChain 一族在 `pyproject.toml` 里只放行到下一个小版本：引擎直接依赖
-它们的断点格式、interrupt / resume 和流式事件，这些在小版本里也改过行为。aiosqlite
-与 SQLAlchemy 同理——`db/base.py` 给 aiosqlite 打了补丁，连接池断开连接时会走到它。
+它们的断点格式、interrupt / resume 和流式事件，这些在小版本里也改过行为。断点格式本身在
+`langgraph-checkpoint` 里（langgraph 只要求它 <5，所以单独卡住）；SQLite、PostgreSQL 两个断点库
+（`langgraph-checkpoint-sqlite`、`langgraph-checkpoint-postgres`）都按它读写，`copy-to-postgres` 搬断点也靠两边是同一版格式。
+`langgraph-checkpoint-postgres` 3.1.3 起要 `langgraph-checkpoint` 4.3，锁在 3.1.2，升级时三个一起动。aiosqlite
+与 SQLAlchemy 同理——`db/base.py` 给 aiosqlite 打了补丁，连接池断开连接时会走到它；应用库换成 PostgreSQL 之后
+补丁照样打着：上传表格、手工登记的 SQLite 数据源还走 aiosqlite。
+
+`[postgres]` 里是应用库用 PostgreSQL 时要的：SQLAlchemy 这边走 asyncpg（和 `[db]` 里连业务库的是同一个包），
+断点库走官方的 `langgraph-checkpoint-postgres`，它只认 psycopg 3 和 `psycopg-pool`。psycopg 带 `[binary]`：
+wheel 里自带 libpq，镜像和本机都不用另装 PostgreSQL 客户端。
 
 升级依赖要主动做，改完跑一遍测试再提交：
 
@@ -1010,7 +1020,7 @@ LangGraph / LangChain 一族在 `pyproject.toml` 里只放行到下一个小版�
 ./scripts/lock-deps.sh --upgrade-package langgraph   # 升一个包（连带它必须跟着动的）
 ./scripts/lock-deps.sh --upgrade                     # 全部升到 pyproject 允许的最新
 ./scripts/lock-deps.sh                               # 只加了新依赖：补上它，已锁的不动
-pip install -e 'backend[microvm,dev,db,docs]' -c backend/requirements.lock   # 装到当前环境
+pip install -e 'backend[microvm,dev,db,docs,postgres]' -c backend/requirements.lock   # 装到当前环境
 ```
 
 重新生成锁文件需要 [uv](https://docs.astral.sh/uv/)；装依赖本身只用 pip。
@@ -1020,7 +1030,65 @@ pip install -e 'backend[microvm,dev,db,docs]' -c backend/requirements.lock   # �
 全部位于 `data/`：`agentlab.db` 业务数据、`checkpoints.db` 执行断点、
 `artifacts/` 工件库、`workspace/` 沙箱文件、`uploads/` 上传文件、`records/` 填报登记的记录表、`files/` 表单附件、
 `.secret_key` 加密密钥。
-删除 `data/` 即恢复出厂设置。
+删除 `data/` 即恢复出厂设置。应用库用 PostgreSQL 时（下一节）不再用 `agentlab.db`、`checkpoints.db`，业务数据和断点
+都在 PostgreSQL 里；别的照旧在 `data/`，数据目录照样要有、要备份。
+
+### 用 PostgreSQL
+
+缺省的应用库是数据目录里的 SQLite：单机单进程，什么都不用装。要把应用库（工作流、运行、事件、审批、待办、数据目录、
+评测……）和执行断点放进 PostgreSQL，设一项：
+
+```bash
+AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agentlab   # postgresql:// 也认
+```
+
+- 要 `[postgres]` 额外依赖（`environment.yml`、Docker 镜像都已带上）；库要先建好（`CREATE DATABASE agentlab`），
+  表由服务启动时建，老版本建的库启动时补列补索引，同 SQLite。启动日志第一句写用的是哪种库、哪台主机哪个库（不写密码）。
+- 断点（LangGraph 的 checkpoints、checkpoint_blobs、checkpoint_writes、checkpoint_migrations 四张表，不和应用的表重名）
+  缺省放在同一个库；要放别处设 `AGENTLAB_CHECKPOINT_URL=postgresql://…`。
+- 连接池：每个进程常驻 `AGENTLAB_DB_POOL_SIZE`（缺省 10）条、高峰再多开 `AGENTLAB_DB_MAX_OVERFLOW`（缺省 20）条，取连接前探活，
+  30 分钟换一次；断点库另有一个小池子。前面有 PgBouncer（事务模式）时：`AGENTLAB_DB_POOL_SIZE` 设成 0（不用连接池）、
+  地址后加 `?prepared_statement_cache_size=0`；断点库用预备语句，要 PgBouncer 1.21 以上开 `max_prepared_statements`，
+  或者用 `AGENTLAB_CHECKPOINT_URL` 让它直连 PostgreSQL。
+- 和 SQLite 上的行为一致：字符串列不限长（SQLite 本来就不查长度，模型里写的长度只是示意）、整数列是 BIGINT、JSON 列存原文
+  （PostgreSQL 的 json，不是 JSONB：JSONB 会重排对象里的键）、时间存不带时区的 UTC、排序时可空列的 NULL 照 SQLite 的位置
+  （升序在前、降序在后）。两处 SQLite 照存而 PostgreSQL 不收的值会被换掉：JSON 里的 NaN / Infinity 写成 null，字符串里的
+  NUL 字符去掉。
+- `AGENTLAB_DATA_DIR` 照旧要设：工件、上传表格的版本库、原件、附件、记录表、沙箱工作区、`.secret_key` 都还是文件。
+
+**从 SQLite 搬过来。** `python -m app.db copy-to-postgres` 把数据目录里的 `agentlab.db` 和 `checkpoints.db` 导进 PostgreSQL，
+停在审批上的、中断了的运行导过去之后照样能接着跑：
+
+```bash
+# 1. 停服务（导入会检查：来源旁边还留着 agentlab.db-wal / checkpoints.db-wal，或者目标库上已经有服务连着，就拒绝）
+# 2. 备份数据目录（停着服务拷一份）
+# 3. 只核对：数来源有多少、目标上已有多少，什么都不写
+cd backend && python -m app.db copy-to-postgres ../data postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agentlab --dry-run
+# 4. 导入：建表、按外键先后逐表分批插入，结束时逐表按主键核对、断点按条数核对，有没导进去的退出码非零
+cd backend && python -m app.db copy-to-postgres ../data postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agentlab
+# 5. 设 AGENTLAB_DATABASE_URL（AGENTLAB_DATA_DIR 还指着原来的数据目录），起服务
+```
+
+- 目标地址不给就用 `AGENTLAB_DATABASE_URL`；`--checkpoint-url` 把断点导到另一个库；`--work-dir` 放快照（要留出和两个库一样大的
+  空间，缺省系统临时目录）。读的是 SQLite 备份接口拷出的一份快照，在快照上先补到当前的表结构，来源的内容不改。
+- 重跑是幂等的：目标上已有同一主键（或撞了别的唯一约束）的行一律不动，只补上还没有的，不重复、也不覆盖——所以导入之后又在
+  SQLite 上改过的行，重跑不会带过去；要整份重来就清空目标库再导。断点同理，已有的不重写。
+- 能查到的只有上面两样：服务连着别的数据目录、另一台机器上的服务连着目标库，查不出来，要自己保证。来源旁边的 -wal 是上次
+  强杀留下的，确认服务已停后加 `--assume-stopped`。
+- 导完 `agentlab.db` 留在数据目录里也没关系（可以当回退用）：它照样算 AgentLab 自己的文件，不能登记成数据源。
+
+**备份。** PostgreSQL 用 `pg_dump`（应用表和断点在同一个库里就一次带上），数据目录照旧整份拷。两样最好在停服务时一起做；
+不停服务的话先 dump 库、再拷数据目录：工件、原件按内容寻址、只增不改，库里引用到的文件拷数据目录时都在。
+
+**多台机器。** 应用库换成 PostgreSQL 之后，几台机器要用同一份数据目录：放在共享存储（NFS 之类）上，每台挂在**同一个绝对路径**
+（库里记着上传表格各版本库文件的绝对路径）。文件都是先写临时文件再改名，读的一方看不到写了一半的。但要说实话：数据目录里还有
+SQLite 文件——上传表格的各版本库（`uploads/tables/`，发布后只读，读没问题）、填报的记录表（`records/*.db`，原地追加写）、
+沙箱里代码自己建的库——**SQLite 文件放在网络文件系统上并发写是不安全的**（文件锁在 NFS 上不可靠），上传表格的版本存储启动时
+取的 flock 在 NFS 上也不一定管用。所以眼下即使换了 PostgreSQL，仍按单进程部署（[生产部署](#生产部署)那一段的限制都还在）；
+多进程、多台机器要等这些写入收归一个进程或换成库里的锁之后。
+
+**测试。** `scripts/test-postgres.sh` 用本机 docker 已有的 `postgres:16` 镜像起一个临时容器（只绑 127.0.0.1 的随机端口，跑完删掉），
+在上面跑后端全量；参数原样交给 pytest。只对 SQLite 成立的测试标了 `sqlite_only`，在 PostgreSQL 上跳过。
 
 ---
 
@@ -1080,6 +1148,12 @@ node scripts/check-all.mjs
 CHECK_DATA_SRC=<数据目录> node scripts/check-all.mjs --stacks 2 --lanes 12
 # 只跑某几项（名字去掉 check- 前缀）
 node scripts/check-all.mjs evidence publish
+```
+
+应用库换成 PostgreSQL 跑同一套（起临时的 `postgres:16` 容器，跑完删掉，见[用 PostgreSQL](#用-postgresql)）：
+
+```bash
+PYTHON=$(conda run -n agentlab which python) ./scripts/test-postgres.sh
 ```
 
 pytest 前面的 `env -u` 不能省：没配 Key 的 provider 会退回环境变量里的密钥，启动时的 seed 也会拿它种一个

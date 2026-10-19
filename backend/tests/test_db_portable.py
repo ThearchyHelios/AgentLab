@@ -106,6 +106,34 @@ def test_postgres_integer_binds_are_bigint():
     assert "runs.last_seq > $1::BIGINT" in sql
 
 
+def test_database_urls_are_normalized_and_never_logged_with_the_password():
+    from app.db.urls import describe, libpq_conninfo, normalize_checkpoint_url, normalize_database_url
+
+    assert normalize_database_url("postgres://u:p%40w@h:5433/db") == "postgresql+asyncpg://u:p%40w@h:5433/db"
+    assert normalize_checkpoint_url("postgresql+asyncpg://u:pw@h/db") == "postgresql://u:pw@h/db"
+    # asyncpg 的 ssl= 换成 libpq 的 sslmode=，只给 asyncpg 看的参数不带给 psycopg
+    assert libpq_conninfo("postgresql+asyncpg://u:pw@h/db?ssl=require&prepared_statement_cache_size=0") \
+        == "postgresql://u:pw@h/db?sslmode=require"
+    assert "pw" not in describe("postgresql+asyncpg://u:pw@h:5433/db")
+    for bad in ("mysql://u@h/db", "sqlite:///x.db", "postgresql://h", "这不是地址"):
+        with pytest.raises(ValueError):
+            normalize_database_url(bad)
+    from app.core.config import Settings
+
+    with pytest.raises(ValueError, match="AGENTLAB_DATABASE_URL"):
+        Settings(database_url="mysql://u@h/db")
+    assert Settings(database_url="  ").db_dialect == "sqlite"
+
+
+def test_the_startup_line_names_the_database_without_the_password():
+    from sqlalchemy.engine import make_url
+
+    line = db_base.describe_database()
+    password = make_url(db_base.settings.db_url).password
+    assert ("PostgreSQL" if PG else "SQLite") in line
+    assert not password or password not in line
+
+
 # --------------------------------------------------------------------------
 # 连着库：两种库同一套结果
 # --------------------------------------------------------------------------

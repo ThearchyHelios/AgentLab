@@ -58,7 +58,8 @@ deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i im
 
 所有数据都在 `DATA_DIR`（默认是包目录下的 `data/`）：数据库 `agentlab.db`、执行断点 `checkpoints.db`、
 工件、上传文件、沙箱工作区，以及加密密钥 `.secret_key`。**要备份的就是这个目录**，
-丢了 `.secret_key`，存进去的 API Key 就解不开了。
+丢了 `.secret_key`，存进去的 API Key 就解不开了。数据库放在 PostgreSQL 时（下面「用 PostgreSQL」）没有这两个库文件，
+另用 `pg_dump` 备份数据库。
 
 deploy.sh 会把数据目录的属主改成容器里的用户（uid 10001），所以备份、删除要用 sudo。
 停下来备份最稳妥（以默认的 `./data` 为例，在包目录里执行）：
@@ -70,6 +71,37 @@ sudo tar -czf ../agentlab-data-$(date +%Y%m%d).tar.gz data
 ```
 
 恢复：停掉容器，把备份解回 `DATA_DIR`，再 `./deploy.sh start`。
+
+## 用 PostgreSQL
+
+缺省数据库是数据目录里的 SQLite。要放进 PostgreSQL（库要先建好），在 `agentlab.env` 里加一行再 `./deploy.sh upgrade`
+（或 stop 再 start）：
+
+```bash
+AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@<数据库地址>:5432/agentlab
+```
+
+容器里的 `127.0.0.1` 是容器自己：数据库在别的机器上就写那台的地址；就在这台机器上，写宿主机在 docker 网桥上的地址
+（一般是 `172.17.0.1`），并让 PostgreSQL 监听这个地址、`pg_hba.conf` 放行容器的网段。执行断点也进同一个库。
+数据目录照样要挂、要备份：工件、上传文件、记录表、加密密钥 `.secret_key` 还在里面。
+
+已经在用 SQLite 的，先把数据导过去（同一个镜像里带着导入命令；`--dry-run` 只核对、不写）：
+
+```bash
+./deploy.sh stop
+sudo tar -czf ../agentlab-data-$(date +%Y%m%d).tar.gz data        # 先备份
+docker run --rm --user 10001:10001 -v "$(pwd)/data:/data" --env-file agentlab.env --entrypoint python \
+  agentlab:<版本> -m app.db copy-to-postgres /data --dry-run
+docker run --rm --user 10001:10001 -v "$(pwd)/data:/data" --env-file agentlab.env --entrypoint python \
+  agentlab:<版本> -m app.db copy-to-postgres /data
+./deploy.sh start                                                  # agentlab.env 里已经有 AGENTLAB_DATABASE_URL
+```
+
+导入结束时逐表打印来源和目标的行数、断点的条数，对不上的列出来、退出码非零；重跑只补没有的行，不重复、不覆盖。
+停在审批上、中断了的运行导过去之后照样能接着跑。导完 `data/agentlab.db` 可以留着当回退：把那一行删掉、重新部署就回到 SQLite
+（导入之后在 PostgreSQL 上新产生的东西不会回来）。备份时除了数据目录，再用 `pg_dump` 备份这个库。
+
+现在仍按一台机器、一个容器部署：多台机器共用一份数据目录的限制见仓库 README「用 PostgreSQL」。
 
 ## 升级
 

@@ -15,6 +15,8 @@ _CHECKPOINT_SCHEMES = {"postgresql", "postgres", "postgresql+psycopg", "postgres
 
 #: asyncpg 和 libpq 对 SSL 的参数名不一样：asyncpg 是 ssl=require，libpq 是 sslmode=require（取值同一套）
 _ASYNCPG_TO_LIBPQ = {"ssl": "sslmode"}
+#: 只给 SQLAlchemy / asyncpg 看的参数，libpq 不认（psycopg 连的时候会报「invalid connection option」）
+_ASYNCPG_ONLY = {"prepared_statement_cache_size", "prepared_statement_name_func", "command_timeout", "async_fallback"}
 
 
 def _parse(raw: str, schemes: set[str], example: str) -> URL:
@@ -44,7 +46,7 @@ def normalize_checkpoint_url(raw: str) -> str:
 def libpq_conninfo(database_url: str) -> str:
     """SQLAlchemy 的地址 → psycopg 的连接串：去掉驱动名，asyncpg 写法的参数换成 libpq 的。"""
     url = make_url(database_url)
-    query = {_ASYNCPG_TO_LIBPQ.get(k, k): v for k, v in url.query.items()}
+    query = {_ASYNCPG_TO_LIBPQ.get(k, k): v for k, v in url.query.items() if k not in _ASYNCPG_ONLY}
     return url.set(drivername="postgresql", query=query).render_as_string(hide_password=False)
 
 
