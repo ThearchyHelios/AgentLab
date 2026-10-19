@@ -301,6 +301,27 @@ def test_more_than_one_worker_needs_postgres(tmp_path):
     assert deploy.containers()[APP]["state"] == "running", "内置 PostgreSQL 时可以多进程"
 
 
+def test_tilde_in_data_dir_is_the_sudo_users_home(tmp_path):
+    """复核 R-d6：DATA_DIR=~/… 用 sudo 运行时按 SUDO_USER 的家目录展开（getent passwd 取），不是 /root；展开后的绝对路径打印出来。"""
+    deploy = Deploy(tmp_path, env_lines=["DATA_DIR=~/agentlab_data"])
+    alice = tmp_path / "home" / "alice"
+    alice.mkdir(parents=True)
+    root_home = tmp_path / "root"
+    root_home.mkdir()
+    getent = tmp_path / "bin" / "getent"
+    getent.write_text(f'#!/bin/sh\n[ "$1" = passwd ] && [ "$2" = alice ] && echo "alice:x:1000:1000::{alice}:/bin/bash"\n')
+    getent.chmod(0o755)
+    out = deploy("install", HOME=str(root_home), SUDO_USER="alice")
+    target = (alice / "agentlab_data").resolve()
+    assert target.is_dir() and not (root_home / "agentlab_data").exists()
+    assert f"数据目录：{target}（DATA_DIR=~/agentlab_data，~ 是 {alice}）" in out.stdout
+    assert deploy.containers()[APP]["mounts"]["/data"] == str(target)
+    # 取不到 SUDO_USER 的家目录：退回 $HOME
+    other = Deploy(tmp_path / "other", env_lines=["DATA_DIR=~/agentlab_data"], name="agl-b")
+    other("install", HOME=str(root_home), SUDO_USER="nobody-here")
+    assert (root_home / "agentlab_data").is_dir()
+
+
 def test_install_postgres_refuses_a_leftover_volume(deploy):
     deploy.state_file.write_text(json.dumps({"images": {}, "containers": {}, "networks": [], "volumes": [VOL]}))
     out = deploy("install", "--postgres", ok=False)

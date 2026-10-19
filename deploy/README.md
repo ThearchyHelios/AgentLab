@@ -85,6 +85,10 @@ sudo cp -rp data/backups/sqlite/<时间>/records/. data/records/           # 记
 
 `-wal`、`-shm` 要先删：留着的话 SQLite 会把它们当成换回来的库的一部分。
 
+`DATA_DIR` 写成 `~/…` 时，`~` 是运行 deploy.sh 的那个人的家目录：用 `sudo ./deploy.sh` 运行时按调用 sudo 的用户
+（`SUDO_USER`）的家目录展开，不是 `/root`。`install`、`upgrade` 开头会打印展开后的绝对路径（`==> 数据目录：…`），对一眼；
+不放心就直接写绝对路径。
+
 deploy.sh 会把数据目录的属主改成容器里的用户（uid 10001），所以备份、删除要用 sudo。
 停下来备份最稳妥（以默认的 `./data` 为例，在包目录里执行）：
 

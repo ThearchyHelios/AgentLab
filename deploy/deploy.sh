@@ -215,13 +215,27 @@ read_env() {
   case "$ENABLE_MICROVM" in auto|0|1) ;; *) die "ENABLE_MICROVM 只能是 auto、0 或 1：$ENABLE_MICROVM" ;; esac
 
   # 相对路径以 deploy.sh 所在的目录为准，和从哪里运行无关
-  # 下面比较的就是字面上的 ~，不需要展开
+  # 下面比较的就是字面上的 ~，不需要展开。~ 是运行 deploy.sh 的那个人的家目录：sudo ./deploy.sh 时 $HOME 常是 /root，
+  # 按 SUDO_USER 的家目录展开（见 invoking_home）
+  INVOKER_HOME="$(invoking_home)"
+  TILDE_NOTE=""
   # shellcheck disable=SC2088
   case "$DATA_DIR" in
     /*) DATA_PATH="$DATA_DIR" ;;
-    "~"|"~/"*) DATA_PATH="$HOME${DATA_DIR#\~}" ;;
+    "~"|"~/"*)
+      DATA_PATH="$INVOKER_HOME${DATA_DIR#\~}"
+      TILDE_NOTE="（DATA_DIR=${DATA_DIR}，~ 是 ${INVOKER_HOME}）" ;;
     *) DATA_PATH="$HERE/${DATA_DIR#./}" ;;
   esac
+}
+
+# 家目录：用 sudo 运行时是调用 sudo 的那个人的（getent passwd 取），取不到退回 $HOME
+invoking_home() {
+  local home=""
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && command -v getent >/dev/null 2>&1; then
+    home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+  fi
+  printf '%s' "${home:-$HOME}"
 }
 
 # ---------------------------------------------------------------------------
@@ -307,7 +321,8 @@ prepare_data() {
     /|/bin|/boot|/dev|/etc|/home|/lib|/opt|/proc|/root|/sbin|/srv|/sys|/usr|/var)
       die "DATA_DIR 不能是系统目录：$DATA_ABS" ;;
   esac
-  [ "$DATA_ABS" != "$HOME" ] || die "DATA_DIR 不能是家目录本身：$DATA_ABS"
+  [ "$DATA_ABS" != "$HOME" ] && [ "$DATA_ABS" != "${INVOKER_HOME:-$HOME}" ] || die "DATA_DIR 不能是家目录本身：$DATA_ABS"
+  say "数据目录：${DATA_ABS}${TILDE_NOTE:-}"
 }
 
 # 已经有同名容器时：它得是 AgentLab 的，数据目录也得和配置的是同一个。
