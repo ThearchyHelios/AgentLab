@@ -12,6 +12,7 @@ from sqlalchemy import JSON, BigInteger, Column, DateTime, Integer, MetaData, ev
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import NullPool
+from sqlalchemy.engine import make_url
 from sqlalchemy.types import TypeDecorator
 
 from app.core.config import settings
@@ -300,11 +301,26 @@ async def dispose_session_engine() -> None:
 
 
 def check_pgbouncer() -> None:
-    """AGENTLAB_DB_PGBOUNCER=1 却没给直连地址：拒绝启动（事务模式下 LISTEN、会话级咨询锁不成立，跨进程的锁会锁不住、放不掉）。"""
-    if settings.db_pgbouncer and settings.db_dialect == "postgresql" and not settings.database_direct_url:
+    """AGENTLAB_DB_PGBOUNCER=1 时直连地址要真的是直连：没给、或者给的和应用库地址指着同一个主机端口（还是那个 PgBouncer），都拒绝
+    启动（事务模式下 LISTEN、会话级咨询锁不成立，跨进程的锁会锁不住、放不掉；复核 R-b12）。"""
+    if not (settings.db_pgbouncer and settings.db_dialect == "postgresql"):
+        return
+    if not settings.database_direct_url:
         raise RuntimeError("AGENTLAB_DB_PGBOUNCER=1（应用库地址是 PgBouncer 的事务模式）时要另给 AGENTLAB_DATABASE_DIRECT_URL："
                            "进程间通知（LISTEN）、跨进程的锁（会话级咨询锁）、断点库要直连 PostgreSQL（或 PgBouncer 的会话模式）。"
-                           "见 README「用 PostgreSQL」里的三种部署")
+                           "见 README「多进程」里的「直连与 PgBouncer」")
+    if _endpoint(settings.database_direct_url) == _endpoint(settings.database_url):
+        from app.db.urls import describe
+
+        raise RuntimeError(f"AGENTLAB_DATABASE_DIRECT_URL 和 AGENTLAB_DATABASE_URL 指着同一个地址（{describe(settings.database_url)}）："
+                           "AGENTLAB_DB_PGBOUNCER=1 说应用库地址是 PgBouncer 的事务模式，直连地址要绕过它、直接连 PostgreSQL"
+                           "（或者 PgBouncer 的会话模式那个端口）。见 README「多进程」里的「直连与 PgBouncer」")
+
+
+def _endpoint(url: str) -> tuple[str, int]:
+    """地址连的是哪个主机端口（端口不写按 5432）。"""
+    parsed = make_url(url)
+    return (parsed.host or "").lower(), int(parsed.port or 5432)
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:

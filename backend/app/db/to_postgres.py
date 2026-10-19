@@ -481,13 +481,23 @@ async def copy_checkpoints(snapshot_ckpt: Path, conninfo: str, *, dry_run: bool,
 # --------------------------------------------------------------------------
 
 
+def checkpoint_conninfo(target_url: str, *, checkpoint_url: str | None = None, direct_url: str | None = None) -> str:
+    """断点搬到哪儿（psycopg 的连接串）：给了断点库地址用它；否则进目标库——给了直连地址就走直连（复核 R-b12：目标地址是
+    PgBouncer 的事务模式时，psycopg 的预备语句、建表时取的会话级锁都会出问题）。"""
+    if checkpoint_url:
+        return normalize_checkpoint_url(checkpoint_url)
+    return libpq_conninfo(normalize_database_url(direct_url) if direct_url else normalize_database_url(target_url))
+
+
 async def copy_to_postgres(source: str | Path, target_url: str, *, checkpoint_url: str | None = None,
-                           dry_run: bool = False, assume_stopped: bool = False, batch: int = DEFAULT_BATCH,
-                           work_dir: str | Path | None = None, progress: Callable[[str], None] = print) -> Report:
+                           direct_url: str | None = None, dry_run: bool = False, assume_stopped: bool = False,
+                           batch: int = DEFAULT_BATCH, work_dir: str | Path | None = None,
+                           progress: Callable[[str], None] = print) -> Report:
+    """direct_url：目标库的直连地址（目标地址是 PgBouncer 时给；断点走它）。"""
     from app.db.base import create_schema, make_engine
 
     target_url = normalize_database_url(target_url)
-    conninfo = normalize_checkpoint_url(checkpoint_url) if checkpoint_url else libpq_conninfo(target_url)
+    conninfo = checkpoint_conninfo(target_url, checkpoint_url=checkpoint_url, direct_url=direct_url)
     db, ckpt = resolve_source(source)
     if (wal := source_in_use(db, ckpt)) and not assume_stopped:
         raise CopyRefused(f"{wal} 还在：服务看起来还开着这个库。先停服务再导入；确认服务已停（上次是强杀，留下了 "
@@ -567,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("source", help="数据目录，或者 agentlab.db 的路径（断点库 checkpoints.db 在同一个目录里找）")
     parser.add_argument("target", nargs="?", help="目标地址 postgresql+asyncpg://…；不给就用 AGENTLAB_DATABASE_URL")
     parser.add_argument("--checkpoint-url", help="断点放到另一个 PostgreSQL 库；不给就用 AGENTLAB_CHECKPOINT_URL，再没有就进目标库")
+    parser.add_argument("--direct-url", help="目标库的直连地址（目标地址是 PgBouncer 时给，断点走它）；不给、目标又是 "
+                                             "AGENTLAB_DATABASE_URL 时用 AGENTLAB_DATABASE_DIRECT_URL")
     parser.add_argument("--dry-run", action="store_true", help="只核对：数来源和目标各有多少行，不建表、不写")
     parser.add_argument("--assume-stopped", action="store_true",
                         help="不查服务停没停（来源旁边留着强杀后的 -wal 时用）")
@@ -576,9 +588,16 @@ def main(argv: list[str] | None = None) -> int:
     target = args.target or settings.database_url
     if not target:
         parser.error("没有目标地址：给第二个参数，或者设 AGENTLAB_DATABASE_URL")
+    direct = args.direct_url or None
+    if direct is None and settings.database_direct_url:
+        try:
+            same = normalize_database_url(target) == settings.database_url
+        except ValueError:
+            same = False
+        direct = settings.database_direct_url if same else None
     try:
         report = asyncio.run(copy_to_postgres(
-            args.source, target, checkpoint_url=args.checkpoint_url or settings.checkpoint_url or None,
+            args.source, target, checkpoint_url=args.checkpoint_url or settings.checkpoint_url or None, direct_url=direct,
             dry_run=args.dry_run, assume_stopped=args.assume_stopped, batch=max(args.batch, 1),
             work_dir=args.work_dir))
     except (CopyRefused, ValueError) as e:

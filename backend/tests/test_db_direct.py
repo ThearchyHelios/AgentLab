@@ -67,3 +67,45 @@ def test_transaction_mode_without_a_direct_url_refuses_to_start(monkeypatch):
     monkeypatch.setattr(settings, "database_direct_url", Settings(database_url=APP, database_direct_url=DIRECT,
                                                                   _env_file=None).database_direct_url)
     base.check_pgbouncer()
+
+
+def test_transaction_mode_with_a_direct_url_that_is_the_same_endpoint_refuses_to_start(monkeypatch):
+    """复核 R-b12：直连地址和应用库地址规范化之后连的是同一个主机端口（还是那个 PgBouncer）——同样拒绝，说清楚。"""
+    from app.db import base
+
+    monkeypatch.setattr(settings, "database_url", Settings(database_url=APP, _env_file=None).database_url)
+    monkeypatch.setattr(settings, "db_pgbouncer", True)
+    for same in (APP, "postgresql+asyncpg://other:pw@PGBOUNCER.internal:6432/agentlab?ssl=require"):
+        monkeypatch.setattr(settings, "database_direct_url",
+                            Settings(database_url=APP, database_direct_url=same, _env_file=None).database_direct_url)
+        with pytest.raises(RuntimeError, match="指着同一个地址"):
+            base.check_pgbouncer()
+    monkeypatch.setattr(settings, "database_direct_url", Settings(
+        database_url=APP, database_direct_url="postgresql://agentlab:secret@pgbouncer.internal:5432/agentlab",
+        _env_file=None).database_direct_url)
+    base.check_pgbouncer()   # 同一台机器上的另一个端口（直连 PostgreSQL 或会话模式）：放行
+
+
+def test_copying_checkpoints_goes_through_the_direct_url(monkeypatch, tmp_path):
+    """复核 R-b12：copy-to-postgres 搬断点缺省走直连地址（设了的话）；单独给了断点库地址就用它。"""
+    from app.db import to_postgres
+
+    assert "db.internal:5432" in to_postgres.checkpoint_conninfo(APP, direct_url=DIRECT)
+    assert "pgbouncer.internal:6432" in to_postgres.checkpoint_conninfo(APP)
+    assert "ckpt.internal" in to_postgres.checkpoint_conninfo(APP, checkpoint_url="postgresql://u:p@ckpt.internal/c",
+                                                              direct_url=DIRECT)
+    seen: dict = {}
+
+    async def fake_copy(source, target, **kw):
+        seen.update(kw, target=target)
+        raise to_postgres.CopyRefused("测试：到这里为止")
+
+    monkeypatch.setattr(to_postgres, "copy_to_postgres", fake_copy)
+    monkeypatch.setattr(settings, "database_url", Settings(database_url=APP, _env_file=None).database_url)
+    monkeypatch.setattr(settings, "database_direct_url",
+                        Settings(database_url=APP, database_direct_url=DIRECT, _env_file=None).database_direct_url)
+    monkeypatch.setattr(settings, "checkpoint_url", "")
+    assert to_postgres.main([str(tmp_path)]) == 2
+    assert seen["direct_url"] == settings.database_direct_url, "目标就是应用库：断点走它的直连地址"
+    assert to_postgres.main([str(tmp_path), "postgresql://u:p@elsewhere.internal:5432/x"]) == 2
+    assert seen["direct_url"] is None, "目标是别的库：不套用应用库的直连地址"
