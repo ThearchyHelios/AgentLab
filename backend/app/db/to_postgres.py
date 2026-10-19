@@ -584,6 +584,13 @@ def main(argv: list[str] | None = None) -> int:
     except (CopyRefused, ValueError) as e:
         print(f"没有导入：{e}", file=sys.stderr)
         return 2
+    except Exception as e:  # noqa: BLE001 - 连不上、库报错：照实说一句，不甩一屏调用栈
+        from app.core.errors import first_line
+
+        what = "核对" if args.dry_run else "导入"
+        tail = "什么都没写" if args.dry_run else "已经写进目标库的行留着，处理好之后重新运行只补缺的"
+        print(f"没有{what}完：{type(e).__name__}：{first_line(e) or '（没有说明）'}。{tail}", file=sys.stderr)
+        return 1
     for line in render(report):
         print(line)
     return 0 if report.ok else 1

@@ -542,6 +542,68 @@ async def create_schema(target: AsyncEngine) -> None:
         await conn.run_sync(_migrate)
 
 
+#: 连不上时等也没用的错误（SQLSTATE 的类）：28 认证失败、3D 库不存在、42 语法或权限。别的（拒绝连接、库正在启动 57P03、
+#: 超时、网络断了）按「还没就绪」退避重试
+_NOT_TRANSIENT_SQLSTATES = ("28", "3D", "42")
+
+
+def _not_transient(error: BaseException) -> bool:
+    from app.db.portable import _driver_error
+
+    seen: Any = error
+    for _ in range(4):
+        state = str(getattr(seen, "sqlstate", "") or "")
+        if state and state != "57P03":
+            return state.startswith(_NOT_TRANSIENT_SQLSTATES)
+        seen = getattr(seen, "__cause__", None) or getattr(seen, "orig", None)
+        if seen is None:
+            break
+    cause = _driver_error(error)
+    return bool(cause is not None and str(cause.sqlstate).startswith(_NOT_TRANSIENT_SQLSTATES))
+
+
+async def wait_for_database(target: AsyncEngine | None = None, *, timeout: float | None = None,
+                            sleep: Any = None, clock: Any = None) -> None:
+    """PostgreSQL 还连不上时按退避（1、2、4、5、5… 秒）重试，每次照实打一条日志，等够 timeout 秒（缺省
+    AGENTLAB_DB_STARTUP_TIMEOUT）还不行就把最后一次的错抛出去。和数据库容器一起起、库还在初始化时，应用不至于一上来就崩。
+    密码不对、库不存在这种等也没用的立刻抛出。SQLite 不等。"""
+    import asyncio
+    import time
+
+    from sqlalchemy import text
+
+    from app.core.errors import first_line
+
+    target = target or engine
+    if target.dialect.name != "postgresql":
+        return
+    budget = settings.db_startup_timeout if timeout is None else timeout
+    pause = sleep or asyncio.sleep
+    now = clock or time.monotonic
+    started = now()
+    delay = 1.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with target.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            if attempt > 1:
+                logger.info("应用库连上了（第 %d 次，等了 %.0f 秒）", attempt, now() - started)
+            return
+        except Exception as e:  # noqa: BLE001 - 判断完是不是该等再决定抛不抛
+            waited = now() - started
+            if _not_transient(e) or waited + delay > budget:
+                logger.error("应用库连不上，不再等了（等了 %.0f 秒）：%s", waited, first_line(e))
+                raise
+            logger.warning("应用库还没就绪（%s），%.0f 秒后重试（已等 %.0f 秒，最多 %d 秒）",
+                           first_line(e), delay, waited, budget)
+        await pause(delay)
+        delay = min(delay * 2, 5.0)
+
+
 async def init_db() -> None:
     logger.info("应用库：%s", describe_database())
+    # 库还没起来（和 PostgreSQL 容器一起起）时先等它；建表、补列、补索引在库里的咨询锁里做，几个工作进程同时启动只做一次
+    await wait_for_database()
     await create_schema(engine)

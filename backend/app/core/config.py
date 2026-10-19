@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     db_max_overflow: int = 20
     db_pool_timeout: int = 30
     db_pool_recycle: int = 1800
+    # 启动时库还连不上（和 PostgreSQL 容器一起起、库还在初始化）最多等多少秒，按退避重试、照实打日志；过了再报错退出。
+    # 密码不对、库不存在这种等也没用的不等
+    db_startup_timeout: int = 90
 
     # --- 多进程（app/cluster，docs/design/orchestration-round §5 W2-b）---
     # 几个工作进程（scripts/prod.sh、Docker 的入口按它给 uvicorn --workers）。只有应用库是 PostgreSQL 时才能大于 1：

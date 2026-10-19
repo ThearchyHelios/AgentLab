@@ -182,6 +182,17 @@ def test_the_command_needs_a_target(tmp_path, monkeypatch, capsys):
     assert "只认 PostgreSQL" in capsys.readouterr().err
 
 
+def test_an_unreachable_target_is_reported_in_one_line(tmp_path, capsys):
+    """目标库连不上（库的容器没起来、被停了）：一句话说清楚、退出码 1，不甩一屏调用栈（deploy.sh migrate-to-postgres 照它回退）。"""
+    import sqlite3
+
+    sqlite3.connect(tmp_path / "agentlab.db").execute("CREATE TABLE t (x)").connection.close()
+    for extra, what in (([], "没有导入完"), (["--dry-run"], "没有核对完")):
+        assert to_postgres.main([str(tmp_path), "postgresql+asyncpg://u:p@127.0.0.1:1/agentlab", *extra]) == 1
+        err = capsys.readouterr().err
+        assert err.startswith(what) and "Traceback" not in err and len(err.strip().splitlines()) == 1
+
+
 def test_the_dispatcher_knows_its_commands(capsys):
     from app.db.__main__ import main
 
