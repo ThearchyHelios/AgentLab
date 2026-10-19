@@ -6,6 +6,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 用法：./scripts/package-docker.sh [--platform linux/arm64|linux/amd64] [--version <版本>] [--out <目录>] [--gzip] [--no-microvm]
+                                  [--no-postgres]
 
   --platform <平台>  目标机的平台。默认按本机架构取 linux/<arch>。64 位系统的 ARM 单板机是 linux/arm64，
                      普通 PC 和服务器是 linux/amd64。和本机架构不同时 docker 用模拟构建，会慢很多。
@@ -14,9 +15,13 @@ usage() {
   --gzip             另外再产出一份 .tar.gz。docker 用 containerd 镜像存储时镜像层本身已经压缩过，.tar.gz 小不了多少。
   --no-microvm       不在镜像里带 microVM 运行时和沙箱镜像，镜像小约 150 MB。目标机没有 KVM 时用不上它们。
                      默认带上：目标机有 KVM 时，deploy.sh 会自动启用 microVM，而且不用联网。
+  --no-postgres      不带内置 PostgreSQL 的镜像（postgres-image.tar，约 150 MB）。只用 SQLite 或外接 PostgreSQL 时用不上；
+                     不带的包在目标机上 install --postgres 要先 docker pull 到同一个标签。默认带上，标签取 deploy.sh 里的
+                     POSTGRES_IMAGE（只在那一处定）。
   -h, --help         显示这段说明。
 
-产物：<out>/agentlab-<版本>-linux-<arch>.tar，里面有 image.tar、deploy.sh、agentlab.env、README.md、SHA256SUMS。
+产物：<out>/agentlab-<版本>-linux-<arch>.tar，里面有 image.tar、postgres-image.tar、deploy.sh、agentlab.env、README.md、
+SHA256SUMS。
 构建需要联网（拉基础镜像、装依赖、拉 microVM 的沙箱镜像）；部署不需要。镜像只留在本机，不会推到任何仓库。
 USAGE
 }
@@ -28,6 +33,7 @@ VERSION=""
 OUT="$ROOT/release"
 GZIP=""
 WITH_MICROVM=1
+WITH_POSTGRES=1
 need_value() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 后面要跟一个值"; echo; usage; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -39,6 +45,7 @@ while [ $# -gt 0 ]; do
     --out=*) OUT="${1#--out=}" ;;
     --gzip) GZIP=1 ;;
     --no-microvm) WITH_MICROVM=0 ;;
+    --no-postgres) WITH_POSTGRES=0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "认不出的参数：$1"; echo; usage; exit 2 ;;
   esac
@@ -76,6 +83,10 @@ VERSION="${VERSION:0:120}"
 IMAGE="agentlab:$VERSION"
 NAME="agentlab-$VERSION-linux-$ARCH"
 
+# 内置 PostgreSQL 的镜像标签只在 deploy.sh 里定一处，这里照它取，包里带的和 deploy.sh 要的才对得上
+PG_IMAGE="$(sed -n 's/^POSTGRES_IMAGE="\([^"]*\)"$/\1/p' "$ROOT/deploy/deploy.sh" | head -n 1)"
+[ -n "$PG_IMAGE" ] || { echo "deploy/deploy.sh 里找不到 POSTGRES_IMAGE=\"...\" 这一行"; exit 1; }
+
 # ---- 工具 ----
 command -v docker >/dev/null || { echo "缺少 docker"; exit 1; }
 docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || { echo "连不上 docker 服务，先把 Docker 启动起来"; exit 1; }
@@ -91,7 +102,8 @@ STAGE="$OUT/$NAME"
 TAR="$OUT/$NAME.tar"
 
 if [ "$WITH_MICROVM" = 1 ]; then MICROVM_NOTE="带 microVM"; else MICROVM_NOTE="不带 microVM"; fi
-echo "==> 版本 $VERSION · 平台 $PLATFORM · $MICROVM_NOTE · 产物 $TAR"
+if [ "$WITH_POSTGRES" = 1 ]; then PG_NOTE="带 $PG_IMAGE"; else PG_NOTE="不带 PostgreSQL 镜像"; fi
+echo "==> 版本 $VERSION · 平台 $PLATFORM · $MICROVM_NOTE · $PG_NOTE · 产物 $TAR"
 
 # ---- 1. 构建 ----
 # 不带 provenance / SBOM：它们会让导出的镜像多出几份附加清单，老版本的 docker load 认不全
@@ -108,16 +120,35 @@ docker buildx build \
 GOT="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$IMAGE")"
 [ "$GOT" = "$PLATFORM" ] || { echo "构建出来的镜像是 ${GOT}，不是 $PLATFORM"; exit 1; }
 
+if [ "$WITH_POSTGRES" = 1 ]; then
+  # 本机没有、或者有的不是目标平台的（比如在 arm64 的机器上打 amd64 的包）就按目标平台拉。containerd 的镜像存储里一个标签
+  # 可以同时有几个平台，inspect 只报本机的那个，所以拉完不再按 inspect 核对：导出时 docker save --platform 取目标平台的
+  PG_GOT="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$PG_IMAGE" 2>/dev/null || true)"
+  if [ "$PG_GOT" != "$PLATFORM" ]; then
+    echo "==> 拉取 ${PG_IMAGE}（${PLATFORM}）"
+    docker pull --platform "$PLATFORM" "$PG_IMAGE"
+  fi
+fi
+
 # ---- 2. 暂存目录 ----
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 trap 'rm -rf "$STAGE"' EXIT
 
 echo "==> 导出镜像（docker save）"
-if docker save --help 2>/dev/null | grep -q -- '--platform'; then
-  docker save --platform "$PLATFORM" -o "$STAGE/image.tar" "$IMAGE"
-else
-  docker save -o "$STAGE/image.tar" "$IMAGE"
+save() {
+  if docker save --help 2>/dev/null | grep -q -- '--platform'; then
+    docker save --platform "$PLATFORM" -o "$1" "$2"
+  else
+    docker save -o "$1" "$2"
+  fi
+}
+save "$STAGE/image.tar" "$IMAGE"
+PAYLOAD=(image.tar)
+if [ "$WITH_POSTGRES" = 1 ]; then
+  echo "==> 导出 ${PG_IMAGE}（docker save）"
+  save "$STAGE/postgres-image.tar" "$PG_IMAGE"
+  PAYLOAD+=(postgres-image.tar)
 fi
 
 fill() {
@@ -128,12 +159,13 @@ fill "$ROOT/deploy/deploy.sh" "$STAGE/deploy.sh"
 fill "$ROOT/deploy/README.md" "$STAGE/README.md"
 cp "$ROOT/deploy/agentlab.env" "$STAGE/agentlab.env"
 chmod 755 "$STAGE/deploy.sh"
-chmod 644 "$STAGE/README.md" "$STAGE/agentlab.env" "$STAGE/image.tar"
+chmod 644 "$STAGE/README.md" "$STAGE/agentlab.env"
+for f in "${PAYLOAD[@]}"; do chmod 644 "$STAGE/$f"; done
 if grep -q '__AGENTLAB_' "$STAGE/deploy.sh" "$STAGE/README.md"; then
   echo "模板里还有没填上的占位符"; exit 1
 fi
 
-(cd "$STAGE" && "${SHA[@]}" image.tar deploy.sh agentlab.env README.md > SHA256SUMS)
+(cd "$STAGE" && "${SHA[@]}" "${PAYLOAD[@]}" deploy.sh agentlab.env README.md > SHA256SUMS)
 chmod 644 "$STAGE/SHA256SUMS"
 
 # ---- 3. 打包 ----
@@ -156,7 +188,7 @@ echo
 echo "完成："
 echo "  $TAR  ($(size "$TAR"))"
 [ -z "$GZIP" ] || echo "  $TAR.gz  ($(size "$TAR.gz"))"
-echo "  镜像 $IMAGE 留在本机（没有推送到任何仓库），$MICROVM_NOTE"
+echo "  镜像 $IMAGE 留在本机（没有推送到任何仓库），${MICROVM_NOTE}，$PG_NOTE"
 echo
 echo "下一步："
 echo "  1. 把 $NAME.tar 拷到目标机（scp、U 盘都行）"
