@@ -913,3 +913,44 @@ async def test_restart_resumes_the_auto_batch_and_settles_finished_runs(monkeypa
     await recall.resume()
     async with SessionLocal() as session:
         assert len(await recall.recall_runs(session, wf, 2)) == 2, "再重启一次：都算过了，不再发起"
+
+
+async def test_a_probe_that_cannot_assemble_its_inputs_says_which_are_missing(engine_up, caplog):
+    """表结构变了、口径凑不齐参数（这一版没有正式运行、也没有等价的问数回答，必填的入口字段又没有缺省值）：不试算，照实记一条
+    「缺哪几个参数」——日志里有，变化记录的影响里也有（变化页照它写），不再一声不响地跳过。之后这条变化再被探查到一次，记下的
+    不丢。"""
+    import logging
+
+    from app.data import source_changes as sc
+    from app.db.models import DataSource
+    from app.db.models_sources import SourceChange
+
+    wf = await S.publish()
+    async with SessionLocal() as session:
+        source = (await session.execute(select(DataSource).where(DataSource.name == S.CURRENT["source"]))).scalar_one()
+        change, _ = await sc.record(session, source, sc.NewChange(kind="column_removed", table="orders", column="amount",
+                                                                  severity="action", key="v3"),
+                                    sc.Detected(job_kind="introspect"))
+        await session.commit()
+        out = sc.change_out(change)
+    with caplog.at_level(logging.INFO, logger="app.ledger.recall"):
+        await recall.process_change(out)
+    async with SessionLocal() as session:
+        probes = [r for r in (await session.execute(select(Run).where(Run.origin_kind == "recall"))).scalars()
+                  if (r.origin or {}).get("change") == out["id"]]
+        row = (await session.execute(select(SourceChange).where(SourceChange.id == out["id"]))).scalar_one()
+    assert probes == [], "凑不齐参数：不试算"
+    [note] = row.affects["probes"]
+    assert (note["workflow_id"], note["version"], note["outcome"]) == (wf, 1, "skipped")
+    assert note["missing"] == ["start", "end"] and "start" in note["reason"], note
+    assert any("start、end" in r.getMessage() for r in caplog.records), [r.getMessage() for r in caplog.records]
+    # 变化接口（变化页）照样带着
+    assert sc.change_out(row)["affects"]["probes"] == [note]
+    # 同一条变化再被探查到一次：影响按新的一次刷新，试算的记录不丢
+    async with SessionLocal() as session:
+        source = await session.get(DataSource, row.source_id)
+        await sc.record(session, source, sc.NewChange(kind="column_removed", table="orders", column="amount",
+                                                      severity="action", key="v3"), sc.Detected(job_kind="introspect"))
+        await session.commit()
+        again = (await session.execute(select(SourceChange).where(SourceChange.id == out["id"]))).scalar_one()
+    assert again.affects["probes"] == [note]

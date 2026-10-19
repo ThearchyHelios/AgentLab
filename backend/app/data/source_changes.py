@@ -156,7 +156,10 @@ async def record(session: AsyncSession, source: Any, change: NewChange, detected
         found.last_seen_at = now
         found.seen_count = int(found.seen_count or 0) + 1
         if found.status == "open":
-            found.affects, found.before, found.after = change.affects, change.before, change.after
+            # 影响按这一次刷新；表结构变了之后口径试算的情况（ledger/recall 记的 probes）不是探查算的，留着
+            probes = (found.affects or {}).get("probes") if isinstance(found.affects, dict) else None
+            found.affects = {**(change.affects or {}), "probes": probes} if probes else change.affects
+            found.before, found.after = change.before, change.after
             if SEVERITY_RANK[change.severity] > SEVERITY_RANK.get(found.severity, 0):
                 found.severity = change.severity
         return found, False
@@ -227,7 +230,8 @@ def change_out(row: SourceChange) -> dict[str, Any]:
         "severity": row.severity, "summary": summary(row), "detected_at": _iso(row.detected_at),
         "last_seen_at": _iso(row.last_seen_at), "seen_count": row.seen_count or 1,
         "detected_by": dict(row.detected_by or {}), "basis": row.basis, "before": row.before, "after": row.after,
-        "affects": row.affects or {"catalog": [], "templates": [], "rules_touched": False},
+        # 缺的几项补上空的：只记了口径试算情况（ledger/recall 的 probes）的那种没有 catalog、templates
+        "affects": {"catalog": [], "templates": [], "rules_touched": False, **(row.affects or {})},
         "struct_version_before": row.struct_version_before, "struct_version_after": row.struct_version_after,
         "status": row.status, "resolution": row.resolution,
     }

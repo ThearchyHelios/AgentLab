@@ -294,7 +294,8 @@ function Facts({ change: c }: { change: SourceChange }) {
 /** 影响面：说到这些列的目录项（测到时和现在的状态）、用到这张表的已发布模板（写死的 SQL 会不会坏）、有效记录条件 */
 function Impact({ change: c }: { change: SourceChange }) {
   const { catalog, templates, rules_touched: rules } = c.affects
-  const empty = !catalog.length && !templates.length && !rules
+  const probes = c.affects.probes ?? []
+  const empty = !catalog.length && !templates.length && !rules && !probes.length
   return (
     <Block title={T.impactTitle} attr="impact">
       {empty && <p className="text-xs text-faint" data-change-impact-none="">{T.impactNone}</p>}
@@ -338,6 +339,21 @@ function Impact({ change: c }: { change: SourceChange }) {
                     </li>
                   ))}
                 </ul>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {probes.length > 0 && (
+        <div data-change-probes={probes.length}>
+          <p className="text-2xs font-medium text-dim">{T.probesTitle}</p>
+          <ul className="mt-1 space-y-0.5">
+            {probes.map((p) => (
+              <li key={`${p.workflow_id}:${p.version}`} className="text-xs text-[var(--warn)]" data-change-probe={p.workflow_id}>
+                {T.probeSkipped(p.name, p.version, p.missing ?? [], p.reason)}
+                {p.inputs_from && T.probeFrom[p.inputs_from] && (
+                  <span className="ml-1.5 text-2xs text-faint">{T.probeFrom[p.inputs_from]}</span>
+                )}
               </li>
             ))}
           </ul>

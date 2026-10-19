@@ -1527,11 +1527,16 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
                 if answer is not None:
                     latest, inputs_from = dict(answer.binding), "answer"
             for card in caliber.cards[:1]:
+                pinned = None
                 try:
                     pinned = await derive.load_pinned(session, caliber.workflow_id, caliber.version, card)
                     names = {str(f.get("name")) for f in pinned.entry_fields}
-                    inputs = compose.check_inputs(pinned, {k: v for k, v in (latest or {}).items() if k in names})
-                except (derive.NotDerivable, compose.ComposeRefused):
+                    given = {k: v for k, v in (latest or {}).items() if k in names}
+                    inputs = compose.check_inputs(pinned, given)
+                except (derive.NotDerivable, compose.ComposeRefused) as e:
+                    # 凑不齐参数（这一版没有正式运行、也没有等价的问数回答，必填的入口字段又没有缺省值）或者派生不了：不试算，
+                    # 照实记一条缺哪几个参数——日志里一条，变化记录的影响里一条（变化页照它写），不再一声不响地跳过
+                    await _probe_skipped(change, caliber, pinned, latest, inputs_from, e.message)
                     continue
                 probe = derive.caliber_probe(pinned)
                 origin = {"probe": 1, "workflow_id": caliber.workflow_id, "version": caliber.version,
@@ -1549,6 +1554,46 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
                     continue
                 launched.append(run.id)
     return launched
+
+
+#: 变化记录 affects 里试算情况的键（data/source_changes 再次探查到同一条变化时保留它）
+PROBES_KEY = "probes"
+
+
+def missing_inputs(pinned: Any, given: Mapping[str, Any] | None) -> list[str]:
+    """口径入口里必填、又没给值也没有缺省值的字段（按入口字段的先后）。"""
+    out = []
+    for f in pinned.entry_fields if pinned is not None else ():
+        name = str(f.get("name") or "").strip()
+        if not name or not f.get("required") or f.get("default") not in (None, ""):
+            continue
+        if (given or {}).get(name) in (None, ""):
+            out.append(name)
+    return out
+
+
+async def _probe_skipped(change: Mapping[str, Any], caliber: Any, pinned: Any, given: Mapping[str, Any] | None,
+                         inputs_from: str, reason: str) -> None:
+    """表结构变了、这一版口径没能试算：记一条日志，写进变化记录的 affects.probes（同一版只记一条，换成最新的说法）。"""
+    from app.db.models_sources import SourceChange
+
+    missing = missing_inputs(pinned, given)
+    name = getattr(pinned, "workflow_name", None) or caliber.workflow_id
+    said = f"缺少参数 {'、'.join(missing)}" if missing else reason
+    logger.info("表结构变了之后口径「%s」v%s 没有试算：%s（参数来自%s）", name, caliber.version, said,
+                {"formal": "最近一次正式运行", "answer": "等价的问数回答", "defaults": "入口的缺省值"}.get(inputs_from, inputs_from))
+    note = {"workflow_id": caliber.workflow_id, "version": caliber.version, "name": str(name), "outcome": "skipped",
+            "missing": missing, "reason": reason, "inputs_from": inputs_from}
+    async with SessionLocal() as session:
+        row = (await session.execute(select(SourceChange).where(SourceChange.id == change.get("id")))).scalar_one_or_none()
+        if row is None:
+            return
+        affects = dict(row.affects or {})
+        kept = [p for p in affects.get(PROBES_KEY) or [] if isinstance(p, dict)
+                and (p.get("workflow_id"), p.get("version")) != (caliber.workflow_id, caliber.version)]
+        affects[PROBES_KEY] = [*kept, note]
+        row.affects = affects
+        await session.commit()
 
 
 async def _settle_probe(run: Run) -> str:
