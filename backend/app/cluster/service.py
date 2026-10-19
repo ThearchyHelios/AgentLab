@@ -80,7 +80,7 @@ class _Service:
         await caches.start()
         await self._lead()
         self.task = asyncio.create_task(self._loop(), name="agentlab-cluster-heartbeat")
-        logger.info("工作进程 %s 已登记（%s，租约 %.0f 秒、心跳 %.0f 秒；现在另有 %d 个进程）", identity.describe(identity.owner()),
+        logger.info("工作进程 %s 已登记（%s，租约 %g 秒、心跳 %g 秒；现在另有 %d 个进程）", identity.describe(identity.owner()),
                     "PostgreSQL，可以多进程" if settings.db_dialect == "postgresql" else "SQLite，单进程",
                     workers.lease_s(), workers.heartbeat_s(), len(live.others))
 

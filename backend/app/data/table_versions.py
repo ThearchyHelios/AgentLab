@@ -2452,6 +2452,16 @@ def _same_path(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
 TMP_STALE_S = 6 * 3600.0
 
 
+async def _tmp_min_age() -> float:
+    """启动清理半成品时只清多久以前的：SQLite（守卫保证只有本进程）、或者 PostgreSQL 上现在没有别的活着的进程，一个都不会有人
+    在写，全清；有别的进程活着，只清 TMP_STALE_S 以前的。"""
+    if settings.db_dialect != "postgresql":
+        return 0.0
+    from app.cluster import state
+
+    return TMP_STALE_S if (await state.current(fresh=True)).others else 0.0
+
+
 def _sweep_tmp(min_age_s: float = 0.0) -> int:
     """删掉上次崩溃留下的 *.tmp-* 半成品（库和原件都是先写临时文件再 link）。min_age_s：只删改动时间早于这么多秒以前的
     （多进程时别的进程可能正在写，见 startup）。"""
@@ -2691,9 +2701,8 @@ async def startup(session: AsyncSession) -> None:
         logger.error("上传表格的版本存储被另一个进程占用，本进程跳过启动清理、迁移和回收")
         return
     async with _store_lock():
-        # 半成品：单进程（SQLite，守卫保证只有本进程）启动时一个都不会有人在写，全清；PostgreSQL 可以多进程，别的进程正在解析的
-        # 临时文件写在锁外，只清 TMP_STALE_S 以前的
-        swept = await asyncio.to_thread(_sweep_tmp, TMP_STALE_S if settings.db_dialect == "postgresql" else 0.0)
+        # 半成品：没有别的进程在跑时一个都不会有人在写，全清；多进程时别的进程正在解析的临时文件写在锁外，只清旧的（_tmp_min_age）
+        swept = await asyncio.to_thread(_sweep_tmp, await _tmp_min_age())
         if swept:
             logger.info("清理了 %d 个上次未完成的上传临时文件", swept)
         migrated = await _migrate_legacy(session)

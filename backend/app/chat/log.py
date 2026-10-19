@@ -242,13 +242,16 @@ async def purge(now: datetime, *, retain_days: float = RETAIN_DAYS, limit: int =
 _last_purge = 0.0
 
 
-async def purge_tick(now: datetime) -> list[str]:
+async def purge_tick(now: datetime | None) -> list[str]:
     """调度循环每一拍调（scheduler/loop.process_due）：一小时最多清一次。"""
     global _last_purge
     if time.monotonic() - _last_purge < PURGE_EVERY_S and _last_purge:
         return []
     _last_purge = time.monotonic()
-    return await purge(now)
+    # 调度循环那一拍不带时刻（process_due() 的 now 缺省为 None）：按现在算
+    from app.db.base import utcnow
+
+    return await purge(now or utcnow())
 
 
 __all__ = ["FINISHED", "HEARTBEAT_S", "PING", "READ_BATCH", "RETAIN_DAYS", "STREAM_END", "add", "append", "beat", "forget",

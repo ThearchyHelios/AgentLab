@@ -36,7 +36,9 @@ class Leadership:
         """本地看：还在当班（租约离到期还有余量）。"""
         if self.until is None:
             return False
-        return (now or utcnow()) + timedelta(seconds=MARGIN_S) < self.until
+        # 余量不超过租约的四分之一：租约调得很短（验收脚本）时也留得出当班的时间
+        margin = min(MARGIN_S, lease_s() / 4)
+        return (now or utcnow()) + timedelta(seconds=margin) < self.until
 
     async def claim(self, now: datetime | None = None) -> bool:
         """接班或续租。交回这一拍之后是不是当班。"""

@@ -1162,6 +1162,7 @@ async def test_guard_is_idempotent_in_one_process(store, guard_reset):
         await table_versions.startup(session)
 
 
+@pytest.mark.sqlite_only  # 文件锁守卫只在 SQLite（单进程）时有：PostgreSQL 可以多进程，版本存储靠跨进程的锁（app/cluster/mutex）
 async def test_second_process_skips_startup_cleanup_and_refuses_writes(store, guard_reset, monkeypatch):
     """L5：子进程先占住守卫，本进程启动时一个文件都不删、不回收，写入一律 StoreUnavailable；子进程退出后恢复。"""
     name = unique()
@@ -1243,6 +1244,7 @@ async def test_second_process_skips_startup_cleanup_and_refuses_writes(store, gu
     assert not half.exists() and not orphan.exists() and not orphan_raw.exists()
 
 
+@pytest.mark.sqlite_only  # 文件锁守卫只在 SQLite（单进程）时有：PostgreSQL 可以多进程，版本存储靠跨进程的锁（app/cluster/mutex）
 async def test_guard_state_does_not_leak_into_another_data_dir(store, guard_reset, monkeypatch, tmp_path):
     proc = hold_guard()
     try:

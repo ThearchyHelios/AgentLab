@@ -791,7 +791,14 @@ class RunManager:
         # 等待从 run.interrupted 算起——以前执行一直计到 finally，收尾那一截执行和等待两边都算，
         # active + wait 比墙钟还长（机器一忙就差出几十毫秒）
         paused: float | None = None
-        async with slots.hold(run_id, origin_kind):
+        # 先要并发名额（app/cluster/slots.py）。等名额的时候被停止（或者关停）也要照实收尾，见 _stopped_in_queue
+        slot = slots.hold(run_id, origin_kind)
+        try:
+            await slot.__aenter__()
+        except asyncio.CancelledError:
+            await self._stopped_in_queue(run_id)
+            raise
+        try:
             # 执行时长从拿到名额算起：排队等名额的那一段不算执行（墙钟从 started_at 算，started_at 也是拿到名额之后才写）
             started = time.perf_counter()
             try:
@@ -976,6 +983,24 @@ class RunManager:
                         from app.sandbox.manager import sandbox_manager
 
                         await sandbox_manager.cleanup(run_id)
+        finally:
+            await slot.__aexit__(None, None, None)
+
+    async def _stopped_in_queue(self, run_id: str) -> None:
+        """还在等并发名额时被取消。关停：什么都不写（还是排队中 / 刚认领的样子），照「属主不在了」的规矩由下次启动或别的
+        进程接手（排队的标失败、认领了的标中断）；人点了停止：收成 cancelled，同执行中停止（run.cancelled 带上是谁停的、封存）。"""
+        try:
+            if self._closing:
+                return
+            actor = self._stopped_by.pop(run_id, None)
+            self._finalizing.add(run_id)
+            await self._finalize(run_id, "cancelled", "用户取消", {}, 0,
+                                 terminal=(EventType.RUN_CANCELLED, {"reason": END_STOPPED, "actor": actor}),
+                                 end_reason=END_STOPPED)
+        finally:
+            self._finalizing.discard(run_id)
+            self._tasks.pop(run_id, None)
+            self._stopped_by.pop(run_id, None)
 
     async def _handle_custom(self, run_id: str, chunk: Any) -> None:
         """节点通过 get_stream_writer 发来的事件。"""
