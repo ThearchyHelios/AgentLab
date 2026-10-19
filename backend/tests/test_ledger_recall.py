@@ -954,3 +954,40 @@ async def test_a_probe_that_cannot_assemble_its_inputs_says_which_are_missing(en
         await session.commit()
         again = (await session.execute(select(SourceChange).where(SourceChange.id == out["id"]))).scalar_one()
     assert again.affects["probes"] == [note]
+
+
+async def test_probe_notes_and_change_refreshes_do_not_overwrite_each_other(engine_up):
+    """同一条变化上几处同时写 affects（几版口径各记一条没试算、探查又刷新了一次影响）：先占住那一行再读改写，谁也不盖掉谁。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.data import source_changes as sc
+    from app.db.models import DataSource
+    from app.db.models_sources import SourceChange
+
+    async with SessionLocal() as session:
+        source = (await session.execute(select(DataSource).where(DataSource.name == S.CURRENT["source"]))).scalar_one()
+        change, _ = await sc.record(session, source, sc.NewChange(kind="column_removed", table="orders", column="amount",
+                                                                  severity="action", key="v4",
+                                                                  affects={"catalog": [], "templates": [],
+                                                                           "rules_touched": False}),
+                                    sc.Detected(job_kind="introspect"))
+        await session.commit()
+        out = sc.change_out(change)
+        source_id = source.id
+
+    async def refresh() -> None:
+        async with SessionLocal() as session:
+            src = await session.get(DataSource, source_id)
+            await sc.record(session, src, sc.NewChange(kind="column_removed", table="orders", column="amount",
+                                                       severity="action", key="v4",
+                                                       affects={"catalog": [], "templates": [], "rules_touched": True}),
+                            sc.Detected(job_kind="introspect"))
+            await session.commit()
+
+    calibers = [SimpleNamespace(workflow_id=f"wf-{i}", version=1) for i in range(6)]
+    await asyncio.gather(*(recall._probe_skipped(out, c, None, {}, "defaults", "缺参数") for c in calibers), refresh())
+    async with SessionLocal() as session:
+        row = (await session.execute(select(SourceChange).where(SourceChange.id == out["id"]))).scalar_one()
+    assert sorted(p["workflow_id"] for p in row.affects["probes"]) == [f"wf-{i}" for i in range(6)], row.affects
+    assert row.affects["rules_touched"] is True, "探查刷新的那一份也在"

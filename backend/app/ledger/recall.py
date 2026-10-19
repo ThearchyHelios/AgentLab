@@ -66,7 +66,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.core.events import EventType
 from app.db.base import SessionLocal, utcnow
@@ -1585,8 +1585,14 @@ async def _probe_skipped(change: Mapping[str, Any], caliber: Any, pinned: Any, g
     note = {"workflow_id": caliber.workflow_id, "version": caliber.version, "name": str(name), "outcome": "skipped",
             "missing": missing, "reason": reason, "inputs_from": inputs_from}
     async with SessionLocal() as session:
-        row = (await session.execute(select(SourceChange).where(SourceChange.id == change.get("id")))).scalar_one_or_none()
+        # 先占住那一行再读改写（SQLite 上拿到写锁、PostgreSQL 上锁住这一行）：几版口径同时记、探查同时刷新影响
+        # （source_changes.record）时一个接一个来，谁也不盖掉谁
+        await session.execute(update(SourceChange).where(SourceChange.id == change.get("id"))
+                              .values(seen_count=SourceChange.seen_count).execution_options(synchronize_session=False))
+        row = (await session.execute(select(SourceChange).where(SourceChange.id == change.get("id"))
+                                     .execution_options(populate_existing=True))).scalar_one_or_none()
         if row is None:
+            await session.rollback()
             return
         affects = dict(row.affects or {})
         kept = [p for p in affects.get(PROBES_KEY) or [] if isinstance(p, dict)
