@@ -185,3 +185,30 @@ async def test_trigger_option_search_ignores_case_and_takes_wildcards_literally(
 
     assert await names("weekly_report") == ["Weekly_Report 样例"], "大小写不分；_ 不匹配任意一个字"
     assert await names("100%") == ["满 100% 样例"], "% 不匹配任意几个字"
+
+
+async def test_a_backlog_on_one_schedule_does_not_crowd_out_the_others(monkeypatch):
+    """积压多的任务不把别的任务挤掉：等着的事件、还没派发的事件按任务（按对象）各读各的上限，不是合起来一个上限。"""
+    monkeypatch.setattr(outbox, "DRAIN_BATCH", 3)
+    monkeypatch.setattr(outbox, "ROUTE_BATCH", 3)
+    busy_up, quiet_up = await workflow("积压的上游"), await workflow("安静的上游")
+    downstream = await workflow("区域汇总")
+    busy = await event_schedule(downstream, {"event": "workflow.finished", "workflow_id": busy_up, "debounce_s": 600},
+                                name="积压的")
+    quiet = await event_schedule(downstream, {"event": "workflow.finished", "workflow_id": quiet_up, "debounce_s": 600},
+                                 name="安静的")
+    t0 = utcnow().replace(microsecond=0)
+    for i in range(5):
+        await put_event("workflow.finished", busy_up, {"workflow_id": busy_up, "run_id": f"b{i}"}, t0 + timedelta(seconds=i))
+    await put_event("workflow.finished", quiet_up, {"workflow_id": quiet_up, "run_id": "q0"}, t0 + timedelta(seconds=10))
+    for _ in range(4):                       # 一拍只派 ROUTE_BATCH 条：多派几拍，六条都派给任务
+        await outbox.route(t0 + timedelta(seconds=20))
+    for i in range(5):
+        await put_event("workflow.finished", busy_up, {"workflow_id": busy_up, "run_id": f"c{i}"}, t0 + timedelta(seconds=30 + i))
+    await put_event("workflow.finished", quiet_up, {"workflow_id": quiet_up, "run_id": "q1"}, t0 + timedelta(seconds=40))
+    async with SessionLocal() as session:
+        rows = list((await session.execute(select(Schedule).where(Schedule.id.in_([busy, quiet])))).scalars())
+        state = await outbox.pending_for_many(session, rows)
+    assert state[quiet]["due_at"] == (t0 + timedelta(seconds=610)).isoformat(), state
+    assert state[quiet]["events"] == 1 and state[busy]["events"] == 3, state
+    assert state[busy]["due_at"] == (t0 + timedelta(seconds=600)).isoformat() and state[busy]["waiting"] == 5

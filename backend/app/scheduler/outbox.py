@@ -559,11 +559,17 @@ async def pending_for_many(session: Any, schedules: list[Schedule]) -> dict[str,
     counts = dict((await session.execute(select(TriggerDelivery.schedule_id, func.count()).where(
         TriggerDelivery.schedule_id.in_(ids), TriggerDelivery.status == "pending")
         .group_by(TriggerDelivery.schedule_id))).all())
+    # 每个任务各读最早的 DRAIN_BATCH 条（同 _drain 一拍读的）：合起来一个上限的话，积压多的任务会把别的挤掉，它们的 due_at 为空
+    ranked = (select(TriggerDelivery.id.label("did"), func.row_number().over(
+        partition_by=TriggerDelivery.schedule_id,
+        order_by=(TriggerDelivery.occurred_at, TriggerDelivery.created_at, TriggerDelivery.id)).label("rn"))
+        .where(TriggerDelivery.schedule_id.in_([i for i in ids if counts.get(i)]), TriggerDelivery.status == "pending")
+        .subquery())
     waiting = (await session.execute(
         select(TriggerDelivery.schedule_id, TriggerDelivery.id, TriggerDelivery.created_at, TriggerEvent)
         .join(TriggerEvent, TriggerEvent.id == TriggerDelivery.event_id)
-        .where(TriggerDelivery.schedule_id.in_([i for i in ids if counts.get(i)]), TriggerDelivery.status == "pending")
-        .order_by(TriggerDelivery.occurred_at, TriggerEvent.created_at).limit(DRAIN_BATCH))).all() if counts else []
+        .join(ranked, ranked.c.did == TriggerDelivery.id).where(ranked.c.rn <= DRAIN_BATCH)
+        .order_by(TriggerDelivery.occurred_at, TriggerEvent.created_at))).all() if counts else []
     by: dict[str, list[tuple[str, TriggerEvent, datetime]]] = {}
     stale: dict[str, int] = {}
     for sid, did, routed, ev in waiting:
@@ -585,8 +591,14 @@ async def pending_for_many(session: Any, schedules: list[Schedule]) -> dict[str,
 
         cond = or_(*[and_(TriggerEvent.event == kind, TriggerEvent.subject_id.in_(sorted(subs)))
                      for kind, subs in pairs.items()])
+        # 每个（事件种类, 对象）各读前 ROUTE_BATCH 条（同改前每个任务各读的那么多）：合起来一个上限会把别的对象挤掉、少算
+        ranked = (select(TriggerEvent.id.label("eid"), func.row_number().over(
+            partition_by=(TriggerEvent.event, TriggerEvent.subject_id),
+            order_by=(TriggerEvent.created_at, TriggerEvent.id)).label("rn"))
+            .where(TriggerEvent.status == "pending", cond).subquery())
         unrouted = (await session.execute(select(TriggerEvent.event, TriggerEvent.subject_id, TriggerEvent.payload)
-                                          .where(TriggerEvent.status == "pending", cond).limit(ROUTE_BATCH))).all()
+                                          .join(ranked, ranked.c.eid == TriggerEvent.id)
+                                          .where(ranked.c.rn <= ROUTE_BATCH))).all()
         for kind, subject, payload in unrouted:
             for sid in ids:
                 if triggers.matches(trig[sid], kind, subject, payload):
