@@ -47,6 +47,7 @@ from app.core.errors import describe_exception, first_line
 from app.data.names import name_key
 from app.db.base import SessionLocal, utcnow
 from app.db.models_sources import SourceObject
+from app.db.portable import contains_ci
 
 logger = logging.getLogger(__name__)
 
@@ -886,9 +887,8 @@ async def search_index(session: AsyncSession, row: Any, query: str, *, limit: in
         return [], 0
     key = name_key(text.rsplit(".", 1)[-1])
     filt = (*_scope_filter(row.id, index_schema(row)), SourceObject.removed_at.is_(None),
-            # 名字比的是 name_key（ASCII 已转小写）；注释要不分大小写：SQLite 的 LIKE 本来就不分（ASCII），PostgreSQL 分
-            or_(SourceObject.name_key.contains(key, autoescape=True),
-                SourceObject.comment.icontains(text, autoescape=True)))
+            # 名字比的是 name_key（ASCII 已转小写）；注释要不分大小写（db/portable.contains_ci：两种库都折 Unicode 的大小写）
+            or_(SourceObject.name_key.contains(key, autoescape=True), contains_ci(SourceObject.comment, text)))
     total = int((await session.execute(select(func.count()).select_from(SourceObject).where(*filt))).scalar() or 0)
     rows = (await session.execute(
         select(SourceObject.name, SourceObject.name_key, SourceObject.kind, SourceObject.comment,

@@ -45,6 +45,21 @@ def test_every_migrated_column_is_in_the_models():
     assert missing == []
 
 
+def test_every_not_null_migrated_column_gets_a_value_for_old_rows():
+    """迁移补的列模型里是 NOT NULL 的，存量行不能留 NULL（PostgreSQL 的表照模型带 NOT NULL，导入时整行插不进）：要么补列时
+    带 DEFAULT 回填，要么登记在 _NOT_NULL_BACKFILLS 里每次启动按模型的缺省值填。"""
+    bad = []
+    for table, column, ddl in db_base._COLUMN_MIGRATIONS:
+        col = Base.metadata.tables[table].c[column]
+        if col.nullable:
+            continue
+        if not re.search(r"\bDEFAULT\b", ddl, re.I) and (table, column) not in db_base._NOT_NULL_BACKFILLS:
+            bad.append((table, column))
+    assert bad == []
+    for table, column in db_base._NOT_NULL_BACKFILLS:
+        assert db_base.model_default(Base.metadata.tables[table].c[column])[0], (table, column)
+
+
 def test_checkpoint_tables_do_not_clash_with_app_tables():
     """断点和应用表放在同一个库、同一个 schema：两边的表名不能撞。名字从两个 saver 自己的建表语句里取。"""
     import inspect as pyinspect
@@ -58,22 +73,40 @@ def test_checkpoint_tables_do_not_clash_with_app_tables():
     assert created & set(Base.metadata.tables) == set()
 
 
-def test_no_query_compares_sorts_or_groups_a_whole_json_column():
-    """PostgreSQL 的 json 没有相等运算符：整列做 ==、!=、in_、DISTINCT、ORDER BY、GROUP BY 都会报错（SQLite 不报）。
-    按里面某个键筛选走 db/portable 的 json_eq 等。扫一遍应用代码里「模型.JSON列」后面跟着这几样的写法。"""
-    from pathlib import Path
+def test_the_compile_guard_catches_whole_json_values_however_they_are_written():
+    """整个 JSON 值做比较、去重、分组、排序：编译时就报错（tests/jsonguard.py，conftest 挂在应用库引擎上，跑全量时一直生效）。
+    按表达式的类型认，逐行正则抓不到的写法也抓得到；按键筛选的 json_eq 等、IS NULL、UNION ALL 不受影响。"""
+    from sqlalchemy import union, union_all
 
-    from sqlalchemy import JSON
+    from tests.jsonguard import JsonMisuse
 
-    columns = sorted({f"{m.class_.__name__}.{a.key}" for m in Base.registry.mappers for a in m.column_attrs
-                      if isinstance(a.columns[0].type, JSON)})
-    names = "|".join(re.escape(c) for c in columns)
-    bad = re.compile(rf"(?<![\w.])({names})\b(\s*(==|!=)|\.(in_|not_in|distinct|is_distinct_from|like|contains)\()"
-                     rf"|(order_by|group_by|distinct)\([^)]*(?<![\w.])({names})\b(?!\[)")
-    app = Path(__file__).resolve().parents[1] / "app"
-    hits = [f"{path.relative_to(app)}:{i}" for path in app.rglob("*.py")
-            for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1) if bad.search(line)]
-    assert columns and hits == []
+    dialect = db_base.engine.sync_engine.dialect
+    alias = Run.origin
+    caught = [
+        select(Run.origin).distinct(),
+        select(Run).distinct(),
+        select(Run.id).order_by(
+            Run.created_at,
+            Run.origin,
+        ),
+        select(Run.id).order_by(alias.desc()),
+        select(Run.id).where(alias == {"a": 1}),
+        select(Run.id).where(Run.input.in_([{"q": 1}])),
+        select(Run.id).where(Run.origin["k"] == 1),
+        select(func.count()).select_from(Run).group_by(Run.options),
+        union(select(Run.origin), select(Run.input)),
+    ]
+    for statement in caught:
+        with pytest.raises(JsonMisuse):
+            statement.compile(dialect=dialect)
+    fine = [
+        select(Run.origin).where(json_eq(Run.origin, "k", 1), Run.origin.is_(None),
+                                 Run.origin != None),  # noqa: E711 - 写成 IS NOT NULL，json 上也能用
+        select(Run.id).where(json_text(Run.origin, "k") == "x").order_by(json_text(Run.origin, "k")).distinct(),
+        union_all(select(Run.origin), select(Run.input)),
+    ]
+    for statement in fine:
+        statement.compile(dialect=dialect)
 
 
 def test_postgres_columns_are_unbounded_varchar_bigint_and_json():
@@ -134,6 +167,16 @@ def test_database_urls_are_normalized_and_never_logged_with_the_password():
     # asyncpg 的 ssl= 换成 libpq 的 sslmode=，只给 asyncpg 看的参数不带给 psycopg
     assert libpq_conninfo("postgresql+asyncpg://u:pw@h/db?ssl=require&prepared_statement_cache_size=0") \
         == "postgresql://u:pw@h/db?sslmode=require"
+    # 应用库地址写 libpq 的 sslmode=：换成 asyncpg 的 ssl=（以前原样交给 asyncpg，连的时候 TypeError）；断点库换回 sslmode=
+    app_url = normalize_database_url("postgresql://u:pw@h/db?sslmode=verify-full")
+    assert app_url == "postgresql+asyncpg://u:pw@h/db?ssl=verify-full"
+    assert libpq_conninfo(app_url) == "postgresql://u:pw@h/db?sslmode=verify-full"
+    for bad, says in (("postgresql://u@h/db?sslrootcert=/etc/ca.pem", "PGSSLROOTCERT"),
+                      ("postgresql://u@h/db?sslmode=strict", "sslmode=strict"),
+                      ("postgresql://u@h/db?ssl=require&sslmode=require", "只写一个"),
+                      ("postgresql://u@h/db?application_name=x", "application_name")):
+        with pytest.raises(ValueError, match=says):
+            normalize_database_url(bad)
     assert "pw" not in describe("postgresql+asyncpg://u:pw@h:5433/db")
     for bad in ("mysql://u@h/db", "sqlite:///x.db", "postgresql://h", "这不是地址"):
         with pytest.raises(ValueError):
@@ -143,6 +186,15 @@ def test_database_urls_are_normalized_and_never_logged_with_the_password():
     with pytest.raises(ValueError, match="AGENTLAB_DATABASE_URL"):
         Settings(database_url="mysql://u@h/db")
     assert Settings(database_url="  ").db_dialect == "sqlite"
+
+
+def test_a_postgres_url_without_the_driver_installed_says_what_to_install(monkeypatch):
+    import importlib.util
+
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: None if name == "asyncpg" else real(name, *a, **k))
+    with pytest.raises(RuntimeError, match=r"backend\[postgres\]"):
+        db_base.make_engine("postgresql+asyncpg://u:pw@127.0.0.1:1/db")
 
 
 def test_the_startup_line_names_the_database_without_the_password():
@@ -188,24 +240,39 @@ async def test_json_helpers_match_the_same_rows_on_both_databases():
         {"flag": False},                                   # 3
         {},                                                # 4
         None,                                              # 5（JSON 的 null）
+        {"v": True, "n": 1.0, "b": False},                 # 6
+        {"v": 1, "n": 1, "b": 0},                          # 7
     ])
-    # 带类型的相等：数字 3 不等于字符串 "3"
+    # 按 JSON 的类型比：数字 3 不等于字符串 "3"；true 不等于 1、false 不等于 0（SQLite 的 json_extract 单用时分不开）；
+    # 数 1 等于 1.0
     assert await _match(tag, json_eq(Run.origin, "v", 3)) == [0]
     assert await _match(tag, json_eq(Run.origin, "v", "3")) == [1]
     assert await _match(tag, json_eq(Run.origin, "s", "3")) == [0]
+    assert await _match(tag, json_eq(Run.origin, "v", 1)) == [7]
+    assert await _match(tag, json_eq(Run.origin, "v", True)) == [6]
+    assert await _match(tag, json_eq(Run.origin, "b", False)) == [6]
+    assert await _match(tag, json_eq(Run.origin, "b", 0)) == [7]
+    assert await _match(tag, json_eq(Run.origin, "n", 1)) == [6, 7]
+    assert await _match(tag, json_eq(Run.origin, "n", 1.0)) == [6, 7]
+    with pytest.raises(TypeError):
+        json_eq(Run.origin, "v", {"a": 1})
     # None：没有这个键、或者值是 null
-    assert await _match(tag, json_eq(Run.origin, "k", None)) == [1, 3, 4, 5]
+    assert await _match(tag, json_eq(Run.origin, "k", None)) == [1, 3, 4, 5, 6, 7]
     # 标记位：true 和非零的数算真
     assert await _match(tag, json_flag(Run.origin, "flag")) == [0, 1]
     from sqlalchemy import not_
 
-    assert await _match(tag, not_(json_flag(Run.origin, "flag"))) == [2, 3, 4, 5]
-    # 文本
+    assert await _match(tag, not_(json_flag(Run.origin, "flag"))) == [2, 3, 4, 5, 6, 7]
+    # 文本：字符串是它本身，数、true / false 是 JSON 写法（两种库都是）
     assert await _match(tag, json_text(Run.origin, "k") == "乙") == [2]
-    assert await _match(tag, func.coalesce(json_text(Run.origin, "k"), "").in_(["甲", ""])) == [0, 1, 3, 4, 5]
+    assert await _match(tag, func.coalesce(json_text(Run.origin, "k"), "").in_(["甲", ""])) == [0, 1, 3, 4, 5, 6, 7]
+    assert await _match(tag, json_text(Run.origin, "v") == "3") == [0, 1]
+    assert await _match(tag, json_text(Run.origin, "v") == "1") == [7]
+    assert await _match(tag, json_text(Run.origin, "v") == "true") == [6]
+    assert await _match(tag, json_text(Run.origin, "n") == "1.0") == [6]
     assert await _match(tag, json_text(Run.origin, "uses").contains("r-22", autoescape=True)) == [2]
     # 是不是字符串：input.question 偶数行是数字、奇数行是字符串
-    assert await _match(tag, json_is_string(Run.input, "question")) == [1, 3, 5]
+    assert await _match(tag, json_is_string(Run.input, "question")) == [1, 3, 5, 7]
 
 
 async def test_json_columns_keep_the_order_of_keys():
@@ -311,6 +378,46 @@ async def test_text_sorts_and_compares_byte_by_byte_like_sqlite():
             Run.workflow_name.like(f"字节-{tag}-%"), Run.workflow_name < f"字节-{tag}-a"))).scalar_one()
     assert [g.removeprefix(f"字节-{tag}-") for g in got] == sorted(names)
     assert lower == sum(1 for n in names if n < "a")
+
+
+async def test_nul_characters_in_text_columns():
+    """文本列里的 NUL：SQLite 照存；PostgreSQL 的 text / varchar 不收，写入时去掉（同 JSON 列），不让整条写入失败。"""
+    async with SessionLocal() as session:
+        row = Run(workflow_name="带\x00NUL\x00的名字", error="错\x00误")
+        session.add(row)
+        await session.commit()
+        rid = row.id
+        await session.execute(text("UPDATE runs SET end_reason = :r WHERE id = :i"), {"r": "x\x00y", "i": rid})
+        await session.commit()
+    async with SessionLocal() as session:
+        got = (await session.execute(select(Run.workflow_name, Run.error, Run.end_reason).where(Run.id == rid))).one()
+    if db_base.engine.dialect.name == "postgresql":
+        assert tuple(got) == ("带NUL的名字", "错误", "xy")
+    else:
+        assert tuple(got) == ("带\x00NUL\x00的名字", "错\x00误", "x\x00y")
+
+
+async def test_case_insensitive_search_folds_like_the_database_does():
+    """contains_ci：ASCII 两种库都不分大小写；非 ASCII（É/é、Ж/ж、全角Ａ/ａ）按库自己会不会折——SQLite 看构建，PostgreSQL 看
+    建库的区域设置（列本身是 COLLATE "C"，列上的 ILIKE 只认 ASCII，所以模式带 COLLATE "default"）。% 和 _ 按字面。"""
+    from app.db.portable import contains_ci
+
+    tag = uuid.uuid4().hex[:12]
+    async with SessionLocal() as session:
+        session.add(Run(workflow_name=f"大小写-{tag}-Éclair Жук Ａｂ Report_100%"))
+        await session.commit()
+        pg = db_base.engine.dialect.name == "postgresql"
+        folds = (await session.execute(text(
+            "SELECT lower('ÉЖＡ' COLLATE \"default\") = 'éжａ'" if pg else "SELECT lower('ÉЖＡ') = 'éжａ'"))).scalar()
+
+        async def hit(needle: str) -> bool:
+            return bool((await session.execute(select(func.count()).select_from(Run).where(
+                Run.workflow_name.like(f"大小写-{tag}-%"), contains_ci(Run.workflow_name, needle)))).scalar())
+
+        assert await hit("report") and await hit("REPORT_100%")
+        assert not await hit("report-100") and not await hit("100%%")
+        assert await hit("éclair") == bool(folds) and await hit("жук") == bool(folds) and await hit("ａｂ") == bool(folds)
+        assert await hit("Éclair") and await hit("Жук")
 
 
 async def test_timestamps_read_back_as_aware_utc():
