@@ -230,6 +230,54 @@ async def test_the_source_lane_is_shared_and_skips_tickets_of_a_gone_process():
     await other.release()
 
 
+async def test_the_source_lane_does_not_look_up_liveness_while_holding_its_lock(monkeypatch):
+    """复核：持着这个源的咨询锁时不另取连接查「谁还活着」（连接池用尽时会卡到取连接超时）——拿锁之前备好；拿锁之后才出现的
+    别的属主这一次当活着，不删它的行。"""
+    from app.core import job_runtime as runtime
+
+    import app.data.catalog_jobs  # noqa: F401 - 登记 draft、profile
+
+    lanes = runtime.lanes
+    holding = {"now": False, "looked_inside": 0}
+    real_locked, real_rows, real_live_for = lanes._locked, lanes._rows, state.live_for
+
+    async def locked(session, source_id):
+        await real_locked(session, source_id)
+        holding["now"] = True
+
+    async def rows(session, source_id, dead_owners):
+        try:
+            return await real_rows(session, source_id, dead_owners)
+        finally:
+            holding["now"] = False
+
+    async def live_for(owners):
+        if holding["now"]:
+            holding["looked_inside"] += 1
+        return await real_live_for(owners)
+
+    monkeypatch.setattr(lanes, "_locked", locked)
+    monkeypatch.setattr(lanes, "_rows", rows)
+    monkeypatch.setattr(state, "live_for", live_for)
+    async with SessionLocal() as session:
+        session.add(LaneTicket(source_id="src-lock", kind="profile", job_id="ghost-job", owner=GHOST, granted=True))
+        await session.commit()
+    mine = await lanes.enter("src-lock", "draft", "job-lock")
+    assert mine.granted.is_set(), "没了的进程占着的位置照旧让出来（拿锁之前就查清楚了）"
+    assert holding["looked_inside"] == 0
+    await mine.release()
+
+    async with SessionLocal() as session:
+        session.add(LaneTicket(source_id="src-late", kind="profile", job_id="late-job", owner=GHOST, granted=True))
+        await session.commit()
+        kept = await real_rows(session, "src-late", frozenset())
+        await session.commit()
+    assert [r.owner for r in kept] == [GHOST], "拿锁之前那份里没有的属主这一次当活着"
+    async with SessionLocal() as session:
+        await session.execute(delete(LaneTicket).where(LaneTicket.source_id.in_(["src-lock", "src-late"])))
+        await session.commit()
+
+
 async def test_reaping_runs_only_touches_the_ones_whose_owner_is_gone():
     from app.engine.runner import run_manager
 

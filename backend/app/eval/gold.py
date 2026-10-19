@@ -209,11 +209,19 @@ async def _launch_and_wait(graph: dict[str, Any], payload: dict[str, Any], *, na
             run_id = run.id
     except LaunchRefused as e:
         return _Ran("failed", None, f"算期望的运行没有发起：{e.message}", GOLD_FAILED)
+    from app.cluster import slots
+
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.0, float(ctx.timeout_s))
+    last = loop.time()
     while True:
         # 执行任务收完尾（含封存）才回来；任务已经不在了（刚建好还没排上、或者已经结束）就立刻回来，再按库里的状态判
-        await run_manager.wait_idle(run_id, timeout=max(0.05, min(5.0, deadline - loop.time())))
+        await run_manager.wait_idle(run_id, timeout=max(0.05, min(1.0, deadline - loop.time())))
+        now = loop.time()
+        if await slots.waiting(run_id, here=run_manager.is_active(run_id)):
+            # 排队等名额的那一段不算时限（复核：满载时排队不该算进每题时限）
+            deadline += now - last
+        last = now
         async with SessionLocal() as session:
             row = await session.get(Run, run_id)
             status, error = (row.status, row.error) if row is not None else ("failed", "运行记录不见了")

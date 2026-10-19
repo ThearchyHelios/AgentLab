@@ -241,16 +241,40 @@ class SourceLanes:
 
             await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": advisory_key(f"lane:{source_id}")})
 
-    async def _rows(self, session: AsyncSession, source_id: str) -> list[Any]:
-        """这个源队里活着的各行（号小的在前）；属主不在了的删掉（不提交）。"""
-        from app.cluster import state
+    async def _dead_owners(self, source_id: str) -> frozenset[str]:
+        """拿这个源的锁之前备好：队里别的进程的属主哪些确实不在了（手上那份不认识的当场再查一次登记）。持着咨询锁时不另取连接
+        查库（复核：连接池用尽时会卡到取连接超时）；拿锁之后才出现的属主不在这里面，这一次当活着，下一次再说。"""
+        from app.cluster import identity, state
+        from app.db.models_cluster import LaneTicket as Row
+
+        async with SessionLocal() as session:
+            owners = set((await session.execute(select(Row.owner).where(Row.source_id == source_id).distinct()))
+                         .scalars())
+        me = identity.owner()
+        others = {o for o in owners if o and o != me}
+        if not others:
+            return frozenset()
+        live = await state.live_for(others)
+        return frozenset(o for o in others if o not in live.others)
+
+    async def _rows(self, session: AsyncSession, source_id: str, dead_owners: frozenset[str]) -> list[Any]:
+        """这个源队里活着的各行（号小的在前）；属主不在了的删掉（不提交）。dead_owners 是拿锁之前备好的那一份：属主是别的进程的
+        只认它；属主是自己的看本进程里登记着没有（正有人排进来时一律算活着）。"""
+        from app.cluster import identity
         from app.db.models_cluster import LaneTicket as Row
 
         rows = list((await session.execute(select(Row).where(Row.source_id == source_id).order_by(Row.id))).scalars())
-        live = await state.live_for([r.owner for r in rows])
-        if self._entering.get(source_id):
-            live = live.trusting()
-        dead = [r.id for r in rows if not live.alive(r.owner, local=self._local_alive(r.id))]
+        me = identity.owner()
+        entering = bool(self._entering.get(source_id))
+
+        def alive(row: Any) -> bool:
+            if not row.owner:
+                return False
+            if row.owner == me:
+                return entering or self._local_alive(row.id)
+            return row.owner not in dead_owners
+
+        dead = [r.id for r in rows if not alive(r)]
         if dead:
             from sqlalchemy import delete
 
@@ -262,9 +286,10 @@ class SourceLanes:
         from app.db.models_cluster import LaneTicket as Row
 
         granted_now: int | None = None
+        dead_owners = await self._dead_owners(source_id)
         async with self._lock(), SessionLocal() as session:
             await self._locked(session, source_id)
-            rows = await self._rows(session, source_id)
+            rows = await self._rows(session, source_id, dead_owners)
             head = next((r for r in rows if r.granted), None)
             if head is None and rows:
                 head = rows[0]
@@ -318,9 +343,10 @@ class SourceLanes:
         if kind not in _LANE_KINDS:
             raise ValueError(f"同源队里没有登记「{kind}」这种事，先 register_lane_kind")
         self._listen()
+        dead_owners = await self._dead_owners(source_id)
         async with self._lock(), SessionLocal() as session:
             await self._locked(session, source_id)
-            rows = await self._rows(session, source_id)
+            rows = await self._rows(session, source_id, dead_owners)
             if rows:
                 head = next((r for r in rows if r.granted), rows[0])
                 await session.commit()
@@ -337,8 +363,9 @@ class SourceLanes:
 
     async def holders(self, source_id: str) -> list[LaneHolder]:
         """队里的各位，排在最前面（正在做）的在前。"""
+        dead_owners = await self._dead_owners(source_id)
         async with SessionLocal() as session:
-            rows = await self._rows(session, source_id)
+            rows = await self._rows(session, source_id, dead_owners)
             await session.commit()
         rows.sort(key=lambda r: (not r.granted, r.id))
         return [LaneHolder(r.kind, r.job_id, r.owner) for r in rows]

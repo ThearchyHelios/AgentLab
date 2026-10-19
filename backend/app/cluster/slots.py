@@ -194,6 +194,8 @@ class _Holder:
     run_id: str
     loop: asyncio.AbstractEventLoop
     woke: asyncio.Event = field(default_factory=asyncio.Event)
+    #: 还在排队等名额（发下来之前）
+    queued: bool = True
 
 
 _holders: dict[str, _Holder] = {}
@@ -379,6 +381,7 @@ async def hold(run_id: str, origin_kind: str | None) -> AsyncIterator[str]:
             await grant()
             got = await _granted(run_id)
             if got:
+                holder.queued = False
                 break
             if got is None:
                 await _request(run_id, klass, priority)
@@ -397,6 +400,17 @@ async def hold(run_id: str, origin_kind: str | None) -> AsyncIterator[str]:
         signals.publish("slot")
 
 
+async def waiting(run_id: str, *, here: bool = False) -> bool:
+    """这次运行是不是正排着队等名额（评测每题的时限、算期望的时限不算这一段，eval/runner、eval/gold）。
+    here：这次运行的执行任务在本进程里（还没开始要、或者已经放掉了名额的就不是在等，不用查库）。"""
+    holder = _holders.get(run_id)
+    if holder is not None:
+        return holder.queued
+    if here:
+        return False
+    return (await _granted(run_id)) is False
+
+
 async def snapshot() -> dict[str, Any]:
     """现在各类在跑、在等几个（系统信息、验收脚本看）。"""
     if _in_memory():
@@ -413,4 +427,5 @@ async def snapshot() -> dict[str, Any]:
 
 
 __all__ = ["CLASSES", "CLASS_LABEL", "ORIGIN_CLASS", "SETTING_KEY", "borrowable", "class_of", "defaults", "forget_policy", "grant",
+           "waiting",
            "hold", "merged", "policy", "problem", "snapshot", "values", "wake_local"]
