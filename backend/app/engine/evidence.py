@@ -3068,7 +3068,11 @@ def _name_masks(markdown: str, catalog: dict[str, Any], snaps: _Snapshots) -> li
     写名字，不该因为名字里有个 5 被打回重写。只认快照里真有的值、整段一字不差，前后紧挨着数字的不算（「冲压15线」不是
     「冲压5线」）；同一个数单独写出来照样要出处。组装和复核用同一份目录，放过的范围一致。"""
     out: list[tuple[int, int]] = []
-    for name in _text_names(catalog, snaps) if any(c.isdigit() for c in markdown) else ():
+    runs = set(re.findall(r"\d+", markdown))
+    for name in _text_names(catalog, snaps) if runs else ():
+        # 名字一字不差地出现、前后不紧挨着数字，名字里的每一串数字在正文里就是完整的一串：先按它挡掉大多数名字
+        if not all(r in runs for r in re.findall(r"\d+", name)):
+            continue
         at = markdown.find(name)
         while at >= 0:
             end = at + len(name)
