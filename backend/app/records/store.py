@@ -4,7 +4,8 @@
 业务列（「填什么」卡片生成），外加一列不对外的 _action_key（幂等键，唯一）。查询走连接上的同名临时视图
 （view_select），视图不露 _action_key。
 
-**写。** 只有 append 一条路：单进程锁（_WRITE_LOCK）里开一个短事务，先按 action_key 查——同一个动作第二次来交回
+**写。** 只有 append 一条路：写锁里开一个短事务（进程里的 _WRITE_LOCK；多进程时调用方另持库里的锁 write_lock()，几个进程
+往同一个文件里写一个接一个——SQLite 文件自己的文件锁在网络文件系统上靠不住），先按 action_key 查——同一个动作第二次来交回
 第一次写下的那一行，不再写；更正是一次新的追加，带 _supersedes 指向被更正的行，原行不改。_seq 是 SQLite 的 rowid
 （INTEGER PRIMARY KEY），只增不减：从不删行，也就不会复用。
 
@@ -47,6 +48,14 @@ _KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _BAD_NAME = re.compile(r"[\"`\[\]\x00-\x1f\x7f]")
 #: 所有写入（建表、加列、追加）共用的锁。写都是几毫秒的短事务，不按表分锁也不会互相拖住
 _WRITE_LOCK = threading.Lock()
+
+
+def write_lock() -> Any:
+    """跨进程的写锁（app/cluster/mutex：PostgreSQL 时是咨询锁，SQLite 只有一个进程、就是本进程的锁）。异步的调用方在把写入
+    放进线程之前持着它（async with）。"""
+    from app.cluster import mutex
+
+    return mutex.lock("records-store")
 
 
 class RecordsRefused(ValueError):

@@ -900,6 +900,16 @@ def _mail_public(stored: Any) -> dict[str, Any]:
     return mail.public_value(stored)
 
 
+#: 运行并发一组（app/cluster/slots.py）
+CONCURRENCY_GROUP = "concurrency"
+
+
+def concurrency_values(stored: Any) -> dict[str, Any]:
+    from app.cluster import slots
+
+    return slots.values(stored)
+
+
 def _internal(key: str) -> bool:
     """通知自己记的账（每天汇总的认领行、自动建过邮件渠道的人，notify/digest.STATE_PREFIX）：不是用户设置，不列、不收。"""
     from app.notify.digest import STATE_PREFIX
@@ -945,6 +955,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     EVAL_GROUP: eval_values(None),
     # 邮件服务（SMTP）：通知渠道的邮件格式用它发信。缺省关
     MAIL_GROUP: _mail_public(None),
+    # 运行并发（app/cluster/slots.py）：全站同时运行的上限，交互、应用、定时、系统四类各自的上限和优先级。多进程时几个进程合起来算
+    CONCURRENCY_GROUP: concurrency_values(None),
 }
 
 
@@ -1011,6 +1023,7 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     merged[APPS_GROUP] = apps_values(stored.get(APPS_GROUP))
     merged[LEDGER_GROUP] = ledger_values(stored.get(LEDGER_GROUP))
     merged[EVAL_GROUP] = eval_values(stored.get(EVAL_GROUP))
+    merged[CONCURRENCY_GROUP] = concurrency_values(stored.get(CONCURRENCY_GROUP))
     # 口令不回（password 恒为 null），只说配没配（password_set）
     merged[MAIL_GROUP] = _mail_public(stored.get(MAIL_GROUP))
     for key, value in stored.items():
@@ -1122,6 +1135,14 @@ async def put_settings(
         if problem := eval_problem(payload.values[EVAL_GROUP]):
             raise HTTPException(422, problem)
         payload.values[EVAL_GROUP] = eval_values(payload.values[EVAL_GROUP])
+    if CONCURRENCY_GROUP in payload.values:
+        from app.cluster import slots
+
+        if problem := slots.problem(payload.values[CONCURRENCY_GROUP]):
+            raise HTTPException(422, problem)
+        saved_row = await session.get(Setting, CONCURRENCY_GROUP)
+        payload.values[CONCURRENCY_GROUP] = slots.merged(saved_row.value if saved_row is not None else None,
+                                                         payload.values[CONCURRENCY_GROUP])
     if MAIL_GROUP in payload.values:
         from app.notify import mail
 
@@ -1144,9 +1165,17 @@ async def put_settings(
         else:
             session.add(Setting(key=key, value=value))
     await session.commit()
+    if CONCURRENCY_GROUP in payload.values:
+        # 本进程马上按新的发名额（别的进程最迟几秒，slots.POLICY_TTL_S）
+        from app.cluster import slots
+
+        slots.forget_policy()
     if NOTIFY_GROUP in payload.values:
         # 中间件、单点登录的回调按进程缓存取对外访问地址：写完库就刷新，不用重启
         public_url.remember(payload.values[NOTIFY_GROUP][public_url.SETTING_KEY])
+        from app.cluster import caches
+
+        await caches.broadcast("public_url")
     return await get_settings(session)
 
 
@@ -1226,4 +1255,14 @@ async def system_info() -> dict[str, Any]:
             "max_run_seconds": app_settings.max_run_seconds,
             "model_timeout_seconds": app_settings.model_timeout_seconds,
         },
+        # 多进程协调（app/cluster）：登记着的工作进程、谁在调度当班、各类运行在跑 / 在等几个
+        "cluster": await _cluster_info(),
     }
+
+
+async def _cluster_info() -> dict[str, Any]:
+    from app.cluster import identity, leader, slots, workers
+
+    return {"me": identity.owner(), "database": app_settings.db_dialect, "workers": await workers.listing(),
+            "leader": await leader.current(), "runs": await slots.snapshot(),
+            "lease_s": workers.lease_s(), "heartbeat_s": workers.heartbeat_s()}

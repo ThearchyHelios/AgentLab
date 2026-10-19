@@ -387,10 +387,11 @@ def _records_gap(entry: Any) -> str | None:
 _LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def _lock(key: str) -> asyncio.Lock:
-    if key not in _LOCKS:
-        _LOCKS[key] = asyncio.Lock()
-    return _LOCKS[key]
+def _lock(key: str) -> Any:
+    """按需视图的单飞锁（app/cluster/mutex，多进程之间也是一把）：同一个键正在运行的那次接上，不另发。"""
+    from app.cluster import mutex
+
+    return mutex.lock(f"app-view:{key}")
 
 
 def normalize_params(form: dict[str, Any] | None, params: Any) -> dict[str, Any]:

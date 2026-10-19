@@ -721,6 +721,18 @@ async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float | No
 
     运行一封存就比的（trigger=sealed）比完接着看能不能按口径自动正式出具（ledger/issue.auto_issue，拍板 L1）：事后补比、
     按需比的不自动出具——那是按现在的口径回看老答案，不该替人补发正式运行。"""
+    from app.cluster import mutex
+
+    # 多进程：封存时比（执行它的进程）和补比（当班进程）可能同时来；跨进程的锁里一次一个，补比、封存时比先看比过没有
+    async with mutex.lock(f"ledger-match:{run_id}"):
+        if trigger in ("sealed", "backfill"):
+            async with SessionLocal() as session:
+                if await store.matched_run_ids(session, [run_id]):
+                    return None
+        return await _match_run(run_id, trigger=trigger, timeout=timeout)
+
+
+async def _match_run(run_id: str, *, trigger: str, timeout: float | None) -> str | None:
     from app.api.evidence import _sealed
     from app.api.settings import ledger_settings
 

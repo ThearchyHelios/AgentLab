@@ -380,26 +380,33 @@ def check_fields(template: dict[str, str], fields: list[dict[str, Any]], workflo
 # 发起一次触发
 # --------------------------------------------------------------------------
 
-#: 每个事件循环一把锁：发起（查重叠 → 记触发 → 发起运行 → 改记录）和通知扫描查库互斥。单进程部署，进程内
-#: 互斥就够；按事件循环分开是因为测试每个用例一个新循环，跨循环用同一把 asyncio.Lock 会报错
-_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
+def launch_lock() -> Any:
+    """发起（查重叠 → 记触发 → 发起运行 → 改记录）和通知扫描查库互斥。跨进程的锁（app/cluster/mutex：本进程按事件循环各一把，
+    PostgreSQL 时另取咨询锁）：多进程时到点的发起在当班进程、「立即运行」在接到请求的进程，照样互斥。"""
+    from app.cluster import mutex
 
-
-def launch_lock() -> asyncio.Lock:
-    loop = asyncio.get_running_loop()
-    lock = _LOCKS.get(loop)
-    if lock is None:
-        lock = _LOCKS[loop] = asyncio.Lock()
-    return lock
+    return mutex.lock("schedule-launch")
 
 
 #: 正在发起的触发：占位记录已写进库、launch_run 还没返回。通知扫描有 launch_lock 挡着，接口的读（任务列表的
-#: last_fire、触发历史）没有：它们据此按「已发起」给，不把还在发起的说成「未能发起」（单进程部署，进程内的集合就够）
+#: last_fire、触发历史）没有：它们据此按「已发起」给，不把还在发起的说成「未能发起」
 _LAUNCHING: set[str] = set()
 
 
-def launching(fire_id: str) -> bool:
-    return fire_id in _LAUNCHING
+def launching(fire_id: str, fire: Any = None) -> bool:
+    """这一次触发是不是还在发起：本进程里在发起；多进程时也可能在别的进程里——占位记录（「未能发起：中断」、还没有运行）写下
+    不到一个租约时长的，按还在发起算（进程真没了的，过了租约就照实显示）。"""
+    if fire_id in _LAUNCHING:
+        return True
+    if fire is None or getattr(fire, "status", None) != "failed_to_start" or getattr(fire, "run_id", None) \
+            or getattr(fire, "reason", None) != INTERRUPTED_REASON or getattr(fire, "created_at", None) is None:
+        return False
+    from datetime import timedelta
+
+    from app.cluster.workers import lease_s
+
+    created = fire.created_at if fire.created_at.tzinfo else fire.created_at.replace(tzinfo=timezone.utc)
+    return created > utcnow() - timedelta(seconds=lease_s())
 
 
 def actor_label(name: str) -> str:

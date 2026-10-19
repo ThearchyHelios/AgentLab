@@ -88,6 +88,8 @@ class PublishPlan(Base, TimestampMixin):
     summary: Mapped[list[Any]] = mapped_column(default=list)
     problems: Mapped[list[Any]] = mapped_column(default=list)
     status: Mapped[str] = mapped_column(String(20), default="planned")
+    #: 执行这份发布单的工作进程（status=running 时，app/cluster）：属主不在了的才按「执行中断」收拾
+    owner: Mapped[str | None] = mapped_column(String(120), default=None)
 
 
 class StoredFile(Base):

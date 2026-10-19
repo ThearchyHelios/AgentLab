@@ -681,21 +681,17 @@ async def resolve_source(
 # 锁：发布、回收、启动清理彼此串行
 # --------------------------------------------------------------------------
 
-_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
-
-
-def store_lock() -> asyncio.Lock:
-    """版本存储的写锁，按事件循环各一把。不可重入：持着它时别再调会自己取锁的函数。
+def store_lock() -> Any:
+    """版本存储的写锁（app/cluster/mutex：本进程一把 asyncio 锁，按事件循环各一把；应用库是 PostgreSQL 时另取一把会话级咨询锁，
+    几个进程之间也串行）。不可重入：持着它时别再调会自己取锁的函数。用法同 asyncio.Lock（async with）。
 
     回收要先看「哪些文件有记录」再删：发布正处在「文件已 link、记录未提交」之间时，回收
     会把它当孤儿删掉；复用一个刚被判为无人引用的构建，也会撞上正在删它的回收。上传不频繁，
     全部串行最省心。按循环分开是因为 asyncio.Lock 一旦在某个循环里等过，就不能换循环用。
     """
-    loop = asyncio.get_running_loop()
-    lock = _locks.get(loop)
-    if lock is None:
-        lock = _locks[loop] = asyncio.Lock()
-    return lock
+    from app.cluster import mutex
+
+    return mutex.lock("upload-store")
 
 
 _store_lock = store_lock
@@ -747,6 +743,10 @@ def acquire_store_guard() -> bool:
     同一进程里重复调用是幂等的；数据目录换了就放掉旧的、对新文件重新加锁。上次没拿到的，再调一次会重试
     （占着它的进程退出后就能拿到）。没有 fcntl 的平台照常可写，只记一条警告。
     """
+    if settings.db_dialect == "postgresql":
+        # 应用库是 PostgreSQL 时可以多进程：发布、回收、启动清理之间靠跨进程的锁（store_lock 的咨询锁）互斥，不再靠文件锁
+        # 独占数据目录（flock 在网络文件系统上也靠不住）
+        return True
     path = _guard_path()
     if _guard.path == path and _guard.fd is not None:
         return True
@@ -776,7 +776,10 @@ def acquire_store_guard() -> bool:
 
 
 def store_writable() -> bool:
-    """本进程能不能写版本存储。没对当前数据目录取过守卫（没调过 startup）的按能写处理：守卫只在启动时取。"""
+    """本进程能不能写版本存储。没对当前数据目录取过守卫（没调过 startup）的按能写处理：守卫只在启动时取。PostgreSQL 时总能写
+    （见 acquire_store_guard）。"""
+    if settings.db_dialect == "postgresql":
+        return True
     return _guard.writable or _guard.path != _guard_path()
 
 
@@ -2445,16 +2448,27 @@ def _same_path(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
         return False
 
 
-def _sweep_tmp() -> int:
-    """删掉上次崩溃留下的 *.tmp-* 半成品（库和原件都是先写临时文件再 link）。"""
+#: 多进程时只清多久以前的半成品（秒）：别的进程正在解析、写的临时文件不在锁里（解析在锁外做），新的不能删
+TMP_STALE_S = 6 * 3600.0
+
+
+def _sweep_tmp(min_age_s: float = 0.0) -> int:
+    """删掉上次崩溃留下的 *.tmp-* 半成品（库和原件都是先写临时文件再 link）。min_age_s：只删改动时间早于这么多秒以前的
+    （多进程时别的进程可能正在写，见 startup）。"""
+    import time as _time
+
     removed = 0
+    floor = _time.time() - min_age_s
     for root in (tables_root(), raw_store.raw_root()):
         if not root.is_dir():
             continue
         for path in root.rglob(f"*{_TMP}*"):
-            if path.is_file():
-                path.unlink(missing_ok=True)
-                removed += 1
+            try:
+                if path.is_file() and (not min_age_s or path.stat().st_mtime < floor):
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                continue
     return removed
 
 
@@ -2677,7 +2691,9 @@ async def startup(session: AsyncSession) -> None:
         logger.error("上传表格的版本存储被另一个进程占用，本进程跳过启动清理、迁移和回收")
         return
     async with _store_lock():
-        swept = await asyncio.to_thread(_sweep_tmp)
+        # 半成品：单进程（SQLite，守卫保证只有本进程）启动时一个都不会有人在写，全清；PostgreSQL 可以多进程，别的进程正在解析的
+        # 临时文件写在锁外，只清 TMP_STALE_S 以前的
+        swept = await asyncio.to_thread(_sweep_tmp, TMP_STALE_S if settings.db_dialect == "postgresql" else 0.0)
         if swept:
             logger.info("清理了 %d 个上次未完成的上传临时文件", swept)
         migrated = await _migrate_legacy(session)

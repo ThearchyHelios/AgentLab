@@ -9,6 +9,10 @@ skipped_misfire；更早的积压只记一条跳过，不补。下一次一律�
 
 事件触发的任务（docs/design/orchestration-round/00-总方案.md §4）不在 fire_due 里：它们没有 next_run_at。每一拍发完到点的，
 接着派待派发事件（scheduler/outbox.dispatch_due）。调度关着时这一拍不存在，事件留在表里。
+
+**多进程只有一个进程当班**（app/cluster/leader.py）：循环在每个进程里都起，每一拍先看本进程当不当班，不当班这一拍什么都
+不做（定时认领、事件派发、流程的时限和核实、Webhook 投递、各类周期清理都只在当班的进程里跑）。当班的进程没了，待命的接班
+之后马上补一拍。切换的那一会儿两边都以为自己当班也重复不了：认领是条件 UPDATE、触发记录和投递记录有唯一约束。
 """
 from __future__ import annotations
 
@@ -178,6 +182,7 @@ class _Runner:
         #: 通知推送另起任务：Webhook 超时加重试最长要几十秒，不能拖着下一拍的发起。同一时刻只跑一份
         self.notify: asyncio.Task[None] | None = None
         self._stopping: asyncio.Event | None = None
+        self._poked: asyncio.Event | None = None
 
     def running(self) -> bool:
         return self.task is not None and not self.task.done()
@@ -189,10 +194,21 @@ class _Runner:
         self.task = asyncio.create_task(self._loop(interval, self._stopping), name="agentlab-scheduler")
         logger.info("定时任务调度已启动，每 %s 秒检查一次", interval)
 
+    def poke(self) -> None:
+        """马上补一拍（刚接了调度班）。"""
+        if self._poked is not None:
+            self._poked.set()
+
     async def _loop(self, interval: float, stopping: asyncio.Event) -> None:
+        from app.cluster import leading
         from app.scheduler import webhook
 
+        self._poked = asyncio.Event()
         while not stopping.is_set():
+            if not leading():
+                # 不当班：这一拍什么都不做，等下一拍（或者接班时被叫醒）
+                await self._wait(stopping, interval)
+                continue
             try:
                 await fire_due()
                 await dispatch_events()
@@ -204,8 +220,20 @@ class _Runner:
                 raise
             except Exception:  # noqa: BLE001 - 这一拍出错不该让循环停下
                 logger.exception("定时任务调度这一拍出错，下一拍照常进行")
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stopping.wait(), timeout=interval)
+            await self._wait(stopping, interval)
+
+    async def _wait(self, stopping: asyncio.Event, interval: float) -> None:
+        poked = self._poked
+        waits = [asyncio.ensure_future(stopping.wait())]
+        if poked is not None:
+            waits.append(asyncio.ensure_future(poked.wait()))
+        try:
+            await asyncio.wait(waits, timeout=interval, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()
+            if poked is not None:
+                poked.clear()
 
     async def stop(self) -> None:
         """让循环收完手上这一拍再停、正在推送的通知推完；各等一个宽限（STOP_GRACE_S、NOTIFY_GRACE_S），两件事并行

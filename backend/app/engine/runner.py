@@ -15,6 +15,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from sqlalchemy import case, func, select, update
 
+from app.cluster import identity
 from app.core.bus import bus
 from app.core.config import settings
 from app.core.errors import describe_exception, raw_detail
@@ -73,7 +74,8 @@ class RunManager:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._checkpointer: BaseCheckpointSaver | None = None
         self._cm: Any = None
-        self._semaphore = asyncio.Semaphore(settings.max_concurrent_runs)
+        # 并发上限以前是这里一把进程内的信号量（max_concurrent_runs）；现在是库里按类别发的名额（app/cluster/slots.py），
+        # 几个进程合起来算，评测、召回这些系统运行不再挤占问数据和试跑
         #: 正在关停。此时收到的取消来自关停而不是用户，运行要记成可恢复的中断
         self._closing = False
         #: 已经跑完、正在落状态和封存的运行。关停不去打断它们
@@ -105,44 +107,68 @@ class RunManager:
                 update(Run).where(func.coalesce(Run.last_seq, 0) < latest)
                 .values(last_seq=latest, updated_at=Run.updated_at)
                 .execution_options(synchronize_session=False))
-            stranded = list((await session.execute(
-                select(Run.id, Run.last_seq).where(Run.status == "running")
-            )).all())
-            queued = list((await session.execute(
-                select(Run.id, Run.last_seq).where(Run.status == "queued")
-            )).all())
-            await session.execute(
-                update(Run)
-                .where(Run.status == "running")
-                .values(status="interrupted", error="服务重启，运行已挂起，可从断点继续运行")
-            )
-            await session.execute(
-                update(Run)
-                .where(Run.status == "queued")
-                .values(status="failed", error=QUEUED_AT_RESTART)
-            )
             await session.commit()
-        # 进程被强杀时连 server_shutdown 日志都来不及发，事件流停在半路。补上这一条，
-        # 回放它的客户端才知道它是挂起了，而不是还在跑
-        for run_id, last_seq in stranded:
-            bus.set_seq(run_id, last_seq or 0)
-            await self._emit(run_id, EventType.LOG, data={
-                "level": "warn", "code": "server_shutdown",
-                "message": "服务上次未正常关闭，这次运行已中断；可从断点继续运行",
-            })
-        # 排队中的改成了失败，也补一条 run.failed：以前只改状态，时间线里没有失败原因这一行（05-已知遗留 (h)）。
-        # 不写结束时间、不封存：它从没开始执行，同以前（定时通知按「没有开始时间」认出它，scheduler/webhook.py）
-        for run_id, last_seq in queued:
-            bus.set_seq(run_id, last_seq or 0)
-            await self._emit(run_id, EventType.RUN_FAILED, data={"error": QUEUED_AT_RESTART})
+        # 上次进程被强杀时留下的记录：只碰属主不在了的（多进程时别的活着的进程在跑的一概不碰，见 reap）
+        from app.cluster import state
+
+        await self.reap(await state.current(fresh=True))
         # 口径账本：最近几天封存了、一次都没比过的探索运行，在后台补比一次（ledger/match.py）。只读工件和版本表，不查业务库、
         # 不调模型；和调度循环同一个开关，拷来的数据目录、测试不补
         from app.ledger import match as ledger_match
         from app.ledger import recall as ledger_recall
 
-        ledger_match.start_backfill()
-        # 口径召回（ledger/recall.py）：最近发布、自动那一批没发完的接着发，结束了还没收尾的召回运行补上收尾。同一个开关
-        ledger_recall.start_resume()
+        # 多进程时只由调度当班的进程做（app/cluster；单进程时本进程启动就当班）：几个进程各补一遍会重复比对、重复召回
+        from app.cluster.service import leading
+
+        if leading():
+            ledger_match.start_backfill()
+            # 口径召回（ledger/recall.py）：最近发布、自动那一批没发完的接着发，结束了还没收尾的召回运行补上收尾。同一个开关
+            ledger_recall.start_resume()
+
+    async def reap(self, live: Any) -> int:
+        """接手属主不在了的运行（启动时；多进程时当班进程隔一会儿再来一次，app/cluster/reaper.py）。规矩同以前的启动整理：
+
+        - running 至少跑过一步、有断点：标 interrupted（可从断点继续运行），补一条 server_shutdown 日志——进程被强杀时连这一条
+          都来不及发，事件流停在半路，回放它的客户端才知道它是挂起了而不是还在跑；
+        - queued 还在排队，一个断点都没写过，「恢复」它只会从 START 用默认值重跑一遍、还丢掉 run.input，那不是恢复是伪造：
+          标 failed，补一条 run.failed（不写结束时间、不封存：它从没开始执行，同以前）。
+
+        不自动重跑有副作用的步骤：人看了再点「继续运行」。属主还活着的（别的进程正在跑、本进程里正在跑）一概不碰；认领那一下是
+        带条件的 UPDATE（状态、属主都还是刚才看到的），几个进程同时接手同一次运行只有一个改得动。交回整理了几次运行。"""
+        from app.cluster.claims import same
+
+        async with SessionLocal() as session:
+            rows = (await session.execute(select(Run.id, Run.owner, Run.status).where(
+                Run.status.in_(("running", "queued"))))).all()
+        done = 0
+        for run_id, owner, status in rows:
+            if live.alive(owner, local=self.is_active(run_id)):
+                continue
+            event: RunEventModel | None = None
+            async with SessionLocal() as session:
+                values: dict[str, Any] = (
+                    {"status": "interrupted", "error": "服务重启，运行已挂起，可从断点继续运行"} if status == "running"
+                    else {"status": "failed", "error": QUEUED_AT_RESTART})
+                claimed = await session.execute(update(Run).where(Run.id == run_id, Run.status == status,
+                                                                  same(Run.owner, owner))
+                                                .values(owner=None, **values).execution_options(synchronize_session=False))
+                if claimed.rowcount != 1:
+                    await session.rollback()
+                    continue
+                run = await session.get(Run, run_id)
+                bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq if run else 0))
+                event = self._event(run_id, EventType.LOG, data={
+                    "level": "warn", "code": "server_shutdown",
+                    "message": "服务上次未正常关闭，这次运行已中断；可从断点继续运行",
+                }) if status == "running" else self._event(run_id, EventType.RUN_FAILED, data={"error": QUEUED_AT_RESTART})
+                await _stage(session, event, run)
+                await session.commit()
+            await bus.publish(event)
+            await bus.close(run_id)
+            done += 1
+        if done:
+            logger.warning("接手了 %d 次属主已经不在的运行（在跑的标中断、排队的标失败）", done)
+        return done
 
     async def shutdown(self) -> None:
         self._closing = True
@@ -224,7 +250,20 @@ class RunManager:
         self, run_id: str, event_type: EventType | str, *, node_id: str | None = None,
         **data: Any,
     ) -> None:
-        """给运行之外的代码往运行里记一条事件。发起时就定下的事件不走这里，交给 start 的 notes。"""
+        """给运行之外的代码往运行里记一条事件。发起时就定下的事件不走这里，交给 start 的 notes。
+
+        执行中的运行，序号由执行它的进程发（core/bus 的进程内计数）：运行在别的活着的进程里执行时交给它记（cluster/requests），
+        不在这里取号——这里的计数和那边的不是同一个，直接写会撞号。"""
+        if not self.is_active(run_id):
+            from app.cluster import requests, workers
+
+            async with SessionLocal() as session:
+                row = (await session.execute(select(Run.status, Run.owner).where(Run.id == run_id))).first()
+            if row is not None and row.status in ("running", "queued") and row.owner \
+                    and row.owner != identity.owner() and await workers.alive(row.owner):
+                await requests.send(row.owner, "note", "run", run_id, payload={
+                    "type": str(event_type), "node_id": node_id, "data": data})
+                return
         await self._emit(run_id, event_type, node_id=node_id, data=data)
 
     # ---------------- 启动 ----------------
@@ -334,6 +373,7 @@ class RunManager:
                 agent_limits=agent_limits,
                 data_versions=data_versions,
                 options=options,
+                origin_kind=origin_kind,
             )
         )
         return run
@@ -644,6 +684,19 @@ class RunManager:
             self._stopped_by[run_id] = actor
             task.cancel()
             return "stopping"
+        # 不在本进程里执行（多进程，app/cluster）：在别的活着的进程里跑（或排队）的给它发停止请求，它照本进程的规矩停、发
+        # run.cancelled（带上是谁停的），界面上同样是「正在停止」；属主不在了的照租约过期接手（标中断），再按停在断点上的放弃
+        from app.cluster import requests, workers
+
+        async with SessionLocal() as session:
+            row = (await session.execute(select(Run.status, Run.owner).where(Run.id == run_id))).first()
+        if row is not None and row.status in ("running", "queued") and row.owner and row.owner != identity.owner():
+            if await workers.alive(row.owner):
+                await requests.send(row.owner, "stop", "run", run_id, actor=actor)
+                return "stopping"
+            from app.cluster import state
+
+            await self.reap((await state.current(fresh=True)).trusting())
         return "cancelled" if await self._abandon(run_id, actor) else None
 
     async def _abandon(self, run_id: str, actor: str | None) -> bool:
@@ -717,7 +770,10 @@ class RunManager:
         options: dict[str, Any] | None = None,
         resumed: list[str] | tuple[str, ...] = (),
         actors: dict[str, str | None] | None = None,
+        origin_kind: str | None = None,
     ) -> None:
+        from app.cluster import slots
+
         started = time.perf_counter()
         status = "succeeded"
         error: str | None = None
@@ -735,12 +791,13 @@ class RunManager:
         # 等待从 run.interrupted 算起——以前执行一直计到 finally，收尾那一截执行和等待两边都算，
         # active + wait 比墙钟还长（机器一忙就差出几十毫秒）
         paused: float | None = None
-        async with self._semaphore:
+        async with slots.hold(run_id, origin_kind):
             try:
                 async with SessionLocal() as session:
                     row = await session.get(Run, run_id)
                     if row is not None:
                         row.status = "running"
+                        row.owner = identity.owner()
                         # started_at 只在第一次开始时写。以前每段 _drive 都覆盖它，
                         # 审批恢复、接着跑之后，运行的"开始时间"就成了最后一段的开始
                         if row.started_at is None:
@@ -1061,6 +1118,10 @@ class RunManager:
                 run.end_reason = end_reason
                 if status != "interrupted":
                     run.finished_at = now
+                else:
+                    # 停在审批上（或挂起）的运行不属于任何进程：谁收到决定谁接着跑（resume / continue_failed 的条件 UPDATE
+                    # 认领，同一个决定只会被一个进程执行）
+                    run.owner = None
                 if status in ("failed", "cancelled"):
                     # 并行支路上已经停下来等人的那张审批卡，运行结束了它也就没有意义了；
                     # 留着的话它一直挂在全局待办里，批了也只会被告知运行不在断点上
@@ -1247,6 +1308,8 @@ def _carried(run: Run) -> dict[str, Any]:
         "data_versions": run.data_versions,
         # 运行选项同理：照发起时的快照，不重新读设置
         "options": run.options or {},
+        # 并发名额按来源归类（app/cluster/slots.py）：恢复、接着跑的那一段和第一段同一类
+        "origin_kind": run.origin_kind,
     }
 
 
@@ -1494,7 +1557,7 @@ async def _claim(
     """只在状态仍是 expected 时把运行改成 running；已经被别人改过就回滚、说明原因。"""
     claimed = await session.execute(
         update(Run).where(Run.id == run_id, Run.status.in_(expected))
-        .values(status="running", error=None, **values)
+        .values(status="running", error=None, owner=identity.owner(), **values)
     )
     if claimed.rowcount != 1:
         await session.rollback()
@@ -1666,3 +1729,28 @@ async def _timing(session: Any, run: Run, elapsed_ms: int, now: datetime) -> dic
 
 
 run_manager = RunManager()
+
+
+def _register_requests() -> None:
+    """别的进程发来的：停止本进程在执行的运行、往它里面记一条事件（app/cluster/requests.py）。"""
+    from app.cluster import requests
+
+    @requests.handle("stop", "run")
+    async def _stop(run_id: str, actor: str | None, _payload: dict[str, Any]) -> None:
+        if run_manager.is_active(run_id):
+            await run_manager.cancel(run_id, actor=actor)
+
+    @requests.handle("note", "run")
+    async def _note(run_id: str, _actor: str | None, payload: dict[str, Any]) -> None:
+        kind, node_id, data = payload.get("type") or EventType.LOG, payload.get("node_id"), dict(payload.get("data") or {})
+        if run_manager.is_active(run_id):
+            await run_manager._emit(run_id, kind, node_id=node_id, data=data)
+            return
+        # 收到时运行已经停下了：停在审批上的接在库里最后一条后面记（同 process/events.record），别的不记
+        from app.engine.run_append import append_events
+
+        if await append_events(run_id, [(kind, node_id, data)], require="interrupted") is None:
+            logger.info("运行 %s 已经不在执行，别的进程要记的一条 %s 没有记", run_id, kind)
+
+
+_register_requests()

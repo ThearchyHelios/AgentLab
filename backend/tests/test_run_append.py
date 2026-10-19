@@ -622,10 +622,10 @@ def _judged_args(run: Run) -> tuple:
 
 
 async def test_a_judge_interleaved_with_a_post_seal_append_survives_a_restart(flaky, monkeypatch):
-    """按需裁判记判定（_append_judged）的条件更新不带 last_seq 条件：它取了号、还没写，封存后追加抢先提交了，
-    它再提交时把 last_seq 写回自己那个更小的号。同一进程里序号计数只增不减，不会撞号；进程重启后计数从 0 起，
-    各处又按 last_seq 接号——裁判自己也是。所以启动时按库里实际的最后一条改正 last_seq：之后再裁判、继续运行，
-    都接在实际的最后一条后面。"""
+    """按需裁判记判定（_append_judged）和封存后追加交错：裁判取了号、还没写，封存后追加抢先提交了。以前裁判的条件更新不带
+    last_seq 条件，照样提交、把 last_seq 写回自己那个更小的号（同一进程里计数只增不减，不撞号；多进程时两个进程各自的计数
+    会撞号）。现在同 append_events：last_seq 也要还是读到的那个，后到的裁判这一次不记（判定照样交回给点的人），last_seq
+    停在追加的那一条上。启动时照旧按库里实际的最后一条改正 last_seq：之后再裁判、继续运行，都接在实际的最后一条后面。"""
     from app.api import evidence
     from app.engine.run_append import append_events
 
@@ -662,9 +662,9 @@ async def test_a_judge_interleaved_with_a_post_seal_append_survives_a_restart(fl
         await asyncio.sleep(0.01)
     written = await append_events(first.id, [inquiry("这次为什么失败")], require="sealed")
     held.set()
-    assert await judging == {"seq": first.last_seq + 1}
+    assert await judging is None, "追加先提交了：后到的裁判不记，免得两条撞号"
     assert written is not None and written[0].seq == first.last_seq + 2
-    assert (await _row(first.id)).last_seq == first.last_seq + 1, "裁判后提交，last_seq 被写回了小的号"
+    assert (await _row(first.id)).last_seq == written[0].seq
     monkeypatch.setattr(evidence, "SessionLocal", opened)
 
     # 进程重启：内存里的序号计数没了，启动时 setup 照常执行一遍。只改落后的那条，别的运行原样不动

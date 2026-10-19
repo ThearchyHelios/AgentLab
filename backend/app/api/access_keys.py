@@ -131,6 +131,9 @@ async def put_settings(payload: SettingsIn, session: AsyncSession = Depends(get_
                      data={"before": bool(before.get(PERSONAL_KEYS)), "after": payload.personal_keys})
     await session.commit()
     remember_settings(value)
+    from app.cluster import caches
+
+    await caches.broadcast("auth_settings")
     return await get_settings()
 
 

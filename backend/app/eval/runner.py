@@ -43,7 +43,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import job_runtime as runtime
-from app.db.base import SessionLocal, utcnow
+from app.db.base import current_owner, SessionLocal, utcnow
 from app.db.models_eval import EvalCase, EvalResult, EvalRun, EvalSuite
 from app.eval.cases import CaseInvalid
 
@@ -963,22 +963,30 @@ def running(run: Any) -> bool:
     return manager.running(leader_of(run))
 
 
+def leader_of_id(rows: Sequence[EvalRun], job_id: str) -> str:
+    """rows 里 id 是 job_id 的那一臂由哪一臂的任务在跑（A/B 几臂共用领头那一臂的后台任务）。"""
+    row = next((r for r in rows if r.id == job_id), None)
+    return leader_of(row) if row is not None else job_id
+
+
 async def reconcile_stale(session: AsyncSession, rows: Sequence[EvalRun]) -> None:
     """读接口当场整理：记着排队、进行中，这个进程里却没在跑（服务重启过）的，照实标中断。"""
-    stale = [r for r in rows if r.status in runtime.ACTIVE and not running(r)]
+    # 属主不在了才算：多进程时别的进程正在跑的评测，这里看不到它的任务，却不能标中断（runtime.stale 按租约判断）
+    stale = await runtime.stale(list(rows), running=lambda job_id: manager.running(leader_of_id(rows, job_id)))
     for row in stale:
         await runtime.close_job(session, EvalRun, EvalResult, row.id, "interrupted", None, "cancelled",
                                 INTERRUPTED, finish=_closing(row.id, INTERRUPTED))
         await session.refresh(row)
 
 
-async def startup() -> int:
-    """服务启动时：没结束的评测标中断（没结束的项记停止），不自动续跑。"""
+async def startup(*, live: Any = None) -> int:
+    """服务启动时（多进程时当班进程隔一会儿再来一次）：属主不在了的评测标中断（没结束的项记停止），不自动续跑。"""
     async def close(session: AsyncSession, job_id: str) -> None:
         await runtime.close_job(session, EvalRun, EvalResult, job_id, "interrupted", None, "cancelled",
                                 INTERRUPTED, finish=_closing(job_id, INTERRUPTED))
 
-    return await runtime.interrupt_on_startup(EvalRun, close, running=manager.running)
+    # 几臂共用领头那一臂的后台任务，各臂的属主是同一个进程：按属主判断就够了（running 只在属主是本进程时看）
+    return await runtime.interrupt_on_startup(EvalRun, close, running=manager.running, live=live)
 
 
 async def stop(run_id: str) -> bool:
@@ -1035,6 +1043,7 @@ async def retry(run_id: str) -> list[str]:
                     setattr(r, key, value)
         for arm in arms:
             arm.status, arm.error, arm.stop_reason, arm.finished_at = "queued", None, None, None
+            arm.owner = current_owner()   # 重新排队的这一次由本进程认领（多进程：别把它当成原来那个进程的）
         await session.flush()
         for arm in arms:
             await _recount(session, arm.id)

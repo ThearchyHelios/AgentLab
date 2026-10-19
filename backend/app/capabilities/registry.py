@@ -184,7 +184,7 @@ def _platform_defaults_apply(row: Any, name: str) -> bool:
     return name in GOVERNANCE_DEFAULTS and row.version == 1 and row.updated_by is None
 
 
-async def refresh_cache(session: AsyncSession) -> None:
+async def refresh_cache(session: AsyncSession, *, broadcast: bool = True) -> None:
     """重算登记的进程内快照。能作证的端点读取：绑定登记端点的 http 自定义工具，治理后效果为 read，声明了 tabular。
     Python 自定义工具（用户代码在算）和 MCP（没有结构化回执）不算，不管登记里写了什么。"""
     from app.capabilities.endpoints import bound_endpoint_ref
@@ -200,6 +200,11 @@ async def refresh_cache(session: AsyncSession) -> None:
     _endpoint_prod.clear()
     _endpoint_prod.update({e.id: bool((e.environments or {}).get("prod"))
                            for e in (await session.execute(select(Endpoint))).scalars()})
+    if broadcast:
+        # 多进程：别的进程的这份快照也要重算（app/cluster/caches.py）
+        from app.cluster import caches
+
+        await caches.broadcast("capabilities")
 
 
 def cached_view(name: str) -> dict[str, Any] | None:

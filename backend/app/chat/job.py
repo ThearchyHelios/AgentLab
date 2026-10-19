@@ -55,7 +55,7 @@ from app.chat import log as turn_log
 from app.chat import record
 from app.chat.drive import TurnDriver
 from app.core import job_runtime as runtime
-from app.db.base import SessionLocal, utcnow
+from app.db.base import SessionLocal, current_owner, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -431,9 +431,10 @@ class ChatTurnExecution(runtime.JobRun):
         fields, meta, outcome, output, usage = await _settled(driver, self)
         await self.save(meta=meta, usage=usage, **fields)
         await self._end(outcome, output)
-        # 晚到的复核先登记、再改任务状态：实时流看到任务结束时，要知道还得等这一次复核回来
+        # 晚到的复核先登记、再改任务状态：实时流看到任务结束时，要知道还得等这一次复核回来（库里也记一笔：别的进程上的流）
         if driver.late_review is not None:
             _track_late(self.turn_id, driver.late_review)
+            await _mark_late(self.turn_id, True)
         await self._job(status="succeeded", stage=None, finished_at=utcnow())
 
     async def _end(self, outcome: str, output: Any = None) -> None:
@@ -499,6 +500,11 @@ class ChatTurnManager(runtime.JobManager):
     def __init__(self) -> None:
         super().__init__(ChatTurnExecution, label="问数据的一轮", name="chat-turn")
 
+    def model(self) -> Any:
+        from app.db.models_chat import ChatTurnJob
+
+        return ChatTurnJob
+
     def start(self, job_id: str) -> bool:  # type: ignore[override]
         """同一轮在这个进程里还有一个后台任务活着就不起第二个、也不把登记换成新的（换了的话，停止只停得到后起的那个，
         先起的那个跑完把「已取消」盖成「已完成」）。起了交回 True。"""
@@ -543,11 +549,44 @@ def _track_late(turn_id: str, task: asyncio.Task[Any]) -> None:
 
     watcher = asyncio.ensure_future(finish())
     _late[turn_id] = watcher
+    watcher.add_done_callback(lambda _t: _later(_mark_late(turn_id, False)))
+
+
+async def _mark_late(turn_id: str, pending: bool) -> None:
+    """晚到的复核记在任务行上（late_review_at）：多进程时别的进程上的流也知道还要等它（stream_status）。"""
+    from app.db.models_chat import ChatTurnJob
+
+    try:
+        async with SessionLocal() as session:
+            await session.execute(update(ChatTurnJob).where(ChatTurnJob.id == turn_id).values(
+                late_review_at=utcnow() if pending else None).execution_options(synchronize_session=False))
+            await session.commit()
+    except Exception:  # noqa: BLE001 - 记不上只是别的进程上的流可能早一点结束
+        logger.exception("问数据：记晚到的复核状态出错")
+    if not pending:
+        turn_log.notify(turn_id)
+
+
+def _later(coro: Any) -> None:
+    with contextlib.suppress(RuntimeError):
+        asyncio.ensure_future(coro)
 
 
 def late_pending(turn_id: str) -> bool:
+    """本进程里晚到的复核还在不在跑。"""
     task = _late.get(turn_id)
     return task is not None and not task.done()
+
+
+async def late_waiting(job: Any) -> bool:
+    """晚到的复核还要不要等：本进程里在跑，或者库里记着、记它的进程（这一轮的属主）还活着。"""
+    if late_pending(job.id):
+        return True
+    if getattr(job, "late_review_at", None) is None:
+        return False
+    from app.cluster import state
+
+    return (await state.live_for([job.owner])).alive(job.owner)
 
 
 # --------------------------------------------------------------------------
@@ -995,7 +1034,7 @@ async def _claim(session: AsyncSession, *, conversation: Any, question: str, dat
             row.meta = {k: v for k, v in new_meta.items() if v is not None}
             row.status, row.error, row.answer, row.review = "running", "", "", {}
             row.run_id = None
-        values = {"status": "queued", "stage": None, "mode": mode, "request": request,
+        values = {"status": "queued", "stage": None, "mode": mode, "request": request, "owner": current_owner(),
                   "run_id": run_id if mode in ("continue", "resume") else None, "attempt": 0,
                   "principal": principal_snapshot(), "actor": actor, "error": None, "started_at": None,
                   "finished_at": None}
@@ -1083,13 +1122,14 @@ async def state(session: AsyncSession, turn_id: str) -> dict[str, Any] | None:
     from app.db.models_chat import ChatTurnJob
 
     job = await session.get(ChatTurnJob, turn_id)
-    return None if job is None else job_view(job)
+    return None if job is None else job_view(job, late=await late_waiting(job))
 
 
-def job_view(job: Any) -> dict[str, Any]:
+def job_view(job: Any, *, late: bool | None = None) -> dict[str, Any]:
     return {"status": job.status, "stage": job.stage, "mode": job.mode, "run_id": job.run_id, "attempt": job.attempt,
             "last_seq": job.last_seq, "attempt_seq": job.attempt_seq, "error": job.error,
-            "late_review": late_pending(job.id)}
+            "late_review": (late_pending(job.id) or getattr(job, "late_review_at", None) is not None) if late is None
+            else late}
 
 
 async def stream_status(turn_id: str) -> str | None:
@@ -1100,7 +1140,7 @@ async def stream_status(turn_id: str) -> str | None:
         job = await session.get(ChatTurnJob, turn_id)
     if job is None:
         return "gone"
-    if job.status in runtime.ACTIVE or late_pending(turn_id):
+    if job.status in runtime.ACTIVE or await late_waiting(job):
         return None
     return job.status
 
@@ -1131,8 +1171,10 @@ async def forget(session: AsyncSession, conversation_id: str) -> None:
 # --------------------------------------------------------------------------
 
 
-async def startup(*, resume: bool | None = None) -> dict[str, int]:
-    """服务启动时（run_manager.setup 之后：服务重启时在跑的运行这时已经标成挂起）：
+async def startup(*, resume: bool | None = None, live: Any = None) -> dict[str, int]:
+    """服务启动时（run_manager.setup 之后：服务重启时在跑的运行这时已经标成挂起）；多进程时当班进程隔一会儿再来一次
+    （app/cluster/reaper.py），只碰属主不在了的轮次（进程没了；或者就是本进程、却不在本进程里跑），别的活着的进程在跑的一概
+    不碰。认领那一下是带条件的 UPDATE，几个进程同时接手同一轮只有一个改得动；接手的进程照下面的规矩办：
 
     - 还在建图（没有运行）的这一轮标中断：那一行记 error 和原因（build_interrupted），可以重试本轮；
     - 已经发起了运行的：resume 为真（缺省看 AGENTLAB_SCHEDULER）就接着等那次运行、照常复核收尾；为假就停着（任务记
@@ -1145,11 +1187,17 @@ async def startup(*, resume: bool | None = None) -> dict[str, int]:
     from app.db.models import Conversation, ConversationTurn
     from app.db.models_chat import ChatTurnJob
 
+    from app.cluster import claims, state
+
     resume = bool(settings.scheduler) if resume is None else resume
     counts = {"interrupted": 0, "resumed": 0, "parked": 0, "legacy": 0}
+    live = live if live is not None else await state.current(fresh=True)
+    claimed = [job_id for job_id, _ in await claims.orphans(ChatTurnJob, live, running=manager.running,
+                                                            statuses=runtime.ACTIVE)]
     async with SessionLocal() as session:
-        jobs = [j for j in (await session.execute(select(ChatTurnJob).where(
-            ChatTurnJob.status.in_(runtime.ACTIVE)))).scalars() if not manager.running(j.id)]
+        jobs = list((await session.execute(select(ChatTurnJob).where(ChatTurnJob.id.in_(claimed),
+                                                                     ChatTurnJob.status.in_(runtime.ACTIVE)))).scalars()) \
+            if claimed else []
         legacy = list((await session.execute(
             select(ConversationTurn).join(Conversation, Conversation.id == ConversationTurn.conversation_id)
             .outerjoin(ChatTurnJob, ChatTurnJob.id == ConversationTurn.id)
@@ -1174,6 +1222,18 @@ async def startup(*, resume: bool | None = None) -> dict[str, int]:
                 await session.commit()
             turn_log.notify(job.id)
             counts["parked"] += 1
+    # 晚到的复核记在库里、记它的进程却不在了：不会再回来，别让别的进程上的流一直等
+    async with SessionLocal() as session:
+        late = (await session.execute(select(ChatTurnJob.id, ChatTurnJob.owner).where(
+            ChatTurnJob.late_review_at.is_not(None)))).all()
+    gone = [turn_id for turn_id, owner in late if not live.alive(owner, local=late_pending(turn_id))]
+    if gone:
+        async with SessionLocal() as session:
+            await session.execute(update(ChatTurnJob).where(ChatTurnJob.id.in_(gone)).values(late_review_at=None)
+                                  .execution_options(synchronize_session=False))
+            await session.commit()
+        for turn_id in gone:
+            turn_log.notify(turn_id)
     for row in legacy:
         if turn_run_id(row):
             continue   # 有运行的老轮次：页面打开时请服务端接着收尾

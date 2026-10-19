@@ -404,6 +404,10 @@ async def set_embedding(
     else:
         session.add(Setting(key=emb.EMBEDDING_SETTING_KEY, value=value))
     await session.commit()
+    # 多进程：别的进程照新的设置换向量模型（不换的话它们按旧模型检索、写旧模型的向量）
+    from app.cluster import caches
+
+    await caches.broadcast("embeddings")
     return {
         "embedder": emb.embedder_id(),
         "dim": emb.embedder_dim(),

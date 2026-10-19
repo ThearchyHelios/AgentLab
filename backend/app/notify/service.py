@@ -262,7 +262,11 @@ async def _where(session: Any, run: Run | None) -> str:
 #: 邮件渠道：设置表里一行 {用户 id: 建的时间}（通知自己记的账，键的开头同 notify/digest.STATE_PREFIX，设置接口不列）。只在
 #: 第一次派到待办时建一次——本人删掉了就是不要，不再替他建回来
 MAIL_AUTO_KEY = "notify_state:mail_auto"
-_mail_auto_lock = asyncio.Lock()
+#: 先读后写那一行：跨进程的锁（app/cluster/mutex）
+def _mail_auto_lock() -> Any:
+    from app.cluster import mutex
+
+    return mutex.lock("notify-mail-auto")
 
 
 async def ensure_assignee_mail(users: list[str]) -> int:
@@ -276,7 +280,7 @@ async def ensure_assignee_mail(users: list[str]) -> int:
 
     if not users or current_mode() == "off":
         return 0
-    async with _mail_auto_lock, SessionLocal() as session:
+    async with _mail_auto_lock(), SessionLocal() as session:
         cfg = await mail.load_config(session)
         if not (cfg.enabled and cfg.default_for_assignees):
             return 0

@@ -446,9 +446,11 @@ _locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, in
     weakref.WeakKeyDictionary()
 
 
-def _lock(key: tuple[str, int]) -> asyncio.Lock:
-    group = _locks.setdefault(asyncio.get_running_loop(), {})
-    return group.setdefault(key, asyncio.Lock())
+def _lock(key: tuple[str, int]) -> Any:
+    """跨进程的锁（app/cluster/mutex）：同一（W、N）的计划和发起多进程时也串行，「已经自动发过几次」读得准。"""
+    from app.cluster import mutex
+
+    return mutex.lock(f"ledger-recall:{key[0]}:{key[1]}")
 
 
 async def launch(workflow_id: str, new_version: int, *, batch: str = "auto", actor: str | None = None) -> list[str]:
@@ -689,44 +691,52 @@ async def settle(run_id: str) -> str | None:
         return None
     _settling.add(run_id)
     try:
-        async with SessionLocal() as session:
-            run = await session.get(Run, run_id)
-            if run is None or run.origin_kind != ORIGIN or run.status not in ("succeeded", "failed", "cancelled") \
-                    or not run.manifest_hash:
-                return None
-            if await _settled(session, run_id) is not None:
-                return None
-        origin = run.origin if isinstance(run.origin, dict) else {}
-        if origin.get("probe"):
-            return await _settle_probe(run)
-        base = {"role": "recall", "workflow_id": origin.get("workflow_id"), "from_version": origin.get("from_version"),
-                "to_version": origin.get("to_version")}
-        if run.status != "succeeded":
-            await _mark(run_id, {**base, "outcome": "failed", "changed": None,
-                                 "error": str(run.error or "运行没有成功结束")[:300]})
-            return "failed"
-        meta = origin.get("metrics") or []
-        values = await card_values(run_id)
-        # 读不出召回卡、少了哪个比较的旧值或新值：两边都是空，按渲染比会被当成「没变」，给每个原答案盖上「已核对，不影响」
-        # ——照实记重算失败，原答案一个不动（收过尾就不再核对，盖错了收不回来）
-        if not meta or any(f"{side}_{m.get('k')}" not in values for m in meta for side in ("old", "new")):
-            await _mark(run_id, {**base, "outcome": "failed", "changed": None, "error": CARD_UNREADABLE})
-            return "failed"
-        results = compare(meta, values)
-        changed = any(r["changed"] for r in results)
-        answers = list(dict.fromkeys(str(u.get("run_id")) for u in origin.get("uses") or [] if u.get("run_id")))
-        tasks: list[str] = []
-        if changed:
-            tasks = await open_tasks(run, reason="caliber")
-        else:
-            for answer in answers:
-                await _mark_answer(answer, run)
-        await _mark(run_id, {**base, "outcome": "changed" if changed else "unchanged", "changed": changed,
-                             "answers": len(answers), "tasks": tasks,
-                             "metrics": [{"k": r["k"], "name": r["name"], "changed": r["changed"]} for r in results]})
-        return "changed" if changed else "unchanged"
+        # 多进程：收尾的进程（runner 收尾时）和当班进程启动时的「补上收尾」可能同时来，跨进程的锁里先看收过没有
+        from app.cluster import mutex
+
+        async with mutex.lock(f"ledger-settle:{run_id}"):
+            return await _settle(run_id)
     finally:
         _settling.discard(run_id)
+
+
+async def _settle(run_id: str) -> str | None:
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        if run is None or run.origin_kind != ORIGIN or run.status not in ("succeeded", "failed", "cancelled") \
+                or not run.manifest_hash:
+            return None
+        if await _settled(session, run_id) is not None:
+            return None
+    origin = run.origin if isinstance(run.origin, dict) else {}
+    if origin.get("probe"):
+        return await _settle_probe(run)
+    base = {"role": "recall", "workflow_id": origin.get("workflow_id"), "from_version": origin.get("from_version"),
+            "to_version": origin.get("to_version")}
+    if run.status != "succeeded":
+        await _mark(run_id, {**base, "outcome": "failed", "changed": None,
+                             "error": str(run.error or "运行没有成功结束")[:300]})
+        return "failed"
+    meta = origin.get("metrics") or []
+    values = await card_values(run_id)
+    # 读不出召回卡、少了哪个比较的旧值或新值：两边都是空，按渲染比会被当成「没变」，给每个原答案盖上「已核对，不影响」
+    # ——照实记重算失败，原答案一个不动（收过尾就不再核对，盖错了收不回来）
+    if not meta or any(f"{side}_{m.get('k')}" not in values for m in meta for side in ("old", "new")):
+        await _mark(run_id, {**base, "outcome": "failed", "changed": None, "error": CARD_UNREADABLE})
+        return "failed"
+    results = compare(meta, values)
+    changed = any(r["changed"] for r in results)
+    answers = list(dict.fromkeys(str(u.get("run_id")) for u in origin.get("uses") or [] if u.get("run_id")))
+    tasks: list[str] = []
+    if changed:
+        tasks = await open_tasks(run, reason="caliber")
+    else:
+        for answer in answers:
+            await _mark_answer(answer, run)
+    await _mark(run_id, {**base, "outcome": "changed" if changed else "unchanged", "changed": changed,
+                         "answers": len(answers), "tasks": tasks,
+                         "metrics": [{"k": r["k"], "name": r["name"], "changed": r["changed"]} for r in results]})
+    return "changed" if changed else "unchanged"
 
 
 async def _mark_answer(answer_id: str, recall_run: Run) -> None:
@@ -1299,8 +1309,10 @@ _catalog_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, 
     weakref.WeakKeyDictionary()
 
 
-def _catalog_lock(source_id: str) -> asyncio.Lock:
-    return _catalog_locks.setdefault(asyncio.get_running_loop(), {}).setdefault(source_id, asyncio.Lock())
+def _catalog_lock(source_id: str) -> Any:
+    from app.cluster import mutex
+
+    return mutex.lock(f"ledger-catalog:{source_id}")
 
 
 async def catalog_pass(source_id: str, edits: Sequence[CatalogEdit]) -> int:
@@ -1649,24 +1661,32 @@ async def consume_source_changes() -> int:
         return 0
     _consuming.add(loop)
     try:
-        count = 0
-        while True:
-            async with SessionLocal() as session:
-                since = await _cursor(session)
-                batch = await source_changes.list_changes(session, since_seq=since, limit=200)
-            if not batch:
-                return count
-            for change in batch:
-                try:
-                    if basis_kind(change) is not None:
-                        await process_change(change)
-                        count += 1
-                except Exception:  # noqa: BLE001 - 一条出错不挡后面的
-                    logger.exception("召回处理变化记录 #%s 出错", change.get("seq"))
-            async with SessionLocal() as session:
-                await _set_cursor(session, int(batch[-1]["seq"]))
+        # 多进程：几个进程的探查、剖析结束时都会来拉，游标是设置表里先读后写的一行——跨进程的锁里一份接一份，后来的接着游标往下拉
+        from app.cluster import mutex
+
+        async with mutex.lock("ledger-consume-changes"):
+            return await _consume(source_changes)
     finally:
         _consuming.discard(loop)
+
+
+async def _consume(source_changes: Any) -> int:
+    count = 0
+    while True:
+        async with SessionLocal() as session:
+            since = await _cursor(session)
+            batch = await source_changes.list_changes(session, since_seq=since, limit=200)
+        if not batch:
+            return count
+        for change in batch:
+            try:
+                if basis_kind(change) is not None:
+                    await process_change(change)
+                    count += 1
+            except Exception:  # noqa: BLE001 - 一条出错不挡后面的
+                logger.exception("召回处理变化记录 #%s 出错", change.get("seq"))
+        async with SessionLocal() as session:
+            await _set_cursor(session, int(batch[-1]["seq"]))
 
 
 # ==========================================================================

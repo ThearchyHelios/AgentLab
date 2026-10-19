@@ -637,18 +637,22 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
             await _end(websocket, run.status if run else None)
             return
 
-        # 占位期间攒下的那几条历史里也有，按 seq 滤掉，否则前端同一步收两遍
-        pump = asyncio.create_task(_pump(websocket, subscription.stream(after=last_seq), run_id))
-        try:
-            # 客户端断开时读操作会抛异常，用它来结束这条连接
-            while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            pass
-        finally:
-            pump.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pump
+        # 占位期间攒下的那几条历史里也有，按 seq 滤掉，否则前端同一步收两遍。多进程时这次运行可能在别的进程里执行：
+        # 跟随它（app/cluster/relay.py），本进程从库里按 seq 追、在本进程的总线上发布，这里收到的和在执行的进程上一样
+        from app.cluster.relay import relay
+
+        with relay.follow_run(run_id, last_seq):
+            pump = asyncio.create_task(_pump(websocket, subscription.stream(after=last_seq), run_id))
+            try:
+                # 客户端断开时读操作会抛异常，用它来结束这条连接
+                while True:
+                    await websocket.receive_text()
+            except WebSocketDisconnect:
+                pass
+            finally:
+                pump.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pump
     except WebSocketDisconnect:
         return
     except Exception:  # noqa: BLE001

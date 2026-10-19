@@ -255,6 +255,16 @@ async def introspect(session: Any, principal: Any) -> dict[str, Any]:
 _BUCKETS: dict[str, tuple[float, float]] = {}
 
 
+async def take_shared(key_id: str) -> int:
+    """同 take，多进程（PostgreSQL）时几个进程共用一个桶（记在库里，app/cluster/counters.py）：不然每个进程各有一个满桶，
+    实际的上限是进程数乘每分钟 RATE_PER_MINUTE 次。SQLite 只有一个进程，照旧用进程里的桶。"""
+    from app.cluster import counters
+
+    if counters.shared():
+        return await counters.take_token(f"key:{key_id}", per_minute=RATE_PER_MINUTE)
+    return take(key_id)
+
+
 def take(key_id: str, *, now: float | None = None) -> int:
     """这把密钥再发一个请求：放行交回 0，超了交回还要等几秒（Retry-After）。令牌桶：满桶 RATE_PER_MINUTE 个，每秒补
     RATE_PER_MINUTE / 60 个。"""

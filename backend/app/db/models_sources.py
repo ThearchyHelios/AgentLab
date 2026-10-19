@@ -22,7 +22,7 @@ from typing import Any
 from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base, PortableJSON, UTCDateTime, new_id, utcnow
+from app.db.base import Base, current_owner, PortableJSON, UTCDateTime, new_id, utcnow
 
 
 class SourceObject(Base):
@@ -100,6 +100,8 @@ class IntrospectJob(Base):
     source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"))
     # queued | running | succeeded | partial | failed | cancelled | interrupted
     status: Mapped[str] = mapped_column(String(20), default="queued")
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     #: manual 人点的 | schedule 定时维护（第 3 波）
     trigger: Mapped[str] = mapped_column(String(20), default="manual")
     #: 这次探查的是哪个 schema（"" 是默认 schema）

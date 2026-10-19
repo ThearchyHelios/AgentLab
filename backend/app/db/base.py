@@ -34,6 +34,14 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
+def current_owner() -> str:
+    """认领一行时记的属主：这个工作进程（app/cluster/identity.OWNER）。运行、问数据的一轮、各种后台任务表的 owner 列缺省取它：
+    建这一行的进程就是认领它的进程，和这一行同一个事务写下，不会有「行建好了、还没人认领」的空档（多进程，W2-b）。"""
+    from app.cluster.identity import owner
+
+    return owner()
+
+
 class UTCDateTime(TypeDecorator):
     """存 UTC、读出来也是带时区的 UTC。
 
@@ -362,6 +370,19 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("catalog_profile_tasks", "snapshot_id", "VARCHAR(32)"),
     # 第 3 波：发布时这一版引用的表的结构版本
     ("workflow_versions", "schema_versions", "JSON"),
+    # 编排完善第 2 波 W2-b（多进程协调）：认领这一行的工作进程（app/cluster）。存量行为空：升级前的进程认领的，按「属主不在了」
+    # 处理（升级要停掉全部进程再起）
+    ("runs", "owner", "VARCHAR(120)"),
+    ("chat_turn_jobs", "owner", "VARCHAR(120)"),
+    ("catalog_draft_jobs", "owner", "VARCHAR(120)"),
+    ("catalog_profile_jobs", "owner", "VARCHAR(120)"),
+    ("introspect_jobs", "owner", "VARCHAR(120)"),
+    ("eval_runs", "owner", "VARCHAR(120)"),
+    ("eval_catalog_snapshots", "owner", "VARCHAR(120)"),
+    ("documents", "owner", "VARCHAR(120)"),
+    ("publish_plans", "owner", "VARCHAR(120)"),
+    # 问数据：等不及的那次复核还在后台跑（实时流在它回来之前不关；多进程时别的进程上的流也看得到）
+    ("chat_turn_jobs", "late_review_at", "DATETIME"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。

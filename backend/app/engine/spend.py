@@ -15,6 +15,10 @@
 各管各的上限，互不挤占。三本按同一个本地日期滚动（_today）。
 
 目录里没有价格的模型估不出金额：只计次数（unpriced_calls），金额上限对它不起作用，由调用方照实说明。
+
+**多进程。** 先读后写以前只靠进程内的锁：两个进程各读到同一个余额，会一起越过上限。现在每次记账先占住设置表里这本账的那一行
+（_locked：PostgreSQL 上是行锁，SQLite 上拿到写锁），读、判断、写在同一个事务里，几个进程一个接一个；这本账还没有那一行时
+插一行，撞了说明别的进程刚插上，重来一次。进程内的锁留着：同一个进程里的几个并行核查先在本进程排队，少占库的锁。
 """
 from __future__ import annotations
 
@@ -41,6 +45,16 @@ def _lock(key: str) -> asyncio.Lock:
     if lock is None:
         lock = group[key] = asyncio.Lock()
     return lock
+
+
+async def _locked(session: Any, key: str) -> Any:
+    """占住设置表里 key 这一行再读它（见模块说明「多进程」）：没有这一行交回 None。updated_at 不动。"""
+    from sqlalchemy import update
+
+    await session.execute(update(Setting).where(Setting.key == key).values(value=Setting.value,
+                                                                           updated_at=Setting.updated_at)
+                          .execution_options(synchronize_session=False))
+    return await session.get(Setting, key, populate_existing=True)
 
 
 def _today() -> str:
@@ -80,21 +94,31 @@ class Ledger:
         limit 为 None 表示不限。估不出金额的调用（priced=False）照记次数，金额记 0，调用方应传 limit=None：
         拿 0 去比上限，等于说它不花钱。
         """
+        from sqlalchemy.exc import IntegrityError
+
         async with _lock(self.key):
-            async with SessionLocal() as session:
-                row = await session.get(Setting, self.key)
-                spend = self._spend_of(row)
-                if limit is not None and spend["usd"] + amount > limit + 1e-12:
-                    return None
-                spend["usd"] = round(spend["usd"] + amount, 8)
-                spend["calls"] += 1
-                spend["unpriced_calls"] += 0 if priced else 1
-                if row is None:
-                    session.add(Setting(key=self.key, value=spend))
-                else:
-                    row.value = spend
-                await session.commit()
-                return spend["date"]
+            for _ in range(3):
+                async with SessionLocal() as session:
+                    row = await _locked(session, self.key)
+                    spend = self._spend_of(row)
+                    if limit is not None and spend["usd"] + amount > limit + 1e-12:
+                        await session.rollback()
+                        return None
+                    spend["usd"] = round(spend["usd"] + amount, 8)
+                    spend["calls"] += 1
+                    spend["unpriced_calls"] += 0 if priced else 1
+                    if row is None:
+                        session.add(Setting(key=self.key, value=spend))
+                    else:
+                        row.value = spend
+                    try:
+                        await session.commit()
+                    except IntegrityError:
+                        # 这本账的那一行刚被别的进程插上：重来一次，这回占得住它
+                        await session.rollback()
+                        continue
+                    return spend["date"]
+            raise RuntimeError(f"记账「{self.key}」失败：设置表里这一行一直插不进去")
 
     async def settle(self, date: str, delta: float) -> None:
         """调用结束后按实际用量找补预留的差额。跨了天就不找补：预留记在前一天，今天从零算。"""
@@ -102,9 +126,10 @@ class Ledger:
             return
         async with _lock(self.key):
             async with SessionLocal() as session:
-                row = await session.get(Setting, self.key)
+                row = await _locked(session, self.key)
                 spend = self._spend_of(row)
                 if row is None or spend["date"] != date:
+                    await session.rollback()
                     return
                 spend["usd"] = max(0.0, round(spend["usd"] + delta, 8))
                 row.value = spend

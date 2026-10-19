@@ -472,7 +472,7 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
         for d in rows:
             notified.setdefault(d.fire_id, []).append({"event": d.event, "status": d.status, "at": _iso(d.created_at)})
     # 正在发起的触发：库里是占位的「未能发起」（为了进程被强杀时照实说），进程还在、只是还没发起完，按已发起给
-    launching = {f.id for f in fires if service.launching(f.id)}
+    launching = {f.id for f in fires if service.launching(f.id, f)}
     return [{
         "id": f.id,
         "fire_at": _iso(f.fire_at),

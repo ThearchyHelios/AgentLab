@@ -310,7 +310,7 @@ async def background_jobs(source_id: str, session: AsyncSession = Depends(get_se
         brief = await module.job_brief(session, job) if job is not None else None
         if job is None or brief is None:
             continue
-        ahead = runtime.lanes.ahead(row.id, job.id)
+        ahead = await runtime.lanes.ahead(row.id, job.id)
         position = len(ahead) if ahead is not None else None
         found.append((position, job.created_at, {
             "kind": kind, "id": job.id, "status": brief["status"], "total": brief.get("total", 0),

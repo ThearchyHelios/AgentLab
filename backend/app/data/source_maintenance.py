@@ -121,7 +121,7 @@ async def _entered(source_id: str, job_id: str) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + LANE_WAIT_S
     while loop.time() < deadline:
-        if runtime.lanes.ahead(source_id, job_id) is not None or not introspect_jobs.manager.running(job_id):
+        if await runtime.lanes.ahead(source_id, job_id) is not None or not introspect_jobs.manager.running(job_id):
             return
         await asyncio.sleep(0.01)
     logger.warning("定时维护：探查任务 %s 过了 %.0f 秒还没进同源队，剖析任务照建", job_id, LANE_WAIT_S)

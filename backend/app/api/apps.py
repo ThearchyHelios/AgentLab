@@ -552,6 +552,9 @@ async def publish_draft(session: AsyncSession, app: App, *, note: str, dispositi
         await session.rollback()
         raise CodedHTTPException(409, "有人刚刚发布了这个应用，请刷新后再试", PUBLISH_CONFLICT) from e
     clear_cache()
+    from app.cluster import caches
+
+    await caches.broadcast("app_pages")
     return {"ok": True, "version": number, "level": level, "spec_hash": row.spec_hash, "issues": issues}
 
 
@@ -1045,4 +1048,7 @@ async def backfill(app_id: str, view_id: str, session: AsyncSession = Depends(ge
     except LaunchRefused as e:
         raise _view_refused(e) from e
     clear_cache()
+    from app.cluster import caches
+
+    await caches.broadcast("app_pages")
     return out

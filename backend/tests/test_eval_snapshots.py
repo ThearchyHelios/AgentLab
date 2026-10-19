@@ -120,7 +120,7 @@ async def test_shadow_drafting_writes_only_the_copy(source, monkeypatch):
     assert snap.status in ("queued", "running")
     # 不占数据源的队：同一个源照样能马上起草、剖析
     await asyncio.sleep(0)
-    assert job_runtime.lanes.holders(source["id"]) == []
+    assert await job_runtime.lanes.holders(source["id"]) == []
     done = await wait_done(snap.id)
     assert done.status == "succeeded", (done.error, done.progress)
     # 线上目录一项不动

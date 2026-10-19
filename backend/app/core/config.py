@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     db_pool_timeout: int = 30
     db_pool_recycle: int = 1800
 
+    # --- 多进程（app/cluster，docs/design/orchestration-round §5 W2-b）---
+    # 几个工作进程（scripts/prod.sh、Docker 的入口按它给 uvicorn --workers）。只有应用库是 PostgreSQL 时才能大于 1：
+    # SQLite 只支持单进程，启动时拒绝（app/cluster/guard.py）
+    workers: int = 1
+    # 每个工作进程在库里登记一行：隔 worker_heartbeat_s 秒续一次租约，租约长 worker_lease_s 秒。进程没了（强杀、断电）
+    # 租约到期后，别的进程接手它认领的运行、问数据、后台任务（各按各的规矩）。租约要比心跳长几倍：库一时慢了不算进程没了
+    worker_lease_s: float = 30.0
+    worker_heartbeat_s: float = 5.0
+
     # --- 前端构建产物（生产部署用）---
     # 设了就由服务端一并托管页面（见 app/web.py），页面和接口同源、只起一个进程。
     # 不设（开发模式）什么都不变：页面由 Vite 开发服务器提供。相对路径按仓库根目录算
@@ -222,6 +231,20 @@ class Settings(BaseSettings):
             return normalize(value.strip())
         except ValueError as e:
             raise ValueError(f"{name}：{e}") from None
+
+    @field_validator("workers")
+    @classmethod
+    def _valid_workers(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("AGENTLAB_WORKERS 至少是 1")
+        return value
+
+    @field_validator("worker_heartbeat_s", "worker_lease_s")
+    @classmethod
+    def _positive_seconds(cls, value: float, info: Any) -> float:
+        if value <= 0:
+            raise ValueError(f"AGENTLAB_{(info.field_name or '').upper()} 要大于 0")
+        return value
 
     @field_validator("web_dist", mode="before")
     @classmethod

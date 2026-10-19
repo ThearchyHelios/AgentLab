@@ -24,7 +24,7 @@ from typing import Any
 from sqlalchemy import Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base, TimestampMixin, UTCDateTime, new_id
+from app.db.base import Base, current_owner, TimestampMixin, UTCDateTime, new_id
 
 #: 这一轮现在在哪一步
 STAGES = ("build", "run", "waiting", "review")
@@ -40,6 +40,8 @@ class ChatTurnJob(Base, TimestampMixin):
     conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"), index=True)
     #: queued | running | succeeded | failed | cancelled | interrupted（core/job_runtime 的状态词）
     status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     stage: Mapped[str | None] = mapped_column(String(20), default=None)
     #: ask | retry | rerun | max_steps | run | continue | resume（app/chat/job.py 的 MODES）
     mode: Mapped[str] = mapped_column(String(20), default="ask")
@@ -54,6 +56,9 @@ class ChatTurnJob(Base, TimestampMixin):
     error: Mapped[str | None] = mapped_column(Text, default=None)
     started_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
+    #: 等不及的那次复核还在后台跑（从什么时候起）：实时流在它回来之前不关。多进程时别的进程上的流也按它判断（属主不在了
+    #: 就不再等）
+    late_review_at: Mapped[datetime | None] = mapped_column(UTCDateTime, default=None)
 
 
 class ChatTurnEvent(Base):

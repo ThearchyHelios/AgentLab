@@ -243,7 +243,8 @@ async def test_background_jobs_follow_the_lane_order(client, shop):
         await session.commit()
         ids = {"introspect": intro.id, "draft": draft.id, "profile": profile.id}
     # 队里是 起草（在做）→ 剖析（排着）；探查刚建、还没进队：排在队里的后面
-    tickets = [runtime.lanes.enter(sid, "draft", ids["draft"]), runtime.lanes.enter(sid, "profile", ids["profile"])]
+    tickets = [await runtime.lanes.enter(sid, "draft", ids["draft"]),
+               await runtime.lanes.enter(sid, "profile", ids["profile"])]
     try:
         items = (await client.get(f"/api/datasources/{sid}/background-jobs")).json()["items"]
         assert [i["kind"] for i in items] == ["draft", "profile", "introspect"], items
@@ -253,7 +254,7 @@ async def test_background_jobs_follow_the_lane_order(client, shop):
         assert {"total", "done", "status"} <= set(items[0])
     finally:
         for t in tickets:
-            t.release()
+            await t.release()
         async with SessionLocal() as session:
             for model, key in ((IntrospectJob, "introspect"), (CatalogDraftJob, "draft"), (CatalogProfileJob, "profile")):
                 await session.execute(delete(model).where(model.id == ids[key]))

@@ -187,7 +187,8 @@ async def _free_name(session: AsyncSession, base: str) -> str:
 async def _register(session: AsyncSession, *, key: str, version: int, columns: list[Column], label: str,
                     app_id: str | None, blueprint_id: str | None) -> RecordsTable:
     path = store.table_path(key, version)
-    await asyncio.to_thread(store.create_file, path, columns)
+    async with store.write_lock():
+        await asyncio.to_thread(store.create_file, path, columns)
     base = f"{SOURCE_PREFIX}{re.sub(r'[^a-z0-9]', '', key.lower())[:12] or 'table'}"
     name = await _free_name(session, base if version == 1 else f"{base}_v{version}")
     source = DataSource(name=name, kind="sqlite", database=str(path), readonly=True, origin=RECORDS_ORIGIN,
@@ -371,7 +372,8 @@ async def _sync_registration(session: AsyncSession, row: RecordsTable, wanted: l
     have = columns_of(row)
     known = {h.name.lower() for h in have}
     added = [c for c in wanted if c.name.lower() not in known]
-    await asyncio.to_thread(store.add_columns, store.table_path(row.table_key, row.version), added)
+    async with store.write_lock():
+        await asyncio.to_thread(store.add_columns, store.table_path(row.table_key, row.version), added)
     by_name = {w.name.lower(): w for w in wanted}
     # 列的顺序：原有的在前（照原来的顺序），新加的在后——和文件里的列序一致。删掉的列（只在不兼容时出现）这里不会有
     kept = [h if draft else by_name.get(h.name.lower(), h) for h in have]

@@ -342,8 +342,11 @@ async def event(session: AsyncSession, blueprint: Any, op: str, principal: Any, 
 _LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def _lock(who: str | None) -> asyncio.Lock:
-    return _LOCKS.setdefault(who or "", asyncio.Lock())
+def _lock(who: str | None) -> Any:
+    """跨进程的锁（app/cluster/mutex）：查上限和发起在一起，多进程时同一个人连点两下也不会多跑一次。"""
+    from app.cluster import mutex
+
+    return mutex.lock(f"personal-refresh:{who or ''}")
 
 
 def _today_start() -> datetime:

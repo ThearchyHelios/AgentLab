@@ -211,7 +211,7 @@ async def test_stop_keeps_what_was_read_and_restart_marks_interrupted(client, bi
 
 async def test_introspect_queues_behind_profile_and_blocks_sync_writes(client, small, monkeypatch):
     sid, _ = small
-    held = runtime.lanes.enter(sid, "profile", "someone-else")
+    held = await runtime.lanes.enter(sid, "profile", "someone-else")
     try:
         job = (await client.post(f"/api/datasources/{sid}/introspect")).json()["job"]
         await asyncio.sleep(0.1)
@@ -220,7 +220,7 @@ async def test_introspect_queues_behind_profile_and_blocks_sync_writes(client, s
         r = await client.post(f"/api/datasources/{sid}/introspect")
         assert r.status_code == 409 and r.json()["code"] == "introspect_busy"
     finally:
-        held.release()
+        await held.release()
     await introspect_jobs.manager.wait(job["id"], timeout=30)
     assert (await client.get(f"/api/datasources/{sid}/introspect-jobs/{job['id']}")).json()["job"]["status"] \
         == "succeeded"
@@ -237,7 +237,8 @@ async def test_introspect_queues_behind_profile_and_blocks_sync_writes(client, s
     job = (await client.post(f"/api/datasources/{sid}/introspect")).json()["job"]
     for _ in range(100):
         await asyncio.sleep(0.02)
-        if runtime.lanes.holders(sid) and runtime.lanes.holders(sid)[0].kind == "introspect":
+        holders = await runtime.lanes.holders(sid)
+        if holders and holders[0].kind == "introspect":
             break
     r = await client.post(f"/api/datasources/{sid}/catalog/draft", json={"tables": ["alpha"]})
     assert r.status_code == 409 and r.json()["code"] == "introspect_busy" and "探查" in r.json()["detail"]
@@ -436,14 +437,14 @@ async def test_draft_and_profile_jobs_say_they_wait_for_introspect(small):
     try:
         for kind, job, waiting in (("profile", profile, catalog_profile_jobs.waiting_for),
                                    ("draft", draft, catalog_jobs.waiting_for)):
-            held = runtime.lanes.enter(sid, "introspect", "an-introspect-job")
-            mine = runtime.lanes.enter(sid, kind, job.id)
+            held = await runtime.lanes.enter(sid, "introspect", "an-introspect-job")
+            mine = await runtime.lanes.enter(sid, kind, job.id)
             try:
                 async with SessionLocal() as session:
                     assert await waiting(session, job) == "introspect", kind
             finally:
-                held.release()
-                mine.release()
+                await held.release()
+                await mine.release()
     finally:
         async with SessionLocal() as session:
             for model, job_id in ((CatalogProfileJob, profile.id), (CatalogDraftJob, draft.id)):
@@ -644,7 +645,7 @@ async def test_tables_added_while_the_job_is_queued_stay_in_scope(client, small)
     got = await so.add_to_scope(sid, ["eta"], trail=so.Trail(via=so.VIA_LOOK, actor="tester"))
     assert got.added == ["eta"]
     await _scope(client, sid, mode="rules", include=["alpha"], removed=["eta"])
-    held = runtime.lanes.enter(sid, "profile", "someone-else")
+    held = await runtime.lanes.enter(sid, "profile", "someone-else")
     try:
         job = (await client.post(f"/api/datasources/{sid}/introspect")).json()["job"]
         assert job["status"] == "queued" and job["total"] == 1
@@ -655,7 +656,7 @@ async def test_tables_added_while_the_job_is_queued_stay_in_scope(client, small)
         # 任务还没开始：范围还是上一次的（eta 还在），新加的两张已经进了表结构
         assert set((await _cache(sid))["tables"]) == {"alpha", "beta", "gamma", "eta"}
     finally:
-        held.release()
+        await held.release()
     await introspect_jobs.manager.wait(job["id"], timeout=30)
     assert (await client.get(f"/api/datasources/{sid}/introspect-jobs/{job['id']}")).json()["job"]["status"] \
         == "succeeded"

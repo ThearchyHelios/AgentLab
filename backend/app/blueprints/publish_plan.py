@@ -629,8 +629,12 @@ async def _start(session: AsyncSession, plan_id: str, *, principal: Principal, w
         # 前面建好的东西不见了：接着做会把后面几步接到一个对不上的状态上，只能重新出单（新单按现在的样子重新算）
         raise PlanRefused(409, "这份发布单前面建好的东西不见了，不能接着做：请重新出一份发布单", OBJECT_MISSING)
     # 条件更新抢到执行权：两个人同时点「确认发布」，只有先到的那个做
+    # 属主记成本进程（多进程：别的进程启动时只收拾属主不在了的那些，见 startup）
+    from app.db.base import current_owner
+
     claimed = await session.execute(update(PublishPlan).where(PublishPlan.id == row.id, PublishPlan.status == want)
-                                    .values(status="running").execution_options(synchronize_session=False))
+                                    .values(status="running", owner=current_owner())
+                                    .execution_options(synchronize_session=False))
     if claimed.rowcount != 1:
         await session.rollback()
         raise PlanRefused(409, "这份发布单刚刚被别人开始执行了，请刷新后查看进度", PLAN_STATE)
@@ -1010,15 +1014,24 @@ _STEPS = {
 # --------------------------------------------------------------------------
 
 
-async def startup() -> int:
+async def startup(*, live: Any = None) -> int:
     """上次进程没了时还在执行的发布单（status=running，执行是在请求里做的，进程一没就再没有人接着推）：改成停下，停在第一个
     还没做完的步骤上、写明执行中断，这样就能「接着做」。那一步可能已经做了一半：接着做时按图哈希复用版本、按应用 id 更新
-    同一个应用，不会另建一份工作流版本或应用。交回整理了几份。"""
+    同一个应用，不会另建一份工作流版本或应用。交回整理了几份。
+
+    只收拾属主不在了的（多进程：别的活着的进程正在执行的不碰；live 见 app/cluster/workers.Liveness，不给就当场查库）。"""
     from app.apps.audit import record
+    from app.cluster import claims, state
     from app.db.base import SessionLocal
 
+    live = live if live is not None else await state.current(fresh=True)
+    claimed = [plan_id for plan_id, _ in await claims.orphans(PublishPlan, live, running=lambda _id: False,
+                                                              statuses=("running",))]
+    if not claimed:
+        return 0
     async with SessionLocal() as session:
-        rows = list((await session.execute(select(PublishPlan).where(PublishPlan.status == "running"))).scalars())
+        rows = list((await session.execute(select(PublishPlan).where(PublishPlan.id.in_(claimed),
+                                                                     PublishPlan.status == "running"))).scalars())
         for row in rows:
             kind = next((st.get("kind") for st in row.steps or [] if st.get("status") not in ("done", "skipped")), None)
             if kind:
