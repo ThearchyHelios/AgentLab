@@ -79,9 +79,11 @@ ENTITY_SYNTAXES = frozenset({1, 2})
 #:   eid、证据下钻都不变
 #: - 3：整表标记 rows= 的结束行越界、起始行在范围内时，截到最后一行（以前整张表算解析不了）。截完照样展开成一格格的
 #:   单元格引用、按格复核，所以这一条只影响组装；复核 3 版以前的文档时，没展开的整表标记照老规矩判，不然老文档里那句
-#:   「没有第 N 行」重新解析得了，会被当成文档被改过（render_mismatch）
+#:   「没有第 N 行」重新解析得了，会被当成文档被改过（render_mismatch）。另外标识列（编码、编号、分组键，见
+#:   cell_format.plain_columns）的数不分千位：编码 1203 不写成「1,203」。真有格子因此改了写法的文档记 cell_display: 3，
+#:   引用上记 plain: true（离线核对页解析不了 SQL，照它渲染）
 #: 新组装的文档里真有格子因为显示规则改了写法时才记 cell_display（参与内容哈希），记的是渲染得出这些格子的最低一版
-#: （只有日期时间被改写的记 2：3 版只多了组装时的整表截行，不改格子的写法），没有的文档和以前一字不差。复核必须按
+#: （只有日期时间被改写的记 2：标识列没有因此改写法的，3 版的整表截行不改格子的写法），没有的文档和以前一字不差。复核必须按
 #: 文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过（render_mismatch）
 CELL_DISPLAY = 3
 CELL_DISPLAYS = frozenset({1, 2, 3})
@@ -704,10 +706,11 @@ def render_metric(metric: dict[str, Any], conv: str | None = None) -> str:
     )
 
 
-def render_cell(value: Any, conv: str | None = None, *, kind: str | None = None) -> str:
+def render_cell(value: Any, conv: str | None = None, *, kind: str | None = None, plain: bool = False) -> str:
     """查询快照里的一格渲染成字。
 
-    - 数按千分位，小数位照值本来的样子（最多 10 位、去尾零）；DECIMAL 落盘后的数字文本
+    - 数按千分位，小数位照值本来的样子（最多 10 位、去尾零）；plain 时不分组（标识列：编码 1203 不写成「1,203」，
+      哪几列是标识列见 cell_format.plain_columns）。DECIMAL 落盘后的数字文本
       （"45678.50"，小数位为 0 的 "45678"，规则见 expressions.cell_value）按数算，用 Decimal
       渲染，不经 float 丢精度
     - kind 是这一列查询时记下的类型：text 列按文本，VARCHAR 的 "2026" 不渲染成「2,026」；
@@ -715,16 +718,17 @@ def render_cell(value: Any, conv: str | None = None, *, kind: str | None = None)
     - NULL 显示「—」：这是快照里的事实（那一格就是空的），不是缺值，更不是 0
     - 文本压成一行，竖线换成 ¦：它常常落在表格里，原样的 | 会多切出一格
     """
+    fmt = "plain" if plain else DEFAULT_FORMAT
     if isinstance(value, str) and cell_value(value, kind) is not value:
         try:
-            return _render_numeric(Decimal(value.strip()), unit="", decimals=None, fmt=DEFAULT_FORMAT, conv=conv)
+            return _render_numeric(Decimal(value.strip()), unit="", decimals=None, fmt=fmt, conv=conv)
         except RenderError:
             raise
         except (ArithmeticError, ValueError) as e:
             raise RenderError(f"「{value}」无法按规则显示") from e
     if isinstance(value, (dict, list)):
         value = json.dumps(value, ensure_ascii=False, default=str)
-    return render_number(value, fmt=DEFAULT_FORMAT, conv=conv).replace("|", "¦")
+    return render_number(value, fmt=fmt, conv=conv).replace("|", "¦")
 
 
 # --------------------------------------------------------------------------
@@ -1321,6 +1325,19 @@ class _Snapshots:
         #: 这一次解析里的单元格要按哪一版显示规则才渲染得出来（有格子因为某一版的规则改了写法，就至少是那一版）：
         #: 组装时据此决定文档记不记、记哪一版 cell_display
         self.needed = 1
+        #: 每份查询快照里的标识列（cell_format.plain_columns），按快照的工件 id 记
+        self.plains: dict[str, frozenset[str]] = {}
+
+    def plain(self, artifact: Any, snapshot: Any) -> frozenset[str]:
+        """这份查询快照里按标识列显示（数不分千位）的结果列。3 版以前的显示规则没有这一条，一律分千位。"""
+        if self.display < 3 or not isinstance(snapshot, dict):
+            return frozenset()
+        key = str(artifact or "")
+        if key not in self.plains:
+            from app.engine.cell_format import plain_columns
+
+            self.plains[key] = plain_columns(snapshot, lambda a: self._fetch(a, "表结构快照")[0])
+        return self.plains[key]
 
     def shown(self, raw: Any) -> Any:
         """按显示规则要显示的原值：2 版起 ISO 日期时间的 T 换成空格。没改就是原值本身。"""
@@ -1343,6 +1360,7 @@ class _Snapshots:
             return self
         twin = _Snapshots(self.loader, entities=self.entities_on, syntax=syntax, display=display)
         twin.memo = self.memo
+        twin.plains = self.plains
         return twin
 
     def get(self, alias: str, artifact: Any) -> tuple[Any, str | None]:
@@ -1441,7 +1459,14 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
     try:
         raw, column = locate_cell(snapshot, parsed["row"], parsed["column"])
         kind = column_kind(snapshot, column)
-        rendered = render_cell(snaps.shown(raw), conv, kind=kind)
+        shown = snaps.shown(raw)
+        rendered = render_cell(shown, conv, kind=kind)
+        plain = column in snaps.plain(entry.get("artifact"), snapshot) \
+            and render_cell(shown, conv, kind=kind, plain=True) != rendered
+        if plain:
+            # 标识列（3 版起）：数不分千位。真改了写法才记——文档的 cell_display 记成 3，引用上记 plain，离线核对页照它渲染
+            rendered = render_cell(shown, conv, kind=kind, plain=True)
+            snaps.needed = max(snaps.needed, 3)
     except CellError as e:
         return _unresolved(marker, alias, "cell", f"{alias} {e}")
     except RenderError as e:
@@ -1452,6 +1477,8 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
             "rendered": rendered}
     if conv:
         cite["conv"] = conv
+    if plain:
+        cite["plain"] = True
     return cite
 
 
@@ -3636,6 +3663,7 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
         return lines
     columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]
     rows = snapshot["rows"]
+    plain = snaps.plain(entry.get("artifact"), snapshot)
     example = None
     for r, record in enumerate(rows[:shown_rows]):
         cells = []
@@ -3643,7 +3671,8 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
             try:
                 raw, _ = locate_cell(snapshot, r, c)
                 kind = column_kind(snapshot, c)
-                shown, numeric = render_cell(snaps.shown(raw), kind=kind), is_number(cell_value(raw, kind))
+                shown = render_cell(snaps.shown(raw), kind=kind, plain=c in plain)
+                numeric = is_number(cell_value(raw, kind))
             except (CellError, RenderError):
                 shown, numeric = MISSING, False
             cells.append(f"{c}={shown}")
@@ -3798,7 +3827,8 @@ def _field_prompt(path: str, value: Any, ev: dict[str, Any], aliases: dict[str, 
         if why:
             raise CellError(why)
         raw, column = locate_cell(snapshot, row, column)
-        shown = render_cell(snaps.shown(raw), kind=column_kind(snapshot, column))
+        shown = render_cell(snaps.shown(raw), kind=column_kind(snapshot, column),
+                            plain=column in snaps.plain(ev.get("artifact"), snapshot))
     except (CellError, RenderError):
         try:
             shown = render_cell(value)

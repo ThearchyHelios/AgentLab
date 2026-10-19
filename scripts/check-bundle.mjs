@@ -864,7 +864,8 @@ await section('样本页：各种形状', async () => {
     check('formats：点开换算成万的数字，引用的值、口径卡里的值照原值写，注明与按显示规则渲染的结果一致',
       detail.includes('74613.65') && detail.includes('与按显示规则渲染的结果一致') && !detail.includes('按显示规则应为'),
       detail.replace(/\s+/g, ' ').slice(0, 160))
-    const order = page.locator('button.num').filter({ hasText: '202,609,071,234,567,890' })
+    // 订单号是标识列（列名以 _no 结尾）：3 版显示规则起不分千位
+    const order = page.locator('button.num').filter({ hasText: /^202609071234567890$/ })
     detail = '找不到订单号'
     let rowCell = ''
     if (await order.count()) {
