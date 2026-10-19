@@ -58,6 +58,24 @@ def test_checkpoint_tables_do_not_clash_with_app_tables():
     assert created & set(Base.metadata.tables) == set()
 
 
+def test_no_query_compares_sorts_or_groups_a_whole_json_column():
+    """PostgreSQL 的 json 没有相等运算符：整列做 ==、!=、in_、DISTINCT、ORDER BY、GROUP BY 都会报错（SQLite 不报）。
+    按里面某个键筛选走 db/portable 的 json_eq 等。扫一遍应用代码里「模型.JSON列」后面跟着这几样的写法。"""
+    from pathlib import Path
+
+    from sqlalchemy import JSON
+
+    columns = sorted({f"{m.class_.__name__}.{a.key}" for m in Base.registry.mappers for a in m.column_attrs
+                      if isinstance(a.columns[0].type, JSON)})
+    names = "|".join(re.escape(c) for c in columns)
+    bad = re.compile(rf"(?<![\w.])({names})\b(\s*(==|!=)|\.(in_|not_in|distinct|is_distinct_from|like|contains)\()"
+                     rf"|(order_by|group_by|distinct)\([^)]*(?<![\w.])({names})\b(?!\[)")
+    app = Path(__file__).resolve().parents[1] / "app"
+    hits = [f"{path.relative_to(app)}:{i}" for path in app.rglob("*.py")
+            for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1) if bad.search(line)]
+    assert columns and hits == []
+
+
 def test_postgres_columns_are_unbounded_varchar_bigint_and_json():
     """应用库上 String(n) 建成不限长的 VARCHAR、文本列按字节比（COLLATE "C"，同 SQLite）、Integer 是 BIGINT（自增主键
     BIGSERIAL）、JSON 是 json（不是 JSONB：JSONB 会重排对象里的键）、时间是不带时区的 TIMESTAMP。SQLite 上的建表语句不变。"""
