@@ -266,10 +266,11 @@ fix_data_owner() {
   owner="$(ls -nd "$DATA_ABS" | awk '{print $3}')"
   [ "$owner" = "$uid" ] && return 0
   # 改属主前确认这确实是一个新目录或者 AgentLab 的数据目录，免得 DATA_DIR 写错改了别的东西
-  # 应用库放在 PostgreSQL 时（AGENTLAB_DATABASE_URL）数据目录里没有 agentlab.db，认 .secret_key 和 uploads/
+  # 认这三样里的一样：agentlab.db（库在 SQLite）、.secret_key（自动生成的加密密钥）、.agentlab-data（服务启动时建的标记，
+  # 库放在 PostgreSQL、密钥又由 AGENTLAB_SECRET_KEY 给时只有它）。只有 uploads/ 这类普通目录名的不认，免得 chown 错了别人的目录
   if [ -n "$(ls -A "$DATA_ABS" 2>/dev/null)" ] && [ ! -e "$DATA_ABS/agentlab.db" ] \
-     && [ ! -e "$DATA_ABS/.secret_key" ] && [ ! -d "$DATA_ABS/uploads" ]; then
-    die "DATA_DIR 指向的 $DATA_ABS 不是空目录，也不像 AgentLab 的数据目录（里面没有 agentlab.db、.secret_key、uploads）。
+     && [ ! -e "$DATA_ABS/.secret_key" ] && [ ! -e "$DATA_ABS/.agentlab-data" ]; then
+    die "DATA_DIR 指向的 $DATA_ABS 不是空目录，也不像 AgentLab 的数据目录（里面没有 agentlab.db、.secret_key、.agentlab-data）。
 为免改错别的文件的属主，请指向一个新目录，或者原来的 AgentLab 数据目录"
   fi
   say "把数据目录的属主改成容器里的用户（uid ${uid}），容器里的服务才写得进去"

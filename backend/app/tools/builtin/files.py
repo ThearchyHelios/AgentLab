@@ -75,10 +75,12 @@ async def file_write(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
         target = _resolve(args.path, ctx)
     except ValueError as e:
         return {"error": str(e)}
-    # 先写临时文件再改名（core/atomic）：同一个工作目录里正在跑的代码、另一台机器上读共享数据目录的一方，看到的要么是
-    # 旧的整份、要么是新的整份。追加也一样：读出原有的、接上新的、整份换掉
-    before = target.read_bytes() if args.append and target.is_file() else b""
-    atomic.write_bytes(target, before + args.content.encode("utf-8"))
+    # 覆盖：先写临时文件再改名（core/atomic），读的一方看到的要么是旧的整份、要么是新的整份，权限照旧。追加：原地追加写
+    # （O_APPEND），不整份重写——文件的 inode、权限不变，原有内容不动，读的一方最多看到半截新内容
+    if args.append:
+        atomic.append_bytes(target, args.content.encode("utf-8"))
+    else:
+        atomic.write_bytes(target, args.content.encode("utf-8"))
     return {"path": args.path, "bytes": target.stat().st_size, "ok": True}
 
 
