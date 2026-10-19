@@ -121,8 +121,10 @@ def spawn(coro: Coroutine[Any, Any, Any]) -> None:
 
 async def drain() -> None:
     """等后台的推送都推完（测试、关停用）。"""
-    while _background:
-        await asyncio.gather(*list(_background), return_exceptions=True)
+    from app.core.background import drain as drain_tasks
+
+    # 不写成 while _background: await gather(...)：别的事件循环上做完、还没摘掉的任务会让那样的循环空转（core/background）
+    await drain_tasks(_background)
 
 
 async def personal_url_problem(url: str) -> str | None:
