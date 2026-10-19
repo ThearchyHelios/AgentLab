@@ -886,8 +886,9 @@ async def search_index(session: AsyncSession, row: Any, query: str, *, limit: in
         return [], 0
     key = name_key(text.rsplit(".", 1)[-1])
     filt = (*_scope_filter(row.id, index_schema(row)), SourceObject.removed_at.is_(None),
+            # 名字比的是 name_key（ASCII 已转小写）；注释要不分大小写：SQLite 的 LIKE 本来就不分（ASCII），PostgreSQL 分
             or_(SourceObject.name_key.contains(key, autoescape=True),
-                SourceObject.comment.contains(text, autoescape=True)))
+                SourceObject.comment.icontains(text, autoescape=True)))
     total = int((await session.execute(select(func.count()).select_from(SourceObject).where(*filt))).scalar() or 0)
     rows = (await session.execute(
         select(SourceObject.name, SourceObject.name_key, SourceObject.kind, SourceObject.comment,
