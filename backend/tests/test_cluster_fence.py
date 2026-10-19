@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-import time
+import contextlib
 
 import pytest
 from sqlalchemy import func, select
@@ -168,3 +168,108 @@ async def test_a_repeated_seq_is_refused_by_the_database():
                          RunEvent(id=new_id(), run_id=run.id, seq=1, type="log", ts=0, data={})])
         with pytest.raises(IntegrityError):
             await session.commit()
+
+
+# ---------------- 复核 R-b9：谁会被打停、谁不会 ----------------
+
+
+async def test_only_executions_bound_to_a_generation_are_stopped_by_check():
+    """续晚之后第一个问 check() 的不一定是运行本身：没绑定世代的调用者（HTTP 处理、调度那一拍）只隔离、不抛；绑定了的抛。
+    隔离之后新身份还没登记上，新开始的执行在 ready() 上等，等不到抛 Fenced；登记上了就放行。"""
+    gate = asyncio.Event()
+    seen: list[str] = []
+
+    async def bound_writer() -> None:
+        fence.bind()
+        await gate.wait()
+        try:
+            fence.check()
+            seen.append("wrote")
+        except fence.Fenced:
+            seen.append("fenced")
+
+    task = asyncio.create_task(bound_writer())
+    await asyncio.sleep(0)
+    before = fence.generation()
+    fence.renewed(ago=lease_s() + 1)
+    fence.check()                                      # 没绑定世代：只隔离
+    assert fence.generation() == before + 1 and fence.pending()
+    gate.set()
+    await task
+    assert seen == ["fenced"], "绑定在隔离之前的那一段执行：不许再写"
+
+    with pytest.raises(fence.Fenced):
+        await fence.ready(timeout=0.1)                 # 新身份还没登记上：新开始的执行等不到就不开始
+    waiting = asyncio.create_task(fence.ready(timeout=5))
+    await asyncio.sleep(0.1)
+    assert not waiting.done()
+    fence.renewed()                                    # 登记上了
+    await asyncio.wait_for(waiting, timeout=2)
+    fence.bind()
+    fence.check()                                      # 新世代照常
+
+
+async def test_the_scheduler_loop_survives_a_fenced_tick(monkeypatch):
+    from app.scheduler import loop as sloop
+
+    calls = {"n": 0}
+
+    async def fire_due(now=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise fence.Fenced()
+        return []
+
+    monkeypatch.setattr(sloop, "fire_due", fire_due)
+    await sloop.runner.start(interval=0.02)
+    try:
+        for _ in range(200):
+            if calls["n"] >= 3:
+                break
+            await asyncio.sleep(0.02)
+        assert calls["n"] >= 3 and sloop.runner.running(), "被 Fenced 打到的那一拍之后照常往下"
+    finally:
+        await sloop.runner.stop()
+
+
+async def test_the_lease_task_keeps_going_when_registering_again_fails(monkeypatch):
+    """隔离之后重新登记：库一抖、版本守卫拦下都不让续租的任务退出，退避着重试；登记上了照常续租。"""
+    from app.cluster import identity, service as service_mod, workers
+    from app.cluster.version import VersionMismatch
+
+    monkeypatch.setattr(identity, "OWNER", identity.OWNER)    # 测试完换回原来的身份
+    monkeypatch.setattr(workers, "heartbeat_s", lambda: 0.01)
+    monkeypatch.setattr(workers, "lease_s", lambda: 5.0)
+    svc = service_mod._Service()
+    tries = {"register": 0, "renew": 0}
+
+    async def register(*, exclusive: bool = False) -> None:  # noqa: ARG001
+        tries["register"] += 1
+        if tries["register"] == 1:
+            raise VersionMismatch("库里还有版本不同的进程活着")
+        if tries["register"] == 2:
+            raise OSError("库一时连不上")
+
+    async def renew() -> bool:
+        tries["renew"] += 1
+        return True
+
+    monkeypatch.setattr(workers, "register", register)
+    monkeypatch.setattr(svc, "renew", renew)
+    old = identity.owner()
+    fence.trip("测试")
+    svc._on_fenced()
+    assert identity.owner() != old and svc.pending_since is not None
+    task = asyncio.create_task(svc._lease_loop())
+    try:
+        for _ in range(300):
+            if tries["renew"] >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert not task.done(), "续租的任务还在"
+        assert tries["register"] == 3 and svc.pending_since is None and not fence.pending()
+        assert tries["renew"] >= 2, "登记上之后照常续租"
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

@@ -543,6 +543,11 @@ class JobRun:
     async def run(self) -> None:
         from app.cluster import fence
 
+        try:
+            await fence.ready()   # 隔离之后新身份还没登记上时先等一等（cluster/fence.ready）
+        except fence.Fenced:
+            logger.error("%s %s：本进程隔离之后一直没重新登记上，不开始（由别的进程按「属主不在了」处理）", self.kind, self.job_id)
+            return
         fence.bind()
         try:
             try:

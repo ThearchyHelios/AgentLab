@@ -6,9 +6,10 @@
 
 - 续租约在单独的任务、单独的连接上做（cluster/service.py），不被同一拍别的活拖住；最近一次续上的时刻记在这里（renewed）。
 - 本进程的执行在动手写之前问一句 check()：离上次续上已经超过一个租约时长（别的进程按两个租约时长才接手，中间留着一段），或者这段
-  执行是在上一次隔离之前开始的（世代不对），就抛 Fenced——写事件、写断点、写终态、写待办和动作、发外部写入之前都问。
+  执行是在上一次隔离之前开始的（世代不对），就抛 Fenced——写事件、写断点、写终态、写待办和动作、发外部写入之前都问。只对绑定了
+  世代的执行（运行的一段执行、后台任务）抛；别的调用者问到时只隔离、不抛。
 - 一旦发现续晚了（trip）：世代加一，手上的执行全部停掉（停的时候不写终态，那些行交给接手的进程按「属主不在了」处理），换一个新的
-  身份重新登记，之后发起的照常。
+  身份重新登记；新身份登记上之前新开始的执行先等着（ready），登记上之后照常。
 
 **用哪只钟（复核 R-b7）。** 别的进程判「租约过期」用的是库的时钟（cluster/workers：续租写 lease_until = 库的 now() + 租约），
 跟各台机器的墙钟差多少无关。这边判「续晚了」用计入休眠的钟：time.monotonic() 在 macOS（mach_absolute_time）、Linux
@@ -21,6 +22,7 @@ Fenced 是 BaseException：节点、工具里常见的 except Exception 拦不�
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import sys
@@ -96,15 +98,36 @@ def bind() -> None:
 
 
 def stale() -> bool:
-    """离上次续上租约是不是已经超过一个租约时长：两只钟（计入休眠的单调钟、墙钟）里走得多的那只说了算。"""
+    """离上次续上租约是不是已经超过一个租约时长：两只钟（计入休眠的单调钟、墙钟）里走得多的那只说了算。隔离之后、新身份还没
+    登记上的那一段也算（pending）。"""
     if not _active:
         return False
     since = _since()
     if since is None:
-        return False
+        return True
     from app.cluster.workers import lease_s
 
     return max(since) > lease_s()
+
+
+def pending() -> bool:
+    """隔离过、换的新身份还没登记上。"""
+    return _active and _renewed is None
+
+
+async def ready(timeout: float | None = None) -> None:
+    """新开始的一段执行（运行、后台任务）在 bind() 之前等一等：隔离之后、新身份还没登记上时，它认领的行在别的进程眼里属主
+    不在，会被当成没人管接手（复核 R-b9）。最多等一个租约时长（timeout），等不到抛 Fenced——不开始，那几行由别的进程照「属主
+    不在了」处理（cluster/service 那边同时会放弃这个一直没登记上的身份）。"""
+    if not pending():
+        return
+    from app.cluster.workers import lease_s
+
+    deadline = _clock() + (lease_s() if timeout is None else timeout)
+    while pending():
+        if _clock() >= deadline:
+            raise Fenced()
+        await asyncio.sleep(0.05)
 
 
 def jumped() -> bool:
@@ -120,22 +143,22 @@ def jumped() -> bool:
 
 
 def fenced_here() -> bool:
-    """当前这段执行还能不能写：世代不对（隔离之前开始的）或者租约续晚了。"""
+    """当前这段执行还能不能写：世代不对（隔离之前开始的）或者租约续晚了。只说绑定了世代的执行（bind 过的）。"""
     if not _active:
         return False
     bound = _bound.get()
-    return (bound is not None and bound != _generation) or stale()
+    return bound is not None and (bound != _generation or stale())
 
 
 def check() -> None:
-    """写之前问一句：不许写就抛 Fenced（续晚了的话顺手隔离）。"""
+    """写之前问一句。续晚了就隔离（谁先问到都一样）；抛 Fenced 只对绑定了世代的执行（运行的一段执行、后台任务：bind 过的）——
+    别的调用者（HTTP 处理、调度那一拍、进程间请求）不是认领了行在跑的执行，抛给它们只会把调度循环之类的打停（复核 R-b9）。"""
     if not _active:
         return
-    if stale():
+    if _renewed is not None and stale():
         trip("执行要写的时候发现租约已经续晚了")
-        raise Fenced()
     bound = _bound.get()
-    if bound is not None and bound != _generation:
+    if bound is not None and (bound != _generation or stale()):
         raise Fenced()
 
 
@@ -162,4 +185,4 @@ def trip(why: str) -> bool:
 
 
 __all__ = ["Fenced", "SLEEP_AWARE", "activate", "bind", "check", "deactivate", "fenced_here", "generation", "jumped", "now",
-           "on_trip", "renewed", "stale", "trip"]
+           "on_trip", "pending", "ready", "renewed", "stale", "trip"]

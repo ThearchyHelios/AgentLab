@@ -794,7 +794,12 @@ class RunManager:
         # 等待从 run.interrupted 算起——以前执行一直计到 finally，收尾那一截执行和等待两边都算，
         # active + wait 比墙钟还长（机器一忙就差出几十毫秒）
         paused: float | None = None
-        # 这段执行属于现在这一世代（cluster/fence.py）：本进程隔离之后，它不再写
+        # 这段执行属于现在这一世代（cluster/fence.py）：本进程隔离之后，它不再写。隔离之后新身份还没登记上时先等一等
+        try:
+            await fence.ready()
+        except Fenced:
+            logger.error("运行 %s：本进程隔离之后一直没重新登记上，不开始执行（由别的进程按「属主不在了」处理）", run_id)
+            return
         fence.bind()
         mine = identity.owner()
         #: 被隔离了（续不上租约）：停手，不写终态（这次运行由接手的进程按「属主不在了」处理）

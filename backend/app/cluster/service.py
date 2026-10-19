@@ -65,6 +65,11 @@ class _Service:
         #: SQLite：守卫已经确认只有本进程——登记只写一次、不续租、本进程直接当班、接手只在启动时做（不为协调多写库）
         self.single = False
         self._lease_conn: Any = None
+        self.lease_wake: asyncio.Event | None = None
+        #: 隔离之后、新身份还没登记上：从什么时候起（cluster/fence.now 的读数）
+        self.pending_since: float | None = None
+        #: 隔离掉（或者一直没登记上、放弃了）的旧身份：新身份登记上之后收拾它们留下的登记、名额、请求、当班租约
+        self.retired: list[str] = []
 
     async def start(self) -> None:
         """登记、开始收发通知、起心跳。SQLite 时先取单进程的守卫（拿不到抛 guard.SingleProcessOnly）。"""
@@ -94,6 +99,7 @@ class _Service:
             await self._lead()
             fence.activate()
             fence.on_trip(self._on_fenced)
+            self.lease_wake = asyncio.Event()
             self.lease_task = asyncio.create_task(self._lease_loop(), name="agentlab-cluster-lease")
             self.task = asyncio.create_task(self._loop(), name="agentlab-cluster-heartbeat")
         logger.info("工作进程 %s 已登记（%s，租约 %g 秒、心跳 %g 秒；现在另有 %d 个进程）", identity.describe(identity.owner()),
@@ -159,27 +165,62 @@ class _Service:
         return True
 
     async def _lease_loop(self) -> None:
+        """续租约；隔离之后改成重新登记新身份。哪一下出了错（库一抖、版本守卫拦下）都不让这个任务退出——它一退，之后就再也没有
+        隔离保护了（复核 R-b9）：照实记日志，退避着重试（最长一个租约时长）。"""
+        from app.cluster import fence
+
+        delay = workers.heartbeat_s()
         while True:
-            await self.renew()
-            await asyncio.sleep(workers.heartbeat_s())
+            try:
+                if self.pending_since is not None:
+                    await self.register_again()
+                else:
+                    await self.renew()
+                delay = workers.heartbeat_s()
+            except asyncio.CancelledError:
+                raise
+            except (Exception, fence.Fenced):  # noqa: BLE001
+                delay = min(max(delay * 2, workers.heartbeat_s()), workers.lease_s())
+                logger.exception("%s出错，%g 秒后再试", "隔离之后重新登记" if self.pending_since is not None else "续租约", delay)
+            if self.lease_wake is None:
+                await asyncio.sleep(delay)
+                continue
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.lease_wake.wait(), timeout=delay)
+            self.lease_wake.clear()
 
     def _on_fenced(self) -> None:
-        """隔离了：手上的执行由各处自己停（runner、job_runtime 登记的处理），这里换身份重新登记。"""
-        asyncio.ensure_future(self._reidentify())
-
-    async def _reidentify(self) -> None:
+        """隔离了：手上的执行由各处自己停（runner、job_runtime 登记的处理）；这里马上换身份（之后新建的行记新身份），叫续租的任务
+        去登记它。"""
         from app.cluster import fence
 
         old = identity.owner()
+        self.retired.append(old)
         new = identity.regenerate()
+        self.pending_since = fence.now()
         leader.scheduler.drop()
-        try:
-            await workers.register()
-            fence.renewed()
-            logger.warning("隔离之后换了身份重新登记：%s → %s（之前认领的行由当班进程按「属主不在了」接手）",
-                           identity.describe(old), identity.describe(new))
-        except Exception:  # noqa: BLE001
-            logger.exception("隔离之后重新登记失败，下一拍再试")
+        logger.warning("隔离：换成新身份 %s（旧身份 %s），登记上之前新开始的执行先等着", new, old)
+        if self.lease_wake is not None:
+            self.lease_wake.set()
+
+    async def register_again(self) -> None:
+        """隔离之后登记新身份。一个租约时长都没登记上（库连不上、版本守卫拦着）就放弃这个身份、再换一个：这期间等不到的执行已经
+        放弃开始（fence.ready），它们的行记着这个身份——它永远不登记，别的进程就照「属主不在了」处理那几行。"""
+        from app.cluster import fence
+
+        assert self.pending_since is not None
+        if fence.now() - self.pending_since > workers.lease_s():
+            gave_up = identity.owner()
+            self.retired.append(gave_up)
+            identity.regenerate()
+            self.pending_since = fence.now()
+            logger.error("新身份 %s 一个租约时长都没登记上，放弃它、换成 %s 再试", gave_up, identity.owner())
+        await workers.register()
+        retired, self.retired = self.retired, []
+        self.pending_since = None
+        fence.renewed()
+        logger.warning("隔离之后换了身份重新登记：%s → %s（之前认领的行由当班进程按「属主不在了」接手）",
+                       "、".join(retired), identity.owner())
 
     # ---------------- 当班、心跳的其余活 ----------------
 
@@ -203,8 +244,9 @@ class _Service:
         return now_leading
 
     async def beat(self) -> None:
-        """心跳的一拍（续租约另在 _lease_loop；测试里直接调）。SQLite 只做本进程自己攒着的活。"""
-        if self.single:
+        """心跳的一拍（续租约另在 _lease_loop；测试里直接调）。SQLite 只做本进程自己攒着的活；隔离之后新身份还没登记上时也只做
+        这些（不争当班、不接手）。"""
+        if self.single or self.pending_since is not None:
             await self._own_work()
             return
         live = await workers.liveness()
@@ -254,6 +296,8 @@ class _Service:
         return out
 
     async def _loop(self) -> None:
+        from app.cluster import fence
+
         assert self.wake is not None
         while True:
             with contextlib.suppress(asyncio.TimeoutError):
@@ -263,7 +307,7 @@ class _Service:
                 await self.beat()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - 一拍出错（库一时不通）不该让心跳停下
+            except (Exception, fence.Fenced):  # noqa: BLE001 - 一拍出错（库一时不通）不该让心跳停下
                 logger.exception("心跳这一拍出错，下一拍照常进行")
 
     async def _light_loop(self) -> None:
@@ -284,6 +328,7 @@ class _Service:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
         self.task = self.lease_task = None
+        self.pending_since, self.retired = None, []
         fence.deactivate()
         with contextlib.suppress(Exception):
             await leader.scheduler.release()
