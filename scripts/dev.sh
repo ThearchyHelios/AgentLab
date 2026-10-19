@@ -71,6 +71,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "==> 后端 http://127.0.0.1:$API_PORT"
+# 开发时一个进程、改了代码自动重启（--reload 先停旧的再起新的，SQLite 的单进程守卫不会挡住它）。要试多进程用
+# scripts/prod.sh --workers N（应用库要是 PostgreSQL），或者 scripts/test-multiprocess.sh 跑多进程端到端
 (cd "$ROOT/backend" && "$PY_BIN" -m uvicorn app.main:app --host 127.0.0.1 --port "$API_PORT" --reload) &
 API_PID=$!
 

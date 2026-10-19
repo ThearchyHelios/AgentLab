@@ -98,5 +98,6 @@ LABEL org.opencontainers.image.title="AgentLab" \
       org.opencontainers.image.version="${VERSION}" \
       agentlab.microvm="${WITH_MICROVM}"
 
-# 单进程：运行管理器在进程内、数据库是 SQLite，不能开多个 worker
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 工作进程数照 AGENTLAB_WORKERS（缺省 1）。大于 1 要应用库是 PostgreSQL（AGENTLAB_DATABASE_URL）：SQLite 只支持单进程，
+# 服务启动时拒绝第二个进程（app/cluster/guard.py）。exec：uvicorn 直接收 SIGTERM，走完整的优雅退出
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers \"${AGENTLAB_WORKERS:-1}\""]

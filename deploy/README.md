@@ -101,7 +101,10 @@ docker run --rm --user 10001:10001 -v "$(pwd)/data:/data" --env-file agentlab.en
 停在审批上、中断了的运行导过去之后照样能接着跑。导完 `data/agentlab.db` 可以留着当回退：把那一行删掉、重新部署就回到 SQLite
 （导入之后在 PostgreSQL 上新产生的东西不会回来）。备份时除了数据目录，再用 `pg_dump` 备份这个库。
 
-现在仍按一台机器、一个容器部署：多台机器共用一份数据目录的限制见仓库 README「用 PostgreSQL」。
+**多进程。** 换成 PostgreSQL 之后可以在容器里起几个工作进程：`agentlab.env` 里加 `AGENTLAB_WORKERS=4`（缺省 1）再
+`./deploy.sh upgrade`。几个进程共用一个端口，各自在库里登记、续租约；一个进程没了，别的进程在租约到期后接手它留下的运行、
+问数据和后台任务（规矩见仓库 README「多进程」）。SQLite 时设大于 1 会启动失败（照实报错：SQLite 只支持单进程）。
+几台机器、几个容器指着同一个库也行，但数据目录要放在共享存储上、每台挂在同一个路径，限制见仓库 README「多进程」。
 
 ## 升级
 

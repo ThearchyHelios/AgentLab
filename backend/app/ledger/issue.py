@@ -329,10 +329,11 @@ _locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, st
 
 
 def _lock(key: tuple[str, str, int]) -> Any:
-    """跨进程的锁（app/cluster/mutex）：多进程时「有没有出具过、今天出了几次」的核对和发起照样一个接一个。"""
+    """跨进程的锁（app/cluster/mutex）：多进程时「有没有出具过、今天出了几次」的核对和发起照样一个接一个。全站一把（不按键）：
+    每日上限是全站的，按键分锁时几个不同的答案同时出具会一起越过上限；出具不频繁，发起本身只是建一条运行。"""
     from app.cluster import mutex
 
-    return mutex.lock(f"ledger-issue:{key[0]}:{key[1]}:{key[2]}")
+    return mutex.lock("ledger-issue")
 
 
 async def _hider(run_id: str) -> Any:

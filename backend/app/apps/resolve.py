@@ -388,7 +388,7 @@ _LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _lock(key: str) -> Any:
-    """按需视图的单飞锁（app/cluster/mutex，多进程之间也是一把）：同一个键正在运行的那次接上，不另发。"""
+    """按需视图的单飞锁（app/cluster/mutex，多进程之间也是一把）：按应用取，同一个键正在运行的那次接上、不另发，每日上限也数得准。"""
     from app.cluster import mutex
 
     return mutex.lock(f"app-view:{key}")
@@ -471,7 +471,8 @@ async def run_view(session: AsyncSession, *, app: Any, version: AppVersion, view
             raise FormRejected(errors)
     inputs = normalize_params(form, params)
     key = await cache_key(session, state, inputs)
-    async with _lock(key):
+    # 按应用一把锁（不按缓存键）：同一个键正在运行的那次接上不另发，每日上限的「数一数再发」几个进程、几个键之间也不越过
+    async with _lock(app.id):
         run = await _cached(session, key)
         if run is not None:
             return run, run.status == "succeeded"

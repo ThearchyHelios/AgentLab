@@ -4,25 +4,28 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-用法：./scripts/prod.sh [--host] [--port <端口>] [--build | --no-build]
+用法：./scripts/prod.sh [--host] [--port <端口>] [--workers <进程数>] [--build | --no-build]
 
   --host         监听 0.0.0.0（同一网络里的设备都能打开）。默认只听 127.0.0.1，只有本机能打开。
                  注意：AgentLab 没有登录，同一网络里打得开页面的人都能用它——跑工作流、花你配的
                  模型额度、读数据源、执行沙箱代码。只在信得过的网络里开，并配好防火墙。
   --port <端口>  监听端口。也可以用环境变量 AGENTLAB_PORT，默认 8000。
+  --workers <N>  起几个工作进程（uvicorn --workers），也可以用环境变量 AGENTLAB_WORKERS，默认 1。
+                 大于 1 要先把应用库换成 PostgreSQL（AGENTLAB_DATABASE_URL）：SQLite 只支持单进程。
   --build        不管前端产物新旧，强制重新构建。
   --no-build     跳过构建，直接用现有的 frontend/dist。
   -h, --help     显示这段说明。
 
 默认只在 frontend/dist 不存在、或者比前端源码旧的时候才构建。
 数据目录照后端配置：默认是仓库下的 data/，用环境变量 AGENTLAB_DATA_DIR 改。
-只能单进程运行：运行管理器在进程内、数据库是 SQLite，多个 worker 会互相踩。
+应用库是 SQLite（缺省）时只能单进程；换成 PostgreSQL 之后可以多进程（README「多进程」）。
 USAGE
 }
 
 # 参数先认完再干活，认不出的直接报错，免得写错的参数被悄悄忽略
 HOST="127.0.0.1"
 PORT="${AGENTLAB_PORT:-8000}"
+WORKERS="${AGENTLAB_WORKERS:-1}"
 BUILD="auto"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -31,6 +34,10 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "--port 后面要跟端口号"; echo; usage; exit 2; }
       PORT="$2"; shift ;;
     --port=*) PORT="${1#--port=}" ;;
+    --workers)
+      [ $# -ge 2 ] || { echo "--workers 后面要跟进程数"; echo; usage; exit 2; }
+      WORKERS="$2"; shift ;;
+    --workers=*) WORKERS="${1#--workers=}" ;;
     --build) BUILD="always" ;;
     --no-build) BUILD="never" ;;
     -h|--help) usage; exit 0 ;;
@@ -44,6 +51,18 @@ esac
 if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   echo "端口超出范围：$PORT"; exit 2
 fi
+case "$WORKERS" in
+  ''|*[!0-9]*) echo "进程数必须是正整数：$WORKERS"; exit 2 ;;
+esac
+if [ "$WORKERS" -lt 1 ]; then
+  echo "进程数至少是 1：$WORKERS"; exit 2
+fi
+# SQLite 只支持单进程（服务自己也会拒绝启动第二个进程，app/cluster/guard.py）：在这里先说清楚，免得 uvicorn 一遍遍重起被拒的进程
+if [ "$WORKERS" -gt 1 ] && [ -z "${AGENTLAB_DATABASE_URL:-}" ]; then
+  echo "应用库是 SQLite 时只支持单进程：要 --workers $WORKERS，先设 AGENTLAB_DATABASE_URL 换成 PostgreSQL（README「用 PostgreSQL」「多进程」）"
+  exit 2
+fi
+export AGENTLAB_WORKERS="$WORKERS"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/frontend/dist"
@@ -152,4 +171,9 @@ echo "==> 启动 $URLS"
 cd "$ROOT/backend"
 # exec：让 uvicorn 直接收 Ctrl-C / SIGTERM，一个信号就走完整的优雅退出（收尾运行、关沙箱）。
 # 要是包一层 shell 再转发，终端的 Ctrl-C 会让 uvicorn 收到两次信号，第二次直接强退、跳过收尾
+# 多进程（--workers 大于 1，PostgreSQL）：uvicorn 起几个工作进程共用这个端口，各自在库里登记、续租约（app/cluster）
+if [ "$WORKERS" -gt 1 ]; then
+  echo "==> $WORKERS 个工作进程（应用库 PostgreSQL）"
+  exec "$PY_BIN" -m uvicorn app.main:app --host "$HOST" --port "$PORT" --workers "$WORKERS"
+fi
 exec "$PY_BIN" -m uvicorn app.main:app --host "$HOST" --port "$PORT"
