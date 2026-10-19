@@ -51,8 +51,7 @@ async def _locked(session: Any, key: str) -> Any:
     """占住设置表里 key 这一行再读它（见模块说明「多进程」）：没有这一行交回 None。updated_at 不动。"""
     from sqlalchemy import update
 
-    await session.execute(update(Setting).where(Setting.key == key).values(value=Setting.value,
-                                                                           updated_at=Setting.updated_at)
+    await session.execute(update(Setting).where(Setting.key == key).values(updated_at=Setting.updated_at)
                           .execution_options(synchronize_session=False))
     return await session.get(Setting, key, populate_existing=True)
 

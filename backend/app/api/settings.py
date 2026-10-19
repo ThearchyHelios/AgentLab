@@ -134,7 +134,7 @@ def _to_out(row: Provider) -> ProviderOut:
 
 @router.get("/providers", response_model=list[ProviderOut])
 async def list_providers(session: AsyncSession = Depends(get_session)) -> list[ProviderOut]:
-    rows = (await session.execute(select(Provider).order_by(Provider.created_at))).scalars()
+    rows = (await session.execute(select(Provider).order_by(Provider.created_at, Provider.id))).scalars()
     return [_to_out(r) for r in rows]
 
 

@@ -205,6 +205,7 @@ def make_engine(url: str | None = None, *, application_name: str = APPLICATION_N
         return made
     from app.db import postgres
 
+    _require_postgres_driver("asyncpg")
     pool: dict[str, Any] = (
         {"poolclass": NullPool} if settings.db_pool_size <= 0 else {
             "pool_size": settings.db_pool_size, "max_overflow": max(settings.db_max_overflow, 0),
@@ -215,7 +216,19 @@ def make_engine(url: str | None = None, *, application_name: str = APPLICATION_N
         connect_args={"server_settings": {"application_name": application_name, "timezone": "UTC"}},
         **pool)
     postgres.install(made.sync_engine.dialect)
+    event.listen(made.sync_engine, "before_cursor_execute", postgres.strip_nul, retval=True)
     return made
+
+
+def _require_postgres_driver(*modules: str) -> None:
+    """设了 AGENTLAB_DATABASE_URL 却没装 [postgres]：说清楚要装什么，不丢一个光秃秃的 ModuleNotFoundError。"""
+    import importlib.util
+
+    missing = [m for m in modules if importlib.util.find_spec(m) is None]
+    if missing:
+        raise RuntimeError(
+            f"应用库设成了 PostgreSQL（AGENTLAB_DATABASE_URL），但没装它要的包（{'、'.join(missing)}）："
+            "pip install -e 'backend[postgres]' -c backend/requirements.lock")
 
 
 def describe_database() -> str:
@@ -364,7 +377,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("schedule_fires", "eval_run_id", "VARCHAR(32)"),
     # 编排完善（docs/design/orchestration-round/00-总方案.md §4）：定时任务的触发方式。存量行都是 cron
     ("schedules", "trigger_kind", "VARCHAR(20) DEFAULT 'cron'"),
-    ("schedules", "trigger", "JSON"),
+    # 第一版补这一列时没带缺省值：在那之前建过定时任务的库里这一列是 NULL（读时 or {} 兜着），模型是 NOT NULL。
+    # 现在带上缺省值；已经补过、留着 NULL 的由 _NOT_NULL_BACKFILLS 填上
+    ("schedules", "trigger", "JSON DEFAULT '{}'"),
     # 第 2 波：服务账号（users.kind）；剖析上传表格源时的快照
     ("users", "kind", "VARCHAR(20) DEFAULT 'person'"),
     ("catalog_profile_tasks", "snapshot_id", "VARCHAR(32)"),
@@ -400,6 +415,42 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
     # 口径账本按种类反查工件（kind=caliber_match，next-round 02 做法 2）
     ("ix_artifacts_kind", "artifacts", "kind"),
 ]
+
+
+#: 补列时没带缺省值、存量行留着 NULL 的 NOT NULL 列：每次启动按模型的缺省值填上（UPDATE … WHERE 列 IS NULL，填完再跑
+#: 什么都不改）。两种库存的才一样，导入 PostgreSQL 时这一列也不会撞 NOT NULL。以后新加的 NOT NULL 列在迁移表里一律带
+#: DEFAULT（test_db_portable 守着），就不用往这里加
+_NOT_NULL_BACKFILLS: list[tuple[str, str]] = [("schedules", "trigger")]
+
+
+def model_default(column: Any) -> tuple[bool, Any]:
+    """模型列的缺省值：(有没有, 值)。标量原样，无参的可调用（dict、list、utcnow 之类）调一次；要按执行上下文算的不算。"""
+    default = getattr(column, "default", None)
+    if default is None:
+        return False, None
+    if default.is_scalar:
+        return True, default.arg
+    if default.is_callable:
+        try:
+            return True, default.arg(None)
+        except Exception:  # noqa: BLE001 - 要读执行上下文的缺省值：这里给不出
+            return False, None
+    return False, None
+
+
+def _backfill_not_null(conn: Any, columns: dict[str, set[str]]) -> None:
+    from sqlalchemy import Table, update
+
+    for table_name, column_name in _NOT_NULL_BACKFILLS:
+        if column_name not in (columns.get(table_name) or set()):
+            continue
+        model = Base.metadata.tables[table_name].c[column_name]
+        known, value = model_default(model)
+        if not known:
+            continue
+        # 只带这一列的表：模型表上 updated_at 的 onupdate 会跟着改（这是补数据，不是改了这一行），老库也未必有那一列
+        bare = Table(table_name, MetaData(), Column(column_name, model.type))
+        conn.execute(update(bare).where(bare.c[column_name].is_(None)).values({column_name: value}))
 
 
 #: 迁移补建的唯一索引：(索引名, 表, 列, 部分索引的条件, 建之前的去重语句)。只在索引还不存在时先去重再建——存量库里可能
@@ -470,6 +521,7 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
         conn.execute(text(dedupe.format(**literals)))
         conn.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({', '.join(wanted)})"
                           + (f" WHERE {where.format(**literals)}" if where else "")))
+    _backfill_not_null(conn, columns)
 
 
 #: init_db 在 PostgreSQL 上拿的会话级咨询锁的号：几个进程同时启动时，建表和迁移一个一个来（同一个号别处别用）

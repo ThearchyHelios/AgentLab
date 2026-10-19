@@ -215,7 +215,7 @@ async def clear_scope(session: AsyncSession, scope: str) -> int:
 async def list_memories(
     session: AsyncSession, *, scope: str | None = None, limit: int = 200
 ) -> list[MemoryItem]:
-    stmt = select(MemoryItem).order_by(MemoryItem.created_at.desc()).limit(limit)
+    stmt = select(MemoryItem).order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc()).limit(limit)
     if scope:
         stmt = stmt.where(MemoryItem.scope == scope)
     return list((await session.execute(stmt)).scalars())

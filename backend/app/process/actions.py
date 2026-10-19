@@ -519,7 +519,7 @@ async def _confirm_task(session: AsyncSession, run_id: str, node_id: str) -> str
 
     return await session.scalar(select(Task.id).where(Task.run_id == run_id, Task.node_id == node_id,
                                                       Task.kind == "action_confirm")
-                                .order_by(Task.created_at.desc()).limit(1))
+                                .order_by(Task.created_at.desc(), Task.id.desc()).limit(1))
 
 
 # --------------------------------------------------------------------------

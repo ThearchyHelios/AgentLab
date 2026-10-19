@@ -52,7 +52,7 @@ async def tool_usage(
         for (rid,) in await session.execute(
             select(Run.id)
             .where(Run.workflow_id == workflow_id, counted_runs())
-            .order_by(Run.created_at.desc())
+            .order_by(Run.created_at.desc(), Run.id.desc())
             .limit(limit_runs)
         )
     ]

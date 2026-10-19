@@ -251,7 +251,8 @@ async def _started_before(hook: AppHook, idem_key: str) -> str | None:
 
     async with SessionLocal() as session:
         rows = (await session.execute(select(Run.id, Run.origin).where(
-            Run.app_id == hook.app_id, Run.origin_kind == "hook").order_by(Run.created_at.desc()).limit(500))).all()
+            Run.app_id == hook.app_id, Run.origin_kind == "hook")
+            .order_by(Run.created_at.desc(), Run.id.desc()).limit(500))).all()
     for run_id, origin in rows:
         if isinstance(origin, dict) and origin.get("hook") == hook.name and origin.get("hook_key") == idem_key:
             return run_id
@@ -267,12 +268,12 @@ async def _signal(hook: AppHook, request: HookRequest, header_key: str, *, recla
     async with SessionLocal() as session:
         task_id = await session.scalar(select(Task.id).where(
             Task.app_id == hook.app_id, Task.kind == "signal", Task.status == "pending",
-            Task.correlation_key == key).order_by(Task.created_at).limit(1))
+            Task.correlation_key == key).order_by(Task.created_at, Task.id).limit(1))
         if task_id is None and reclaimed:
             # 上一次处理到一半服务停了：在等的待办其实已经解决，交回它，不当成没人在等
             done = (await session.execute(select(Task.id, Task.run_id).where(
                 Task.app_id == hook.app_id, Task.kind == "signal", Task.status != "pending",
-                Task.correlation_key == key).order_by(Task.created_at.desc()).limit(1))).first()
+                Task.correlation_key == key).order_by(Task.created_at.desc(), Task.id.desc()).limit(1))).first()
             if done is not None:
                 return {"task_id": done[0], "run_id": done[1]}
     if task_id is None:
@@ -409,7 +410,7 @@ async def recent_receipts(session: AsyncSession, app_id: str, name: str,
                .scalars())
     rows = list((await session.execute(
         select(HookReceipt).where(HookReceipt.hook_id.in_(ids or [""]), HookReceipt.status != "signature")
-        .order_by(HookReceipt.received_at.desc()).limit(max(1, min(limit, RECEIPTS_MAX))))).scalars())
+        .order_by(HookReceipt.received_at.desc(), HookReceipt.id.desc()).limit(max(1, min(limit, RECEIPTS_MAX))))).scalars())
     return {"items": [{"idem_key": r.idem_key, "status": r.status,
                        "received_at": r.received_at.isoformat() if r.received_at else None,
                        "run_id": r.run_id, "task_id": r.task_id, "detail": r.detail} for r in rows],

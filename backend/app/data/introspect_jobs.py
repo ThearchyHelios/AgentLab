@@ -104,13 +104,13 @@ def _iso(value: Any) -> str | None:
 async def active_job(session: AsyncSession, source_id: str) -> IntrospectJob | None:
     return (await session.execute(
         select(IntrospectJob).where(IntrospectJob.source_id == source_id, IntrospectJob.status.in_(ACTIVE))
-        .order_by(IntrospectJob.created_at.desc()).limit(1))).scalar_one_or_none()
+        .order_by(IntrospectJob.created_at.desc(), IntrospectJob.id.desc()).limit(1))).scalar_one_or_none()
 
 
 async def latest_job(session: AsyncSession, source_id: str) -> IntrospectJob | None:
     return (await session.execute(
         select(IntrospectJob).where(IntrospectJob.source_id == source_id)
-        .order_by(IntrospectJob.created_at.desc()).limit(1))).scalar_one_or_none()
+        .order_by(IntrospectJob.created_at.desc(), IntrospectJob.id.desc()).limit(1))).scalar_one_or_none()
 
 
 async def load(session: AsyncSession, source_id: str, job_id: str) -> IntrospectJob | None:
@@ -437,7 +437,7 @@ async def _record_scope_changes(session: AsyncSession, row: Any, job: Introspect
             select(IntrospectJob).where(IntrospectJob.source_id == job.source_id, IntrospectJob.id != job.id,
                                         IntrospectJob.started_at.is_not(None),
                                         IntrospectJob.created_at <= job.created_at)
-            .order_by(IntrospectJob.created_at.desc()).limit(1))).scalar_one_or_none()
+            .order_by(IntrospectJob.created_at.desc(), IntrospectJob.id.desc()).limit(1))).scalar_one_or_none()
         before = (previous.scope or {}).get("rules") if previous is not None else None
         after = (job.scope or {}).get("rules")
         if isinstance(before, dict) and isinstance(after, dict) and before != after:

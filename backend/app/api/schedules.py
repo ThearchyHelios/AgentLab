@@ -467,7 +467,7 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
     if fires:
         rows = (await session.execute(
             select(WebhookDelivery).where(WebhookDelivery.fire_id.in_([f.id for f in fires]))
-            .order_by(WebhookDelivery.created_at)
+            .order_by(WebhookDelivery.created_at, WebhookDelivery.id)
         )).scalars()
         for d in rows:
             notified.setdefault(d.fire_id, []).append({"event": d.event, "status": d.status, "at": _iso(d.created_at)})
@@ -618,10 +618,10 @@ async def trigger_options(event: str | None = None, q: str | None = None, select
     async def page(model: Any, *conds: Any) -> tuple[list[Any], bool]:
         query = select(model).where(*conds)
         if words:
-            # 名字里含这几个字，不分大小写：PostgreSQL 上 LIKE 分 ASCII 大小写、SQLite 不分，一律 ilike（转义同 runs._like）
-            from app.api.runs import _like
+            # 名字里含这几个字，不分大小写：两种库同一个说法（db/portable.contains_ci，PostgreSQL 上按库的区域设置折大小写）
+            from app.db.portable import contains_ci
 
-            query = query.where(model.name.ilike(f"%{_like(words)}%", escape="\\"))
+            query = query.where(contains_ci(model.name, words))
         rows = list((await session.execute(query.order_by(model.name, model.id).limit(limit + 1))).scalars())
         more = len(rows) > limit
         rows = rows[:limit]
@@ -656,7 +656,7 @@ async def trigger_options(event: str | None = None, q: str | None = None, select
         objects, more = await makers[e]()
         entries.append({"event": e, "label": triggers.EVENT_LABEL[e], "subject_label": triggers.SUBJECT_LABEL[e],
                         "objects": objects, "more": more})
-    apps = (await session.execute(select(App.id, App.name).where(App.status != "archived").order_by(App.name))).all()
+    apps = (await session.execute(select(App.id, App.name).where(App.status != "archived").order_by(App.name, App.id))).all()
     return {
         "events": entries,
         "origins": [{"kind": k, "label": triggers.ORIGIN_LABEL[k]} for k in triggers.FORMAL_ORIGINS],
@@ -737,7 +737,7 @@ async def _preview_event(session: AsyncSession, body: dict[str, Any]) -> dict[st
 
 @router.get("")
 async def list_schedules(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    rows = list((await session.execute(select(Schedule).order_by(Schedule.created_at.desc()))).scalars())
+    rows = list((await session.execute(select(Schedule).order_by(Schedule.created_at.desc(), Schedule.id.desc()))).scalars())
     return {"items": await _schedule_outs(session, rows)}
 
 

@@ -241,7 +241,7 @@ async def schedules_for(session: Any, source_id: str) -> list[dict[str, Any]]:
 
     rows = (await session.execute(select(Schedule).where(
         Schedule.target_kind == "source_maintenance", Schedule.target_id == source_id)
-        .order_by(Schedule.created_at))).scalars()
+        .order_by(Schedule.created_at, Schedule.id))).scalars()
     return [{"id": r.id, "name": r.name, "cron": r.cron, "timezone": r.timezone, "enabled": r.enabled,
              "next_run_at": r.next_run_at.isoformat() if r.next_run_at else None} for r in rows]
 

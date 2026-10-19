@@ -533,7 +533,7 @@ async def _active_run(schedule_id: str) -> tuple[str, str, bool, bool] | None:
     async with SessionLocal() as session:
         row = (await session.execute(
             select(Run.id, Run.status).where(Run.schedule_id == schedule_id, Run.status.in_(ACTIVE_RUN))
-            .order_by(Run.created_at.desc()).limit(1))).first()
+            .order_by(Run.created_at.desc(), Run.id.desc()).limit(1))).first()
         if row is None:
             return None
         run_id, status = row

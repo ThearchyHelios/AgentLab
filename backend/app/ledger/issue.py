@@ -154,7 +154,7 @@ async def issued_runs(session: Any, run_id: str) -> list[Run]:
     （db/portable.json_eq，同 auth/keys 认幂等键的写法）。"""
     rows = (await session.execute(select(Run).where(
         Run.origin_kind == ORIGIN, json_eq(Run.origin, "source_run", run_id))
-        .order_by(Run.created_at.desc()))).scalars()
+        .order_by(Run.created_at.desc(), Run.id.desc()))).scalars()
     return list(rows)
 
 
@@ -319,7 +319,7 @@ async def _conversation_of(session: Any, run: Run) -> dict[str, str]:
     if origin.get("conversation_id") and origin.get("turn_id"):
         return {"conversation_id": str(origin["conversation_id"]), "turn_id": str(origin["turn_id"])}
     turn = (await session.execute(select(ConversationTurn).where(ConversationTurn.run_id == run.id)
-                                  .order_by(ConversationTurn.created_at.desc()))).scalars().first()
+                                  .order_by(ConversationTurn.created_at.desc(), ConversationTurn.id.desc()))).scalars().first()
     return {"conversation_id": turn.conversation_id, "turn_id": turn.id} if turn is not None else {}
 
 

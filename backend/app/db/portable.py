@@ -2,12 +2,14 @@
 
 只给应用库（agentlab.db / AGENTLAB_DATABASE_URL）用；发给业务数据源的 SQL 不走这里。
 
-**按 JSON 列里的键筛选。** SQLite 用 json_extract：取出来是 SQL 标量（字符串是文本、数字是数字、true 是 1、
-没有这个键或值为 null 是 NULL），和 Python 值比是带类型的比较（数字 3 不等于字符串 "3"）。PostgreSQL 的 JSON 列是
-存原文的 json（db/base.PortableJSON），用 -> / ->> 取，要比较的只把取出来的那一小段转成 JSONB：
+**按 JSON 列里的键筛选。** 两种库同一套语义，按 JSON 的类型比（SQLite 的 json_extract 单独用时不分：true 取出来
+是 1，和 1 比相等；PostgreSQL 的 JSON 列是存原文的 json，db/base.PortableJSON，比较时只把取出来的那一小段转成 JSONB）：
 
-- json_eq：PostgreSQL 上按 JSONB 相等比（`(col -> 'k')::jsonb = '3'::jsonb`），同样带类型，和 SQLite 一致；
-- json_text：只要文本（字符串原样、数字是它的写法），PostgreSQL 上是 ->>；
+- json_eq(列, 键, 值)：字符串只等于同样的字符串；数只等于数（1 和 1.0 相等）；True / False 只等于 JSON 的 true / false
+  （不等于 1 / 0）；None 是「没有这个键或值为 null」。只收这几种标量；
+- json_text：这个键的值当文本——字符串是它本身，数、true / false、数组、对象是它的 JSON 写法（同 PostgreSQL 的 ->>，
+  SQLite 上用 json_type 分开、非字符串取 -> 的写法），没有这个键或值为 null 是 NULL。所以数 1 的 json_text 是 '1'，
+  两种库都是；
 - json_flag：标记位「真」（true、非零的数）：没有这个键、null、false、0 都算假；
 - json_is_string：这个键的值是不是字符串（SQLite 的 json_type 叫 text，PostgreSQL 的 jsonb_typeof 叫 string）。
 
@@ -15,6 +17,11 @@
 
 **插入，撞了唯一键就什么都不做。** insert_ignore 按会话连着的库挑 sqlite / postgresql 的 insert，两边的
 on_conflict_do_nothing 是同一个接口。
+
+**不分大小写地找子串。** contains_ci：SQLite 上是 lower(列) LIKE lower(模式)（同 SQLAlchemy 的 ilike；大小写怎么折
+看 SQLite 的构建，本机 conda 的 3.53 连 É/é、全角Ａ/ａ 都认）。PostgreSQL 上应用库的文本列是 COLLATE "C"（db/postgres.py），
+列上的 ILIKE、lower() 只认 ASCII 的大小写；所以模式带 COLLATE "default"，按建库时的区域设置折大小写（en_US.UTF-8、
+C.UTF-8 都认 Unicode；建库用的是纯 C 区域的话只认 ASCII）。用户输入里的 %、_、反斜杠按字面匹配。
 
 **撞的是哪个唯一约束。** unique_violation 认 IntegrityError：SQLite 的报错是「UNIQUE constraint failed: 表.列」，
 PostgreSQL（asyncpg）的是 23505，表名、DETAIL 里的「Key (列)=」分别带着。不靠约束名（命名规则改了也认得出）。
@@ -64,12 +71,15 @@ class json_text(FunctionElement[str]):
 
 
 class _JsonEq(FunctionElement[bool]):
+    """kind 是 text / number / true / false，写进语句（语句缓存按它区分）；true / false 不用绑定参数。"""
+
     type = Boolean()
     inherit_cache = True
     name = "json_eq"
 
-    def __init__(self, column: Any, key: str, value: Any) -> None:
-        super().__init__(column, _key(key), bindparam(None, value, type_=_JsonScalar()))
+    def __init__(self, column: Any, key: str, kind: str, value: Any = None) -> None:
+        extra = [] if kind in ("true", "false") else [bindparam(None, value, type_=_JsonScalar())]
+        super().__init__(column, _key(key), literal_column(kind), *extra)
 
 
 class _JsonNull(FunctionElement[bool]):
@@ -82,10 +92,18 @@ class _JsonNull(FunctionElement[bool]):
 
 
 def json_eq(column: Any, key: str, value: Any) -> Any:
-    """JSON 列顶层键的值等于 value（带类型的比较，见模块说明）。value 为 None 时是「没有这个键或值为 null」。
+    """JSON 列顶层键的值等于 value（按 JSON 的类型比，见模块说明）。value 为 None 时是「没有这个键或值为 null」。
 
-    None 用另一个表达式：语句缓存不按绑定参数的值区分，同一个表达式不能因为值是 None 编译成两样。"""
-    return _JsonNull(column, key) if value is None else _JsonEq(column, key, value)
+    值的种类写进语句：语句缓存不按绑定参数的值区分，同一个表达式不能因为值的种类不同编译成两样。"""
+    if value is None:
+        return _JsonNull(column, key)
+    if isinstance(value, bool):
+        return _JsonEq(column, key, "true" if value else "false")
+    if isinstance(value, (int, float)):
+        return _JsonEq(column, key, "number", value)
+    if isinstance(value, str):
+        return _JsonEq(column, key, "text", value)
+    raise TypeError(f"json_eq 只比标量（字符串、数、布尔、None），不收 {type(value).__name__}")
 
 
 class json_flag(FunctionElement[bool]):
@@ -120,14 +138,23 @@ def _parts(element: Any, compiler: Any, **kw: Any) -> tuple[str, str, list[Any]]
 
 @compiles(json_text)
 def _json_text_sqlite(element: Any, compiler: Any, **kw: Any) -> str:
+    # 同 PostgreSQL 的 ->>：字符串取它本身，别的取 JSON 写法（-> 要 SQLite 3.38 以上）
     col, key, _ = _parts(element, compiler, **kw)
-    return f"json_extract({col}, '$.{key}')"
+    path = f"'$.{key}'"
+    return (f"(CASE json_type({col}, {path}) WHEN 'text' THEN json_extract({col}, {path}) WHEN 'null' THEN NULL "
+            f"ELSE ({col} -> {path}) END)")
+
+
+_SQLITE_KIND = {"text": "= 'text'", "number": "IN ('integer', 'real')", "true": "= 'true'", "false": "= 'false'"}
 
 
 @compiles(_JsonEq)
 def _json_eq_sqlite(element: Any, compiler: Any, **kw: Any) -> str:
-    col, key, (value,) = _parts(element, compiler, **kw)
-    return f"(json_extract({col}, '$.{key}') = {compiler.process(value, **kw)})"
+    col, key, (kind, *value) = _parts(element, compiler, **kw)
+    typed = f"json_type({col}, '$.{key}') {_SQLITE_KIND[kind.name]}"
+    if not value:
+        return f"({typed})"
+    return f"({typed} AND json_extract({col}, '$.{key}') = {compiler.process(value[0], **kw)})"
 
 
 @compiles(_JsonNull)
@@ -164,8 +191,10 @@ def _json_text_pg(element: Any, compiler: Any, **kw: Any) -> str:
 
 @compiles(_JsonEq, "postgresql")
 def _json_eq_pg(element: Any, compiler: Any, **kw: Any) -> str:
-    col, key, (value,) = _parts(element, compiler, **kw)
-    return f"({_got(col, key)} = CAST({compiler.process(value, **kw)} AS JSONB))"
+    # JSONB 的相等本来就按类型：'1' = '1.0'，'1' ≠ 'true'，'"1"' ≠ '1'
+    col, key, (kind, *value) = _parts(element, compiler, **kw)
+    right = f"'{kind.name}'::jsonb" if not value else f"CAST({compiler.process(value[0], **kw)} AS JSONB)"
+    return f"({_got(col, key)} = {right})"
 
 
 @compiles(_JsonNull, "postgresql")
@@ -185,6 +214,38 @@ def _json_flag_pg(element: Any, compiler: Any, **kw: Any) -> str:
 def _json_is_string_pg(element: Any, compiler: Any, **kw: Any) -> str:
     col, key, _ = _parts(element, compiler, **kw)
     return f"(jsonb_typeof({_got(col, key)}) = 'string')"
+
+
+# ---- 不分大小写的子串 ----
+
+
+def _escape_like(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+class _ContainsCI(FunctionElement[bool]):
+    type = Boolean()
+    inherit_cache = True
+    name = "contains_ci"
+
+
+def contains_ci(column: Any, text: str) -> Any:
+    """列里含有 text，不分大小写（见模块说明）。"""
+    return _ContainsCI(column, bindparam(None, f"%{_escape_like(text)}%", type_=String()))
+
+
+@compiles(_ContainsCI)
+def _contains_ci_sqlite(element: Any, compiler: Any, **kw: Any) -> str:
+    column, pattern = list(element.clauses)
+    return (f"(lower({compiler.process(column, **kw)}) LIKE lower({compiler.process(pattern, **kw)}) "
+            "ESCAPE '\\')")
+
+
+@compiles(_ContainsCI, "postgresql")
+def _contains_ci_pg(element: Any, compiler: Any, **kw: Any) -> str:
+    column, pattern = list(element.clauses)
+    return (f"({compiler.process(column, **kw)} ILIKE ({compiler.process(pattern, **kw)} COLLATE \"default\") "
+            "ESCAPE '\\')")
 
 
 # ---- 插入，撞了唯一键就跳过 ----

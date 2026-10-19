@@ -193,7 +193,7 @@ class CaliberKind:
         from app.db.models import Workflow
 
         items: list[CaliberView] = []
-        for wf in (await session.execute(select(Workflow).order_by(Workflow.name))).scalars().all():
+        for wf in (await session.execute(select(Workflow).order_by(Workflow.name, Workflow.id))).scalars().all():
             latest = await app_versions.latest_published(session, wf.id)
             if latest is not None:
                 items += views_of(wf.id, wf.name, latest)

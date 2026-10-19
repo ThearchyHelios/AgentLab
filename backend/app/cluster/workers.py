@@ -135,7 +135,7 @@ async def listing() -> list[dict[str, Any]]:
 
     now = utcnow()
     async with SessionLocal() as session:
-        rows = (await session.execute(select(ClusterWorker).order_by(ClusterWorker.started_at))).scalars().all()
+        rows = (await session.execute(select(ClusterWorker).order_by(ClusterWorker.started_at, ClusterWorker.id))).scalars().all()
     return [{"id": r.id, "host": r.host, "pid": r.pid, "alive": r.lease_until > now, "me": r.id == identity.owner(),
              "started_at": r.started_at.isoformat() if r.started_at else None,
              "heartbeat_at": r.heartbeat_at.isoformat() if r.heartbeat_at else None} for r in rows]

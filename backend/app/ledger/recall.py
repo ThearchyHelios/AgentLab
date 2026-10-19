@@ -231,7 +231,7 @@ async def recall_runs(session: Any, workflow_id: str, new_version: int | None = 
                              json_eq(Run.origin, "workflow_id", workflow_id), not_(json_flag(Run.origin, "probe")))
     if new_version is not None:
         stmt = stmt.where(json_eq(Run.origin, "to_version", int(new_version)))
-    return list((await session.execute(stmt.order_by(Run.created_at.desc()))).scalars())
+    return list((await session.execute(stmt.order_by(Run.created_at.desc(), Run.id.desc()))).scalars())
 
 
 async def build_plan(session: Any, workflow_id: str, new_version: int) -> Plan:
@@ -1546,7 +1546,7 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
                 continue
             latest = (await session.execute(select(Run.input).where(
                 Run.workflow_id == caliber.workflow_id, Run.version == caliber.version, Run.run_class == "formal",
-                Run.status == "succeeded").order_by(Run.finished_at.desc()).limit(1))).scalar_one_or_none()
+                Run.status == "succeeded").order_by(Run.finished_at.desc(), Run.id.desc()).limit(1))).scalar_one_or_none()
             inputs_from = "formal" if latest else "defaults"
             if not latest:
                 # 这一版还没有正式运行：退回最近一次等价于它的问数回答绑定出的参数，再没有才只用入口的缺省值

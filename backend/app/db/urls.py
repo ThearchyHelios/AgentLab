@@ -15,6 +15,13 @@ _CHECKPOINT_SCHEMES = {"postgresql", "postgres", "postgresql+psycopg", "postgres
 
 #: asyncpg 和 libpq 对 SSL 的参数名不一样：asyncpg 是 ssl=require，libpq 是 sslmode=require（取值同一套）
 _ASYNCPG_TO_LIBPQ = {"ssl": "sslmode"}
+#: libpq 写法的 SSL 证书参数：asyncpg 不收这几个连接参数（SQLAlchemy 原样交过去就是 TypeError），改用同名的环境变量
+_LIBPQ_SSL_FILES = {"sslrootcert": "PGSSLROOTCERT", "sslcert": "PGSSLCERT", "sslkey": "PGSSLKEY",
+                    "sslcrl": "PGSSLCRL", "sslpassword": "PGSSLPASSWORD"}
+_SSL_MODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+#: 应用库地址里认的参数。SQLAlchemy 把地址里的参数原样交给 asyncpg.connect，它不认的（application_name、connect_timeout
+#: 这类 libpq 写法）连的时候才报 TypeError；这里在启动时就说清楚
+_APP_PARAMS = {"ssl", "prepared_statement_cache_size", "target_session_attrs", "async_fallback"}
 #: 只给 SQLAlchemy / asyncpg 看的参数，libpq 不认（psycopg 连的时候会报「invalid connection option」）
 _ASYNCPG_ONLY = {"prepared_statement_cache_size", "prepared_statement_name_func", "command_timeout", "async_fallback"}
 
@@ -32,9 +39,26 @@ def _parse(raw: str, schemes: set[str], example: str) -> URL:
 
 
 def normalize_database_url(raw: str) -> str:
-    """AGENTLAB_DATABASE_URL → postgresql+asyncpg://…（密码原样保留）。认不出的写法抛 ValueError。"""
+    """AGENTLAB_DATABASE_URL → postgresql+asyncpg://…（密码原样保留）。认不出的写法抛 ValueError。
+
+    SSL：libpq 的 sslmode= 换成 asyncpg 的 ssl=（取值同一套：disable / allow / prefer / require / verify-ca / verify-full）；
+    证书文件（sslrootcert 之类）asyncpg 不收连接参数，要用 PGSSLROOTCERT 等环境变量（asyncpg 和断点库的 libpq 都认）。"""
     url = _parse(raw, _APP_SCHEMES, "postgresql+asyncpg://用户:密码@主机:5432/库名")
-    return url.set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
+    query = dict(url.query)
+    if files := [k for k in query if k in _LIBPQ_SSL_FILES]:
+        raise ValueError("地址里不能写 " + "、".join(files) + "：asyncpg 不收这几个参数，改设环境变量 "
+                         + "、".join(_LIBPQ_SSL_FILES[k] for k in files))
+    if "sslmode" in query:
+        if "ssl" in query:
+            raise ValueError("ssl= 和 sslmode= 只写一个")
+        mode = str(query.pop("sslmode"))
+        if mode not in _SSL_MODES:
+            raise ValueError(f"认不出 sslmode={mode}（可选 {' / '.join(sorted(_SSL_MODES))}）")
+        query["ssl"] = mode
+    if other := sorted(k for k in query if k not in _APP_PARAMS):
+        raise ValueError("地址里的参数 " + "、".join(other) + " 不认（asyncpg 不收）；能写的只有 "
+                         + "、".join(sorted(_APP_PARAMS | {"sslmode"})))
+    return url.set(drivername="postgresql+asyncpg", query=query).render_as_string(hide_password=False)
 
 
 def normalize_checkpoint_url(raw: str) -> str:

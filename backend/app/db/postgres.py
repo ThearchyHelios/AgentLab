@@ -12,13 +12,17 @@ VARCHAR(n) 超长直接报错、INTEGER 只有 32 位。模型里的 String(n) �
 **文本怎么比大小、怎么排序。** SQLite 缺省按字节比（BINARY）；PostgreSQL 按建库时的区域设置（常见的 en_US.UTF-8 不分
 大小写地先比字母、忽略标点），同一列排出来的先后、`key < '…'` 这种比较的结果都会变。应用库上的文本列建表时一律带
 COLLATE "C"（按字节比），和 SQLite 一致，不看建库时选了什么区域；LIKE 'xx%' 这种前缀匹配也因此用得上普通索引。
-ILIKE、lower() 照旧按库的字符集分大小写。
+代价是列上的 ILIKE、lower() 也按 C 的规则，只认 ASCII 的大小写（É/é、全角Ａ/ａ 不认）：要不分大小写地找，用
+db/portable.contains_ci，模式带 COLLATE "default"，按建库时的区域设置折大小写。
 
 **ORDER BY 里 NULL 的位置。** SQLite 升序 NULL 在前、降序 NULL 在后，PostgreSQL 正好相反。应用里两百多处排序，
 可空的列（开始时间、到期时间、发布时间……）排出来的先后要和 SQLite 一致：可空列上没写 nulls_first / nulls_last
 的 ASC 补 NULLS FIRST、DESC 补 NULLS LAST，ORDER BY 里直接写列名（隐含 ASC）的同样补上。不可空的列不动——
-补了会让索引用不上，又没有 NULL 可排。窗口函数 OVER (ORDER BY …) 里同样补。原生 text() 里写的 ORDER BY 不经过
-这里，要自己写明（db/base 的去重语句里就写了）。
+补了会让索引用不上，又没有 NULL 可排。窗口函数 OVER (ORDER BY …) 里同样补。
+
+只认直接写的列（Column，含它的 asc() / desc()）。这几种不补，两种库排出来的先后可能不同，要紧的地方自己写明
+nulls_first / nulls_last：label 出来的聚合（max(...) 之类）、coalesce / case 这类表达式、外连接进来的表上的列（模型里
+不可空，外连接没连上时却是 NULL）、原生 text() 里的 ORDER BY（db/base 的去重语句里写明了）。
 """
 
 from __future__ import annotations
@@ -81,6 +85,33 @@ class AppCompiler(PGCompiler_asyncpg):
         if not explicit and modifier in (operators.asc_op, operators.desc_op) and _nullable(unary.element):
             text += " NULLS FIRST" if modifier is operators.asc_op else " NULLS LAST"
         return text
+
+
+def _has_nul(value: Any) -> bool:
+    return isinstance(value, str) and "\x00" in value
+
+
+def _clean_row(params: Any) -> Any:
+    if isinstance(params, dict):
+        return {k: v.replace("\x00", "") if _has_nul(v) else v for k, v in params.items()} \
+            if any(_has_nul(v) for v in params.values()) else params
+    if isinstance(params, (list, tuple)) and any(_has_nul(v) for v in params):
+        return type(params)(v.replace("\x00", "") if _has_nul(v) else v for v in params)
+    return params
+
+
+def strip_nul(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any,
+              executemany: bool) -> tuple[str, Any]:
+    """写进 PostgreSQL 之前去掉文本参数里的 NUL 字符（before_cursor_execute，retval=True）。
+
+    PostgreSQL 的 text / varchar 不收 \\x00（报 invalid byte sequence），SQLite 照存：一段带 NUL 的模型输出、一个从二进制
+    文件里粘出来的问题，在 SQLite 上写得进去，在 PostgreSQL 上整条写入失败。所以和 JSON 列（db/base.pg_json_dumps）一样
+    去掉。只看参数里的字符串，bytes（LargeBinary）不动；没有 NUL 的参数原样交回，不多一次拷贝。"""
+    if executemany:
+        if any(_clean_row(row) is not row for row in parameters):
+            return statement, [_clean_row(row) for row in parameters]
+        return statement, parameters
+    return statement, _clean_row(parameters)
 
 
 def install(dialect: Any) -> None:

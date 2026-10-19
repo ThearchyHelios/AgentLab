@@ -31,6 +31,10 @@ def sanitize_session(session_id: str | None) -> str:
     return safe[:_SESSION_MAX] or "default"
 
 
+#: 数据目录里的标记文件（Settings.ensure_dirs 建，deploy/deploy.sh 认）
+DATA_DIR_MARKER = ".agentlab-data"
+
+
 class Settings(BaseSettings):
     """全局配置。所有项都可以用 AGENTLAB_ 前缀的环境变量覆盖。"""
 
@@ -327,6 +331,16 @@ class Settings(BaseSettings):
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.workspace_dir, self.uploads_dir):
             d.mkdir(parents=True, exist_ok=True)
+        # 认得出「这是 AgentLab 的数据目录」的标记：应用库放在 PostgreSQL 时这里没有 agentlab.db，设了 AGENTLAB_SECRET_KEY
+        # 时也没有 .secret_key。deploy.sh 改属主前按它认，免得 DATA_DIR 写错把别人的目录 chown 了。只建一次，不覆盖
+        marker = self.data_dir / DATA_DIR_MARKER
+        if not marker.exists():
+            from app.core import atomic
+
+            try:
+                atomic.create_text(marker, "AgentLab 的数据目录（deploy.sh 按这个文件认，别删）\n")
+            except OSError:
+                pass
 
 
 @lru_cache

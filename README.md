@@ -1042,16 +1042,30 @@ AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agen
 
 - 要 `[postgres]` 额外依赖（`environment.yml`、Docker 镜像都已带上）；库要先建好（`CREATE DATABASE agentlab`），
   表由服务启动时建，老版本建的库启动时补列补索引，同 SQLite。启动日志第一句写用的是哪种库、哪台主机哪个库（不写密码）。
+- 没装 `[postgres]` 就设了这一项，启动时直接报要装什么（`pip install -e 'backend[postgres]' -c backend/requirements.lock`）。
+- SSL：地址后加 `?sslmode=require`（或 `verify-ca`、`verify-full`；asyncpg 的写法 `?ssl=require` 也认），启动时换成 asyncpg
+  认的参数。证书文件不写在地址里（asyncpg 不收 `sslrootcert` 这类参数，写了启动就报错），设环境变量 `PGSSLROOTCERT`、
+  `PGSSLCERT`、`PGSSLKEY`——应用库的 asyncpg 和断点库的 libpq 都认。地址里别的 libpq 参数（`application_name`、
+  `connect_timeout` 之类）asyncpg 也不收，同样启动时报出来。
 - 断点（LangGraph 的 checkpoints、checkpoint_blobs、checkpoint_writes、checkpoint_migrations 四张表，不和应用的表重名）
-  缺省放在同一个库；要放别处设 `AGENTLAB_CHECKPOINT_URL=postgresql://…`。
+  缺省放在同一个库；要放别处设 `AGENTLAB_CHECKPOINT_URL=postgresql://…`（这一项是 libpq 的写法，`sslrootcert` 等可以直接写）。
 - 连接池：每个进程常驻 `AGENTLAB_DB_POOL_SIZE`（缺省 10）条、高峰再多开 `AGENTLAB_DB_MAX_OVERFLOW`（缺省 20）条，取连接前探活，
   30 分钟换一次；断点库另有一个小池子。前面有 PgBouncer（事务模式）时：`AGENTLAB_DB_POOL_SIZE` 设成 0（不用连接池）、
   地址后加 `?prepared_statement_cache_size=0`；断点库用预备语句，要 PgBouncer 1.21 以上开 `max_prepared_statements`，
   或者用 `AGENTLAB_CHECKPOINT_URL` 让它直连 PostgreSQL。
+- 连接数的账：每个进程最多 `AGENTLAB_DB_POOL_SIZE + AGENTLAB_DB_MAX_OVERFLOW`（缺省 10 + 20 = 30）条应用库连接，断点库的池子
+  最多 `min(AGENTLAB_MAX_CONCURRENT_RUNS, 20)` 条（至少 4，缺省 20），合起来一个进程最多 50 条；导入命令另占几条。PostgreSQL
+  缺省 `max_connections=100`，还要留几条给 `psql`、备份和超级用户（`superuser_reserved_connections` 缺省 3）：一个进程够用，
+  起几个进程就是几倍——要么把 `max_connections` 调大（约「进程数 × 50 + 20」），要么调小两边的池子（比如 POOL_SIZE=5、
+  MAX_OVERFLOW=10、MAX_CONCURRENT_RUNS=10，一个进程最多 25 条），要么前面放 PgBouncer。
 - 和 SQLite 上的行为一致：字符串列不限长（SQLite 本来就不查长度，模型里写的长度只是示意）、文本按字节比大小和排序
   （列上带 COLLATE "C"，同 SQLite，不看建库时选的区域设置）、整数列是 BIGINT、JSON 列存原文（PostgreSQL 的 json，不是 JSONB：
-  JSONB 会重排对象里的键）、时间存不带时区的 UTC、排序时可空列的 NULL 照 SQLite 的位置（升序在前、降序在后）。两处 SQLite 照存而 PostgreSQL 不收的值会被换掉：JSON 里的 NaN / Infinity 写成 null，字符串里的
-  NUL 字符去掉。
+  JSONB 会重排对象里的键）、时间存不带时区的 UTC、排序时可空列的 NULL 照 SQLite 的位置（升序在前、降序在后；只管直接按列
+  排的，按聚合、coalesce 之类的表达式排的不管，列表都另带了 id 之类的决胜键，并列时两种库排出来一样）、按 JSON 里的键筛选
+  按 JSON 的类型比（true 不等于 1）。两处 SQLite 照存而 PostgreSQL 不收的值会被换掉：JSON 里的 NaN / Infinity 写成 null，
+  文本（JSON 里的、普通文本列里的）中的 NUL 字符去掉。
+- 不分大小写的搜索（运行列表按名字、对象索引按注释）：文本列是 COLLATE "C"，列上的 ILIKE 只认 ASCII 的大小写，所以按建库时的
+  区域设置折大小写——建库用 `en_US.UTF-8`、`C.UTF-8` 这类区域，É/é、全角Ａ/ａ 都认；用纯 `C` 区域建的库只认 ASCII。
 - `AGENTLAB_DATA_DIR` 照旧要设：工件、上传表格的版本库、原件、附件、记录表、沙箱工作区、`.secret_key` 都还是文件。
 
 **从 SQLite 搬过来。** `python -m app.db copy-to-postgres` 把数据目录里的 `agentlab.db` 和 `checkpoints.db` 导进 PostgreSQL，
@@ -1071,12 +1085,18 @@ cd backend && python -m app.db copy-to-postgres ../data postgresql+asyncpg://age
   空间，缺省系统临时目录）。读的是 SQLite 备份接口拷出的一份快照，在快照上先补到当前的表结构，来源的内容不改。
 - 重跑是幂等的：目标上已有同一主键（或撞了别的唯一约束）的行一律不动，只补上还没有的，不重复、也不覆盖——所以导入之后又在
   SQLite 上改过的行，重跑不会带过去；要整份重来就清空目标库再导。断点同理，已有的不重写。
-- 能查到的只有上面两样：服务连着别的数据目录、另一台机器上的服务连着目标库，查不出来，要自己保证。来源旁边的 -wal 是上次
-  强杀留下的，确认服务已停后加 `--assume-stopped`。
+- 能查到的只有上面两样：服务连着别的数据目录、另一台机器上的服务连着目标库，查不出来，要自己保证。服务正常停下时会关掉
+  所有连接、-wal 随之消失；还在的是上次强杀留下的，确认服务已停后加 `--assume-stopped`。
+- 老库里 SQLite 存得下、PostgreSQL 不收的会先在快照上处理、在报告里照实列出：老版本补列时没带缺省值、留着 NULL 的 NOT NULL 列
+  填成模型的缺省值（启动时的迁移在 SQLite 上也这么填，两边存的一样）；**孤儿行**——外键指向已经不在的行（SQLite 当时没强制
+  外键留下的）——外键是 SET NULL 的置空，别的（CASCADE、不可空）不导入，按表列出条数，不算核对失败（父行被删时它们本来就该
+  跟着删）。自增主键的序列接在 SQLite 用过的最大号后面（删过的号不复用）。
 - 导完 `agentlab.db` 留在数据目录里也没关系（可以当回退用）：它照样算 AgentLab 自己的文件，不能登记成数据源。
 
 **备份。** PostgreSQL 用 `pg_dump`（应用表和断点在同一个库里就一次带上），数据目录照旧整份拷。两样最好在停服务时一起做；
-不停服务的话先 dump 库、再拷数据目录：工件、原件按内容寻址、只增不改，库里引用到的文件拷数据目录时都在。
+不停服务的话先 dump 库、再拷数据目录：工件、原件按内容寻址、只增不改，库里引用到的文件拷数据目录时都在。例外是填报的记录表
+`records/*.db`：SQLite 文件、原地追加写，开着服务直接拷可能拷到写了一半的——要么停服务拷，要么一个个用 SQLite 的备份接口拷
+（`sqlite3 data/records/x.v1.db ".backup /备份目录/x.v1.db"`）。
 
 **多台机器**见下一节[多进程](#多进程)。
 

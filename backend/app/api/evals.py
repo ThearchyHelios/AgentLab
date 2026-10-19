@@ -285,7 +285,7 @@ async def _overview(session: AsyncSession, suite_ids: list[str]) -> dict[str, di
                                  for r in reversed(same)]
     schedules = (await session.execute(select(Schedule).where(
         Schedule.target_kind == "eval_suite", Schedule.target_id.in_(suite_ids))
-        .order_by(Schedule.created_at))).scalars()
+        .order_by(Schedule.created_at, Schedule.id))).scalars()
     for row in schedules:
         try:
             text = cron.describe(row.cron, row.timezone)
@@ -299,7 +299,7 @@ async def _overview(session: AsyncSession, suite_ids: list[str]) -> dict[str, di
 @router.get("/suites")
 async def list_suites(archived: bool = False, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """题集（归档的不列，archived=true 时一起列）。每个题集另带 latest、trend、schedules（_overview）。"""
-    query = select(EvalSuite).order_by(EvalSuite.updated_at.desc())
+    query = select(EvalSuite).order_by(EvalSuite.updated_at.desc(), EvalSuite.id.desc())
     if not archived:
         query = query.where(EvalSuite.archived.is_(False))
     rows = list((await session.execute(query)).scalars())
@@ -457,7 +457,7 @@ async def preview_sql(suite_id: str, request: Request, session: AsyncSession = D
     async with SessionLocal() as read:
         refs = (await read.execute(select(Artifact.id).where(
             Artifact.run_id == outcome.run_ids[0], Artifact.kind == "query_snapshot",
-            Artifact.node_id == gold_rules.QUERY_NODE).order_by(Artifact.created_at.desc()))).scalars().all()
+            Artifact.node_id == gold_rules.QUERY_NODE).order_by(Artifact.created_at.desc(), Artifact.id.desc()))).scalars().all()
     snapshot = None
     for ref in refs:
         try:
@@ -537,7 +537,7 @@ async def _run_queries(session: AsyncSession, run_id: str) -> list[dict[str, Any
     from app.db.models import Artifact
 
     rows = (await session.execute(select(Artifact).where(Artifact.run_id == run_id, Artifact.kind == QUERY_SNAPSHOT_KIND)
-                                  .order_by(Artifact.created_at))).scalars().all()
+                                  .order_by(Artifact.created_at, Artifact.id))).scalars().all()
     out = []
     for ref in rows:
         try:
@@ -780,7 +780,8 @@ def _snapshot_error(e: snapshots.SnapshotInvalid) -> CodedHTTPException:
 
 @router.get("/catalog-snapshots")
 async def list_snapshots(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    rows = list((await session.execute(select(EvalCatalogSnapshot).order_by(EvalCatalogSnapshot.created_at.desc())
+    rows = list((await session.execute(select(EvalCatalogSnapshot)
+                                       .order_by(EvalCatalogSnapshot.created_at.desc(), EvalCatalogSnapshot.id.desc())
                                        .limit(200))).scalars())
     await snapshots.reconcile_stale(session, rows)
     return {"snapshots": [snapshots.snapshot_out(r) for r in rows]}
@@ -976,7 +977,8 @@ async def list_evaluations(suite_id: str, limit: int = 50, session: AsyncSession
 
     await _suite(session, suite_id)
     rows = list((await session.execute(select(EvalRun).where(EvalRun.suite_id == suite_id)
-                                       .order_by(EvalRun.created_at.desc()).limit(max(1, min(limit, 200))))).scalars())
+                                       .order_by(EvalRun.created_at.desc(), EvalRun.id.desc())
+                                       .limit(max(1, min(limit, 200))))).scalars())
     await runner.reconcile_stale(session, rows)
     return {"evaluations": [_evaluation_out(r) for r in rows]}
 
@@ -1185,7 +1187,7 @@ async def get_pair(pair_id: str, session: AsyncSession = Depends(get_session)) -
     from app.eval import compare, runner
 
     rows = list((await session.execute(select(EvalRun).where(EvalRun.pair_id == pair_id)
-                                       .order_by(EvalRun.created_at))).scalars())
+                                       .order_by(EvalRun.created_at, EvalRun.id))).scalars())
     if not rows:
         raise CodedHTTPException(404, "这次 A/B 不存在", PAIR_NOT_FOUND)
     await runner.reconcile_stale(session, rows)

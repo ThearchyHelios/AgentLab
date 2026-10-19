@@ -505,7 +505,7 @@ async def observed_facts(session: AsyncSession, source_id: str,
         query = query.where(TableObservation.table_name.in_(wanted))
     out: dict[str, dict[str, Any]] = {}
     seen: set[tuple[str, str, str]] = set()
-    for r in (await session.execute(query.order_by(TableObservation.at.desc()))).scalars():
+    for r in (await session.execute(query.order_by(TableObservation.at.desc(), TableObservation.id.desc()))).scalars():
         key = (r.table_name, r.kind, r.column_name)
         if key in seen:
             continue

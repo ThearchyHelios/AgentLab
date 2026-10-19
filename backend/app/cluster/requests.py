@@ -69,7 +69,7 @@ async def _drain() -> int:
     me = identity.owner()
     async with SessionLocal() as session:
         rows = list((await session.execute(select(ClusterRequest).where(ClusterRequest.owner == me)
-                                           .order_by(ClusterRequest.created_at))).scalars())
+                                           .order_by(ClusterRequest.created_at, ClusterRequest.id))).scalars())
         if not rows:
             return 0
         await session.execute(delete(ClusterRequest).where(ClusterRequest.id.in_([r.id for r in rows])))

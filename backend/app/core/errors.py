@@ -36,8 +36,8 @@ _UNREACHABLE = ("connection refused", "nodename nor servname", "name or service 
                 "all connection attempts failed", "network is unreachable")
 
 #: SQLAlchemy 包过的驱动异常开头是「(sqlite3.OperationalError) 」；asyncpg（PostgreSQL）的后面还跟着
-#: 「<class 'asyncpg.exceptions.UniqueViolationError'>: 」，一起去掉
-_WRAPPED = re.compile(r"^\([\w.]+\)\s*(?:<class '[\w.]+'>:\s*)?")
+#: 「<class 'asyncpg.exceptions.UniqueViolationError'>: 」，一起去掉（直接拿 e.orig 的也只剩后一段，同样去掉）
+_WRAPPED = re.compile(r"^(?:\([\w.]+\)\s*)?(?:<class '[\w.]+'>:\s*)?")
 # 内部符号：`a.b.<locals>._run()`、`<function f at 0x…>`、模块路径。对使用者没有意义
 _LOCALS = re.compile(r"[\w.]*<locals>\.?[\w.]*(\(\))?")
 _REPR = re.compile(r"<(?:function|bound method|coroutine|object) [^>]*>")

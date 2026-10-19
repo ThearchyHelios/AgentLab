@@ -446,7 +446,7 @@ async def notify_due(now: datetime | None = None) -> int:
                     and_(ScheduleFire.status == "started", Run.status.in_(_WATCHED),
                          or_(ScheduleFire.notified_status.is_(None), ScheduleFire.notified_status != Run.status)),
                 ))
-                .order_by(ScheduleFire.created_at)
+                .order_by(ScheduleFire.created_at, ScheduleFire.id)
             )).all()
             if rows:
                 # 链接里的地址：全站同一个对外访问地址（环境变量优先，其次设置，core/public_url.py）

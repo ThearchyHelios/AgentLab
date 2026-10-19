@@ -127,7 +127,7 @@ async def active_job(session: AsyncSession, source_id: str) -> CatalogProfileJob
     return (await session.execute(
         select(CatalogProfileJob).where(CatalogProfileJob.source_id == source_id,
                                         CatalogProfileJob.status.in_(ACTIVE))
-        .order_by(CatalogProfileJob.created_at.desc()).limit(1)
+        .order_by(CatalogProfileJob.created_at.desc(), CatalogProfileJob.id.desc()).limit(1)
     )).scalar_one_or_none()
 
 
@@ -135,7 +135,7 @@ async def latest_job(session: AsyncSession, source_id: str) -> CatalogProfileJob
     """最近建的一个（任何状态）。"""
     return (await session.execute(
         select(CatalogProfileJob).where(CatalogProfileJob.source_id == source_id)
-        .order_by(CatalogProfileJob.created_at.desc()).limit(1)
+        .order_by(CatalogProfileJob.created_at.desc(), CatalogProfileJob.id.desc()).limit(1)
     )).scalar_one_or_none()
 
 

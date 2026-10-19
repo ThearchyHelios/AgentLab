@@ -241,7 +241,7 @@ async def _artifacts(run_id: str, kind: str) -> list[tuple[str | None, tuple[str
 
     async with SessionLocal() as session:
         rows = (await session.execute(select(Artifact.id, Artifact.node_id).where(
-            Artifact.run_id == run_id, Artifact.kind == kind).order_by(Artifact.created_at))).all()
+            Artifact.run_id == run_id, Artifact.kind == kind).order_by(Artifact.created_at, Artifact.id))).all()
     out: list[tuple[str | None, tuple[str, Any]]] = []
     for artifact_id, node_id in rows:
         try:

@@ -132,7 +132,7 @@ async def estimate(session: AsyncSession, suite_id: str, items: int) -> dict[str
     平均记成 0、却有估不出的调用的，也按估不出算。"""
     row = (await session.execute(select(EvalRun).where(
         EvalRun.suite_id == suite_id, EvalRun.status.in_(("succeeded", "partial")))
-        .order_by(EvalRun.created_at.desc()).limit(1))).scalar_one_or_none()
+        .order_by(EvalRun.created_at.desc(), EvalRun.id.desc()).limit(1))).scalar_one_or_none()
     if row is None:
         return {"items": items, "per_item_usd": None, "total_usd": None, "basis": None,
                 "note": "这个题集还没有评完过，估不出花费：按每题开评前的实际花费累计，到了上限就停"}
@@ -322,7 +322,7 @@ class EvalExecution(runtime.JobRun):
         async with SessionLocal() as session:
             leader = await session.get(EvalRun, self.job_id)
             runs = [leader] if not leader.pair_id else list((await session.execute(
-                select(EvalRun).where(EvalRun.pair_id == leader.pair_id).order_by(EvalRun.created_at))).scalars())
+                select(EvalRun).where(EvalRun.pair_id == leader.pair_id).order_by(EvalRun.created_at, EvalRun.id))).scalars())
             suite = await session.get(EvalSuite, leader.suite_id)
             if suite is None:
                 raise runtime.JobFailed("题集不存在，可能已被删除")
@@ -398,7 +398,7 @@ class EvalExecution(runtime.JobRun):
                 unrestricted = True
         if unrestricted:
             ids += list((await session.execute(select(DataSource.id).where(DataSource.enabled.is_(True))
-                                               .order_by(DataSource.created_at))).scalars())
+                                               .order_by(DataSource.created_at, DataSource.id))).scalars())
         return list(dict.fromkeys(ids))
 
     # ---------------------------------------------------------------- 主循环

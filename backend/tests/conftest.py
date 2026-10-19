@@ -71,6 +71,12 @@ os.environ.setdefault("AGENTLAB_SCHEDULER", "0")
 
 import pytest  # noqa: E402
 
+# 整个 JSON 值做比较、去重、分组、排序时编译就报错（tests/jsonguard.py）：PostgreSQL 的 json 不支持，SQLite 的测试也拦下
+from app.db.base import engine as _guarded_engine  # noqa: E402
+from tests.jsonguard import install as _json_guard  # noqa: E402
+
+_json_guard(_guarded_engine.sync_engine.dialect)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _prepare_schema():

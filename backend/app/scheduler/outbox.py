@@ -388,7 +388,7 @@ async def _drain(schedule_id: str, now: datetime) -> list[ScheduleFire]:
             select(TriggerDelivery.id, TriggerDelivery.created_at, TriggerEvent)
             .join(TriggerEvent, TriggerEvent.id == TriggerDelivery.event_id)
             .where(TriggerDelivery.schedule_id == schedule_id, TriggerDelivery.status == "pending")
-            .order_by(TriggerDelivery.occurred_at, TriggerEvent.created_at).limit(DRAIN_BATCH))).all()
+            .order_by(TriggerDelivery.occurred_at, TriggerEvent.created_at, TriggerEvent.id).limit(DRAIN_BATCH))).all()
         # 等着的时候改了触发条件（换了对象、加了过滤）：已经不合条件的不再派发
         stale = [did for did, _, ev in rows if not triggers.matches(trigger, ev.event, ev.subject_id, ev.payload)]
         if stale:

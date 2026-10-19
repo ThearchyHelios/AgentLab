@@ -58,7 +58,8 @@ deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i im
 
 所有数据都在 `DATA_DIR`（默认是包目录下的 `data/`）：数据库 `agentlab.db`、执行断点 `checkpoints.db`、
 工件、上传文件、沙箱工作区，以及加密密钥 `.secret_key`。**要备份的就是这个目录**，
-丢了 `.secret_key`，存进去的 API Key 就解不开了。数据库放在 PostgreSQL 时（下面「用 PostgreSQL」）没有这两个库文件，
+丢了 `.secret_key`，存进去的 API Key 就解不开了。目录里的 `.agentlab-data` 是服务启动时建的标记，deploy.sh 改属主前按它
+（或 `agentlab.db`、`.secret_key`）认出这是 AgentLab 的数据目录，别删。数据库放在 PostgreSQL 时（下面「用 PostgreSQL」）没有这两个库文件，
 另用 `pg_dump` 备份数据库。
 
 deploy.sh 会把数据目录的属主改成容器里的用户（uid 10001），所以备份、删除要用 sudo。
