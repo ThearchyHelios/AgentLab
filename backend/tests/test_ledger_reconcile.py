@@ -263,7 +263,9 @@ async def test_the_reconcile_view_gives_the_panel_what_it_draws(client, monkeypa
     body = {"query": action["query"], "workflow_id": wf, "version": 1, "inputs": CHECKED, "confirm": True}
     res = await client.post(f"/api/ledger/answers/{row.id}/reconcile", json=body)
     assert res.status_code == 409 and res.json()["code"] == ledger_reconcile.NEEDS_PAIRS
-    assert res.json()["options"] == {"columns": ["gmv"], "metrics": [{"id": "gmv", "name": "销售额", "unit": "元"}]}
+    # suggested：逐格证明了的预选（这条查询只引用了一列，没有逐格比，空）
+    assert res.json()["options"] == {"columns": ["gmv"], "metrics": [{"id": "gmv", "name": "销售额", "unit": "元"}],
+                                     "suggested": []}
     done = await reconcile(client, row.id, {**body, "pairs": [{"ours": "gmv", "metric": "gmv"}]})
     [listed] = (await ledger_of(client, row.id))["reconciled"]
     assert listed["run_id"] == done.id and listed["card"] == "reconcile"
