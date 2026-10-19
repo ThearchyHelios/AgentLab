@@ -208,6 +208,63 @@ def report_fields(state: GraphState, spec: GraphSpec, node: GraphNode) -> list[d
     return found
 
 
+#: 写作提示里「没有查到的数据」一节最多列几次、每次的原因留多长：只是让写作者知道哪部分没查到、为什么，不是排错日志
+FAILED_SHOWN = 8
+FAILED_REASON_CHARS = 160
+
+
+def failed_queries(state: GraphState, spec: GraphSpec, node: GraphNode) -> list[dict[str, Any]]:
+    """上游 Agent 查库失败的那几次：调用记录（产出的 tool_calls）里平台查询工具交回「查询失败…」的。
+
+    失败的查询不进证据台账，证据目录里没有它；写作者只在上游的文字里看到 SQL 和列名，会照着写出引用不存在的 Q1… 的
+    标记，重写一次也常常还是那样，最后把解析不了的标记原样交给看的人（2026-10 部署上撞过：数据源连不上，六次查询全失败，
+    答案里全是没填上的 ⟦?v:Q1…⟧）。照实告诉写作者哪几次没查到、为什么，让它照实说没查到。范围和 report_fields 一致：
+    祖先节点，写了 evidence_from 就只收那几个。原因只取报错的第一行：工具交回时已经按这次运行的遮罩规则处理过（datasource
+    的 mask_error_text），和上游 Agent 自己看到的是同一句。"""
+    from app.capabilities.registry import is_platform_query
+
+    sources = _setting(spec, node, "evidence_from", "ancestors")
+    if isinstance(sources, str) and sources != "ancestors":
+        sources = [sources]
+    keep = {str(s) for s in sources} if isinstance(sources, list) else None
+    allowed = _ancestors(spec, node.id)
+    outputs = state.get("nodes") or {}
+    found: list[dict[str, Any]] = []
+    for other in spec.nodes:
+        result = outputs.get(other.id)
+        if other.id not in allowed or (keep is not None and other.id not in keep) or not isinstance(result, dict):
+            continue
+        for call in result.get("tool_calls") or []:
+            if not isinstance(call, dict) or call.get("repeat") or call.get("skipped") or call.get("denied"):
+                continue
+            name, said = str(call.get("tool") or ""), str(call.get("result") or "").strip()
+            if not is_platform_query(name) or not (call.get("ok") is False or said.startswith("查询失败")):
+                continue
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            reason = said.splitlines()[0] if said else "没有交回结果"
+            found.append({"node_id": other.id, "title": other.title or other.id, "tool": name,
+                          "sql": " ".join(str(args.get("sql") or "").split())[:200],
+                          "reason": reason[:FAILED_REASON_CHARS]})
+    return found
+
+
+def _failed_section(failed: list[dict[str, Any]], *, any_query: bool) -> str:
+    """写作提示里「没有查到的数据」一节，和照实说没查到的要求。一次成功的查询都没有时，不许写单元格引用。"""
+    lines = [f"- 「{f['title']}」{f['tool']}" + (f"：{f['sql']}" if f["sql"] else "") + f"（{f['reason']}）"
+             for f in failed[:FAILED_SHOWN]]
+    if len(failed) > FAILED_SHOWN:
+        lines.append(f"- 另有 {len(failed) - FAILED_SHOWN} 次，同样没有结果")
+    rule = (FAILED_NONE_RULE if not any_query else FAILED_SOME_RULE)
+    return f"## 没有查到的数据\n上游有 {len(failed)} 次数据查询失败了，证据目录里没有它们的结果：\n" + "\n".join(lines) + f"\n\n{rule}"
+
+
+#: 一次成功的查询都没有时交给写作者的要求（写作提示和重写请求里同一句）
+FAILED_NONE_RULE = ("这次一次成功的查询都没有：不要写 [[v:…]] 单元格引用，也不要写任何数字；照实写没有查到数据、失败的原因，"
+                    "以及怎么排查（比如检查数据源连接）。")
+#: 有成功的查询、也有失败的时
+FAILED_SOME_RULE = "上面这几次没有结果可以引用：不要为它们写引用、也不要估数，照实说这部分没有查到。"
+
+
 async def model_window(session: Any, spec: ModelSpec, model_id: str) -> int | None:
     """写作模型的上下文窗口（token）：模型接入里给这个模型登记的 context 优先，其次模型目录
     （providers/catalog.py）；都没有返回 None，由 catalog_budget 取保守值。"""
@@ -531,16 +588,18 @@ def _named(violations: list[dict[str, Any]], limit: int = 3) -> str:
     return "、".join(f"「{n}」" for n in names)
 
 
-def _repair_request(violations: list[dict[str, Any]]) -> str:
+def _repair_request(violations: list[dict[str, Any]], failed_rule: str | None = None) -> str:
     return (
         "你写的报告没有通过系统核对，问题如下：\n"
         f"{describe_violations(violations)}\n\n"
         "请重写整篇报告：所有数字都用引用标记写，只引用证据目录里有的指标和输入；"
-        "不要解释改了什么，只输出新的报告正文。"
+        + (f"{failed_rule}" if failed_rule else "")
+        + "不要解释改了什么，只输出新的报告正文。"
     )
 
 
-def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims: str = "off") -> list[BaseMessage]:
+def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims: str = "off",
+              failed: str | None = None) -> list[BaseMessage]:
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
@@ -554,7 +613,7 @@ def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims
     return [
         SystemMessage(content="\n\n".join(p for p in (system, ROLE) if p)),
         HumanMessage(content=(
-            f"{instructions}\n\n{writer.text}\n\n{rules}\n\n"
+            f"{instructions}\n\n{writer.text}\n\n" + (f"{failed}\n\n" if failed else "") + f"{rules}\n\n"
             "只输出报告正文（Markdown），不要写撰写说明。"
         )),
     ]
@@ -678,7 +737,16 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                  budget=writer.budget, window=window, queries=writer.queries, omitted=len(writer.omitted),
                  compact=writer.compact, compact_rows=writer.compact_rows,
                  nodes=[{k: r[k] for k in ("node_id", "title", "total", "omitted", "compact")} for r in writer.nodes])
-    messages = _messages(ctx, state, writer, claims)
+    failed = failed_queries(upstream, spec, ctx.node)  # type: ignore[arg-type]
+    any_query = any(entry.get("kind") == "query" for entry in catalog.values())
+    failed_rule = (FAILED_SOME_RULE if any_query else FAILED_NONE_RULE) if failed else None
+    if failed:
+        ctx.emit(EventType.LOG, level="warn", code="report_queries_failed",
+                 message=f"上游有 {len(failed)} 次数据查询失败" + ("，一次成功的都没有" if not any_query else "")
+                         + "：已告诉写作模型照实说没有查到，不为它们写引用",
+                 failed=len(failed), any_query=any_query)
+    messages = _messages(ctx, state, writer, claims,
+                         _failed_section(failed, any_query=any_query) if failed else None)
     started = time.perf_counter()
     spent: list[dict[str, Any]] = []
     nudged = False
@@ -726,7 +794,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         ctx.emit(EventType.LOG, level="warn", code="report_repair",
                  message=f"报告有 {len(blocking)} 处未通过核对（{_named(blocking)}），"
                          f"已要求模型重写（第 {repairs} 次）")
-        messages = [*messages, response, HumanMessage(content=_repair_request(blocking))]
+        messages = [*messages, response, HumanMessage(content=_repair_request(blocking, failed_rule))]
         response, raw = await draft(messages)
         doc = await compose(raw)
 
