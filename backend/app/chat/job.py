@@ -16,7 +16,8 @@
 
 **事件日志**（chat/log.py；每条 {seq, type, data, ts}）：
   turn.attempt {mode, attempts, scope, max_steps?}  这一次尝试开始了（发起、重试本轮、重新运行、跑一下、继续运行、接着收尾）
-  op {...}                       助手的一条操作原样（含查看、final、usage；心跳不落库，只在实时流上发，见 chat/log.beat）
+  op {...}                       助手的一条操作原样（含查看、final、usage；心跳只落换了阶段的那一拍，同一阶段接着的只在实时流上发，
+                                 见 chat/log.beat）
   stage {stage}                  到了哪一步：build 建图、run 运行、waiting 停在审批上等人、review 复核
   run {run_id, status, run_class} 发起了一次运行（页面据此接上运行自己的实时流看过程）
   review {result}                复核结论原样（含 usage、retry_instruction）
@@ -141,6 +142,8 @@ class ChatDriver(TurnDriver):
         self.execution = execution
         self._thinking = ""
         self._thinking_at = time.monotonic()
+        #: 最近一次落库的心跳的阶段：同一阶段接着的心跳不落库（on_op）
+        self._beat_phase: Any = None
         #: 这一轮的查看记录（存进 meta.looks）
         self.looks: list[dict[str, Any]] = []
         #: 等不及的那次复核（还在跑）：收尾之后由它把用量记进这一轮
@@ -161,9 +164,12 @@ class ChatDriver(TurnDriver):
             return
         await self._flush_thinking()
         if kind == "heartbeat":
-            # 纯保活：只在实时流上发、不落库（chat/log.beat；以前每 3 秒落一条）
-            turn_log.beat(self.execution.turn_id, op)
-            return
+            if op.get("phase") == self._beat_phase:
+                # 同一阶段接着的心跳是纯保活：只在实时流上发、不落库（chat/log.beat；以前每 3 秒落一条）
+                turn_log.beat(self.execution.turn_id, op)
+                return
+            # 换了阶段的那一拍（规划 → 查看 → 搭建……）说的是到了哪一步，照落：刷新、重开时过程里那一行阶段要回放得出来
+            self._beat_phase = op.get("phase")
         await self.execution.emit("op", op)
         if kind == "look" and (look := record.look_event(op)) is not None:
             self.looks.append(look)
@@ -179,6 +185,7 @@ class ChatDriver(TurnDriver):
         self._thinking_at = time.monotonic()
 
     async def _generate(self, instruction: str, base_graph: dict[str, Any] | None) -> tuple[list[dict[str, Any]], str | None]:
+        self._beat_phase = None   # 每一次生成从头算：第一拍心跳照落（页面按它画「规划」那一行）
         try:
             return await super()._generate(instruction, base_graph)
         finally:

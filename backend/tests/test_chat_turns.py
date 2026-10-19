@@ -947,8 +947,9 @@ async def test_a_stop_that_lands_while_launching_still_cancels_the_run(client, m
 
 
 async def test_heartbeats_go_out_on_the_stream_but_are_not_stored(client, monkeypatch, source):
-    """心跳是纯保活（模型几秒没出声时助手发的一拍 heartbeat 操作）：只在实时流上发、不落库，重连时流自己补最近的一拍；
-    落库的事件（思考、操作、阶段……）照旧。以前每 3 秒落一条，一轮下来几百条心跳。"""
+    """心跳（模型几秒没出声时助手发的一拍 heartbeat 操作）：换了阶段的那一拍照落（刷新后过程里那一行阶段回放得出来），同一阶段
+    接着的是纯保活，只在实时流上发、不落库，重连时流自己补最近的一拍；别的事件（思考、操作、阶段……）照旧。以前每 3 秒落一条，
+    一轮下来几百条心跳。"""
     from app.api import copilot
 
     gate = asyncio.Event()
@@ -969,10 +970,10 @@ async def test_heartbeats_go_out_on_the_stream_but_are_not_stored(client, monkey
             event = json.loads(frame[6:])
             if event.get("type") == "op" and event["data"].get("op") == "heartbeat":
                 beats.append(event)
-        if len(beats) >= 2:
+        if any("seq" not in b for b in beats):
             break
     await stream.aclose()
-    assert all("seq" not in b for b in beats), "心跳不占 seq：重连按 seq 补齐时不会多出来、也不会漏"
+    assert [b for b in beats if "seq" not in b], "同一阶段接着的心跳不占 seq：重连按 seq 补齐时不会多出来、也不会漏"
     # 重连（从最后一条落库的事件接着读）：流先补一拍最近的心跳，页面接着知道还在等模型
     stored = await _events(turn_id)
     again = turn_log.stream(turn_id, stored[-1]["seq"], active=active, heartbeat=0.2)
@@ -983,7 +984,10 @@ async def test_heartbeats_go_out_on_the_stream_but_are_not_stored(client, monkey
     gate.set()
     await _done(turn_id)
     events = await _events(turn_id)
-    assert not [e for e in events if e["type"] == "op" and e["data"].get("op") == "heartbeat"], "心跳一条都不落库"
+    stored = [e for e in events if e["type"] == "op" and e["data"].get("op") == "heartbeat"]
+    # 只落换了阶段的那一拍（规划、查看……各一拍），同一阶段接着的几十拍都不落
+    phases = [e["data"]["phase"] for e in stored]
+    assert phases and phases[0] == "planning" and all(a != b for a, b in zip(phases, phases[1:])), phases
     assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
     assert turn_log.latest_beat(turn_id) is None, "这一轮结束了，进程里记的那一拍跟着清掉"
 

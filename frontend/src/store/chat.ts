@@ -1329,7 +1329,9 @@ function opPatch(t: ChatTurn, op: CopilotOp): Partial<ChatTurn> {
   const last = t.ops[t.ops.length - 1]
   const ops = op.op === 'thinking' && last?.op === 'thinking'
     ? [...t.ops.slice(0, -1), { ...last, delta: String(last.delta ?? '') + String(op.delta ?? '') }]
-    : [...t.ops, op]
+    // 心跳只说「还在等」：接着的一拍顶替上一拍（重连时服务端会补最近的一拍，chat/log.beat），不叠成好几条
+    : op.op === 'heartbeat' && last?.op === 'heartbeat' ? [...t.ops.slice(0, -1), op]
+      : [...t.ops, op]
   switch (op.op) {
     case 'thinking':
       return { ops, phase: 'planning', thinking: (t.thinking + (op.delta ?? '')).slice(-2000) }

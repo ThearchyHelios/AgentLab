@@ -1271,12 +1271,17 @@ async function driveTurn(T, epoch) {
           { cause: { kind: 'refused', message, code: got.json.code ?? null }, runId: null, usage: T.usage })
       }
       const ops = []
+      T.beatPhase = undefined   // 每一次生成从头算：第一拍心跳照落
       for (const op of got.ops) {
         if (op.gate) { await until(() => ctl[op.gate] || gone(T, epoch), 15000); continue }
         if (gone(T, epoch)) return
-        // 心跳不落库、不带 seq（服务端 chat/log.beat）：只记最近的一拍，流上发一条不带 seq 的；之后落了新事件就作废
-        if (op.op === 'heartbeat') T.beat = { op, at: T.events.length }
-        else emit(T, 'op', op)
+        // 心跳只落换了阶段的那一拍（服务端 chat/job.ChatDriver.on_op）；同一阶段接着的不落库、不带 seq（chat/log.beat）：只记
+        // 最近的一拍，流上发一条不带 seq 的；之后落了新事件就作废
+        if (op.op === 'heartbeat' && op.phase === T.beatPhase) T.beat = { op, at: T.events.length }
+        else {
+          if (op.op === 'heartbeat') T.beatPhase = op.phase
+          emit(T, 'op', op)
+        }
         if (op.op !== 'thinking' && op.op !== 'heartbeat') ops.push(op)
         if (op.op === 'look') T.looks.push(op)
         if (op.op === 'usage') T.usage.copilot = addTotal(T.usage.copilot, op)
@@ -2636,9 +2641,14 @@ for (const theme of THEMES) {
     check('从不往回要：重连的 seq 只增不减', afters.every((a, i) => i === 0 || a >= afters[i - 1]), afters.join(','))
     check('补齐：服务端这一轮记下的事件，页面一条不少地收到了', !!T && t.turnSeq === T.events.length,
       `${t.turnSeq} / ${T?.events.length}`)
-    const ops = T?.events.filter((e) => e.type === 'op').length ?? -1
-    check('不重复：助手的操作一条只收一份', t.ops.length === ops && t.ops.filter((o) => o.op === 'add_node').length === 3,
-      `${t.ops.length} / ${ops}`)
+    // 心跳只落换了阶段的那一拍，同一阶段接着的不带 seq（服务端 chat/log.beat）：重连时服务端会补最近的一拍，页面接着的那一拍
+    // 顶替上一拍，不另起一条。按 seq 补齐的「一条只收一份」比的是心跳之外的操作
+    const ops = T?.events.filter((e) => e.type === 'op' && e.data?.op !== 'heartbeat').length ?? -1
+    const mine = t.ops.filter((o) => o.op !== 'heartbeat').length
+    check('不重复：助手的操作一条只收一份', mine === ops && t.ops.filter((o) => o.op === 'add_node').length === 3,
+      `${mine} / ${ops}`)
+    check('……补过的心跳不叠成好几条', t.ops.every((o, i) => o.op !== 'heartbeat' || t.ops[i + 1]?.op !== 'heartbeat'),
+      t.ops.map((o) => o.op).join(','))
     check('画布边收边长到收尾：图有 3 个节点，运行接上了', t.graph?.nodes?.length === 3 && !!t.run?.id)
     check('页面不写这一轮的结局（不 PATCH）', log.patches.slice(patchesBefore).length === 0)
     await page.getByRole('button', { name: '停止这一轮' }).click().catch(() => {})
