@@ -163,7 +163,7 @@ async def sealed_runs(session: AsyncSession, workflow_id: Any, version: Any, gra
                               or_(Run.origin_kind.is_(None), Run.origin_kind.in_(SEALED_ORIGINS)))
     if isinstance(origin, str) and origin.startswith("schedule:"):
         query = query.where(Run.schedule_id == origin[len("schedule:"):])
-    rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc())
+    rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc(), Run.id.desc())
                                        .limit(max(n, 1) * 3 + 5))).scalars())
     out: list[Run] = []
     for run in rows:
@@ -213,7 +213,7 @@ async def trend_runs(session: AsyncSession, app_id: str | None, workflow_id: Any
         rows = (await session.execute(select(Run).where(
             Run.app_id == app_id, Run.origin_kind == BACKFILL_ORIGIN, Run.workflow_id == workflow_id,
             Run.version == version, Run.version_hash == graph_hash, Run.run_class == "formal",
-            Run.status == "succeeded").order_by(Run.created_at.desc()).limit(max(n, 1) * 3 + 5))).scalars()
+            Run.status == "succeeded").order_by(Run.created_at.desc(), Run.id.desc()).limit(max(n, 1) * 3 + 5))).scalars()
         seen = {input_key(r.input) for r in own}
         for run in rows:
             key = input_key(run.input)
@@ -387,10 +387,11 @@ def _records_gap(entry: Any) -> str | None:
 _LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def _lock(key: str) -> asyncio.Lock:
-    if key not in _LOCKS:
-        _LOCKS[key] = asyncio.Lock()
-    return _LOCKS[key]
+def _lock(key: str) -> Any:
+    """按需视图的单飞锁（app/cluster/mutex，多进程之间也是一把）：按缓存键（视图 + 参数）取，同一个键正在运行的那次接上、不另发。"""
+    from app.cluster import mutex
+
+    return mutex.lock(f"app-view:{key}")
 
 
 def normalize_params(form: dict[str, Any] | None, params: Any) -> dict[str, Any]:
@@ -470,24 +471,36 @@ async def run_view(session: AsyncSession, *, app: Any, version: AppVersion, view
             raise FormRejected(errors)
     inputs = normalize_params(form, params)
     key = await cache_key(session, state, inputs)
+    # 锁按缓存键（这个视图、这组参数）：管的是去重——同一个键正在运行的那次接上，不另算一遍。每日上限不靠它：发起之前在库里先占
+    # 一份这个应用今天的额度（app/cluster/quota，带条件的加一），几个键、几个进程同时刷新也正好到上限为止，发起不成退回
+    from app.cluster import quota
+
     async with _lock(key):
         run = await _cached(session, key)
         if run is not None:
             return run, run.status == "succeeded"
-        # 「每天」按服务端所在时区的自然日算
-        start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-        used = await session.scalar(select(func.count(Run.id)).where(
-            Run.app_id == app.id, Run.origin_kind == "app_view", Run.created_at >= start))
         limit = await daily_limit(session)
-        if int(used or 0) >= limit:
+
+        async def used_today(s: AsyncSession) -> int:
+            # 「每天」按服务端所在时区的自然日算
+            start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            return int(await s.scalar(select(func.count(Run.id)).where(
+                Run.app_id == app.id, Run.origin_kind == "app_view", Run.created_at >= start)) or 0)
+
+        day = await quota.take(f"app_view:{app.id}", limit, seed=used_today)
+        if day is None:
             raise ViewRefused(429, f"这个应用今天的按需运行已达到上限（{limit} 次），请明天再试，或请管理员调整上限",
                               DAILY_LIMIT)
-        run = await launch_run(
-            session, workflow_id=state.pin["workflow_id"], run_class="formal", version=state.pin["version"],
-            expect_hash=state.pin.get("graph_hash"), input_payload=inputs, actor=actor, origin_kind="app_view",
-            app_id=app.id, app_version=version.version,
-            origin={"view": view_id, "spec_hash": version.spec_hash, "actor_verified": principal.verified,
-                    "auth_mode": principal.mode, **_key_trace(principal)})
+        try:
+            run = await launch_run(
+                session, workflow_id=state.pin["workflow_id"], run_class="formal", version=state.pin["version"],
+                expect_hash=state.pin.get("graph_hash"), input_payload=inputs, actor=actor, origin_kind="app_view",
+                app_id=app.id, app_version=version.version,
+                origin={"view": view_id, "spec_hash": version.spec_hash, "actor_verified": principal.verified,
+                        "auth_mode": principal.mode, **_key_trace(principal)})
+        except BaseException:
+            await quota.give_back(f"app_view:{app.id}", day=day)
+            raise
         ttl = source.get("ttl_s")
         if ttl is None and await reads_live(session, state.graph):
             ttl = TTL_DEFAULT
@@ -1062,7 +1075,7 @@ async def _task_states(session: AsyncSession, run: Run) -> dict[str, Any]:
     from app.db.models_process import Task
 
     rows = (await session.execute(select(Task.node_id, Task.status).where(Task.run_id == run.id)
-                                  .order_by(Task.created_at))).all()
+                                  .order_by(Task.created_at, Task.id))).all()
     return {str(node): {"status": status} for node, status in rows if node}
 
 
@@ -1523,7 +1536,7 @@ async def _trails(session: AsyncSession, runs: list[Run]) -> dict[str, _Trail]:
     if not ids:
         return out
     for row in (await session.execute(select(Task.run_id, Task.node_id, Task.kind, Task.status, Task.outcome)
-                                      .where(Task.run_id.in_(ids)).order_by(Task.created_at))).all():
+                                      .where(Task.run_id.in_(ids)).order_by(Task.created_at, Task.id))).all():
         out[row.run_id].tasks.append(row)
     for row in (await session.execute(select(ActionRecord).where(ActionRecord.run_id.in_(ids))
                                       .order_by(ActionRecord.created_at, ActionRecord.attempt))).scalars():
@@ -1582,6 +1595,10 @@ async def _rejected_exits(session: AsyncSession, runs: list[Run], out: dict[str,
         names = {str(v.get("node_id")) for v in via or [] if isinstance(v, dict) and v.get("node_id")}
         if names:
             gates[run_id] = names
+        for v in via or []:
+            # 子工作流里的关卡（「sub/x」）不在运行的图上：名字照终态事件上记的（「子工作流 › x」），不写内部 id
+            if isinstance(v, dict) and v.get("node_id") and isinstance(v.get("label"), str) and v["label"]:
+                out[run_id].end_labels.setdefault(str(v["node_id"]), v["label"])
     if not gates:
         return
     wanted = sorted({n for names in gates.values() for n in names})
@@ -1755,7 +1772,7 @@ async def list_instances(session: AsyncSession, app_id: str, *, mine: str | None
         query = query.where(Run.started_by == mine)
     if status:
         query = query.where(Run.status == status)
-    rows = list((await session.execute(query.order_by(Run.created_at.desc()).limit(max(1, min(limit, 200)) * 2)))
+    rows = list((await session.execute(query.order_by(Run.created_at.desc(), Run.id.desc()).limit(max(1, min(limit, 200)) * 2)))
                 .scalars())
     if entry:
         rows = [r for r in rows if (r.origin or {}).get("entry") == entry]
@@ -1906,7 +1923,7 @@ async def _task_list(session: AsyncSession, ctx: _Page, props: dict[str, Any]) -
                 | ((TaskAssignment.principal_kind == "user") & (TaskAssignment.principal == (p.username or "")))
                 | ((TaskAssignment.principal_kind == "group") & TaskAssignment.principal.in_(list(p.groups) or [""])))
             query = query.where(Task.id.in_(mine))
-    rows = list((await session.execute(query.order_by(Task.created_at.desc()).limit(100))).scalars())
+    rows = list((await session.execute(query.order_by(Task.created_at.desc(), Task.id.desc()).limit(100))).scalars())
     runs = {run_id: str((origin or {}).get("title") or name or "") for run_id, origin, name in (await session.execute(
         select(Run.id, Run.origin, Run.workflow_name).where(Run.id.in_({t.run_id for t in rows})))).all()}
     return {"scope": scope, "items": [_task_row(t, runs.get(t.run_id)) for t in rows]}
@@ -1964,11 +1981,11 @@ async def _process_data(session: AsyncSession, ctx: _Page, ctype: Any, kind: str
         return {"state": "empty"}
     if kind == "task":
         task = (await session.execute(select(Task).where(Task.run_id == run.id, Task.node_id == node_id)
-                                      .order_by(Task.created_at.desc()))).scalars().first()
+                                      .order_by(Task.created_at.desc(), Task.id.desc()))).scalars().first()
         if task is None:
             return {"state": "empty", "node": node_id}
         rows = list((await session.execute(select(TaskAssignment).where(TaskAssignment.task_id == task.id)
-                                           .order_by(TaskAssignment.created_at))).scalars())
+                                           .order_by(TaskAssignment.created_at, TaskAssignment.id))).scalars())
         reader = principal_with_actor(ctx.principal, ctx.actor)
         resolved_at = _aware(task.resolved_at).isoformat() if task.resolved_at else None
         signoffs = ctype == "task_form" and any(

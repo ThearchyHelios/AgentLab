@@ -206,7 +206,7 @@ async def list_shares(app_id: str, session: AsyncSession = Depends(get_session),
 
     app, _ = await _managed(session, app_id, x_actor)
     rows = list((await session.execute(select(ViewShare).where(ViewShare.app_id == app.id)
-                                       .order_by(ViewShare.created_at.desc()))).scalars())
+                                       .order_by(ViewShare.created_at.desc(), ViewShare.id.desc()))).scalars())
     version = await _previous(session, app)
     titles = _titles(version.spec if version is not None else None)
     return {"enabled": await _enabled(session), "embed_origins": bool(settings.embed_origins),

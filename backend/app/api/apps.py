@@ -249,7 +249,7 @@ async def list_apps(include_archived: bool = False, scope: str | None = None,
     from app.blueprints.personal import allowed
 
     principal = _principal(x_actor)
-    query = select(App).order_by(App.updated_at.desc())
+    query = select(App).order_by(App.updated_at.desc(), App.id.desc())
     if not include_archived:
         query = query.where(App.status != "archived")
     if scope == "personal":
@@ -434,7 +434,7 @@ async def assistant_conversation(app_id: str, session: AsyncSession = Depends(ge
     mine = Conversation.created_by == who if who else Conversation.created_by.is_(None)
     lookup = (select(Conversation).where(Conversation.kind == "app", Conversation.app_id == app.id,
                                          Conversation.archived.is_(False), mine)
-              .order_by(Conversation.last_active_at.desc()).limit(1))
+              .order_by(Conversation.last_active_at.desc(), Conversation.id.desc()).limit(1))
     # 取或建在进程里按 (应用, 人) 串行：编辑器开发模式下 effect 执行两次、同一个人开两个标签页，都会同时来取。库里有
     # (app_id, created_by) 的部分唯一索引（ux_conversations_app_owner）：别处（另一个进程）抢先建了的，这次插入在保存点里
     # 被拒，改用那一段——历史才不会被拆开。没署名（关登录又没填）的不受索引约束，靠这把进程内的锁
@@ -552,6 +552,9 @@ async def publish_draft(session: AsyncSession, app: App, *, note: str, dispositi
         await session.rollback()
         raise CodedHTTPException(409, "有人刚刚发布了这个应用，请刷新后再试", PUBLISH_CONFLICT) from e
     clear_cache()
+    from app.cluster import caches
+
+    await caches.broadcast("app_pages")
     return {"ok": True, "version": number, "level": level, "spec_hash": row.spec_hash, "issues": issues}
 
 
@@ -689,7 +692,7 @@ async def _hook_state(session: AsyncSession, app: App) -> tuple[dict[str, Any], 
     version = await _previous(session, app)
     rows: dict[str, AppHook] = {}
     for row in (await session.execute(select(AppHook).where(AppHook.app_id == app.id)
-                                      .order_by(AppHook.created_at))).scalars():
+                                      .order_by(AppHook.created_at, AppHook.id))).scalars():
         rows.setdefault(row.name, row)
     return declarations(app.draft or {}), declarations(version.spec if version is not None else {}), rows
 
@@ -1045,4 +1048,7 @@ async def backfill(app_id: str, view_id: str, session: AsyncSession = Depends(ge
     except LaunchRefused as e:
         raise _view_refused(e) from e
     clear_cache()
+    from app.cluster import caches
+
+    await caches.broadcast("app_pages")
     return out

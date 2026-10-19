@@ -136,6 +136,8 @@ export type TurnCause =
   | { kind: 'run'; error?: string; detail?: string | null }
   | { kind: 'gone' }
   | { kind: 'build_interrupted' }
+  /** 服务重启后接着收尾时，发起这一轮的账号已停用、或者已经没有问数据的权限（服务端 chat/job.current_principal） */
+  | { kind: 'identity'; message?: string }
   | { kind: 'crash'; message?: string }
 
 /**
@@ -649,6 +651,12 @@ function causeFailure(cause: TurnCause, scope?: ScopeSource[]): Failure {
       return GONE
     case 'build_interrupted':
       return BUILD_INTERRUPTED
+    case 'identity':
+      return {
+        title: '上次未完成',
+        reason: cause.message || '发起这一轮的账号已无法接着收尾，本轮没有接着做。',
+        hint: '如需继续，请由现在有问数据权限的人重新提问。',
+      }
     case 'crash':
       return failureOf(cause.message || '发生错误')
   }
@@ -1321,7 +1329,9 @@ function opPatch(t: ChatTurn, op: CopilotOp): Partial<ChatTurn> {
   const last = t.ops[t.ops.length - 1]
   const ops = op.op === 'thinking' && last?.op === 'thinking'
     ? [...t.ops.slice(0, -1), { ...last, delta: String(last.delta ?? '') + String(op.delta ?? '') }]
-    : [...t.ops, op]
+    // 心跳只说「还在等」：接着的一拍顶替上一拍（重连时服务端会补最近的一拍，chat/log.beat），不叠成好几条
+    : op.op === 'heartbeat' && last?.op === 'heartbeat' ? [...t.ops.slice(0, -1), op]
+      : [...t.ops, op]
   switch (op.op) {
     case 'thinking':
       return { ops, phase: 'planning', thinking: (t.thinking + (op.delta ?? '')).slice(-2000) }
@@ -1438,7 +1448,8 @@ function play(flow: Flow, serverId: string, after: number) {
         }
         return
       case 'op':
-        patch((t) => ({ ...opPatch(t, d as CopilotOp), turnSeq: e.seq }))
+        // 心跳不带 seq（不落库，chat/log.beat）：不动收到的最后一个 seq
+        patch((t) => ({ ...opPatch(t, d as CopilotOp), ...(typeof e.seq === 'number' ? { turnSeq: e.seq } : {}) }))
         return
       case 'stage': {
         const stage = String(d.stage ?? '')

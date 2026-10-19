@@ -356,15 +356,25 @@ async def test_trigger_options(client):
     table = await upload_table("门店销售")
     flat = await upload_table("门店名单", mode="replace")
     wf, wf_name = await workflow("日报")
-    draft, _ = await workflow("草稿", published=False)
+    draft, draft_name = await workflow("草稿", published=False)
     r = await client.get("/api/schedules/trigger-options")
     assert r.status_code == 200
     out = r.json()
     events = {e["event"]: e for e in out["events"]}
     assert list(events) == ["table.version", "workflow.finished", "source.changed"]
-    tables = {o["id"]: o for o in events["table.version"]["objects"]}
+
+    # 对象按名字排、一页 100 个：同一个库里别的测试建的工作流、数据源多了，这里建的可能排到第一页外面。按名字（q）查要的那几个
+    async def objects(event: str, name: str) -> dict[str, dict]:
+        got = await client.get("/api/schedules/trigger-options", params={"event": event, "q": name})
+        assert got.status_code == 200
+        [entry] = got.json()["events"]
+        return {o["id"]: o for o in entry["objects"]}
+
+    async with SessionLocal() as session:
+        table_name, flat_name = [(await session.get(DataSource, i)).name for i in (table, flat)]
+    tables = {**await objects("table.version", table_name), **await objects("table.version", flat_name)}
     assert tables[table]["ok"] is True and tables[flat]["ok"] is False and "按期累积" in tables[flat]["reason"]
-    flows = {o["id"]: o for o in events["workflow.finished"]["objects"]}
+    flows = {**await objects("workflow.finished", wf_name), **await objects("workflow.finished", draft_name)}
     assert flows[wf] == {"id": wf, "name": wf_name, "ok": True, "reason": None}
     assert flows[draft]["ok"] is False and "发布" in flows[draft]["reason"]
     assert "hook" in [o["kind"] for o in out["origins"]] and out["max_depth"] == 5

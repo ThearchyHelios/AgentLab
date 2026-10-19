@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +25,7 @@ from app.data.engine import engines, run_query
 from app.db.base import SessionLocal
 from app.db.models import DataSource, ImportStaging, SourceSnapshot, TableImport, TableRecipe
 from app.main import app
+from tests.fixtures.names import letters
 from tests.fixtures.xlsx.flow import FLOW_EXPECT, flow_workbook
 from tests.test_recipe_imports import (  # noqa: F401 - fake 是夹具，导入即可用
     FLOW_FULL, api_stage, fake, raw_bytes, recipe_source, staged,
@@ -52,7 +52,7 @@ async def client():
 
 
 def unique(prefix: str = "wp5c") -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+    return f"{prefix}_{letters(10)}"
 
 
 async def stage(client, name: str, raw: bytes, filename: str, **form: str):

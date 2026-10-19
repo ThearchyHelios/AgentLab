@@ -127,7 +127,12 @@ export function RecallMarks({ recall }: { recall?: LedgerRecallMarks }) {
       {[...checked.values()].map((c) => (
         <li key={`c-${c.workflow_id ?? ''}`} className="flex items-start gap-1.5 text-dim" data-ledger-recall-checked={c.to_version ?? ''}>
           <CircleCheck size={11} className="mt-[2px] shrink-0 text-faint" aria-hidden />
-          <span>{R.checked(caliberName(c.workflow_name, c.to_version))}</span>
+          <span>
+            {R.checked(caliberName(c.workflow_name, c.to_version))}
+            {!!c.row_order_metrics?.length && (
+              <span className="ml-1" data-ledger-recall-row-order="">{R.checkedRowOrder(c.row_order_metrics)}</span>
+            )}
+          </span>
         </li>
       ))}
       {[...basis.entries()].map(([group, b]) => (

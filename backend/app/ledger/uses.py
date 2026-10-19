@@ -116,7 +116,7 @@ async def _answers(session: AsyncSession, workflow_id: str, below: int | None, o
     rows = (await session.execute(
         select(Artifact.run_id, Artifact.meta, Run.finished_at).join(Run, Run.id == Artifact.run_id)
         .where(Artifact.kind == store.KIND, Run.status == "succeeded", counted_runs())
-        .order_by(Run.finished_at.desc()))).all()
+        .order_by(Run.finished_at.desc(), Run.id.desc()))).all()
     wanted: dict[str, datetime | None] = {}
     for run_id, meta, at in rows:
         keys = [k for k in ((meta or {}).get("calibers") or []) if isinstance(k, str) and k.startswith(prefix)]
@@ -179,7 +179,7 @@ async def _chat_owners(session: AsyncSession, found: list[Use]) -> None:
     if missing:
         for turn_id, conv, rid in (await session.execute(
                 select(ConversationTurn.id, ConversationTurn.conversation_id, ConversationTurn.run_id)
-                .where(ConversationTurn.run_id.in_(missing)).order_by(ConversationTurn.created_at))).all():
+                .where(ConversationTurn.run_id.in_(missing)).order_by(ConversationTurn.created_at, ConversationTurn.id))).all():
             turns.setdefault(rid, (conv, turn_id))
     convs = sorted({c for c, _ in turns.values()})
     owners = dict((await session.execute(select(Conversation.id, Conversation.created_by)
@@ -219,7 +219,7 @@ async def _formal(session: AsyncSession, clause: Any, *, kind_of: Any) -> tuple[
     rows = list((await session.execute(
         select(Run).where(clause, Run.run_class == "formal", Run.status == "succeeded",
                           Run.manifest_hash.is_not(None), counted_runs())
-        .order_by(Run.finished_at.desc()).limit(MAX_FORMAL + 1))).scalars())
+        .order_by(Run.finished_at.desc(), Run.id.desc()).limit(MAX_FORMAL + 1))).scalars())
     truncated = len(rows) > MAX_FORMAL
     per: dict[tuple[str, str], int] = {}
     out: list[Use] = []
@@ -325,7 +325,7 @@ async def _exporters(session: AsyncSession, uses: list[Use]) -> None:
     by: dict[str, list[str]] = {}
     for rid, actor in (await session.execute(select(AuditEvent.subject_id, AuditEvent.actor).where(
             AuditEvent.action == EXPORTED, AuditEvent.subject_kind == "run",
-            AuditEvent.subject_id.in_(ids)).order_by(AuditEvent.at))).all():
+            AuditEvent.subject_id.in_(ids)).order_by(AuditEvent.at, AuditEvent.id))).all():
         if actor and actor not in by.setdefault(rid, []):
             by[rid].append(actor)
     for use in uses:

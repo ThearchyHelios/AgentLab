@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from datetime import timedelta, timezone
 
@@ -218,8 +219,10 @@ async def test_a_regression_is_pushed_without_numbers(client, monkeypatch, recei
     assert message["event"] == "eval.regressed" and message["title"] == "定时评测「虚构周回归」有退步"
     text = message["text"]
     assert "通过：0 / 1 题" in text and "退步：1 题" in text
+    # 消息里的编号（32 位十六进制）和发送时间是随机的、可能正好带着「310」：去掉再查，查的是写出来的文字
+    readable = re.sub(r"[0-9a-f]{32}", "<id>", json.dumps({**message, "sent_at": ""}, ensure_ascii=False))
     for secret in ("330", "310", "gmv", "orders", "paid_date"):
-        assert secret not in json.dumps(message, ensure_ascii=False), f"通知里不该有 {secret}"
+        assert secret not in readable, f"通知里不该有 {secret}"
     from app.db.models import NotifyDelivery
 
     async with SessionLocal() as session:

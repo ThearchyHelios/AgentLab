@@ -87,6 +87,9 @@ export const LEDGER_UI = {
     maskedPlaceholder: '已遮罩，请重新填写',
     pairs: '选择要对照的指标',
     pairsHint: '认不出这次的哪一列对应口径的哪个指标，请为要对照的列选一个口径卡上的指标',
+    /** 有预选的：按逐格比对证明了的那几列预选上，人可以改 */
+    pairsSuggested: '已按逐格比对的结论预选了能证明对应的列，请核对，可以改选',
+    pairSuggestedTag: '预选',
     pairNone: '不对照',
     pairEmpty: '至少选一组对照',
     launch: '发起对账',
@@ -130,6 +133,8 @@ export const LEDGER_UI = {
   recall: {
     /** 口径升版后在同一份数据上重算过、数没变 */
     checked: (caliber: string) => `已按口径${caliber} 核对，不影响`,
+    /** 部分指标行序不定：那几项没能核对，照实列出 */
+    checkedRowOrder: (names: string[]) => `其中${names.map((x) => `「${x}」`).join('、')}行序不定，没能核对`,
     /** 依据有变：目录里影响数字的项被驳回或修改、出现新码值、处理变化时改了目录（目录类），表或列被删、类型变了（表结构） */
     basis: (what: 'catalog' | 'structure' | 'other', items: number) =>
       `${what === 'structure' ? '依据的表结构有变' : what === 'catalog' ? '依据的数据目录有变' : '答案的依据有变'}`

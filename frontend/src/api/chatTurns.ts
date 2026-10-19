@@ -125,7 +125,12 @@ export function streamChatTurn(
             controller.abort()
             return
           }
-          if (typeof event.seq !== 'number' || event.seq <= lastSeq) continue   // 重连时重叠的那段只要一份
+          if (typeof event.seq !== 'number') {
+            // 助手等模型时的心跳不落库、不带 seq（服务端 chat/log.beat）：照收、不动 lastSeq，重连时服务端会补最近的一拍
+            if (event.type === 'op' && event.data?.op === 'heartbeat' && !closed) onEvent(event as ChatTurnEvent)
+            continue
+          }
+          if (event.seq <= lastSeq) continue   // 重连时重叠的那段只要一份
           lastSeq = event.seq
           got = true
           if (!closed) onEvent(event as ChatTurnEvent)

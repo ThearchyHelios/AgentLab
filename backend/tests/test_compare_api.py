@@ -476,3 +476,79 @@ async def test_real_runs_split_data_and_parameter_changes(client, engine_up, ord
     body = await get(client, f"/api/runs/{third}/compare/base")
     assert (body["base_run_id"], body["reason"]) == (second, "same_workflow")
     json.dumps(body, allow_nan=False)
+
+
+# --------------------------------------------------------------------------
+# 子工作流里的口径卡：还原输入按卡所在那一层找产出
+# --------------------------------------------------------------------------
+
+
+def sub_card_graph():
+    """子工作流：取数 → 原样解析 → 口径卡（东区金额读单元格；区域数读解析出来的整份结果的行，要从解析节点当时的产出还原）。"""
+    return chain(
+        node("s", "input", "开始"),
+        node("fetch", "tool", "区域取数", tool=f"db_query__{E2E_SOURCE}", args={"sql": E2E_SQL.replace(
+            "{{ input.start }}", "2026-08-31").replace("{{ input.end }}", "2026-09-06")}),
+        node("parse", "transform", "原样解析", mode="json", template="{{ nodes.fetch }}", assign_to="rows"),
+        node("card", "metrics", "子口径卡", caliber="周报口径", caliber_version="v1", metrics=[
+            {"id": "east", "name": "东区金额", "unit": "元", "decimals": 1, "format": "thousands",
+             "expression": "cell(nodes.fetch, 0, 'gmv')"},
+            {"id": "regions", "name": "区域数", "unit": "个", "decimals": 0, "format": "plain",
+             "expression": "len(nodes.parse.rows)"}]),
+        node("o", "output", "出口", fields=[{"name": "指标", "value": "{{ nodes.card.text }}"}]),
+    )
+
+
+async def test_cards_inside_a_subworkflow_restore_inputs_from_their_own_layer(client, engine_up, orders):
+    """子工作流里的卡（这次运行里的 id「sub/card」）取值链写的是子图里的 id（nodes.parse）：对比还原容器输入时要找「sub/parse」
+    的产出，不是父图里的 parse。父图里另有同名的 fetch、parse（查的是另一条 SQL），按层找才不会取错。"""
+    from tests import ledger_samples as S
+
+    path, source_id = orders
+    sub_id = await S.publish("区域子流程", graph=sub_card_graph(), level="draft")
+    workflow = await new_workflow("子流程周报")
+
+    def graph():
+        return chain(
+            node("start", "input", "开始"),
+            # 父图里同名的取数、解析节点：一行，和子图里那份三行的结果不一样
+            node("fetch", "tool", "父图取数", tool=f"db_query__{E2E_SOURCE}",
+                 args={"sql": "SELECT COUNT(*) AS n FROM orders"}),
+            node("parse", "transform", "父图解析", mode="json", template="{{ nodes.fetch }}"),
+            node("sub", "subgraph", "区域子流程", workflow_id=sub_id, workflow_version=1),
+            node("out", "output", "成果", fields=[{"name": "指标", "value": "{{ nodes.sub.output.指标 }}"}]),
+        )
+
+    async def finished() -> str:
+        run = await run_manager.start(graph=graph(), input_payload={}, workflow_id=workflow, workflow_name="子流程周报")
+        for _ in range(400):
+            await asyncio.sleep(0.05)
+            async with SessionLocal() as session:
+                row = await session.get(Run, run.id)
+            if row.status in ("succeeded", "failed") and row.manifest_seq is not None:
+                assert row.status == "succeeded", row.error
+                return run.id
+        raise AssertionError(f"运行 {run.id} 没有结束")
+
+    first = await finished()
+    db = sqlite3.connect(path)
+    db.execute("UPDATE orders SET amount = 1500.5 WHERE day = '2026-09-01'")
+    db.commit()
+    db.close()
+    await engines.invalidate(source_id)
+    second = await finished()
+
+    body = await get(client, f"/api/runs/{second}/compare?base={first}")
+    metrics = {m["metric_id"] if "metric_id" in m else m["id"]: m for m in body["metrics"]}
+    east, regions = metrics["east"], metrics["regions"]
+    assert (east["classification"], east["base"], east["target"]) == ("data_only", 1200.5, 1500.5)
+    # 区域数：从子图里那次取数的产出还原（三行），两次一样
+    assert (regions["base"], regions["target"]) == (3, 3)
+    assert regions["classification"] == "unchanged", regions
+    problems = [i.get("problem") for i in regions.get("inputs") or [] if i.get("problem")]
+    assert not problems, problems
+    # 区域数的那份结果顺着取值链认到子图里那次取数（两次之间改了数，快照不同），不是父图里同名的 fetch（两次一样）
+    [cell] = east["inputs"]
+    [rows] = regions["inputs"]
+    assert (rows["base_artifact"], rows["target_artifact"]) == (cell["base_artifact"], cell["target_artifact"])
+    assert rows["base_artifact"] != rows["target_artifact"]

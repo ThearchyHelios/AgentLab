@@ -49,7 +49,7 @@ def user_out(row: User) -> dict[str, Any]:
 
 @router.get("/users")
 async def list_users(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    rows = (await session.execute(select(User).order_by(User.created_at))).scalars()
+    rows = (await session.execute(select(User).order_by(User.created_at, User.id))).scalars()
     return {"items": [user_out(r) for r in rows]}
 
 
@@ -294,7 +294,7 @@ async def candidates(purpose: str, app_id: str | None = None, entry: str | None 
 @router.get("/audit")
 async def list_audit(subject_kind: str | None = None, subject_id: str | None = None, limit: int = 200,
                      session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    query = select(AuditEvent).order_by(AuditEvent.at.desc()).limit(max(1, min(limit, 1000)))
+    query = select(AuditEvent).order_by(AuditEvent.at.desc(), AuditEvent.id.desc()).limit(max(1, min(limit, 1000)))
     if subject_kind:
         query = query.where(AuditEvent.subject_kind == subject_kind)
     if subject_id:

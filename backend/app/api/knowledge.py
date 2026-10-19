@@ -221,7 +221,7 @@ async def list_documents(
     collection: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> list[Document]:
-    stmt = select(Document).order_by(Document.created_at.desc()).limit(300)
+    stmt = select(Document).order_by(Document.created_at.desc(), Document.id.desc()).limit(300)
     if collection:
         stmt = stmt.where(Document.collection == collection)
     return list((await session.execute(stmt)).scalars())
@@ -404,6 +404,10 @@ async def set_embedding(
     else:
         session.add(Setting(key=emb.EMBEDDING_SETTING_KEY, value=value))
     await session.commit()
+    # 多进程：别的进程照新的设置换向量模型（不换的话它们按旧模型检索、写旧模型的向量）
+    from app.cluster import caches
+
+    await caches.broadcast("embeddings")
     return {
         "embedder": emb.embedder_id(),
         "dim": emb.embedder_dim(),
@@ -473,8 +477,10 @@ class _ReindexJob:
         }
 
 
-#: 最近一次重建。只在进程里记：重建是幂等的，服务重启丢了进度，再点一次就是
+#: 最近一次重建（本进程里的）。重建是幂等的，服务重启丢了进度，再点一次就是。多进程时进度另记在设置表里（REINDEX_KEY，
+#: 带上做它的进程），别的进程上的「有没有在跑」「到哪了」读那一份；同一时间只跑一个靠跨进程的锁（kb-reindex）
 _REINDEX: _ReindexJob | None = None
+REINDEX_KEY = "cluster:kb_reindex"
 #: 后台任务要有人拿着引用，否则跑到一半可能被回收
 _REINDEX_TASK: Any = None
 
@@ -483,9 +489,59 @@ def reindex_job() -> _ReindexJob | None:
     return _REINDEX
 
 
-async def _run_reindex(job: _ReindexJob) -> None:
+async def _save_state(job: _ReindexJob) -> None:
+    """把进度记进设置表（多进程时别的进程读它；SQLite 只有一个进程，不记）。写不进去只记日志。"""
+    from app.cluster import counters, identity
+
+    if not counters.shared():
+        return
+    from app.db.base import SessionLocal
+    from app.db.models import Setting
+
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(Setting, REINDEX_KEY)
+            value = {**job.view(), "owner": identity.owner()}
+            if row is None:
+                session.add(Setting(key=REINDEX_KEY, value=value))
+            else:
+                row.value = value
+            await session.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("重建索引的进度没记进库")
+
+
+async def _stored_state() -> dict[str, Any] | None:
+    """别的进程记的那一份：还写着在跑、做它的进程却不在了的，照实说没做完。SQLite 只有一个进程，没有这一份。"""
+    from app.cluster import counters, state
+
+    if not counters.shared():
+        return None
+    from app.db.base import SessionLocal
+    from app.db.models import Setting
+
+    async with SessionLocal() as session:
+        row = await session.get(Setting, REINDEX_KEY)
+    value = dict(row.value) if row is not None and isinstance(row.value, dict) else None
+    if value is None:
+        return None
+    owner = value.pop("owner", None)
+    if value.get("state") == "running" and not (await state.live_for([owner])).alive(owner, local=False):
+        value.update(state="failed", error="重建索引未完成：做这件事的服务进程停止了", hint="再点一次重建就是")
+    return value
+
+
+async def _run_reindex(job: _ReindexJob, lock: Any = None) -> None:
+    import asyncio
+
     from app.db.base import SessionLocal, utcnow
 
+    async def report() -> None:
+        while True:
+            await _save_state(job)
+            await asyncio.sleep(1.0)
+
+    reporter = asyncio.ensure_future(report())
     try:
         async with SessionLocal() as session:
             out = await kb.reindex(session, job.collection, on_progress=job.chunk_step)
@@ -499,6 +555,10 @@ async def _run_reindex(job: _ReindexJob) -> None:
         job.state, job.error, job.hint = "failed", f"重建索引未完成：{reason}", hint or None
     finally:
         job.finished_at = utcnow()
+        reporter.cancel()
+        await _save_state(job)
+        if lock is not None:
+            await lock.give_back()
 
 
 @kb_router.post("/reindex")
@@ -538,12 +598,22 @@ async def reindex(
             409, f"正在重建索引（{_REINDEX.collection or '全部集合'}，"
                  f"已完成 {running['done']}/{running['total']}），请等待完成后再操作",
         )
+    # 多进程：别的进程上正在重建的，跨进程的锁占不到（app/cluster/mutex），同样 409，说法照它记在库里的进度
+    from app.cluster import mutex
+
+    lock = mutex.lock("kb-reindex")
+    if not await lock.try_take():
+        other = await _stored_state() or {}
+        raise HTTPException(
+            409, f"正在重建索引（{other.get('collection') or '全部集合'}，"
+                 f"已完成 {other.get('done', 0)}/{other.get('total', 0)}），请等待完成后再操作",
+        )
     job = _REINDEX = _ReindexJob(collection, chunks, memories)
     if background:
-        _REINDEX_TASK = asyncio.create_task(_run_reindex(job))
+        _REINDEX_TASK = asyncio.create_task(_run_reindex(job, lock))
         return JSONResponse(job.view(), status_code=202)
 
-    await _run_reindex(job)
+    await _run_reindex(job, lock)
     if job.state == "failed":
         raise HTTPException(502, job.error + (f"。{job.hint}" if job.hint else ""))
     return job.result
@@ -553,8 +623,13 @@ async def reindex(
 async def reindex_status() -> dict[str, Any]:
     """最近一次重建的进度：{state, phase, total, done, chunks, memories, result, error…}。
 
-    还没重建过返回 {state: "idle"}。
+    还没重建过返回 {state: "idle"}。多进程时本进程没在做的，读做它的进程记在库里的那一份。
     """
+    if _REINDEX is not None and _REINDEX.state == "running":
+        return _REINDEX.view()
+    stored = await _stored_state()
+    if stored is not None and (_REINDEX is None or str(stored.get("started_at") or "") > _REINDEX.view()["started_at"]):
+        return stored
     return _REINDEX.view() if _REINDEX is not None else {"state": "idle"}
 
 
@@ -635,7 +710,7 @@ class SkillOut(SkillIn):
 
 @skills_router.get("", response_model=list[SkillOut])
 async def list_skills(session: AsyncSession = Depends(get_session)) -> list[Skill]:
-    return list((await session.execute(select(Skill).order_by(Skill.created_at.desc()))).scalars())
+    return list((await session.execute(select(Skill).order_by(Skill.created_at.desc(), Skill.id.desc()))).scalars())
 
 
 @skills_router.post("", response_model=SkillOut, status_code=201)

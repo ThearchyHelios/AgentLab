@@ -219,8 +219,11 @@ async def run_backfill(session: AsyncSession, app: Any, version: AppVersion, vie
 _LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
 
 
-def _lock(app_id: str, view_id: str) -> asyncio.Lock:
-    return _LOCKS.setdefault((app_id, view_id), asyncio.Lock())
+def _lock(app_id: str, view_id: str) -> Any:
+    """跨进程的锁（app/cluster/mutex）：同一个视图的补算多进程时也只跑一份。"""
+    from app.cluster import mutex
+
+    return mutex.lock(f"app-backfill:{app_id}:{view_id}")
 
 
 async def _run_backfill(session: AsyncSession, app: Any, version: AppVersion, view_id: str, *, principal: Any,

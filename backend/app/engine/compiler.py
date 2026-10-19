@@ -136,7 +136,8 @@ def _wrap(
                     "attempt": attempt + 1,
                     "ts": time.time(),
                 }
-                return {**updates, "trail": [trail]}
+                # 节点自己交回的 trail（子工作流里走了驳回出口的那几步，multi._rejected_steps）排在这一步前面
+                return {**updates, "trail": [*(updates.get("trail") or []), trail]}
             except GraphBubbleUp:
                 # interrupt() / Command 靠异常向上传递控制流，不是执行失败：
                 # 必须原样放行，否则人工介入会被当成节点报错吞掉。
@@ -230,7 +231,10 @@ async def _rejected_exit(node: GraphNode, ctx: NodeContext, error: NodeRejected,
     # 节点在驳回之前已经算出的（NodeRejected.exit_updates：双盲复算的出具缺口、台账条目）照样交出；驳回的那几个键在上面
     payload = {**(extra.get("payload") or {}), **error.exit_payload()}
     nodes = run_ctx.spec.node_map()
-    to = [{"node_id": run_ctx.global_id(t), "label": nodes[t].title if t in nodes else t} for t in dict.fromkeys(targets)]
+    # 名字按这次运行的说法记（子工作流里的写「子工作流 › x」，RunContext.global_label）：父运行的图上没有子工作流里的节点，
+    # 实例页、通知、待办、Webhook 都照这个名字说
+    to = [{"node_id": run_ctx.global_id(t), "label": run_ctx.global_label(nodes[t].title if t in nodes else t)}
+          for t in dict.fromkeys(targets)]
     try:
         artifact_id: str | None = await put_json(payload, kind="node_output", run_id=run_ctx.run_id,
                                                  node_id=run_ctx.global_id(node.id),
@@ -244,7 +248,7 @@ async def _rejected_exit(node: GraphNode, ctx: NodeContext, error: NodeRejected,
              outcome="rejected", **said, to=to, **({"evidence": ledger} if ledger else {}))
     updates: dict[str, Any] = {"nodes": {node.id: payload}, "trail": [{
         "node_id": node.id, "type": str(node.type), "duration_ms": elapsed, "attempt": attempt, "ts": time.time(),
-        "outcome": "rejected", "label": node.title, **said, "to": to}]}
+        "outcome": "rejected", "label": run_ctx.global_label(node.title), **said, "to": to}]}
     if ledger:
         updates["evidence"] = ledger
     if extra.get("usage"):

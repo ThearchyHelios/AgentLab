@@ -98,6 +98,8 @@ SNAPSHOT_TAMPERED = "查询快照与哈希不一致，疑似被修改，不比�
 SNAPSHOT_MISSING = "查询快照读不出来，不比对"
 NO_SQL = "查询快照里没有 SQL，不比对"
 PARSE_FAILED = "这次的 SQL 无法解析，没有比对"
+#: 指标按「同一行」认来自口径，可那一行重跑时不一定还是它（说法在 labels，这里给调用方一个名字）
+ROW_ORDER_UNSTABLE = ledger_labels.ROW_ORDER_UNSTABLE
 MERGED = "合并查询的格不和口径比对（它的数来自各个输入的查询）"
 COMPOSED_UNPROVEN = "这条查询出自助手选用的口径，但和口径的取数没能证明一致（可能被改过）"
 MORE_CANDIDATES = "另有 {n} 份相关口径没有比对（每条查询最多比 {max} 份）"
@@ -546,7 +548,7 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
     等价）/ none（没有相关的口径）/ skipped（没比完：超时、解析失败、快照读不出）。composed 是 composed_nodes 的结果，
     不给就没有助手选用的。referenced 是报告引用了哪条查询的哪几列（labels.referenced_columns：{查询快照: {列名}}）：
     给了的，整条比不等价时按引用的列投影再比（_projected）；不给就只整条比。纯计算，从不抛异常。评测逐题比 SQL 也调它。"""
-    from app.data.sql_semantics import match_template, normalize_sql, one_row
+    from app.data.sql_semantics import match_template, normalize_sql, one_row, ordered
 
     out: list[dict[str, Any]] = []
     for query in queries:
@@ -567,6 +569,9 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
         if normalize_sql(query.sql, query.dialect).parse_error:
             out.append({**row, "status": "skipped", "reason": PARSE_FAILED, "candidates": []})
             continue
+        # 按行号取的那一格重跑时还是不是同一行（sql_semantics.row_stable）：指标标签按「同一行」认来自口径时要看它
+        row["ordered"] = ordered(query.sql, query.dialect)
+        row["one_row"] = one_row(query.sql, query.dialect)
         candidates: list[dict[str, Any]] = []
         for caliber, fetch in pool[:MAX_CANDIDATES]:
             if deadline is not None and time.monotonic() > deadline:
@@ -600,7 +605,6 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
         if wanted is not None and len(wanted) >= 2 and status == "related":
             # 整条（按全部引用列投影）没证明：被引用的几列逐格各比一次，每个数按它自己那一格的结论标（labels.cell_label）
             row["cells"] = _cells(query, wanted, pool[:MAX_CANDIDATES], candidates, chosen, deadline)
-            row["one_row"] = one_row(query.sql, query.dialect)
         out.append(row)
     return out
 
@@ -717,6 +721,18 @@ async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float | No
 
     运行一封存就比的（trigger=sealed）比完接着看能不能按口径自动正式出具（ledger/issue.auto_issue，拍板 L1）：事后补比、
     按需比的不自动出具——那是按现在的口径回看老答案，不该替人补发正式运行。"""
+    from app.cluster import mutex
+
+    # 多进程：封存时比（执行它的进程）和补比（当班进程）可能同时来；跨进程的锁里一次一个，补比、封存时比先看比过没有
+    async with mutex.lock(f"ledger-match:{run_id}"):
+        if trigger in ("sealed", "backfill"):
+            async with SessionLocal() as session:
+                if await store.matched_run_ids(session, [run_id]):
+                    return None
+        return await _match_run(run_id, trigger=trigger, timeout=timeout)
+
+
+async def _match_run(run_id: str, *, trigger: str, timeout: float | None) -> str | None:
     from app.api.evidence import _sealed
     from app.api.settings import ledger_settings
 
@@ -782,7 +798,7 @@ async def backfill(*, days: int = BACKFILL_DAYS, limit: int = BACKFILL_LIMIT) ->
             select(Run.id).where(Run.status == "succeeded", Run.run_class != "formal",
                                  Run.origin_kind.in_(EXPLORE_ORIGINS), Run.manifest_hash.is_not(None),
                                  Run.finished_at >= since)
-            .order_by(Run.finished_at.desc()).limit(limit))).all()]
+            .order_by(Run.finished_at.desc(), Run.id.desc()).limit(limit))).all()]
         done = await store.matched_run_ids(session, ids)
     count = 0
     for run_id in ids:

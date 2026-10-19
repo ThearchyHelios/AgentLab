@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +37,7 @@ from app.data import schema_diff as sd
 from app.data.names import name_key
 from app.db.base import utcnow
 from app.db.models_sources import SourceChange
+from app.db.portable import json_eq
 
 logger = logging.getLogger(__name__)
 
@@ -150,13 +151,21 @@ async def record(session: AsyncSession, source: Any, change: NewChange, detected
         raise ValueError(f"不认识的严重程度：{change.severity}")
     fp = fingerprint(change.kind, change.table, change.column, change.key)
     now = utcnow()
+    # 已经有了的：先按条件 UPDATE 记下又见到一次（同时占住那一行：SQLite 上拿到写锁、PostgreSQL 上锁住这一行），再读出来改
+    # 影响面——口径试算同时往 affects 里记没试算的那几版（ledger/recall._probe_skipped，同样先占住再读改写），谁也不盖掉谁
+    seen = await session.execute(update(SourceChange).where(
+        SourceChange.source_id == source.id, SourceChange.fingerprint == fp)
+        .values(last_seen_at=now, seen_count=func.coalesce(SourceChange.seen_count, 0) + 1)
+        .execution_options(synchronize_session=False))
     found = (await session.execute(select(SourceChange).where(
-        SourceChange.source_id == source.id, SourceChange.fingerprint == fp))).scalar_one_or_none()
+        SourceChange.source_id == source.id, SourceChange.fingerprint == fp)
+        .execution_options(populate_existing=True))).scalar_one_or_none() if seen.rowcount else None
     if found is not None:
-        found.last_seen_at = now
-        found.seen_count = int(found.seen_count or 0) + 1
         if found.status == "open":
-            found.affects, found.before, found.after = change.affects, change.before, change.after
+            # 影响按这一次刷新；表结构变了之后口径试算的情况（ledger/recall 记的 probes）不是探查算的，留着
+            probes = (found.affects or {}).get("probes") if isinstance(found.affects, dict) else None
+            found.affects = {**(change.affects or {}), "probes": probes} if probes else change.affects
+            found.before, found.after = change.before, change.after
             if SEVERITY_RANK[change.severity] > SEVERITY_RANK.get(found.severity, 0):
                 found.severity = change.severity
         return found, False
@@ -227,7 +236,8 @@ def change_out(row: SourceChange) -> dict[str, Any]:
         "severity": row.severity, "summary": summary(row), "detected_at": _iso(row.detected_at),
         "last_seen_at": _iso(row.last_seen_at), "seen_count": row.seen_count or 1,
         "detected_by": dict(row.detected_by or {}), "basis": row.basis, "before": row.before, "after": row.after,
-        "affects": row.affects or {"catalog": [], "templates": [], "rules_touched": False},
+        # 缺的几项补上空的：只记了口径试算情况（ledger/recall 的 probes）的那种没有 catalog、templates
+        "affects": {"catalog": [], "templates": [], "rules_touched": False, **(row.affects or {})},
         "struct_version_before": row.struct_version_before, "struct_version_after": row.struct_version_after,
         "status": row.status, "resolution": row.resolution,
     }
@@ -337,7 +347,7 @@ async def notify_after_job(source_id: str, job_id: str) -> int:
             n = int((await session.execute(select(func.count()).select_from(SourceChange).where(
                 SourceChange.source_id == source_id, SourceChange.severity == "action",
                 SourceChange.status == "open",
-                func.json_extract(SourceChange.detected_by, "$.job_id") == job_id))).scalar() or 0)
+                json_eq(SourceChange.detected_by, "job_id", job_id)))).scalar() or 0)
         if n:
             from app.notify import service
 

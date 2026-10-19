@@ -120,7 +120,7 @@ async def pick_base(session: Any, target: Run, *, schedule_only: bool = False) -
                    Run.created_at < target.created_at)
         base = (await session.execute(
             select(Run).where(*earlier, Run.status == "succeeded", Run.manifest_hash.is_not(None))
-            .order_by(Run.created_at.desc()).limit(1))).scalars().first()
+            .order_by(Run.created_at.desc(), Run.id.desc()).limit(1))).scalars().first()
         if base is None:
             continue
         between = await session.scalar(select(func.count()).select_from(Run).where(
@@ -184,9 +184,15 @@ async def _side(run: Run, sealed: _Sealed, masks: _Masks, kinds: dict[str, Any])
               for artifact, info in sealed.queries.items()}
     returned = _returned(sealed)
 
-    def sources(started: int) -> recompute.Sources:
-        return recompute.Sources(load=loader, queries=tuple(sealed.queries), outputs=_outputs_before(sealed, started),
-                                 masked=masked, returned=returned, finished=_finished_before(sealed, started))
+    def sources(started: int, card_node: str = "") -> recompute.Sources:
+        # 节点产出、跑完的时刻按口径卡所在那一层的 id 交进去（engine/lineage.in_scope，同推演 api/whatif._sources）：子工作流
+        # 里的卡（「子工作流节点 id/卡」）取值链写的是子图里的 id，只看同一张子图里的节点，父图里同名的不算
+        from app.engine.lineage import in_scope
+
+        return recompute.Sources(load=loader, queries=tuple(sealed.queries),
+                                 outputs=in_scope(_outputs_before(sealed, started), card_node),
+                                 masked=masked, returned=returned,
+                                 finished=in_scope(_finished_before(sealed, started), card_node))
 
     return engine.Side(run=run_ref(run), graph=sealed.graph, events=sealed.events, cards=cards, load=loader,
                        masked=masked, sources=sources, dialects=kinds, inputs=dict(run.input or {}))

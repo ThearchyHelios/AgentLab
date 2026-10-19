@@ -5075,6 +5075,8 @@ export const DUAL_CHECK_TEXT = {
     /** 认不出任何指标时留的出口：驳回后节点按人工驳回失败 */
     reject: '驳回并终止',
     emptyReject: '驳回后节点失败，本次运行终止。可以在备注中说明原因',
+    /** 节点接了驳回出口（中断内容的 reject_route）：驳回后转到那一步 */
+    emptyRejectRoute: (goes: string) => `驳回后${goes}。可以在备注中说明原因`,
     rejected: '已驳回，本次运行终止',
   },
 

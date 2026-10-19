@@ -121,8 +121,10 @@ def spawn(coro: Coroutine[Any, Any, Any]) -> None:
 
 async def drain() -> None:
     """等后台的推送都推完（测试、关停用）。"""
-    while _background:
-        await asyncio.gather(*list(_background), return_exceptions=True)
+    from app.core.background import drain as drain_tasks
+
+    # 不写成 while _background: await gather(...)：别的事件循环上做完、还没摘掉的任务会让那样的循环空转（core/background）
+    await drain_tasks(_background)
 
 
 async def personal_url_problem(url: str) -> str | None:
@@ -262,7 +264,11 @@ async def _where(session: Any, run: Run | None) -> str:
 #: 邮件渠道：设置表里一行 {用户 id: 建的时间}（通知自己记的账，键的开头同 notify/digest.STATE_PREFIX，设置接口不列）。只在
 #: 第一次派到待办时建一次——本人删掉了就是不要，不再替他建回来
 MAIL_AUTO_KEY = "notify_state:mail_auto"
-_mail_auto_lock = asyncio.Lock()
+#: 先读后写那一行：跨进程的锁（app/cluster/mutex）
+def _mail_auto_lock() -> Any:
+    from app.cluster import mutex
+
+    return mutex.lock("notify-mail-auto")
 
 
 async def ensure_assignee_mail(users: list[str]) -> int:
@@ -276,7 +282,7 @@ async def ensure_assignee_mail(users: list[str]) -> int:
 
     if not users or current_mode() == "off":
         return 0
-    async with _mail_auto_lock, SessionLocal() as session:
+    async with _mail_auto_lock(), SessionLocal() as session:
         cfg = await mail.load_config(session)
         if not (cfg.enabled and cfg.default_for_assignees):
             return 0
@@ -405,7 +411,9 @@ async def notify_recall(task_id: str, users: list[str]) -> int:
 
         def message(answers: str, tasks: int, link: tuple[str, str] | None) -> dict[str, Any]:
             return {"event": event, "status": "pending", "ok": False,
-                    "title": recall.CHANGED_TITLE.format(name=name[:80] or "口径", version=origin.get("to_version")),
+                    # 待办开出来时按结论起的标题（数变了 / 行序不定、没能核对）：通知和待办说同一句
+                    "title": (recall.ROW_ORDER_TITLE if "行序不定" in (task.title or "") else recall.CHANGED_TITLE)
+                    .format(name=name[:80] or "口径", version=origin.get("to_version")),
                     "lines": [*head, ("答案", answers), *([("待办", f"{tasks} 条")] if tasks > 1 else []), *tail],
                     "links": [link] if base and link else [],
                     "subject": {"task_id": task_id, "run_id": task.run_id, "workflow_id": origin.get("workflow_id")}}

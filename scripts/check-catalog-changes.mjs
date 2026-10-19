@@ -178,6 +178,9 @@ function freshChanges() {
         templates: [{ workflow_id: 'wf-check-weekly', name: '门店周报', version: 3, level: 'published', impact: 'direct',
           nodes: [{ node_id: 'q_orders', label: '取订单', type: 'tool', impact: 'direct', breaks: true, unknown_columns: ['status'] }] }],
         rules_touched: true,
+        // 表结构变了之后没能试算的口径（服务端 ledger/recall._probe_skipped）：缺哪几个参数
+        probes: [{ workflow_id: 'wf-check-weekly', version: 3, name: '门店周报', outcome: 'skipped', missing: ['start', 'end'],
+          reason: '「start」必填；「end」必填', inputs_from: 'defaults' }],
       },
       actions: [act('clean_catalog'), act('redraft'), act('reprofile', NOT_PROFILED), ...COMMON] }),
     change({ seq: 14, id: 'chg-codes', table: 'orders', column: 'channel', kind: 'codes_new', category: 'value', severity: 'action',
@@ -458,6 +461,8 @@ await section('变化：依据、前后、影响面、动作照服务端给的�
   check('……写死这张表的已发布模板：「这条 SQL 现在会报列不存在（status）」', (await textOf(d.locator('[data-change-node="q_orders"]'))).includes('这条 SQL 现在会报列不存在（status）')
         && (await d.locator('[data-change-node="q_orders"]').getAttribute('data-change-breaks')) === '1')
   check('……模板链到编排页那个节点', (await d.locator('[data-change-template] a').first().getAttribute('href')) === '/studio/wf-check-weekly?focus=q_orders')
+  check('……没能试算的口径照实写缺哪几个参数', (await textOf(d.locator('[data-change-probe="wf-check-weekly"]')))
+    .includes('「门店周报」v3：缺少参数 start、end，没有试算'))
   check('……有效记录条件用到了这一列', (await textOf(d.locator('[data-change-rules]'))).includes('有效记录条件用到了这一列'))
   check('动作照服务端给的：清理目录项、重新起草、重新剖析、知道了、误报', JSON.stringify(await attrs(d.locator('[data-change-action]'), 'data-change-action'))
         === '["clean_catalog","redraft","reprofile","acknowledge","dismiss"]')

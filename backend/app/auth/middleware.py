@@ -197,7 +197,7 @@ class AuthMiddleware:
                 keys.note(principal.key_id, method=method, route=path, status=principal.status, run_id=None, ip=ip)
             await _reply(send, principal.status, principal.detail, principal.code)
             return
-        if wait := keys.take(principal.key_id):
+        if wait := await keys.take_shared(principal.key_id):
             keys.note(principal.key_id, method=method, route=path, status=429, run_id=None, ip=ip)
             await _reply(send, 429, f"这把访问密钥的请求太频繁（每分钟最多 {keys.RATE_PER_MINUTE} 次），请 {wait} 秒后再试",
                          keys.KEY_RATE_LIMITED, [(b"retry-after", str(wait).encode())])

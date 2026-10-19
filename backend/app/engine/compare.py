@@ -183,8 +183,9 @@ class Side:
       没有的，就是读不出来或者被改过
     - load：工件 id → 内容，只认封存范围内的；文件不在返回 None，内容和哈希对不上抛 ValueError
     - masked：查询快照 → 要遮的列（小写）：查询当时记下的加数据源现在设的
-    - sources：口径卡那次执行开始的事件序号 → 推演重算还原输入要用的 Sources（节点产出、跑完的时刻都按那一刻）。
-      不给就按 load、masked 拼一个最小的：nodes.* 这类容器输入还原不出来
+    - sources：(口径卡那次执行开始的事件序号, 卡在这次运行里的节点 id) → 推演重算还原输入要用的 Sources（节点产出、跑完的
+      时刻都按那一刻，按卡所在那一层的 id 记：子工作流里的卡只看同一张子图里的节点）。不给就按 load、masked 拼一个最小的：
+      nodes.* 这类容器输入还原不出来
     - dialects：数据源名 → 类型（sqlite / postgres …），规范化 SQL 时按它的方言解析
     - inputs：运行输入（Run.input）
     """
@@ -195,7 +196,7 @@ class Side:
     cards: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
     load: Callable[[str], Any] = lambda _: None
     masked: Mapping[str, frozenset[str]] = field(default_factory=dict)
-    sources: Callable[[int], recompute.Sources] | None = None
+    sources: Callable[[int, str], recompute.Sources] | None = None
     dialects: Mapping[str, str | None] = field(default_factory=dict)
     inputs: dict[str, Any] = field(default_factory=dict)
 
@@ -454,7 +455,7 @@ def _plan_card(side: Side, card: _Card, queries: list[_Query]) -> None:
     """按推演重算的规则还原卡上每个指标的输入：落在哪份快照上、是不是遮罩列、容器的完整值。"""
     if card.content is None:
         return
-    sources = side.sources(card.started) if side.sources is not None else recompute.Sources(
+    sources = side.sources(card.started, card.node_id) if side.sources is not None else recompute.Sources(
         load=side.load, queries=tuple(dict.fromkeys(q.artifact for q in queries)), masked=side.masked)
     store = recompute._Store(sources)
     card.sources = sources

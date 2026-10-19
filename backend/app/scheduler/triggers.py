@@ -248,29 +248,40 @@ async def find_cycle(session: Any, *, schedule_id: str | None, trigger: dict[str
     start, target = subject_of(trigger), target_workflow_id
     if start == target:
         return [start, start]
-    edges: dict[str, set[str]] = {}
-    rows = (await session.execute(select(Schedule.id, Schedule.trigger, Schedule.workflow_id, Schedule.target_kind)
-                                  .where(Schedule.trigger_kind == "event"))).all()
-    for sid, other, workflow_id, kind in rows:
-        if sid == schedule_id or (kind or "workflow") != "workflow" or not isinstance(other, dict):
-            continue
-        if other.get("event") == "workflow.finished" and subject_of(other) and workflow_id:
-            edges.setdefault(subject_of(other), set()).add(workflow_id)
-    # 从 B 出发找回 A 的路（广度优先，取最短的一条说给人听）
-    parent: dict[str, str | None] = {target: None}
-    queue = [target]
-    while queue:
-        node = queue.pop(0)
-        for nxt in sorted(edges.get(node, ())):
-            if nxt in parent:
+
+    async def edges_from(nodes: list[str]) -> dict[str, set[str]]:
+        """这几个工作流跑完会触发哪些工作流：只读「上游工作流运行成功结束」、对象是它们的那几个任务（按触发条件里的事件种类和
+        对象筛，SQLAlchemy 的通用 JSON 访问），不把全部事件触发任务读出来。"""
+        rows = (await session.execute(select(Schedule.id, Schedule.trigger, Schedule.workflow_id, Schedule.target_kind)
+                                      .where(Schedule.trigger_kind == "event",
+                                             Schedule.trigger["event"].as_string() == "workflow.finished",
+                                             Schedule.trigger["workflow_id"].as_string().in_(nodes)))).all()
+        out: dict[str, set[str]] = {}
+        for sid, other, workflow_id, kind in rows:
+            if sid == schedule_id or (kind or "workflow") != "workflow" or not isinstance(other, dict):
                 continue
-            parent[nxt] = node
-            if nxt == start:
-                back = [start]                  # A ← … ← B，倒着记
-                while back[-1] != target:
-                    back.append(parent[back[-1]] or target)
-                return [start, *reversed(back)]
-            queue.append(nxt)
+            if other.get("event") == "workflow.finished" and subject_of(other) and workflow_id:
+                out.setdefault(subject_of(other), set()).add(workflow_id)
+        return out
+
+    # 从 B 出发找回 A 的路（广度优先，一层查一次，取最短的一条说给人听）
+    parent: dict[str, str | None] = {target: None}
+    frontier = [target]
+    while frontier:
+        edges = await edges_from(frontier)
+        nxt_level: list[str] = []
+        for node in frontier:
+            for nxt in sorted(edges.get(node, ())):
+                if nxt in parent:
+                    continue
+                parent[nxt] = node
+                if nxt == start:
+                    back = [start]                  # A ← … ← B，倒着记
+                    while back[-1] != target:
+                        back.append(parent[back[-1]] or target)
+                    return [start, *reversed(back)]
+                nxt_level.append(nxt)
+        frontier = nxt_level
     return None
 
 
@@ -536,7 +547,7 @@ async def sample(session: Any, trigger: dict[str, Any]) -> Sample:
         query = query.where(Run.app_id == trigger["app_id"])
     if trigger.get("origin_kind"):
         query = query.where(Run.origin_kind == trigger["origin_kind"])
-    candidates = list((await session.execute(query.order_by(Run.finished_at.desc()).limit(SAMPLE_SCAN)))
+    candidates = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.id.desc()).limit(SAMPLE_SCAN)))
                       .scalars()) if subject else []
     # 和真派发同一套条件（matches）：缺省不认的途经驳回、应用补算跳过，取合条件的最近一次
     for run in candidates:

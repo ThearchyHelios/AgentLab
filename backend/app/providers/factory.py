@@ -53,7 +53,7 @@ class ProviderNotConfigured(RuntimeError):
 
 
 async def list_providers(session: AsyncSession) -> list[Provider]:
-    rows = await session.execute(select(Provider).order_by(Provider.created_at))
+    rows = await session.execute(select(Provider).order_by(Provider.created_at, Provider.id))
     return list(rows.scalars())
 
 

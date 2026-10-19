@@ -913,3 +913,131 @@ async def test_restart_resumes_the_auto_batch_and_settles_finished_runs(monkeypa
     await recall.resume()
     async with SessionLocal() as session:
         assert len(await recall.recall_runs(session, wf, 2)) == 2, "再重启一次：都算过了，不再发起"
+
+
+async def test_a_probe_that_cannot_assemble_its_inputs_says_which_are_missing(engine_up, caplog):
+    """表结构变了、口径凑不齐参数（这一版没有正式运行、也没有等价的问数回答，必填的入口字段又没有缺省值）：不试算，照实记一条
+    「缺哪几个参数」——日志里有，变化记录的影响里也有（变化页照它写），不再一声不响地跳过。之后这条变化再被探查到一次，记下的
+    不丢。"""
+    import logging
+
+    from app.data import source_changes as sc
+    from app.db.models import DataSource
+    from app.db.models_sources import SourceChange
+
+    wf = await S.publish()
+    async with SessionLocal() as session:
+        source = (await session.execute(select(DataSource).where(DataSource.name == S.CURRENT["source"]))).scalar_one()
+        change, _ = await sc.record(session, source, sc.NewChange(kind="column_removed", table="orders", column="amount",
+                                                                  severity="action", key="v3"),
+                                    sc.Detected(job_kind="introspect"))
+        await session.commit()
+        out = sc.change_out(change)
+    with caplog.at_level(logging.INFO, logger="app.ledger.recall"):
+        await recall.process_change(out)
+    async with SessionLocal() as session:
+        probes = [r for r in (await session.execute(select(Run).where(Run.origin_kind == "recall"))).scalars()
+                  if (r.origin or {}).get("change") == out["id"]]
+        row = (await session.execute(select(SourceChange).where(SourceChange.id == out["id"]))).scalar_one()
+    assert probes == [], "凑不齐参数：不试算"
+    [note] = row.affects["probes"]
+    assert (note["workflow_id"], note["version"], note["outcome"]) == (wf, 1, "skipped")
+    assert note["missing"] == ["start", "end"] and "start" in note["reason"], note
+    assert any("start、end" in r.getMessage() for r in caplog.records), [r.getMessage() for r in caplog.records]
+    # 变化接口（变化页）照样带着
+    assert sc.change_out(row)["affects"]["probes"] == [note]
+    # 同一条变化再被探查到一次：影响按新的一次刷新，试算的记录不丢
+    async with SessionLocal() as session:
+        source = await session.get(DataSource, row.source_id)
+        await sc.record(session, source, sc.NewChange(kind="column_removed", table="orders", column="amount",
+                                                      severity="action", key="v3"), sc.Detected(job_kind="introspect"))
+        await session.commit()
+        again = (await session.execute(select(SourceChange).where(SourceChange.id == out["id"]))).scalar_one()
+    assert again.affects["probes"] == [note]
+
+
+async def test_probe_notes_and_change_refreshes_do_not_overwrite_each_other(engine_up):
+    """同一条变化上几处同时写 affects（几版口径各记一条没试算、探查又刷新了一次影响）：先占住那一行再读改写，谁也不盖掉谁。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.data import source_changes as sc
+    from app.db.models import DataSource
+    from app.db.models_sources import SourceChange
+
+    async with SessionLocal() as session:
+        source = (await session.execute(select(DataSource).where(DataSource.name == S.CURRENT["source"]))).scalar_one()
+        change, _ = await sc.record(session, source, sc.NewChange(kind="column_removed", table="orders", column="amount",
+                                                                  severity="action", key="v4",
+                                                                  affects={"catalog": [], "templates": [],
+                                                                           "rules_touched": False}),
+                                    sc.Detected(job_kind="introspect"))
+        await session.commit()
+        out = sc.change_out(change)
+        source_id = source.id
+
+    async def refresh() -> None:
+        async with SessionLocal() as session:
+            src = await session.get(DataSource, source_id)
+            await sc.record(session, src, sc.NewChange(kind="column_removed", table="orders", column="amount",
+                                                       severity="action", key="v4",
+                                                       affects={"catalog": [], "templates": [], "rules_touched": True}),
+                            sc.Detected(job_kind="introspect"))
+            await session.commit()
+
+    calibers = [SimpleNamespace(workflow_id=f"wf-{i}", version=1) for i in range(6)]
+    await asyncio.gather(*(recall._probe_skipped(out, c, None, {}, "defaults", "缺参数") for c in calibers), refresh())
+    async with SessionLocal() as session:
+        row = (await session.execute(select(SourceChange).where(SourceChange.id == out["id"]))).scalar_one()
+    assert sorted(p["workflow_id"] for p in row.affects["probes"]) == [f"wf-{i}" for i in range(6)], row.affects
+    assert row.affects["rules_touched"] is True, "探查刷新的那一份也在"
+
+
+# --------------------------------------------------------------------------
+# 行序不定的指标（召回比不出变没变）：不当「没变」
+# --------------------------------------------------------------------------
+
+
+async def test_all_metrics_with_unstable_row_order_cannot_be_checked_and_open_a_task(monkeypatch):
+    """全部指标都行序不定：结论写「核对不了（行序不定）」，开召回待办请人核对，不在原答案上记「已核对，不影响」。"""
+    wf = await S.publish()
+    a1 = await answer(monkeypatch)
+    graph = S.caliber_graph()
+    graph["nodes"][3]["data"]["config"]["instructions"] = "写周销售（新的写法）"
+    await publish_v2(wf, graph=graph)
+    monkeypatch.setattr(recall, "_rows_stable", lambda pinned, metric: False)
+    [done] = await run_recall(wf)
+    assert done.status == "succeeded", done.error
+    [settled] = [d for d in await events(done.id, EventType.LEDGER_RECALLED) if d.get("role") == "recall"]
+    assert settled["outcome"] == "row_order" and settled["changed"] is None
+    assert settled["row_order_metrics"] == ["销售额"] and settled["metrics"][0]["row_order"] == "unstable"
+    [task] = await recall_tasks(done.id)
+    assert task.title == "口径「周销售」升到 v2，答案里的数行序不定、没能核对，请人工核对"
+    assert await events(a1.id, EventType.LEDGER_RECALLED) == [], "核对不了的不在原答案上记「不影响」"
+    async with SessionLocal() as session:
+        view = await recall.batches(session, wf, 2)
+        state, _ = await recall.outcome_of(session, done)
+    assert state == "row_order" and view["groups"][0]["state"] == "row_order" and view["counts"]["row_order"] == 1
+
+
+async def test_some_metrics_with_unstable_row_order_are_listed_and_the_rest_decide(monkeypatch):
+    """部分行序不定：已判定的照常判（数没变就在原答案上记不影响），行序不定的那几项在结论和原答案的记账里照实列出。"""
+    two = S.caliber_graph()
+    card = two["nodes"][2]["data"]["config"]
+    card["metrics"] = [*card["metrics"], {**card["metrics"][0], "id": "gmv2", "name": "销售额（另算）"}]
+    wf = await S.publish(graph=two)
+    a1 = await answer(monkeypatch)
+    v2 = S.caliber_graph()
+    v2["nodes"][2]["data"]["config"]["metrics"] = card["metrics"]
+    v2["nodes"][3]["data"]["config"]["instructions"] = "写周销售（新的写法）"
+    await publish_v2(wf, graph=v2)
+    monkeypatch.setattr(recall, "_rows_stable", lambda pinned, metric: metric.get("id") != "gmv2")
+    [done] = await run_recall(wf)
+    assert done.status == "succeeded", done.error
+    [settled] = [d for d in await events(done.id, EventType.LEDGER_RECALLED) if d.get("role") == "recall"]
+    assert settled["outcome"] == "unchanged" and settled["changed"] is False
+    assert settled["row_order_metrics"] == ["销售额（另算）"]
+    assert [m.get("changed") for m in settled["metrics"]] == [False, None]
+    [booked] = await events(a1.id, EventType.LEDGER_RECALLED)
+    assert booked["changed"] is False and booked["row_order_metrics"] == ["销售额（另算）"]
+    assert await recall_tasks(done.id) == []

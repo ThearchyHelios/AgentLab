@@ -309,7 +309,7 @@ async def queue(session: Any, *, principal: Any) -> dict[str, Any]:
     kinds = {name: kind for name, kind in (await session.execute(select(DataSource.name, DataSource.kind))).all()}
     runs = list((await session.execute(select(Run).where(
         Run.origin_kind == "chat", Run.status == "succeeded", Run.run_class != "formal", counted_runs())
-        .order_by(Run.created_at.desc()).limit(RUN_LIMIT))).scalars())
+        .order_by(Run.created_at.desc(), Run.id.desc()).limit(RUN_LIMIT))).scalars())
     turns = await _turns(session, runs)
     by_run = {r.id: r for r in runs}
     # 每次运行最新的一份比对（store.latest 按事件认这一次封存的；这里只要内容，按工件引用的时间取最新）

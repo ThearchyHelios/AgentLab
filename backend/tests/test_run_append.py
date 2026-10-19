@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 from collections import Counter
 
 import pytest
@@ -25,7 +24,6 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.core.bus import bus
-from app.core.config import settings
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent
@@ -34,6 +32,7 @@ from app.engine.context import NodeError
 from app.engine.runner import RunManager, run_manager, verify_manifest
 from app.engine.schema import NodeType
 from app.tools.registry import register
+from tests import appdb
 
 #: Agent 场景里工具真正执行的次数。注册表是进程级的，工具只注册一次，计数按测试清零
 CALLS: list[str] = []
@@ -162,12 +161,7 @@ async def _pending(run_id: str) -> list[Approval]:
 
 def _sql(statement: str, *params) -> None:
     """另开一条连接改库：模拟别处（恢复、继续运行、另一个写入者）抢在中间提交。"""
-    db = sqlite3.connect(settings.db_path, timeout=5)
-    try:
-        db.execute(statement, params)
-        db.commit()
-    finally:
-        db.close()
+    appdb.execute((statement, params))
 
 
 # --------------------------------------------------------------------------
@@ -226,12 +220,7 @@ async def test_a_resume_that_wins_the_row_leaves_nothing_behind(monkeypatch):
 
     def resumed_in_between(run_id, value):
         if run_id == paused.id:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                db.execute("UPDATE runs SET status = 'running' WHERE id = ?", (paused.id,))
-                db.commit()
-            finally:
-                db.close()
+            appdb.execute(("UPDATE runs SET status = 'running' WHERE id = ?", (paused.id,)))
         set_seq(run_id, value)
 
     monkeypatch.setattr(bus, "set_seq", resumed_in_between)
@@ -252,14 +241,9 @@ async def test_events_written_elsewhere_in_between_win(monkeypatch):
 
     def written_in_between(run_id, value):
         if run_id == paused.id:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                db.execute("INSERT INTO run_events (id, run_id, seq, type, node_id, ts, data) "
-                           "VALUES ('elsewhere-1', ?, ?, 'log', NULL, 0, '{}')", (paused.id, taken))
-                db.execute("UPDATE runs SET last_seq = ? WHERE id = ?", (taken, paused.id))
-                db.commit()
-            finally:
-                db.close()
+            appdb.execute(("INSERT INTO run_events (id, run_id, seq, type, node_id, ts, data) "
+                           "VALUES ('elsewhere-1', ?, ?, 'log', NULL, 0, '{}')", (paused.id, taken)),
+                          ("UPDATE runs SET last_seq = ? WHERE id = ?", (taken, paused.id)))
         set_seq(run_id, value)
 
     monkeypatch.setattr(bus, "set_seq", written_in_between)
@@ -352,12 +336,8 @@ async def test_published_only_once_stored_and_never_when_not_written(monkeypatch
 
     async def stored_when_published(event):
         if event.type == EventType.APPROVAL_INQUIRY:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                (count,) = db.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND seq = ?",
-                                      (event.run_id, event.seq)).fetchone()
-            finally:
-                db.close()
+            [(count,)] = appdb.query("SELECT count(*) FROM run_events WHERE run_id = ? AND seq = ?",
+                                     event.run_id, event.seq)
             published.append((event.seq, count))
         await publish(event)
 
@@ -430,12 +410,7 @@ async def test_a_sealed_run_that_changes_in_between_gets_nothing(monkeypatch, ch
 
     def changed_in_between(run_id, value):
         if run_id == final.id:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                db.execute(change, (final.id,))
-                db.commit()
-            finally:
-                db.close()
+            appdb.execute((change, (final.id,)))
         set_seq(run_id, value)
 
     monkeypatch.setattr(bus, "set_seq", changed_in_between)
@@ -647,10 +622,10 @@ def _judged_args(run: Run) -> tuple:
 
 
 async def test_a_judge_interleaved_with_a_post_seal_append_survives_a_restart(flaky, monkeypatch):
-    """按需裁判记判定（_append_judged）的条件更新不带 last_seq 条件：它取了号、还没写，封存后追加抢先提交了，
-    它再提交时把 last_seq 写回自己那个更小的号。同一进程里序号计数只增不减，不会撞号；进程重启后计数从 0 起，
-    各处又按 last_seq 接号——裁判自己也是。所以启动时按库里实际的最后一条改正 last_seq：之后再裁判、继续运行，
-    都接在实际的最后一条后面。"""
+    """按需裁判记判定（_append_judged）和封存后追加交错：裁判取了号、还没写，封存后追加抢先提交了。以前裁判的条件更新不带
+    last_seq 条件，照样提交、把 last_seq 写回自己那个更小的号（同一进程里计数只增不减，不撞号；多进程时两个进程各自的计数
+    会撞号）。现在同 append_events：last_seq 也要还是读到的那个，后到的裁判这一次不记（判定照样交回给点的人），last_seq
+    停在追加的那一条上。启动时照旧按库里实际的最后一条改正 last_seq：之后再裁判、继续运行，都接在实际的最后一条后面。"""
     from app.api import evidence
     from app.engine.run_append import append_events
 
@@ -687,9 +662,9 @@ async def test_a_judge_interleaved_with_a_post_seal_append_survives_a_restart(fl
         await asyncio.sleep(0.01)
     written = await append_events(first.id, [inquiry("这次为什么失败")], require="sealed")
     held.set()
-    assert await judging == {"seq": first.last_seq + 1}
+    assert await judging is None, "追加先提交了：后到的裁判不记，免得两条撞号"
     assert written is not None and written[0].seq == first.last_seq + 2
-    assert (await _row(first.id)).last_seq == first.last_seq + 1, "裁判后提交，last_seq 被写回了小的号"
+    assert (await _row(first.id)).last_seq == written[0].seq
     monkeypatch.setattr(evidence, "SessionLocal", opened)
 
     # 进程重启：内存里的序号计数没了，启动时 setup 照常执行一遍。只改落后的那条，别的运行原样不动

@@ -136,6 +136,7 @@ def held_guard(store):
     table_versions._release_guard()
 
 
+@pytest.mark.sqlite_only  # 文件锁守卫只在 SQLite（单进程）时有：PostgreSQL 可以多进程，版本存储靠跨进程的锁（app/cluster/mutex）
 async def test_read_only_process_refuses_writes_with_503_and_keeps_reads(client, held_guard):
     name = unique()
     base = await first_import(client, name, seed=505)
@@ -170,6 +171,7 @@ async def test_read_only_process_refuses_writes_with_503_and_keeps_reads(client,
         assert await table_versions.expire_stagings(session) == []
 
 
+@pytest.mark.sqlite_only  # 文件锁守卫只在 SQLite（单进程）时有：PostgreSQL 可以多进程，版本存储靠跨进程的锁（app/cluster/mutex）
 async def test_read_only_process_refuses_activate_and_commit_keeps_the_trial(client, held_guard):
     """启用旧版本 503；提交 503 时不消耗试运行库（守卫拿回来之后照常提交）。"""
     name = unique()
@@ -196,6 +198,7 @@ async def test_read_only_process_refuses_activate_and_commit_keeps_the_trial(cli
     assert resp.json()["parts"] == 3
 
 
+@pytest.mark.sqlite_only  # 文件锁守卫只在 SQLite（单进程）时有：PostgreSQL 可以多进程，版本存储靠跨进程的锁（app/cluster/mutex）
 async def test_read_only_process_refuses_version_and_edit_writes_before_doing_any_work(client, held_guard, store,
                                                                                     monkeypatch):
     """只读进程：移除一期（要物化）、作废接受（累积模式，要物化）、edits/apply、edits/undo、POST /{id}/redraft 一律 503，
@@ -253,6 +256,7 @@ async def test_read_only_process_refuses_version_and_edit_writes_before_doing_an
     assert len((await db_get(ImportStaging, applied["id"])).edits) == 1, "撤销没有生效"
 
 
+@pytest.mark.sqlite_only  # 文件锁守卫只在 SQLite（单进程）时有：PostgreSQL 可以多进程，版本存储靠跨进程的锁（app/cluster/mutex）
 async def test_read_only_process_still_deletes_a_manual_source(client, held_guard):
     """手工登记的源没有导入记录、配方、暂存区和隔离文件，不碰版本存储：只读进程里照常删除（9.1 只要求上传源 503）。"""
     sid = "manual-" + unique("m")

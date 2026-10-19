@@ -294,7 +294,7 @@ def accept_problem(setting: dict[str, Any] | None, *, name: str, mime: str, size
 # --------------------------------------------------------------------------
 
 #: 还没绑到记录上：JSON 列显式写过 None 的存的是 JSON 的 null，不是 SQL 的 NULL，两种都算
-_NO_RECORD = text("(files.bound_record IS NULL OR files.bound_record = 'null')")
+_NO_RECORD = text("(files.bound_record IS NULL OR CAST(files.bound_record AS TEXT) = 'null')")
 
 
 def file_fields(form: Any) -> list[str]:

@@ -43,6 +43,10 @@ export const TRIGGER_TEXT = {
   /** 不能选的对象：名字后面接服务端给的原因 */
   subjectNotOk: (name: string, reason: string) => `${name}（${reason}）`,
   subjectGone: (name: string) => `${name}（已不存在）`,
+  /** 对象太多、一页没列完：按名字查找 */
+  subjectSearch: (label: string) => `按名称查找${label}`,
+  subjectSearchHint: '只列出了一部分，输入名称中的字查找',
+  subjectSearchNone: '没有名称中含这些字的',
   optionsLoading: '正在读取可选的对象…',
   optionsFailed: '无法读取可选的对象',
   optionsUnsupported: '服务端暂不支持事件触发，请升级服务端后再使用',

@@ -23,6 +23,7 @@ from app.db.base import SessionLocal
 from app.db.models import DataSource
 from app.engine import masking
 from app.engine.nodes import challenge as challenge_mod
+from tests.fixtures.names import letters
 from tests.test_challenge_node import Models, Play, engine_up, finish, graph, output_of  # noqa: F401 - engine_up 是自动用上的夹具
 
 #: 四笔订单，买家手机号设了遮罩；备注没设遮罩，其中一条写着换了写法的号码
@@ -42,7 +43,7 @@ async def masked_shop(tmp_path):
     db.executescript(SCRIPT)
     db.commit()
     db.close()
-    name = f"shop_{uuid.uuid4().hex[:8]}"
+    name = f"shop_{letters(8)}"
     async with SessionLocal() as session:
         row = DataSource(name=name, kind="sqlite", database=str(path), readonly=True, enabled=True,
                          options={"mask_columns": ["buyer_phone"]})
@@ -139,7 +140,7 @@ async def big_shop(tmp_path):
     db.executescript(BIG)
     db.commit()
     db.close()
-    name = f"shop_{uuid.uuid4().hex[:8]}"
+    name = f"shop_{letters(8)}"
     async with SessionLocal() as session:
         row = DataSource(name=name, kind="sqlite", database=str(path), readonly=True, enabled=True,
                          options={"mask_columns": ["amount", "buyer_name"]})

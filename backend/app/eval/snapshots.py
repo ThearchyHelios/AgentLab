@@ -562,8 +562,8 @@ class ShadowDrafts(runtime.JobManager):
 manager = ShadowDrafts()
 
 
-async def startup() -> int:
-    """服务启动时：没结束的影子起草标中断（不自动续跑）。"""
+async def startup(*, live: Any = None) -> int:
+    """服务启动时（多进程时当班进程隔一会儿再来一次）：属主不在了的影子起草标中断（不自动续跑）。"""
     async def close(session: AsyncSession, job_id: str) -> None:
         await session.execute(update(EvalCatalogSnapshot).where(
             EvalCatalogSnapshot.id == job_id, EvalCatalogSnapshot.status.in_(runtime.ACTIVE))
@@ -571,12 +571,13 @@ async def startup() -> int:
             .execution_options(synchronize_session=False))
         await session.commit()
 
-    return await runtime.interrupt_on_startup(EvalCatalogSnapshot, close, running=manager.running)
+    return await runtime.interrupt_on_startup(EvalCatalogSnapshot, close, running=manager.running, live=live)
 
 
 async def reconcile_stale(session: AsyncSession, rows: Iterable[EvalCatalogSnapshot]) -> None:
     """读接口当场整理：记着排队、进行中，这个进程里却没在跑（服务重启过）的，照实标中断。"""
-    stale = [r for r in rows if r.status in runtime.ACTIVE and not manager.running(r.id)]
+    # 属主不在了才算：多进程时别的进程正在跑的，这里看不到它的任务，却不能标中断（runtime.stale 按租约判断）
+    stale = await runtime.stale(list(rows), running=manager.running)
     for row in stale:
         row.status, row.error, row.finished_at = "interrupted", INTERRUPTED, utcnow()
     if stale:

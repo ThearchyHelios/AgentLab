@@ -6,6 +6,7 @@ import os
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from app.core import atomic
 from app.core.config import settings
 
 _PREFIX = "enc::"
@@ -16,12 +17,11 @@ def _load_key() -> bytes:
     raw = settings.secret_key
     if not raw:
         key_file = settings.data_dir / ".secret_key"
-        if key_file.exists():
-            raw = key_file.read_text().strip()
-        else:
-            raw = base64.urlsafe_b64encode(os.urandom(32)).decode()
-            key_file.write_text(raw)
-            key_file.chmod(0o600)
+        if not key_file.exists():
+            # 只建一次（core/atomic.create_text）：两个进程同时第一次启动，后到的读先到的那一把，不会各拿一把、
+            # 各自加密的东西对方解不开
+            atomic.create_text(key_file, base64.urlsafe_b64encode(os.urandom(32)).decode(), mode=0o600)
+        raw = key_file.read_text().strip()
     # 任意字符串都归一化成 32 字节 Fernet key
     digest = hashlib.sha256(raw.encode()).digest()
     return base64.urlsafe_b64encode(digest)

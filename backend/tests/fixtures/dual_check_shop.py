@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import uuid
 from pathlib import Path
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -27,6 +26,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from app.data import introspect
 from app.db.base import SessionLocal
 from app.db.models import DataSource
+from tests.fixtures.names import letters
 
 ROWS = [
     (1, "华东", 101, 100.0, "paid", "2026-08-31", "2026-09-01", "online", 0),
@@ -67,7 +67,7 @@ def build(path: Path, *, date_type: str = "DATE") -> Path:
 
 async def add_source(path: Path, *, options: dict | None = None) -> tuple[str, str]:
     """登记成只读的手工源，探查好表结构。返回 (数据源名, id)。"""
-    name = f"dc_shop_{uuid.uuid4().hex[:8]}"
+    name = f"dc_shop_{letters(8)}"
     async with SessionLocal() as session:
         row = DataSource(name=name, kind="sqlite", database=str(path), readonly=True, enabled=True,
                          options=dict(options or {}))
@@ -135,7 +135,7 @@ class Blind:
                         hook, blind.on_query = blind.on_query, None
                         hook()
                     call = {"name": f"db_query__{blind.source}", "args": {"sql": sqls[done]},
-                            "id": f"blind-{uuid.uuid4().hex[:6]}"}
+                            "id": f"blind-{letters(6)}"}
                     return AIMessage(content="查一下。", tool_calls=[call])
                 return AIMessage(content="查完了。")
             blind.writer_prompts.append(text)

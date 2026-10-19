@@ -129,3 +129,30 @@ def failed(*keys: str) -> None:
 def succeeded(*keys: str) -> None:
     for key in keys:
         _failures.pop(key, None)
+
+
+# 多进程（PostgreSQL）时登录失败记在库里（app/cluster/counters.py），几个进程看到的是同一份：不然把尝试分散到几个进程上，
+# 退避就弱了几倍。SQLite 只有一个进程，照旧用上面进程里的那份
+
+async def wait_for(*keys: str) -> int:
+    from app.cluster import counters
+
+    return await counters.wait_seconds(*keys) if counters.shared() else wait_seconds(*keys)
+
+
+async def note_failed(*keys: str) -> None:
+    from app.cluster import counters
+
+    if counters.shared():
+        await counters.failed(*keys, free_tries=_FREE_TRIES, max_wait_s=_MAX_WAIT_S)
+    else:
+        failed(*keys)
+
+
+async def note_succeeded(*keys: str) -> None:
+    from app.cluster import counters
+
+    if counters.shared():
+        await counters.succeeded(*keys)
+    else:
+        succeeded(*keys)

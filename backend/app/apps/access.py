@@ -72,7 +72,7 @@ def role_of(principal: Principal, app: Any, grants: list[Any]) -> str | None:
 
 async def grants_of(session: AsyncSession, app_id: str) -> list[AppGrant]:
     return list((await session.execute(select(AppGrant).where(AppGrant.app_id == app_id)
-                                       .order_by(AppGrant.created_at))).scalars())
+                                       .order_by(AppGrant.created_at, AppGrant.id))).scalars())
 
 
 async def app_role(session: AsyncSession, principal: Principal, app: Any) -> str | None:

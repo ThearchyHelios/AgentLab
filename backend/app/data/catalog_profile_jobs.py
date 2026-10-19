@@ -48,7 +48,7 @@ import logging
 import time
 from typing import Any
 
-from sqlalchemy import case, delete, func, or_, select, update
+from sqlalchemy import case, delete, func, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,6 +60,7 @@ from app.data.catalog_profile import (
 )
 from app.data.engine import SnapshotTampered
 from app.db.base import SessionLocal, new_id, utcnow
+from app.db.portable import json_flag
 from app.db.models import CatalogDraftJob, CatalogProfileJob, CatalogProfileTask, DataSource
 
 logger = logging.getLogger(__name__)
@@ -126,7 +127,7 @@ async def active_job(session: AsyncSession, source_id: str) -> CatalogProfileJob
     return (await session.execute(
         select(CatalogProfileJob).where(CatalogProfileJob.source_id == source_id,
                                         CatalogProfileJob.status.in_(ACTIVE))
-        .order_by(CatalogProfileJob.created_at.desc()).limit(1)
+        .order_by(CatalogProfileJob.created_at.desc(), CatalogProfileJob.id.desc()).limit(1)
     )).scalar_one_or_none()
 
 
@@ -134,7 +135,7 @@ async def latest_job(session: AsyncSession, source_id: str) -> CatalogProfileJob
     """最近建的一个（任何状态）。"""
     return (await session.execute(
         select(CatalogProfileJob).where(CatalogProfileJob.source_id == source_id)
-        .order_by(CatalogProfileJob.created_at.desc()).limit(1)
+        .order_by(CatalogProfileJob.created_at.desc(), CatalogProfileJob.id.desc()).limit(1)
     )).scalar_one_or_none()
 
 
@@ -278,7 +279,7 @@ async def waiting_for(session: AsyncSession, job: CatalogProfileJob) -> str | No
     任务，或者正在同步起草。"""
     if job.status != "queued":
         return None
-    ahead = runtime.lanes.ahead(job.source_id, job.id)
+    ahead = await runtime.lanes.ahead(job.source_id, job.id)
     if ahead is not None:
         if any(kind in ("draft", "sync_draft") for kind in ahead):
             return "draft"
@@ -286,7 +287,7 @@ async def waiting_for(session: AsyncSession, job: CatalogProfileJob) -> str | No
         return "introspect" if "introspect" in ahead else None
     from app.data import catalog_jobs
 
-    if catalog_jobs.sync_drafting(job.source_id):
+    if await catalog_jobs.sync_drafting(job.source_id):
         return "draft"
     earlier = (await session.execute(
         select(CatalogDraftJob.id).where(CatalogDraftJob.source_id == job.source_id,
@@ -345,7 +346,7 @@ _SHOWN = (case((CatalogProfileTask.started_at.is_(None), 1), else_=0), *_NEWEST)
 #: 只做了取值观察的那一项（observe 范围、maintenance 范围里只到期观察的表）在逐表一行的 summary 里带这个标记：它不是一次
 #: 剖析，不算「上次剖析」——不然表清单的「上次剖析」、给助手的剖析事实（行数、日期范围）会被一次只记了行数的观察顶掉
 OBSERVE_ONLY = "observe_only"
-_PROFILED = func.coalesce(func.json_extract(CatalogProfileTask.summary, f"$.{OBSERVE_ONLY}"), 0) == 0
+_PROFILED = not_(json_flag(CatalogProfileTask.summary, OBSERVE_ONLY))
 
 
 def _observe_only(checks: list[Any] | None) -> bool:
@@ -689,7 +690,7 @@ async def _behind_draft(session: AsyncSession, source_id: str) -> bool:
     """这个源有排队、进行中的起草任务，或者正在同步起草：新建的剖析任务要排在它后面。"""
     from app.data import catalog_jobs
 
-    return catalog_jobs.sync_drafting(source_id) or await catalog_jobs.active_job(session, source_id) is not None
+    return await catalog_jobs.sync_drafting(source_id) or await catalog_jobs.active_job(session, source_id) is not None
 
 
 async def nothing_reason(session: AsyncSession, row: Any, source: Any, scope: str) -> str | None:
@@ -858,13 +859,13 @@ async def cancel(session: AsyncSession, job: CatalogProfileJob) -> None:
     await _close(session, job_id, "cancelled", None, "cancelled", None)
 
 
-async def startup() -> int:
+async def startup(*, live: Any = None) -> int:
     """服务启动时：排队、进行中的剖析任务标成 interrupted，没结束的表记 cancelled、写明服务重启，不自动续跑；再把剖析设置的
     旧键迁移掉。返回标了几个任务。"""
     async def interrupt(session: AsyncSession, job_id: str) -> None:
         await _close(session, job_id, "interrupted", INTERRUPTED_ERROR, "cancelled", INTERRUPTED_ERROR)
 
-    n = await runtime.interrupt_on_startup(CatalogProfileJob, interrupt, running=manager.running)
+    n = await runtime.interrupt_on_startup(CatalogProfileJob, interrupt, running=manager.running, live=live)
     if n:
         logger.warning("服务重启：%d 个数据剖析任务没有做完，已标为中断，可在数据目录页重试", n)
     async with SessionLocal() as session:

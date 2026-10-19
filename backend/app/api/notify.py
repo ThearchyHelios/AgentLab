@@ -127,7 +127,7 @@ async def list_channels() -> dict[str, Any]:
     from app.db.models import User
 
     principal = current_principal()
-    stmt = select(NotifyChannel).order_by(NotifyChannel.created_at)
+    stmt = select(NotifyChannel).order_by(NotifyChannel.created_at, NotifyChannel.id)
     if principal.mode != "off":
         # 个人渠道只给本人看
         stmt = stmt.where(or_(NotifyChannel.scope != "user", NotifyChannel.owner_id == principal.user_id))
@@ -295,7 +295,7 @@ async def list_deliveries(
     format 是渠道的格式：邮件渠道成功的那条界面上写「已交给邮件服务器」，不写「已送达」（退信不追踪）。"""
     stmt = (select(NotifyDelivery, NotifyChannel.format)
             .join(NotifyChannel, NotifyChannel.id == NotifyDelivery.channel_id)
-            .order_by(NotifyDelivery.created_at.desc()).limit(limit))
+            .order_by(NotifyDelivery.created_at.desc(), NotifyDelivery.id.desc()).limit(limit))
     principal = current_principal()
     if principal.mode != "off" and not principal.at_least("builder"):
         stmt = stmt.where(NotifyChannel.scope == "user", NotifyChannel.owner_id == principal.user_id)

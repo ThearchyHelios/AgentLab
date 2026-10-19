@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -27,6 +26,7 @@ from app.main import app
 from tests.fixtures import dual_check_shop as shop
 from tests.fixtures.acceptance import retail
 from tests.fixtures.catalog.fake_model import FakeModel
+from tests.fixtures.names import letters
 from tests.fixtures.sources import drop_source
 
 SUITE_FILE = Path(__file__).parent / "fixtures" / "eval" / "retail_suite.json"
@@ -57,7 +57,7 @@ async def source(tmp_path):
 
 
 async def new_suite(client, **body) -> dict:
-    res = await client.post("/api/evals/suites", json={"name": f"虚构题集_{uuid.uuid4().hex[:6]}", **body}, headers=ACTOR)
+    res = await client.post("/api/evals/suites", json={"name": f"虚构题集_{letters(6)}", **body}, headers=ACTOR)
     assert res.status_code == 201, res.text
     return res.json()
 
@@ -264,7 +264,7 @@ def _weekly(source_name: str, *, refunds: bool = False) -> dict:
 
 async def test_caliber_cases_list_and_dispose_upgrades(client, source):
     async with SessionLocal() as session:
-        wf = Workflow(name=f"周销售_{uuid.uuid4().hex[:6]}", graph=_weekly(source["name"]), status="published",
+        wf = Workflow(name=f"周销售_{letters(6)}", graph=_weekly(source["name"]), status="published",
                       published_version=1, version=1)
         session.add(wf)
         await session.flush()
@@ -329,7 +329,7 @@ async def test_caliber_cases_list_and_dispose_upgrades(client, source):
 
 async def test_caliber_cases_pin_only_published_versions(client, source):
     async with SessionLocal() as session:
-        wf = Workflow(name=f"草稿口径_{uuid.uuid4().hex[:6]}", graph=_weekly(source["name"]), status="draft", version=1)
+        wf = Workflow(name=f"草稿口径_{letters(6)}", graph=_weekly(source["name"]), status="draft", version=1)
         session.add(wf)
         await session.flush()
         session.add(WorkflowVersion(workflow_id=wf.id, version=1, graph=_weekly(source["name"])))

@@ -556,9 +556,16 @@ async def test_startup_locks_legacy_sources_registered_under_other_spellings(cli
 
 
 def _app_db() -> str:
-    """测试进程实际连着的元数据库（conftest 建的那个）。data_dir 被夹具换过，和 settings.db_path 不是同一个。"""
+    """测试进程实际连着的元数据库（conftest 建的那个）。data_dir 被夹具换过，和 settings.db_path 不是同一个。
+
+    应用库是 PostgreSQL 时没有连着的库文件：拿数据目录里的 agentlab.db 顶上（导入 PostgreSQL 之前留下的那一份，
+    同一批元数据，照样不许登记），先建出这个文件，硬链接、大小写这些变体才有东西可指。"""
     from app.db import base as db_base
 
+    if db_base.engine.dialect.name != "sqlite":
+        settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+        settings.db_path.touch()
+        return str(settings.db_path)
     return str(db_base.engine.url.database)
 
 

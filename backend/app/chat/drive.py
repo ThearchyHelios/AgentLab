@@ -100,6 +100,20 @@ def add_usage(into: dict[str, Any] | None, more: Mapping[str, Any] | None) -> di
     return out
 
 
+async def _sealed(run_id: str, timeout: float) -> None:
+    """等终态的运行封存好（manifest_hash 写上），最多 timeout 秒。"""
+    from app.db.base import SessionLocal
+    from app.db.models import Run
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        async with SessionLocal() as session:
+            if await session.scalar(select(Run.manifest_hash).where(Run.id == run_id)):
+                return
+        await asyncio.sleep(0.1)
+
+
 class TurnDriver:
     """一轮问数据。drive() 跑完一轮，结果在 turn 上；on_phase(阶段) 在每一步开始时调。子类给差异（见模块说明）。
 
@@ -244,6 +258,9 @@ class TurnDriver:
             if row is None or row.status in ("succeeded", "failed", "cancelled", "interrupted"):
                 # 封存在终态之后：等执行任务收完尾（含封存），评分只读封存范围
                 await run_manager.wait_idle(run_id, timeout=CANCEL_GRACE_S)
+                if row is not None and row.status != "interrupted" and not run_manager.is_active(run_id):
+                    # 多进程：运行在别的进程里执行（审批之后被别的进程接着跑了），本进程等不到它的执行任务，回库里等封存
+                    await _sealed(run_id, CANCEL_GRACE_S)
                 async with SessionLocal() as session:
                     return await session.get(Run, run_id)
             await asyncio.sleep(0.2)

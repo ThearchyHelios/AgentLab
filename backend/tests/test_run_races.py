@@ -254,11 +254,10 @@ async def test_abandoning_while_the_pause_is_being_recorded(slow, monkeypatch):
 
 async def test_an_approval_closed_just_before_it_is_marked_answered(slow, monkeypatch):
     """放弃恰好提交在「读到这条审批还是 pending」和「把它记成已回复」之间。"""
-    import sqlite3
-
     from sqlalchemy import event
 
     from app.db.base import engine
+    from tests import appdb
 
     run = await run_manager.start(graph=_graph(gate=True), input_payload={"q": "x"})
     await _until(lambda: _is(run.id, "interrupted"))
@@ -268,11 +267,8 @@ async def test_an_approval_closed_just_before_it_is_marked_answered(slow, monkey
     def abandon_first(conn, cursor, statement, params, context, executemany):
         if armed["on"] and statement.lstrip().upper().startswith("UPDATE APPROVALS"):
             armed["on"] = False
-            other = sqlite3.connect(engine.url.database, timeout=5)
-            other.execute("UPDATE approvals SET status='cancelled' WHERE run_id=?", (run.id,))
-            other.execute("UPDATE runs SET status='cancelled' WHERE id=?", (run.id,))
-            other.commit()
-            other.close()
+            appdb.execute(("UPDATE approvals SET status='cancelled' WHERE run_id=?", (run.id,)),
+                          ("UPDATE runs SET status='cancelled' WHERE id=?", (run.id,)))
 
     event.listen(engine.sync_engine, "before_cursor_execute", abandon_first)
     try:

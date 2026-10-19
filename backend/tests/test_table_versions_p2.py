@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import create_engine, select, text
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.data import raw_store, recipe_parsers, recipe_types, table_versions
@@ -32,6 +33,7 @@ from app.db.base import SessionLocal, utcnow
 from app.db.models import (
     DataSource, ImportStaging, SourceSnapshot, TableBuild, TableImport, TableRecipe,
 )
+from app.db.portable import unique_violation
 
 
 @pytest.fixture(autouse=True)
@@ -268,8 +270,10 @@ async def test_recipe_seq_is_unique_per_source():
         session.add(TableRecipe(source_id=sid, seq=1, recipe={}, recipe_sha256=RECIPE_SHA))
         await session.commit()
         session.add(TableRecipe(source_id=sid, seq=1, recipe={}, recipe_sha256=RECIPE_SHA))
-        with pytest.raises(Exception, match="UNIQUE"):
+        with pytest.raises(IntegrityError) as caught:
             await session.commit()
+    # 撞的正是 (source_id, seq) 这一条唯一约束（两种库的报错写法不同，按表和列认）
+    assert unique_violation(caught.value, "table_recipes", "source_id", "seq")
 
 
 # --------------------------------------------------------------------------

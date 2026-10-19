@@ -20,4 +20,5 @@ dependencies:
       # 沙箱会退回 Seatbelt —— 代价是内存限额在 macOS 上限不住。
       # [docs] 让 PDF / Word 传得进知识库。约十几兆，但少了它上传这类文件
       # 只会得到一句"要先装解析库"——而界面上并不会拦着你去传
-      - -e ./backend[microvm,dev,db,docs]
+      # [postgres] 应用库用 PostgreSQL 时要的驱动和断点库（AGENTLAB_DATABASE_URL），不设那一项就用不上
+      - -e ./backend[microvm,dev,db,docs,postgres]

@@ -44,6 +44,7 @@ from sqlalchemy import func, select
 
 from app.db.base import SessionLocal
 from app.db.models import Run, Workflow
+from app.db.portable import json_eq
 
 logger = logging.getLogger(__name__)
 
@@ -150,10 +151,10 @@ async def issued_today(session: Any) -> int:
 
 async def issued_runs(session: Any, run_id: str) -> list[Run]:
     """这次运行按口径出具过的正式运行（origin.source_run 是它），新的在前。origin_kind 有索引，先按它筛再看 origin
-    （json_extract，同 auth/keys 认幂等键的写法）。"""
+    （db/portable.json_eq，同 auth/keys 认幂等键的写法）。"""
     rows = (await session.execute(select(Run).where(
-        Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.source_run") == run_id)
-        .order_by(Run.created_at.desc()))).scalars()
+        Run.origin_kind == ORIGIN, json_eq(Run.origin, "source_run", run_id))
+        .order_by(Run.created_at.desc(), Run.id.desc()))).scalars()
     return list(rows)
 
 
@@ -318,7 +319,7 @@ async def _conversation_of(session: Any, run: Run) -> dict[str, str]:
     if origin.get("conversation_id") and origin.get("turn_id"):
         return {"conversation_id": str(origin["conversation_id"]), "turn_id": str(origin["turn_id"])}
     turn = (await session.execute(select(ConversationTurn).where(ConversationTurn.run_id == run.id)
-                                  .order_by(ConversationTurn.created_at.desc()))).scalars().first()
+                                  .order_by(ConversationTurn.created_at.desc(), ConversationTurn.id.desc()))).scalars().first()
     return {"conversation_id": turn.conversation_id, "turn_id": turn.id} if turn is not None else {}
 
 
@@ -327,9 +328,17 @@ _locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, st
     weakref.WeakKeyDictionary()
 
 
-def _lock(key: tuple[str, str, int]) -> asyncio.Lock:
-    group = _locks.setdefault(asyncio.get_running_loop(), {})
-    return group.setdefault(key, asyncio.Lock())
+def _lock(key: tuple[str, str, int]) -> Any:
+    """同一（运行、工作流、版本）的出具一个接一个（app/cluster/mutex，多进程之间也是一把）：管的是「这一次出具过没有」的去重，
+    同时点了几下只发起一次。每日上限不靠它：发起之前先在库里占一份额度（app/cluster/quota），几份不同的出具可以同时发起，上限
+    照样数得准。"""
+    from app.cluster import mutex
+
+    return mutex.lock(f"ledger-issue:{key[0]}:{key[1]}:{key[2]}")
+
+
+#: 每日出具额度在 cluster/quota 里的名字
+QUOTA = "ledger_issue"
 
 
 async def _hider(run_id: str) -> Any:
@@ -365,12 +374,24 @@ async def issue(run_id: str, workflow_id: str, version: int, *, principal: Any, 
                       "how": plan.how, "binding_hash": input_key(plan.binding), "match": plan.match_artifact,
                       "auto": auto, **({"granted_by_app": plan.granted_by_app} if plan.granted_by_app else {})}
             actor = run.started_by if auto else principal.username
+            # 先占一份今天的额度（库里带条件的加一，几个进程同时出具也正好到上限为止），发起不成退回
+            from app.api.settings import ledger_settings
+            from app.cluster import quota
+
+            limit = int((await ledger_settings(session))["issue_daily_limit"])
+            day = await quota.take(QUOTA, limit, seed=issued_today)
+            if day is None:
+                raise IssueRefused(429, OVER_LIMIT.format(limit=limit), DAILY_LIMIT)
             try:
                 launched = await launch_run(session, workflow_id=workflow_id, run_class="formal", version=int(version),
                                             input_payload=plan.inputs, actor=actor, origin_kind=ORIGIN, origin=origin,
                                             expect_hash=plan.expect_hash)
             except LaunchRefused as e:
+                await quota.give_back(QUOTA, day=day)
                 raise IssueRefused(e.status_code, e.message, e.code or REFUSED) from e
+            except BaseException:
+                await quota.give_back(QUOTA, day=day)
+                raise
             return launched, True
 
 

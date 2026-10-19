@@ -104,13 +104,13 @@ def _iso(value: Any) -> str | None:
 async def active_job(session: AsyncSession, source_id: str) -> IntrospectJob | None:
     return (await session.execute(
         select(IntrospectJob).where(IntrospectJob.source_id == source_id, IntrospectJob.status.in_(ACTIVE))
-        .order_by(IntrospectJob.created_at.desc()).limit(1))).scalar_one_or_none()
+        .order_by(IntrospectJob.created_at.desc(), IntrospectJob.id.desc()).limit(1))).scalar_one_or_none()
 
 
 async def latest_job(session: AsyncSession, source_id: str) -> IntrospectJob | None:
     return (await session.execute(
         select(IntrospectJob).where(IntrospectJob.source_id == source_id)
-        .order_by(IntrospectJob.created_at.desc()).limit(1))).scalar_one_or_none()
+        .order_by(IntrospectJob.created_at.desc(), IntrospectJob.id.desc()).limit(1))).scalar_one_or_none()
 
 
 async def load(session: AsyncSession, source_id: str, job_id: str) -> IntrospectJob | None:
@@ -132,7 +132,7 @@ async def waiting_for(session: AsyncSession, job: IntrospectJob) -> str | None:
     起草）；任务刚建、后台还没排进队时看库：同源有比它先建的、排队或进行中的起草、剖析任务。"""
     if job.status != "queued":
         return None
-    ahead = runtime.lanes.ahead(job.source_id, job.id)
+    ahead = await runtime.lanes.ahead(job.source_id, job.id)
     if ahead is not None:
         return ahead[0] if ahead else None
     from app.db.models import CatalogDraftJob, CatalogProfileJob
@@ -437,7 +437,7 @@ async def _record_scope_changes(session: AsyncSession, row: Any, job: Introspect
             select(IntrospectJob).where(IntrospectJob.source_id == job.source_id, IntrospectJob.id != job.id,
                                         IntrospectJob.started_at.is_not(None),
                                         IntrospectJob.created_at <= job.created_at)
-            .order_by(IntrospectJob.created_at.desc()).limit(1))).scalar_one_or_none()
+            .order_by(IntrospectJob.created_at.desc(), IntrospectJob.id.desc()).limit(1))).scalar_one_or_none()
         before = (previous.scope or {}).get("rules") if previous is not None else None
         after = (job.scope or {}).get("rules")
         if isinstance(before, dict) and isinstance(after, dict) and before != after:
@@ -512,12 +512,12 @@ async def cancel(session: AsyncSession, job: IntrospectJob) -> None:
     await _close(session, job_id, "cancelled", None, STOPPED_ERROR)
 
 
-async def startup() -> int:
+async def startup(*, live: Any = None) -> int:
     """服务启动时：排队、进行中的探查任务标成 interrupted，没读的表 cancelled，读完的物化进去；不自动续跑。"""
     async def interrupt(session: AsyncSession, job_id: str) -> None:
         await _close(session, job_id, "interrupted", INTERRUPTED_ERROR, INTERRUPTED_ERROR)
 
-    n = await runtime.interrupt_on_startup(IntrospectJob, interrupt, running=manager.running)
+    n = await runtime.interrupt_on_startup(IntrospectJob, interrupt, running=manager.running, live=live)
     if n:
         logger.warning("服务重启：%d 个探查任务没有做完，已标为中断，可在数据源卡片上重新探查", n)
     return n

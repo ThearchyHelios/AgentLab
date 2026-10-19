@@ -646,8 +646,13 @@ class EngineCache:
         if self._verifying.get(token) is done:
             del self._verifying[token]
 
-    async def invalidate(self, source_id: str) -> None:
+    async def invalidate(self, source_id: str, *, broadcast: bool = True) -> None:
         sid = str(source_id)
+        if broadcast:
+            # 多进程：别的进程手上这个源的连接池也要扔掉（换了地址、口令、只读开关），见 app/cluster/caches.py
+            from app.cluster import caches
+
+            await caches.broadcast("datasource_engine", sid)
         # 正在进行的核对也撇开：失效之后来的请求重新核对，不搭失效之前那一次的便车
         for token in [t for t in self._verifying if _source_of(t[0]) == sid]:
             del self._verifying[token]

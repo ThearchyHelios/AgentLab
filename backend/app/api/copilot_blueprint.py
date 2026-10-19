@@ -207,9 +207,12 @@ async def _conversation(session: AsyncSession, blueprint: Any, actor: str | None
 async def _open_turn(session: AsyncSession, conversation: Any, question: str) -> str:
     from sqlalchemy import func, select
 
+    from app.chat.job import hold_conversation
     from app.db.base import utcnow
     from app.db.models import ConversationTurn
 
+    # 先占住这段对话再取最大值往下接（同 api/conversations 开一轮）：多进程时同时两次开轮不撞号
+    await hold_conversation(session, conversation.id)
     seq = int((await session.execute(select(func.coalesce(func.max(ConversationTurn.seq), -1))
                                      .where(ConversationTurn.conversation_id == conversation.id))).scalar_one()) + 1
     turn = ConversationTurn(conversation_id=conversation.id, seq=seq, question=question, status="running")

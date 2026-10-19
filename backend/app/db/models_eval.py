@@ -29,7 +29,7 @@ from typing import Any
 from sqlalchemy import ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, synonym
 
-from app.db.base import Base, TimestampMixin, UTCDateTime, new_id
+from app.db.base import Base, current_owner, TimestampMixin, UTCDateTime, new_id
 
 #: 题目的种类：ask 问数据题（走问数据同一条路作答）、workflow 钉版本的工作流题
 CASE_KINDS = ("ask", "workflow")
@@ -128,6 +128,8 @@ class EvalCatalogSnapshot(Base, TimestampMixin):
     origin: Mapped[str] = mapped_column(String(20), default="live")
     # queued | running | succeeded | partial | failed | cancelled | interrupted
     status: Mapped[str] = mapped_column(String(20), default="succeeded")
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     artifact_id: Mapped[str | None] = mapped_column(String(64), default=None)
     # 拍了哪些数据源：[{id, name}]（名字是拍的那一刻的）
     sources: Mapped[list[Any]] = mapped_column(default=list)
@@ -160,6 +162,8 @@ class EvalRun(Base, TimestampMixin):
     suite_id: Mapped[str] = mapped_column(ForeignKey("eval_suites.id", ondelete="CASCADE"))
     # queued | running | succeeded | partial | failed | cancelled | interrupted（core/job_runtime 的状态词）
     status: Mapped[str] = mapped_column(String(20), default="queued")
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     trigger: Mapped[str] = mapped_column(String(20), default="manual")
     # 定时发起的那一条（ScheduleFire.eval_run_id 反过来指向这里）
     schedule_id: Mapped[str | None] = mapped_column(String(32), default=None)

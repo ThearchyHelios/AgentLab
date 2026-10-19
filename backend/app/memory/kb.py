@@ -399,7 +399,8 @@ async def list_collections(session: AsyncSession) -> list[dict[str, Any]]:
             func.sum(Document.chunk_count),
         ).group_by(Document.collection)
     )
+    # sum 在 PostgreSQL 上给的是 numeric（驱动交回 Decimal），SQLite 给整数：一律转成 int
     return [
-        {"collection": name, "documents": docs, "chunks": chunks or 0}
+        {"collection": name, "documents": int(docs), "chunks": int(chunks or 0)}
         for name, docs, chunks in rows
     ]

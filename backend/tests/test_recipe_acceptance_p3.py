@@ -1683,6 +1683,7 @@ sys.stdin.read()
 """
 
 
+@pytest.mark.sqlite_only  # 文件锁守卫只在 SQLite（单进程）时有：PostgreSQL 可以多进程，版本存储靠跨进程的锁（app/cluster/mutex）
 async def test_l5_another_process_holding_the_store_guard(client, store):
     """L5：子进程先占住 .store.lock → 本进程 acquire_store_guard() 返回 False；本进程调 startup：事先放好的临时文件和孤儿
     构建库一个都没删；/upload、stage、trial、commit、activate 返回 503 store_unavailable，GET 接口照常；过期处理不抛；
