@@ -14,7 +14,7 @@ from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Workflow
-from app.engine.context import PREFIX_KEY, STREAM_KEY, NodeContext, NodeError, stream_writer
+from app.engine.context import LABEL_PREFIX_KEY, PREFIX_KEY, STREAM_KEY, NodeContext, NodeError, stream_writer
 from app.engine.lineage import whole_ref
 from app.engine.state import GraphState, message_text, template_context
 from app.engine.toolcalls import (
@@ -691,7 +691,8 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 恢复重放的标记和签批人只属于父图的节点，不能漏进子图（节点 id 可能重名）。前缀和写入口见 engine/context：
         # 子图里的节点经父运行的写入口发事件、节点 id 带前缀；嵌套的子图拿到的是同一个写入口、更长的前缀
         extra={**{k: v for k, v in ctx.run.extra.items() if k not in ("resumed", "actors")},
-               PREFIX_KEY: f"{ctx.run.global_id(ctx.node.id)}/", STREAM_KEY: stream_writer(ctx.run)},
+               PREFIX_KEY: f"{ctx.run.global_id(ctx.node.id)}/", LABEL_PREFIX_KEY: f"{ctx.run.global_label(ctx.node.title)} › ",
+               STREAM_KEY: stream_writer(ctx.run)},
     )
 
     ctx.emit(EventType.LOG, level="info",
@@ -753,6 +754,11 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     }
     if ledger := [_forwarded(e, ctx.node.id) for e in result_state.get("evidence") or [] if isinstance(e, dict)]:
         updates["evidence"] = ledger
+    if rejected := _rejected_steps(result_state, ctx.node.id):
+        # 子工作流里走了驳回出口的那几步（engine/compiler._rejected_exit 记的 outcome=rejected）交回父图的 trail：运行收尾
+        # 据此在终态事件上照实写「途经驳回」（runner._rejected_via），实例页、通知、定时任务的 Webhook 说得出「子工作流 › 把关」
+        # 被驳回、转到哪。名字、转到哪几步在子图里已经按这次运行的说法记好（global_label、global_id），这里只接上节点 id 的前缀
+        updates["trail"] = rejected
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: output}
@@ -761,6 +767,12 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
 #: 台账条目里写着节点 id 的键：交回父图时一并加前缀（双盲复算的条目记着它复算的口径卡）
 _LEDGER_NODE_KEYS = ("node_id", "card")
+
+
+def _rejected_steps(sub_state: dict[str, Any], node_id: str) -> list[dict[str, Any]]:
+    """子工作流的 trail 里走了驳回出口的那几步，节点 id 换成父图这一层的（「子工作流节点 id/…」）。"""
+    return [{**t, "node_id": f"{node_id}/{t.get('node_id')}"} for t in sub_state.get("trail") or []
+            if isinstance(t, dict) and t.get("outcome") == "rejected"]
 
 
 def _forwarded(entry: dict[str, Any], node_id: str) -> dict[str, Any]:

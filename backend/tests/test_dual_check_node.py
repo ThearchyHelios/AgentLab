@@ -376,8 +376,10 @@ async def test_disagreement_pauses_with_the_agreed_payload_and_card(monkeypatch,
     approval = await pending(run.id)
     assert approval.mode == "input" and approval.node_id == "dual"
     payload = approval.payload
-    # 约定的六个键，另加 on_reject（实际生效的处置）：审核人在卡上要看得出没采用原流程会不会让运行失败
-    assert set(payload) == {"kind", "node_id", "mode", "title", "card_artifact", "summary", "on_reject"}
+    # 约定的六个键，另加 on_reject（实际生效的处置）：审核人在卡上要看得出没采用原流程会不会让运行失败；reject_route
+    # （驳回之后去哪，engine/replay.reject_route）：没接驳回出口，驳回后运行就此结束
+    assert set(payload) == {"kind", "node_id", "mode", "title", "card_artifact", "summary", "on_reject", "reject_route"}
+    assert payload["reject_route"] == {"ends": "run"}
     assert payload["kind"] == "dual_check" and payload["node_id"] == "dual" and payload["mode"] == "input"
     assert payload["on_reject"] == "degrade"
     [item] = payload["summary"]

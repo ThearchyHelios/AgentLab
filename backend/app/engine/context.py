@@ -43,9 +43,16 @@ class RunContext:
         """这张图里的节点 id → 这次运行里的 id（事件、工件上记的那个）：最外层原样，子工作流里加前缀。"""
         return f"{self.prefix}{node_id}"
 
+    def global_label(self, title: str) -> str:
+        """这张图里的节点标题 → 这次运行里给人看的名字：最外层原样，子工作流里接上子工作流的名字（「子工作流 › x」，嵌套的
+        一层层接上，同 multi.run_subgraph 记在异常上的 label）。父运行的图上没有子工作流里的节点，各处照这个名字说。"""
+        return f"{self.extra.get(LABEL_PREFIX_KEY) or ''}{title}"
+
 
 #: 子工作流里的节点 id 前缀（RunContext.extra 里的键，engine/nodes/multi.run_subgraph 放）
 PREFIX_KEY = "node_prefix"
+#: 子工作流里的节点名前缀（「子工作流 › 」，同上）：RunContext.global_label
+LABEL_PREFIX_KEY = "node_label_prefix"
 #: 父运行的事件流（RunContext.extra 里的键，同上）。子工作流在父节点里用 ainvoke 跑，LangGraph 不把它的 custom 事件交给
 #: 父图的流（ainvoke 不开 custom 模式，get_stream_writer 拿到的是空的那个）：子工作流里每一步以前在运行的事件里一条都
 #: 没有，时间线看不到、封存也不含它查过的数。所以 run_subgraph 把父图那一刻的写入口交下来，子工作流的节点经它发

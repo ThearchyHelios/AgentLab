@@ -1582,6 +1582,10 @@ async def _rejected_exits(session: AsyncSession, runs: list[Run], out: dict[str,
         names = {str(v.get("node_id")) for v in via or [] if isinstance(v, dict) and v.get("node_id")}
         if names:
             gates[run_id] = names
+        for v in via or []:
+            # 子工作流里的关卡（「sub/x」）不在运行的图上：名字照终态事件上记的（「子工作流 › x」），不写内部 id
+            if isinstance(v, dict) and v.get("node_id") and isinstance(v.get("label"), str) and v["label"]:
+                out[run_id].end_labels.setdefault(str(v["node_id"]), v["label"])
     if not gates:
         return
     wanted = sorted({n for names in gates.values() for n in names})
