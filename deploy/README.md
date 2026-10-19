@@ -10,6 +10,7 @@
 | 文件 | 用途 |
 | --- | --- |
 | `image.tar` | Docker 镜像（`docker save` 导出），镜像名 `agentlab:__AGENTLAB_VERSION__` |
+| `postgres-image.tar` | 内置 PostgreSQL 的镜像（`install --postgres` 时用，见「用 PostgreSQL」）。打包时用了 `--no-postgres` 的包里没有 |
 | `deploy.sh` | 一键部署脚本：安装、启动、停止、升级、卸载 |
 | `agentlab.env` | 配置：端口、监听地址、数据目录、模型 Key、代理、沙箱 |
 | `README.md` | 本说明 |
@@ -21,7 +22,8 @@
 - **架构要一致**：这个包是 `linux/__AGENTLAB_ARCH__`。在目标机上运行 `uname -m`：
   `aarch64` 对应 arm64（ARM 单板机要装 64 位系统），`x86_64` 对应 amd64。不一致的镜像跑不起来，
   deploy.sh 会在导入前就报出来；
-- 磁盘：镜像导入后约 0.8～1 GB（看 Docker 用的存储方式），另留数据目录的空间；
+- 磁盘：镜像导入后约 0.8～1 GB（看 Docker 用的存储方式），另留数据目录的空间；用内置 PostgreSQL 再加约 0.4 GB 的镜像
+  和库本身的空间（在 docker 的数据卷里）；
 - 可选：宿主机支持 KVM（有 `/dev/kvm`）时，代码会在 microVM 里执行，隔离最强，见下面的「代码沙箱」；
 - 当前用户能用 docker（在 `docker` 组里），或者用 `sudo` 运行 deploy.sh。
 
@@ -41,6 +43,7 @@ nano agentlab.env
 
 deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i image.tar`，本机已有就跳过）→
 创建数据目录 → 启动容器（`--restart unless-stopped`，开机自动起来）→ 等健康检查通过 → 打印访问地址。
+库缺省是数据目录里的 SQLite；要用 PostgreSQL 的新部署把第 3 步换成 `./deploy.sh install --postgres`（见「用 PostgreSQL」）。
 
 ## 访问
 
@@ -59,8 +62,12 @@ deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i im
 所有数据都在 `DATA_DIR`（默认是包目录下的 `data/`）：数据库 `agentlab.db`、执行断点 `checkpoints.db`、
 工件、上传文件、沙箱工作区，以及加密密钥 `.secret_key`。**要备份的就是这个目录**，
 丢了 `.secret_key`，存进去的 API Key 就解不开了。目录里的 `.agentlab-data` 是服务启动时建的标记，deploy.sh 改属主前按它
-（或 `agentlab.db`、`.secret_key`）认出这是 AgentLab 的数据目录，别删。数据库放在 PostgreSQL 时（下面「用 PostgreSQL」）没有这两个库文件，
+（或 `agentlab.db`、`.secret_key`、`.postgres/state`）认出这是 AgentLab 的数据目录，别删。数据库放在 PostgreSQL 时（下面「用 PostgreSQL」）没有这两个库文件，
 另用 `pg_dump` 备份数据库。
+
+`./deploy.sh upgrade` 换版本之前会自动备份一次库：SQLite 拷到数据目录的 `backups/sqlite/<时间>/`（SQLite 的备份接口，
+一致的一份），内置 PostgreSQL 用 `pg_dump` 存到 `backups/postgres/`，各只留最近 5 份（`agentlab.env` 里 `BACKUP_KEEP=` 改）。
+这只是升级的保险，不代替下面的整目录备份：工件、上传文件和 `.secret_key` 不在里面。
 
 deploy.sh 会把数据目录的属主改成容器里的用户（uid 10001），所以备份、删除要用 sudo。
 停下来备份最稳妥（以默认的 `./data` 为例，在包目录里执行）：
@@ -75,8 +82,96 @@ sudo tar -czf ../agentlab-data-$(date +%Y%m%d).tar.gz data
 
 ## 用 PostgreSQL
 
-缺省数据库是数据目录里的 SQLite。要放进 PostgreSQL（库要先建好），在 `agentlab.env` 里加一行再 `./deploy.sh upgrade`
-（或 stop 再 start）：
+库有三种放法，选一种：
+
+| | 怎么用 | 库在哪里 | 数据目录里 |
+| --- | --- | --- | --- |
+| SQLite（缺省） | `./deploy.sh` | 数据目录的 `agentlab.db`、`checkpoints.db` | 全部数据 |
+| 内置 PostgreSQL | 新部署 `./deploy.sh install --postgres`；已经在用 SQLite 的 `./deploy.sh migrate-to-postgres` | docker 数据卷 `<CONTAINER_NAME>-pgdata` | 工件、上传文件、`.secret_key`、库的密码 `.postgres/` 和备份 `backups/` |
+| 外接 PostgreSQL | `agentlab.env` 里设 `AGENTLAB_DATABASE_URL` | 你自己的 PostgreSQL | 工件、上传文件、`.secret_key` |
+
+内置和外接只能选一种：`agentlab.env` 里设了 `AGENTLAB_DATABASE_URL`（或 `AGENTLAB_CHECKPOINT_URL`）又加 `--postgres`，
+或者数据目录已经是内置的，deploy.sh 照实报错、不起任何容器。不管哪种，数据目录都照样要挂、要备份。
+
+### 内置 PostgreSQL
+
+`./deploy.sh install --postgres` 在 AgentLab 旁边再起一个 PostgreSQL 容器：
+
+- 镜像缺省 `postgres:16.15`（小版本固定在 deploy.sh 里，每台机器起的都一样；离线包里带着 `postgres-image.tar`，本机已有同名镜像
+  就不导入）。要换在 `agentlab.env` 里写 `POSTGRES_IMAGE=postgres:16.x`，再 `./deploy.sh install`：服务先停、库的容器按新镜像重建，
+  数据卷不动；新镜像起不来（跨大版本时数据格式不通用）就换回原来的镜像、照实报错。
+- 两个容器在同一个 docker 网络 `<CONTAINER_NAME>-net` 里，PostgreSQL 的端口**不对外开**，只有 AgentLab 的容器连得到。
+- 库的数据在 docker 数据卷 `<CONTAINER_NAME>-pgdata` 里（不在数据目录：数据目录会被改属主，PostgreSQL 的文件属主不能动）。
+- 密码第一次部署时自动生成，存在数据目录的 `.postgres/password` 和 `.postgres/pgpass`（都是 0600），不进镜像、不进日志、
+  不进 `docker inspect`，`agentlab.env` 里什么都不用填。AgentLab 的容器按 `PGPASSFILE` 读它。**丢了数据目录就连不上这个库**，
+  所以数据目录照样要整份备份。
+- 用过一次之后这个数据目录就一直是内置 PostgreSQL（记在 `.postgres/state`），之后的 `install`、`upgrade`、`start` 不用再加
+  `--postgres`。
+- `start`、`restart` 先起库、等 `pg_isready` 通过再起服务；`stop` 先停服务再停库。开机时两个容器一起被 docker 拉起来，库还没就绪时
+  服务按退避重试（日志里写着「应用库还没就绪……秒后重试」），最多等 90 秒（`AGENTLAB_DB_STARTUP_TIMEOUT`），不会一上来就崩。
+- 表结构和默认数据（内置模板、技能）每次启动自动补齐；几个工作进程（`AGENTLAB_WORKERS`）同时起也只做一次（库里的锁）。
+- `./deploy.sh status` 显示两个容器的状态，`./deploy.sh logs --postgres` 看库的日志。
+
+可以在 `agentlab.env` 里改的（都有缺省值，一般不用写）：
+
+| 项 | 缺省 | 说明 |
+| --- | --- | --- |
+| `POSTGRES_IMAGE` | `postgres:16.15` | 库的镜像 |
+| `POSTGRES_CONTAINER` | `<CONTAINER_NAME>-postgres` | 库的容器名 |
+| `DOCKER_NETWORK` | `<CONTAINER_NAME>-net` | 两个容器共用的网络 |
+| `POSTGRES_VOLUME` | `<CONTAINER_NAME>-pgdata` | 库的数据卷 |
+| `BACKUP_KEEP` | `5` | 升级前自动备份留几份（SQLite 也按它） |
+
+环境变量 `DEPLOY_<名字>` 盖过 `agentlab.env` 里的同名项（这几项加上 `HOST_PORT`、`BIND_ADDR`、`DATA_DIR`、`CONTAINER_NAME`），
+一台机器上并排部署两套、或者测试时用。
+
+**备份。** `upgrade` 前自动 `pg_dump` 一份到 `backups/postgres/`。平时要手动备份（服务开着也行，`pg_dump` 读的是一致的快照）：
+
+```bash
+docker exec agentlab-postgres pg_dump -U agentlab -d agentlab -Fc > agentlab-$(date +%Y%m%d).dump
+```
+
+再加上数据目录（见「数据和备份」），两样合起来才是完整的一份。
+
+**恢复。** 用 `pg_dump` 的备份把库换回去（以缺省的容器名为例，`<备份>` 换成文件名）：
+
+```bash
+./deploy.sh stop                       # 两个都停
+docker start agentlab-postgres         # 只起库
+until docker exec agentlab-postgres pg_isready -q -h 127.0.0.1 -U agentlab; do sleep 1; done
+docker exec agentlab-postgres psql -U agentlab -d postgres \
+  -c 'DROP DATABASE agentlab WITH (FORCE)' -c 'CREATE DATABASE agentlab OWNER agentlab'
+docker exec -i agentlab-postgres pg_restore -U agentlab -d agentlab --no-owner < <备份>
+./deploy.sh start
+```
+
+数据目录要换回同一时间的备份，工件、上传文件和库里的记录才对得上。
+
+**从 SQLite 切过来。** 正在用 SQLite 的部署运行 `./deploy.sh migrate-to-postgres`，它依次：
+
+1. 停服务；
+2. 备份 SQLite 库到 `backups/sqlite/<时间>/`；
+3. 起内置 PostgreSQL（第一次生成密码）；
+4. 用镜像里的 `python -m app.db copy-to-postgres` 先核对（`--dry-run`，只数行数）；
+5. 正式导入，逐表按主键核对、断点按条数核对（停在审批上的、中断了的运行导过去之后照样能接着跑）；
+6. 在数据目录里记下「已切到内置 PostgreSQL」，按内置库起服务、等健康检查通过。
+
+记下之前任何一步出错，都停在原地：服务按 SQLite 原样恢复（原来在跑就起回来），库的容器停掉，屏幕上是那一步的原话。
+处理好之后重新运行就行，重复执行是安全的：已经切过的什么都不做；上次没切成、留在内置库里的半份数据先清空再导，
+不会和 SQLite 上后来改过的混在一起（`status` 里会写「上次 migrate-to-postgres 没切成」）。数据卷已经存在、又不是这个
+数据目录上次没切成留下的（比如以前卸载时留下的另一份库），它不会去清空，照实报错让你决定。
+
+切完之后 `agentlab.db`、`checkpoints.db` 原样留在数据目录里、不再使用，`backups/sqlite/` 里还有一份。**什么时候能删**：
+在 PostgreSQL 上用一段时间、做过一次完整备份（`pg_dump` 加数据目录）之后。删之前它们是回退的路：`./deploy.sh stop`、
+`sudo rm <数据目录>/.postgres/state`、`./deploy.sh install`，就回到切换那一刻的 SQLite（切换之后在 PostgreSQL 上新产生的东西
+不会带回来；库的容器停着不用，`docker rm -f agentlab-postgres` 可删）。
+
+**卸载。** `./deploy.sh uninstall` 连库的容器和网络一起删，数据卷和数据目录都留着；同一个数据目录再 `./deploy.sh install`
+就接着用原来的库。确定不要了：`docker volume rm agentlab-pgdata`（不可恢复）。
+
+### 外接 PostgreSQL
+
+库在你自己的 PostgreSQL 上（要先建好），在 `agentlab.env` 里加一行再 `./deploy.sh install`：
 
 ```bash
 AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@<数据库地址>:5432/agentlab
@@ -84,7 +179,7 @@ AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@<数据库地址>:5
 
 容器里的 `127.0.0.1` 是容器自己：数据库在别的机器上就写那台的地址；就在这台机器上，写宿主机在 docker 网桥上的地址
 （一般是 `172.17.0.1`），并让 PostgreSQL 监听这个地址、`pg_hba.conf` 放行容器的网段。执行断点也进同一个库。
-数据目录照样要挂、要备份：工件、上传文件、记录表、加密密钥 `.secret_key` 还在里面。
+表结构和默认数据同样在每次启动时自动补齐，库暂时连不上时同样按退避重试。
 
 已经在用 SQLite 的，先把数据导过去（同一个镜像里带着导入命令；`--dry-run` 只核对、不写）：
 
@@ -95,12 +190,14 @@ docker run --rm --user 10001:10001 -v "$(pwd)/data:/data" --env-file agentlab.en
   agentlab:<版本> -m app.db copy-to-postgres /data --dry-run
 docker run --rm --user 10001:10001 -v "$(pwd)/data:/data" --env-file agentlab.env --entrypoint python \
   agentlab:<版本> -m app.db copy-to-postgres /data
-./deploy.sh start                                                  # agentlab.env 里已经有 AGENTLAB_DATABASE_URL
+./deploy.sh install                                                # agentlab.env 里已经有 AGENTLAB_DATABASE_URL
 ```
 
 导入结束时逐表打印来源和目标的行数、断点的条数，对不上的列出来、退出码非零；重跑只补没有的行，不重复、不覆盖。
-停在审批上、中断了的运行导过去之后照样能接着跑。导完 `data/agentlab.db` 可以留着当回退：把那一行删掉、重新部署就回到 SQLite
-（导入之后在 PostgreSQL 上新产生的东西不会回来）。备份时除了数据目录，再用 `pg_dump` 备份这个库。
+导完 `data/agentlab.db` 可以留着当回退：把那一行删掉、重新部署就回到 SQLite（导入之后在 PostgreSQL 上新产生的东西不会回来）。
+外接的库 deploy.sh 不备份，自己用 `pg_dump` 备份。
+
+### 多进程
 
 **多进程。** 换成 PostgreSQL 之后可以在容器里起几个工作进程：`agentlab.env` 里加 `AGENTLAB_WORKERS=4`（缺省 1）再
 `./deploy.sh upgrade`。几个进程共用一个端口，各自在库里登记、续租约；一个进程没了，别的进程在租约到期后接手它留下的运行、
@@ -119,7 +216,9 @@ cp ../agentlab-<旧版本>-linux-__AGENTLAB_ARCH__/agentlab.env .   # 沿用原�
 ```
 
 `upgrade` 导入新镜像、用新镜像替换容器，数据目录不动。deploy.sh 会检查新配置指向的数据目录和
-正在用的是不是同一个，不是就停下来提醒，不会让新版本悄悄从一个空库开始。
+正在用的是不是同一个，不是就停下来提醒，不会让新版本悄悄从一个空库开始。换之前先停旧服务、自动备份一次库
+（见「数据和备份」），备份没做成就把旧服务起回来、不升级。新版本启动时自动补表结构和默认数据，不用手动迁移。
+用内置 PostgreSQL 的，新包里的 `POSTGRES_IMAGE` 换了小版本时库的容器跟着换（数据卷不动）。
 
 新容器没通过健康检查时，原来的容器会保留为 `agentlab-previous`，屏幕上会打印回退命令。
 旧镜像也留着，确认新版本没问题后可以 `docker rmi agentlab:<旧版本>` 删掉。
@@ -135,6 +234,7 @@ cp ../agentlab-<旧版本>-linux-__AGENTLAB_ARCH__/agentlab.env .   # 沿用原�
 ./deploy.sh logs          # 最后 200 行
 ./deploy.sh logs -f       # 持续跟随，Ctrl-C 退出
 ./deploy.sh logs --tail 1000
+./deploy.sh logs --postgres  # 内置 PostgreSQL 的日志
 ```
 
 日志由 docker 自动轮转（单个 10 MB、保留 3 个），不会塞满存储卡。
@@ -146,10 +246,12 @@ cp ../agentlab-<旧版本>-linux-__AGENTLAB_ARCH__/agentlab.env .   # 沿用原�
 ./deploy.sh start                       # 再启动
 ./deploy.sh restart                     # 重启
 ./deploy.sh uninstall                   # 删除容器，保留数据和镜像
-./deploy.sh uninstall --purge-image     # 连镜像一起删
+./deploy.sh uninstall --purge-image     # 连镜像一起删（PostgreSQL 的镜像不删，别的东西可能也在用）
 ```
 
-卸载**永远不删数据**。确定不要了再手动删除数据目录（不可恢复）：`sudo rm -rf <数据目录>`。
+内置 PostgreSQL 时这几个命令按顺序管两个容器（起的时候先起库，停的时候先停服务），卸载连库的容器和网络一起删。
+卸载**永远不删数据**。确定不要了再手动删除数据目录（不可恢复）：`sudo rm -rf <数据目录>`；内置 PostgreSQL 的数据卷另删：
+`docker volume rm <CONTAINER_NAME>-pgdata`。
 
 改了 `agentlab.env` 之后运行 `./deploy.sh install` 让新配置生效（`restart` 不会重读配置）。
 

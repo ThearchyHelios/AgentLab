@@ -44,6 +44,7 @@ conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装
 后端仍只听 127.0.0.1，页面里的 `/api` 由前端开发服务器在本机转发。**默认不开登录**：同一网络里打得开页面的人
 都能用全部功能——跑工作流、花你配的模型额度、读数据源、执行沙箱代码，审批和发起记的是各自填的署名、未经核实。
 只在信得过的网络里这样用；多人使用请开登录，见[身份与权限](#身份与权限)。
+应用库要用 PostgreSQL 时加 `--postgres`（本机 docker 起一个开发用的库，见[用 PostgreSQL](#用-postgresql)）。
 认不出的参数直接报错，`./scripts/dev.sh --help` 看用法。
 
 **无需配置 API Key 即可完整体验。** 内置 Mock provider 产出流式回复、工具调用与
@@ -74,7 +75,10 @@ http://127.0.0.1:8000 。前端产物不存在或比源码旧时才重新构建�
 `--platform linux/arm64` 或 `linux/amd64`），连同一键部署脚本、配置模板和部署说明打成
 `release/agentlab-<版本>-linux-<arch>.tar`。拷到只装了 Docker Engine 的离线机器上，解包、按需修改
 `agentlab.env`、运行 `./deploy.sh` 即可，不需要 docker compose。安装、升级、备份、沙箱权限与常见问题见
-[deploy/README.md](deploy/README.md)。
+[deploy/README.md](deploy/README.md)。应用库可以用包里带的 PostgreSQL：新部署 `./deploy.sh install --postgres`（旁边再起一个
+PostgreSQL 容器，端口不对外，密码自动生成在数据目录里），已经在用 SQLite 的 `./deploy.sh migrate-to-postgres`（停服务、备份、
+导入、核对，哪一步出错都退回 SQLite）；`upgrade` 前自动备份库，表结构和默认数据启动时自动补齐。三种放法见 deploy/README.md
+「用 PostgreSQL」。
 
 镜像里默认带 microVM 的运行时和沙箱镜像（约 150 MB，`--no-microvm` 可不带）。目标机有 KVM 时，deploy.sh
 先用临时容器试启动一台 microVM，起得来就把 `/dev/kvm` 交给容器，代码在 microVM 里执行，部署时不用联网。
@@ -1067,6 +1071,16 @@ AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agen
 - 不分大小写的搜索（运行列表按名字、对象索引按注释）：文本列是 COLLATE "C"，列上的 ILIKE 只认 ASCII 的大小写，所以按建库时的
   区域设置折大小写——建库用 `en_US.UTF-8`、`C.UTF-8` 这类区域，É/é、全角Ａ/ａ 都认；用纯 `C` 区域建的库只认 ASCII。
 - `AGENTLAB_DATA_DIR` 照旧要设：工件、上传表格的版本库、原件、附件、记录表、沙箱工作区、`.secret_key` 都还是文件。
+- 启动时库还连不上（和库的容器一起起、库还在初始化）：按退避重试（1、2、4、5、5… 秒），每次打一条「应用库还没就绪」，最多等
+  `AGENTLAB_DB_STARTUP_TIMEOUT`（缺省 90）秒再报错退出；密码不对、库不存在这种等也没用的（SQLSTATE 28、3D、42 类）立刻报错。
+  建表、补列补索引在库里的咨询锁里做，默认数据在跨进程的锁里补，几个工作进程同时起各只做一次。
+
+**和库一起起。** 部署：离线包的 `./deploy.sh install --postgres` 带一个内置 PostgreSQL，`migrate-to-postgres` 把 SQLite 的部署切过去
+（[deploy/README.md](deploy/README.md)「用 PostgreSQL」）。开发：`./scripts/dev.sh --postgres` 起（已经有就复用）一个本地的
+`postgres:16` 容器 `agentlab-dev-postgres`，只开在 `127.0.0.1:55432`，数据在 docker 数据卷 `agentlab-dev-pgdata`，密码第一次
+自动生成在 `data/.postgres-dev/`（后端按 `PGPASSFILE` 读），后端照它设 `AGENTLAB_DATABASE_URL`；Ctrl-C 只停前后端，库的容器
+留着下次复用。容器名、端口、数据卷、镜像用 `AGENTLAB_DEV_PG_CONTAINER`、`AGENTLAB_DEV_PG_PORT`、`AGENTLAB_DEV_PG_VOLUME`、
+`AGENTLAB_DEV_PG_IMAGE` 改。不加 `--postgres` 和原来一样：SQLite，不用 docker。
 
 **从 SQLite 搬过来。** `python -m app.db copy-to-postgres` 把数据目录里的 `agentlab.db` 和 `checkpoints.db` 导进 PostgreSQL，
 停在审批上的、中断了的运行导过去之后照样能接着跑：
