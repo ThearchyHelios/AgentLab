@@ -481,3 +481,22 @@ async def test_an_idle_single_process_writes_nothing_for_coordination(monkeypatc
         assert cluster.leading(), "只有本进程：直接当班"
     finally:
         await cluster.stop()
+
+
+def test_the_worker_count_comes_from_the_backend_settings():
+    """复核 R-b4：prod.sh、Docker 的入口按 python -m app.cluster workers 起几个进程（后端自己读环境变量和 .env）；SQLite 而大于 1 时
+    照实报错、退出码 2。"""
+    backend = Path(__file__).resolve().parents[1]
+    base = {k: v for k, v in os.environ.items() if not k.startswith("AGENTLAB_")}
+    base.update(PYTHONPATH=str(backend), AGENTLAB_DATA_DIR=os.environ["AGENTLAB_DATA_DIR"],
+                AGENTLAB_SECRET_KEY="test-only-not-a-real-key")
+
+    def ask(**env: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-m", "app.cluster", "workers"], cwd=str(backend), env={**base, **env},
+                              capture_output=True, text=True, timeout=60)
+
+    sqlite = ask(AGENTLAB_DATABASE_URL="", AGENTLAB_WORKERS="3")
+    assert sqlite.returncode == 2 and "只支持单进程" in sqlite.stderr, sqlite.stderr[-1000:]
+    assert ask(AGENTLAB_DATABASE_URL="", AGENTLAB_WORKERS="1").stdout.strip() == "1"
+    pg = ask(AGENTLAB_DATABASE_URL="postgresql://u:p@db.internal:5432/agentlab", AGENTLAB_WORKERS="3")
+    assert pg.returncode == 0 and pg.stdout.strip() == "3", pg.stderr[-1000:]
