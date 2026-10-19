@@ -1050,9 +1050,8 @@ AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agen
 - 断点（LangGraph 的 checkpoints、checkpoint_blobs、checkpoint_writes、checkpoint_migrations 四张表，不和应用的表重名）
   缺省放在同一个库；要放别处设 `AGENTLAB_CHECKPOINT_URL=postgresql://…`（这一项是 libpq 的写法，`sslrootcert` 等可以直接写）。
 - 连接池：每个进程常驻 `AGENTLAB_DB_POOL_SIZE`（缺省 10）条、高峰再多开 `AGENTLAB_DB_MAX_OVERFLOW`（缺省 20）条，取连接前探活，
-  30 分钟换一次；断点库另有一个小池子。前面有 PgBouncer（事务模式）时：`AGENTLAB_DB_POOL_SIZE` 设成 0（不用连接池）、
-  地址后加 `?prepared_statement_cache_size=0`；断点库用预备语句，要 PgBouncer 1.21 以上开 `max_prepared_statements`，
-  或者用 `AGENTLAB_CHECKPOINT_URL` 让它直连 PostgreSQL。
+  30 分钟换一次；断点库另有一个小池子。前面有 PgBouncer 时照下面「直连与 PgBouncer」的三种部署写（事务模式要开
+  `AGENTLAB_DB_PGBOUNCER=1` 并另给直连地址）。
 - 连接数的账：每个进程最多 `AGENTLAB_DB_POOL_SIZE + AGENTLAB_DB_MAX_OVERFLOW`（缺省 10 + 20 = 30）条应用库连接，断点库的池子
   最多 `min(AGENTLAB_MAX_CONCURRENT_RUNS, 20)` 条（至少 4，缺省 20），合起来一个进程最多 50 条；导入命令另占几条。PostgreSQL
   缺省 `max_connections=100`，还要留几条给 `psql`、备份和超级用户（`superuser_reserved_connections` 缺省 3）：一个进程够用，
@@ -1127,8 +1126,24 @@ AGENTLAB_WORKERS=4 …                                                          
 | `AGENTLAB_SCHEDULER_TICK_S` | 15 | 调度循环一拍的间隔 |
 
 连接数照上一节「连接数的账」按进程数乘，另外每个进程多一条专门收发进程间通知（LISTEN / NOTIFY）的连接，不占连接池；跨进程的锁
-（咨询锁）持锁期间占连接池里的一条。前面放 PgBouncer（事务模式）时，通知那一条要直连 PostgreSQL（事务模式下 LISTEN 收不到通知），
-会话级的咨询锁也要求直连或会话模式——多进程部署建议应用库直连。
+（会话级咨询锁）持锁期间占一条。
+
+**直连与 PgBouncer。** 有几样连接依赖会话状态：收发进程间通知的那一条（LISTEN）、跨进程的锁（会话级咨询锁，取锁和放锁要在同一条
+会话上）、断点库（预备语句，建表时取会话锁）。普通查询走 `AGENTLAB_DATABASE_URL`；设了 `AGENTLAB_DATABASE_DIRECT_URL`（写法同它）
+时，上面这几样走直连地址（断点库缺省也走它，`AGENTLAB_CHECKPOINT_URL` 另给的除外）；不设就全用同一个地址。三种部署：
+
+| 部署 | 怎么设 |
+| --- | --- |
+| 直连 PostgreSQL | 只设 `AGENTLAB_DATABASE_URL`。最简单，多进程建议这样 |
+| PgBouncer 会话模式（`pool_mode=session`） | `AGENTLAB_DATABASE_URL` 指 PgBouncer 就行：会话模式下一个客户端连接独占一条服务端连接，会话状态都在 |
+| PgBouncer 事务模式（`pool_mode=transaction`） | `AGENTLAB_DATABASE_URL` 指 PgBouncer，另设 `AGENTLAB_DB_PGBOUNCER=1` 和 `AGENTLAB_DATABASE_DIRECT_URL`（直连 PostgreSQL，或指 PgBouncer 的会话模式那个库）。没给直连地址时拒绝启动 |
+
+`AGENTLAB_DB_PGBOUNCER=1` 做的事（只对普通地址）：不用客户端的连接池（交给 PgBouncer）；关掉 SQLAlchemy 和 asyncpg 的预备语句缓存
+（事务模式下下一条语句可能落在另一条服务端连接上，缓存着的预备语句在那边不存在）；asyncpg 每条语句仍先预备再执行（SQLAlchemy 的
+asyncpg 方言一律这样做，同一个事务里、在同一条服务端连接上），名字用随机的，不和别的客户端留下的撞名——PgBouncer 那边要配
+`server_reset_query = DISCARD ALL` 加 `server_reset_query_always = 1` 收掉留下的预备语句，或用 1.21 以上开 `max_prepared_statements`。
+事务级的咨询锁（发名额、同源队、建表时用）在事务模式下照常成立：取锁、放锁在同一个事务里。这几条照 SQLAlchemy、asyncpg、psycopg
+的文档和代码核过，没有在真的 PgBouncer 上跑过（本机没有它的镜像）。
 
 **认领和租约。** 每个进程在库里登记一行（主机、pid、启动时的随机串），隔一拍心跳续租约。运行、问数据的一轮、后台任务（探查、起草、
 剖析、评测、影子起草）、处理中的文档、执行中的发布单都记着认领它的进程；租约按进程算，进程没了它认领的行一起到期。平稳关停的进程

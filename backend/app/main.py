@@ -58,6 +58,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # SQLite 只支持单进程：同一个数据目录已经有一个进程在用（uvicorn --workers、两个服务指着同一个目录）就拒绝启动、照实说
     # （app/cluster/guard.py）。PostgreSQL 可以多进程，什么都不做
     guard.acquire()
+    # PgBouncer 事务模式（AGENTLAB_DB_PGBOUNCER=1）要另给直连地址，没给就拒绝启动（db/base.check_pgbouncer）
+    from app.db.base import check_pgbouncer
+
+    check_pgbouncer()
     await init_db()
     # 多进程协调（app/cluster）：登记这个工作进程、开始心跳和进程间通知、争调度当班。要在下面的启动整理之前：整理只碰属主不在了的
     # 行，要先知道别的进程谁还活着
@@ -150,9 +154,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await cluster.stop()
         # 应用库的连接全关掉：SQLite 最后一个连接关掉时才把 -wal 并回、删掉（copy-to-postgres 按它认服务停没停），
         # PostgreSQL 的连接池也正常关
-        from app.db.base import engine as db_engine
+        from app.db.base import dispose_session_engine, engine as db_engine
 
         await db_engine.dispose()
+        await dispose_session_engine()
         logger.info("已停止")
 
 

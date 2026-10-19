@@ -37,6 +37,14 @@ RETRY_S = 2.0
 Handler = Callable[[list[str]], Any]
 
 
+def listen_dsn() -> str:
+    """收发通知那条专用连接的地址：LISTEN 要一条一直开着的会话，设了直连地址（AGENTLAB_DATABASE_DIRECT_URL）就走它——普通地址
+    可能是 PgBouncer 的事务模式，那里收不到通知。"""
+    from app.db.urls import libpq_conninfo
+
+    return libpq_conninfo(settings.session_db_url)
+
+
 def _tag() -> str:
     return identity.owner().rsplit(":", 1)[-1]
 
@@ -126,9 +134,8 @@ class Signals:
         import asyncpg
 
         from app.db.base import APPLICATION_NAME
-        from app.db.urls import libpq_conninfo
 
-        dsn = libpq_conninfo(settings.database_url)
+        dsn = listen_dsn()
         first = True
         while not self._stopping:
             lost = asyncio.Event()
