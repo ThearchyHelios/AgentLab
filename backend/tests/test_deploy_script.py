@@ -32,8 +32,13 @@ pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="要 bash")
 
 
 class Deploy:
-    def __init__(self, root: Path, *, env_lines: list[str] | None = None) -> None:
+    """一份解开的离线包。share 给了另一份：两份用同一个假 docker（同一台机器上的两个部署）。"""
+
+    def __init__(self, root: Path, *, env_lines: list[str] | None = None, name: str = APP,
+                 share: "Deploy | None" = None) -> None:
         self.root = root
+        self.name = name
+        root.mkdir(parents=True, exist_ok=True)
         self.pkg = root / "pkg"
         self.pkg.mkdir()
         text = (REPO / "deploy" / "deploy.sh").read_text(encoding="utf-8")
@@ -47,8 +52,8 @@ class Deploy:
         docker = bin_dir / "docker"
         docker.write_text(f'#!/bin/sh\nexec "{sys.executable}" -S "{FAKE}" "$@"\n')
         docker.chmod(0o755)
-        self.state_file = root / "docker-state.json"
-        self.log_file = root / "docker-calls.jsonl"
+        self.state_file = share.state_file if share else root / "docker-state.json"
+        self.log_file = share.log_file if share else root / "docker-calls.jsonl"
         self.env = {
             "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(root), "LANG": "C.UTF-8",
             "FAKE_DOCKER_STATE": str(self.state_file), "FAKE_DOCKER_LOG": str(self.log_file),
@@ -59,7 +64,8 @@ class Deploy:
         return (self.pkg / "data").resolve()
 
     def write_env(self, extra: list[str]) -> None:
-        lines = ["HOST_PORT=18765", "BIND_ADDR=127.0.0.1", "DATA_DIR=./data", f"CONTAINER_NAME={APP}",
+        port = 18765 if self.name == APP else 18766
+        lines = [f"HOST_PORT={port}", "BIND_ADDR=127.0.0.1", "DATA_DIR=./data", f"CONTAINER_NAME={self.name}",
                  "ENABLE_MICROVM=0", "ENABLE_BWRAP=0", "AGENTLAB_SECRET_KEY=", *extra]
         (self.pkg / "agentlab.env").write_text("\n".join(lines) + "\n")
 
@@ -80,11 +86,14 @@ class Deploy:
     def containers(self) -> dict:
         return self.state()["containers"]
 
-    def mode(self) -> str:
+    def state_values(self) -> dict[str, str]:
         path = self.data / ".postgres" / "state"
         if not path.exists():
-            return "sqlite"
-        return next(line.split("=", 1)[1] for line in path.read_text().splitlines() if line.startswith("mode="))
+            return {}
+        return dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
+
+    def mode(self) -> str:
+        return self.state_values().get("mode", "sqlite")
 
 
 def index_of(calls: list[list[str]], pred) -> int:
@@ -408,9 +417,9 @@ def test_uninstall_refuses_a_foreign_container_with_the_postgres_name(deploy):
     state["containers"][PG] = {"image": "redis:7", "state": "running", "env": {}, "labels": {}, "mounts": {},
                                "ports": [], "network": "bridge"}
     deploy.state_file.write_text(json.dumps(state))
-    out = deploy("uninstall", ok=False)
-    assert "不是 deploy.sh 起的内置 PostgreSQL" in out.stderr
-    assert PG in deploy.containers()
+    out = deploy("uninstall")
+    assert "不是 deploy.sh 起的内置 PostgreSQL" in out.stderr and "没有删它" in out.stderr
+    assert PG in deploy.containers() and APP not in deploy.containers(), "别人的留着，自己的删掉"
 
 
 # --------------------------------------------------------------------------
@@ -579,7 +588,7 @@ def test_migrate_without_an_app_container_removes_the_failed_one(deploy):
 def test_migrate_refuses_a_volume_it_did_not_create(deploy):
     _sqlite_deployment(deploy)
     state = deploy.state()
-    state["volumes"].append(VOL)
+    state["volumes"][VOL] = {}
     deploy.state_file.write_text(json.dumps(state))
     out = deploy("migrate-to-postgres", ok=False)
     assert VOL in out.stderr and "没有动它" in out.stderr
@@ -591,6 +600,95 @@ def test_migrate_refuses_a_volume_it_did_not_create(deploy):
 def test_migrate_needs_a_sqlite_database(deploy):
     out = deploy("migrate-to-postgres", ok=False)
     assert "install --postgres" in out.stderr
+
+
+# --------------------------------------------------------------------------
+# 同一台机器上两个部署：名字记在数据目录里，容器、数据卷带部署编号（复核 R-d1）
+# --------------------------------------------------------------------------
+
+
+def _two_deployments(tmp_path) -> tuple[Deploy, Deploy]:
+    """a 用内置库在跑；b 是 SQLite 部署，一次 migrate 没切成（记成 migrating）。"""
+    a = Deploy(tmp_path / "a")
+    a("install", "--postgres")
+    b = Deploy(tmp_path / "b", name="agl-b", share=a)
+    make_sqlite_data(b.pkg / "data")
+    b("install")
+    b("migrate-to-postgres", ok=False, FAKE_COPY_FAIL="real")
+    assert b.mode() == "migrating"
+    return a, b
+
+
+def _touched(calls: list[list[str]], name: str) -> list[list[str]]:
+    """动了 name 这个容器的调用（清空库、删、停、重建）。"""
+    return [c for c in calls if (c[:2] == ["exec", name]) or (c[:1] in (["rm"], ["stop"]) and name in c)
+            or runs_named(name)(c)]
+
+
+def test_the_state_file_records_names_and_labels_carry_the_deployment_id(deploy):
+    deploy("install", "--postgres")
+    values = deploy.state_values()
+    assert values["mode"] == "builtin" and values["container"] == PG and values["volume"] == VOL and values["network"] == NET
+    dep = values["id"]
+    assert len(dep) == 12
+    state = deploy.state()
+    assert state["containers"][PG]["labels"]["agentlab.deployment"] == dep
+    assert state["volumes"][VOL] == {"agentlab.role": "pgdata", "agentlab.deployment": dep}
+
+
+def test_renaming_to_another_deployments_database_is_refused_before_anything_is_touched(tmp_path):
+    a, b = _two_deployments(tmp_path)
+    before = a.containers()[PG]
+    b.write_env([f"POSTGRES_CONTAINER={PG}", f"POSTGRES_VOLUME={VOL}"])
+    for args in (["migrate-to-postgres"], ["uninstall"], ["stop"]):
+        out = b(*args, ok=False)
+        assert "记着它的内置 PostgreSQL 用的是 agl-b-postgres" in out.stderr, args
+        assert _touched(b.calls(), PG) == [], f"{args}：a 的库一点没动"
+    assert a.containers()[PG] == before
+
+
+def test_an_old_state_file_is_backfilled_and_another_deployments_container_still_refused(tmp_path):
+    a, b = _two_deployments(tmp_path)
+    # 早先的状态文件只记了模式；agentlab.env 又改成了 a 的名字
+    (b.data / ".postgres" / "state").write_text("mode=migrating\nsince=2026-10-01T00:00:00+00:00\n")
+    b.write_env([f"POSTGRES_CONTAINER={PG}", f"POSTGRES_VOLUME={VOL}", f"DOCKER_NETWORK={NET}"])
+    out = b("migrate-to-postgres", ok=False)
+    assert "按 agentlab.env 现在的名字补记" in out.stdout
+    assert "另一个部署" in out.stderr
+    assert not any(c[:2] == ["exec", PG] for c in b.calls()), "没有在 a 的库里 DROP"
+    assert a.containers()[PG]["state"] == "running"
+    assert b.state_values()["container"] == PG, "照实补记了现在的名字"
+
+
+def test_an_unlabelled_container_is_recognised_by_its_password_mount(tmp_path):
+    """早先起的库容器没有部署编号的标签：挂着这个数据目录的密码文件、挂的是 POSTGRES_VOLUME 的才认。"""
+    a = Deploy(tmp_path / "a")
+    a("install", "--postgres")
+    state = a.state()
+    del state["containers"][PG]["labels"]["agentlab.deployment"]
+    a.state_file.write_text(json.dumps(state))
+    a("restart", "--postgres")
+    assert a.containers()[PG]["state"] == "running"
+    state["containers"][PG]["mounts"]["/run/agentlab/password"] = "/elsewhere/.postgres/password"
+    a.state_file.write_text(json.dumps(state))
+    out = a("restart", "--postgres", ok=False)
+    assert "不是这个数据目录" in out.stderr
+    out = a("uninstall")
+    assert PG in a.containers() and "没有删它" in out.stderr
+
+
+def test_upgrade_with_a_new_image_does_not_recreate_another_deployments_container(tmp_path):
+    a = Deploy(tmp_path / "a")
+    a("install", "--postgres")
+    b = Deploy(tmp_path / "b", name="agl-b", share=a)
+    b("install", "--postgres")
+    # b 的状态文件是早先记的、名字又改成了 a 的：补记之后部署编号对不上，不碰 a 的库
+    (b.data / ".postgres" / "state").write_text("mode=builtin\n")
+    b.write_env([f"POSTGRES_CONTAINER={PG}", f"POSTGRES_VOLUME={VOL}", f"DOCKER_NETWORK={NET}"])
+    (b.pkg / "postgres-image.tar").write_text("postgres:16.99 \n")
+    out = b("upgrade", ok=False, DEPLOY_POSTGRES_IMAGE="postgres:16.99")
+    assert "另一个部署" in out.stderr
+    assert a.containers()[PG]["image"] == PG_IMAGE and not any(runs_named(PG)(c) for c in b.calls())
 
 
 def test_package_script_takes_the_postgres_image_from_deploy_sh():

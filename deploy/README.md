@@ -119,7 +119,10 @@ sudo tar -czf ../agentlab-data-$(date +%Y%m%d).tar.gz data
   不进 `docker inspect`，`agentlab.env` 里什么都不用填。AgentLab 的容器按 `PGPASSFILE` 读它。**丢了数据目录就连不上这个库**，
   所以数据目录照样要整份备份。
 - 用过一次之后这个数据目录就一直是内置 PostgreSQL（记在 `.postgres/state`），之后的 `install`、`upgrade`、`start` 不用再加
-  `--postgres`。
+  `--postgres`。状态文件里同时记着库的容器、数据卷、网络的名字和一个部署编号，deploy.sh 起的库容器、建的数据卷和网络都带着
+  `agentlab.deployment=<编号>` 的标签：之后 `agentlab.env` 里的名字和记着的对不上（比如改成了同一台机器上另一个部署的名字），
+  或者同名的容器、数据卷是别的部署的，deploy.sh 照实报错、不碰它们——清空库、删容器、换镜像重建之前都核对。早先的状态文件只记了
+  模式的，第一次遇到时按当时的名字补记。
 - `start` 先起库、等 `pg_isready` 通过再起服务；`stop` 先停服务再停库。`restart` 缺省只重启服务（库停着的话先把库起来），
   `restart --postgres` 连库一起重启（先停服务再停库，再先起库后起服务）。开机时两个容器一起被 docker 拉起来，库还没就绪时
   服务按退避重试（日志里写着「应用库还没就绪……秒后重试」），最多等 90 秒（`AGENTLAB_DB_STARTUP_TIMEOUT`），不会一上来就崩。

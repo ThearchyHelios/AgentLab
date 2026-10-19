@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import sys
 from pathlib import Path
 
@@ -40,9 +41,14 @@ def host_arch() -> str:
 
 
 def load() -> dict:
-    if STATE.exists():
-        return json.loads(STATE.read_text())
-    return {"images": {}, "containers": {}, "networks": [], "volumes": []}
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    state.setdefault("images", {})
+    state.setdefault("containers", {})
+    # 网络、数据卷：名字 → 标签。测试里直接写列表（只有名字、没标签）的也认
+    for kind in ("networks", "volumes"):
+        value = state.get(kind) or {}
+        state[kind] = {name: {} for name in value} if isinstance(value, list) else value
+    return state
 
 
 def save(state: dict) -> None:
@@ -80,12 +86,13 @@ def fmt_container(c: dict, fmt: str) -> str:
         return "true" if c["state"] == "running" else "false"
     if fmt == "{{.Config.Image}}":
         return c["image"]
-    if ".Mounts" in fmt and '"/data"' in fmt:
-        return c["mounts"].get("/data", "")
+    if ".Mounts" in fmt and (m := re.search(r'eq \.Destination "([^"]+)"', fmt)):
+        # .Source（绑定挂载的宿主机路径）和 .Name（数据卷名）这里存的是同一个值
+        return c["mounts"].get(m.group(1), "")
     if ".State.Health" in fmt:
         return container_health(c)
-    if '"agentlab.role"' in fmt:
-        return c["labels"].get("agentlab.role", "")
+    if ".Config.Labels" in fmt and (m := re.search(r'index \.Config\.Labels "([^"]+)"', fmt)):
+        return c["labels"].get(m.group(1), "")
     if ".HostConfig.PortBindings" in fmt:
         return "".join(p.rsplit(":", 2)[-2] for p in c["ports"])
     raise KeyError(fmt)
@@ -264,8 +271,7 @@ def main(argv: list[str]) -> int:
         if name in state["containers"]:
             fail(f'docker: Error response from daemon: Conflict. The container name "/{name}" is already in use.', 125)
         for vol in opts["volumes"]:
-            if vol not in state["volumes"]:
-                state["volumes"].append(vol)
+            state["volumes"].setdefault(vol, {})
         state["containers"][name] = {
             "image": image, "state": "running", "env": opts["env"], "labels": opts["labels"],
             "mounts": opts["mounts"], "ports": opts["ports"], "network": network or "bridge",
@@ -331,31 +337,29 @@ def main(argv: list[str]) -> int:
             print(host_part)
         return 0
 
-    if cmd == "network":
+    if cmd in ("network", "volume"):
+        kind = cmd + "s"
         sub, name = args[0], args[-1]
         if sub == "inspect":
-            return 0 if name in state["networks"] else 1
+            if name not in state[kind]:
+                return 1
+            if len(args) >= 3 and args[1] == "-f":
+                m = re.search(r'index \.Labels "([^"]+)"', args[2])
+                if not m:
+                    unknown(argv)
+                print(state[kind][name].get(m.group(1), ""))
+            return 0
         if sub == "create":
-            if name in state["networks"]:
+            labels = dict(a.split("=", 1) for a in (args[i + 1] for i, x in enumerate(args) if x == "--label"))
+            if name in state[kind] and cmd == "network":
                 fail(f"network with name {name} already exists")
-            state["networks"].append(name)
+            state[kind].setdefault(name, labels)
             save(state)
             return 0
         if sub == "rm":
-            if any(c["network"] == name for c in state["containers"].values()):
+            if cmd == "network" and any(c["network"] == name for c in state["containers"].values()):
                 fail(f"error while removing network: network {name} has active endpoints")
-            state["networks"].remove(name)
-            save(state)
-            return 0
-        unknown(argv)
-
-    if cmd == "volume":
-        sub, name = args[0], args[-1]
-        if sub == "inspect":
-            return 0 if name in state["volumes"] else 1
-        if sub == "create":
-            if name not in state["volumes"]:
-                state["volumes"].append(name)
+            state[kind].pop(name, None)
             save(state)
             return 0
         unknown(argv)

@@ -7,7 +7,9 @@
                        连库时读，PGPASSFILE 指过来）。已有就不动；密码不打印、不进任何参数和日志
     state              数据目录用的是哪种库：没切过是 sqlite；--set builtin 记成「已切到内置 PostgreSQL」（deploy.sh 只在导入、
                        核对都通过之后才记，记下之前出错就还是 sqlite）；migrating 是「开始往内置库里导了、还没切成」——
-                       用的仍是 SQLite，只是让下一次 migrate-to-postgres 认得出数据卷里那半份是自己上次留下的
+                       用的仍是 SQLite，只是让下一次 migrate-to-postgres 认得出数据卷里那半份是自己上次留下的。
+                       --container / --volume / --network 记下这个数据目录的内置库用的名字；第一次记时生成部署编号 id
+                       （deploy.sh 把它打在库的容器、数据卷、网络的标签上，按它认哪些是这个部署的）。--get 键 打印一项
     backup-sqlite      拷一份 agentlab.db、checkpoints.db 到 <数据目录>/backups/sqlite/<时间>/（SQLite 的备份接口，一致的一份），
                        只留最近 --keep 份
     backup-dir         建（或收紧）备份目录：从 backups/ 起每一层 0700（pg_dump 写进去之前用）
@@ -62,28 +64,56 @@ def postgres_secrets(data: Path, *, folder: str, host: str, port: int, database:
     return made
 
 
-def read_state(data: Path) -> str:
-    """数据目录用的是哪种库：sqlite（没切过）、builtin（已切到内置 PostgreSQL）或 migrating（切到一半，用的仍是 SQLite）。"""
+#: 状态文件里的几项（顺序就是写出来的顺序）。名字三项：这个数据目录的内置库用的容器、数据卷、网络
+STATE_KEYS = ("mode", "since", "id", "container", "volume", "network")
+NAME_KEYS = ("container", "volume", "network")
+
+
+def read_state_values(data: Path) -> dict[str, str]:
     path = data / POSTGRES_DIR / STATE_FILE
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("mode="):
-                mode = line.split("=", 1)[1].strip()
-                return mode if mode in MODES else "sqlite"
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        pass
-    return "sqlite"
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() in STATE_KEYS:
+            values[key.strip()] = value.strip()
+    return values
 
 
-def write_state(data: Path, mode: str) -> None:
-    if mode not in MODES:
+def read_state(data: Path) -> str:
+    """数据目录用的是哪种库：sqlite（没切过）、builtin（已切到内置 PostgreSQL）或 migrating（切到一半，用的仍是 SQLite）。"""
+    mode = read_state_values(data).get("mode", "sqlite")
+    return mode if mode in MODES else "sqlite"
+
+
+def write_state(data: Path, mode: str | None = None, **names: str | None) -> dict[str, str]:
+    """改模式（mode 给了才改；改了才换 since）、记名字（给了的那几项）；别的照旧。第一次写时生成部署编号 id，之后不变。"""
+    if mode is not None and mode not in MODES:
         raise SystemExit(f"认不出的模式：{mode}（{' / '.join(MODES)}）")
+    unknown = set(names) - set(NAME_KEYS)
+    if unknown:
+        raise SystemExit(f"认不出的名字：{'、'.join(sorted(unknown))}")
+    values = read_state_values(data)
+    if mode is not None and values.get("mode") != mode:
+        values["mode"] = mode
+        values["since"] = datetime.now(timezone.utc).isoformat()
+    values.setdefault("mode", "sqlite")
+    values.setdefault("since", datetime.now(timezone.utc).isoformat())
+    values.setdefault("id", secrets.token_hex(6))
+    for key, value in names.items():
+        if value:
+            values[key] = value
     root = data / POSTGRES_DIR
     if not root.exists():
         root.mkdir(parents=True)
         root.chmod(0o711)
     # 不是密钥：宿主机上的 deploy.sh 直接读它，0644
-    atomic.write_text(root / STATE_FILE, f"mode={mode}\nsince={datetime.now(timezone.utc).isoformat()}\n", mode=0o644)
+    text = "".join(f"{key}={values[key]}\n" for key in STATE_KEYS if values.get(key))
+    atomic.write_text(root / STATE_FILE, text, mode=0o644)
+    return values
 
 
 @contextlib.contextmanager
@@ -171,6 +201,9 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("state")
     s.add_argument("--data", default="/data")
     s.add_argument("--set", choices=MODES)
+    for key in NAME_KEYS:
+        s.add_argument(f"--{key}")
+    s.add_argument("--get", choices=STATE_KEYS)
     b = sub.add_parser("backup-sqlite")
     b.add_argument("--data", default="/data")
     b.add_argument("--keep", type=int, default=5)
@@ -187,9 +220,13 @@ def main(argv: list[str] | None = None) -> int:
                                 user=args.user)
         print("生成了新密码" if made else "沿用已有的密码")
     elif args.command == "state":
-        if args.set:
-            write_state(Path(args.data), args.set)
-        print(read_state(Path(args.data)))
+        names = {key: getattr(args, key) for key in NAME_KEYS if getattr(args, key)}
+        if args.set or names:
+            write_state(Path(args.data), args.set, **names)
+        if args.get:
+            print(read_state_values(Path(args.data)).get(args.get, ""))
+        else:
+            print(read_state(Path(args.data)))
     elif args.command == "backup-sqlite":
         target = backup_sqlite(Path(args.data), keep=args.keep)
         print(target if target is not None else "没有 SQLite 库，不用备份")

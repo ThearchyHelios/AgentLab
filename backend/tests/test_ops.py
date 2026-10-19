@@ -62,6 +62,34 @@ def test_state_defaults_to_sqlite_and_records_switches(tmp_path, capsys):
         ops.main(["state", "--data", str(tmp_path), "--set", "external"])
 
 
+def test_state_records_names_and_a_stable_deployment_id(tmp_path, capsys):
+    assert ops.main(["state", "--data", str(tmp_path), "--set", "migrating", "--container", "agl-postgres",
+                     "--volume", "agl-pgdata", "--network", "agl-net"]) == 0
+    values = ops.read_state_values(tmp_path)
+    assert values["mode"] == "migrating" and values["container"] == "agl-postgres" and values["volume"] == "agl-pgdata"
+    dep = values["id"]
+    assert len(dep) == 12
+    since = values["since"]
+    # 改模式：名字、编号照旧，since 换新
+    ops.write_state(tmp_path, "builtin")
+    again = ops.read_state_values(tmp_path)
+    assert again["id"] == dep and again["network"] == "agl-net" and again["mode"] == "builtin"
+    assert again["since"] >= since
+    # 只补记名字：模式不变
+    ops.write_state(tmp_path, None, container="agl-db")
+    assert ops.read_state(tmp_path) == "builtin" and ops.read_state_values(tmp_path)["container"] == "agl-db"
+    capsys.readouterr()
+    assert ops.main(["state", "--data", str(tmp_path), "--get", "id"]) == 0
+    assert capsys.readouterr().out.strip() == dep
+    # 早先的状态文件（只有模式）：第一次写时补上编号
+    (tmp_path / ".postgres" / "state").write_text("mode=migrating\n")
+    ops.write_state(tmp_path, None, container="c", volume="v", network="n")
+    old = ops.read_state_values(tmp_path)
+    assert old["mode"] == "migrating" and old["id"] and old["id"] != dep
+    with pytest.raises(SystemExit):
+        ops.write_state(tmp_path, None, image="x")
+
+
 def test_prune_keeps_the_newest_by_name(tmp_path):
     for name in ("agentlab-20260101T000000Z.dump", "agentlab-20260103T000000Z.dump", "agentlab-20260102T000000Z.dump"):
         (tmp_path / name).write_bytes(b"x")
