@@ -225,44 +225,83 @@ def _grant_lock() -> asyncio.Lock:
     return lock
 
 
+@dataclass
+class _MemRow:
+    run_id: str
+    klass: str
+    priority: int
+    requested_at: Any
+    owner: str = ""
+    granted: bool = False
+
+
+#: SQLite 时的名额（复核 R-b3）：只有一个进程，规矩照同一套、只是不落库——一段运行不为要名额多写三次库
+_mem: dict[str, _MemRow] = {}
+
+
+def _in_memory() -> bool:
+    return settings.db_dialect == "sqlite"
+
+
+def _pick(rows: list[Any], pol: dict[str, Any]) -> list[str]:
+    """按规矩挑这一次发给谁（库里的行、进程里的行同一套）：优先级高的先、同级先来先得，类别上限、全站上限、交互留底。"""
+    used = Counter(r.klass for r in rows if r.granted)
+    total = sum(used.values())
+    # 交互以外的三类合起来用了几个：到了「全站上限 − 交互留底」就不再发给它们（留底永远给交互）
+    others = total - used["interactive"]
+    others_cap = borrowable(pol)
+    limits = {k: int(v["limit"]) for k, v in pol["classes"].items()}
+    granted: list[str] = []
+    waiting = sorted((r for r in rows if not r.granted), key=lambda r: (-int(r.priority or 0), r.requested_at, r.run_id))
+    for row in waiting:
+        if total >= int(pol["max_total"]):
+            break
+        if used[row.klass] >= limits.get(row.klass, int(pol["max_total"])):
+            continue
+        if row.klass != "interactive" and others >= others_cap:
+            continue
+        used[row.klass] += 1
+        total += 1
+        if row.klass != "interactive":
+            others += 1
+        granted.append(row.run_id)
+    return granted
+
+
 async def grant() -> list[str]:
     """把等着的按规矩过一遍，够格的改成已发；属主不在了的行删掉。交回这一次发出去的。全站串行（见模块说明）。"""
+    if _in_memory():
+        pol = await policy()
+        for run_id in [r for r in _mem if not _local(r)]:
+            _mem.pop(run_id, None)
+        granted = _pick(list(_mem.values()), pol)
+        for run_id in granted:
+            _mem[run_id].granted = True
+        if granted:
+            wake_local()
+        return granted
     from app.cluster import state
     from app.db.models_cluster import RunSlot
 
     pol = await policy()
+    # 拿锁之前先备好「谁还活着」（必要时这时候查库），持锁期间只用持锁的那条连接
+    live = await state.current()
+    known_dead = await _known_dead(live)
     async with _grant_lock():
         async with SessionLocal() as session:
             if session.get_bind().dialect.name == "postgresql":
                 await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _GRANT_KEY})
             rows = list((await session.execute(select(RunSlot))).scalars())
-            live = await state.live_for([r.owner for r in rows])
-            dead = [r.run_id for r in rows if not live.alive(r.owner, local=_local(r.run_id))]
+            # 持着全站的锁时不另取连接查库（复核：连接池用尽时会卡到取连接超时）：用锁之前拿好的那一份「谁还活着」，不认识的属主
+            # 这一次当活着（不删它的行），下一次手上那份更新了再说
+            me = identity.owner()
+            dead = [r.run_id for r in rows
+                    if (r.owner == me and not _local(r.run_id)) or (r.owner != me and r.owner in known_dead)]
             if dead:
                 await session.execute(delete(RunSlot).where(RunSlot.run_id.in_(dead)))
             rows = [r for r in rows if r.run_id not in set(dead)]
-            used = Counter(r.klass for r in rows if r.granted)
-            total = sum(used.values())
-            # 交互以外的三类合起来用了几个：到了「全站上限 − 交互留底」就不再发给它们（留底永远给交互）
-            others = total - used["interactive"]
-            others_cap = borrowable(pol)
-            limits = {k: int(v["limit"]) for k, v in pol["classes"].items()}
-            granted: list[str] = []
-            waiting = sorted((r for r in rows if not r.granted),
-                             key=lambda r: (-int(r.priority or 0), r.requested_at, r.run_id))
+            granted = _pick(rows, pol)
             now = utcnow()
-            for row in waiting:
-                if total >= int(pol["max_total"]):
-                    break
-                if used[row.klass] >= limits.get(row.klass, int(pol["max_total"])):
-                    continue
-                if row.klass != "interactive" and others >= others_cap:
-                    continue
-                used[row.klass] += 1
-                total += 1
-                if row.klass != "interactive":
-                    others += 1
-                granted.append(row.run_id)
             if granted:
                 await session.execute(update(RunSlot).where(RunSlot.run_id.in_(granted))
                                       .values(granted=True, granted_at=now).execution_options(synchronize_session=False))
@@ -275,8 +314,25 @@ async def grant() -> list[str]:
     return granted
 
 
+async def _known_dead(live: Any) -> set[str]:
+    """名额表里属主不在手上那份「活着」里的那几个，拿锁之前当场再查一次登记：仍不在的算没了。"""
+    from app.cluster import state
+    from app.db.models_cluster import RunSlot
+
+    async with SessionLocal() as session:
+        owners = set((await session.execute(select(RunSlot.owner).distinct())).scalars())
+    unknown = {o for o in owners if o and o != identity.owner() and o not in live.others}
+    if not unknown:
+        return set()
+    fresh = await state.current(fresh=True)
+    return {o for o in unknown if o not in fresh.others}
+
+
 async def _granted(run_id: str) -> bool | None:
     """这一行发了没有：True 发了，False 还在等，None 这一行不见了（被当成属主不在了删掉）。"""
+    if _in_memory():
+        row = _mem.get(run_id)
+        return None if row is None else row.granted
     from app.db.models_cluster import RunSlot
 
     async with SessionLocal() as session:
@@ -284,6 +340,9 @@ async def _granted(run_id: str) -> bool | None:
 
 
 async def _request(run_id: str, klass: str, priority: int) -> None:
+    if _in_memory():
+        _mem[run_id] = _MemRow(run_id, klass, priority, utcnow(), identity.owner())
+        return
     from app.db.models_cluster import RunSlot
 
     async with SessionLocal() as session:
@@ -294,6 +353,9 @@ async def _request(run_id: str, klass: str, priority: int) -> None:
 
 
 async def _release(run_id: str) -> None:
+    if _in_memory():
+        _mem.pop(run_id, None)
+        return
     from app.db.models_cluster import RunSlot
 
     async with SessionLocal() as session:
@@ -337,11 +399,14 @@ async def hold(run_id: str, origin_kind: str | None) -> AsyncIterator[str]:
 
 async def snapshot() -> dict[str, Any]:
     """现在各类在跑、在等几个（系统信息、验收脚本看）。"""
-    from app.db.models_cluster import RunSlot
+    if _in_memory():
+        rows = [(r.klass, r.granted) for r in _mem.values() if _local(r.run_id)]
+    else:
+        from app.db.models_cluster import RunSlot
 
-    async with SessionLocal() as session:
-        rows = list((await session.execute(select(RunSlot.klass, RunSlot.granted))).all())
-    out = {k: {"running": 0, "waiting": 0} for k in CLASSES}
+        async with SessionLocal() as session:
+            rows = list((await session.execute(select(RunSlot.klass, RunSlot.granted))).all())
+    out = {k: {"running": 0, "waiting": 0} for k in CLASSES}  # noqa: C420
     for klass, granted in rows:
         out.setdefault(klass, {"running": 0, "waiting": 0})["running" if granted else "waiting"] += 1
     return {"policy": await policy(), "classes": out}

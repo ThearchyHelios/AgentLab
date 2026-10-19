@@ -115,7 +115,7 @@ async def test_a_class_at_its_cap_does_not_hold_up_the_others(monkeypatch):
     await _until(lambda: "chat" in got)
     assert len({"e1", "e2"} & set(got)) == 1, "系统类到了上限：另一个等着"
     snapshot = await slots.snapshot()
-    assert snapshot["classes"]["system"] == {"running": 1, "waiting": 1}
+    assert snapshot["classes"]["system"] == {"running": 1, "waiting": 1}, snapshot
     gate.set()
     await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
 
@@ -174,6 +174,7 @@ async def test_interactive_takes_the_reserve_at_once_and_it_is_never_lent(monkey
     await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
 
 
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="SQLite 只有一个进程，名额在进程里（复核 R-b3），没有别的进程的名额行")
 async def test_slots_held_by_a_process_that_is_gone_are_taken_back(monkeypatch):
     _policy(monkeypatch, 1, interactive=(1, 40))
     async with SessionLocal() as session:
@@ -185,6 +186,7 @@ async def test_slots_held_by_a_process_that_is_gone_are_taken_back(monkeypatch):
         assert rows == ["mine"], "没了的进程占着的名额收回了"
 
 
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="SQLite 只有一个进程，名额在进程里（复核 R-b3），没有别的进程的名额行")
 async def test_slots_of_a_live_peer_are_left_alone(monkeypatch):
     _policy(monkeypatch, 1, interactive=(1, 40))
     await _peer(PEER)
@@ -451,3 +453,31 @@ async def test_preflight_refuses_a_beating_peer_and_waits_out_a_stale_one():
     with pytest.raises(version.VersionMismatch):
         await _peer_version(PEER, "0.0.9+old+aaaaaaaaaaaa")
         await workers.register()
+
+
+@pytest.mark.sqlite_only
+async def test_an_idle_single_process_writes_nothing_for_coordination(monkeypatch):
+    """复核 R-b3：SQLite（只有一个进程）空闲时协调不写库——不续租约、不写当班、不周期接手；要名额、放名额也不落库。用另一条连接
+    读 PRAGMA data_version：别的连接提交过写事务它就会变。"""
+    import sqlite3
+
+    from app import cluster
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "worker_heartbeat_s", 0.05)
+    await cluster.start()
+    try:
+        await asyncio.sleep(0.2)
+        probe = sqlite3.connect(settings.db_path)
+        try:
+            before = probe.execute("PRAGMA data_version").fetchone()[0]
+            await asyncio.sleep(0.6)                       # 十来拍心跳
+            async with slots.hold("idle-check", "chat"):    # 一段运行要一个名额、用完放掉
+                pass
+            after = probe.execute("PRAGMA data_version").fetchone()[0]
+        finally:
+            probe.close()
+        assert before == after, "空闲的单进程为协调写了库"
+        assert cluster.leading(), "只有本进程：直接当班"
+    finally:
+        await cluster.stop()
