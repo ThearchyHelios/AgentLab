@@ -236,6 +236,8 @@ class Prepared:
     run: dict[str, Any] = field(default_factory=dict)
     #: 按参数定义收好类型的参数（typed_args）：哈希、预览按它算，send 发的也是它
     args: dict[str, Any] = field(default_factory=dict)
+    #: 记录上写的节点 id：认出升级前那种键（legacy_node_id）时照它记，同一个键下的记录 node_id 一致，下一次还认得出
+    node_id: str | None = None
 
     @property
     def idem_key(self) -> str:
@@ -247,8 +249,11 @@ async def latest(session: AsyncSession, key: str) -> ActionRecord | None:
                                 .order_by(ActionRecord.attempt.desc()).limit(1))
 
 
-async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, args: dict[str, Any]) -> Prepared:
-    """节点每次执行都先走这里：按 action_key 查记录，决定发不发、第几次发、走哪个环境。
+async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, args: dict[str, Any],
+                  legacy_node_id: str | None = None) -> Prepared:
+    """节点每次执行都先走这里：按 action_key 查记录，决定发不发、第几次发、走哪个环境。node_id 是这次运行里的节点 id
+    （子工作流里的带前缀）；legacy_node_id 是升级前子工作流里按子图里的 id 记的那种（tools._run_write 交进来），按它也没查到
+    才算头一次。
 
     sent / unknown 抛 ActionPending（不发）；failed 且没有人核实为「重新发送」的抛 ActionFailed。先查记录再收类型：已生效
     （演练过）的交回存下的回执、已发出 / 结果未知的挂起，都和这一次渲染出来的参数无关——发出之后能力的参数定义改了、手上的
@@ -263,13 +268,21 @@ async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, a
         run = await session.get(Run, run_id)
         endpoint = await _endpoint(session, capability)
         prev = await latest(session, key)
+        if prev is None and legacy_node_id:
+            # 升级前子工作流里的写入按子图里的节点 id 记幂等键（node_id 也记成它）：恢复时整个子图重跑，照那个键认出已经
+            # 记下的那一笔，接着用它的键（不重发、第几次发送接着数）。新记的子图写入 node_id 带前缀，认不到这里来
+            old_key = action_key(run_id, legacy_node_id, exec_no)
+            old = await latest(session, old_key)
+            if old is not None and old.node_id == legacy_node_id:
+                key, prev, node_id = old_key, old, legacy_node_id
     facts = {"app_id": run.app_id, "workflow_id": run.workflow_id, "workflow_version": run.version,
              "graph_hash": run.version_hash, "started_by": run.started_by} if run is not None else {}
     endpoint_name = endpoint.name if endpoint is not None else None
     if prev is not None and prev.state in ("confirmed", "simulated"):
         # 交回的是生效的那一次：指纹、预览、环境、第几次都照记录，不按这一次的参数重算
         return Prepared(key=key, attempt=prev.attempt, payload_hash=prev.payload_hash, preview=prev.preview,
-                        environment=prev.environment, endpoint=endpoint_name, receipt=_receipt_of(prev), run=facts)
+                        environment=prev.environment, endpoint=endpoint_name, receipt=_receipt_of(prev), run=facts,
+                        node_id=node_id)
     if prev is not None and prev.state in ("sent", "unknown"):
         raise ActionPending(prev.id)
     formal = run is not None and run.run_class == "formal"
@@ -290,15 +303,18 @@ async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, a
     args = typed_args(capability, args)
     return Prepared(key=key, attempt=attempt, payload_hash=payload_hash(name, args),
                     preview=masked(args, masked_paths(capability)), environment=environment, endpoint=endpoint_name,
-                    run=facts, args=args)
+                    run=facts, args=args, node_id=node_id)
 
 
 async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, exec_no: int,
-               emit: Callable[..., None], on_behalf: str | dict[str, Any] | None = None) -> dict[str, Any]:
+               emit: Callable[..., None], on_behalf: str | dict[str, Any] | None = None,
+               confirm_node: str | None = None) -> dict[str, Any]:
     """先写记录再发送。返回节点的产出；结果未知抛 ActionPending，确定失败抛 ActionFailed。发的是 prepare 收好类型的
     那一份参数（prep.args），和确认卡上的哈希是同一份。
 
-    on_behalf 原样交给平台执行器写身份断言：{"sub": 运行的发起人, "act": 确认人}（capabilities.endpoints.on_behalf_parts）。"""
+    on_behalf 原样交给平台执行器写身份断言：{"sub": 运行的发起人, "act": 确认人}（capabilities.endpoints.on_behalf_parts）。
+    记录上的节点 id 照 prepare 认定的（prep.node_id）；confirm_node 是动作确认待办上记的节点 id（确认卡上的，子工作流里是
+    子图里的 id），不给就按 node_id 找。"""
     from app.capabilities.registry import endpoint_request, masked_paths
 
     name = capability.name
@@ -306,11 +322,12 @@ async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, ex
         rec = await session.scalar(select(ActionRecord).where(ActionRecord.idem_key == prep.idem_key))
         if rec is None:
             rec = ActionRecord(
-                action_key=prep.key, attempt=prep.attempt, idem_key=prep.idem_key, run_id=run_id, node_id=node_id,
+                action_key=prep.key, attempt=prep.attempt, idem_key=prep.idem_key, run_id=run_id,
+                node_id=prep.node_id or node_id,
                 exec_no=exec_no, capability=name, capability_version=getattr(capability, "version", None),
                 endpoint_id=getattr(capability, "endpoint_id", None), environment=prep.environment,
                 payload_hash=prep.payload_hash, preview=prep.preview, state="pending",
-                confirm_task_id=await _confirm_task(session, run_id, node_id),
+                confirm_task_id=await _confirm_task(session, run_id, confirm_node or node_id),
                 app_id=prep.run.get("app_id"), workflow_id=prep.run.get("workflow_id"),
                 workflow_version=prep.run.get("workflow_version"), graph_hash=prep.run.get("graph_hash"))
             session.add(rec)

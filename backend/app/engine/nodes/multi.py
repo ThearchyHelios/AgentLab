@@ -14,7 +14,9 @@ from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Workflow
-from app.engine.context import LABEL_PREFIX_KEY, PREFIX_KEY, STREAM_KEY, NodeContext, NodeError, stream_writer
+from app.engine.context import (
+    LABEL_PREFIX_KEY, PREFIX_KEY, ROOT_IDS_KEY, STREAM_KEY, NodeContext, NodeError, stream_writer,
+)
 from app.engine.lineage import whole_ref
 from app.engine.state import GraphState, message_text, template_context
 from app.engine.toolcalls import (
@@ -692,8 +694,16 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 子图里的节点经父运行的写入口发事件、节点 id 带前缀；嵌套的子图拿到的是同一个写入口、更长的前缀
         extra={**{k: v for k, v in ctx.run.extra.items() if k not in ("resumed", "actors")},
                PREFIX_KEY: f"{ctx.run.global_id(ctx.node.id)}/", LABEL_PREFIX_KEY: f"{ctx.run.global_label(ctx.node.title)} › ",
-               STREAM_KEY: stream_writer(ctx.run)},
+               STREAM_KEY: stream_writer(ctx.run),
+               # 最外层图上的节点 id：子图里的写入认升级前按子图里的 id 记的幂等键时，排除父图同名节点记的那一条（tools._run_write）
+               ROOT_IDS_KEY: ctx.run.extra.get(ROOT_IDS_KEY) or frozenset(n.id for n in ctx.run.spec.nodes)},
     )
+    # 这个子工作流节点之前几次执行里，子图各节点跑过的记录（交回父图 trail 的，见下）：子图从它们接着数第几次执行
+    # （engine/evidence.next_exec）。以前每次都从空的 trail 起步，循环里第二轮的子图节点又记成第 1 次：台账分不出是哪一次，
+    # 写外部系统的幂等键（按第几次执行算）和第一轮撞上，第二轮的写入交回第一轮的回执、不发送
+    prefix = f"{ctx.node.id}/"
+    seed = [{**t, "node_id": str(t.get("node_id"))[len(prefix):]} for t in state.get("trail") or []
+            if isinstance(t, dict) and str(t.get("node_id") or "").startswith(prefix)]
 
     ctx.emit(EventType.LOG, level="info",
              message=f"进入子工作流「{workflow.name}」（{len(sub_spec.nodes)} 个节点）")
@@ -711,7 +721,7 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "output": {},
                 "messages": [],
                 "usage": {},
-                "trail": [],
+                "trail": seed,
                 "loops": {},
             },
             {"recursion_limit": limit},
@@ -732,6 +742,9 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         raise
 
     output = result_state.get("output") or {}
+    # 这一次执行新跑的那几步（trail 只追加：前面是交进去的 seed）
+    ran = [t for t in (result_state.get("trail") or [])[len(seed):] if isinstance(t, dict)]
+    result_state = {**result_state, "trail": ran}
     result = {
         "output": output,
         "workflow": workflow.name,
@@ -754,11 +767,12 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     }
     if ledger := [_forwarded(e, ctx.node.id) for e in result_state.get("evidence") or [] if isinstance(e, dict)]:
         updates["evidence"] = ledger
-    if rejected := _rejected_steps(result_state, ctx.node.id):
-        # 子工作流里走了驳回出口的那几步（engine/compiler._rejected_exit 记的 outcome=rejected）交回父图的 trail：运行收尾
-        # 据此在终态事件上照实写「途经驳回」（runner._rejected_via），实例页、通知、定时任务的 Webhook 说得出「子工作流 › 把关」
-        # 被驳回、转到哪。名字、转到哪几步在子图里已经按这次运行的说法记好（global_label、global_id），这里只接上节点 id 的前缀
-        updates["trail"] = rejected
+    if ran:
+        # 子图这一次跑过的每一步交回父图的 trail，节点 id 接上前缀（「子工作流节点 id/…」）：同一个子工作流节点下一次执行时
+        # 从这里接着数（上面的 seed）；走了驳回出口的那几步（outcome=rejected）运行收尾据此在终态事件上照实写「途经驳回」
+        # （runner._rejected_via），实例页、通知、定时任务的 Webhook 说得出「子工作流 › 把关」被驳回、转到哪（名字、转到哪几步
+        # 在子图里已经按这次运行的说法记好：global_label、global_id）。父图自己的节点按自己的 id 数，不受影响
+        updates["trail"] = [{**t, "node_id": f"{prefix}{t.get('node_id')}"} for t in ran]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         updates["vars"] = {var_name: output}
@@ -767,12 +781,6 @@ async def run_subgraph(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
 #: 台账条目里写着节点 id 的键：交回父图时一并加前缀（双盲复算的条目记着它复算的口径卡）
 _LEDGER_NODE_KEYS = ("node_id", "card")
-
-
-def _rejected_steps(sub_state: dict[str, Any], node_id: str) -> list[dict[str, Any]]:
-    """子工作流的 trail 里走了驳回出口的那几步，节点 id 换成父图这一层的（「子工作流节点 id/…」）。"""
-    return [{**t, "node_id": f"{node_id}/{t.get('node_id')}"} for t in sub_state.get("trail") or []
-            if isinstance(t, dict) and t.get("outcome") == "rejected"]
 
 
 def _forwarded(entry: dict[str, Any], node_id: str) -> dict[str, Any]:
