@@ -350,9 +350,11 @@ def _plain_cell(expression: str, fetch: str) -> str | None:
 
 def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str], caliber_columns: list[str] | None,
                metrics: list[dict[str, Any]], fetch: str, card: str, fallback: bool, chosen: Any,
-               referenced: list[tuple[int, str]], projected: Any = None) -> Plan:
+               referenced: list[tuple[int, str]], projected: Any = None, cells: Any = None,
+               caliber: str | None = None) -> Plan:
     """配列、（多行时）定行和键：交回 Plan，配不了的抛 ReconcileRefused（见模块说明）。projected 是比对候选的 projection
-    （按引用的列投影过的：{ours: [这次留下的列], caliber: [口径留下的列]}，按位置一一对应）。纯计算。"""
+    （按引用的列投影过的：{ours: [这次留下的列], caliber: [口径留下的列]}，按位置一一对应）。cells 是这条查询逐格比的结论
+    （ledger/match._cells），caliber 是这份口径的键：要人选对照时按它预选（_suggested）。纯计算。"""
     def check_column(column: str) -> None:
         if column not in ours_columns:
             raise ReconcileRefused(422, PAIR_COLUMN.format(column=column))
@@ -365,7 +367,8 @@ def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str
     numeric = [c for i, c in enumerate(ours_columns) if c.lower() not in hidden and _numeric(ours_rows, i)]
     options = {"options": {"columns": numeric,
                            "metrics": [{"id": str(m.get("id")), "name": str(m.get("name") or m.get("id")),
-                                        "unit": str(m.get("unit") or "")} for m in metrics if m.get("id")]}}
+                                        "unit": str(m.get("unit") or "")} for m in metrics if m.get("id")],
+                           "suggested": _suggested(cells, caliber, fetch, numeric, metrics)}}
     if multi:
         return _plan_rows(ours_columns, ours_rows, hidden, caliber_columns, referenced, check_column)
     if chosen is not None:
@@ -407,6 +410,40 @@ def plan_pairs(*, ours_columns: list[str], ours_rows: list[Any], hidden: set[str
     if not pairs:
         raise ReconcileRefused(409, PAIRS_NONE, NEEDS_PAIRS, extra=options)
     return Plan(pairs=pairs)
+
+
+def _suggested(cells: Any, caliber: str | None, fetch: str, columns: list[str],
+               metrics: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """要人选对照时预选哪几对：[{ours, metric}]。按逐格比的结论（ledger/match._cells）——这次结果的这一列单独比，和这份口径
+    取数节点的某一列等价（逐格证明了，projection.caliber 是那一列），口径卡上只读这一列这一格的指标就是它最可能的对照。只认
+    证明了的：只是「相关」的那一格比到的是第一个试的列，不是最像的，不替人猜；一个口径列对上几个指标的也不预选。界面照它
+    预选、人可以改。"""
+    from app.engine.expressions import ExpressionError, cell_parts, leaf_refs, parse_expression
+
+    if not isinstance(cells, dict) or not caliber:
+        return []
+    reads: dict[str, list[str]] = {}
+    for m in metrics:
+        try:
+            leaves = leaf_refs(parse_expression(str(m.get("expression") or ""))[0])
+        except ExpressionError:
+            continue
+        cols = {_plain_cell(str(leaf), fetch) for leaf in leaves if cell_parts(str(leaf)) is not None}
+        if len(leaves) == 1 and len(cols) == 1 and None not in cols and m.get("id"):
+            reads.setdefault(str(next(iter(cols))).lower(), []).append(str(m["id"]))
+    out: list[dict[str, str]] = []
+    for col in columns:
+        cell = cells.get(col)
+        cands = cell.get("candidates") if isinstance(cell, dict) else None
+        proven = next((c for c in cands or [] if isinstance(c, dict) and c.get("status") == "proven"
+                       and c.get("caliber") == caliber and c.get("node_id") == fetch), None)
+        theirs = ((proven or {}).get("projection") or {}).get("caliber") if proven else None
+        if not isinstance(theirs, list) or len(theirs) != 1 or not isinstance(theirs[0], str):
+            continue
+        hits = reads.get(theirs[0].lower()) or []
+        if len(hits) == 1:
+            out.append({"ours": col, "metric": hits[0]})
+    return out
 
 
 def _projected_pairs(projected: Any, ours_columns: list[str]) -> list[tuple[str, str]] | None:
@@ -583,7 +620,8 @@ async def reconcile(run_id: str, req: Request, *, principal: Any) -> Run:
                       caliber_columns=_caliber_columns(template, inputs, list(pinned.entry_fields), kind, schema),
                       metrics=pinned.metrics, fetch=str(fetch["id"]), card=pinned.card_title,
                       fallback=bool((cand.get("diff") or {}).get("fallback")), chosen=req.pairs,
-                      referenced=_referenced(sealed, req.query), projected=cand.get("projection"))
+                      referenced=_referenced(sealed, req.query), projected=cand.get("projection"),
+                      cells=query.get("cells"), caliber=key)
     graph = build(pinned, sql=snap["sql"], tool=f"{QUERY_PREFIX}{source}", plan=plan, inputs=inputs,
                   fetch=str(fetch["id"]))
 

@@ -87,6 +87,9 @@ export const LEDGER_UI = {
     maskedPlaceholder: '已遮罩，请重新填写',
     pairs: '选择要对照的指标',
     pairsHint: '认不出这次的哪一列对应口径的哪个指标，请为要对照的列选一个口径卡上的指标',
+    /** 有预选的：按逐格比对证明了的那几列预选上，人可以改 */
+    pairsSuggested: '已按逐格比对的结论预选了能证明对应的列，请核对，可以改选',
+    pairSuggestedTag: '预选',
     pairNone: '不对照',
     pairEmpty: '至少选一组对照',
     launch: '发起对账',
