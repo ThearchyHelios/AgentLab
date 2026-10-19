@@ -37,7 +37,7 @@ import asyncio
 import re
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -234,18 +234,54 @@ def failed_queries(state: GraphState, spec: GraphSpec, node: GraphNode) -> list[
         result = outputs.get(other.id)
         if other.id not in allowed or (keep is not None and other.id not in keep) or not isinstance(result, dict):
             continue
-        for call in result.get("tool_calls") or []:
-            if not isinstance(call, dict) or call.get("repeat") or call.get("skipped") or call.get("denied"):
-                continue
+        calls = [c for c in result.get("tool_calls") or []
+                 if isinstance(c, dict) and not (c.get("repeat") or c.get("skipped") or c.get("denied"))
+                 and is_platform_query(str(c.get("tool") or ""))]
+        for i, call in enumerate(calls):
             name, said = str(call.get("tool") or ""), str(call.get("result") or "").strip()
-            if not is_platform_query(name) or not (call.get("ok") is False or said.startswith("查询失败")):
+            if not _query_failed(call):
                 continue
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            if _superseded(name, str(args.get("sql") or ""), calls[i + 1:]):
+                # 写错了一条、下一条马上改对了：这次失败已被替代，不算「没有查到」（不然写作模型会写「还有一次取数失败」，
+                # 复核据此判有缺口）
+                continue
             reason = said.splitlines()[0] if said else "没有交回结果"
             found.append({"node_id": other.id, "title": other.title or other.id, "tool": name,
                           "sql": " ".join(str(args.get("sql") or "").split())[:200],
                           "reason": reason[:FAILED_REASON_CHARS]})
     return found
+
+
+def _query_failed(call: Mapping[str, Any]) -> bool:
+    said = str(call.get("result") or "").strip()
+    return call.get("ok") is False or said.startswith("查询失败")
+
+
+def _tables(sql: str) -> set[str] | None:
+    """这条 SQL 读的表（sql_semantics.facets 的 tables，按比较用的写法）；解析不了的为 None。"""
+    from app.data.sql_semantics import facets
+
+    f = facets(sql)
+    if f.parse_error or not f.tables:
+        return None
+    return {str(p.key) for p in f.tables}
+
+
+def _superseded(tool: str, sql: str, later: list[dict[str, Any]]) -> bool:
+    """同一个节点里这次失败之后，还有一条成功的平台查询替代了它：同一个数据源（同一个查询工具）、读的表覆盖了失败那条读的
+    表；失败那条解析不了（取不出表）的，同一个数据源之后有成功的查询就算。"""
+    wanted = _tables(sql)
+    for call in later:
+        if str(call.get("tool") or "") != tool or _query_failed(call):
+            continue
+        if wanted is None:
+            return True
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        got = _tables(str(args.get("sql") or ""))
+        if got is not None and wanted <= got:
+            return True
+    return False
 
 
 def _failed_section(failed: list[dict[str, Any]], *, any_query: bool) -> str:
