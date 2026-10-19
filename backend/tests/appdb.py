@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 from typing import Any
 
@@ -75,3 +76,27 @@ def refuse_inserts(table: str, condition: str, *, name: str) -> tuple[list[str],
         return create, drop
     return ([f"CREATE TRIGGER {name} BEFORE INSERT ON {table} WHEN {condition} "
              f"BEGIN SELECT RAISE(ABORT, 'refused by test'); END"], [f"DROP TRIGGER IF EXISTS {name}"])
+
+
+def admin_conninfo() -> str:
+    """测试用的 PostgreSQL 服务器上能建库删库的连接串（就是这个 xdist 进程自己的库，建删别的库用）。"""
+    return _pg_conninfo()
+
+
+@contextlib.contextmanager
+def fresh_postgres_database(tag: str):
+    """同一台测试服务器上另建一个空库，交回它的地址（postgresql+asyncpg://…），用完删掉。只在 PostgreSQL 时能用。"""
+    import uuid
+
+    import psycopg
+    from sqlalchemy.engine import make_url
+
+    url = make_url(settings.db_url)
+    name = f"{url.database}_{tag}_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(_pg_conninfo(), autocommit=True) as conn:
+        conn.execute(f'CREATE DATABASE "{name}"')
+    try:
+        yield url.set(database=name).render_as_string(hide_password=False)
+    finally:
+        with psycopg.connect(_pg_conninfo(), autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
