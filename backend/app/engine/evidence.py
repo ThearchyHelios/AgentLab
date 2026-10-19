@@ -61,7 +61,7 @@ from app.data.provenance_types import DOC_PROVENANCE
 from app.data.tabular import UNSHAPED_NOTE
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell
 from app.engine.guards import FALLBACK_CONTEXT
-from app.engine.issuance import _tolerance, extract_numbers, number_allowance
+from app.engine.issuance import _CN_COUNT_UNIT, _tolerance, extract_numbers, number_allowance
 from app.engine.labels import option_label
 
 DOC_SCHEMA = "agentlab.report/1"
@@ -2872,7 +2872,8 @@ def compose_doc(
                     unit["segments"] = _link_entities(unit["segments"], catalog, index)
         all_segments = [s for block in out_blocks for unit in block["units"] for s in unit["segments"]]
     # 裸数字单独切成片段：前端要在那几个字底下画「无出处」
-    refs = [tuple(s["span"]) for s in all_segments if s.get("ref")] + _header_masks(out_blocks, catalog)
+    refs = [tuple(s["span"]) for s in all_segments if s.get("ref")] + _header_masks(out_blocks, catalog) \
+        + _name_masks(markdown, catalog, snaps)
     syntax = [tuple(s["span"]) for s in all_segments if s["kind"] == "structural"]
     bare = _bare_numbers(markdown, refs, allow_numbers, syntax)
     for block in out_blocks:
@@ -2950,6 +2951,52 @@ def _header_masks(blocks: list[dict[str, Any]], catalog: dict[str, Any]) -> list
             if all(s.get("kind") == "text" for s in body) \
                     and "".join(str(s.get("text") or "") for s in body).strip() in names:
                 out.append((spans[0][0], spans[-1][1]))
+    return out
+
+
+#: 文本格的值本身是数、或者是带单位的数（「120台」「3.5万元」「45%」「约 30 天」「205L」）：不算名字（_name_masks），照抄进
+#: 正文的那个数照样要出处。单位认出具校验数量词那一套（issuance._CN_COUNT_UNIT），再加百分号、万亿千百和 1–3 个拉丁字母
+_UNIT_VALUE = re.compile(
+    r"^(?:约|共|近|超|逾|合计|总计|≈|~)?\s*[+-]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)\s*"
+    r"(?:[%％‰]|[万亿千百]?(?:" + _CN_COUNT_UNIT.pattern + r"|[A-Za-z]{1,3}))?\s*$")
+
+
+def _text_names(catalog: dict[str, Any], snaps: _Snapshots) -> set[str]:
+    """目录里每次查询的快照中，文本格里带数字的值（「冲压5线」「KX-205 线」）：至少有一个数字、至少有一个不是数字的字，
+    本身不是数、也不是带单位的数（_UNIT_VALUE）。按写作目录里显示的样子（压成一行）收。取不回的快照跳过。"""
+    names: set[str] = set()
+    for alias, entry in catalog.items():
+        if not isinstance(entry, dict) or entry.get("kind") != "query":
+            continue
+        snapshot, why = snaps.get(alias, entry.get("artifact"))
+        if why or not isinstance(snapshot, dict):
+            continue
+        columns = [str(c) for c in snapshot.get("columns") or []]
+        kinds = [column_kind(snapshot, c) for c in columns]
+        for row in snapshot.get("rows") or []:
+            cells = row if isinstance(row, list) else [row.get(c) for c in columns] if isinstance(row, dict) else []
+            for raw, kind in zip(cells, kinds):
+                if not isinstance(raw, str) or cell_value(raw, kind) is not raw:
+                    continue
+                text = _clean(raw)
+                if any(c.isdigit() for c in text) and not text.isdigit() and not _UNIT_VALUE.match(text):
+                    names.add(text)
+    return names
+
+
+def _name_masks(markdown: str, catalog: dict[str, Any], snaps: _Snapshots) -> list[tuple[int, int]]:
+    """正文里一字不差地写出了查询结果中文本格的值（_text_names）的那几段：名字里的数字不是结论数字，写作者照着查询结果
+    写名字，不该因为名字里有个 5 被打回重写。只认快照里真有的值、整段一字不差，前后紧挨着数字的不算（「冲压15线」不是
+    「冲压5线」）；同一个数单独写出来照样要出处。组装和复核用同一份目录，放过的范围一致。"""
+    out: list[tuple[int, int]] = []
+    for name in _text_names(catalog, snaps) if any(c.isdigit() for c in markdown) else ():
+        at = markdown.find(name)
+        while at >= 0:
+            end = at + len(name)
+            before, after = markdown[at - 1:at], markdown[end:end + 1]
+            if not (before.isdigit() or before == "." or after.isdigit()):
+                out.append((at, end))
+            at = markdown.find(name, at + 1)
     return out
 
 
@@ -3219,7 +3266,7 @@ def verify_doc(
     if tiled and pos != len(markdown):
         violations.append(_violation("segment_mismatch", "正文末尾有一段不属于任何片段，文档可能被修改过"))
 
-    masks += _header_masks(list(doc.get("blocks") or []), catalog)
+    masks += _header_masks(list(doc.get("blocks") or []), catalog) + _name_masks(markdown, catalog, snaps)
     for token in _bare_numbers(markdown, masks, allow_numbers, syntax):
         owner = next(((sid, uid) for s, e, sid, uid in owners if s <= token.start < e), (None, None))
         violations.append(_violation(
