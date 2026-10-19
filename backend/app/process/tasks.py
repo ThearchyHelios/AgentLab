@@ -1027,14 +1027,15 @@ async def startup(*, live: Any = None) -> int:
     """启动时：存量的待审批补建 Task（派给任何人，幂等）；上次停在 resolving 的（判定之后、恢复之前进程没了）按 Approval
     的状态收拾——还在等的退回 pending、撤回那一票，已经交给引擎的记成已处理。返回补建的条数。
 
-    多进程：别的进程活着时，resolving 可能正是它在判定、恢复（几秒的事），只收拾停在 resolving 超过两个租约时长的。"""
+    多进程：别的进程活着时，resolving 可能正是它在判定、恢复（几秒的事），只收拾停在 resolving 超过两个租约时长的；当班进程隔一会儿
+    来的那一次（live.trust_mine）不论有没有别的进程都这样——本进程自己也可能正在判定。只有启动时、又没有别的进程的那一次全收拾。"""
     from datetime import timedelta
 
     from app.cluster import state
     from app.cluster.workers import lease_s
 
     live = live if live is not None else await state.current(fresh=True)
-    stale_before = utcnow() - timedelta(seconds=2 * lease_s()) if live.others else None
+    stale_before = utcnow() - timedelta(seconds=2 * lease_s()) if (live.others or live.trust_mine) else None
     async with SessionLocal() as session:
         orphans = list((await session.execute(
             select(Approval).outerjoin(Task, Task.approval_id == Approval.id)
