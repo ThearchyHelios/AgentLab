@@ -135,6 +135,38 @@ def test_backup_sqlite_copies_a_consistent_snapshot_including_the_wal(tmp_path, 
     assert len(list(target.iterdir())) == 2 and not (target / "20200101T000000Z").exists()
 
 
+def test_backup_sqlite_also_copies_the_record_tables(tmp_path):
+    """复核 R-d4：填报的记录表 records/**/*.db（原地追加写的 SQLite）也用备份接口拷进同一份备份，相对路径照旧。"""
+    sqlite3.connect(tmp_path / "agentlab.db").close()
+    (tmp_path / "records" / "nested").mkdir(parents=True)
+    rec = sqlite3.connect(tmp_path / "records" / "sales.v1.db")
+    rec.execute("PRAGMA journal_mode=WAL")
+    rec.execute("CREATE TABLE records (v TEXT)")
+    rec.execute("INSERT INTO records VALUES ('还在 WAL 里的一行')")
+    rec.commit()
+    sqlite3.connect(tmp_path / "records" / "nested" / "visits.v2.db").close()
+    (tmp_path / "records" / "notes.txt").write_text("不是库，不拷")
+    try:
+        target = ops.backup_sqlite(tmp_path, keep=5)
+    finally:
+        rec.close()
+    copied = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
+    assert copied == ["agentlab.db", "records/nested/visits.v2.db", "records/sales.v1.db"]
+    db = sqlite3.connect(target / "records" / "sales.v1.db")
+    assert db.execute("SELECT v FROM records").fetchall() == [("还在 WAL 里的一行",)]
+    db.close()
+    for folder in (target / "records", target / "records" / "nested"):
+        assert _mode(folder) == 0o700
+    assert _mode(target / "records" / "sales.v1.db") == 0o600
+
+
+def test_record_tables_alone_are_left_to_the_whole_directory_backup(tmp_path):
+    """库在 PostgreSQL（没有 agentlab.db、checkpoints.db）时不做这份备份：记录表跟着整个数据目录备份。"""
+    (tmp_path / "records").mkdir()
+    sqlite3.connect(tmp_path / "records" / "sales.v1.db").close()
+    assert ops.backup_sqlite(tmp_path, keep=5) is None
+
+
 def test_backup_dir_creates_and_tightens_every_level(tmp_path, capsys):
     (tmp_path / "backups").mkdir(mode=0o755)
     (tmp_path / "backups").chmod(0o755)

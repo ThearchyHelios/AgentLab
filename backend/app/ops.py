@@ -10,8 +10,9 @@
                        用的仍是 SQLite，只是让下一次 migrate-to-postgres 认得出数据卷里那半份是自己上次留下的。
                        --container / --volume / --network 记下这个数据目录的内置库用的名字；第一次记时生成部署编号 id
                        （deploy.sh 把它打在库的容器、数据卷、网络的标签上，按它认哪些是这个部署的）。--get 键 打印一项
-    backup-sqlite      拷一份 agentlab.db、checkpoints.db 到 <数据目录>/backups/sqlite/<时间>/（SQLite 的备份接口，一致的一份），
-                       只留最近 --keep 份
+    backup-sqlite      拷一份 agentlab.db、checkpoints.db 和填报的记录表 records/**/*.db 到 <数据目录>/backups/sqlite/<时间>/
+                       （SQLite 的备份接口，各自一致的一份，记录表保持 records/ 下的相对路径），只留最近 --keep 份。上传原件、
+                       上传表格的版本库、工件、附件、沙箱工作区不在里面：那些要整个数据目录一起备份
     backup-dir         建（或收紧）备份目录：从 backups/ 起每一层 0700（pg_dump 写进去之前用）
     prune              目录里按名字排序只留最近 --keep 个（pg_dump 的备份用）
 
@@ -172,18 +173,33 @@ def prune(folder: Path, keep: int) -> list[Path]:
     return gone
 
 
+def _sqlite_sources(data: Path) -> list[Path]:
+    """要备份的 SQLite 文件（相对数据目录）：应用库、断点库，和填报的记录表（records/ 下，原地追加写，开着服务直接拷可能拷到
+    写了一半的，所以也走备份接口）。"""
+    found = [Path(name) for name in ("agentlab.db", "checkpoints.db") if (data / name).is_file()]
+    records = data / "records"
+    if records.is_dir():
+        found += sorted(p.relative_to(data) for p in records.rglob("*.db") if p.is_file())
+    return found
+
+
 def backup_sqlite(data: Path, *, keep: int) -> Path | None:
-    """agentlab.db、checkpoints.db 拷到 backups/sqlite/<时间>/。两个都没有（库在 PostgreSQL）交回 None。"""
-    sources = [p for p in (data / "agentlab.db", data / "checkpoints.db") if p.is_file()]
-    if not sources:
+    """agentlab.db、checkpoints.db、records/**/*.db 拷到 backups/sqlite/<时间>/（相对路径照旧）。应用库和断点库都没有（库在
+    PostgreSQL）交回 None——记录表那时由整目录备份管。"""
+    sources = _sqlite_sources(data)
+    if not any(p.parent == Path(".") for p in sources):
         return None
     with _private_umask():
         root = backup_dir(data, "sqlite")
         target = root / _stamp()
         target.mkdir(exist_ok=True)
         target.chmod(BACKUP_DIR_MODE)
-        for src in sources:
-            _copy_sqlite(src, target / src.name)
+        for rel in sources:
+            dst = target / rel
+            for folder in reversed(dst.relative_to(target).parents[:-1]):
+                (target / folder).mkdir(exist_ok=True)
+                (target / folder).chmod(BACKUP_DIR_MODE)
+            _copy_sqlite(data / rel, dst)
     prune(root, keep)
     return target
 

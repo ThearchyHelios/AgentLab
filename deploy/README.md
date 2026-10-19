@@ -66,10 +66,12 @@ deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i im
 另用 `pg_dump` 备份数据库。
 
 `./deploy.sh upgrade` 换版本之前会自动备份一次库：SQLite 拷到数据目录的 `backups/sqlite/<时间>/`（SQLite 的备份接口，
-一致的一份），内置 PostgreSQL 用 `pg_dump` 存到 `backups/postgres/`，各只留最近 5 份（`agentlab.env` 里 `BACKUP_KEEP=` 改）。
+各自一致的一份：`agentlab.db`、`checkpoints.db`，和填报的记录表 `records/` 下的各个 `.db`，相对路径照旧），内置 PostgreSQL
+用 `pg_dump` 存到 `backups/postgres/`（整个库，含断点），各只留最近 5 份（`agentlab.env` 里 `BACKUP_KEEP=` 改）。
 备份里是整个库（含加密存着的密钥），所以 `backups/` 和下面每一层目录都是 0700、备份文件 0600，属主同数据目录（uid 10001）：
 宿主机上要看、要拷走都得用 sudo（`sudo ls -l data/backups/sqlite/`、`sudo cp -a data/backups /别处/`）。
-这只是升级的保险，不代替下面的整目录备份：工件、上传文件和 `.secret_key` 不在里面。
+这只是升级的保险，不代替下面的整目录备份：上传的原件和上传表格的各版本库、工件库、表单附件、知识库、沙箱工作区、加密密钥
+`.secret_key` 都不在里面（用内置 PostgreSQL 时记录表也不在 `pg_dump` 里，它们是数据目录里的文件）。
 
 用 SQLite 的部署要从 `backups/sqlite/` 恢复（以缺省的 `./data` 为例，`<时间>` 换成目录名）：
 
@@ -77,6 +79,7 @@ deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i im
 ./deploy.sh stop
 sudo rm -f data/agentlab.db-wal data/agentlab.db-shm data/checkpoints.db-wal data/checkpoints.db-shm
 sudo cp -p data/backups/sqlite/<时间>/agentlab.db data/backups/sqlite/<时间>/checkpoints.db data/   # -p：属主仍是 10001
+sudo cp -rp data/backups/sqlite/<时间>/records/. data/records/           # 记录表（有的话），同样先删掉它们的 -wal、-shm
 ./deploy.sh start
 ```
 
