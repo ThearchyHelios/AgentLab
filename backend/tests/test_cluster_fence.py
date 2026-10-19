@@ -83,9 +83,21 @@ async def _no_repeated_seq(run_id: str) -> None:
     assert rows == [], f"撞号：{rows}"
 
 
+async def _checkpointed_before_slow(run_id: str) -> None:
+    """等 slow 前面那一步的断点落了库（LangGraph 存断点和下一步并行：慢一点的库上 slow 已经开始、断点还在写）。"""
+    config = {"configurable": {"thread_id": run_id}}
+    for _ in range(300):
+        tup = await run_manager.checkpointer.aget_tuple(config)
+        if tup is not None and int((tup.metadata or {}).get("step", -1)) >= 1:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("slow 前面那一步的断点一直没落库")
+
+
 async def _stall_and_take_over(slow) -> str:
     run = await run_manager.start(graph=GRAPH, input_payload={"question": "q"})
     await asyncio.wait_for(slow["entered"].wait(), timeout=15)
+    await _checkpointed_before_slow(run.id)
     before = fence.generation()
     fence.renewed(time.monotonic() - lease_s() - 1)    # 卡了一个多租约时长
     await _taken_over(run.id)
