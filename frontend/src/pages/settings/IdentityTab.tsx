@@ -13,7 +13,8 @@ import type { AuthMode, GroupRow, Role, UserRow } from '../../typesApp'
 /*
  * 设置 → 身份（A7、§3.12）：登录方式、单点登录、使用者能否问数据、用户、组。只给管理员；关登录时所有人等同管理员。
  *
- * 从关闭登录切到本地账号时，必须在同一个请求里建出第一个管理员（否则切过去没有人能登录）；切到单点登录时至少
+ * 从关闭登录（或单点登录）切到本地账号时，库里还没有能用密码登录的管理员，就必须在同一个请求里建出第一个管理员（否则切过去
+ * 没有人能登录）；已经有了就不用建，保存后回登录页用他登录。有管理员但都没设密码（关登录时新建用户可以不填）的，照实说是谁。切到单点登录时至少
  * 配一个映射为管理员的用户或组（admin_users、admin_groups 至少一项：小团队的单点登录服务常常没有组声明）。环境变量指定了登录方式时这里只读。人员变动只改组成员，不发应用的新版本（写审计）
  */
 
@@ -37,7 +38,8 @@ export function IdentityTab() {
   return (
     <div className="space-y-8" data-identity="">
       <ModeSection settings={settings} onSaved={load} />
-      <UsersSection mode={settings.mode} />
+      {/* 用户列表里新建了管理员、重设了密码：登录方式那一块要重新判断还要不要建第一个管理员 */}
+      <UsersSection mode={settings.mode} onChanged={load} />
       <GroupsSection mode={settings.mode} />
     </div>
   )
@@ -51,7 +53,11 @@ function ModeSection({ settings, onSaved }: { settings: Settings; onSaved: () =>
   const [boot, setBoot] = useState({ username: '', password: '', display_name: '' })
   const [busy, setBusy] = useState(false)
   const radio = useRadioGroup(MODES, mode, setMode)
-  const needsBoot = settings.mode === 'off' && mode === 'local'
+  const loginAdmins = settings.local_admins ?? []
+  const passwordless = settings.passwordless_admins ?? []
+  const toLocal = settings.mode !== 'local' && mode === 'local'
+  // 已经有能用密码登录的管理员就不用再建：后端也是这条判据（_local_admin_exists）
+  const needsBoot = toLocal && loginAdmins.length === 0
   const oidcList = (key: string): string =>
     Array.isArray(oidc[key]) ? oidc[key].join('\n') : typeof oidc[key] === 'string' ? oidc[key] : ''
   const setList = (key: string, text: string) =>
@@ -91,10 +97,20 @@ function ModeSection({ settings, onSaved }: { settings: Settings; onSaved: () =>
           </button>
         ))}
       </div>
+      {toLocal && !needsBoot && (
+        <p className="mt-3 rounded-lg border px-3 py-2 text-2xs text-dim" data-identity-existing-admins="">
+          {T.existingAdmins(loginAdmins.map((a) => a.username).join('、'))}
+        </p>
+      )}
       {needsBoot && (
         <fieldset className="mt-3 space-y-2 rounded-lg border px-3 py-2" data-identity-bootstrap="">
           <legend className="px-1 text-xs font-medium">{T.bootstrap}</legend>
           <p className="text-2xs text-faint">{T.bootstrapHint}</p>
+          {passwordless.length > 0 && (
+            <p className="text-2xs" style={{ color: 'var(--st-waiting)' }} data-identity-passwordless-admins="">
+              {T.passwordlessAdmins(passwordless.join('、'))}
+            </p>
+          )}
           <div className="grid grid-cols-3 gap-2">
             <Field label={T.username} required>
               {(p) => <input {...p} className="field" value={boot.username} autoComplete="off"
@@ -154,7 +170,7 @@ function ModeSection({ settings, onSaved }: { settings: Settings; onSaved: () =>
   )
 }
 
-function UsersSection({ mode }: { mode: AuthMode }) {
+function UsersSection({ mode, onChanged }: { mode: AuthMode; onChanged?: () => void }) {
   const [rows, setRows] = useState<UserRow[] | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [creating, setCreating] = useState(false)
@@ -167,6 +183,7 @@ function UsersSection({ mode }: { mode: AuthMode }) {
     try {
       await api.identity.updateUser(u.id, body)
       load()
+      onChanged?.()
     } catch (e) {
       toast.error(e)
     }
@@ -219,7 +236,7 @@ function UsersSection({ mode }: { mode: AuthMode }) {
           ))}
         </div>
       )}
-      {creating && <UserCreator onClose={() => setCreating(false)} onSaved={() => { setCreating(false); load() }} />}
+      {creating && <UserCreator onClose={() => setCreating(false)} onSaved={() => { setCreating(false); load(); onChanged?.() }} />}
     </section>
   )
 }

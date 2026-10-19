@@ -84,6 +84,34 @@ async def test_switching_to_local_needs_the_first_admin_in_the_same_request():
         "库里只存 token 的 sha256"
 
 
+async def test_switching_to_local_with_an_admin_who_has_a_password_does_not_ask_for_another():
+    """关登录时已经建了设过密码的管理员：设置页不该再要求建第一个管理员，切过去用他登录。"""
+    await auth_env.make_user("ada", "admin")
+    await auth_env.make_user("bo", "builder")
+    c = auth_env.client()
+    got = (await c.get("/api/auth/settings")).json()
+    assert got["local_admins"] == [{"username": "ada", "display_name": "ada"}], got
+    assert got["passwordless_admins"] == []
+    r = await c.put("/api/auth/settings", json={"mode": "local"})
+    assert r.status_code == 200, r.text
+    assert "principal" not in r.json(), "没新建管理员就不替谁登录：切过去回登录页"
+    assert (await c.get("/api/auth/me")).status_code == 401
+    assert (await (await auth_env.login("ada")).get("/api/auth/me")).json()["role"] == "admin"
+
+
+async def test_an_admin_without_a_password_is_named_and_still_needs_the_first_admin():
+    """关登录时新建用户可以不填密码：这样的管理员切过去登录不了，要建一个能登录的，并说清是谁没设密码。"""
+    async with SessionLocal() as s:
+        s.add(User(username="nopw", display_name="没设密码的", role="admin", password_hash=None))
+        s.add(User(username="gone", display_name="停用的", role="admin", password_hash=None, disabled=True))
+        await s.commit()
+    c = auth_env.client()
+    got = (await c.get("/api/auth/settings")).json()
+    assert got["local_admins"] == [] and got["passwordless_admins"] == ["nopw"], got
+    r = await c.put("/api/auth/settings", json={"mode": "local"})
+    assert r.status_code == 422 and "第一个管理员" in r.json()["detail"]
+
+
 async def test_roles_401_403_and_forged_actor():
     admin = await auth_env.turn_on_local()
     await auth_env.make_user("bob", "builder")
