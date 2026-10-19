@@ -26,9 +26,9 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "本机没有镜像 ${IM
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT INT TERM
 
-# fsync、同步提交都关掉：测试库用完就扔，不需要落盘的保证。连接数放宽：每个 xdist 进程不用连接池（每个测试一个事件循环），
-# 但同一时刻会开好几条，断点库还各有一个小池子。认证用 trust（只绑 127.0.0.1、用完即删的库）：不用连接池时每次查库都
-# 新建连接，SCRAM 握手一次十几毫秒，trust 三毫秒，一次运行几十次查库，差出来的够让计时类的测试越界
+# fsync、同步提交都关掉：测试库用完就扔，不需要落盘的保证。连接数放宽：每个 xdist 进程按事件循环各有一个池子
+# （tests/pgpool.py），断点库还各有一个小池子。认证用 trust（只绑 127.0.0.1、用完即删的库）：每个测试的事件循环都要
+# 新建连接，SCRAM 握手一次十几毫秒，trust 三毫秒
 docker run -d --name "$NAME" -e POSTGRES_USER="$USER_NAME" -e POSTGRES_PASSWORD="$PASS" -e POSTGRES_DB="$DB" \
   -e POSTGRES_HOST_AUTH_METHOD=trust \
   -p 127.0.0.1::5432 --tmpfs /var/lib/postgresql/data:rw "$IMAGE" \

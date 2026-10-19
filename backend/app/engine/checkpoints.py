@@ -72,11 +72,6 @@ def open_saver() -> contextlib.AbstractAsyncContextManager[BaseCheckpointSaver]:
     return open_sqlite_saver(settings.checkpoint_path)
 
 
-def kind() -> str:
-    """"sqlite" 或 "postgresql"：断点库放在哪种库里。"""
-    return "postgresql" if settings.checkpoint_conninfo else "sqlite"
-
-
 async def count(saver: Any, thread_id: str | None = None) -> tuple[int, int]:
     """(断点条数, pending writes 条数)。thread_id 为空数全部。copy-to-postgres 核对用，走公开接口。"""
     config = {"configurable": {"thread_id": thread_id}} if thread_id else None
