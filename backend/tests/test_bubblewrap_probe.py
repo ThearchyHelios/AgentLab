@@ -103,3 +103,58 @@ def test_auto_falls_back_to_local_and_says_why(monkeypatch: pytest.MonkeyPatch) 
     # 节点上选 fast 档也不能点到一个起不来的 bubblewrap
     monkeypatch.setattr(mgr.sys, "platform", "linux")
     assert manager._resolve_named("fast") is None
+
+
+# --------------------------------------------------------------------------
+# 环境变量：沙箱里的代码看不到后端进程的（模型的 API Key、带密码的 AGENTLAB_DATABASE_URL）
+# --------------------------------------------------------------------------
+
+_SECRETS = {"AGENTLAB_DATABASE_URL": "postgresql+asyncpg://u:not-a-real-password@h/db",
+            "ANTHROPIC_API_KEY": "sk-ant-not-real", "OPENAI_API_KEY": "sk-not-real"}
+
+
+def _setenvs(argv: list[str]) -> dict[str, str]:
+    return {argv[i + 1]: argv[i + 2] for i, a in enumerate(argv) if a == "--setenv"}
+
+
+def test_the_sandbox_starts_from_a_cleared_environment(monkeypatch, tmp_path):
+    from app.sandbox.base import SandboxLimits
+
+    for key, value in _SECRETS.items():
+        monkeypatch.setenv(key, value)
+    argv = bw.BubblewrapSandbox()._argv(tmp_path, SandboxLimits(), ["/usr/bin/python3", "/work/x.py"],
+                                        {"RUN_FLAG": "1", "HOME": "/work/custom"})
+    # --clearenv 在所有 --setenv 前面：bwrap 按先后处理，放后面就把设好的也清掉了
+    assert argv[1] == "--clearenv" and argv.index("--clearenv") < argv.index("--setenv")
+    env = _setenvs(argv)
+    assert env["RUN_FLAG"] == "1" and env["HOME"] == "/work/custom", "调用方给的照旧生效，能盖过缺省的"
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert not any(k.startswith("AGENTLAB_") or k.endswith("_API_KEY") for k in env)
+    assert not any(v in " ".join(argv) for v in _SECRETS.values())
+
+
+async def test_bwrap_itself_gets_only_a_minimal_environment(monkeypatch, tmp_path):
+    for key, value in _SECRETS.items():
+        monkeypatch.setenv(key, value)
+    seen: dict[str, Any] = {}
+
+    class Done:
+        returncode = 0
+        pid = 1
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_exec(*argv, **kwargs):
+        seen["argv"], seen["env"] = list(argv), kwargs.get("env")
+        return Done()
+
+    box = bw.BubblewrapSandbox()
+    monkeypatch.setattr(bw.BubblewrapSandbox, "available", staticmethod(lambda: True))
+    monkeypatch.setattr(box, "_session_dir", lambda _sid: tmp_path)
+    monkeypatch.setattr(bw.asyncio, "create_subprocess_exec", fake_exec)
+    result = await box.run("print(1)", env={"RUN_FLAG": "1"})
+    assert result.ok, result.error
+    assert seen["env"] is not None and set(seen["env"]) == {"PATH"}, "bwrap 进程本身不继承后端的环境变量"
+    assert not any(v in " ".join(seen["argv"]) for v in _SECRETS.values())
+    assert _setenvs(seen["argv"])["RUN_FLAG"] == "1"
