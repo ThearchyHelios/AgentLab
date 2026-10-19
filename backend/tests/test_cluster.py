@@ -395,7 +395,8 @@ async def _until(check, timeout: float = 10.0) -> None:
 
 
 async def test_a_daily_quota_is_taken_up_to_the_limit_by_concurrent_callers():
-    """先占额度再发起（cluster/quota）：20 个协程同时占、上限 5，正好 5 个占到；这一天第一次占按已有的记录起算；退回一份又能占。"""
+    """先占额度再发起（cluster/quota）：10 个协程同时占、上限 5，正好 5 个占到；这一天第一次占按已有的记录起算；退回一份又能占。
+    （同时占的个数不超过连接池能直接给的连接数：SQLite 的池子是各测试共用的，排队等连接会把它绑到这个测试的事件循环上。）"""
     from app.cluster import quota
 
     name = f"test-quota-{new_id()[:8]}"
@@ -403,7 +404,7 @@ async def test_a_daily_quota_is_taken_up_to_the_limit_by_concurrent_callers():
     async def seed(_session) -> int:
         return 2   # 今天已经做过 2 次
 
-    got = await asyncio.gather(*(quota.take(name, 5, seed=seed) for _ in range(20)))
+    got = await asyncio.gather(*(quota.take(name, 5, seed=seed) for _ in range(10)))
     assert sum(got) == 3 and await quota.used(name) == 5
     assert not await quota.take(name, 5)
     await quota.give_back(name)
