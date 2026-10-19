@@ -1719,6 +1719,41 @@ def _resolve_entity(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
             "kind": ev_kind, "role": "entity", "status": "resolved", "rendered": ref}
 
 
+#: 字段标记前面这几种连接：「产量表的」「产量表中的」「产量表里的」，或者只隔空白（_short_column）
+_SHORT_JOINERS = ("中的", "里的", "的", "")
+#: 流式渲染时为 _short_column 留着的已渲染文字有多长：表名再长也够看
+SHORT_LOOKBACK = 160
+
+
+def _short_column(before: str, ref: str) -> str | None:
+    """[[c:表.列]] 前面紧挨着（隔空白、「的」「中的」「里的」）刚写过同一张表的名字时，正文里只显示列名：交回列名，不用缩短的
+    交回 None。部署上撞过「取自 某表 的 某表.某列」。
+
+    before 是标记前面已经渲染出来的正文（[[t:表]] 渲染出来就是表名本身，写成文字的表名也算）。表名按 name_key 比（只对
+    ASCII 不分大小写），带库名的写法（db.表.列）全名、末段都认；英文名前面还连着字母、数字、下划线的不算（myorders 不是
+    orders）。粗体、斜体收尾的星号、下划线跳过。"""
+    table, dot, column = ref.strip().rpartition(".")
+    if not dot or not table or not column:
+        return None
+    tail = before.rstrip(_BLANK)
+    for joiner in _SHORT_JOINERS:
+        if joiner and not tail.endswith(joiner):
+            continue
+        head = tail[:len(tail) - len(joiner)].rstrip(_BLANK) if joiner else tail
+        if not joiner and head == before:
+            continue                                   # 什么都没隔：「产量表产量表.工厂」不是这种写法，不动
+        head = head.rstrip("*_")
+        for name in dict.fromkeys((table, table.rsplit(".", 1)[-1])):
+            start = len(head) - len(name)
+            if start < 0 or name_key(head[start:]) != name_key(name):
+                continue
+            if start > 0 and name[0].isascii() and (head[start - 1].isascii() and (head[start - 1].isalnum()
+                                                                                  or head[start - 1] == "_")):
+                continue
+            return column
+    return None
+
+
 # --------------------------------------------------------------------------
 # 引文：[[q:K1|原话]] 要在检索快照的命中片段里逐字出现
 # --------------------------------------------------------------------------
@@ -2154,14 +2189,19 @@ def _wordish(ch: str) -> bool:
     return ch.isdecimal() or (ch.isascii() and ch.isalnum())
 
 
-def _render(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "") -> str:
+def _render(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "",
+            before: str = "") -> str:
+    """before：这段文字前面已经渲染出来的正文（流式渲染分块时用），字段标记要看前面刚写过的表名（_short_column）。"""
     text = _tidy(_expand_tables(text, catalog, snaps, cells_allowed, prev), catalog, snaps, cells_allowed, prev)
     out: list[str] = []
     last = 0
     for marker in parse_markers(text):
         out.append(text[last:marker["start"]])
         if marker["kind"] != "see":
-            out.append(resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)["rendered"])
+            cite = resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)
+            short = _short_column(before + "".join(out), cite["ref"]) \
+                if marker["kind"] == "c" and cite["status"] == "resolved" else None
+            out.append(short or cite["rendered"])
         last = marker["end"]
     out.append(text[last:])
     return "".join(out)
@@ -2247,6 +2287,8 @@ class StreamRenderer:
         self.snaps = _Snapshots(loader)
         self.pending = ""
         self.prev = ""
+        #: 已经放出去的正文的末尾一截：字段标记要看前面刚写过的表名（_short_column）
+        self.shown = ""
 
     def _has_unit(self, marker: dict[str, Any]) -> bool:
         return bool(_rendered_unit(marker, self.catalog, self.snaps, self.cells_allowed))
@@ -2254,8 +2296,9 @@ class StreamRenderer:
     def _release(self, ready: str) -> str:
         if not ready:
             return ""
-        out = _render(ready, self.catalog, self.snaps, self.cells_allowed, self.prev)
+        out = _render(ready, self.catalog, self.snaps, self.cells_allowed, self.prev, self.shown)
         self.prev = ready[-1]
+        self.shown = (self.shown + out)[-SHORT_LOOKBACK:]
         return out
 
     def feed(self, delta: str) -> str:
@@ -2868,6 +2911,9 @@ def compose_doc(
                             continue
                         cite = _stored(resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps))
                         ok = cite["status"] == "resolved"
+                        if ok and marker["kind"] == "c" and (short := _short_column("".join(parts), cite["ref"])):
+                            # 紧跟在同一张表名后面：只显示列名，引用上记 short，复核照它核对（老文档没有这一项，照全名）
+                            cite = {**cite, "rendered": short, "short": True}
                         seg = {
                             "kind": _SEG_KIND.get(marker["kind"])
                             or ("number" if marker["kind"] == "m" or (ok and is_number(cite.get("value")))
@@ -3217,6 +3263,10 @@ def verify_doc(
                 cite = _phase_two_cite(seg, ref, text) \
                     or resolve_ref(ref, catalog, cells_allowed=cells_allowed, loader=snaps)
                 ok = cite["status"] == "resolved"
+                if ok and ref.startswith("c:") and (seg.get("cite") or {}).get("short") is True \
+                        and "." in str(cite.get("rendered") or ""):
+                    # 组装时紧跟在同一张表名后面、只显示了列名（_short_column）：照列名核对
+                    cite = {**cite, "rendered": str(cite["rendered"]).rsplit(".", 1)[-1]}
                 # 反引号里的实体：片段的字带着两个反引号
                 shown = f"`{cite['rendered']}`" if seg.get("code") and seg.get("kind") == "entity" else cite["rendered"]
                 matches = shown == text
@@ -3609,7 +3659,8 @@ ENTITY_RULES = (
     "表和字段（系统会核对）：提到表名、字段名时写 [[t:表名]]、[[c:表名.字段名]]；英文的名字也可以放进反引号"
     "（`orders`），中文的表名、字段名一律用 [[t:]] / [[c:]]——反引号里的中文名系统不核对；"
     "只写下面列出的、或者这次查过的数据源里真实存在的名字——本次运行的表结构快照、查询用到的表、"
-    "查询结果列里都没有的名字，会被标成「可能是编造的名字」。\n"
+    "查询结果列里都没有的名字，会被标成「可能是编造的名字」。"
+    "紧跟在同一张表名后面的字段（「[[t:orders]] 的 [[c:orders.amount]]」）只显示字段名，不用为了不重复把字段改写成别的说法。\n"
     "说明一个数是怎么算出来的（按哪个字段去重、怎么汇总、筛了什么条件）时，句末挂 [[see:Q1]] 指向算出它的那次"
     "查询（下面每张表后面写了哪几次查询用到它）：只挂 [[t:]]、[[c:]] 指不出是哪一次查询算出的这个数。"
 )

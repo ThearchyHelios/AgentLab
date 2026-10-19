@@ -161,10 +161,11 @@ def test_phase_two_ledgers_build_no_entities():
 
 def test_entity_markers_render_as_the_name(catalog):
     doc = compose_doc("数据来自 [[t:orders]] 的 [[c:orders.amount]] 和 [[c:order_cnt]]。[[see:t:refunds]]", catalog)
-    assert doc["markdown"] == "数据来自 orders 的 orders.amount 和 order_cnt。"
+    # 紧跟在同一张表名后面的字段只显示字段名（不写成「orders 的 orders.amount」），出处照旧是那个字段
+    assert doc["markdown"] == "数据来自 orders 的 amount 和 order_cnt。"
     segs = entity_segments(doc)
     assert [(s["text"], s["cite"]["kind"], s["state"]) for s in segs] == [
-        ("orders", "table", "deterministic"), ("orders.amount", "column", "deterministic"),
+        ("orders", "table", "deterministic"), ("amount", "column", "deterministic"),
         ("order_cnt", "column", "deterministic")]
     assert segs[0]["cite"]["eid"] == catalog["t:orders"]["eid"]
     assert doc["violations"] == [] and doc["stats"]["entities"] == 3

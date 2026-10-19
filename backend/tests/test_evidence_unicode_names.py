@@ -97,7 +97,8 @@ def test_new_doc_records_the_syntax_and_resolves_chinese_names(catalog):
     doc = compose("本月[[t:明细]]的[[c:明细.金额]]按[[c:区域]]汇总，[[v:Q1.r0.区域]]最高。[[see:t:汇总,Q1]]", catalog)
     assert ENTITY_SYNTAX == 2 and doc["entity_syntax"] == 2 and doc_entity_syntax(doc) == 2
     assert '"entity_syntax":2' in canonical_json(doc)          # 在文档顶层，参与内容哈希
-    assert doc["markdown"] == "本月明细的明细.金额按区域汇总，分区甲最高。"     # 显示写作者写的名字本身
+    # 显示写作者写的名字本身；紧跟在同一张表名后面的字段只显示字段名（不写成「明细的明细.金额」）
+    assert doc["markdown"] == "本月明细的金额按区域汇总，分区甲最高。"
     assert doc["violations"] == []
     table, column, shared = entities(doc)
     assert table["cite"]["alias"] == "t:明细" and table["state"] == "deterministic"
@@ -117,7 +118,7 @@ def test_streaming_renders_chinese_names_like_the_full_doc(catalog):
     streamed = "".join([renderer.feed("本月[[t:明"), renderer.feed("细]]的[[c:明细.金"), renderer.feed("额]]上升。"),
                         renderer.flush()])
     assert streamed == render_markers(text, catalog, loader=loader) == compose(text, catalog)["markdown"] \
-        == "本月明细的明细.金额上升。"
+        == "本月明细的金额上升。"
 
 
 @pytest.mark.parametrize("ref", [
