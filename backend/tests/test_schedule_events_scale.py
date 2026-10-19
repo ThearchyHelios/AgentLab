@@ -169,3 +169,19 @@ async def test_a_window_ending_where_another_fire_already_is_still_fires():
     assert len(await fires(sid)) == 2
     assert [d.status for d in await deliveries(sid)] == ["fired", "fired"]
     assert TriggerDelivery is not None
+
+
+async def test_trigger_option_search_ignores_case_and_takes_wildcards_literally(client):
+    """按名字查不分大小写（PostgreSQL 上 LIKE 分 ASCII 大小写、SQLite 不分：一律 ilike），% 和 _ 按字面匹配、不当通配符。"""
+    async with SessionLocal() as session:
+        session.add_all([Workflow(name=n, graph={"nodes": [], "edges": []})
+                         for n in ("Weekly_Report 样例", "WeeklyXReport 样例", "满 100% 样例", "满 1000 样例")])
+        await session.commit()
+
+    async def names(q: str) -> list[str]:
+        r = await client.get("/api/schedules/trigger-options", params={"event": "workflow.finished", "q": q})
+        assert r.status_code == 200, r.text
+        return [o["name"] for o in r.json()["events"][0]["objects"]]
+
+    assert await names("weekly_report") == ["Weekly_Report 样例"], "大小写不分；_ 不匹配任意一个字"
+    assert await names("100%") == ["满 100% 样例"], "% 不匹配任意几个字"

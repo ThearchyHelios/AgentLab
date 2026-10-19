@@ -618,7 +618,10 @@ async def trigger_options(event: str | None = None, q: str | None = None, select
     async def page(model: Any, *conds: Any) -> tuple[list[Any], bool]:
         query = select(model).where(*conds)
         if words:
-            query = query.where(model.name.contains(words, autoescape=True))
+            # 名字里含这几个字，不分大小写：PostgreSQL 上 LIKE 分 ASCII 大小写、SQLite 不分，一律 ilike（转义同 runs._like）
+            from app.api.runs import _like
+
+            query = query.where(model.name.ilike(f"%{_like(words)}%", escape="\\"))
         rows = list((await session.execute(query.order_by(model.name, model.id).limit(limit + 1))).scalars())
         more = len(rows) > limit
         rows = rows[:limit]
