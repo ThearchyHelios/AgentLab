@@ -29,13 +29,15 @@ def _key(name: str, day: str) -> str:
 
 
 async def take(name: str, limit: int, *, seed: Callable[[Any], Awaitable[int]] | None = None,
-               day: str | None = None) -> bool:
-    """占一份额度：这一天占过的还不到 limit 就加一、交回 True，到了交回 False（什么都不改）。seed(session)：这一天第一次占时
-    已经用掉了几份（按库里的记录数）。"""
+               day: str | None = None) -> str | None:
+    """占一份额度：这一天占过的还不到 limit 就加一、交回占在了哪一天（本地日期），到了交回 None（什么都不改）。seed(session)：
+    这一天第一次占时已经用掉了几份（按库里的记录数）。退回时把交回的日期给 give_back（复核 R-b11：23:59:59 占、00:00:01 发起
+    失败，要退回前一天那一份，不是第二天的）。"""
     from app.db.models_cluster import RateCounter as Row
     from app.db.portable import insert_ignore
 
-    key = _key(name, day or today())
+    day = day or today()
+    key = _key(name, day)
     async with SessionLocal() as session:
         if await session.scalar(select(Row.key).where(Row.key == key)) is None:
             used = int(await seed(session)) if seed is not None else 0
@@ -45,11 +47,11 @@ async def take(name: str, limit: int, *, seed: Callable[[Any], Awaitable[int]] |
         done = await session.execute(update(Row).where(Row.key == key, Row.count < int(limit))
                                      .values(count=Row.count + 1).execution_options(synchronize_session=False))
         await session.commit()
-    return done.rowcount == 1
+    return day if done.rowcount == 1 else None
 
 
 async def give_back(name: str, *, day: str | None = None) -> None:
-    """退回一份（占了额度、却没发起成）。"""
+    """退回一份（占了额度、却没发起成）。day 给 take 交回的那个日期（不给按今天，只有测试这么用）。"""
     from app.db.models_cluster import RateCounter as Row
 
     key = _key(name, day or today())

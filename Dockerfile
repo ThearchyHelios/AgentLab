@@ -76,6 +76,8 @@ SH
 WORKDIR /app
 COPY LICENSE COMMERCIAL-LICENSE.md /app/
 COPY backend/app /app/backend/app
+# 锁文件留一份：进程登记的代码版本把它算进源码指纹（app/cluster/version.py：升了依赖的进程也算版本不同）
+COPY backend/requirements.lock /app/backend/requirements.lock
 COPY --from=web /src/frontend/dist /app/web
 
 ENV AGENTLAB_WEB_DIST=/app/web \

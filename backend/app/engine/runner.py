@@ -58,6 +58,9 @@ REJECTED_CONTINUE = "被驳回的运行不能继续运行：改好内容后重�
 REJECTED_RESUME = "这次运行已被驳回，没有待处理的审批，无法恢复：改好内容后重新发起"
 #: 服务重启时还在排队的运行改成失败时写的话（run.error 和补发的 run.failed 是同一句）
 QUEUED_AT_RESTART = "服务重启时这次运行仍在排队，没有可恢复的进度，请重新发起运行"
+#: 本进程隔离（续不上租约）之后没能重新登记，这一段执行没有开始（cluster/fence.ready 等不到）
+NOT_REREGISTERED_QUEUED = "本进程隔离后没能重新登记，这次运行没有开始执行，请重新发起运行"
+NOT_REREGISTERED_RESUMABLE = "本进程隔离后没能重新登记，这次运行没有接着执行，已挂起，可从断点继续运行"
 
 
 class ContinueRefused(ValueError):
@@ -794,7 +797,12 @@ class RunManager:
         # 等待从 run.interrupted 算起——以前执行一直计到 finally，收尾那一截执行和等待两边都算，
         # active + wait 比墙钟还长（机器一忙就差出几十毫秒）
         paused: float | None = None
-        # 这段执行属于现在这一世代（cluster/fence.py）：本进程隔离之后，它不再写
+        # 这段执行属于现在这一世代（cluster/fence.py）：本进程隔离之后，它不再写。隔离之后新身份还没登记上时先等一等
+        try:
+            await fence.ready()
+        except Fenced:
+            await self._not_reregistered(run_id)
+            return
         fence.bind()
         mine = identity.owner()
         #: 被隔离了（续不上租约）：停手，不写终态（这次运行由接手的进程按「属主不在了」处理）
@@ -1000,6 +1008,45 @@ class RunManager:
                         await sandbox_manager.cleanup(run_id)
         finally:
             await slot.__aexit__(None, None, None)
+
+    async def _not_reregistered(self, run_id: str) -> None:
+        """隔离之后新身份一直没登记上、这一段执行不开始了（fence.ready 等不到，复核 R-b15）：照实收尾，不留给别的进程按「服务
+        重启时还在排队」去标。排队中的（一步都没执行过）收成失败；已经执行过、停在断点上又要接着执行的收成中断（断点完好，可以
+        继续运行）。条件更新：状态、属主还是刚才看到的才改（别的进程先接手了就不动）。"""
+        from app.cluster.claims import same
+
+        logger.error("运行 %s：本进程隔离之后一直没重新登记上，这一段执行不开始", run_id)
+        try:
+            event: RunEventModel | None = None
+            async with SessionLocal() as session:
+                seen = (await session.execute(select(Run.status, Run.owner).where(Run.id == run_id))).first()
+                if seen is None or seen.status not in ("queued", "running"):
+                    return
+                if seen.status == "queued":
+                    values: dict[str, Any] = {"status": "failed", "error": NOT_REREGISTERED_QUEUED}
+                else:
+                    values = {"status": "interrupted", "error": NOT_REREGISTERED_RESUMABLE}
+                claimed = await session.execute(update(Run).where(
+                    Run.id == run_id, Run.status == seen.status, same(Run.owner, seen.owner))
+                    .values(owner=None, **values).execution_options(synchronize_session=False))
+                if claimed.rowcount != 1:
+                    await session.rollback()
+                    return
+                run = await session.get(Run, run_id)
+                bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq if run else 0))
+                event = (self._event(run_id, EventType.RUN_FAILED, data={"error": NOT_REREGISTERED_QUEUED})
+                         if seen.status == "queued" else
+                         self._event(run_id, EventType.LOG, data={"level": "warn", "code": "not_reregistered",
+                                                                  "message": NOT_REREGISTERED_RESUMABLE}))
+                await _stage(session, event, run)
+                await session.commit()
+            await bus.publish(event)
+            await bus.close(run_id)
+        except Exception:  # noqa: BLE001 - 收不了尾的留给别的进程按「属主不在了」处理
+            logger.exception("运行 %s：收尾时出错，留给别的进程按属主不在了处理", run_id)
+        finally:
+            self._tasks.pop(run_id, None)
+            self._stopped_by.pop(run_id, None)
 
     async def _stopped_in_queue(self, run_id: str) -> None:
         """还在等并发名额时被取消。关停：什么都不写（还是排队中 / 刚认领的样子），照「属主不在了」的规矩由下次启动或别的
@@ -1786,15 +1833,19 @@ run_manager = RunManager()
 
 
 def _fenced_saver(saver: BaseCheckpointSaver) -> BaseCheckpointSaver:
-    """断点库的写也要过 cluster/fence：本进程续不上租约之后，手上的执行不再写断点（接手的进程会从断点接着跑，两边都写就分叉了）。"""
+    """断点库的写也要过 cluster/fence：本进程续不上租约之后，手上的执行不再写断点（接手的进程会从断点接着跑，两边都写就分叉了）。
+
+    包成协程、在协程里查（复核 R-b8）：LangGraph 在节点的完成回调里调 aput_writes 拿协程交给后台任务——同步包装在回调里就抛了，
+    每次隔离 asyncio 都记一条「Exception in callback … FuturesDict.on_done」；在协程里抛，异常留在写断点的那个任务里，由 LangGraph
+    照常收走。"""
     for name in ("aput", "aput_writes"):
         original = getattr(saver, name, None)
         if original is None:
             continue
 
-        def guarded(*args: Any, __original: Any = original, **kwargs: Any) -> Any:
+        async def guarded(*args: Any, __original: Any = original, **kwargs: Any) -> Any:
             fence.check()
-            return __original(*args, **kwargs)
+            return await __original(*args, **kwargs)
 
         setattr(saver, name, guarded)
     return saver
@@ -1816,8 +1867,9 @@ def _register_requests() -> None:
 
     @requests.handle("stop", "run")
     async def _stop(run_id: str, actor: str | None, _payload: dict[str, Any]) -> None:
-        if run_manager.is_active(run_id):
-            await run_manager.cancel(run_id, actor=actor)
+        # 不在本进程执行的也照停止的规矩办（cancel 自己看属主）：在别的活着的进程里执行就转给它，属主不在了就接手、放弃，停在
+        # 断点上的收成 cancelled，已经结束的什么都不做。隔离之后转到新身份名下的停止请求就是这样落下的（复核 R-b10）
+        await run_manager.cancel(run_id, actor=actor)
 
     @requests.handle("note", "run")
     async def _note(run_id: str, _actor: str | None, payload: dict[str, Any]) -> None:

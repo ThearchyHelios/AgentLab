@@ -12,6 +12,7 @@ from sqlalchemy import JSON, BigInteger, Column, DateTime, Integer, MetaData, ev
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import NullPool
+from sqlalchemy.engine import make_url
 from sqlalchemy.types import TypeDecorator
 
 from app.core.config import settings
@@ -300,11 +301,40 @@ async def dispose_session_engine() -> None:
 
 
 def check_pgbouncer() -> None:
-    """AGENTLAB_DB_PGBOUNCER=1 却没给直连地址：拒绝启动（事务模式下 LISTEN、会话级咨询锁不成立，跨进程的锁会锁不住、放不掉）。"""
-    if settings.db_pgbouncer and settings.db_dialect == "postgresql" and not settings.database_direct_url:
+    """AGENTLAB_DB_PGBOUNCER=1 时直连地址要真的是直连：没给、或者给的和应用库地址指着同一个主机端口（还是那个 PgBouncer），都拒绝
+    启动（事务模式下 LISTEN、会话级咨询锁不成立，跨进程的锁会锁不住、放不掉；复核 R-b12）。"""
+    if not (settings.db_pgbouncer and settings.db_dialect == "postgresql"):
+        return
+    if not settings.database_direct_url:
         raise RuntimeError("AGENTLAB_DB_PGBOUNCER=1（应用库地址是 PgBouncer 的事务模式）时要另给 AGENTLAB_DATABASE_DIRECT_URL："
                            "进程间通知（LISTEN）、跨进程的锁（会话级咨询锁）、断点库要直连 PostgreSQL（或 PgBouncer 的会话模式）。"
-                           "见 README「用 PostgreSQL」里的三种部署")
+                           "见 README「多进程」里的「直连与 PgBouncer」")
+    if _endpoint(settings.database_direct_url) == _endpoint(settings.database_url):
+        from app.db.urls import describe
+
+        raise RuntimeError(f"AGENTLAB_DATABASE_DIRECT_URL 和 AGENTLAB_DATABASE_URL 指着同一个地址（{describe(settings.database_url)}）："
+                           "AGENTLAB_DB_PGBOUNCER=1 说应用库地址是 PgBouncer 的事务模式，直连地址要绕过它、直接连 PostgreSQL"
+                           "（或者 PgBouncer 的会话模式那个端口）。见 README「多进程」里的「直连与 PgBouncer」")
+
+
+def _endpoint(url: str) -> tuple[str, int]:
+    """地址连的是哪个主机端口（端口不写按 5432）。主机名规范化：localhost、127.x.x.x、::1 都算本机回环；IP 地址按地址比
+    （::ffff:10.0.0.5 和 10.0.0.5 相同）；解析不成 IP 的按字面（小写）比，不查 DNS。"""
+    import ipaddress
+
+    parsed = make_url(url)
+    host = (parsed.host or "").strip().strip("[]").lower().rstrip(".")
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if host == "localhost" or host.endswith(".localhost") or (addr is not None and addr.is_loopback):
+        host = "loopback"
+    elif addr is not None:
+        host = str(addr)
+    return host, int(parsed.port or 5432)
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -584,10 +614,19 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
     _backfill_not_null(conn, columns)
 
 
+#: 存量库里 run_events 撞了号、这一次没建唯一索引时记下的结果（settings 表里；cluster: 开头的不是用户设置，api/settings 不列）
+SEQ_DUPLICATES_KEY = "cluster:run_events_seq_duplicates"
+#: 记下的撞号最多几处（之后启动只核对这几处还在不在）
+SEQ_DUPLICATES_KEPT = 200
+
+
 def _unique_run_event_seq(conn: Any, columns: dict[str, set[str]]) -> None:  # pragma: no cover - 同步回调
     """run_events 的 (run_id, seq) 补唯一索引（ux_run_events_run_seq，换掉原来不唯一的 ix_run_events_run_seq）。存量库里可能已经
     有撞了号的（多进程之前的进程内计数、按需裁判的老写法）：先数一数，有就照实记日志、这一次不建（照旧用不唯一的索引），不让启动
-    失败——那几次运行的封存核对本来就对不上，删哪一条都不对，要人看。"""
+    失败——那几次运行的封存核对本来就对不上，删哪一条都不对，要人看。
+
+    数一次就记下结果（settings 表的 SEQ_DUPLICATES_KEY：撞了号的那几处），之后启动不再整表 GROUP BY（复核 R-b13）：只按索引核对
+    记下的那几处还撞不撞，还撞着就一句话带过；都清掉了才再整表数一遍、建索引、删掉这条记录。"""
     from sqlalchemy import inspect, text
 
     if "run_events" not in columns:
@@ -595,16 +634,76 @@ def _unique_run_event_seq(conn: Any, columns: dict[str, set[str]]) -> None:  # p
     names = {ix["name"] for ix in inspect(conn).get_indexes("run_events")}
     if "ux_run_events_run_seq" in names:
         return
-    dupes = conn.execute(text("SELECT run_id, seq, COUNT(*) FROM run_events GROUP BY run_id, seq HAVING COUNT(*) > 1 "
-                              "LIMIT 20")).all()
+    known = _known_seq_duplicates(conn, columns)
+    if known:
+        still = _still_duplicated(conn, known["pairs"])
+        if still:
+            logger.info("run_events 里还有撞了号的事件（%s 记下的 %d 处里还剩 %d 处）：(run_id, seq) 的唯一索引照旧不建，"
+                        "处理掉之后下次启动会再核对一遍", known.get("found_at") or "之前", len(known["pairs"]), still)
+            return
+    dupes = conn.execute(text("SELECT run_id, seq FROM run_events GROUP BY run_id, seq HAVING COUNT(*) > 1 LIMIT :n"),
+                         {"n": SEQ_DUPLICATES_KEPT + 1}).all()
     if dupes:
         runs = sorted({str(r[0]) for r in dupes})
-        logger.warning("run_events 里有撞了号的事件（%d 处以上，涉及运行 %s）：这一次不建 (run_id, seq) 的唯一索引。"
-                       "这几次运行的封存核对对不上，请人工核对后处理", len(dupes), "、".join(runs[:5]))
+        logger.warning("run_events 里有撞了号的事件（%d 处%s，涉及运行 %s）：这一次不建 (run_id, seq) 的唯一索引。"
+                       "这几次运行的封存核对对不上，请人工核对后处理（之后启动只核对这几处，不再整表查）",
+                       min(len(dupes), SEQ_DUPLICATES_KEPT), "以上" if len(dupes) > SEQ_DUPLICATES_KEPT else "",
+                       "、".join(runs[:5]))
+        _remember_seq_duplicates(conn, [[str(r[0]), int(r[1])] for r in dupes[:SEQ_DUPLICATES_KEPT]],
+                                 more=len(dupes) > SEQ_DUPLICATES_KEPT)
         return
     conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_run_events_run_seq ON run_events (run_id, seq)"))
     if "ix_run_events_run_seq" in names:
         conn.execute(text("DROP INDEX IF EXISTS ix_run_events_run_seq"))
+    if known is not None:
+        _forget_seq_duplicates(conn)
+        logger.info("run_events 里的撞号都处理掉了：补上了 (run_id, seq) 的唯一索引")
+
+
+def _known_seq_duplicates(conn: Any, columns: dict[str, set[str]]) -> dict[str, Any] | None:  # pragma: no cover
+    if "settings" not in columns:
+        return None
+    from sqlalchemy import select
+
+    from app.db.models import Setting
+
+    row = conn.execute(select(Setting.value).where(Setting.key == SEQ_DUPLICATES_KEY)).first()
+    value = row[0] if row else None
+    if not isinstance(value, dict) or not isinstance(value.get("pairs"), list):
+        return None
+    return value
+
+
+def _still_duplicated(conn: Any, pairs: list[Any]) -> int:  # pragma: no cover
+    """记下的那几处里还撞着的有几处（每处按 (run_id, seq) 索引查一次）。"""
+    from sqlalchemy import func, select
+
+    from app.db.models import RunEvent
+
+    left = 0
+    for pair in pairs:
+        if not (isinstance(pair, list) and len(pair) == 2):
+            continue
+        n = conn.execute(select(func.count()).select_from(RunEvent).where(
+            RunEvent.run_id == str(pair[0]), RunEvent.seq == int(pair[1]))).scalar()
+        left += int((n or 0) > 1)
+    return left
+
+
+def _remember_seq_duplicates(conn: Any, pairs: list[list[Any]], *, more: bool) -> None:  # pragma: no cover
+    from app.db.models import Setting
+
+    _forget_seq_duplicates(conn)
+    conn.execute(Setting.__table__.insert().values(
+        key=SEQ_DUPLICATES_KEY, value={"pairs": pairs, "more": more, "found_at": utcnow().isoformat(timespec="seconds")}))
+
+
+def _forget_seq_duplicates(conn: Any) -> None:  # pragma: no cover
+    from sqlalchemy import delete
+
+    from app.db.models import Setting
+
+    conn.execute(delete(Setting).where(Setting.key == SEQ_DUPLICATES_KEY))
 
 
 #: init_db 在 PostgreSQL 上拿的会话级咨询锁的号：几个进程同时启动时，建表和迁移一个一个来（同一个号别处别用）

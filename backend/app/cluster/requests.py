@@ -94,9 +94,11 @@ _running: set[asyncio.Future[Any]] = set()
 
 async def _handle(fn: Callable[..., Awaitable[Any]], kind: str, target: str, target_id: str, actor: str | None,
                   payload: dict[str, Any]) -> None:
+    from app.cluster.fence import Fenced
+
     try:
         await fn(target_id, actor, payload)
-    except Exception:  # noqa: BLE001
+    except (Exception, Fenced):  # noqa: BLE001 - Fenced 是 BaseException，不接住就成了没人取的任务异常
         logger.exception("办进程间请求 %s/%s %s 出错", kind, target, target_id)
 
 

@@ -201,6 +201,7 @@ class _Runner:
 
     async def _loop(self, interval: float, stopping: asyncio.Event) -> None:
         from app.cluster import leading
+        from app.cluster.fence import Fenced
         from app.scheduler import webhook
 
         self._poked = asyncio.Event()
@@ -218,7 +219,7 @@ class _Runner:
                     self.notify = asyncio.create_task(_notify(webhook), name="agentlab-scheduler-notify")
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - 这一拍出错不该让循环停下
+            except (Exception, Fenced):  # noqa: BLE001 - 这一拍出错不该让循环停下（Fenced 是 BaseException：复核 R-b9）
                 logger.exception("定时任务调度这一拍出错，下一拍照常进行")
             await self._wait(stopping, interval)
 

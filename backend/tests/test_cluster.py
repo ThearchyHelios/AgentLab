@@ -7,6 +7,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -337,6 +338,63 @@ async def test_stopping_a_run_whose_owner_is_gone_takes_it_over_and_abandons_it(
     assert row.status == "cancelled" and row.end_reason == "stopped"
 
 
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="SQLite 只有一个进程，名额在进程里（复核 R-b3）")
+async def test_a_slot_is_released_under_the_identity_it_was_taken_with(monkeypatch):
+    """复核 R-b10：拿着名额的时候隔离换了身份，放名额照样删得到那一行（按要名额时的身份删），不用等旧身份过期才收回。"""
+    _policy(monkeypatch, 2, interactive=(2, 40))
+    monkeypatch.setattr(identity, "OWNER", identity.OWNER)
+    async with slots.hold("rb10-run", "chat"):
+        identity.regenerate()
+    async with SessionLocal() as session:
+        left = list((await session.execute(select(RunSlot).where(RunSlot.run_id == "rb10-run"))).scalars())
+    assert left == []
+
+
+async def test_registering_again_tidies_up_what_the_retired_identity_left(monkeypatch):
+    """复核 R-b10：隔离之后新身份登记上，旧身份的登记、名额、同源队的位置删掉，当班租约交出，发给它的请求转到新身份名下照办——
+    停止请求对停在断点上的那次运行照停止的规矩收成 cancelled。"""
+    from app.cluster import requests, version
+    from app.cluster import service as service_mod
+    from app.cluster.fence import now as fence_now
+
+    monkeypatch.setattr(identity, "OWNER", f"{identity.host()}:{os.getpid()}:retired0")   # 测试完换回原来的身份
+    old = identity.owner()
+    now = utcnow()
+    async with SessionLocal() as session:
+        session.add(ClusterWorker(id=old, host="this-host", pid=1, started_at=now, heartbeat_at=now,
+                                  lease_until=now + timedelta(seconds=60), code_version=version.code_version(),
+                                  schema_version=version.schema_version()))
+        session.add(RunSlot(run_id="retired-slot", klass="interactive", priority=40, owner=old, granted=True,
+                            requested_at=now))
+        session.add(LaneTicket(source_id="src-retired", kind="profile", job_id="retired-job", owner=old, granted=True))
+        session.add(ClusterLease(name="test-retired", owner=old, lease_until=now + timedelta(seconds=60), epoch=1))
+        run = Run(status="interrupted", owner=old, graph={}, input={})
+        session.add(run)
+        await session.flush()
+        session.add(ClusterRequest(owner=old, kind="stop", target="run", target_id=run.id, actor="张工", payload={}))
+        await session.commit()
+    svc = service_mod._Service()
+    svc.retired = [old]
+    identity.regenerate()
+    svc.pending_since = fence_now()
+    await svc.register_again()
+    new = identity.owner()
+    async with SessionLocal() as session:
+        ids = set((await session.execute(select(ClusterWorker.id))).scalars())
+        slot_rows = list((await session.execute(select(RunSlot).where(RunSlot.owner == old))).scalars())
+        lane_rows = list((await session.execute(select(LaneTicket).where(LaneTicket.owner == old))).scalars())
+        lease = await session.get(ClusterLease, "test-retired")
+        sent = list((await session.execute(select(ClusterRequest.owner).where(ClusterRequest.target_id == run.id))).scalars())
+    assert old not in ids and new in ids, "旧身份的登记删掉：别的进程马上按属主不在了接手"
+    assert slot_rows == [] and lane_rows == [] and lease.owner is None
+    assert sent == [new], "发给旧身份的请求转到新身份名下"
+    await requests.drain()
+    await requests.settle()
+    async with SessionLocal() as session:
+        row = await session.get(Run, run.id)
+    assert row.status == "cancelled" and row.end_reason == "stopped", "停止请求照停止的规矩落下了"
+
+
 async def test_leadership_is_handed_over_when_the_lease_runs_out():
     me = leader_mod.Leadership("test-lead")
     assert await me.claim() and me.held()
@@ -353,6 +411,87 @@ async def test_leadership_is_handed_over_when_the_lease_runs_out():
     assert await me.claim() and me.epoch == first + 1, "到期了接班，换一次当班加一"
     await me.release()
     assert (await leader_mod.current("test-lead"))["owner"] is None
+
+
+def test_the_fence_judges_by_the_sleep_aware_clock_and_falls_back_to_the_wall(monkeypatch):
+    """复核 R-b7、R-b14：取得到计入休眠的钟时只看它——它走过两个租约（合盖、挂起）算续晚了，墙钟往前、往后跳一小时不算（只算
+    两只钟对不上，jumped）；取不到计入休眠的钟时，monotonic 和墙钟里走得多的那只说了算（墙钟当后备）。"""
+    from app.cluster import fence
+
+    clocks = {"mono": 1000.0, "wall": 5000.0}
+    monkeypatch.setattr(fence, "_clock", lambda: clocks["mono"])
+    monkeypatch.setattr(fence, "_wall", lambda: clocks["wall"])
+    monkeypatch.setattr(fence, "SLEEP_AWARE", True)
+    fence.activate()
+    try:
+        assert not fence.stale() and not fence.jumped()
+        for jump in (3600.0, -3600.0):                   # NTP 一步校时、手动改时间
+            fence.renewed()
+            clocks["wall"] += jump
+            assert not fence.stale() and fence.jumped(), "只是墙钟跳了：不算续晚了"
+        fence.renewed()
+        clocks["mono"] += 2 * workers.lease_s()          # 计入休眠的钟走过两个租约（合盖）
+        assert fence.stale()
+        fence.renewed()
+        clocks["mono"] += workers.lease_s() / 2
+        clocks["wall"] += workers.lease_s() / 2
+        assert not fence.stale() and not fence.jumped()
+
+        monkeypatch.setattr(fence, "SLEEP_AWARE", False)  # 取不到计入休眠的钟：monotonic 不计休眠，墙钟当后备
+        fence.renewed()
+        clocks["wall"] += 2 * workers.lease_s()
+        assert fence.stale()
+    finally:
+        fence.deactivate()
+
+
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="SQLite 只有一个进程，租约用本机的钟")
+async def test_leases_use_the_database_clock_not_the_local_wall_clock(monkeypatch):
+    """复核 R-b7：本机墙钟快了一个小时——别的进程照样算活着、它拿着的当班租约照样抢不走；按库的时钟自己的租约已经过期时，续租
+    不再续这个身份，而是隔离。"""
+    from app.cluster import fence
+    from app.cluster.service import service
+    from app.db.base import utcnow as real_utcnow
+    import app.db.base as db_base
+
+    await _peer(PEER)
+    lead = leader_mod.Leadership("test-skew")
+    async with SessionLocal() as session:
+        session.add(ClusterLease(name="test-skew", owner=PEER, lease_until=real_utcnow() + timedelta(seconds=60), epoch=1))
+        await session.commit()
+    skewed = lambda: real_utcnow() + timedelta(hours=1)  # noqa: E731
+    monkeypatch.setattr(workers, "utcnow", skewed)
+    monkeypatch.setattr(db_base, "utcnow", skewed)
+    assert PEER in (await workers.liveness()).others, "按库的时钟它的租约没过期"
+    assert not await lead.claim(), "当班租约按库的时钟判：抢不走"
+    async with SessionLocal() as session:
+        await session.execute(delete(ClusterWorker).where(ClusterWorker.id == PEER))   # 它没记版本：登记时会被版本守卫拦下
+        await session.execute(delete(ClusterLease).where(ClusterLease.name == "test-skew"))
+        await session.commit()
+
+    await workers.register()
+    fence.activate()
+    before = fence.generation()
+    try:
+        assert await service.renew(), "按库的时钟没过期：续上"
+        monkeypatch.setattr(fence, "SLEEP_AWARE", True)
+        for jump in (3600.0, -3600.0):                   # 单进程、墙钟往前往后跳一小时（复核 R-b14）
+            monkeypatch.setattr(fence, "_wall", lambda jump=jump: time.time() + jump)
+            assert not fence.stale() and fence.jumped()
+            fence.check()
+            assert await service.renew() and fence.generation() == before, "库的时钟说租约还在：续上、不隔离"
+            assert not fence.jumped(), "续上之后两只钟重新对齐"
+        monkeypatch.setattr(fence, "_wall", time.time)
+        async with SessionLocal() as session:
+            row = await session.get(ClusterWorker, identity.owner())
+            row.lease_until = real_utcnow() - timedelta(seconds=1)   # 库的时钟已经过了它的租约，本机的两只钟都没觉得
+            await session.commit()
+        assert not await service.renew() and fence.generation() == before + 1, "过期了不续这个身份：隔离"
+    finally:
+        fence.deactivate()
+        if service._lease_conn is not None:
+            await service._lease_conn.close()
+            service._lease_conn = None
 
 
 async def test_the_daily_cap_is_not_overrun_by_concurrent_charges():
@@ -405,10 +544,25 @@ async def test_a_daily_quota_is_taken_up_to_the_limit_by_concurrent_callers():
         return 2   # 今天已经做过 2 次
 
     got = await asyncio.gather(*(quota.take(name, 5, seed=seed) for _ in range(10)))
-    assert sum(got) == 3 and await quota.used(name) == 5
+    assert sum(1 for g in got if g) == 3 and await quota.used(name) == 5
     assert not await quota.take(name, 5)
     await quota.give_back(name)
     assert await quota.take(name, 5) and not await quota.take(name, 5)
+
+
+async def test_a_quota_is_given_back_to_the_day_it_was_taken(monkeypatch):
+    """复核 R-b11：23:59:59 占、00:00:01 发起失败——退回前一天那一份，第二天的不动。"""
+    from app.cluster import quota
+
+    name = f"test-quota-{new_id()[:8]}"
+    days = iter(["2026-10-18", "2026-10-19", "2026-10-19", "2026-10-19"])
+    monkeypatch.setattr(quota, "today", lambda: next(days))
+    day = await quota.take(name, 5)
+    assert day == "2026-10-18"
+    assert await quota.take(name, 5) == "2026-10-19"   # 过了零点又占了一份
+    await quota.give_back(name, day=day)                 # 前一天占的那一份发起失败
+    assert await quota.used(name, day="2026-10-18") == 0
+    assert await quota.used(name, day="2026-10-19") == 1, "第二天的那一份不动"
 
 
 def test_a_daily_quota_holds_across_two_processes():
@@ -419,7 +573,7 @@ def test_a_daily_quota_holds_across_two_processes():
               "from app.cluster import quota\n"
               "async def main():\n"
               f"    got = await asyncio.gather(*(quota.take({name!r}, 10) for _ in range(15)))\n"
-              "    print(sum(got))\n"
+              "    print(sum(1 for g in got if g))\n"
               "asyncio.run(main())\n")
     env = {**os.environ, "PYTHONPATH": str(backend), "AGENTLAB_DB_POOL_SIZE": "5"}
     procs = [subprocess.Popen([sys.executable, "-c", script], cwd=str(backend), env=env, stdout=subprocess.PIPE,
@@ -502,6 +656,109 @@ async def test_preflight_refuses_a_beating_peer_and_waits_out_a_stale_one():
     with pytest.raises(version.VersionMismatch):
         await _peer_version(PEER, "0.0.9+old+aaaaaaaaaaaa")
         await workers.register()
+
+
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="preflight 只在 PostgreSQL 上看")
+async def test_preflight_names_every_live_process_of_another_version():
+    """复核 R-b13：一个心跳在走、一个心跳停着——报错两个都列出来（只点名先看到心跳的那个，人停掉它再起还会被另一个拦下）。"""
+    from app.cluster import version
+
+    await _peer_version(PEER, "0.0.9+old+aaaaaaaaaaaa")
+    await _peer_version(GHOST, "0.0.8+older+bbbbbbbbbbbb")
+
+    async def beat() -> None:
+        for _ in range(15):
+            await asyncio.sleep(0.1)
+            async with SessionLocal() as session:
+                row = await session.get(ClusterWorker, PEER)
+                row.heartbeat_at = utcnow()
+                await session.commit()
+
+    beating = asyncio.create_task(beat())
+    with pytest.raises(version.VersionMismatch) as e:
+        await version.preflight(observe_s=0.5)
+    await beating
+    text = str(e.value)
+    assert "2 个版本不同" in text and "aaaaaaaaaaaa" in text and "bbbbbbbbbbbb" in text
+    assert "心跳在走" in text and "心跳停着" in text
+
+
+def test_the_fingerprint_changes_with_the_dependency_lock(monkeypatch, tmp_path):
+    """复核 R-b13：依赖锁文件变了（升了依赖）源码指纹跟着变；锁文件取不到时换成几个关键包的版本。"""
+    from app.cluster import version
+
+    lock = tmp_path / "requirements.lock"
+    monkeypatch.setattr(version, "LOCK_FILE", lock)
+
+    def fingerprint() -> str:
+        version.source_fingerprint.cache_clear()
+        return version.source_fingerprint()
+
+    try:
+        lock.write_text("sqlalchemy==2.0.40\n")
+        first = fingerprint()
+        assert fingerprint() == first
+        lock.write_text("sqlalchemy==2.0.41\n")
+        assert fingerprint() != first, "升了一个依赖：指纹不同"
+        lock.unlink()
+        assert version.dependency_marker().startswith(b"packages:") and b"sqlalchemy==" in version.dependency_marker()
+        assert fingerprint() not in (first,)
+    finally:
+        version.source_fingerprint.cache_clear()
+
+
+async def test_a_known_seq_collision_is_not_rescanned_on_every_start(tmp_path, caplog):
+    """复核 R-b13：存量库里有撞了号的事件——第一次启动整表数一遍、记下结果、不建唯一索引；之后启动只核对记下的那几处，不再整表
+    GROUP BY；撞号处理掉之后再数一遍、建索引、删掉记录。用一个单独的 SQLite 库（两种库的测试里都跑）。"""
+    import logging
+
+    from sqlalchemy import event, inspect, text
+
+    from app.db import base as db_base
+    from app.db.models import Setting
+
+    target = db_base.make_engine(f"sqlite+aiosqlite:///{tmp_path / 'seq.db'}")
+    scans: list[str] = []
+    event.listen(target.sync_engine, "before_cursor_execute",
+                 lambda conn, cursor, statement, *a: scans.append(statement) if "GROUP BY run_id, seq" in statement else None)
+    try:
+        await db_base.create_schema(target)
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+
+        async with target.begin() as conn:
+            await conn.execute(text("DROP INDEX ux_run_events_run_seq"))
+            await conn.execute(text("CREATE INDEX ix_run_events_run_seq ON run_events (run_id, seq)"))
+        async with async_sessionmaker(target, expire_on_commit=False)() as session:
+            session.add(Run(id="r1", status="succeeded", graph={}, input={}))
+            await session.flush()
+            session.add_all([RunEvent(id=eid, run_id="r1", seq=seq, type="log", ts=0, data={})
+                             for eid, seq in (("e1", 1), ("e2", 1), ("e3", 2))])
+            await session.commit()
+
+        async def start() -> set[str]:
+            async with target.begin() as conn:
+                def run(sync_conn):
+                    cols = {t: {c["name"] for c in inspect(sync_conn).get_columns(t)} for t in ("run_events", "settings")}
+                    db_base._unique_run_event_seq(sync_conn, cols)
+                    return {ix["name"] for ix in inspect(sync_conn).get_indexes("run_events")}
+                return await conn.run_sync(run)
+
+        caplog.set_level(logging.INFO, logger="app.db.base")
+        assert "ux_run_events_run_seq" not in await start() and len(scans) == 1
+        async with target.connect() as conn:
+            marker = (await conn.execute(text(f"SELECT value FROM settings WHERE key = '{db_base.SEQ_DUPLICATES_KEY}'"))).scalar()
+        assert '"r1"' in str(marker) and "1" in str(marker)
+        assert "ux_run_events_run_seq" not in await start() and len(scans) == 1, "第二次启动不再整表 GROUP BY"
+        assert any("还有撞了号的事件" in r.getMessage() for r in caplog.records)
+        async with target.begin() as conn:
+            await conn.execute(text("DELETE FROM run_events WHERE id = 'e2'"))
+        assert "ux_run_events_run_seq" in await start() and len(scans) == 2, "处理掉之后再数一遍、建上索引"
+        async with target.connect() as conn:
+            left = (await conn.execute(text(f"SELECT COUNT(*) FROM settings WHERE key = '{db_base.SEQ_DUPLICATES_KEY}'"))).scalar()
+        assert left == 0
+        assert Setting.__tablename__ == "settings"
+    finally:
+        await target.dispose()
 
 
 @pytest.mark.sqlite_only
