@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 
 import pytest
 from sqlalchemy import func, select
@@ -237,7 +238,7 @@ async def test_the_lease_task_keeps_going_when_registering_again_fails(monkeypat
     from app.cluster import identity, service as service_mod, workers
     from app.cluster.version import VersionMismatch
 
-    monkeypatch.setattr(identity, "OWNER", identity.OWNER)    # 测试完换回原来的身份
+    monkeypatch.setattr(identity, "OWNER", f"{identity.host()}:{os.getpid()}:retired1")   # 测试完换回原来的身份
     monkeypatch.setattr(workers, "heartbeat_s", lambda: 0.01)
     monkeypatch.setattr(workers, "lease_s", lambda: 5.0)
     svc = service_mod._Service()

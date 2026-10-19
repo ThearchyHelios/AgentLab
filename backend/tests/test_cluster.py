@@ -356,7 +356,7 @@ async def test_registering_again_tidies_up_what_the_retired_identity_left(monkey
     from app.cluster import service as service_mod
     from app.cluster.fence import now as fence_now
 
-    monkeypatch.setattr(identity, "OWNER", identity.OWNER)
+    monkeypatch.setattr(identity, "OWNER", f"{identity.host()}:{os.getpid()}:retired0")   # 测试完换回原来的身份
     old = identity.owner()
     now = utcnow()
     async with SessionLocal() as session:
