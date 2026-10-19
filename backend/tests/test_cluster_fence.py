@@ -149,6 +149,27 @@ async def test_a_run_continued_elsewhere_finishes_once_and_the_stalled_side_stay
     await _no_repeated_seq(run_id)
 
 
+@pytest.mark.parametrize("jump", [3600.0, -3600.0])
+async def test_a_wall_clock_jump_does_not_fence_a_running_run(slow, monkeypatch, jump):
+    """复核 R-b14：执行到一半本机墙钟往前 / 往后跳一小时（NTP 一步校时、手动改时间）——计入休眠的钟没问题，不隔离，运行照常跑完。"""
+    import time as _time
+
+    monkeypatch.setattr(fence, "SLEEP_AWARE", True)
+    run = await run_manager.start(graph=GRAPH, input_payload={"question": "q"})
+    await asyncio.wait_for(slow["entered"].wait(), timeout=15)
+    before = fence.generation()
+    monkeypatch.setattr(fence, "_wall", lambda: _time.time() + jump)
+    slow["gate"].set()
+    for _ in range(300):
+        async with SessionLocal() as session:
+            row = await session.get(Run, run.id)
+        if row.status in ("succeeded", "failed", "interrupted") and not run_manager.is_active(run.id):
+            break
+        await asyncio.sleep(0.05)
+    assert row.status == "succeeded", row.error
+    assert fence.generation() == before, "没有隔离"
+
+
 async def test_the_final_write_checks_the_owner():
     async with SessionLocal() as session:
         run = Run(status="running", owner="peer-host:1:abcd", graph={}, input={})

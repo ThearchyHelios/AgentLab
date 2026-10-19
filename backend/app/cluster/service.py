@@ -131,15 +131,15 @@ class _Service:
     async def renew(self) -> bool:
         """续一拍租约（在专用连接上，不走连接池：池子被占满时取连接要等，等得比租约还长）。按库的时钟续、按库的时钟核对（复核
         R-b7）：库里自己的租约已经过期（或者登记不见了），别的进程可能已经接手，不再续这个身份——隔离（cluster/fence.py），换身份
-        重新登记。本地的两只钟说续晚了、或者两只钟差出一个租约（墙钟跳了），同样隔离。交回续没续上。"""
+        重新登记。计入休眠的钟说续晚了，同样隔离；两只钟差出一个租约（墙钟跳了）只记一条日志，以库的核对为准（复核 R-b14）。
+        交回续没续上。"""
         from app.cluster import fence
 
         if fence.stale():
             fence.trip("续租约的时候发现已经续晚了")
             return False
-        if fence.jumped():
-            fence.trip("续租约的时候发现本机的墙钟和单调钟差出一个租约以上（墙钟跳了，或者休眠没计进单调钟）")
-            return False
+        # 两只钟对不上（墙钟跳了，或者单调钟没计入休眠）：不直接隔离，以下面这一句按库的时钟核对的结果为准（复核 R-b14）
+        jumped = fence.jumped()
         try:
             conn = await self._lease_conn_open()
             renewed = await asyncio.wait_for(conn.fetchval(
@@ -159,8 +159,12 @@ class _Service:
             self._lease_conn = None
             return False
         if renewed is None:
-            fence.trip("按库的时钟本进程的租约已经过期" if expired else "本进程的登记不见了（被当成不在了）")
+            why = "按库的时钟本进程的租约已经过期" if expired else "本进程的登记不见了（被当成不在了）"
+            fence.trip(why + ("；本机的墙钟和单调钟也差出了一个租约以上" if jumped else ""))
             return False
+        if jumped:
+            logger.warning("本机的墙钟和单调钟差出一个租约以上（墙钟跳了：NTP 校时、手动改时间、虚拟机对时），按库的时钟本进程的租约"
+                           "还没过期：照常续上，不隔离")
         fence.renewed()
         return True
 

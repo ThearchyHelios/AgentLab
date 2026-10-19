@@ -7,6 +7,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -412,25 +413,34 @@ async def test_leadership_is_handed_over_when_the_lease_runs_out():
     assert (await leader_mod.current("test-lead"))["owner"] is None
 
 
-def test_the_fence_counts_what_the_monotonic_clock_missed(monkeypatch):
-    """复核 R-b7：单调钟不走（休眠不计、虚拟机挂起）而墙钟过了两个租约——照样算续晚了；两只钟差出一个租约算跳了。"""
+def test_the_fence_judges_by_the_sleep_aware_clock_and_falls_back_to_the_wall(monkeypatch):
+    """复核 R-b7、R-b14：取得到计入休眠的钟时只看它——它走过两个租约（合盖、挂起）算续晚了，墙钟往前、往后跳一小时不算（只算
+    两只钟对不上，jumped）；取不到计入休眠的钟时，monotonic 和墙钟里走得多的那只说了算（墙钟当后备）。"""
     from app.cluster import fence
 
     clocks = {"mono": 1000.0, "wall": 5000.0}
     monkeypatch.setattr(fence, "_clock", lambda: clocks["mono"])
     monkeypatch.setattr(fence, "_wall", lambda: clocks["wall"])
+    monkeypatch.setattr(fence, "SLEEP_AWARE", True)
     fence.activate()
     try:
         assert not fence.stale() and not fence.jumped()
-        clocks["wall"] += 2 * workers.lease_s()          # 合盖两个租约：单调钟没计，墙钟走了
-        assert fence.stale() and fence.jumped()
+        for jump in (3600.0, -3600.0):                   # NTP 一步校时、手动改时间
+            fence.renewed()
+            clocks["wall"] += jump
+            assert not fence.stale() and fence.jumped(), "只是墙钟跳了：不算续晚了"
         fence.renewed()
-        clocks["mono"] += 2 * workers.lease_s()          # 反过来：墙钟被往回拨了，单调钟照走
-        assert fence.stale() and fence.jumped()
+        clocks["mono"] += 2 * workers.lease_s()          # 计入休眠的钟走过两个租约（合盖）
+        assert fence.stale()
         fence.renewed()
         clocks["mono"] += workers.lease_s() / 2
         clocks["wall"] += workers.lease_s() / 2
         assert not fence.stale() and not fence.jumped()
+
+        monkeypatch.setattr(fence, "SLEEP_AWARE", False)  # 取不到计入休眠的钟：monotonic 不计休眠，墙钟当后备
+        fence.renewed()
+        clocks["wall"] += 2 * workers.lease_s()
+        assert fence.stale()
     finally:
         fence.deactivate()
 
@@ -464,6 +474,14 @@ async def test_leases_use_the_database_clock_not_the_local_wall_clock(monkeypatc
     before = fence.generation()
     try:
         assert await service.renew(), "按库的时钟没过期：续上"
+        monkeypatch.setattr(fence, "SLEEP_AWARE", True)
+        for jump in (3600.0, -3600.0):                   # 单进程、墙钟往前往后跳一小时（复核 R-b14）
+            monkeypatch.setattr(fence, "_wall", lambda jump=jump: time.time() + jump)
+            assert not fence.stale() and fence.jumped()
+            fence.check()
+            assert await service.renew() and fence.generation() == before, "库的时钟说租约还在：续上、不隔离"
+            assert not fence.jumped(), "续上之后两只钟重新对齐"
+        monkeypatch.setattr(fence, "_wall", time.time)
         async with SessionLocal() as session:
             row = await session.get(ClusterWorker, identity.owner())
             row.lease_until = real_utcnow() - timedelta(seconds=1)   # 库的时钟已经过了它的租约，本机的两只钟都没觉得

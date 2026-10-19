@@ -11,12 +11,14 @@
 - 一旦发现续晚了（trip）：世代加一，手上的执行全部停掉（停的时候不写终态，那些行交给接手的进程按「属主不在了」处理），换一个新的
   身份重新登记；新身份登记上之前新开始的执行先等着（ready），登记上之后照常。
 
-**用哪只钟（复核 R-b7）。** 别的进程判「租约过期」用的是库的时钟（cluster/workers：续租写 lease_until = 库的 now() + 租约），
-跟各台机器的墙钟差多少无关。这边判「续晚了」用计入休眠的钟：time.monotonic() 在 macOS（mach_absolute_time）、Linux
+**用哪只钟（复核 R-b7、R-b14）。** 别的进程判「租约过期」用的是库的时钟（cluster/workers：续租写 lease_until = 库的 now() +
+租约），跟各台机器的墙钟差多少无关。这边判「续晚了」用计入休眠的钟：time.monotonic() 在 macOS（mach_absolute_time）、Linux
 （CLOCK_MONOTONIC）上都不计休眠——笔记本合盖、虚拟机挂起超过两个租约，对面早已接手，这边还以为刚续过。所以 Linux 用
-CLOCK_BOOTTIME，macOS 用 clock_gettime(CLOCK_MONOTONIC)（这个计入休眠），都取不到时退回 monotonic；不论哪种，另外同时比墙钟，
-两只钟里走得多的那只说过了一个租约就算续晚了。续租时再比一下两只钟（jumped）：差出一个租约以上（墙钟跳了、或者计入休眠的钟
-其实没计）就隔离。续租那一句本身也按库的时钟核对：库里自己的租约已经过期（或者登记不见了），就不再续这个身份。
+CLOCK_BOOTTIME，macOS 用 clock_gettime(CLOCK_MONOTONIC)（这个计入休眠），只看它；墙钟会被 NTP 一步校时、手动改时间、虚拟机
+对时拨来拨去，取得到计入休眠的钟时不拿它判（否则单进程墙钟一跳就把自己隔离了）。两只都取不到时退回 monotonic，墙钟当后备：
+两只里走得多的那只说过了一个租约就算续晚了。两只钟对不上（jumped，差出一个租约以上）时不直接隔离：先续一次租，续租那一句按库的
+时钟核对「自己的租约还没过期」，以它为准——续上了记一条日志照常，续不上（库里自己的租约已经过期、或者登记不见了）才隔离。
+虚拟机被宿主挂起时客户机的 CLOCK_BOOTTIME 也可能停着：那时靠续租那一句（最迟一拍心跳之后）发现过期。
 
 Fenced 是 BaseException：节点、工具里常见的 except Exception 拦不住它，一路退到执行的最外层。没起协调（测试、脚本）时什么都不查。
 """
@@ -98,8 +100,8 @@ def bind() -> None:
 
 
 def stale() -> bool:
-    """离上次续上租约是不是已经超过一个租约时长：两只钟（计入休眠的单调钟、墙钟）里走得多的那只说了算。隔离之后、新身份还没
-    登记上的那一段也算（pending）。"""
+    """离上次续上租约是不是已经超过一个租约时长：取得到计入休眠的钟时只看它；取不到时它（monotonic）和墙钟里走得多的那只说了算。
+    隔离之后、新身份还没登记上的那一段也算（pending）。"""
     if not _active:
         return False
     since = _since()
@@ -107,7 +109,7 @@ def stale() -> bool:
         return True
     from app.cluster.workers import lease_s
 
-    return max(since) > lease_s()
+    return (since[0] if SLEEP_AWARE else max(since)) > lease_s()
 
 
 def pending() -> bool:
@@ -131,7 +133,8 @@ async def ready(timeout: float | None = None) -> None:
 
 
 def jumped() -> bool:
-    """两只钟差出一个租约以上（墙钟往前或往后跳了，或者单调钟没计入休眠）：续租时问，是就隔离。"""
+    """两只钟差出一个租约以上（墙钟往前或往后跳了，或者单调钟没计入休眠）。续租时问：是的话不直接隔离，以续租那一句按库的时钟
+    核对的结果为准（cluster/service.renew）。"""
     if not _active:
         return False
     since = _since()
