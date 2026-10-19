@@ -109,3 +109,25 @@ def test_copying_checkpoints_goes_through_the_direct_url(monkeypatch, tmp_path):
     assert seen["direct_url"] == settings.database_direct_url, "目标就是应用库：断点走它的直连地址"
     assert to_postgres.main([str(tmp_path), "postgresql://u:p@elsewhere.internal:5432/x"]) == 2
     assert seen["direct_url"] is None, "目标是别的库：不套用应用库的直连地址"
+
+
+def test_loopback_spellings_count_as_the_same_endpoint(monkeypatch):
+    """R-b12 的尾巴：localhost、127.0.0.1、::1 是同一台机器——同一个端口时照样拒绝；IP 按地址比，解析不成 IP 的按字面比。"""
+    from app.db import base
+
+    def norm(url: str) -> str:
+        return Settings(database_url=url, _env_file=None).database_url
+
+    monkeypatch.setattr(settings, "db_pgbouncer", True)
+    for app_url, direct in (("postgresql://u:p@localhost:6432/db", "postgresql://u:p@127.0.0.1:6432/db"),
+                            ("postgresql://u:p@127.0.0.1:6432/db", "postgresql://u:p@[::1]:6432/db"),
+                            ("postgresql://u:p@10.0.0.5:6432/db", "postgresql://u:p@[::ffff:10.0.0.5]:6432/db")):
+        monkeypatch.setattr(settings, "database_url", norm(app_url))
+        monkeypatch.setattr(settings, "database_direct_url", norm(direct))
+        with pytest.raises(RuntimeError, match="指着同一个地址"):
+            base.check_pgbouncer()
+    monkeypatch.setattr(settings, "database_url", norm("postgresql://u:p@localhost:6432/db"))
+    monkeypatch.setattr(settings, "database_direct_url", norm("postgresql://u:p@127.0.0.1:5432/db"))
+    base.check_pgbouncer()   # 本机另一个端口：放行
+    monkeypatch.setattr(settings, "database_direct_url", norm("postgresql://u:p@db.internal:6432/db"))
+    base.check_pgbouncer()   # 名字不同、不查 DNS：按字面算不同

@@ -318,9 +318,23 @@ def check_pgbouncer() -> None:
 
 
 def _endpoint(url: str) -> tuple[str, int]:
-    """地址连的是哪个主机端口（端口不写按 5432）。"""
+    """地址连的是哪个主机端口（端口不写按 5432）。主机名规范化：localhost、127.x.x.x、::1 都算本机回环；IP 地址按地址比
+    （::ffff:10.0.0.5 和 10.0.0.5 相同）；解析不成 IP 的按字面（小写）比，不查 DNS。"""
+    import ipaddress
+
     parsed = make_url(url)
-    return (parsed.host or "").lower(), int(parsed.port or 5432)
+    host = (parsed.host or "").strip().strip("[]").lower().rstrip(".")
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if host == "localhost" or host.endswith(".localhost") or (addr is not None and addr.is_loopback):
+        host = "loopback"
+    elif addr is not None:
+        host = str(addr)
+    return host, int(parsed.port or 5432)
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
