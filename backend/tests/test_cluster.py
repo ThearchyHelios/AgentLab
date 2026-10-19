@@ -355,6 +355,70 @@ async def test_leadership_is_handed_over_when_the_lease_runs_out():
     assert (await leader_mod.current("test-lead"))["owner"] is None
 
 
+def test_the_fence_counts_what_the_monotonic_clock_missed(monkeypatch):
+    """复核 R-b7：单调钟不走（休眠不计、虚拟机挂起）而墙钟过了两个租约——照样算续晚了；两只钟差出一个租约算跳了。"""
+    from app.cluster import fence
+
+    clocks = {"mono": 1000.0, "wall": 5000.0}
+    monkeypatch.setattr(fence, "_clock", lambda: clocks["mono"])
+    monkeypatch.setattr(fence, "_wall", lambda: clocks["wall"])
+    fence.activate()
+    try:
+        assert not fence.stale() and not fence.jumped()
+        clocks["wall"] += 2 * workers.lease_s()          # 合盖两个租约：单调钟没计，墙钟走了
+        assert fence.stale() and fence.jumped()
+        fence.renewed()
+        clocks["mono"] += 2 * workers.lease_s()          # 反过来：墙钟被往回拨了，单调钟照走
+        assert fence.stale() and fence.jumped()
+        fence.renewed()
+        clocks["mono"] += workers.lease_s() / 2
+        clocks["wall"] += workers.lease_s() / 2
+        assert not fence.stale() and not fence.jumped()
+    finally:
+        fence.deactivate()
+
+
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="SQLite 只有一个进程，租约用本机的钟")
+async def test_leases_use_the_database_clock_not_the_local_wall_clock(monkeypatch):
+    """复核 R-b7：本机墙钟快了一个小时——别的进程照样算活着、它拿着的当班租约照样抢不走；按库的时钟自己的租约已经过期时，续租
+    不再续这个身份，而是隔离。"""
+    from app.cluster import fence
+    from app.cluster.service import service
+    from app.db.base import utcnow as real_utcnow
+    import app.db.base as db_base
+
+    await _peer(PEER)
+    lead = leader_mod.Leadership("test-skew")
+    async with SessionLocal() as session:
+        session.add(ClusterLease(name="test-skew", owner=PEER, lease_until=real_utcnow() + timedelta(seconds=60), epoch=1))
+        await session.commit()
+    skewed = lambda: real_utcnow() + timedelta(hours=1)  # noqa: E731
+    monkeypatch.setattr(workers, "utcnow", skewed)
+    monkeypatch.setattr(db_base, "utcnow", skewed)
+    assert PEER in (await workers.liveness()).others, "按库的时钟它的租约没过期"
+    assert not await lead.claim(), "当班租约按库的时钟判：抢不走"
+    async with SessionLocal() as session:
+        await session.execute(delete(ClusterWorker).where(ClusterWorker.id == PEER))   # 它没记版本：登记时会被版本守卫拦下
+        await session.execute(delete(ClusterLease).where(ClusterLease.name == "test-skew"))
+        await session.commit()
+
+    await workers.register()
+    fence.activate()
+    before = fence.generation()
+    try:
+        assert await service.renew(), "按库的时钟没过期：续上"
+        async with SessionLocal() as session:
+            row = await session.get(ClusterWorker, identity.owner())
+            row.lease_until = real_utcnow() - timedelta(seconds=1)   # 库的时钟已经过了它的租约，本机的两只钟都没觉得
+            await session.commit()
+        assert not await service.renew() and fence.generation() == before + 1, "过期了不续这个身份：隔离"
+    finally:
+        fence.deactivate()
+        if service._lease_conn is not None:
+            await service._lease_conn.close()
+            service._lease_conn = None
+
+
 async def test_the_daily_cap_is_not_overrun_by_concurrent_charges():
     from app.engine.spend import Ledger
 

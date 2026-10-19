@@ -129,7 +129,6 @@ async def preflight(*, observe_s: float | None = None) -> None:
     if settings.db_dialect != "postgresql":
         return
     from app.cluster.workers import heartbeat_s, lease_s
-    from app.db.base import utcnow
 
     observe = 2 * heartbeat_s() + 1.0 if observe_s is None else observe_s
     loop = asyncio.get_running_loop()
@@ -137,7 +136,7 @@ async def preflight(*, observe_s: float | None = None) -> None:
     first_beats: dict[str, Any] = {}
     warned = False
     while True:
-        mismatched = await _mismatched_alive(utcnow())
+        mismatched = await _mismatched_alive()
         if not mismatched:
             return
         for peer in mismatched:
@@ -154,14 +153,19 @@ async def preflight(*, observe_s: float | None = None) -> None:
         await asyncio.sleep(min(0.5, max(0.1, heartbeat_s() / 2)))
 
 
-async def _mismatched_alive(now: Any) -> list[dict[str, Any]]:
+async def _mismatched_alive(now: Any = None) -> list[dict[str, Any]]:
+    """租约没过期、版本不同的别的进程。now 不给就按库的时钟（租约是按库的时钟写的，cluster/workers）。"""
+    from sqlalchemy import text
+
     from app.db.base import engine
 
     async with engine.connect() as conn:
         peers = await _peers(conn)
+        if peers and now is None:
+            now = (await conn.execute(text("SELECT timezone('UTC', clock_timestamp())"))).scalar()
     if not peers:
         return []
-    naive = now.replace(tzinfo=None)
+    naive = _naive(now)
     alive = [p for p in peers if p.get("lease_until") is not None and _naive(p["lease_until"]) > naive]
     return [p for p in alive if not same(p.get("code_version"), p.get("schema_version"))]
 
@@ -177,8 +181,9 @@ def _message(peers: list[dict[str, Any]]) -> str:
 
 
 def check_rows(rows: list[Any], now: Any) -> None:
-    """登记那一下（cluster/workers.register，持着事务级咨询锁）再查一遍：别的活着的进程里有版本不同的就抛 VersionMismatch。"""
-    naive = now.replace(tzinfo=None)
+    """登记那一下（cluster/workers.register，持着事务级咨询锁）再查一遍：别的活着的进程里有版本不同的就抛 VersionMismatch。
+    now 是库的时钟。"""
+    naive = _naive(now)
     bad = [{"id": r.id, "code_version": r.code_version, "schema_version": r.schema_version} for r in rows
            if r.lease_until is not None and _naive(r.lease_until) > naive and r.id != identity.owner()
            and not same(r.code_version, r.schema_version)]

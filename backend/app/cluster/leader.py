@@ -7,6 +7,9 @@
 两个进程短暂地都以为自己当班（续租那一拍库慢了、本地还没过期）时，重复不了：定时认领本来就是条件 UPDATE、触发记录
 (任务, 时刻, 种类) 唯一，事件派发按投递记录的唯一约束，待办的升级、核实各自也是条件更新。当班只是让它们平常不撞。
 本地另留一截余量（MARGIN）：租约快到期还没续上时，自己先当作不当班了。
+
+租约按库的时钟写、按库的时钟判（复核 R-b7，同 cluster/workers）：机器之间墙钟差多少都不会让两边都以为租约归自己。本地判「还当
+不当班」不看墙钟，看计入休眠的单调钟（cluster/fence.now）：从发出续租那一刻起算一个租约时长，库里的租约只会更晚到期。
 """
 from __future__ import annotations
 
@@ -15,9 +18,9 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import case, or_, update
 
-from app.cluster import identity
-from app.cluster.workers import lease_s
-from app.db.base import SessionLocal, utcnow
+from app.cluster import fence, identity
+from app.cluster.workers import db_now, lease_s
+from app.db.base import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -29,33 +32,42 @@ MARGIN_S = 2.0
 class Leadership:
     def __init__(self, name: str) -> None:
         self.name = name
+        #: 库里记的到期时刻（库的时钟；给人看、交班用）
         self.until: datetime | None = None
+        #: 本地判还当不当班用的到期时刻（cluster/fence.now 的读数）
+        self.local_until: float | None = None
         self.epoch = 0
 
     def single(self) -> None:
         """只有本进程（SQLite）：直接算当班，不写库。"""
         self.until = datetime.max.replace(tzinfo=None)
+        self.local_until = float("inf")
 
-    def held(self, now: datetime | None = None) -> bool:
+    def drop(self) -> None:
+        """本地当作不当班了（隔离之后换身份时：库里那份租约属于旧身份）。"""
+        self.until = self.local_until = None
+
+    def held(self) -> bool:
         """本地看：还在当班（租约离到期还有余量）。"""
-        if self.until is None:
+        if self.until is None or self.local_until is None:
             return False
         if self.until.tzinfo is None:
             return True   # single()：只有本进程
         # 余量不超过租约的四分之一：租约调得很短（验收脚本）时也留得出当班的时间
         margin = min(MARGIN_S, lease_s() / 4)
-        return (now or utcnow()) + timedelta(seconds=margin) < self.until
+        return fence.now() + margin < self.local_until
 
-    async def claim(self, now: datetime | None = None) -> bool:
+    async def claim(self) -> bool:
         """接班或续租。交回这一拍之后是不是当班。"""
         from app.db.models_cluster import ClusterLease
         from app.db.portable import insert_ignore
 
-        now = now or utcnow()
-        until = now + timedelta(seconds=lease_s())
+        started = fence.now()
         me = identity.owner()
         mine = ClusterLease.owner == me
         async with SessionLocal() as session:
+            now = await db_now(session)
+            until = now + timedelta(seconds=lease_s())
             done = await session.execute(
                 update(ClusterLease).where(
                     ClusterLease.name == self.name,
@@ -74,15 +86,15 @@ class Leadership:
                     .on_conflict_do_nothing(index_elements=["name"]))
                 epoch = 1 if inserted.rowcount == 1 else None
             await session.commit()
-        was = self.held(now)
+        was = self.held()
         if epoch is None:
             if was or self.until is not None:
                 logger.warning("调度当班交给了别的进程（本进程 %s 不再当班）", identity.describe(me))
-            self.until = None
+            self.drop()
             return False
         if not was and self.epoch != epoch:
             logger.info("本进程（%s）接手调度当班（第 %d 班）", identity.describe(me), epoch)
-        self.until, self.epoch = until, int(epoch)
+        self.until, self.local_until, self.epoch = until, started + lease_s(), int(epoch)
         return True
 
     async def release(self) -> None:
@@ -92,7 +104,7 @@ class Leadership:
         if self.until is None:
             return
         single = self.until.tzinfo is None
-        self.until = None
+        self.drop()
         if single:
             return
         async with SessionLocal() as session:

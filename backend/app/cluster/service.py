@@ -123,23 +123,28 @@ class _Service:
         return self._lease_conn
 
     async def renew(self) -> bool:
-        """续一拍租约（在专用连接上，不走连接池：池子被占满时取连接要等，等得比租约还长）。续晚了（离上次续上超过一个租约时长）
-        就不续这个身份了：隔离（cluster/fence.py），换身份重新登记。交回续没续上。"""
-        from datetime import timedelta
-
+        """续一拍租约（在专用连接上，不走连接池：池子被占满时取连接要等，等得比租约还长）。按库的时钟续、按库的时钟核对（复核
+        R-b7）：库里自己的租约已经过期（或者登记不见了），别的进程可能已经接手，不再续这个身份——隔离（cluster/fence.py），换身份
+        重新登记。本地的两只钟说续晚了、或者两只钟差出一个租约（墙钟跳了），同样隔离。交回续没续上。"""
         from app.cluster import fence
-        from app.db.base import utcnow
 
         if fence.stale():
             fence.trip("续租约的时候发现已经续晚了")
             return False
-        now = utcnow()
-        until = now + timedelta(seconds=workers.lease_s())
+        if fence.jumped():
+            fence.trip("续租约的时候发现本机的墙钟和单调钟差出一个租约以上（墙钟跳了，或者休眠没计进单调钟）")
+            return False
         try:
             conn = await self._lease_conn_open()
-            done = await asyncio.wait_for(conn.execute(
-                "UPDATE cluster_workers SET heartbeat_at = $2, lease_until = $3 WHERE id = $1",
-                identity.owner(), now.replace(tzinfo=None), until.replace(tzinfo=None)), timeout=workers.heartbeat_s())
+            renewed = await asyncio.wait_for(conn.fetchval(
+                "UPDATE cluster_workers SET heartbeat_at = timezone('UTC', clock_timestamp()), "
+                "lease_until = timezone('UTC', clock_timestamp()) + make_interval(secs => $2) "
+                "WHERE id = $1 AND lease_until >= timezone('UTC', clock_timestamp()) RETURNING id",
+                identity.owner(), float(workers.lease_s())), timeout=workers.heartbeat_s())
+            if renewed is None:
+                expired = await asyncio.wait_for(conn.fetchval(
+                    "SELECT lease_until < timezone('UTC', clock_timestamp()) FROM cluster_workers WHERE id = $1",
+                    identity.owner()), timeout=workers.heartbeat_s())
         except Exception:  # noqa: BLE001 - 库一时连不上：这一拍没续上，下一拍再试（续晚了的话下一拍隔离）
             logger.warning("续租约没续上，下一拍再试", exc_info=True)
             with contextlib.suppress(Exception):
@@ -147,9 +152,9 @@ class _Service:
                     await self._lease_conn.close()
             self._lease_conn = None
             return False
-        if done.endswith(" 0"):
-            logger.warning("本进程的登记不见了（可能被当成没了），重新登记")
-            await workers.register()
+        if renewed is None:
+            fence.trip("按库的时钟本进程的租约已经过期" if expired else "本进程的登记不见了（被当成不在了）")
+            return False
         fence.renewed()
         return True
 
@@ -167,7 +172,7 @@ class _Service:
 
         old = identity.owner()
         new = identity.regenerate()
-        leader.scheduler.until = None
+        leader.scheduler.drop()
         try:
             await workers.register()
             fence.renewed()

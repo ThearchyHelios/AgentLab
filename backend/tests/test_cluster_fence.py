@@ -99,7 +99,7 @@ async def _stall_and_take_over(slow) -> str:
     await asyncio.wait_for(slow["entered"].wait(), timeout=15)
     await _checkpointed_before_slow(run.id)
     before = fence.generation()
-    fence.renewed(time.monotonic() - lease_s() - 1)    # 卡了一个多租约时长
+    fence.renewed(ago=lease_s() + 1)                   # 卡了一个多租约时长
     await _taken_over(run.id)
     slow["gate"].set()                                 # 缓过来，手上的执行接着往下走
     for _ in range(200):
