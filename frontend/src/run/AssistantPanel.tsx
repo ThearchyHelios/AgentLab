@@ -16,7 +16,7 @@ import { formatCost, formatLapse, formatOffset, formatSpan, formatTokens, shortI
 import { statusLabel } from '../lib/status'
 import { CHAT_BLUEPRINT_TEXT, runClassLabel, SQL_CHECK_TEXT } from '../lib/terms'
 import { sortSqlChecks } from '../lib/sqlcheck'
-import type { RunUsage, ToolChange } from '../types'
+import type { ConversationTurn, RunUsage, ToolChange } from '../types'
 import { AssistantStream, type StreamTurn } from './AssistantStream'
 import { Composer } from './Composer'
 import { SqlCheckBody } from './SqlChecks'
@@ -220,6 +220,21 @@ function copilotTurn(
   }
 }
 
+/**
+ * 之前那几轮的报错：落库时记了原因（meta.cause，助手本轮未完成的那种）就连「怎么办」和诊断一起摊开，
+ * 和这一轮当场看到的一样；老轮次只有一句话
+ */
+const pastError = (t: ConversationTurn): StreamTurn['error'] => {
+  const cause = t.meta?.cause
+  if (!t.error) return undefined
+  if (!cause || typeof cause !== 'object' || cause.kind !== 'copilot') return t.error
+  return {
+    error: t.error,
+    ...(typeof cause.hint === 'string' && cause.hint ? { hint: cause.hint } : {}),
+    ...(typeof cause.detail === 'string' && cause.detail ? { detail: cause.detail } : {}),
+  }
+}
+
 /** 这一轮变少了的工具，分「没让删」和「按要求」两组：和改图回执（toast）同一条规则 */
 const toolLossOf = (out: CopilotOutcome) =>
   splitShrunk(out.toolChanges, out.dropped.map((w) => ({ node_id: w.nodeId, field: w.field })))
@@ -254,7 +269,7 @@ function ChatView({ hasRun, onOpenRun }: { hasRun: boolean; onOpenRun: () => voi
     status: t.status === 'error' ? '本轮未能完成' : t.graph ? '已修改画布' : '已回答',
     steps: [],
     output: t.answer ? { 回答: t.answer } : t.explanation ? { 说明: t.explanation } : null,
-    error: t.status === 'error' ? t.error || undefined : undefined,
+    error: t.status === 'error' ? pastError(t) : undefined,
   })), [earlier])
   const shown = showPast ? [...pastTurns, ...turns] : turns
   const streamRef = useRef<HTMLDivElement>(null)
