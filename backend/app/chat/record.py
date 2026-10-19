@@ -14,7 +14,8 @@
 **失败只记原因（cause），不记说法。** 页面以前记的是翻成人话之后的 failure（标题、原因、怎么办：lib/explain 那一套），说法在
 界面层；服务端只记发生了什么，页面恢复时照同一套 lib/explain 讲（frontend/src/store/chat.ts 的 failureFromCause）：
   {kind: refused, message, code}        开流之前就被拒（模型没配好、限定的数据源都不在）
-  {kind: copilot, message, hint, detail} 生成过程交出 error（助手本轮未完成）
+  {kind: copilot, message, hint, detail, code?, diagnostics?} 生成过程交出 error（助手本轮未完成；一个操作都没给的带
+                                        code=copilot_empty 和诊断 copilot_gen.StreamDiagnosis.as_dict，画布轮次同样记）
   {kind: blocked, issues, self_checked} 生成的图没过检查
   {kind: start, message, code, status}  发起运行被拒（绑定的工具不在、使用者用不了的节点）
   {kind: run, error, detail}            运行失败

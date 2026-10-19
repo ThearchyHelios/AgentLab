@@ -8,6 +8,7 @@ wait_for，而 wait_for 取消之后要等被取消的那一方收完尾：驱�
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Awaitable
@@ -135,9 +136,9 @@ def _abandon(job: asyncio.Future[Any], *, cancel: bool = True) -> None:
 # --------------------------------------------------------------------------
 
 _MARKUP = re.compile(
-    r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}"                      # DeepSeek 的 DSML
+    r"</?\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}"                  # DeepSeek 的 DSML
     r"|<[｜|]\s*tool[▁_ ]calls?[▁_ ]begin\s*[｜|]>"          # DeepSeek 的特殊 token
-    r"|<\s*(?:tool_call|function_call)\s*>"
+    r"|<\s*(?:tool_calls?|function_calls?)\s*>"
     r"|<\s*invoke\s+name\s*=",
     re.IGNORECASE,
 )
@@ -173,3 +174,146 @@ def leaked_markup(text: str | None) -> str | None:
 
 def markup_warning(snippet: str, who: str = "模型") -> str:
     return f"{who}以文本形式输出了工具调用（{snippet[:40]}…），未实际调用工具"
+
+
+# --------------------------------------------------------------------------
+# 把写成文字的工具调用读出来
+#
+# 助手（app/api/copilot_gen）不走工具调用接口：操作（look、add_node……）是正文里一行一行的 JSON。可模型偶尔还是按自己训练时
+# 那套调用格式写（部署上撞过：DeepSeek 想先 look 看表，思考里写着「先输出 look」，正文却是一段 DSML），意图和参数都对，
+# 只是格式不对。助手按名字把它们读成操作；节点里的 agent 仍然只认、不读（真要调工具得走接口，见上面的纠正）。
+#
+# 认得的几种写法：
+#   DSML（DeepSeek）       <｜DSML｜invoke name="look"><｜DSML｜parameter name="need" string="true">…</｜DSML｜parameter>
+#                          </｜DSML｜invoke>，外面可能包一层 function_calls / calls；竖线一到两个、中间可能有空格
+#   <invoke>               同上去掉 DSML 前缀（<function_calls><invoke name="…"><parameter name="…">…）
+#   <tool_call>            <tool_call>{"name": "look", "arguments": {…}}</tool_call>（function_call 同）
+#   DeepSeek 特殊 token    <｜tool▁call▁begin｜>function<｜tool▁sep｜>look ```json {…}```<｜tool▁call▁end｜>，
+#                          或者 <｜tool▁call▁begin｜>look<｜tool▁sep｜>{…}<｜tool▁call▁end｜>
+# --------------------------------------------------------------------------
+
+_DSML_PREFIX = re.compile(r"<(/?)\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*", re.IGNORECASE)
+_INVOKE = re.compile(r"<invoke\s+name\s*=\s*[\"']([^\"']*)[\"']\s*>(.*?)</invoke\s*>", re.DOTALL | re.IGNORECASE)
+_PARAMETER = re.compile(r"<parameter\s+name\s*=\s*[\"']([^\"']*)[\"']([^>]*)>(.*?)</parameter\s*>",
+                        re.DOTALL | re.IGNORECASE)
+_PARAMETER_OPEN = re.compile(r"<parameter\b", re.IGNORECASE)
+_PARAMETER_CLOSE = re.compile(r"</parameter\s*>", re.IGNORECASE)
+_STRING_ATTR = re.compile(r"string\s*=\s*[\"'](true|false)[\"']", re.IGNORECASE)
+_JSON_CALL = re.compile(r"<(tool_call|function_call)\s*>(.*?)</\1\s*>", re.DOTALL | re.IGNORECASE)
+_TOKEN_CALL = re.compile(r"<[｜|]\s*tool[▁_ ]call[▁_ ]begin\s*[｜|]>(.*?)<[｜|]\s*tool[▁_ ]sep\s*[｜|]>(.*?)"
+                         r"<[｜|]\s*tool[▁_ ]call[▁_ ]end\s*[｜|]>", re.DOTALL | re.IGNORECASE)
+#: 一次调用的开头：在它之后还没等到结尾的，留着等后面的行
+_CALL_OPENER = re.compile(r"<invoke\s+name\s*=|<(?:tool_call|function_call)\s*>"
+                          r"|<[｜|]\s*tool[▁_ ]call[▁_ ]begin\s*[｜|]>", re.IGNORECASE)
+_FENCE = re.compile(r"^`{3,}[A-Za-z0-9_-]*\s*|\s*`{3,}$")
+#: 参数值像 JSON 的（没写 string 属性时按 JSON 读）
+_JSONISH = re.compile(r"^\s*(?:[\[{\"]|-?\d|true\b|false\b|null\b)")
+
+
+@dataclass(frozen=True)
+class LeakedCall:
+    """写成文字的一次工具调用。args 是 None：参数读不出来（名字照样交出去，由调用方记进诊断）。"""
+
+    name: str
+    args: dict[str, Any] | None
+
+
+def _parameter_value(raw: str, attrs: str) -> Any:
+    """DSML 的 string="true" 是原样的字符串，string="false" 是 JSON；没写的看着像 JSON 就按 JSON 读，读不成照原样。"""
+    value = raw.strip()
+    flag = _STRING_ATTR.search(attrs)
+    if flag and flag.group(1).lower() == "true":
+        return value
+    if flag or _JSONISH.match(value):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _invoke_call(name: str, body: str) -> LeakedCall:
+    return LeakedCall(name.strip(), {key.strip(): _parameter_value(raw, attrs)
+                                     for key, attrs, raw in _PARAMETER.findall(body)})
+
+
+def _json_call(body: str) -> LeakedCall:
+    """<tool_call>{"name": …, "arguments": {…}}</tool_call>：arguments 也可能是一段 JSON 字符串。"""
+    try:
+        obj = json.loads(body.strip())
+    except ValueError:
+        return LeakedCall("", None)
+    if not isinstance(obj, dict):
+        return LeakedCall("", None)
+    function = obj.get("function") if isinstance(obj.get("function"), dict) else {}
+    name = str(obj.get("name") or function.get("name") or "")
+    args = next((v for v in (obj.get("arguments"), obj.get("parameters"), obj.get("args"),
+                             function.get("arguments")) if v is not None), {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except ValueError:
+            args = None
+    return LeakedCall(name, args if isinstance(args, dict) else None)
+
+
+def _token_call(head: str, body: str) -> LeakedCall:
+    """DeepSeek 特殊 token 的两种排法：sep 前是 function、名字在 sep 后第一行；或者 sep 前就是名字。参数可能套着围栏。"""
+    head, body = head.strip(), body.strip()
+    if head.lower() in ("", "function"):
+        name, _, body = body.partition("\n")
+    else:
+        name = head
+    body = _FENCE.sub("", body.strip()).strip()
+    try:
+        args = json.loads(body) if body else {}
+    except ValueError:
+        args = None
+    return LeakedCall(name.strip(), args if isinstance(args, dict) else None)
+
+
+#: 流读完了、最后一次调用还差结尾（模型写完参数就停了）时补上的结尾，按开头的写法
+_CLOSERS = (("<invoke", "</invoke>"), ("<tool_call", "</tool_call>"), ("<function_call", "</function_call>"),
+            ("<", "<｜tool▁call▁end｜>"))
+
+
+def take_leaked_calls(text: str, *, final: bool = False) -> tuple[list[LeakedCall], str]:
+    """从一段写成文字的工具调用里取出已经写完的调用（按出现的先后），交回 (调用, 还没写完的那一段)。还没写完的从最后一个
+    没等到结尾的调用开头算起；外层的包装（function_calls、DSML 的 calls）、调用之间的说明文字不留——没有没写完的调用时交回
+    空串。流式读的时候一行一行攒进来，每攒一行取一次。
+
+    final：后面不会再来了。最后一次调用只差结尾的（参数都写完整了，模型写完就停了）补上结尾再读一次；参数写到一半的、
+    补上也读不出名字和参数的，照样交回——拿半截参数当一次调用，比照实说没写完更糟。"""
+    calls, rest = _take(text)
+    if final and rest and len(_PARAMETER_OPEN.findall(rest)) == len(_PARAMETER_CLOSE.findall(rest)):
+        closer = next(c for prefix, c in _CLOSERS if rest.lower().startswith(prefix))
+        more, left = _take(rest + closer)
+        if more and not left and all(c.name and c.args is not None for c in more):
+            return calls + more, ""
+    return calls, rest
+
+
+def _take(text: str) -> tuple[list[LeakedCall], str]:
+    text = _DSML_PREFIX.sub(r"<\1", text)
+    found: list[tuple[int, int, LeakedCall]] = []
+    for m in _INVOKE.finditer(text):
+        found.append((m.start(), m.end(), _invoke_call(m.group(1), m.group(2))))
+    for m in _JSON_CALL.finditer(text):
+        found.append((m.start(), m.end(), _json_call(m.group(2))))
+    for m in _TOKEN_CALL.finditer(text):
+        found.append((m.start(), m.end(), _token_call(m.group(1), m.group(2))))
+    found.sort(key=lambda f: f[0])
+    calls: list[LeakedCall] = []
+    end = 0
+    for start, stop, call in found:
+        if start < end:  # 套在别的调用里面的不另算
+            continue
+        calls.append(call)
+        end = stop
+    opener = _CALL_OPENER.search(text, end)
+    return calls, text[opener.start():] if opener else ""
+
+
+def has_markup(text: str) -> bool:
+    """这一段里有没有工具调用标记（只认标记本身，不认 leaked_markup 那种「假设调用了」的说法）：流式读的时候据此开始攒。"""
+    return bool(_MARKUP.search(text))

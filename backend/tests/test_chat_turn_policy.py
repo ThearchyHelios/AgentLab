@@ -196,13 +196,16 @@ async def test_answer_ops_says_to_retry_an_empty_generation(client, monkeypatch)
     assert err["code"] == turn.EMPTY_GENERATION and err["next"] == "retry", err
     # 原因是重来时交给助手的那句纠正（这次连思考都没有），诊断写在 detail（不含原文）
     assert err["reason"].startswith("什么都没有输出") and "look" in err["reason"], err
-    assert err["message"] == "助手本轮未完成：模型没有给出任何修改，也没有说明原因"
+    # 说法按诊断照实写；起草时已经当场纠正过一次（第二次还是空的），整轮才交 error
+    assert err["message"] == "助手本轮未完成：模型什么都没有输出"
     assert "正文 0 字，思考 0 字" in err["detail"] and err["diagnostics"]["ops"] == 0
+    assert err["diagnostics"]["nudged"] is True and model.calls == 2, err
 
 
 async def test_the_eval_driver_retries_an_empty_generation_once(monkeypatch):
     """评测的作答（app/eval/answer.Driver）走同一个决定：第一次一个操作都没给就带着原因重来一次，原因照实记在 retries；
-    重来还不行才照实报建图失败（助手调用失败），不再试第三次。"""
+    重来还不行才照实报建图失败（助手调用失败），不再试第三次。每一次生成里起草时已经当场纠正过一次（copilot_gen
+    FORMAT_NUDGE_PROMPT），所以一次生成算两次调用。"""
     import json
 
     import app.api.copilot as copilot
@@ -210,7 +213,7 @@ async def test_the_eval_driver_retries_an_empty_generation_once(monkeypatch):
     from tests.test_usage_meter import Scripted
 
     reply = json.dumps({"op": "reply", "text": "上周没有华中区的数据"}, ensure_ascii=False)
-    for replies, path in (([[""], [reply]], "reply"), ([[""]], "build_failed")):
+    for replies, path, calls in (([[""], [""], [reply]], "reply", 3), ([[""]], "build_failed", 4)):
         model = Scripted(model="claude-opus-5", replies=replies)
         seen: list[str] = []
 
@@ -228,14 +231,14 @@ async def test_the_eval_driver_retries_an_empty_generation_once(monkeypatch):
         driver = answer.Driver("上周华中区销售额", datasource_ids=[], ctx=answer.TurnContext(
             suite_id="s", suite_name="虚构题集", eval_run_id="e", case_id=None, case_seq=1, actor=None))
         t = await driver.drive()
-        assert t.path == path and t.attempts == 1 and model.calls == 2, (t.path, t.attempts, model.calls, t.reason)
+        assert t.path == path and t.attempts == 1 and model.calls == calls, (t.path, t.attempts, model.calls, t.reason)
         assert len(t.retries) == 1 and t.retries[0].startswith("什么都没有输出"), t.retries
         # 重来时问题后面附那句纠正，不原样重发
         assert seen[1] == turn.empty_retry_instruction("上周华中区销售额", t.retries[0]) != seen[0], seen
         assert "什么都没有输出" in seen[1]
         if path == "build_failed":
             assert t.copilot_failed and t.reason.startswith("助手本轮未完成"), t.reason
-        assert t.usage["assistant"]["calls"] == 2, "两次生成都是这一题花的"
+        assert t.usage["assistant"]["calls"] == calls, "两次生成（连同各自当场纠正的那一次）都是这一题花的"
 
 
 async def test_review_says_whether_and_how_to_retry(client, monkeypatch):

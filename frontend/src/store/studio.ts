@@ -484,13 +484,20 @@ const memoryOf = (past: ConversationTurn[]): StudioState['copilotMemory'] => ({
   past, total: past.length, turns: Math.min(past.length, COPILOT_HISTORY_TURNS),
 })
 
+/**
+ * 画布这一轮没完成时记下的原因：同问数据一轮的 meta.cause（backend/app/chat/record.py 的 kind=copilot）。
+ * 以前只记 error 那一句，诊断（模型交回了什么）没落库，事后查不了为什么失败
+ */
+type CanvasCause = { kind: 'copilot'; message: string; hint?: string; detail?: string; code?: string
+  diagnostics?: Record<string, unknown> }
+
 /** 把画布上这一轮记进会话，下一条指令才接得上 */
 function recordCanvasTurn(
   conversationId: string | null,
   instruction: string,
   patch: { graph?: any; explanation?: string; answer?: string; status?: 'done' | 'error'; error?: string
-    /** 这一轮的查看记录（look §2.5.8）：服务端下一轮据此写「上一轮查看过」 */
-    meta?: { looks: LookEvent[] } },
+    /** 这一轮的查看记录（look §2.5.8）：服务端下一轮据此写「上一轮查看过」；没完成的另记原因 */
+    meta?: { looks?: LookEvent[]; cause?: CanvasCause } },
   set?: (fn: (s: StudioState) => Partial<StudioState>) => void,
 ): void {
   if (!conversationId) return
@@ -2148,7 +2155,15 @@ export const useStudio = create<StudioState>((set, get) => ({
             finish({ explanation: '', error: message,
                      errorHint: typeof op.hint === 'string' ? op.hint : '',
                      errorDetail: typeof op.detail === 'string' ? op.detail : '' })
-            recordCanvasTurn(get().copilotConversationId, instruction, { status: 'error', error: message, ...looksMeta() }, set)
+            const cause: CanvasCause = {
+              kind: 'copilot', message,
+              ...(typeof op.hint === 'string' && op.hint ? { hint: op.hint } : {}),
+              ...(typeof op.detail === 'string' && op.detail ? { detail: op.detail } : {}),
+              ...(typeof op.code === 'string' && op.code ? { code: op.code } : {}),
+              ...(op.diagnostics && typeof op.diagnostics === 'object' ? { diagnostics: op.diagnostics } : {}),
+            }
+            recordCanvasTurn(get().copilotConversationId, instruction,
+              { status: 'error', error: message, meta: { ...looksMeta().meta, cause } }, set)
             break
           }
         }

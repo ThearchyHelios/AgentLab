@@ -850,12 +850,13 @@ def test_attempt_records_say_what_the_page_used_to_say():
 
 
 async def test_an_empty_generation_is_retried_once_on_the_server(client, monkeypatch):
-    """助手只写了思考、一个操作都没给（error.next=retry）：服务端带着原因重来一次（turn.retry kind=empty），不用页面在。"""
+    """助手只写了思考、一个操作都没给（error.next=retry）：服务端带着原因重来一次（turn.retry kind=empty），不用页面在。
+    一次建图里起草时已经当场纠正过一次（copilot_gen FORMAT_NUDGE_PROMPT），那一次也空着，整次建图才交 error。"""
     import app.api.copilot as copilot
     from tests.test_usage_meter import Scripted
 
     reply = json.dumps({"op": "reply", "text": "上周没有华中区的数据"}, ensure_ascii=False)
-    model = Scripted(model="claude-opus-5", replies=[[""], [reply]])
+    model = Scripted(model="claude-opus-5", replies=[[""], [""], [reply]])
 
     async def _model(*_a, **_k):
         return model, "claude-opus-5"
@@ -871,7 +872,7 @@ async def test_an_empty_generation_is_retried_once_on_the_server(client, monkeyp
     assert "正文 0 字" in retry["detail"], retry
     row = await _row(turn_id)
     assert row.status == "done" and row.answer == "上周没有华中区的数据" and row.meta["noQuery"] is True
-    assert row.meta["usage"]["copilot"]["calls"] == 2, "两次建图都是这一轮花的"
+    assert row.meta["usage"]["copilot"]["calls"] == 3, "两次建图（连同第一次当场纠正的那一次）都是这一轮花的"
 
 
 async def test_several_stranded_turns_of_one_conversation_can_be_resumed_together(client):

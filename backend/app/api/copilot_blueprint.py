@@ -71,7 +71,7 @@ BLUEPRINT_SYSTEM_PROMPT = """\
 
 BLUEPRINT_PROTOCOL_PROMPT = """\
 输出格式（严格遵守）：
-- 每行一个完整的 JSON 对象，除此之外不输出任何东西——不要 markdown 围栏、不要解释文字
+- 每行一个完整的 JSON 对象，除此之外不输出任何东西——不要 markdown 围栏、不要解释文字，也不要写成工具调用的格式（这里没有工具调用接口）
 - 可用操作：
   {"op":"plan","summary":"一句话说明打算怎么整理"}          ← 第一行
   {"op":"bp_template","template":{"id":"periodic_board","version":1}}

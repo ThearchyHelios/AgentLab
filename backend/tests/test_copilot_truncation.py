@@ -163,7 +163,8 @@ async def test_a_cut_in_the_middle_of_the_ops_is_not_delivered_as_done(client, m
 
 
 async def test_output_that_parses_to_nothing_is_an_error(client, monkeypatch):
-    """格式跑偏（只写了说明文字、没有一行是操作），每一行都被跳过：一个操作都没有，也没有 done。诊断写明跳过了几行。"""
+    """格式跑偏（只写了说明文字、没有一行是操作），每一行都被跳过：一个操作都没有，也没有 done。当场带纠正重写一次还是这样，
+    才报错；诊断写明跳过了几行（两次的）。"""
     model = _Scripted([AIMessageChunk(content="先看一下表结构，\n再决定怎么搭。\n"),
                        AIMessageChunk(content="", response_metadata={"finish_reason": "stop"})])
     events = await _events(client, monkeypatch, model)
@@ -171,7 +172,8 @@ async def test_output_that_parses_to_nothing_is_an_error(client, monkeypatch):
     assert "final" not in kinds
     [err] = [e for e in events if e["op"] == "error"]
     assert err["message"].startswith("助手本轮未完成：") and "画布未修改" in err["hint"]
-    assert "跳过 2 行：2 行不是完整的 JSON" in err["detail"] and "先看一下表" not in err["detail"], err
+    assert "跳过 4 行：4 行不是完整的 JSON" in err["detail"] and "先看一下表" not in err["detail"], err
+    assert err["message"] == "助手本轮未完成：模型的输出格式不对，没有一行能认出的操作" and model.calls == 2, err
 
 
 async def test_a_pretty_printed_op_in_a_fence_is_read(client, monkeypatch):
