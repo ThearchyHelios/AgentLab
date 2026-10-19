@@ -66,10 +66,12 @@ deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i im
 另用 `pg_dump` 备份数据库。
 
 `./deploy.sh upgrade` 换版本之前会自动备份一次库：SQLite 拷到数据目录的 `backups/sqlite/<时间>/`（SQLite 的备份接口，
-一致的一份），内置 PostgreSQL 用 `pg_dump` 存到 `backups/postgres/`，各只留最近 5 份（`agentlab.env` 里 `BACKUP_KEEP=` 改）。
+各自一致的一份：`agentlab.db`、`checkpoints.db`，和填报的记录表 `records/` 下的各个 `.db`，相对路径照旧），内置 PostgreSQL
+用 `pg_dump` 存到 `backups/postgres/`（整个库，含断点），各只留最近 5 份（`agentlab.env` 里 `BACKUP_KEEP=` 改）。
 备份里是整个库（含加密存着的密钥），所以 `backups/` 和下面每一层目录都是 0700、备份文件 0600，属主同数据目录（uid 10001）：
 宿主机上要看、要拷走都得用 sudo（`sudo ls -l data/backups/sqlite/`、`sudo cp -a data/backups /别处/`）。
-这只是升级的保险，不代替下面的整目录备份：工件、上传文件和 `.secret_key` 不在里面。
+这只是升级的保险，不代替下面的整目录备份：上传的原件和上传表格的各版本库、工件库、表单附件、知识库、沙箱工作区、加密密钥
+`.secret_key` 都不在里面（用内置 PostgreSQL 时记录表也不在 `pg_dump` 里，它们是数据目录里的文件）。
 
 用 SQLite 的部署要从 `backups/sqlite/` 恢复（以缺省的 `./data` 为例，`<时间>` 换成目录名）：
 
@@ -77,10 +79,15 @@ deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i im
 ./deploy.sh stop
 sudo rm -f data/agentlab.db-wal data/agentlab.db-shm data/checkpoints.db-wal data/checkpoints.db-shm
 sudo cp -p data/backups/sqlite/<时间>/agentlab.db data/backups/sqlite/<时间>/checkpoints.db data/   # -p：属主仍是 10001
+sudo cp -rp data/backups/sqlite/<时间>/records/. data/records/           # 记录表（有的话），同样先删掉它们的 -wal、-shm
 ./deploy.sh start
 ```
 
 `-wal`、`-shm` 要先删：留着的话 SQLite 会把它们当成换回来的库的一部分。
+
+`DATA_DIR` 写成 `~/…` 时，`~` 是运行 deploy.sh 的那个人的家目录：用 `sudo ./deploy.sh` 运行时按调用 sudo 的用户
+（`SUDO_USER`）的家目录展开，不是 `/root`。`install`、`upgrade` 开头会打印展开后的绝对路径（`==> 数据目录：…`），对一眼；
+不放心就直接写绝对路径。
 
 deploy.sh 会把数据目录的属主改成容器里的用户（uid 10001），所以备份、删除要用 sudo。
 停下来备份最稳妥（以默认的 `./data` 为例，在包目录里执行）：
@@ -119,7 +126,10 @@ sudo tar -czf ../agentlab-data-$(date +%Y%m%d).tar.gz data
   不进 `docker inspect`，`agentlab.env` 里什么都不用填。AgentLab 的容器按 `PGPASSFILE` 读它。**丢了数据目录就连不上这个库**，
   所以数据目录照样要整份备份。
 - 用过一次之后这个数据目录就一直是内置 PostgreSQL（记在 `.postgres/state`），之后的 `install`、`upgrade`、`start` 不用再加
-  `--postgres`。
+  `--postgres`。状态文件里同时记着库的容器、数据卷、网络的名字和一个部署编号，deploy.sh 起的库容器、建的数据卷和网络都带着
+  `agentlab.deployment=<编号>` 的标签：之后 `agentlab.env` 里的名字和记着的对不上（比如改成了同一台机器上另一个部署的名字），
+  或者同名的容器、数据卷是别的部署的，deploy.sh 照实报错、不碰它们——清空库、删容器、换镜像重建之前都核对。早先的状态文件只记了
+  模式的，第一次遇到时按当时的名字补记。
 - `start` 先起库、等 `pg_isready` 通过再起服务；`stop` 先停服务再停库。`restart` 缺省只重启服务（库停着的话先把库起来），
   `restart --postgres` 连库一起重启（先停服务再停库，再先起库后起服务）。开机时两个容器一起被 docker 拉起来，库还没就绪时
   服务按退避重试（日志里写着「应用库还没就绪……秒后重试」），最多等 90 秒（`AGENTLAB_DB_STARTUP_TIMEOUT`），不会一上来就崩。

@@ -73,19 +73,24 @@ fi
 export AGENTLAB_PORT="$API_PORT"
 
 # ---- --postgres：本地开发用的 PostgreSQL ----
-# 这几项（AGENTLAB_DEV_PG_*）只有这个脚本用。和后端的配置一样认 .env：环境变量 > backend/.env > .env > 缺省（后端的 settings
-# 读这两个文件，后一个优先）。不 source：.env 是给后端按 KEY=VALUE 读的，不是 shell（值里的 $、空格、反引号不该被执行）
+# 这几项（AGENTLAB_DEV_PG_*，还有数据目录 AGENTLAB_DATA_DIR）和后端的配置一样认 .env：环境变量 > backend/.env > .env > 缺省
+# （后端的 settings 读这两个文件，后一个优先）。写法照后端的 dotenv：KEY=value、KEY = value、export KEY=value、引号、行尾 # 注释。
+# 不 source：.env 是给后端按 KEY=VALUE 读的，不是 shell（值里的 $、空格、反引号不该被执行）
 dotenv_value() {
-  local key="$1" file line val="" found=""
+  local key="$1" file line name val="" found=""
   for file in "$ROOT/.env" "$ROOT/backend/.env"; do
     [ -f "$file" ] || continue
     while IFS= read -r line || [ -n "$line" ]; do
       line="${line%$'\r'}"
       line="${line#"${line%%[![:space:]]*}"}"
       line="${line#export }"
-      case "$line" in
-        "$key="*) val="${line#*=}"; found=1 ;;
-      esac
+      case "$line" in *=*) ;; *) continue ;; esac
+      name="${line%%=*}"
+      name="${name%"${name##*[![:space:]]}"}"
+      [ "$name" = "$key" ] || continue
+      val="${line#*=}"
+      val="${val#"${val%%[![:space:]]*}"}"
+      found=1
     done < "$file"
   done
   [ -n "$found" ] || return 1
@@ -96,18 +101,20 @@ dotenv_value() {
   esac
   printf '%s' "$val"
 }
-dev_pg_setting() {
+dotenv_setting() {
   local value
   value="$(printenv "$1" 2>/dev/null || true)"
   [ -n "$value" ] || value="$(dotenv_value "$1" || true)"
   printf '%s' "${value:-$2}"
 }
 if [ -n "$WITH_PG" ]; then
-  PG_CONTAINER="$(dev_pg_setting AGENTLAB_DEV_PG_CONTAINER agentlab-dev-postgres)"
-  PG_PORT="$(dev_pg_setting AGENTLAB_DEV_PG_PORT 55432)"
-  PG_VOLUME="$(dev_pg_setting AGENTLAB_DEV_PG_VOLUME agentlab-dev-pgdata)"
-  PG_IMAGE="$(dev_pg_setting AGENTLAB_DEV_PG_IMAGE postgres:16)"
-  DEV_DATA="${AGENTLAB_DATA_DIR:-$ROOT/data}"
+  PG_CONTAINER="$(dotenv_setting AGENTLAB_DEV_PG_CONTAINER agentlab-dev-postgres)"
+  PG_PORT="$(dotenv_setting AGENTLAB_DEV_PG_PORT 55432)"
+  PG_VOLUME="$(dotenv_setting AGENTLAB_DEV_PG_VOLUME agentlab-dev-pgdata)"
+  PG_IMAGE="$(dotenv_setting AGENTLAB_DEV_PG_IMAGE postgres:16)"
+  # 密码文件放在后端实际用的数据目录里：和后端一样读 AGENTLAB_DATA_DIR，相对路径按后端的工作目录（backend/）算
+  DEV_DATA="$(dotenv_setting AGENTLAB_DATA_DIR "$ROOT/data")"
+  case "$DEV_DATA" in /*) ;; *) DEV_DATA="$ROOT/backend/$DEV_DATA" ;; esac
   case "$PG_PORT" in ''|*[!0-9]*) echo "AGENTLAB_DEV_PG_PORT 要是端口号：$PG_PORT"; exit 2 ;; esac
   command -v docker >/dev/null || { echo "--postgres 要用 docker，没找到它"; exit 1; }
   docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || { echo "连不上 docker 服务，先把 Docker 启动起来"; exit 1; }

@@ -215,13 +215,27 @@ read_env() {
   case "$ENABLE_MICROVM" in auto|0|1) ;; *) die "ENABLE_MICROVM 只能是 auto、0 或 1：$ENABLE_MICROVM" ;; esac
 
   # 相对路径以 deploy.sh 所在的目录为准，和从哪里运行无关
-  # 下面比较的就是字面上的 ~，不需要展开
+  # 下面比较的就是字面上的 ~，不需要展开。~ 是运行 deploy.sh 的那个人的家目录：sudo ./deploy.sh 时 $HOME 常是 /root，
+  # 按 SUDO_USER 的家目录展开（见 invoking_home）
+  INVOKER_HOME="$(invoking_home)"
+  TILDE_NOTE=""
   # shellcheck disable=SC2088
   case "$DATA_DIR" in
     /*) DATA_PATH="$DATA_DIR" ;;
-    "~"|"~/"*) DATA_PATH="$HOME${DATA_DIR#\~}" ;;
+    "~"|"~/"*)
+      DATA_PATH="$INVOKER_HOME${DATA_DIR#\~}"
+      TILDE_NOTE="（DATA_DIR=${DATA_DIR}，~ 是 ${INVOKER_HOME}）" ;;
     *) DATA_PATH="$HERE/${DATA_DIR#./}" ;;
   esac
+}
+
+# 家目录：用 sudo 运行时是调用 sudo 的那个人的（getent passwd 取），取不到退回 $HOME
+invoking_home() {
+  local home=""
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && command -v getent >/dev/null 2>&1; then
+    home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+  fi
+  printf '%s' "${home:-$HOME}"
 }
 
 # ---------------------------------------------------------------------------
@@ -307,7 +321,8 @@ prepare_data() {
     /|/bin|/boot|/dev|/etc|/home|/lib|/opt|/proc|/root|/sbin|/srv|/sys|/usr|/var)
       die "DATA_DIR 不能是系统目录：$DATA_ABS" ;;
   esac
-  [ "$DATA_ABS" != "$HOME" ] || die "DATA_DIR 不能是家目录本身：$DATA_ABS"
+  [ "$DATA_ABS" != "$HOME" ] && [ "$DATA_ABS" != "${INVOKER_HOME:-$HOME}" ] || die "DATA_DIR 不能是家目录本身：$DATA_ABS"
+  say "数据目录：${DATA_ABS}${TILDE_NOTE:-}"
 }
 
 # 已经有同名容器时：它得是 AgentLab 的，数据目录也得和配置的是同一个。
@@ -597,6 +612,83 @@ stored_mode() {
 
 volume_exists() { docker volume inspect "$1" >/dev/null 2>&1; }
 
+# ---------------------------------------------------------------------------
+# 哪些是这个部署的内置库：状态文件第一次记 migrating / builtin 时一并记下容器、数据卷、网络的名字和一个部署编号（id）；
+# deploy.sh 起的库容器、建的数据卷和网络都打上 agentlab.deployment=<id>。之后 agentlab.env 里的名字和记着的对不上就拒绝
+# （换了名字会去动同一台机器上另一个部署的库），容器、数据卷的部署编号对不上也拒绝，都对上了才清空库、删容器
+# ---------------------------------------------------------------------------
+DEPLOY_ID=""
+
+# 状态文件里的一项（id、container、volume、network）；读不到（权限）交给容器里的 app.ops
+state_value() {
+  local key="$1" file="$DATA_ABS/$PG_STATE_REL"
+  if [ -r "$file" ]; then
+    sed -n "s/^$key=//p" "$file" | head -n 1
+  elif [ -e "$file" ] || [ ! -x "$DATA_ABS" ] || { [ -e "$DATA_ABS/.postgres" ] && [ ! -x "$DATA_ABS/.postgres" ]; }; then
+    ops state --get "$key" | tail -n 1
+  fi
+}
+
+# 记下（或补记）名字；$1 给了就同时改模式。第一次写时 app.ops 生成部署编号
+record_pg_state() {
+  local args=(state --container "$POSTGRES_CONTAINER" --volume "$POSTGRES_VOLUME" --network "$DOCKER_NETWORK")
+  [ -z "${1:-}" ] || args+=(--set "$1")
+  ops "${args[@]}" >/dev/null || return 1
+  DEPLOY_ID="$(state_value id)"
+  [ -n "$DEPLOY_ID" ]
+}
+
+# 数据目录记着的名字和 agentlab.env 现在的一致才往下走。老的状态文件（只记了模式）第一次遇到时按现在的名字补记、照实打一行
+check_pg_names() {
+  local key want got env_key missing=""
+  for key in container volume network; do
+    case "$key" in
+      container) want="$POSTGRES_CONTAINER"; env_key=POSTGRES_CONTAINER ;;
+      volume) want="$POSTGRES_VOLUME"; env_key=POSTGRES_VOLUME ;;
+      network) want="$DOCKER_NETWORK"; env_key=DOCKER_NETWORK ;;
+    esac
+    got="$(state_value "$key")"
+    if [ -z "$got" ]; then
+      missing=1
+    elif [ "$got" != "$want" ]; then
+      die "数据目录 $DATA_ABS 记着它的内置 PostgreSQL 用的是 ${got}（${env_key}），agentlab.env 现在是 ${want}。
+名字一换就会去动同一台机器上别的部署的库（或者找不到这个部署自己的），没有往下做。
+  - 把 agentlab.env 里的 $env_key 改回 ${got}（没写这一项的，看 CONTAINER_NAME 是不是改过：缺省名字跟着它走）；
+  - 确实要换名字：先 ./deploy.sh stop，docker rename / 新建好之后，把 $DATA_ABS/$PG_STATE_REL 里的 ${key}= 那一行改成新名字（要 sudo）"
+    fi
+  done
+  if [ -n "$missing" ] || [ -z "$(state_value id)" ]; then
+    say "数据目录的状态文件是早先记的（没记名字），按 agentlab.env 现在的名字补记：容器 ${POSTGRES_CONTAINER}、数据卷 ${POSTGRES_VOLUME}、网络 ${DOCKER_NETWORK}"
+    record_pg_state || die "没能补记数据目录的状态文件（$DATA_ABS/${PG_STATE_REL}）"
+  fi
+  DEPLOY_ID="$(state_value id)"
+}
+
+volume_label() { docker volume inspect -f "{{index .Labels \"$2\"}}" "$1" 2>/dev/null || true; }
+
+# 数据卷的部署编号：$1=strict 时没有编号的（早先建的）也不认——清空库之前用
+check_volume_is_ours() {
+  volume_exists "$POSTGRES_VOLUME" || return 0
+  local dep
+  dep="$(volume_label "$POSTGRES_VOLUME" agentlab.deployment)"
+  if [ -n "$dep" ] && [ "$dep" != "$DEPLOY_ID" ]; then
+    die "docker 数据卷 $POSTGRES_VOLUME 是另一个部署的内置 PostgreSQL 的（部署编号 ${dep}，这个数据目录是 ${DEPLOY_ID}），没有碰它。
+agentlab.env 里的 POSTGRES_VOLUME 写成这个部署自己的（看 $DATA_ABS/$PG_STATE_REL 里的 volume=）"
+  fi
+  if [ -z "$dep" ] && [ "${1:-}" = strict ]; then
+    die "docker 数据卷 $POSTGRES_VOLUME 没有部署编号的标签，认不出是不是这个数据目录的，切换要清空它，没有动。
+确定是这个数据目录上次没切成留下的：docker volume rm ${POSTGRES_VOLUME}，再运行 ./deploy.sh migrate-to-postgres"
+  fi
+}
+
+ensure_volume() {
+  if volume_exists "$POSTGRES_VOLUME"; then
+    check_volume_is_ours
+    return 0
+  fi
+  docker volume create --label agentlab.role=pgdata --label "agentlab.deployment=$DEPLOY_ID" "$POSTGRES_VOLUME" >/dev/null
+}
+
 resolve_mode() {
   local stored
   stored="$(stored_mode)"
@@ -689,7 +781,19 @@ ensure_pg_image() {
 ensure_network() {
   docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 && return 0
   say "创建 docker 网络 ${DOCKER_NETWORK}（PostgreSQL 只在这个网络里可见，端口不对外）"
-  docker network create "$DOCKER_NETWORK" >/dev/null
+  docker network create --label agentlab.role=network --label "agentlab.deployment=$DEPLOY_ID" "$DOCKER_NETWORK" >/dev/null
+}
+
+# 网络是不是这个部署建的：标签和部署编号对得上；早先建的没有标签，按数据目录里记着的网络名认
+network_is_ours() {
+  local role dep
+  role="$(docker network inspect -f '{{index .Labels "agentlab.role"}}' "$DOCKER_NETWORK" 2>/dev/null || true)"
+  dep="$(docker network inspect -f '{{index .Labels "agentlab.deployment"}}' "$DOCKER_NETWORK" 2>/dev/null || true)"
+  if [ -n "$role$dep" ]; then
+    [ "$role" = network ] && [ -n "$DEPLOY_ID" ] && [ "$dep" = "$DEPLOY_ID" ]
+  else
+    [ -n "$DATA_ABS" ] && [ "$(state_value network)" = "$DOCKER_NETWORK" ]
+  fi
 }
 
 pg_secrets() {
@@ -698,17 +802,43 @@ pg_secrets() {
     || die "没能在数据目录里生成 PostgreSQL 的密码文件（$DATA_ABS/.postgres/）"
 }
 
-check_pg_is_ours() {
-  local role
+# 叫 POSTGRES_CONTAINER 的容器是不是这个部署的内置库：deploy.sh 起的（agentlab.role=postgres）、部署编号对得上（早先起的
+# 没有编号标签时，看它挂的密码文件是不是这个数据目录的）、挂的数据卷就是 POSTGRES_VOLUME。不是的话 PG_NOT_OURS 里是原因
+PG_NOT_OURS=""
+
+pg_is_ours() {
+  local role dep pw vol
   role="$(docker inspect -f '{{index .Config.Labels "agentlab.role"}}' "$POSTGRES_CONTAINER" 2>/dev/null || true)"
-  [ "$role" = postgres ] || die "已经有一个叫 $POSTGRES_CONTAINER 的容器，但它不是 deploy.sh 起的内置 PostgreSQL。
-改一下 agentlab.env 里的 POSTGRES_CONTAINER（缺省是 <CONTAINER_NAME>-postgres）"
+  dep="$(docker inspect -f '{{index .Config.Labels "agentlab.deployment"}}' "$POSTGRES_CONTAINER" 2>/dev/null || true)"
+  pw="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/run/agentlab/password"}}{{.Source}}{{end}}{{end}}' \
+    "$POSTGRES_CONTAINER" 2>/dev/null || true)"
+  vol="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' \
+    "$POSTGRES_CONTAINER" 2>/dev/null || true)"
+  if [ "$role" != postgres ]; then
+    PG_NOT_OURS="它不是 deploy.sh 起的内置 PostgreSQL"
+  elif [ -n "$dep" ] && [ "$dep" != "$DEPLOY_ID" ]; then
+    PG_NOT_OURS="它是另一个部署的内置 PostgreSQL（部署编号 ${dep}，这个数据目录是 ${DEPLOY_ID:-还没有}）"
+  elif [ -z "$dep" ] && [ "$pw" != "$DATA_ABS/.postgres/password" ]; then
+    PG_NOT_OURS="它挂的密码文件是 ${pw:-（没有）}，不是这个数据目录（${DATA_ABS}）的，是另一个部署的内置 PostgreSQL"
+  elif [ "$vol" != "$POSTGRES_VOLUME" ]; then
+    PG_NOT_OURS="它挂的数据卷是 ${vol:-（没有）}，不是 agentlab.env 里的 $POSTGRES_VOLUME"
+  else
+    PG_NOT_OURS=""
+    return 0
+  fi
+  return 1
+}
+
+check_pg_is_ours() {
+  pg_is_ours || die "已经有一个叫 $POSTGRES_CONTAINER 的容器，但${PG_NOT_OURS}，没有碰它。
+改一下 agentlab.env 里的 POSTGRES_CONTAINER（缺省是 <CONTAINER_NAME>-postgres），或者看 $DATA_ABS/$PG_STATE_REL 里记着的名字"
 }
 
 run_pg_container() {
   docker run -d \
     --name "$POSTGRES_CONTAINER" \
     --label agentlab.role=postgres \
+    --label "agentlab.deployment=$DEPLOY_ID" \
     --restart unless-stopped \
     --network "$DOCKER_NETWORK" \
     -e "POSTGRES_USER=$PG_USER" \
@@ -757,7 +887,9 @@ replace_pg_image() {
 
 # 起内置库（没有就建，停着就起），等 pg_isready 通过
 start_pg() {
+  [ -n "$DEPLOY_ID" ] || die "内部错误：还不知道这个数据目录的部署编号（状态文件 $DATA_ABS/${PG_STATE_REL}）"
   ensure_network
+  ensure_volume
   if container_exists "$POSTGRES_CONTAINER"; then
     check_pg_is_ours
     local cur
@@ -768,6 +900,8 @@ start_pg() {
     fi
     if [ "$(container_state "$POSTGRES_CONTAINER")" != running ]; then
       say "启动内置 PostgreSQL（${POSTGRES_CONTAINER}）"
+      # 回退时关掉过重启策略（stop_pg --no-restart），起的时候恢复
+      docker update --restart unless-stopped "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
       docker start "$POSTGRES_CONTAINER" >/dev/null || die "内置 PostgreSQL 的容器起不来，见上面 docker 的报错"
     fi
   else
@@ -780,9 +914,15 @@ start_pg() {
   fi
 }
 
+# 在跑的、在反复重启的（镜像起不来、--restart unless-stopped 一遍遍拉）都停。--no-restart：再关掉重启策略（回退时用：
+# 一个起不来的库容器不该在后台一直重启），下次 start_pg 起它时恢复
 stop_pg() {
   container_exists "$POSTGRES_CONTAINER" || return 0
-  [ "$(container_state "$POSTGRES_CONTAINER")" = running ] || return 0
+  [ "${1:-}" != --no-restart ] || docker update --restart=no "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+  case "$(container_state "$POSTGRES_CONTAINER")" in
+    running|restarting) ;;
+    *) return 0 ;;
+  esac
   say "停止内置 PostgreSQL（${POSTGRES_CONTAINER}，数据保留）"
   docker stop "$POSTGRES_CONTAINER" >/dev/null
 }
@@ -854,9 +994,10 @@ cmd_install() {
   - 确定不要了：docker volume rm ${POSTGRES_VOLUME}（不可恢复），再运行；
   - 两份都留着：agentlab.env 里另起一个 POSTGRES_VOLUME 的名字"
       pg_secrets
-      # 先记下再起库：新数据目录里没有 SQLite 的库，没什么可「切」的；起库失败了重来也认得出数据卷是自己的
-      ops state --set builtin >/dev/null || die "没能在数据目录里记下「用内置 PostgreSQL」"
+      # 先记下再起库：新数据目录里没有 SQLite 的库，没什么可「切」的；起库失败了重来也认得出数据卷是自己的。连同名字、部署编号
+      record_pg_state builtin || die "没能在数据目录里记下「用内置 PostgreSQL」"
     else
+      check_pg_names
       pg_secrets
     fi
     start_pg
@@ -886,6 +1027,7 @@ cmd_upgrade() {
   say "应用库：$(mode_label)"
   PG_APPLY_IMAGE=1
   if [ "$MODE" = builtin ]; then
+    check_pg_names
     ensure_pg_image
     pg_secrets
     start_pg
@@ -933,7 +1075,7 @@ migrate_rollback() {
       docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
     fi
   fi
-  stop_pg
+  stop_pg --no-restart
   die "没有切换，仍用 SQLite（数据目录里的 agentlab.db 没动过）。照上面的报错处理好之后重新运行 ./deploy.sh migrate-to-postgres，
 重复执行是安全的：内置库里这次导了一半的会先清空再导"
 }
@@ -973,6 +1115,11 @@ cmd_migrate_to_postgres() {
   - 确定不要了：docker volume rm ${POSTGRES_VOLUME}（不可恢复），再运行；
   - 要留着：agentlab.env 里另起一个 POSTGRES_VOLUME 的名字"
   fi
+  if [ "$state" = migrating ]; then
+    # 上次没切成：名字要和那次记下的一样，数据卷、库容器要是这个部署的——下面要清空那个库
+    check_pg_names
+    check_volume_is_ours strict
+  fi
   if container_exists "$POSTGRES_CONTAINER"; then check_pg_is_ours; fi
   fix_data_owner
   ensure_pg_image
@@ -986,9 +1133,11 @@ cmd_migrate_to_postgres() {
   backup_sqlite || migrate_rollback "SQLite 库备份失败"
   say "3/6 起内置 PostgreSQL"
   ( pg_secrets ) || migrate_rollback "没能生成内置 PostgreSQL 的密码"
-  ops state --set migrating >/dev/null || migrate_rollback "没能在数据目录里记下「开始切换」"
+  record_pg_state migrating || migrate_rollback "没能在数据目录里记下「开始切换」"
   ( start_pg ) || migrate_rollback "内置 PostgreSQL 没起来"
-  # 内置库里要是有东西，只能是上次没切成留下的半份（上面查过数据卷），清空重来
+  # 内置库里要是有东西，只能是上次没切成留下的半份（上面查过名字和数据卷），清空重来。清空之前再核对一遍：库容器、数据卷都是
+  # 这个部署的（start_pg 刚起的也一样）
+  ( check_pg_is_ours && check_volume_is_ours strict ) || migrate_rollback "库的容器或数据卷认不出是这个部署的，没有清空"
   docker exec "$POSTGRES_CONTAINER" psql -q -U "$PG_USER" -d postgres -v ON_ERROR_STOP=1 \
     -c "DROP DATABASE IF EXISTS \"$PG_DB\" WITH (FORCE)" -c "CREATE DATABASE \"$PG_DB\" OWNER \"$PG_USER\"" >/dev/null \
     || migrate_rollback "没能清空内置库里上次留下的数据"
@@ -1021,6 +1170,10 @@ locate_data() {
     MODE="builtin"
   elif [ -n "$EXTERNAL_DB" ]; then
     MODE="external"
+  fi
+  # 内置库用着、或者切到一半：起停、卸载都要动库的容器，先核对名字（顺带拿到部署编号）
+  if [ -n "$DATA_ABS" ]; then
+    case "$(stored_state)" in builtin|migrating) check_pg_names ;; esac
   fi
 }
 
@@ -1125,8 +1278,10 @@ cmd_uninstall() {
   local src="" name pg=""
   if container_exists "$CONTAINER_NAME"; then
     check_is_agentlab
-    src="$(data_source_of "$CONTAINER_NAME")"
   fi
+  # 数据目录（容器实际挂的，没有容器看配置）里记着内置库的名字和部署编号：对不上的不删
+  locate_data
+  src="$DATA_ABS"
   for name in "$CONTAINER_NAME" "$CONTAINER_NAME-previous"; do
     if container_exists "$name"; then
       say "删除容器 $name"
@@ -1134,14 +1289,21 @@ cmd_uninstall() {
     fi
   done
   if container_exists "$POSTGRES_CONTAINER"; then
-    check_pg_is_ours
-    say "删除内置 PostgreSQL 的容器 ${POSTGRES_CONTAINER}（数据卷 $POSTGRES_VOLUME 留着）"
-    docker rm -f "$POSTGRES_CONTAINER" >/dev/null
-    pg=1
+    if pg_is_ours; then
+      say "删除内置 PostgreSQL 的容器 ${POSTGRES_CONTAINER}（数据卷 $POSTGRES_VOLUME 留着）"
+      docker rm -f "$POSTGRES_CONTAINER" >/dev/null
+      pg=1
+    else
+      warn "有一个叫 $POSTGRES_CONTAINER 的容器，但${PG_NOT_OURS}：没有删它"
+    fi
   fi
   if docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
-    docker network rm "$DOCKER_NETWORK" >/dev/null 2>&1 && say "删除 docker 网络 $DOCKER_NETWORK" \
-      || warn "docker 网络 $DOCKER_NETWORK 没删掉（可能还有别的容器连着）"
+    if network_is_ours; then
+      docker network rm "$DOCKER_NETWORK" >/dev/null 2>&1 && say "删除 docker 网络 $DOCKER_NETWORK" \
+        || warn "docker 网络 $DOCKER_NETWORK 没删掉（可能还有别的容器连着）"
+    else
+      echo "docker 网络 $DOCKER_NETWORK 不是这个部署建的（没有这个部署的标签，数据目录里也没记着它），没有删"
+    fi
   fi
   if [ -n "$PURGE_IMAGE" ]; then
     if image_present; then
