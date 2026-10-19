@@ -206,6 +206,8 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
         elif etype == EventType.TOOL_END and tool and tool in failed_at:
             recovered.add(tool)
 
+    #: 报过的节点失败 (节点 id, 原话)：子工作流节点跟着子图里那一步失败时认得出是同一件事
+    failures: list[tuple[str, str]] = []
     for e in rows:
         etype = str(_event_field(e, "type", ""))
         data = _event_field(e, "data") or {}
@@ -224,11 +226,18 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             # 失败」；也不进 RETRYABLE——重跑只会把同一件事再问一遍人。答案没走完是缺口，记 DEGRADED（没有成果时
             # empty_output 另按 BROKEN 说）
             err = str(data.get("error") or "").strip()[:200]
-            add("node_rejected", f"节点「{titles.get(node_id) or node_id}」被驳回：{err}", DEGRADED)
+            if any(inner.startswith(f"{node_id}/") and said == err for inner, said in failures):
+                continue    # 子工作流里那一步被驳回、子工作流节点跟着收尾：同一件事，只报那一步（同下面的执行失败）
+            failures.append((str(node_id), err))
+            add("node_rejected", f"节点「{_step_name(str(node_id), titles)}」被驳回：{err}", DEGRADED)
 
         elif etype == EventType.NODE_FAILED:
             err = str(data.get("error") or "").strip()[:200]
-            add("node_failed", f"节点「{titles.get(node_id) or node_id}」执行失败：{err}", BROKEN)
+            if any(inner.startswith(f"{node_id}/") and said == err for inner, said in failures):
+                # 子工作流里那一步失败了，子工作流节点（「sub」）跟着失败、原话相同：同一件事，只报更具体的那一步（上面已报）
+                continue
+            failures.append((str(node_id), err))
+            add("node_failed", f"节点「{_step_name(str(node_id), titles)}」执行失败：{err}", BROKEN)
 
         elif etype == EventType.RUN_FAILED:
             err = str(data.get("error") or "").strip()[:200]
@@ -262,6 +271,15 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
         add("markup_output", "交付的是一段未执行的工具调用标记，而不是对问题的回答", BROKEN)
 
     return signals
+
+
+def _step_name(node_id: str, titles: Mapping[str, str]) -> str:
+    """失败的那一步给人看的名字。子工作流里的（「子工作流节点 id/…」）一层层接上 node.started 记的名字：「复核子流程 › 算一下」，
+    不写内部 id；没记名字的那一层照写 id 的那一段。"""
+    if "/" not in node_id:
+        return titles.get(node_id) or node_id
+    parts = node_id.split("/")
+    return " › ".join(titles.get("/".join(parts[:i + 1])) or parts[i] for i in range(len(parts)))
 
 
 def worst(signals: Iterable[Signal]) -> str:
