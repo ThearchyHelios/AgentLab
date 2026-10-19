@@ -19,10 +19,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base, UTCDateTime, new_id, utcnow
+from app.db.base import Base, PortableJSON, UTCDateTime, new_id, utcnow
 
 
 class SourceObject(Base):
@@ -92,7 +92,8 @@ class IntrospectJob(Base):
     __table_args__ = (
         Index("ix_introspect_jobs_source_created", "source_id", "created_at"),
         Index("ux_introspect_jobs_active", "source_id", unique=True,
-              sqlite_where=text("status IN ('queued', 'running')")),
+              sqlite_where=text("status IN ('queued', 'running')"),
+              postgresql_where=text("status IN ('queued', 'running')")),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
@@ -219,8 +220,8 @@ class SourceChange(Base):
     seen_count: Mapped[int] = mapped_column(Integer, default=1)
     detected_by: Mapped[dict[str, Any]] = mapped_column(default=dict)
     basis: Mapped[dict[str, Any] | None] = mapped_column(default=None)
-    before: Mapped[Any] = mapped_column(JSON, nullable=True, default=None)
-    after: Mapped[Any] = mapped_column(JSON, nullable=True, default=None)
+    before: Mapped[Any] = mapped_column(PortableJSON, nullable=True, default=None)
+    after: Mapped[Any] = mapped_column(PortableJSON, nullable=True, default=None)
     affects: Mapped[dict[str, Any] | None] = mapped_column(default=None)
     struct_version_before: Mapped[int | None] = mapped_column(Integer, default=None)
     struct_version_after: Mapped[int | None] = mapped_column(Integer, default=None)

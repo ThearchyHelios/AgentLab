@@ -66,11 +66,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, not_, select
 
 from app.core.events import EventType
 from app.db.base import SessionLocal, utcnow
 from app.db.models import Run, RunEvent, Workflow
+from app.db.portable import json_eq, json_flag, json_text
 from app.ledger import uses as ledger_uses
 
 logger = logging.getLogger(__name__)
@@ -225,10 +226,9 @@ def source_cards(graph: Any) -> list[str]:
 async def recall_runs(session: Any, workflow_id: str, new_version: int | None = None) -> list[Run]:
     """以 W（新版本 N）发起过的召回运行（试算的不算），新的在前。origin_kind 有索引，先按它筛再看 origin。"""
     stmt = select(Run).where(Run.origin_kind == ORIGIN,
-                             func.json_extract(Run.origin, "$.workflow_id") == workflow_id,
-                             func.coalesce(func.json_extract(Run.origin, "$.probe"), 0) == 0)
+                             json_eq(Run.origin, "workflow_id", workflow_id), not_(json_flag(Run.origin, "probe")))
     if new_version is not None:
-        stmt = stmt.where(func.json_extract(Run.origin, "$.to_version") == int(new_version))
+        stmt = stmt.where(json_eq(Run.origin, "to_version", int(new_version)))
     return list((await session.execute(stmt.order_by(Run.created_at.desc()))).scalars())
 
 
@@ -567,9 +567,8 @@ async def version_recall_counts(session: Any, workflow_id: str, version: int) ->
         state, _ = await outcome_of(session, run)
         changed += state == "changed"
     as_old = int(await session.scalar(select(func.count()).select_from(Run).where(
-        Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.workflow_id") == workflow_id,
-        func.json_extract(Run.origin, "$.from_version") == int(version),
-        func.coalesce(func.json_extract(Run.origin, "$.probe"), 0) == 0)) or 0)
+        Run.origin_kind == ORIGIN, json_eq(Run.origin, "workflow_id", workflow_id),
+        json_eq(Run.origin, "from_version", int(version)), not_(json_flag(Run.origin, "probe")))) or 0)
     return {"groups": len(as_new), "changed": changed, "recalled_from": as_old}
 
 
@@ -986,7 +985,7 @@ async def answer_marks(session: Any, run_id: str, principal: Any) -> dict[str, A
         select(Task, Run.origin).join(Run, Run.id == Task.run_id)
         .where(Task.kind == TASK_KIND, Task.status == "pending",
                (Task.run_id == run_id) | ((Run.origin_kind == ORIGIN)
-                                          & (func.instr(func.json_extract(Run.origin, "$.uses"), run_id) > 0)))
+                                          & json_text(Run.origin, "uses").contains(run_id, autoescape=True)))
         .order_by(Task.created_at, Task.id))).all()
     mine = await _assignments(session, [t.id for t, _ in candidates])
     tasks: list[dict[str, Any]] = []
@@ -1134,8 +1133,8 @@ async def _explore_snapshots(session: Any, source: Any, tables: Iterable[str], *
     stmt = (select(Artifact.id, Artifact.meta, Run.id, Run.finished_at).join(Run, Run.id == Artifact.run_id)
             .where(Artifact.kind == QUERY_SNAPSHOT_KIND, Run.run_class == "exploratory", Run.status == "succeeded",
                    Run.manifest_hash.is_not(None), counted_runs(),
-                   or_(func.json_extract(Artifact.meta, "$.source_id") == source.id,
-                       func.json_extract(Artifact.meta, "$.source") == source.name))
+                   or_(json_eq(Artifact.meta, "source_id", source.id),
+                       json_eq(Artifact.meta, "source", source.name)))
             .order_by(Run.finished_at.desc(), Run.id, Artifact.id))
     cut = _aware(before)
     offset = 0
@@ -1473,10 +1472,10 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
             continue
         async with SessionLocal() as session:
             done = await session.scalar(select(func.count()).select_from(Run).where(
-                Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.probe") == 1,
-                func.json_extract(Run.origin, "$.workflow_id") == caliber.workflow_id,
-                func.json_extract(Run.origin, "$.version") == caliber.version,
-                func.json_extract(Run.origin, "$.change") == change.get("id")))
+                Run.origin_kind == ORIGIN, json_flag(Run.origin, "probe"),
+                json_eq(Run.origin, "workflow_id", caliber.workflow_id),
+                json_eq(Run.origin, "version", caliber.version),
+                json_eq(Run.origin, "change", change.get("id"))))
             if done:
                 continue
             latest = (await session.execute(select(Run.input).where(

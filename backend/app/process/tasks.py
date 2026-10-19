@@ -35,6 +35,7 @@ from app.db.base import SessionLocal, utcnow
 from app.db.models import (
     App, Approval, AppVersion, AuditEvent, Group, GroupMember, Run, Task, TaskAssignment, User,
 )
+from app.db.portable import json_text
 from app.engine.lint_process import normalize_policy, parse_duration
 from app.process.events import record
 
@@ -913,7 +914,7 @@ async def tick(now: datetime | None = None) -> list[str]:
     """调度循环每一拍：提醒、升级、超时驳回（永不自动批准）。交回这一拍处理过的待办 id（生效可查：办了哪几条，
     不只是几条；测试按自己造的那条断言，不受同一个库里别的待办影响）。试运行的待办不处理（只显示时限）。"""
     now = now or utcnow()
-    action = func.json_extract(Task.on_timeout, "$.action")
+    action = json_text(Task.on_timeout, "action")
     trial = select(Run.id).where(Run.origin_kind == TRIAL_ORIGIN)
     async with SessionLocal() as session:
         due = list((await session.execute(select(Task.id).where(

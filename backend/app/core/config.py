@@ -47,6 +47,17 @@ class Settings(BaseSettings):
 
     # --- 存储 ---
     data_dir: Path = PROJECT_DIR / "data"
+    # 应用自己的库（工作流、运行、事件、审批……）。不设：数据目录里的 SQLite（agentlab.db，断点在 checkpoints.db），
+    # 单机单进程。设成 postgresql+asyncpg://用户:密码@主机:端口/库名（postgresql:// 也认）时整个应用库用 PostgreSQL，
+    # LangGraph 的断点也放进同一个库；checkpoint_url 另给就放那里。数据目录照旧要有：工件、上传表格、沙箱等仍是文件
+    database_url: str = ""
+    checkpoint_url: str = ""
+    # PostgreSQL 的连接池（SQLite 不用这几项）。pool_size=0 表示不用连接池、每次新建连接（前面有 PgBouncer 时用，
+    # 测试里也这么用：每个测试一个事件循环，asyncpg 的连接不能跨循环）
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout: int = 30
+    db_pool_recycle: int = 1800
 
     # --- 前端构建产物（生产部署用）---
     # 设了就由服务端一并托管页面（见 app/web.py），页面和接口同源、只起一个进程。
@@ -195,6 +206,23 @@ class Settings(BaseSettings):
             return True
         return value
 
+    @field_validator("database_url", "checkpoint_url", mode="before")
+    @classmethod
+    def _valid_postgres_url(cls, value: object, info: Any) -> object:
+        # 写错了启动时就报出来，别等到第一次查库。只认 PostgreSQL：SQLite 就是不设
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return ""
+        if not isinstance(value, str):
+            return value
+        from app.db.urls import normalize_database_url, normalize_checkpoint_url
+
+        name = f"AGENTLAB_{(info.field_name or '').upper()}"
+        normalize = normalize_database_url if info.field_name == "database_url" else normalize_checkpoint_url
+        try:
+            return normalize(value.strip())
+        except ValueError as e:
+            raise ValueError(f"{name}：{e}") from None
+
     @field_validator("web_dist", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object) -> object:
@@ -223,12 +251,29 @@ class Settings(BaseSettings):
 
     @property
     def db_url(self) -> str:
-        return f"sqlite+aiosqlite:///{self.db_path}"
+        """应用库的 SQLAlchemy 地址：设了 database_url 用它（已规范成 postgresql+asyncpg://），否则数据目录里的 SQLite。"""
+        return self.database_url or f"sqlite+aiosqlite:///{self.db_path}"
+
+    @property
+    def db_dialect(self) -> str:
+        """"sqlite" 或 "postgresql"。"""
+        return "postgresql" if self.database_url else "sqlite"
 
     @property
     def checkpoint_path(self) -> Path:
-        """LangGraph checkpointer 用独立的库文件，避免和业务表抢写锁。"""
+        """LangGraph checkpointer 用独立的库文件，避免和业务表抢写锁。只在 SQLite 时用。"""
         return self.data_dir / "checkpoints.db"
+
+    @property
+    def checkpoint_conninfo(self) -> str | None:
+        """PostgreSQL 断点库的 libpq 连接串（psycopg 用）：checkpoint_url 优先，否则由 database_url 换算。SQLite 时 None。"""
+        if self.checkpoint_url:
+            return self.checkpoint_url
+        if self.database_url:
+            from app.db.urls import libpq_conninfo
+
+            return libpq_conninfo(self.database_url)
+        return None
 
     @property
     def workspace_dir(self) -> Path:

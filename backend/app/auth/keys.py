@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from starlette.requests import HTTPConnection
 
 from app.api.coded import CodedHTTPException
@@ -535,12 +535,13 @@ async def started_before(principal: Any, idem_key: str) -> str | None:
     """拥有者按这个幂等键用密钥发起过的实例（来源里记着 idempotency_key）：处理到一半服务停了、同一个键重新认领时交回它。"""
     from app.db.base import SessionLocal
     from app.db.models import Run
+    from app.db.portable import json_eq
 
     async with SessionLocal() as session:
         return await session.scalar(select(Run.id).where(
             Run.origin_kind == "app_entry", Run.started_by == principal.username,
-            func.json_extract(Run.origin, "$.idempotency_key") == idem_key,
-            func.json_extract(Run.origin, "$.via") == "key").order_by(Run.created_at.desc()).limit(1))
+            json_eq(Run.origin, "idempotency_key", idem_key),
+            json_eq(Run.origin, "via", "key")).order_by(Run.created_at.desc()).limit(1))
 
 
 # ---------------------------------------------------------------- 请求记录（A6）

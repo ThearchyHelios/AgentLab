@@ -37,6 +37,7 @@ from app.data import schema_diff as sd
 from app.data.names import name_key
 from app.db.base import utcnow
 from app.db.models_sources import SourceChange
+from app.db.portable import json_eq
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +338,7 @@ async def notify_after_job(source_id: str, job_id: str) -> int:
             n = int((await session.execute(select(func.count()).select_from(SourceChange).where(
                 SourceChange.source_id == source_id, SourceChange.severity == "action",
                 SourceChange.status == "open",
-                func.json_extract(SourceChange.detected_by, "$.job_id") == job_id))).scalar() or 0)
+                json_eq(SourceChange.detected_by, "job_id", job_id)))).scalar() or 0)
         if n:
             from app.notify import service
 

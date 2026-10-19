@@ -540,10 +540,13 @@ _DB_SIDE_FILES = ("", "-wal", "-shm", "-journal")
 
 
 def _app_db_files() -> list[Path]:
-    """应用自己的库：元数据库、运行检查点库，以及实际连着的元数据库（测试里和 data_dir 下的不是同一个）。"""
+    """应用自己的库：元数据库、运行检查点库，以及实际连着的元数据库（测试里和 data_dir 下的不是同一个）。
+
+    应用库是 PostgreSQL 时，数据目录里的 agentlab.db、checkpoints.db 照样算：导入 PostgreSQL 之前的那份还留在那里，
+    里面是同一批元数据。连着的库这时是库名不是文件，不算进来。"""
     dbs = [settings.db_path, settings.checkpoint_path]
     try:
-        live = db_base.engine.url.database
+        live = db_base.engine.url.database if db_base.engine.dialect.name == "sqlite" else None
     except Exception:  # noqa: BLE001 - 取不到就只按配置里的路径判断
         live = None
     if live and live != ":memory:":

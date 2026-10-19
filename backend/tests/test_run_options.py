@@ -112,9 +112,11 @@ def test_a_missing_table_is_left_alone():
 
 
 async def test_new_databases_index_schedule_id():
+    from sqlalchemy import inspect
+
     async with app_engine.connect() as conn:
-        names = {row[1] for row in (await conn.execute(text("PRAGMA index_list(runs)"))).all()}
-    assert "ix_runs_schedule_id" in names
+        indexes = await conn.run_sync(lambda sync: inspect(sync).get_indexes("runs"))
+    assert {ix["name"]: ix["column_names"] for ix in indexes}.get("ix_runs_schedule_id") == ["schedule_id"]
 
 
 async def test_a_migrated_row_reads_back_empty_options():

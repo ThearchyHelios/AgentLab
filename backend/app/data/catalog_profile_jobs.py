@@ -48,7 +48,7 @@ import logging
 import time
 from typing import Any
 
-from sqlalchemy import case, delete, func, or_, select, update
+from sqlalchemy import case, delete, func, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,6 +60,7 @@ from app.data.catalog_profile import (
 )
 from app.data.engine import SnapshotTampered
 from app.db.base import SessionLocal, new_id, utcnow
+from app.db.portable import json_flag
 from app.db.models import CatalogDraftJob, CatalogProfileJob, CatalogProfileTask, DataSource
 
 logger = logging.getLogger(__name__)
@@ -345,7 +346,7 @@ _SHOWN = (case((CatalogProfileTask.started_at.is_(None), 1), else_=0), *_NEWEST)
 #: 只做了取值观察的那一项（observe 范围、maintenance 范围里只到期观察的表）在逐表一行的 summary 里带这个标记：它不是一次
 #: 剖析，不算「上次剖析」——不然表清单的「上次剖析」、给助手的剖析事实（行数、日期范围）会被一次只记了行数的观察顶掉
 OBSERVE_ONLY = "observe_only"
-_PROFILED = func.coalesce(func.json_extract(CatalogProfileTask.summary, f"$.{OBSERVE_ONLY}"), 0) == 0
+_PROFILED = not_(json_flag(CatalogProfileTask.summary, OBSERVE_ONLY))
 
 
 def _observe_only(checks: list[Any] | None) -> bool:

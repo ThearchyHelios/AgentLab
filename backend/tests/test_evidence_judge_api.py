@@ -446,7 +446,7 @@ async def test_a_continue_that_wins_the_row_between_check_and_write_gets_no_even
     """核对过状态、还没写入的那一下，接着跑的条件更新（runner._claim）先提交了：追加判定的条件更新落空，
     照样不记——核对和写入是同一行上的条件更新，不是先读后写。"""
     from app.core.bus import bus
-    from app.core.config import settings
+    from tests import appdb
 
     Models(monkeypatch, verdicts={"新客": "contradicted"})
     row = await finish(weekly(claims="judge"))
@@ -456,12 +456,7 @@ async def test_a_continue_that_wins_the_row_between_check_and_write_gets_no_even
     def claimed_in_between(run_id, value):
         # _append_judged 读完运行、分配序号之前正好调用它：在这里用另一条连接把运行占成 running
         if run_id == row.id:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                db.execute("UPDATE runs SET status = 'running' WHERE id = ?", (row.id,))
-                db.commit()
-            finally:
-                db.close()
+            appdb.execute(("UPDATE runs SET status = 'running' WHERE id = ?", (row.id,)))
         set_seq(run_id, value)
 
     monkeypatch.setattr(bus, "set_seq", claimed_in_between)

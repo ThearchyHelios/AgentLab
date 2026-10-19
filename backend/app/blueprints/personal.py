@@ -416,9 +416,10 @@ async def refresh(session: AsyncSession, app: Any, *, principal: Any) -> tuple[A
 
 def _runs_of(app_id: str, graph_hash: str) -> Any:
     from app.db.models import Run
+    from app.db.portable import json_eq
 
     return select(Run).where(Run.app_id == app_id, Run.origin_kind == ORIGIN,
-                             func.json_extract(Run.origin, "$.graph_hash") == graph_hash)
+                             json_eq(Run.origin, "graph_hash", graph_hash))
 
 
 async def latest_refresh(session: AsyncSession, app_id: str, graph_hash: str, *, active_only: bool = False) -> Any:

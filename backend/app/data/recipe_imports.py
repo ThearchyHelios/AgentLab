@@ -90,6 +90,7 @@ from app.data.recipe_types import (
 from app.data.xlsx_scan import WorkbookScan
 from app.db.base import new_id, utcnow
 from app.db.models import DataSource, ImportStaging, SourceSnapshot, TableBuild, TableImport, TableRecipe
+from app.db.portable import unique_violation
 
 logger = logging.getLogger(__name__)
 
@@ -2747,7 +2748,7 @@ async def commit_staging(session: AsyncSession, staging: ImportStaging, *, trial
         raise _publish_refused(e) from e
     except IntegrityError as e:
         await _back_to_drafting(session, staging_id)
-        if "data_sources.name" in str(e.orig if e.orig is not None else e):
+        if unique_violation(e, "data_sources", "name"):
             raise ImportRefused(409, "name_taken", f"名称「{name}」已被占用，请放弃这次导入后换一个名称") from e
         raise ImportRefused(500, "publish_failed", "导入失败：写入版本记录时出错，当前版本未受影响") from e
     except BaseException:

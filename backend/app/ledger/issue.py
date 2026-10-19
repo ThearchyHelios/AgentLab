@@ -44,6 +44,7 @@ from sqlalchemy import func, select
 
 from app.db.base import SessionLocal
 from app.db.models import Run, Workflow
+from app.db.portable import json_eq
 
 logger = logging.getLogger(__name__)
 
@@ -150,9 +151,9 @@ async def issued_today(session: Any) -> int:
 
 async def issued_runs(session: Any, run_id: str) -> list[Run]:
     """这次运行按口径出具过的正式运行（origin.source_run 是它），新的在前。origin_kind 有索引，先按它筛再看 origin
-    （json_extract，同 auth/keys 认幂等键的写法）。"""
+    （db/portable.json_eq，同 auth/keys 认幂等键的写法）。"""
     rows = (await session.execute(select(Run).where(
-        Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.source_run") == run_id)
+        Run.origin_kind == ORIGIN, json_eq(Run.origin, "source_run", run_id))
         .order_by(Run.created_at.desc()))).scalars()
     return list(rows)
 

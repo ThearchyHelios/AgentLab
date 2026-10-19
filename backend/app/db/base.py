@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import json
+import logging
+import math
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
-from sqlalchemy import JSON, DateTime, MetaData, event
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import JSON, BigInteger, Column, DateTime, Integer, MetaData, event
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import NullPool
 from sqlalchemy.types import TypeDecorator
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -57,11 +64,31 @@ class UTCDateTime(TypeDecorator):
         return value.astimezone(timezone.utc)
 
 
+#: 应用库的 JSON 列：两种库上都是存原文的 JSON（PostgreSQL 的 json，不是 JSONB）。JSONB 会把对象里的键重新排序：
+#: 应用里不少地方按存进去的键的先后出东西（快照的列、表的先后、复核结论各段的先后），换成 JSONB 读回来就变了样，
+#: 测试当场抓到好几处。json 的代价是没有相等运算符：== 比较、DISTINCT、GROUP BY、ORDER BY 不能直接作用在整列上
+#: （应用里没有这种写法，test_db_portable 守着）；按里面某个键筛选走 db/portable 的 json_eq 等，只把取出来的那一小段
+#: 转成 JSONB 比较
+PortableJSON = JSON()
+
+
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
-    # 图定义、节点配置、事件负载都是任意形状的 JSON，统一映射到 SQLite 的 JSON 列
-    type_annotation_map = {dict[str, Any]: JSON, list[Any]: JSON, datetime: UTCDateTime}
+    # 图定义、节点配置、事件负载都是任意形状的 JSON，统一映射到 JSON 列（见 PortableJSON）
+    type_annotation_map = {dict[str, Any]: PortableJSON, list[Any]: PortableJSON, datetime: UTCDateTime}
+
+
+@event.listens_for(Column, "after_parent_attach")
+def _portable_integer(column: Column, table: Any) -> None:
+    """应用库的 Integer 列在 PostgreSQL 上换成 BIGINT（SQLite 照旧是 INTEGER，主键照旧是 rowid）。
+
+    SQLite 的 INTEGER 是 64 位，PostgreSQL 的只有 32 位：行数估计、字节数、累计的计数都可能过 21 亿。在列挂到表上
+    的那一刻换（定义模型时，任何查询之前）：建表是 BIGINT（自增主键是 BIGSERIAL），和这一列比较、写进这一列的绑定
+    参数也按 BIGINT 转换。只管挂在应用 metadata 上、类型正好是 Integer 的列；业务数据源那边的表不受影响。"""
+    if getattr(table, "metadata", None) is Base.metadata and type(column.type) is Integer \
+            and not column.type._variant_mapping:
+        column.type = Integer().with_variant(BigInteger(), "postgresql")
 
 
 class TimestampMixin:
@@ -101,16 +128,10 @@ def _stop_aiosqlite_once() -> None:
     aiosqlite.Connection.stop = stop  # type: ignore[method-assign]
 
 
+# 应用库是 PostgreSQL 时也照样打：上传表格、手工登记的 SQLite 业务库（data/engine）还是走 aiosqlite 的连接池
 _stop_aiosqlite_once()
-# pool_pre_ping：取连接前先探一下活。取消异常打进 SQLAlchemy 的清理流程时
-# （_close_connection 记完日志会把 CancelledError 原样抛出，跳过了把连接记录
-# 清空的那一行），已经关掉的连接会留在池里，下一个取到它的人拿到的是
-# "no active connection"。探活失败会被当成断开，换一条新的——SQLite 本地一次
-# SELECT 1 的代价，换池子不被污染。
-engine = create_async_engine(settings.db_url, echo=False, future=True, pool_pre_ping=True)
 
 
-@event.listens_for(engine.sync_engine, "connect")
 def _set_sqlite_pragma(dbapi_conn, _record):  # pragma: no cover - 驱动回调
     """WAL + 外键约束。WAL 让读写不互相阻塞，事件写入和前端轮询能并行。"""
     cur = dbapi_conn.cursor()
@@ -119,6 +140,92 @@ def _set_sqlite_pragma(dbapi_conn, _record):  # pragma: no cover - 驱动回调
     cur.execute("PRAGMA busy_timeout=5000")
     cur.close()
 
+
+def _finite(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
+
+
+def _no_nul(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {_no_nul(k): _no_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_no_nul(v) for v in value]
+    return value
+
+
+def pg_json_dumps(value: Any) -> str:
+    """PostgreSQL 上写 JSON 列。它不收 NaN / Infinity（SQLite 照存）；字符串里的 \\u0000 json 列收，但一转成 JSONB
+    （按键筛选时，db/portable）、一取成文本就报错，那一整条查询跟着失败。
+
+    非有限的浮点写成 null（同浏览器的 JSON.stringify），字符串里的 NUL 字符去掉；平常的值一次 dumps 就过，
+    只有碰上了才多走一遍。"""
+    try:
+        text = json.dumps(value, allow_nan=False)
+    except ValueError:
+        text = json.dumps(_finite(value), allow_nan=False)
+    if "\\u0000" in text:
+        text = json.dumps(_no_nul(json.loads(text)), allow_nan=False)
+    return text
+
+
+#: 应用连 PostgreSQL 时报的 application_name。copy-to-postgres 按它认目标库上还有没有服务连着（它自己报的是 agentlab-copy）
+APPLICATION_NAME = "agentlab"
+
+
+def make_engine(url: str | None = None, *, application_name: str = APPLICATION_NAME) -> AsyncEngine:
+    """应用库的引擎。SQLite：WAL、外键、忙等，单个文件；PostgreSQL：连接池、方言调整（db/postgres.py）。
+
+    copy-to-postgres 建目标库的引擎也走这里，两边的列类型、排序规则是同一套。
+    """
+    url = url or settings.db_url
+    if url.startswith("sqlite"):
+        # pool_pre_ping：取连接前先探一下活。取消异常打进 SQLAlchemy 的清理流程时
+        # （_close_connection 记完日志会把 CancelledError 原样抛出，跳过了把连接记录
+        # 清空的那一行），已经关掉的连接会留在池里，下一个取到它的人拿到的是
+        # "no active connection"。探活失败会被当成断开，换一条新的——SQLite 本地一次
+        # SELECT 1 的代价，换池子不被污染。
+        made = create_async_engine(url, echo=False, future=True, pool_pre_ping=True)
+        event.listen(made.sync_engine, "connect", _set_sqlite_pragma)
+        return made
+    from app.db import postgres
+
+    pool: dict[str, Any] = (
+        {"poolclass": NullPool} if settings.db_pool_size <= 0 else {
+            "pool_size": settings.db_pool_size, "max_overflow": max(settings.db_max_overflow, 0),
+            "pool_timeout": settings.db_pool_timeout, "pool_recycle": settings.db_pool_recycle})
+    made = create_async_engine(
+        url, echo=False, future=True, pool_pre_ping=True, json_serializer=pg_json_dumps,
+        # 会话时区定成 UTC：时间列是不带时区的 UTC（UTCDateTime），库里 now() 之类的也按 UTC 算
+        connect_args={"server_settings": {"application_name": application_name, "timezone": "UTC"}},
+        **pool)
+    postgres.install(made.sync_engine.dialect)
+    return made
+
+
+def describe_database() -> str:
+    """启动日志里的一句：用的是哪种库、在哪（不写密码）。"""
+    from app.db.urls import describe
+
+    if settings.checkpoint_url:
+        points = f"断点在 PostgreSQL {describe(settings.checkpoint_url)}"
+    elif settings.db_dialect == "sqlite":
+        points = f"断点 {settings.checkpoint_path}"
+    else:
+        points = "断点在同一个库"
+    if settings.db_dialect == "sqlite":
+        return f"SQLite（{settings.db_path}，{points}）"
+    return f"PostgreSQL（{describe(settings.db_url)}，{points}）"
+
+
+engine = make_engine()
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -129,8 +236,10 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
-# 轻量迁移：create_all 只建新表，不给已有表加列。SQLite 的 ADD COLUMN
-# 便宜且带默认值回填，够用；等真需要改列类型再考虑 alembic。
+# 轻量迁移：create_all 只建新表，不给已有表加列。ADD COLUMN 便宜且带默认值回填，够用；等真需要改列类型再考虑 alembic。
+# 第三项照 SQLite 写（类型和缺省值的字面量）。PostgreSQL 上类型取模型里这一列的（按应用库的方言调整编译：String(n)
+# 是 VARCHAR、Integer 是 BIGINT、JSON 是 json、时间是 TIMESTAMP），缺省值取这里写的，布尔的 0 / 1 换成 false / true
+# （_column_ddl）。所以这里加的每一列模型里都得有：test_db_portable 守着
 _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("runs", "run_class", "TEXT DEFAULT 'exploratory'"),
     ("runs", "version", "INTEGER"),
@@ -274,44 +383,92 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
 
 #: 迁移补建的唯一索引：(索引名, 表, 列, 部分索引的条件, 建之前的去重语句)。只在索引还不存在时先去重再建——存量库里可能
 #: 已经有并发留下的重复行，直接建会失败。去重的规矩写在各自的语句里：多出的钩子行删掉（只留最早的那一行，它的密钥照旧
-#: 能用），多出的助手对话归档（不删，历史还在）
+#: 能用），多出的助手对话归档（不删，历史还在）。条件和语句里的 {false} / {true} 按方言换成布尔的字面量（SQLite 是 0 / 1）
 _UNIQUE_INDEX_MIGRATIONS: list[tuple[str, str, tuple[str, ...], str | None, str]] = [
     ("ux_app_hooks_app_name", "app_hooks", ("app_id", "name"), None,
      "DELETE FROM app_hooks WHERE id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER "
-     "(PARTITION BY app_id, name ORDER BY created_at, id) AS rn FROM app_hooks) WHERE rn = 1)"),
-    ("ux_conversations_app_owner", "conversations", ("app_id", "created_by"), "kind = 'app' AND archived = 0",
-     "UPDATE conversations SET archived = 1 WHERE kind = 'app' AND archived = 0 AND created_by IS NOT NULL "
+     "(PARTITION BY app_id, name ORDER BY created_at, id) AS rn FROM app_hooks) AS ranked WHERE rn = 1)"),
+    ("ux_conversations_app_owner", "conversations", ("app_id", "created_by"), "kind = 'app' AND archived = {false}",
+     "UPDATE conversations SET archived = {true} WHERE kind = 'app' AND archived = {false} AND created_by IS NOT NULL "
      "AND id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY app_id, created_by "
-     "ORDER BY last_active_at DESC, id) AS rn FROM conversations WHERE kind = 'app' AND archived = 0 "
-     "AND created_by IS NOT NULL) WHERE rn = 1)"),
+     "ORDER BY last_active_at DESC, id) AS rn FROM conversations WHERE kind = 'app' AND archived = {false} "
+     "AND created_by IS NOT NULL) AS ranked WHERE rn = 1)"),
 ]
+
+#: 布尔字面量：SQLite 的布尔列存 0 / 1
+_BOOL_LITERALS = {"sqlite": {"false": "0", "true": "1"}, "postgresql": {"false": "false", "true": "true"}}
+
+_DEFAULT = re.compile(r"\s+DEFAULT\s+(.+)$", re.I | re.S)
+
+
+def _column_ddl(dialect: Any, table: str, column: str, ddl: str) -> str:
+    """ADD COLUMN 里列名后面那一段。SQLite 原样用迁移表里写的；PostgreSQL 类型取模型里这一列的，缺省值取迁移表里的。"""
+    if dialect.name == "sqlite":
+        return ddl
+    from sqlalchemy import Boolean
+
+    from app.db.postgres import AppTypeCompiler
+
+    col = Base.metadata.tables[table].c[column]
+    out = AppTypeCompiler(dialect).process(col.type, type_expression=col)
+    if match := _DEFAULT.search(ddl):
+        default = match.group(1).strip()
+        if isinstance(col.type, Boolean):
+            default = {"0": "false", "1": "true"}.get(default, default)
+        out += f" DEFAULT {default}"
+    return out
 
 
 def _migrate(conn) -> None:  # pragma: no cover - 同步回调
-    from sqlalchemy import text
+    """给老库补列、补索引。已有的列和索引按 inspector 认（两种库同一套），再跑一遍什么都不做。"""
+    from sqlalchemy import inspect, text
 
+    dialect = conn.dialect
+    literals = _BOOL_LITERALS.get(dialect.name, _BOOL_LITERALS["postgresql"])
+    inspector = inspect(conn)
+    tables = set(inspector.get_table_names())
+    columns = {t: {c["name"] for c in inspector.get_columns(t)} for t in tables}
+    # IF NOT EXISTS：PostgreSQL 上多个进程同时启动，各自的检查和补列之间别人可能已经补上了（init_db 另外拿着锁）
+    add = "ADD COLUMN IF NOT EXISTS" if dialect.name == "postgresql" else "ADD COLUMN"
     for table, column, ddl in _COLUMN_MIGRATIONS:
-        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+        cols = columns.get(table)
         if cols and column not in cols:
-            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
-    for name, table, columns in _INDEX_MIGRATIONS:
-        wanted = (columns,) if isinstance(columns, str) else columns
-        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+            conn.execute(text(f"ALTER TABLE {table} {add} {column} {_column_ddl(dialect, table, column, ddl)}"))
+            cols.add(column)
+    for name, table, wanted in _INDEX_MIGRATIONS:
+        wanted = (wanted,) if isinstance(wanted, str) else wanted
+        cols = columns.get(table) or set()
         if all(c in cols for c in wanted):
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({', '.join(wanted)})"))
-    for name, table, columns, where, dedupe in _UNIQUE_INDEX_MIGRATIONS:
-        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
-        exists = conn.execute(text("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :n"), {"n": name}).first()
-        if exists or not all(c in cols for c in columns):
+    for name, table, wanted, where, dedupe in _UNIQUE_INDEX_MIGRATIONS:
+        cols = columns.get(table) or set()
+        if not all(c in cols for c in wanted):
             continue
-        conn.execute(text(dedupe))
-        conn.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({', '.join(columns)})"
-                          + (f" WHERE {where}" if where else "")))
+        if any(ix["name"] == name for ix in inspect(conn).get_indexes(table)):
+            continue
+        conn.execute(text(dedupe.format(**literals)))
+        conn.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({', '.join(wanted)})"
+                          + (f" WHERE {where.format(**literals)}" if where else "")))
+
+
+#: init_db 在 PostgreSQL 上拿的会话级咨询锁的号：几个进程同时启动时，建表和迁移一个一个来（同一个号别处别用）
+_INIT_LOCK = 0x4167656E744C6162  # "AgentLab"
+
+
+async def create_schema(target: AsyncEngine) -> None:
+    """建表、补列补索引（create_all 只建新表，老库的新列靠 _migrate）。两种库同一套；copy-to-postgres 建目标库也用它。"""
+    from app.db import models  # noqa: F401  确保模型已注册到 metadata
+
+    async with target.begin() as conn:
+        if conn.dialect.name == "postgresql":
+            # 事务结束自动放锁。CREATE TABLE IF NOT EXISTS 在 PostgreSQL 上并发执行也会撞（系统表的唯一约束）
+            from sqlalchemy import text
+
+            await conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _INIT_LOCK})
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate)
 
 
 async def init_db() -> None:
-    from app.db import models  # noqa: F401  确保模型已注册到 metadata
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_migrate)
+    logger.info("应用库：%s", describe_database())
+    await create_schema(engine)

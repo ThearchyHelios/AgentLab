@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 from collections import Counter
 
 import pytest
@@ -25,7 +24,6 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.core.bus import bus
-from app.core.config import settings
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Approval, Run, RunEvent
@@ -34,6 +32,7 @@ from app.engine.context import NodeError
 from app.engine.runner import RunManager, run_manager, verify_manifest
 from app.engine.schema import NodeType
 from app.tools.registry import register
+from tests import appdb
 
 #: Agent 场景里工具真正执行的次数。注册表是进程级的，工具只注册一次，计数按测试清零
 CALLS: list[str] = []
@@ -162,12 +161,7 @@ async def _pending(run_id: str) -> list[Approval]:
 
 def _sql(statement: str, *params) -> None:
     """另开一条连接改库：模拟别处（恢复、继续运行、另一个写入者）抢在中间提交。"""
-    db = sqlite3.connect(settings.db_path, timeout=5)
-    try:
-        db.execute(statement, params)
-        db.commit()
-    finally:
-        db.close()
+    appdb.execute((statement, params))
 
 
 # --------------------------------------------------------------------------
@@ -226,12 +220,7 @@ async def test_a_resume_that_wins_the_row_leaves_nothing_behind(monkeypatch):
 
     def resumed_in_between(run_id, value):
         if run_id == paused.id:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                db.execute("UPDATE runs SET status = 'running' WHERE id = ?", (paused.id,))
-                db.commit()
-            finally:
-                db.close()
+            appdb.execute(("UPDATE runs SET status = 'running' WHERE id = ?", (paused.id,)))
         set_seq(run_id, value)
 
     monkeypatch.setattr(bus, "set_seq", resumed_in_between)
@@ -252,14 +241,9 @@ async def test_events_written_elsewhere_in_between_win(monkeypatch):
 
     def written_in_between(run_id, value):
         if run_id == paused.id:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                db.execute("INSERT INTO run_events (id, run_id, seq, type, node_id, ts, data) "
-                           "VALUES ('elsewhere-1', ?, ?, 'log', NULL, 0, '{}')", (paused.id, taken))
-                db.execute("UPDATE runs SET last_seq = ? WHERE id = ?", (taken, paused.id))
-                db.commit()
-            finally:
-                db.close()
+            appdb.execute(("INSERT INTO run_events (id, run_id, seq, type, node_id, ts, data) "
+                           "VALUES ('elsewhere-1', ?, ?, 'log', NULL, 0, '{}')", (paused.id, taken)),
+                          ("UPDATE runs SET last_seq = ? WHERE id = ?", (taken, paused.id)))
         set_seq(run_id, value)
 
     monkeypatch.setattr(bus, "set_seq", written_in_between)
@@ -352,12 +336,8 @@ async def test_published_only_once_stored_and_never_when_not_written(monkeypatch
 
     async def stored_when_published(event):
         if event.type == EventType.APPROVAL_INQUIRY:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                (count,) = db.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND seq = ?",
-                                      (event.run_id, event.seq)).fetchone()
-            finally:
-                db.close()
+            [(count,)] = appdb.query("SELECT count(*) FROM run_events WHERE run_id = ? AND seq = ?",
+                                     event.run_id, event.seq)
             published.append((event.seq, count))
         await publish(event)
 
@@ -430,12 +410,7 @@ async def test_a_sealed_run_that_changes_in_between_gets_nothing(monkeypatch, ch
 
     def changed_in_between(run_id, value):
         if run_id == final.id:
-            db = sqlite3.connect(settings.db_path, timeout=5)
-            try:
-                db.execute(change, (final.id,))
-                db.commit()
-            finally:
-                db.close()
+            appdb.execute((change, (final.id,)))
         set_seq(run_id, value)
 
     monkeypatch.setattr(bus, "set_seq", changed_in_between)

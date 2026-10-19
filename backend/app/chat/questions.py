@@ -98,6 +98,7 @@ async def recent_questions(session: AsyncSession, principal: Any, *, limit: int)
     """最近问过的问题，从新到旧，最多 limit 条（取法见模块开头）。principal 用来去掉这个人读不了的只给拥有者的运行。"""
     from app.auth.access import hidden_runs
     from app.db.models import Conversation, ConversationTurn, Run
+    from app.db.portable import json_is_string
     from app.engine.origin import counted_runs
 
     hidden = hidden_runs(principal)
@@ -112,7 +113,7 @@ async def recent_questions(session: AsyncSession, principal: Any, *, limit: int)
     runs = (await session.execute(
         select(Run.id, Run.input, Run.workflow_name, Run.created_at, Run.origin_kind)
         .where(Run.run_class != "formal", func.coalesce(Run.origin_kind, "") != "chat", counted_runs(), not_(hidden),
-               func.json_type(Run.input, "$.question") == "text")
+               json_is_string(Run.input, "question"))
         .order_by(Run.created_at.desc()).limit(limit)
     )).all()
     out = [Question(text=question.strip(), at=at, run_id=run_id, turn_id=turn_id, workflow=workflow, origin="chat")

@@ -143,10 +143,10 @@ def actions_of(content: dict[str, Any], names: dict[str, str], hide: Any = None)
 
 async def reconciled_runs(session: Any, run_id: str) -> list[Run]:
     """对这次运行对过的账（origin.source_run 是它），新的在前。"""
-    from sqlalchemy import func
+    from app.db.portable import json_eq
 
     rows = (await session.execute(select(Run).where(
-        Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.source_run") == run_id)
+        Run.origin_kind == ORIGIN, json_eq(Run.origin, "source_run", run_id))
         .order_by(Run.created_at.desc()))).scalars()
     return list(rows)
 

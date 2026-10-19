@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from sqlalchemy import case, func, select, update
@@ -71,7 +71,7 @@ class RunManager:
 
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        self._checkpointer: AsyncSqliteSaver | None = None
+        self._checkpointer: BaseCheckpointSaver | None = None
         self._cm: Any = None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_runs)
         #: 正在关停。此时收到的取消来自关停而不是用户，运行要记成可恢复的中断
@@ -86,7 +86,10 @@ class RunManager:
     async def setup(self) -> None:
         self._closing = False
         settings.ensure_dirs()
-        self._cm = AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path))
+        # SQLite：数据目录里的 checkpoints.db；PostgreSQL：同一个库（或 AGENTLAB_CHECKPOINT_URL），见 engine/checkpoints.py
+        from app.engine.checkpoints import open_saver
+
+        self._cm = open_saver()
         self._checkpointer = await self._cm.__aenter__()
         # 上次进程被强杀时留下的记录。running 和 queued 要分开处理：
         # running 至少跑过一步、有 checkpoint，可以续；queued 还在排队，
@@ -163,7 +166,7 @@ class RunManager:
                 await self._cm.__aexit__(None, None, None)
 
     @property
-    def checkpointer(self) -> AsyncSqliteSaver:
+    def checkpointer(self) -> BaseCheckpointSaver:
         if self._checkpointer is None:
             raise RuntimeError("RunManager 还没初始化")
         return self._checkpointer
@@ -889,6 +892,15 @@ class RunManager:
                 try:
                     await self._finalize(run_id, status, error, final_state, elapsed,
                                          terminal=terminal, error_node=error_node, end_reason=end_reason)
+                    # 记 action.unknown、安排核实也算收尾：做完才把自己摘掉。以前摘掉之后才做，等运行「不在跑了」
+                    # 再去读事件的一方（接口、测试）有一小段读不到这一条；库慢一点（PostgreSQL 满载时）就读不到
+                    if pending_action is not None:
+                        from app.process.actions import on_unknown
+
+                        try:
+                            await on_unknown(pending_action)
+                        except Exception:  # noqa: BLE001 - 运行已经收成挂起；没安排上的核实，下次启动时 actions.startup 补上
+                            logger.exception("run %s 的动作 %s 结果未知，安排核实时出错", run_id, pending_action)
                 finally:
                     # 收尾被打断（关停时的取消、库连接出错）也得把自己摘掉。以前写在
                     # _finalize 后面，一被打断就漏掉，留下的任务让下一次 shutdown 的
@@ -896,13 +908,6 @@ class RunManager:
                     self._finalizing.discard(run_id)
                     self._tasks.pop(run_id, None)
                     self._stopped_by.pop(run_id, None)
-                if pending_action is not None:
-                    from app.process.actions import on_unknown
-
-                    try:
-                        await on_unknown(pending_action)
-                    except Exception:  # noqa: BLE001 - 运行已经收成挂起；没安排上的核实，下次启动时 actions.startup 补上
-                        logger.exception("run %s 的动作 %s 结果未知，安排核实时出错", run_id, pending_action)
                 # 运行到终态就把沙箱会话收掉。thread_id 每个 run 都是新的，
                 # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），
                 # 而且没有任何自动回收路径会碰它——闲置回收只在"下次有人执行
