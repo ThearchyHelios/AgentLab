@@ -560,6 +560,30 @@ def test_a_failed_copy_leaves_the_sqlite_service_as_it_was_and_rerunning_works(d
     assert deploy.mode() == "builtin"
 
 
+def test_a_database_that_keeps_restarting_is_stopped_and_left_without_a_restart_policy(deploy):
+    """复核 R-d2：库的镜像起不来、容器一遍遍重启（restarting）时，回退要真停下它、关掉重启策略；再起时恢复。"""
+    _sqlite_deployment(deploy)
+    (deploy.pkg / "postgres-image.tar").write_text(f"alpine:latest \n{PG_IMAGE} \n")
+    out = deploy("migrate-to-postgres", ok=False, DEPLOY_POSTGRES_IMAGE="alpine:latest", FAKE_RESTARTING_IMAGE="alpine:latest")
+    assert "没有切换，仍用 SQLite" in out.stderr
+    pg = deploy.containers()[PG]
+    assert pg["state"] == "exited" and pg["restart"] == "no", "停下了、不会再被拉起来"
+    calls = deploy.calls()
+    assert index_of(calls, lambda a: a == ["update", "--restart=no", PG]) < index_of(calls, is_cmd("stop", PG))
+    # 换回能起的镜像重跑：库的容器按新镜像重建，重启策略照常
+    deploy("migrate-to-postgres")
+    assert deploy.containers()[PG]["restart"] == "unless-stopped" and deploy.mode() == "builtin"
+    # ./deploy.sh stop 同一个函数：在重启的也停
+    state = deploy.state()
+    state["containers"][PG]["state"] = "restarting"
+    deploy.state_file.write_text(json.dumps(state))
+    deploy("stop")
+    assert deploy.containers()[PG]["state"] == "exited"
+    deploy("start")
+    calls = deploy.calls()
+    assert index_of(calls, lambda a: a == ["update", "--restart", "unless-stopped", PG]) < index_of(calls, is_cmd("start", PG))
+
+
 def test_a_stopped_service_stays_stopped_after_a_failed_migration(deploy):
     _sqlite_deployment(deploy)
     deploy("stop")

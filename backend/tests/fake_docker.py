@@ -11,6 +11,7 @@ FAKE_COPY_FAIL 成功或失败。
     FAKE_PSQL_FAIL=1                 docker exec … psql 失败
     FAKE_UNHEALTHY_ENV=<变量名>      带这个环境变量（-e）起的容器健康检查不过
     FAKE_UNHEALTHY_IMAGE=<镜像>      用这个镜像起的容器健康检查不过
+    FAKE_RESTARTING_IMAGE=<镜像>     用这个镜像起的容器一直在重启（restarting）
 """
 
 from __future__ import annotations
@@ -272,12 +273,27 @@ def main(argv: list[str]) -> int:
             fail(f'docker: Error response from daemon: Conflict. The container name "/{name}" is already in use.', 125)
         for vol in opts["volumes"]:
             state["volumes"].setdefault(vol, {})
+        flapping = os.environ.get("FAKE_RESTARTING_IMAGE") == image
         state["containers"][name] = {
-            "image": image, "state": "running", "env": opts["env"], "labels": opts["labels"],
-            "mounts": opts["mounts"], "ports": opts["ports"], "network": network or "bridge",
+            "image": image, "state": "restarting" if flapping else "running", "env": opts["env"],
+            "labels": opts["labels"], "mounts": opts["mounts"], "ports": opts["ports"], "network": network or "bridge",
+            "restart": opts.get("--restart", "no"),
         }
         save(state)
         print("f" * 64)
+        return 0
+
+    if cmd == "update":
+        name = args[-1]
+        c = state["containers"].get(name)
+        if c is None:
+            fail(f"Error response from daemon: No such container: {name}")
+        for i, a in enumerate(args[:-1]):
+            if a.startswith("--restart="):
+                c["restart"] = a.split("=", 1)[1]
+            elif a == "--restart":
+                c["restart"] = args[i + 1]
+        save(state)
         return 0
 
     if cmd in ("start", "stop", "restart"):

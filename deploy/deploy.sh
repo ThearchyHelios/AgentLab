@@ -873,6 +873,8 @@ start_pg() {
     fi
     if [ "$(container_state "$POSTGRES_CONTAINER")" != running ]; then
       say "启动内置 PostgreSQL（${POSTGRES_CONTAINER}）"
+      # 回退时关掉过重启策略（stop_pg --no-restart），起的时候恢复
+      docker update --restart unless-stopped "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
       docker start "$POSTGRES_CONTAINER" >/dev/null || die "内置 PostgreSQL 的容器起不来，见上面 docker 的报错"
     fi
   else
@@ -885,9 +887,15 @@ start_pg() {
   fi
 }
 
+# 在跑的、在反复重启的（镜像起不来、--restart unless-stopped 一遍遍拉）都停。--no-restart：再关掉重启策略（回退时用：
+# 一个起不来的库容器不该在后台一直重启），下次 start_pg 起它时恢复
 stop_pg() {
   container_exists "$POSTGRES_CONTAINER" || return 0
-  [ "$(container_state "$POSTGRES_CONTAINER")" = running ] || return 0
+  [ "${1:-}" != --no-restart ] || docker update --restart=no "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+  case "$(container_state "$POSTGRES_CONTAINER")" in
+    running|restarting) ;;
+    *) return 0 ;;
+  esac
   say "停止内置 PostgreSQL（${POSTGRES_CONTAINER}，数据保留）"
   docker stop "$POSTGRES_CONTAINER" >/dev/null
 }
@@ -1040,7 +1048,7 @@ migrate_rollback() {
       docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
     fi
   fi
-  stop_pg
+  stop_pg --no-restart
   die "没有切换，仍用 SQLite（数据目录里的 agentlab.db 没动过）。照上面的报错处理好之后重新运行 ./deploy.sh migrate-to-postgres，
 重复执行是安全的：内置库里这次导了一半的会先清空再导"
 }
