@@ -152,10 +152,11 @@ class _Service:
         with contextlib.suppress(Exception):
             await workers.prune()
             await requests.prune()
-            if settings.db_dialect == "postgresql":
-                from app.cluster import caches, counters
+            from app.cluster import caches, counters
 
-                await counters.prune()
+            # 到期的计数、额度（每日额度两种库都记在库里）
+            await counters.prune()
+            if settings.db_dialect == "postgresql":
                 await caches.prune()
         return out
 

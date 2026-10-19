@@ -341,3 +341,37 @@ async def _until(check, timeout: float = 10.0) -> None:
         if loop.time() > deadline:
             raise AssertionError("等超时了")
         await asyncio.sleep(0.05)
+
+
+async def test_a_daily_quota_is_taken_up_to_the_limit_by_concurrent_callers():
+    """先占额度再发起（cluster/quota）：20 个协程同时占、上限 5，正好 5 个占到；这一天第一次占按已有的记录起算；退回一份又能占。"""
+    from app.cluster import quota
+
+    name = f"test-quota-{new_id()[:8]}"
+
+    async def seed(_session) -> int:
+        return 2   # 今天已经做过 2 次
+
+    got = await asyncio.gather(*(quota.take(name, 5, seed=seed) for _ in range(20)))
+    assert sum(got) == 3 and await quota.used(name) == 5
+    assert not await quota.take(name, 5)
+    await quota.give_back(name)
+    assert await quota.take(name, 5) and not await quota.take(name, 5)
+
+
+def test_a_daily_quota_holds_across_two_processes():
+    """两个进程同时各占 15 次、上限 10：合计正好 10 次。"""
+    name = f"test-quota-{new_id()[:8]}"
+    backend = Path(__file__).resolve().parents[1]
+    script = ("import asyncio, sys\n"
+              "from app.cluster import quota\n"
+              "async def main():\n"
+              f"    got = await asyncio.gather(*(quota.take({name!r}, 10) for _ in range(15)))\n"
+              "    print(sum(got))\n"
+              "asyncio.run(main())\n")
+    env = {**os.environ, "PYTHONPATH": str(backend), "AGENTLAB_DB_POOL_SIZE": "5"}
+    procs = [subprocess.Popen([sys.executable, "-c", script], cwd=str(backend), env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) for _ in range(2)]
+    outs = [p.communicate(timeout=120) for p in procs]
+    assert all(p.returncode == 0 for p in procs), [o[1][-2000:] for o in outs]
+    assert sum(int(o[0].strip().splitlines()[-1]) for o in outs) == 10

@@ -329,11 +329,16 @@ _locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, st
 
 
 def _lock(key: tuple[str, str, int]) -> Any:
-    """跨进程的锁（app/cluster/mutex）：多进程时「有没有出具过、今天出了几次」的核对和发起照样一个接一个。全站一把（不按键）：
-    每日上限是全站的，按键分锁时几个不同的答案同时出具会一起越过上限；出具不频繁，发起本身只是建一条运行。"""
+    """同一（运行、工作流、版本）的出具一个接一个（app/cluster/mutex，多进程之间也是一把）：管的是「这一次出具过没有」的去重，
+    同时点了几下只发起一次。每日上限不靠它：发起之前先在库里占一份额度（app/cluster/quota），几份不同的出具可以同时发起，上限
+    照样数得准。"""
     from app.cluster import mutex
 
-    return mutex.lock("ledger-issue")
+    return mutex.lock(f"ledger-issue:{key[0]}:{key[1]}:{key[2]}")
+
+
+#: 每日出具额度在 cluster/quota 里的名字
+QUOTA = "ledger_issue"
 
 
 async def _hider(run_id: str) -> Any:
@@ -369,12 +374,23 @@ async def issue(run_id: str, workflow_id: str, version: int, *, principal: Any, 
                       "how": plan.how, "binding_hash": input_key(plan.binding), "match": plan.match_artifact,
                       "auto": auto, **({"granted_by_app": plan.granted_by_app} if plan.granted_by_app else {})}
             actor = run.started_by if auto else principal.username
+            # 先占一份今天的额度（库里带条件的加一，几个进程同时出具也正好到上限为止），发起不成退回
+            from app.api.settings import ledger_settings
+            from app.cluster import quota
+
+            limit = int((await ledger_settings(session))["issue_daily_limit"])
+            if not await quota.take(QUOTA, limit, seed=issued_today):
+                raise IssueRefused(429, OVER_LIMIT.format(limit=limit), DAILY_LIMIT)
             try:
                 launched = await launch_run(session, workflow_id=workflow_id, run_class="formal", version=int(version),
                                             input_payload=plan.inputs, actor=actor, origin_kind=ORIGIN, origin=origin,
                                             expect_hash=plan.expect_hash)
             except LaunchRefused as e:
+                await quota.give_back(QUOTA)
                 raise IssueRefused(e.status_code, e.message, e.code or REFUSED) from e
+            except BaseException:
+                await quota.give_back(QUOTA)
+                raise
             return launched, True
 
 
