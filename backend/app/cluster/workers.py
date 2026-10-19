@@ -25,6 +25,10 @@ from app.db.base import SessionLocal, utcnow
 logger = logging.getLogger(__name__)
 
 
+#: 登记时全站串行用的事务级咨询锁的号
+_REGISTER_KEY = 0x4167576F726B6572  # "AgWorker"
+
+
 def lease_s() -> float:
     """租约多长（秒）：至少是心跳间隔的三倍——库一时慢了、一拍没续上，不算进程没了。"""
     return max(float(settings.worker_lease_s), 3.0 * float(settings.worker_heartbeat_s))
@@ -83,15 +87,25 @@ async def register(*, exclusive: bool = False) -> None:
     守卫已经确认没有别的进程在用这个数据目录，见 cluster/guard.py）。"""
     from app.db.models_cluster import ClusterWorker
 
+    from app.cluster import version
+
     me = identity.owner()
     now = utcnow()
     async with SessionLocal() as session:
         if exclusive:
             await session.execute(delete(ClusterWorker).where(ClusterWorker.id != me))
+        elif session.get_bind().dialect.name == "postgresql":
+            # 查「还有没有活着的、版本不同的进程」和登记在同一个事务里、全站串行：两个不同版本同时启动只有先登记上的起得来
+            from sqlalchemy import text
+
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _REGISTER_KEY})
+            others = (await session.execute(select(ClusterWorker).where(ClusterWorker.id != me))).scalars().all()
+            version.check_rows(list(others), now)
         row = await session.get(ClusterWorker, me)
         if row is None:
             session.add(ClusterWorker(id=me, host=identity.host(), pid=os.getpid(), started_at=now, heartbeat_at=now,
-                                      lease_until=now + timedelta(seconds=lease_s()), info=_info()))
+                                      lease_until=now + timedelta(seconds=lease_s()), info=_info(),
+                                      code_version=version.code_version(), schema_version=version.schema_version()))
         else:
             row.heartbeat_at, row.lease_until = now, now + timedelta(seconds=lease_s())
         await session.commit()
@@ -137,6 +151,7 @@ async def listing() -> list[dict[str, Any]]:
     async with SessionLocal() as session:
         rows = (await session.execute(select(ClusterWorker).order_by(ClusterWorker.started_at, ClusterWorker.id))).scalars().all()
     return [{"id": r.id, "host": r.host, "pid": r.pid, "alive": r.lease_until > now, "me": r.id == identity.owner(),
+             "code_version": r.code_version, "schema_version": r.schema_version,
              "started_at": r.started_at.isoformat() if r.started_at else None,
              "heartbeat_at": r.heartbeat_at.isoformat() if r.heartbeat_at else None} for r in rows]
 

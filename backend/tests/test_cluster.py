@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.cluster import identity, leader as leader_mod, slots, state, workers
+from app.core.config import settings as app_settings
 from app.db.base import SessionLocal, new_id, utcnow
 from app.db.models import Run, RunEvent
 from app.db.models_cluster import ClusterLease, ClusterRequest, ClusterWorker, LaneTicket, RunSlot
@@ -375,3 +376,78 @@ def test_a_daily_quota_holds_across_two_processes():
     outs = [p.communicate(timeout=120) for p in procs]
     assert all(p.returncode == 0 for p in procs), [o[1][-2000:] for o in outs]
     assert sum(int(o[0].strip().splitlines()[-1]) for o in outs) == 10
+
+
+# --------------------------------------------------------------------------
+# 不许新旧版本混跑（cluster/version.py）
+# --------------------------------------------------------------------------
+
+async def _peer_version(owner: str, code: str | None, *, lease_s: float = 60.0) -> None:
+    now = utcnow()
+    async with SessionLocal() as session:
+        session.add(ClusterWorker(id=owner, host="peer-host", pid=4242, started_at=now, heartbeat_at=now,
+                                  lease_until=now + timedelta(seconds=lease_s), code_version=code,
+                                  schema_version=None if code is None else _schema()))
+        await session.commit()
+
+
+def _schema() -> str:
+    from app.cluster import version
+
+    return version.schema_version()
+
+
+async def _rows():
+    async with SessionLocal() as session:
+        return list((await session.execute(select(ClusterWorker))).scalars())
+
+
+async def test_a_live_process_of_another_version_is_named_and_refused():
+    from app.cluster import version
+
+    await _peer_version(PEER, "0.0.9+old+aaaaaaaaaaaa")
+    with pytest.raises(version.VersionMismatch) as e:
+        version.check_rows(await _rows(), utcnow())
+    assert "peer-host 上的进程 4242" in str(e.value) and "0.0.9+old+aaaaaaaaaaaa" in str(e.value) and "先停掉" in str(e.value)
+
+
+async def test_the_same_version_joins_and_expired_or_unversioned_dead_ones_do_not_count():
+    from app.cluster import version
+
+    await _peer_version(PEER, version.code_version())
+    await _peer_version(GHOST, "0.0.9+old+aaaaaaaaaaaa", lease_s=-5)
+    version.check_rows(await _rows(), utcnow())
+    assert version.same("0.1.0+other-build+" + version.source_fingerprint(), version.schema_version()), \
+        "比的是源码指纹：构建号写法不同、代码相同算同一版"
+
+
+@pytest.mark.skipif(app_settings.db_dialect != "postgresql", reason="只在 PostgreSQL 上拦（SQLite 只有一个进程）")
+async def test_preflight_refuses_a_beating_peer_and_waits_out_a_stale_one():
+    from app.cluster import version
+
+    await _peer_version(PEER, "0.0.9+old+aaaaaaaaaaaa")
+
+    async def beat() -> None:
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            async with SessionLocal() as session:
+                row = await session.get(ClusterWorker, PEER)
+                row.heartbeat_at = utcnow()
+                await session.commit()
+
+    beating = asyncio.create_task(beat())
+    with pytest.raises(version.VersionMismatch):
+        await version.preflight(observe_s=0.5)
+    await beating
+    async with SessionLocal() as session:
+        await session.execute(delete(ClusterWorker).where(ClusterWorker.id == PEER))
+        await session.commit()
+    # 强杀之后留下的旧版登记（心跳停着、租约还有 1 秒）：等它过期就起
+    await _peer_version(GHOST, "0.0.9+old+aaaaaaaaaaaa", lease_s=1.0)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    await version.preflight(observe_s=0.3)
+    assert 0.5 < loop.time() - t0 < 5
+    with pytest.raises(version.VersionMismatch):
+        await _peer_version(PEER, "0.0.9+old+aaaaaaaaaaaa")
+        await workers.register()

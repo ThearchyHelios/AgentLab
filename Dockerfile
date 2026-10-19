@@ -93,6 +93,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --start-interval=2s -
 
 # 版本号放在最后：它每次打包都不同，放前面会让装依赖那几层的缓存全部失效
 ARG VERSION=dev
+# 进程登记时带上构建号（app/cluster/version.py：库里还有活着的、版本不同的进程时新进程不许加入）
+ENV AGENTLAB_BUILD=${VERSION}
 LABEL org.opencontainers.image.title="AgentLab" \
       org.opencontainers.image.description="可视化 Agent 编排实验台" \
       org.opencontainers.image.version="${VERSION}" \

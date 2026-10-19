@@ -62,6 +62,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     from app.db.base import check_pgbouncer
 
     check_pgbouncer()
+    # 不许新旧版本混跑（app/cluster/version.py）：库里还有活着的、版本不同的进程就不启动——在补列之前看
+    from app.cluster import version
+
+    await version.preflight()
     await init_db()
     # 多进程协调（app/cluster）：登记这个工作进程、开始心跳和进程间通知、争调度当班。要在下面的启动整理之前：整理只碰属主不在了的
     # 行，要先知道别的进程谁还活着

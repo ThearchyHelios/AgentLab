@@ -454,6 +454,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("publish_plans", "owner", "VARCHAR(120)"),
     # 问数据：等不及的那次复核还在后台跑（实时流在它回来之前不关；多进程时别的进程上的流也看得到）
     ("chat_turn_jobs", "late_review_at", "DATETIME"),
+    # 工作进程登记的代码版本、库结构版本（app/cluster/version.py：不许新旧版本混跑）
+    ("cluster_workers", "code_version", "VARCHAR(200)"),
+    ("cluster_workers", "schema_version", "VARCHAR(64)"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。
