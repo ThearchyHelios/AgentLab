@@ -43,6 +43,9 @@ EPHEMERAL_FLUSH_S = 0.05
 POLL_S = 2.0
 #: 一条载荷最多多少字节（PostgreSQL 的 NOTIFY 上限是 8000）
 PAYLOAD_MAX = 7000
+#: 往回多读几条（复核 R-b5）：号是先取后提交的，号大的先提交时游标会越过号小的那一条；每次从游标往回留这么多条重读，按已经
+#: 发布过的 seq 去重
+LOOKBACK = 64
 #: 不落库的事件（同 engine/runner._EPHEMERAL）
 EPHEMERAL = {EventType.LLM_TOKEN, EventType.LLM_THINKING_DELTA}
 _TERMINAL = ("succeeded", "failed", "cancelled")
@@ -53,6 +56,10 @@ class Relay:
         #: 本进程里在跟随的运行：{run_id: 跟随的连接数}、游标（已经在本进程发布过的最大 seq）
         self._follow: dict[str, int] = {}
         self._cursor: dict[str, int] = {}
+        #: 本进程已经发布过的 seq（游标往回 LOOKBACK 条以内的）：往回重读时去重
+        self._seen: dict[str, set[int]] = {}
+        #: 接上时回放到了哪一条：往回重读不越过它（那之前的回放已经发过）
+        self._floor: dict[str, int] = {}
         self._pumping: dict[str, asyncio.Lock] = {}
         #: 本进程里在看的问数据一轮
         self._turns: dict[str, int] = {}
@@ -106,6 +113,9 @@ class Relay:
         """这条连接在看这次运行（WebSocket 接上、回放完之后）：在本进程里没在执行时从库里追。"""
         self._follow[run_id] = self._follow.get(run_id, 0) + 1
         self._cursor[run_id] = max(self._cursor.get(run_id, 0), int(after or 0))
+        # 回放已经发到 after 为止（订阅位那边按 after 去重）：往回重读不越过它
+        self._floor[run_id] = max(self._floor.get(run_id, 0), int(after or 0)) if run_id not in self._floor else \
+            min(self._floor[run_id], int(after or 0))
         if signals.active:
             signals.publish("w", f"r:{run_id}")
             self._kick(run_id)
@@ -116,6 +126,8 @@ class Relay:
             if left <= 0:
                 self._follow.pop(run_id, None)
                 self._cursor.pop(run_id, None)
+                self._seen.pop(run_id, None)
+                self._floor.pop(run_id, None)
                 self._pumping.pop(run_id, None)
             else:
                 self._follow[run_id] = left
@@ -151,15 +163,19 @@ class Relay:
         lock = self._pumping.setdefault(run_id, asyncio.Lock())
         async with lock:
             after = self._cursor.get(run_id, 0)
+            floor = self._floor.get(run_id, 0)
+            seen = self._seen.setdefault(run_id, set())
             async with SessionLocal() as session:
                 # 先读状态、再读事件：终态和终态事件是同一个事务提交的，读到终态时终态事件一定也读得到
                 status = await session.scalar(select(Run.status).where(Run.id == run_id))
-                rows = list((await session.execute(select(RunEvent).where(RunEvent.run_id == run_id,
-                                                                          RunEvent.seq > after)
-                                                   .order_by(RunEvent.seq))).scalars())
+                fetched = list((await session.execute(select(RunEvent).where(
+                    RunEvent.run_id == run_id, RunEvent.seq > max(floor, after - LOOKBACK))
+                    .order_by(RunEvent.seq))).scalars())
+            rows = [r for r in fetched if int(r.seq or 0) not in seen and int(r.seq or 0) > floor]
             last_log = None
             for row in rows:
                 self._cursor[run_id] = max(self._cursor.get(run_id, 0), int(row.seq or 0))
+                seen.add(int(row.seq or 0))
                 last_log = row
                 try:
                     event = RunEventModel(id=row.id, run_id=run_id, seq=row.seq, type=EventType(row.type),
@@ -167,6 +183,9 @@ class Relay:
                 except ValueError:
                     continue   # 不认识的事件种类（更新的版本写的）：回放时照样读得到，这里不转
                 await bus.publish(event, relayed=True)
+            low = self._cursor.get(run_id, 0) - 2 * LOOKBACK
+            if len(seen) > 4 * LOOKBACK:
+                self._seen[run_id] = {q for q in seen if q > low}
             ended = status is None or status in _TERMINAL or (
                 status == "interrupted" and last_log is not None and last_log.type == EventType.LOG
                 and (last_log.data or {}).get("code") == "server_shutdown")
@@ -275,6 +294,7 @@ class Relay:
             return
         if event.run_id in self._follow:
             self._cursor[event.run_id] = max(self._cursor.get(event.run_id, 0), int(event.seq or 0))
+            self._seen.setdefault(event.run_id, set()).add(int(event.seq or 0))
         signals.publish("r", event.run_id, event.seq)
 
     async def _flush(self) -> None:
@@ -292,8 +312,33 @@ class Relay:
                 signals.publish("b", turn_id, text)
 
 
+def _size(item: dict[str, Any]) -> int:
+    return len(json.dumps(item, ensure_ascii=False, default=str).encode())
+
+
+def _split(item: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    """太长的一条正文增量按字切成几条（复核 R-b6：以前截掉一截）：按字切，不会切坏 UTF-8；每条都在 limit 字节以内。切不开的
+    （不是正文增量）交回空。"""
+    data = dict(item.get("data") or {})
+    text = data.get("delta")
+    if not isinstance(text, str) or set(data) != {"delta"}:
+        return []
+    out: list[dict[str, Any]] = []
+    while text:
+        low, high = 1, len(text)
+        while low < high:   # 二分：最长的一段前缀，装得进 limit
+            mid = (low + high + 1) // 2
+            if _size({**item, "data": {"delta": text[:mid]}}) <= limit:
+                low = mid
+            else:
+                high = mid - 1
+        out.append({**item, "data": {"delta": text[:low]}})
+        text = text[low:]
+    return out
+
+
 def _chunks(items: list[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:
-    """按载荷上限切开（同一个节点接着的正文增量先合成一条）。太长的单条截断增量。"""
+    """按载荷上限切开（同一个节点接着的正文增量先合成一条；合成之后太长的再按字切成几条，不截）。"""
     merged: list[dict[str, Any]] = []
     for item in items:
         prev = merged[-1] if merged else None
@@ -303,19 +348,17 @@ def _chunks(items: list[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:
             prev["seq"] = item.get("seq", prev.get("seq"))
             continue
         merged.append(dict(item))
+    limit = PAYLOAD_MAX - 2
+    pieces: list[dict[str, Any]] = []
+    for item in merged:
+        if _size(item) <= limit:
+            pieces.append(item)
+        else:
+            pieces.extend(_split(item, limit))   # 不是正文增量又太长的（不该有）丢掉，丢了无妨：不落库的本来就不进回放
     chunk: list[dict[str, Any]] = []
     size = 2
-    for item in merged:
-        text = json.dumps(item, ensure_ascii=False, default=str)
-        n = len(text.encode())
-        if n > PAYLOAD_MAX - 2:
-            data = dict(item.get("data") or {})
-            if "delta" in data:
-                data["delta"] = str(data["delta"])[: PAYLOAD_MAX // 4]
-                item = {**item, "data": data}
-                n = len(json.dumps(item, ensure_ascii=False, default=str).encode())
-            if n > PAYLOAD_MAX - 2:
-                continue
+    for item in pieces:
+        n = _size(item)
         if chunk and size + n + 1 > PAYLOAD_MAX:
             yield chunk
             chunk, size = [], 2

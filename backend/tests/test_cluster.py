@@ -500,3 +500,66 @@ def test_the_worker_count_comes_from_the_backend_settings():
     assert ask(AGENTLAB_DATABASE_URL="", AGENTLAB_WORKERS="1").stdout.strip() == "1"
     pg = ask(AGENTLAB_DATABASE_URL="postgresql://u:p@db.internal:5432/agentlab", AGENTLAB_WORKERS="3")
     assert pg.returncode == 0 and pg.stdout.strip() == "3", pg.stderr[-1000:]
+
+
+async def test_the_relay_rereads_a_little_behind_so_a_late_commit_is_not_skipped():
+    """复核 R-b5：号先取后提交，号大的先提交时游标会越过号小的那一条——转发器往回留一小段重读、按发布过的 seq 去重。"""
+    from app.cluster.relay import relay
+    from app.core.bus import bus
+
+    async with SessionLocal() as session:
+        run = Run(status="running", owner=PEER, graph={}, input={})
+        session.add(run)
+        await session.flush()
+        session.add_all([RunEvent(id=new_id(), run_id=run.id, seq=s, type="log", ts=0, data={"n": s}) for s in (1, 3)])
+        await session.commit()
+    got: list[int] = []
+    with bus.attach(run.id) as sub, relay.follow_run(run.id, 0):
+        async def collect() -> None:
+            async for event in sub.stream():
+                got.append(event.seq)
+
+        reader = asyncio.create_task(collect())
+        await relay.pump(run.id)
+        async with SessionLocal() as session:   # 号小的那一条后提交
+            session.add(RunEvent(id=new_id(), run_id=run.id, seq=2, type="log", ts=0, data={"n": 2}))
+            await session.commit()
+        await relay.pump(run.id)
+        await relay.pump(run.id)
+        await asyncio.sleep(0.1)
+        reader.cancel()
+    assert sorted(got) == [1, 2, 3] and len(got) == 3, got
+
+
+async def test_cache_invalidations_committed_out_of_order_are_all_applied(monkeypatch):
+    """复核 R-b5：缓存失效的通知 id 大的先提交，id 小的后到也照样处理（往回留一小段重读、按 id 去重）。"""
+    from app.cluster import caches
+    from app.db.models_cluster import CacheEvent
+
+    seen: list[str | None] = []
+    caches.on("test-cache", lambda key: seen.append(key))
+    monkeypatch.setattr(caches, "_enabled", lambda: True)
+    await caches.start()
+    base = caches._last_seen or 0
+    async with SessionLocal() as session:
+        session.add(CacheEvent(id=base + 5, name="test-cache", key="late-big", owner=PEER))
+        await session.commit()
+    assert await caches.poll() == 1
+    async with SessionLocal() as session:
+        session.add(CacheEvent(id=base + 3, name="test-cache", key="early-small", owner=PEER))
+        await session.commit()
+    assert await caches.poll() == 1 and await caches.poll() == 0
+    assert seen == ["late-big", "early-small"]
+
+
+def test_a_long_merged_delta_is_split_not_cut():
+    """复核 R-b6：几条正文增量合成一条之后超过载荷上限，按字切成几条（不切坏 UTF-8），拼回来一字不少。"""
+    import json
+
+    from app.cluster.relay import PAYLOAD_MAX, _chunks
+
+    items = [{"type": "llm.token", "node_id": "w", "seq": i, "data": {"delta": "数据" * 500 + "😀"}} for i in range(1, 9)]
+    chunks = list(_chunks(items))
+    assert all(len(json.dumps(c, ensure_ascii=False).encode()) <= PAYLOAD_MAX for c in chunks)
+    text = "".join(e["data"]["delta"] for c in chunks for e in c)
+    assert text == ("数据" * 500 + "😀") * 8
