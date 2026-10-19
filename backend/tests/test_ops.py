@@ -95,11 +95,25 @@ def test_backup_sqlite_copies_a_consistent_snapshot_including_the_wal(tmp_path, 
     assert copy.execute("SELECT v FROM t").fetchall() == [("还在 WAL 里",)]
     copy.close()
     assert (stamp / "checkpoints.db").exists()
+    # 备份里是整个库：目录只有属主进得去，文件只有属主读得到
+    for level in (tmp_path / "backups", target, stamp):
+        assert _mode(level) == 0o700, level
+    assert _mode(stamp / "agentlab.db") == 0o600 and _mode(stamp / "checkpoints.db") == 0o600
+    assert sorted(p.name for p in stamp.iterdir()) == ["agentlab.db", "checkpoints.db"], "没留下 -journal 之类的"
     # 只留最近 keep 份
     for name in ("20200101T000000Z", "20200102T000000Z"):
         (target / name).mkdir()
     ops.backup_sqlite(tmp_path, keep=2)
     assert len(list(target.iterdir())) == 2 and not (target / "20200101T000000Z").exists()
+
+
+def test_backup_dir_creates_and_tightens_every_level(tmp_path, capsys):
+    (tmp_path / "backups").mkdir(mode=0o755)
+    (tmp_path / "backups").chmod(0o755)
+    assert ops.main(["backup-dir", "--data", str(tmp_path), "postgres"]) == 0
+    assert capsys.readouterr().out.strip() == str(tmp_path / "backups" / "postgres")
+    assert _mode(tmp_path / "backups") == 0o700, "已有的收紧"
+    assert _mode(tmp_path / "backups" / "postgres") == 0o700
 
 
 def test_backup_sqlite_without_databases_does_nothing(tmp_path, capsys):

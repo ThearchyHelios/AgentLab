@@ -10,12 +10,17 @@
                        用的仍是 SQLite，只是让下一次 migrate-to-postgres 认得出数据卷里那半份是自己上次留下的
     backup-sqlite      拷一份 agentlab.db、checkpoints.db 到 <数据目录>/backups/sqlite/<时间>/（SQLite 的备份接口，一致的一份），
                        只留最近 --keep 份
+    backup-dir         建（或收紧）备份目录：从 backups/ 起每一层 0700（pg_dump 写进去之前用）
     prune              目录里按名字排序只留最近 --keep 个（pg_dump 的备份用）
+
+备份里是整个库（含加密存的密钥、业务数据），目录一律 0700、文件 0600，属主是容器里的用户（同数据目录）；宿主机上要读用 sudo。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import secrets
 import sqlite3
 import sys
@@ -28,6 +33,10 @@ from app.core import atomic
 POSTGRES_DIR = ".postgres"
 STATE_FILE = "state"
 MODES = ("sqlite", "builtin", "migrating")
+BACKUPS_DIR = "backups"
+#: 备份的目录、文件的权限：只有属主（容器里的用户）能读
+BACKUP_DIR_MODE = 0o700
+BACKUP_FILE_MODE = 0o600
 
 
 def _stamp() -> str:
@@ -77,16 +86,42 @@ def write_state(data: Path, mode: str) -> None:
     atomic.write_text(root / STATE_FILE, f"mode={mode}\nsince={datetime.now(timezone.utc).isoformat()}\n", mode=0o644)
 
 
+@contextlib.contextmanager
+def _private_umask():
+    """这一段里新建的文件、目录别人读不到（SQLite 备份时建的 -journal 也一样），出来恢复原来的 umask。"""
+    old = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
+
+def backup_dir(data: Path, *parts: str) -> Path:
+    """<数据目录>/backups/<parts…>：从 backups/ 起每一层建出来（已有的收紧）成 0700，交回最里面那层。"""
+    folder = data / BACKUPS_DIR
+    levels = [folder]
+    for part in parts:
+        folder = folder / part
+        levels.append(folder)
+    for level in levels:
+        level.mkdir(exist_ok=True)
+        level.chmod(BACKUP_DIR_MODE)
+    return folder
+
+
 def _copy_sqlite(src: Path, dst: Path) -> None:
     # 读写打开、只许读：WAL 模式的库用 mode=ro 打开，关掉时会留下它自己建的 -wal（同 db/to_postgres.snapshot）
     conn = sqlite3.connect(src)
     conn.execute("PRAGMA query_only = 1")
     try:
+        # 先以 0600 建出空文件再交给 SQLite 写：从有这个文件起就只有属主读得到
+        os.close(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, BACKUP_FILE_MODE))
         out = sqlite3.connect(dst)
         try:
             conn.backup(out)
         finally:
             out.close()
+        dst.chmod(BACKUP_FILE_MODE)
     finally:
         conn.close()
 
@@ -112,11 +147,13 @@ def backup_sqlite(data: Path, *, keep: int) -> Path | None:
     sources = [p for p in (data / "agentlab.db", data / "checkpoints.db") if p.is_file()]
     if not sources:
         return None
-    root = data / "backups" / "sqlite"
-    target = root / _stamp()
-    target.mkdir(parents=True, exist_ok=True)
-    for src in sources:
-        _copy_sqlite(src, target / src.name)
+    with _private_umask():
+        root = backup_dir(data, "sqlite")
+        target = root / _stamp()
+        target.mkdir(exist_ok=True)
+        target.chmod(BACKUP_DIR_MODE)
+        for src in sources:
+            _copy_sqlite(src, target / src.name)
     prune(root, keep)
     return target
 
@@ -137,6 +174,9 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("backup-sqlite")
     b.add_argument("--data", default="/data")
     b.add_argument("--keep", type=int, default=5)
+    d = sub.add_parser("backup-dir")
+    d.add_argument("--data", default="/data")
+    d.add_argument("parts", nargs="*", help="backups/ 下面的几层，比如 postgres")
     r = sub.add_parser("prune")
     r.add_argument("--dir", required=True)
     r.add_argument("--keep", type=int, default=5)
@@ -153,6 +193,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "backup-sqlite":
         target = backup_sqlite(Path(args.data), keep=args.keep)
         print(target if target is not None else "没有 SQLite 库，不用备份")
+    elif args.command == "backup-dir":
+        print(backup_dir(Path(args.data), *args.parts))
     elif args.command == "prune":
         for gone in prune(Path(args.dir), args.keep):
             print(f"删掉旧备份 {gone.name}")

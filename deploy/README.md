@@ -10,7 +10,7 @@
 | 文件 | 用途 |
 | --- | --- |
 | `image.tar` | Docker 镜像（`docker save` 导出），镜像名 `agentlab:__AGENTLAB_VERSION__` |
-| `postgres-image.tar` | 内置 PostgreSQL 的镜像（`install --postgres` 时用，见「用 PostgreSQL」）。打包时用了 `--no-postgres` 的包里没有 |
+| `postgres-image.tar` | 内置 PostgreSQL 的镜像（`install --postgres` 时用，见「用 PostgreSQL」）。包因此多约 160 MB，导入后在 docker 里占约 0.7 GB；只用 SQLite 或外接 PostgreSQL 时用不上，打包时用 `--no-postgres` 就没有这个文件 |
 | `deploy.sh` | 一键部署脚本：安装、启动、停止、升级、卸载 |
 | `agentlab.env` | 配置：端口、监听地址、数据目录、模型 Key、代理、沙箱 |
 | `README.md` | 本说明 |
@@ -67,7 +67,20 @@ deploy.sh 依次：检查 docker 和架构 → 导入镜像（`docker load -i im
 
 `./deploy.sh upgrade` 换版本之前会自动备份一次库：SQLite 拷到数据目录的 `backups/sqlite/<时间>/`（SQLite 的备份接口，
 一致的一份），内置 PostgreSQL 用 `pg_dump` 存到 `backups/postgres/`，各只留最近 5 份（`agentlab.env` 里 `BACKUP_KEEP=` 改）。
+备份里是整个库（含加密存着的密钥），所以 `backups/` 和下面每一层目录都是 0700、备份文件 0600，属主同数据目录（uid 10001）：
+宿主机上要看、要拷走都得用 sudo（`sudo ls -l data/backups/sqlite/`、`sudo cp -a data/backups /别处/`）。
 这只是升级的保险，不代替下面的整目录备份：工件、上传文件和 `.secret_key` 不在里面。
+
+用 SQLite 的部署要从 `backups/sqlite/` 恢复（以缺省的 `./data` 为例，`<时间>` 换成目录名）：
+
+```bash
+./deploy.sh stop
+sudo rm -f data/agentlab.db-wal data/agentlab.db-shm data/checkpoints.db-wal data/checkpoints.db-shm
+sudo cp -p data/backups/sqlite/<时间>/agentlab.db data/backups/sqlite/<时间>/checkpoints.db data/   # -p：属主仍是 10001
+./deploy.sh start
+```
+
+`-wal`、`-shm` 要先删：留着的话 SQLite 会把它们当成换回来的库的一部分。
 
 deploy.sh 会把数据目录的属主改成容器里的用户（uid 10001），所以备份、删除要用 sudo。
 停下来备份最稳妥（以默认的 `./data` 为例，在包目录里执行）：
@@ -107,7 +120,8 @@ sudo tar -czf ../agentlab-data-$(date +%Y%m%d).tar.gz data
   所以数据目录照样要整份备份。
 - 用过一次之后这个数据目录就一直是内置 PostgreSQL（记在 `.postgres/state`），之后的 `install`、`upgrade`、`start` 不用再加
   `--postgres`。
-- `start`、`restart` 先起库、等 `pg_isready` 通过再起服务；`stop` 先停服务再停库。开机时两个容器一起被 docker 拉起来，库还没就绪时
+- `start` 先起库、等 `pg_isready` 通过再起服务；`stop` 先停服务再停库。`restart` 缺省只重启服务（库停着的话先把库起来），
+  `restart --postgres` 连库一起重启（先停服务再停库，再先起库后起服务）。开机时两个容器一起被 docker 拉起来，库还没就绪时
   服务按退避重试（日志里写着「应用库还没就绪……秒后重试」），最多等 90 秒（`AGENTLAB_DB_STARTUP_TIMEOUT`），不会一上来就崩。
 - 表结构和默认数据（内置模板、技能）每次启动自动补齐；几个工作进程（`AGENTLAB_WORKERS`）同时起也只做一次（库里的锁）。
 - `./deploy.sh status` 显示两个容器的状态，`./deploy.sh logs --postgres` 看库的日志。
@@ -125,15 +139,17 @@ sudo tar -czf ../agentlab-data-$(date +%Y%m%d).tar.gz data
 环境变量 `DEPLOY_<名字>` 盖过 `agentlab.env` 里的同名项（这几项加上 `HOST_PORT`、`BIND_ADDR`、`DATA_DIR`、`CONTAINER_NAME`），
 一台机器上并排部署两套、或者测试时用。
 
-**备份。** `upgrade` 前自动 `pg_dump` 一份到 `backups/postgres/`。平时要手动备份（服务开着也行，`pg_dump` 读的是一致的快照）：
+**备份。** `upgrade` 前自动 `pg_dump` 一份到 `backups/postgres/`（0600，见「数据和备份」）。平时要手动备份（服务开着也行，
+`pg_dump` 读的是一致的快照；`umask 077` 让导出的文件只有自己读得到）：
 
 ```bash
-docker exec agentlab-postgres pg_dump -U agentlab -d agentlab -Fc > agentlab-$(date +%Y%m%d).dump
+(umask 077; docker exec agentlab-postgres pg_dump -U agentlab -d agentlab -Fc > agentlab-$(date +%Y%m%d).dump)
 ```
 
 再加上数据目录（见「数据和备份」），两样合起来才是完整的一份。
 
-**恢复。** 用 `pg_dump` 的备份把库换回去（以缺省的容器名为例，`<备份>` 换成文件名）：
+**恢复。** 用 `backups/postgres/` 里的备份把库换回去（以缺省的名字、在包目录里为例，`<备份>` 换成文件名，`sudo ls data/backups/postgres/`
+看有哪些）。备份文件是 0600、属主 10001，宿主机上的人读不到，所以最后一步在一个以 10001 运行的临时容器里读它，不用 sudo：
 
 ```bash
 ./deploy.sh stop                       # 两个都停
@@ -141,9 +157,13 @@ docker start agentlab-postgres         # 只起库
 until docker exec agentlab-postgres pg_isready -q -h 127.0.0.1 -U agentlab; do sleep 1; done
 docker exec agentlab-postgres psql -U agentlab -d postgres \
   -c 'DROP DATABASE agentlab WITH (FORCE)' -c 'CREATE DATABASE agentlab OWNER agentlab'
-docker exec -i agentlab-postgres pg_restore -U agentlab -d agentlab --no-owner < <备份>
+docker run --rm --network agentlab-net -v "$(pwd)/data:/data" --user 10001:10001 -e PGPASSFILE=/data/.postgres/pgpass \
+  --entrypoint pg_restore postgres:16.15 -h agentlab-postgres -U agentlab -d agentlab --no-owner /data/backups/postgres/<备份>
 ./deploy.sh start
 ```
+
+自己手动导出、放在别处的备份（上面「备份」那条命令导出的，属主是你自己）直接从宿主机喂进去：
+`docker exec -i agentlab-postgres pg_restore -U agentlab -d agentlab --no-owner < agentlab-<日期>.dump`。
 
 数据目录要换回同一时间的备份，工件、上传文件和库里的记录才对得上。
 
@@ -165,6 +185,23 @@ docker exec -i agentlab-postgres pg_restore -U agentlab -d agentlab --no-owner <
 在 PostgreSQL 上用一段时间、做过一次完整备份（`pg_dump` 加数据目录）之后。删之前它们是回退的路：`./deploy.sh stop`、
 `sudo rm <数据目录>/.postgres/state`、`./deploy.sh install`，就回到切换那一刻的 SQLite（切换之后在 PostgreSQL 上新产生的东西
 不会带回来；库的容器停着不用，`docker rm -f agentlab-postgres` 可删）。
+
+**首次在 Linux 上切换前的检查。** 第一次在一台机器上 `install --postgres` 或 `migrate-to-postgres` 之前，花几分钟看一遍
+（以缺省的 `./data` 为例，在包目录里执行）：
+
+- **docker 版本**：`docker version --format '{{.Server.Version}}'`，要 20.10 以上（健康检查、自建网络、`--stop-timeout` 都要用）；
+  运行 deploy.sh 的用户在 `docker` 组里（`id -nG` 里有 docker），否则整条命令前加 sudo。
+- **属主**：`ls -lnd data` 第三列应是 `10001`（deploy.sh 改的）。数据目录不要放在 NFS、SMB 这类不认 uid 的挂载上：属主改不过去，
+  服务写不进去。
+- **权限**：切换（或第一次起库）之后看一眼——`ls -ld data/.postgres` 应是 `drwx--x--x`（0711），`cat data/.postgres/state`
+  不用 sudo 就能读到（deploy.sh 在宿主机上直接读它，读不到时会退回去用容器读，只是慢一点）；`sudo ls -ln data/.postgres`
+  里 `password`、`pgpass` 是 `-rw-------`、属主 10001；`sudo ls -ld data/backups` 是 `drwx------`。
+- **磁盘空间**：切换时数据目录里要放得下两份库（`backups/sqlite/` 里的一份备份，加上导入时的临时快照，用完就删），
+  另外 docker 的存储目录要放得下 PostgreSQL 的镜像（约 0.7 GB）和库本身（大致和 SQLite 的库一样大，索引多的表会大一些）。
+  看大小：`sudo du -sh data/agentlab.db data/checkpoints.db`；看剩余：`df -h data` 和
+  `df -h "$(docker info --format '{{.DockerRootDir}}')"`。
+- **整目录备份**：切换会先自动备份一份库，但还是建议先按「数据和备份」停服务整份打包一次数据目录。切换期间服务是停着的，
+  时长大致是导入的时间（每秒几千到几万行，看机器）。
 
 **卸载。** `./deploy.sh uninstall` 连库的容器和网络一起删，数据卷和数据目录都留着；同一个数据目录再 `./deploy.sh install`
 就接着用原来的库。确定不要了：`docker volume rm agentlab-pgdata`（不可恢复）。
@@ -244,12 +281,14 @@ cp ../agentlab-<旧版本>-linux-__AGENTLAB_ARCH__/agentlab.env .   # 沿用原�
 ```bash
 ./deploy.sh stop                        # 停止（开机也不会自动起来）
 ./deploy.sh start                       # 再启动
-./deploy.sh restart                     # 重启
+./deploy.sh restart                     # 重启服务（内置 PostgreSQL 不跟着重启）
+./deploy.sh restart --postgres          # 连内置 PostgreSQL 一起重启
 ./deploy.sh uninstall                   # 删除容器，保留数据和镜像
 ./deploy.sh uninstall --purge-image     # 连镜像一起删（PostgreSQL 的镜像不删，别的东西可能也在用）
 ```
 
-内置 PostgreSQL 时这几个命令按顺序管两个容器（起的时候先起库，停的时候先停服务），卸载连库的容器和网络一起删。
+内置 PostgreSQL 时这几个命令按顺序管两个容器（起的时候先起库，停的时候先停服务；`restart` 不加 `--postgres` 只动服务），
+卸载连库的容器和网络一起删。
 卸载**永远不删数据**。确定不要了再手动删除数据目录（不可恢复）：`sudo rm -rf <数据目录>`；内置 PostgreSQL 的数据卷另删：
 `docker volume rm <CONTAINER_NAME>-pgdata`。
 

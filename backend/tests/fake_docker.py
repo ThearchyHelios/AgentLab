@@ -154,7 +154,7 @@ def run_oneoff(state: dict, opts: dict, image: str, command: list[str]) -> int:
         from app import ops
 
         rest = [to_host(a, data) for a in command[2:]]
-        if rest and rest[0] in ("postgres-secrets", "state", "backup-sqlite") and "--data" not in rest:
+        if rest and rest[0] in ("postgres-secrets", "state", "backup-sqlite", "backup-dir") and "--data" not in rest:
             rest[1:1] = ["--data", data or "/data"]
         return ops.main(rest)
     if entry == "python" and command[:3] == ["-m", "app.db", "copy-to-postgres"]:
@@ -171,12 +171,17 @@ def run_oneoff(state: dict, opts: dict, image: str, command: list[str]) -> int:
             if not a.startswith("-"):
                 Path(to_host(a, data)).mkdir(parents=True, exist_ok=True)
         return 0
-    if entry == "pg_dump":
+    if entry == "sh" and command[:1] == ["-c"] and 'pg_dump "$@"' in command[1]:
+        # sh -c '<脚本>' pg_dump <参数…>：照脚本里的 umask 建文件
+        umask = 0o077 if "umask 077" in command[1] else 0o022
         if os.environ.get("FAKE_PGDUMP_FAIL"):
             print("pg_dump: fake 的失败", file=sys.stderr)
             return 1
-        out = command[command.index("-f") + 1]
-        Path(to_host(out, data)).write_bytes(b"PGDMP fake")
+        args = command[3:]
+        out = Path(to_host(args[args.index("-f") + 1], data))
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666 & ~umask)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"PGDMP fake")
         return 0
     unknown(["run", "--rm", image, *command])
     return 99

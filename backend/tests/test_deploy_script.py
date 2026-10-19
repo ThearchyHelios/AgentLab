@@ -127,7 +127,8 @@ def deploy(tmp_path):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("args", [["bogus"], ["start", "--postgres"], ["upgrade", "--postgres"],
+@pytest.mark.parametrize("args", [["bogus"], ["start", "--postgres"], ["upgrade", "--postgres"], ["status", "--postgres"],
+                                  ["restart", "--all"],
                                   ["install", "--purge-image"], ["migrate-to-postgres", "-f"], ["status", "--tail", "3"]])
 def test_unknown_arguments_are_refused_before_doing_anything(deploy, args):
     out = deploy(*args, ok=False)
@@ -138,7 +139,8 @@ def test_unknown_arguments_are_refused_before_doing_anything(deploy, args):
 
 def test_help_lists_the_postgres_commands(deploy):
     out = deploy("--help")
-    for word in ("install [--postgres]", "migrate-to-postgres", "logs [-f] [--tail N] [--postgres]", "DEPLOY_<名字>"):
+    for word in ("install [--postgres]", "migrate-to-postgres", "restart [--postgres]", "logs [-f] [--tail N] [--postgres]",
+                 "DEPLOY_<名字>"):
         assert word in out.stdout
 
 
@@ -282,12 +284,37 @@ def test_start_stop_restart_order_the_two_containers(deploy):
     pg_ready = index_of(calls, lambda a: a[:1] == ["inspect"] and a[-1] == PG and ".State.Health" in a[2])
     assert pg_start < pg_ready < index_of(calls, is_cmd("start", APP)), "先起库、等就绪，再起服务"
 
-    deploy("restart")
+    deploy("restart", "--postgres")
     calls = deploy.calls()
     order = [index_of(calls, is_cmd("stop", APP)), index_of(calls, is_cmd("stop", PG)),
              index_of(calls, is_cmd("start", PG)), index_of(calls, is_cmd("start", APP))]
-    assert order == sorted(order)
+    assert order == sorted(order), "--postgres：先停服务、再停库，先起库、再起服务"
     assert {c["state"] for c in deploy.containers().values()} == {"running"}
+
+
+def test_restart_by_default_leaves_the_database_alone(deploy):
+    deploy("install", "--postgres")
+    out = deploy("restart")
+    calls = deploy.calls()
+    assert ["restart", APP] in calls
+    assert not any(a[:1] in (["stop"], ["start"], ["restart"]) and a[-1] == PG for a in calls), "库不跟着重启"
+    assert "已重启" in out.stdout
+    # 库停着时先把库起来，服务才连得上
+    state = deploy.state()
+    state["containers"][PG]["state"] = "exited"
+    deploy.state_file.write_text(json.dumps(state))
+    deploy("restart")
+    calls = deploy.calls()
+    assert index_of(calls, is_cmd("start", PG)) < index_of(calls, lambda a: a == ["restart", APP])
+    assert not any(is_cmd("stop", PG)(a) for a in calls)
+    assert deploy.containers()[PG]["state"] == "running"
+
+
+def test_restart_postgres_needs_the_builtin_database(deploy):
+    deploy("install")
+    out = deploy("restart", "--postgres", ok=False)
+    assert "没用内置 PostgreSQL" in out.stderr
+    assert not any(a[:1] in (["stop"], ["restart"]) for a in deploy.calls()), "什么都没动"
 
 
 def test_status_and_logs_show_the_database(deploy):
@@ -346,14 +373,19 @@ def test_upgrade_builtin_dumps_after_stopping_the_app_and_keeps_the_last_n(deplo
     deploy("upgrade", DEPLOY_BACKUP_KEEP="3")
     calls = deploy.calls()
     stop = index_of(calls, is_cmd("stop", APP))
-    dump = index_of(calls, oneoff("pg_dump"))
+    dump = index_of(calls, oneoff("sh", "pg_dump"))
     new_app = index_of(calls, runs_named(APP))
     assert stop < dump < new_app, "停了旧服务再备份，备份完才起新的"
     dump_args = calls[dump]
     assert dump_args[dump_args.index("--network") + 1] == NET and "PGPASSFILE=/data/.postgres/pgpass" in dump_args
+    assert dump_args[dump_args.index("-c") + 1].startswith("umask 077 && "), "备份文件从建出来就是 0600"
+    assert dump_args[dump_args.index("--user") + 1] == "10001:10001", "属主照数据目录：容器里的用户"
     kept = sorted(p.name for p in folder.iterdir())
     assert len(kept) == 3 and kept[-1].startswith("agentlab-") and kept[-1] > "agentlab-20260103", kept
     assert (folder / kept[-1]).read_bytes() == b"PGDMP fake"
+    assert stat.S_IMODE((folder / kept[-1]).stat().st_mode) == 0o600
+    for level in (deploy.data / "backups", folder):
+        assert stat.S_IMODE(level.stat().st_mode) == 0o700, level
 
 
 def test_upgrade_sqlite_backs_up_the_database_files(deploy):
@@ -367,6 +399,9 @@ def test_upgrade_sqlite_backs_up_the_database_files(deploy):
     copy = sqlite3.connect(stamp / "agentlab.db")
     assert copy.execute("SELECT v FROM t").fetchall() == [("一",)]
     copy.close()
+    for level in (deploy.data / "backups", deploy.data / "backups" / "sqlite", stamp):
+        assert stat.S_IMODE(level.stat().st_mode) == 0o700, level
+    assert stat.S_IMODE((stamp / "agentlab.db").stat().st_mode) == 0o600
 
 
 def test_failed_backup_aborts_the_upgrade_and_restarts_the_old_service(deploy):
@@ -513,6 +548,28 @@ def test_package_script_takes_the_postgres_image_from_deploy_sh():
     out = subprocess.run(["sed", "-n", r's/^POSTGRES_IMAGE="\([^"]*\)"$/\1/p', str(REPO / "deploy" / "deploy.sh")],
                          capture_output=True, text=True, check=True)
     assert out.stdout.strip() == PG_IMAGE
+
+
+def test_env_template_lists_the_postgres_settings_commented_out_with_the_defaults():
+    """agentlab.env 模板末尾的「内置 PostgreSQL（可选）」：几项都注释着（不改任何人的部署），缺省值和 deploy.sh 里的一致。"""
+    template = (REPO / "deploy" / "agentlab.env").read_text(encoding="utf-8")
+    section = template[template.index("# ---- 内置 PostgreSQL（可选）----"):]
+    assert template.rstrip().endswith(section.rstrip()), "追加在文件末尾"
+    commented = dict(line[2:].split("=", 1) for line in section.splitlines()
+                     if line.startswith("# ") and "=" in line and line[2:3].isupper())
+    assert commented == {"POSTGRES_IMAGE": PG_IMAGE, "POSTGRES_CONTAINER": "agentlab-postgres",
+                         "DOCKER_NETWORK": "agentlab-net", "POSTGRES_VOLUME": "agentlab-pgdata", "BACKUP_KEEP": "5"}
+    assert not any(line.split("=", 1)[0] in commented for line in template.splitlines() if not line.startswith("#")), \
+        "都是注释"
+
+
+def test_settings_written_in_agentlab_env_take_effect(tmp_path):
+    deploy = Deploy(tmp_path, env_lines=["POSTGRES_CONTAINER=agl-db", "DOCKER_NETWORK=agl-n", "POSTGRES_VOLUME=agl-v",
+                                         "BACKUP_KEEP=1"])
+    deploy("install", "--postgres")
+    assert set(deploy.containers()) == {APP, "agl-db"}
+    assert deploy.containers()["agl-db"]["mounts"]["/var/lib/postgresql/data"] == "agl-v"
+    assert deploy.containers()[APP]["network"] == "agl-n"
 
 
 def test_dev_script_refuses_unknown_arguments_and_documents_postgres():

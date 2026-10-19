@@ -34,8 +34,10 @@ usage() {
   migrate-to-postgres
                      把正在用 SQLite 的部署切到内置 PostgreSQL：停服务 → 备份 → 起 PostgreSQL → 先核对再导入 → 记下
                      「已切换」→ 起服务。哪一步出错都停在原地、仍用 SQLite。重复执行是安全的；SQLite 的库文件原样留着。
-  start | stop | restart
-                     启动 / 停止 / 重启。内置 PostgreSQL 时先起库、等它就绪再起服务；停的时候先停服务再停库。
+  start | stop       启动 / 停止。内置 PostgreSQL 时先起库、等它就绪再起服务；停的时候先停服务再停库。
+  restart [--postgres]
+                     重启服务（库停着的话先把库起来）。--postgres：内置 PostgreSQL 也一起重启（先停服务、再停库，
+                     起的时候先起库）。
   status             查看容器状态、健康检查、数据目录、用的哪种库、代码沙箱和访问地址。
   logs [-f] [--tail N] [--postgres]
                      查看日志（默认最后 200 行），-f 持续跟随，--postgres 看内置 PostgreSQL 的。
@@ -66,6 +68,7 @@ TAIL="200"
 PURGE_IMAGE=""
 WITH_POSTGRES=""
 LOGS_POSTGRES=""
+RESTART_POSTGRES=""
 if [ $# -gt 0 ]; then
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -90,6 +93,7 @@ while [ $# -gt 0 ]; do
       case "$CMD" in
         install) WITH_POSTGRES=1 ;;
         logs) LOGS_POSTGRES=1 ;;
+        restart) RESTART_POSTGRES=1 ;;
         *) bad_arg "$1" ;;
       esac ;;
     *) bad_arg "$1" ;;
@@ -754,17 +758,16 @@ stop_app() {
 image_user() { docker image inspect -f '{{.Config.User}}' "$IMAGE"; }
 
 # pg_dump 一份到数据目录的 backups/postgres/，只留最近 BACKUP_KEEP 份。用 PostgreSQL 镜像里的 pg_dump（和库同版本），
-# 以数据目录的属主写文件
+# 以数据目录的属主写文件。备份里是整个库：目录 0700（app.ops backup-dir）、文件 0600（umask 077 下建，没有别人读得到的那一刻）
 backup_pg() {
   local stamp file
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   file="backups/postgres/$PG_DB-$stamp.dump"
   say "备份内置 PostgreSQL：pg_dump 到 $DATA_ABS/$file"
-  docker run --rm --network none -v "$DATA_ABS:/data" --user "$(image_user)" --entrypoint mkdir "$POSTGRES_IMAGE" \
-    -p /data/backups/postgres >/dev/null \
-    || { warn "没能在数据目录里建备份目录 backups/postgres/"; return 1; }
+  ops backup-dir postgres >/dev/null || { warn "没能在数据目录里建备份目录 backups/postgres/"; return 1; }
   docker run --rm --network "$DOCKER_NETWORK" -v "$DATA_ABS:/data" --user "$(image_user)" -e "PGPASSFILE=$PG_PASSFILE" \
-    --entrypoint pg_dump "$POSTGRES_IMAGE" -h "$POSTGRES_CONTAINER" -U "$PG_USER" -d "$PG_DB" -Fc -f "/data/$file" \
+    --entrypoint sh "$POSTGRES_IMAGE" -c 'umask 077 && exec pg_dump "$@"' pg_dump \
+    -h "$POSTGRES_CONTAINER" -U "$PG_USER" -d "$PG_DB" -Fc -f "/data/$file" \
     || { warn "pg_dump 失败"; return 1; }
   ops prune --dir /data/backups/postgres --keep "$BACKUP_KEEP" >/dev/null || warn "旧备份没删掉，不影响这次升级"
 }
@@ -1003,15 +1006,21 @@ cmd_stop() {
   say "已停止。开机也不会自动起来，要用时运行 ./deploy.sh start"
 }
 
+# 缺省只重启服务：库不用跟着断一次（库停着的话先把它起来，服务才连得上）。--postgres 连库一起重启
 cmd_restart() {
   check_docker; read_env; require_container; locate_data
-  say "重启 $CONTAINER_NAME"
-  if [ "$MODE" = builtin ]; then
+  if [ -n "$RESTART_POSTGRES" ]; then
+    [ "$MODE" = builtin ] || die "这个部署没用内置 PostgreSQL，--postgres 没有可重启的库。只重启服务：./deploy.sh restart"
+    say "重启 $CONTAINER_NAME 和内置 PostgreSQL（${POSTGRES_CONTAINER}）"
     stop_app
     stop_pg
     start_pg
     docker start "$CONTAINER_NAME" >/dev/null
   else
+    say "重启 $CONTAINER_NAME"
+    if [ "$MODE" = builtin ] && [ "$(container_state "$POSTGRES_CONTAINER")" != running ]; then
+      start_pg
+    fi
     docker restart "$CONTAINER_NAME" >/dev/null
   fi
   wait_app "已重启"
