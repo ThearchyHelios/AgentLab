@@ -60,7 +60,7 @@ function render(c) {
   try {
     const value = v.parseJson(c.json)
     const token = v.tokenAt(v.numberTokens(c.json), [])
-    if (c.cell) return { shown: v.renderCell(value, token, c.conv, c.kind, c.display) }
+    if (c.cell) return { shown: v.renderCell(value, token, c.conv, c.kind, c.display, c.plain) }
     const decimals = v.parseJson(c.decimals)
     return { shown: v.renderNumber(value, token, { unit: c.unit, decimals,
       decimalsToken: v.tokenAt(v.numberTokens(c.decimals), []), fmt: c.format, conv: c.conv }) }
@@ -137,9 +137,10 @@ def py_number(value: Any, unit: str, decimals: Any, fmt: Any, conv: Any) -> str 
         return None
 
 
-def py_cell(raw: Any, conv: Any, kind: Any, display: int) -> str | None:
+def py_cell(raw: Any, conv: Any, kind: Any, display: int, plain: bool = False) -> str | None:
     try:
-        return render_cell(_Snapshots(display=display).shown(raw), conv, kind=kind)
+        # 3 版起标识列的数不分千位：服务端按 SQL 判（cell_format），引用上记 plain，页面照它渲染
+        return render_cell(_Snapshots(display=display).shown(raw), conv, kind=kind, plain=plain and display >= 3)
     except RenderError:
         return None
 
@@ -190,9 +191,9 @@ def cell_cases() -> list[dict[str, Any]]:
         text = json.dumps(raw, ensure_ascii=False)
         for kind in CELL_KINDS:
             for conv in CELL_CONVS:
-                for display in (1, 2):
+                for display, plain in ((1, False), (2, False), (3, False), (3, True), (2, True)):
                     cases.append({"cell": True, "json": text, "kind": kind, "conv": conv, "display": display,
-                                  "py": py_cell(json.loads(text), conv, kind, display)})
+                                  "plain": plain, "py": py_cell(json.loads(text), conv, kind, display, plain)})
     return cases
 
 
@@ -331,7 +332,8 @@ def test_every_format_in_the_monthly_sample_passes_as_exported():
         "m:conv_rate": "2.35%", "m:growth": "-8.2%", "m:orders": "12840单", "m:avg": "5.81元", "m:avg|.3": "5.811元",
         "m:avg|int": "6元", "m:share|pct": "34.6%", "m:export": "15,230.4美元",
         "v:Q1.r0.region": "华南", "v:Q1.r0.gmv": "45,678.5", "v:Q1.r0.gmv|万": "4.57万", "v:Q1.r1.region": "华东",
-        "v:Q1.r1.gmv": "-1,200.75", "v:Q1.r0.order_no": "202,609,071,234,567,890",
+        # 订单号是标识列（列名以 _no 结尾）：3 版显示规则起不分千位，超过 2^53 也一位不差
+        "v:Q1.r1.gmv": "-1,200.75", "v:Q1.r0.order_no": "202609071234567890",
         "v:Q1.r0.paid_at": "2026-09-07 08:21:39",
     }
 
@@ -353,8 +355,8 @@ def test_every_format_in_the_monthly_sample_passes_as_exported():
     ("v:Q1.r0.gmv", "54,678.5", "45678.5", "45,678.5"),                                # DECIMAL 落成的数字文本
     ("v:Q1.r1.gmv", "1,200.75", "-1200.75", "-1,200.75"),                              # 负数单元格
     ("v:Q1.r0.gmv|万", "5.57万", "45678.5", "4.57万"),                                 # 单元格换算成万
-    ("v:Q1.r0.order_no", "202,609,071,234,567,891", "202609071234567890",
-     "202,609,071,234,567,890"),                                                       # 超过 2^53 的整数
+    # 超过 2^53 的整数；标识列不分组，应显示的字和引用的值一样，原因里不另写
+    ("v:Q1.r0.order_no", "202609071234567891", "202609071234567890", None),
     ("v:Q1.r0.paid_at", "2026-09-08 08:21:39", "2026-09-07T08:21:39", "2026-09-07 08:21:39"),   # 日期时间
 ])
 def test_changing_only_the_shown_text_fails_and_names_both(ref, text, cited, expected):
@@ -391,13 +393,27 @@ def test_a_format_the_page_does_not_know_cannot_pass(ref, cite, text):
     assert hit["result"] == "na" and hit["reason"].startswith("无法核对显示文字："), hit
 
 
+def test_identifier_cells_read_without_separators_and_the_page_follows():
+    """标识列（订单号这类编号，列名以 _no 结尾）的数不分千位：文档记 cell_display: 3、引用上记 plain，页面照它渲染、
+    原样通过；把 plain 去掉的伪造页，页面按千分位渲染，和正文显示的字对不上，不通过。"""
+    from tests.bundle_samples import formats_bundle
+
+    bundle = formats_bundle()
+    art, doc = doc_of(bundle)
+    seg = segment(doc, "v:Q1.r0.order_no")
+    assert doc["cell_display"] == 3 and seg["text"] == "202609071234567890" and seg["cite"]["plain"] is True
+    assert item(verdicts(bundle), "v:Q1.r0.order_no")["result"] == "pass"
+    seg["cite"].pop("plain")
+    assert item(verdicts(reseal(bundle, art, doc)), "v:Q1.r0.order_no")["result"] == "fail"
+
+
 def test_an_unknown_cell_display_version_cannot_pass():
     """文档记下的单元格显示规则版本认不出（服务端复核记 bad_schema）：单元格的显示文字判无法核对；口径卡的照常核对。"""
     from tests.bundle_samples import formats_bundle
 
     bundle = formats_bundle()
     art, doc = doc_of(bundle)
-    doc["cell_display"] = 3
+    doc["cell_display"] = 4
     got = verdicts(reseal(bundle, art, doc))
     cells = [n for n in got["numbers"] if n["ref"].startswith("v:")]
     assert cells and all(n["result"] == "na" and n["reason"].startswith("无法核对显示文字：") for n in cells)
@@ -521,7 +537,7 @@ def test_numeric_text_cells_show_their_own_digits_in_the_panel():
     table["rows"][0][2] = "202609071234567891"
     got = verdicts(formats_bundle(table=table))
     order = item(got, "v:Q1.r0.order_no")
-    assert order["result"] == "pass" and order["text"] == "202,609,071,234,567,891", order
+    assert order["result"] == "pass" and order["text"] == "202609071234567891", order
     assert order["truthText"] == "202609071234567891", order
     assert item(got, "v:Q1.r0.gmv")["truthText"] == "45678.50"
     # 不是数字文本的格子不另写原文：照旧按值写

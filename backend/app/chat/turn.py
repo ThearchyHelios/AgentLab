@@ -51,6 +51,12 @@ RETRY_WITH_BASE = ("这个工作流上一次运行没有成功：{reason}。\n\n
                    "改完继续回答原来的问题：{question}")
 #: 没有图可交回（上一次连图都没建出来）时：原问题后面缀上原因，从零再建
 RETRY_FROM_SCRATCH = "{question}\n\n（上一次没有成功：{reason}。请针对这个原因调整，重新给出完整的工作流。）"
+#: 生成过程一个操作都没给（EMPTY_GENERATION）时自动重来交给助手的话：原问题后面缀上那句纠正（error 的 reason，见
+#: copilot_gen.StreamDiagnosis.correction：只写了思考、格式跑偏、用了工具调用各有一句）。不原样重发——原样重发多半还是
+#: 只写思考（部署上撞过两次都是空的）
+RETRY_EMPTY = "{question}\n\n（上一次没有给出可用的操作：{reason}。）"
+#: 没有纠正可用（老服务端只给了「模型没有给出任何修改」）时补的那句
+EMPTY_FALLBACK = "这次请直接按输出格式给出操作（每行一个 JSON），要看表就先输出一行 look"
 #: 用户点「重试本轮」时交给助手的话（以前在问数据页 retryTurn 里拼，一轮搬到服务端之后在这里）：有图时说的是「没有给出可用的
 #: 结果」——上一次未必是运行失败（停止了、被驳回、结论不可用都算），原因是那一次的归档说法（chat/record.attempt_reason）；
 #: 没有图的同 RETRY_FROM_SCRATCH
@@ -149,6 +155,14 @@ def retry_instruction(question: str, reason: str, has_base: bool) -> str:
     return template.format(question=question, reason=reason)
 
 
+def empty_retry_instruction(question: str, reason: str) -> str:
+    """生成过程一个操作都没给、自动重来时交给助手的话：问题后面附那句纠正（reason）；纠正里没说怎么做的补 EMPTY_FALLBACK。"""
+    reason = reason.strip().rstrip("。")
+    if "look" not in reason:
+        reason = f"{reason}；{EMPTY_FALLBACK}" if reason else EMPTY_FALLBACK
+    return RETRY_EMPTY.format(question=question, reason=reason)
+
+
 def user_retry_instruction(question: str, reason: str, has_base: bool) -> str:
     """用户点「重试本轮」时交给助手的话。has_base：有上一次建出的图可以交回去改。"""
     template = RETRY_USER_WITH_BASE if has_base else RETRY_FROM_SCRATCH
@@ -160,7 +174,8 @@ def has_nodes(graph: Any) -> bool:
     return isinstance(graph, Mapping) and bool(graph.get("nodes"))
 
 
-__all__ = ["EMPTY_GENERATION", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_FAIL", "NEXT_READY", "NEXT_REPLY", "NEXT_RETRY",
-           "NEXT_RUN", "NEXT_STEPS", "QUESTION_FIELD", "RETRY_ERRORS", "RETRY_FROM_SCRATCH", "RETRY_USER_WITH_BASE",
-           "RETRY_WITH_BASE", "blocked_reason", "error_reason", "fill_input", "has_nodes", "next_step", "retry_after_review",
+__all__ = ["EMPTY_FALLBACK", "EMPTY_GENERATION", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_FAIL", "NEXT_READY",
+           "NEXT_REPLY", "NEXT_RETRY", "NEXT_RUN", "NEXT_STEPS", "QUESTION_FIELD", "RETRY_EMPTY", "RETRY_ERRORS",
+           "RETRY_FROM_SCRATCH", "RETRY_USER_WITH_BASE", "RETRY_WITH_BASE", "blocked_reason",
+           "empty_retry_instruction", "error_reason", "fill_input", "has_nodes", "next_step", "retry_after_review",
            "retry_instruction", "review_reason", "user_retry_instruction"]

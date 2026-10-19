@@ -866,7 +866,9 @@ async def test_an_empty_generation_is_retried_once_on_the_server(client, monkeyp
     await _done(turn_id)
     events = await _events(turn_id)
     [retry] = [e["data"] for e in events if e["type"] == "turn.retry"]
-    assert retry["kind"] == "empty" and retry["reason"] == "模型没有给出任何修改，也没有说明原因"
+    # 原因是重来时交给助手的那句纠正（这次连思考都没有），诊断（不含原文）随事件记下
+    assert retry["kind"] == "empty" and retry["reason"].startswith("什么都没有输出"), retry
+    assert "正文 0 字" in retry["detail"], retry
     row = await _row(turn_id)
     assert row.status == "done" and row.answer == "上周没有华中区的数据" and row.meta["noQuery"] is True
     assert row.meta["usage"]["copilot"]["calls"] == 2, "两次建图都是这一轮花的"

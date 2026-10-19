@@ -229,7 +229,8 @@ NODE_REFERENCE = """\
   **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游的口径卡指标、查询结果
   （tool 节点和 agent 查过的库、merge 的合并结果，按查询先后编成 Q1、Q2…）、查库当时的表结构、知识库检索（按先后编成 K1、K2…）
   和运行输入，模型只能写引用标记，数值由系统从证据里取出来渲染；模型自己写的数字会被打回重写：
-  - [[m:指标id]]：口径卡指标。比率、增幅、占比、差值这类派生计算只能先在口径卡里登记再引用
+  - [[m:指标id]]：口径卡指标。比率、增幅、占比、差值这类派生计算只能先在口径卡里登记再引用。渲染出来自带单位（口径卡里的
+    unit，「8条」），instructions 里不要写成「覆盖 [[m:line_count]] 条产线」这样后面再跟一个单位，写「覆盖 [[m:line_count]] 产线」
   - [[v:Q1.r0.列名]]：第 1 次查询结果里第 0 行那一列的原值（行号从 0 数）
   - [[table:Q1 cols=列a,列b rows=0-4]]：把查询结果的几行几列原样生成表格，每一格都点得开出处
   - [[i:输入字段]]：运行输入
@@ -289,6 +290,10 @@ NODE_REFERENCE = """\
 4. 不要用 transform 解析 agent / llm 的文字：口径卡读 cell(nodes.查库节点id, 行, '列名') 或 vars.<agent 的 assign_to>.字段
 5. 数据在两个库、要按行对齐时：两个 tool 节点各自聚合到相同的键和粒度 → merge 按键合并 → 口径卡算派生指标 → report。
    同一个库写成一条 SQL；只组合几个单值用口径卡的 cell()；不要用 code 节点合并（出处会断，喂给口径卡时核对不了）
+6. 问题里的「今天、昨天、上周、本月、去年」这类相对日期一律按运行当天算：SQL 用数据源方言里取当天的写法（CURRENT_DATE、
+   CURDATE()、date('now')、SYSDATE），agent 先调 current_time 拿到当天日期再写条件（agent 的 prompt 里写明这一点、tools 绑上
+   current_time）。不要用表里最大的日期（MAX(日期)）去推「上周」「本月」：数据没更新到那段时间时，推出来的是另一段，报告还会
+   把它当成上周来写。想让报告说清数据最新到哪天，另取一列 MAX(日期) AS 数据最新日期
 
 模型字段（llm / agent / supervisor / report 的 config.model）：
 - **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。
@@ -928,9 +933,11 @@ async def generate(
         async for _op in gen.draft(human):
             pass
         if applier.replied is None and gen.asked is None and all(o.get("op") == "plan" for o in applier.seen):
-            raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因")
+            raise gen.empty()
     except Exception as e:  # noqa: BLE001
         reason, _ = explain_error(e)
+        if isinstance(e, CopilotIncomplete) and e.detail:
+            reason = f"{reason}；{e.detail}"
         raise HTTPException(
             502, f"模型未返回可用的工作流（{reason}）。请换一种描述重试；如反复出现，"
                  "请在输入框的「助手使用的模型」中换用指令遵循能力更强的模型",
@@ -1765,11 +1772,13 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
             if gen.asked is None and all(o.get("op") == "plan" for o in applier.seen):
                 # 只写了思考（deepseek 这类推理模型偶发）、或者格式跑偏：带机读码，问数据页和评测按 chat/turn 的规矩自动
                 # 重来一次（error.next = retry），还不行再照实报
-                raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
-                                        hint="画布未修改。可以重试，或把需求描述得更具体", code=turn.EMPTY_GENERATION)
+                # 错误详情里记诊断（结束原因、正文和思考的长度、跳过的行和原因、工具调用……，不记原文），重来时交给助手的
+                # 原因换成一句纠正（Generation.empty）
+                raise gen.empty(hint="画布未修改。可以重试，或把需求描述得更具体")
         except CopilotIncomplete as e:
             failed = {"op": "error", "message": f"助手本轮未完成：{e}", "hint": e.hint, "detail": e.detail,
-                      "reason": str(e), **({"code": e.code} if e.code else {})}
+                      "reason": e.correction or str(e), **({"code": e.code} if e.code else {}),
+                      **({"diagnostics": e.diagnostics} if e.diagnostics else {})}
             yield {**failed, "next": turn.next_step(failed)}
             return
         except Exception as e:  # noqa: BLE001
@@ -2451,8 +2460,7 @@ async def app_stream(payload: AppStreamIn, session: AsyncSession = Depends(get_s
                 return
             if gen.asked is None and gen.done is None and not applier.effective:
                 # 流正常结束，却没有 done、也没有一个操作落地：不能按「无需修改」交付
-                raise CopilotIncomplete("模型没有给出任何修改，也没有说明原因",
-                                        hint="应用草稿未修改。可以重试，或把要求描述得更具体")
+                raise gen.empty(hint="应用草稿未修改。可以重试，或把要求描述得更具体")
             async for op in _with_heartbeat(gen.repair(), phase="repairing"):
                 yield _sse(op)
             remaining = await checker.issues()
@@ -2804,5 +2812,7 @@ async def review_of_run(session: AsyncSession, run: Any, *, question: str, provi
             chat_model, question=question, answer=answer, signals=signals,
             # 报告撰写节点产出的答案逐段对应着证据文档：只能加说明，不能改写
             locked=bool(output and output.get("_evidence")),
+            # 已经处理好的（首稿没过、重写后已全部通过……）：不是缺口，照实告诉复核模型
+            settled=rv.notes(rows),
         )
     return done(result)

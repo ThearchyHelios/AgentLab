@@ -58,7 +58,8 @@ def test_iso_datetimes_read_with_a_space(catalog):
     assert when["cite"]["value"] == "2026-06-30T08:21:39"
     assert when["cite"]["eid"] == cell_eid(ART, 0, "redeemed_at")
     assert store["text"] == "门店01"
-    assert doc["cell_display"] == CELL_DISPLAY == 2 and doc_cell_display(doc) == 2
+    # 记的是渲染得出这些格子的最低一版：3 版（整表截行）不改格子的写法，只有日期时间被改写的照旧记 2
+    assert doc["cell_display"] == 2 and doc_cell_display(doc) == 2 and CELL_DISPLAY >= 2
     assert '"cell_display":2' in canonical_json(doc), "在文档顶层，参与内容哈希"
     assert verify_doc(doc, catalog, loader=load)["ok"]
 

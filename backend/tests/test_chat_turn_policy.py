@@ -194,7 +194,10 @@ async def test_answer_ops_says_to_retry_an_empty_generation(client, monkeypatch)
                 events.append(json.loads(line[6:]))
     [err] = [e for e in events if e["op"] == "error"]
     assert err["code"] == turn.EMPTY_GENERATION and err["next"] == "retry", err
-    assert err["reason"] == "模型没有给出任何修改，也没有说明原因" and err["message"].startswith("助手本轮未完成")
+    # 原因是重来时交给助手的那句纠正（这次连思考都没有），诊断写在 detail（不含原文）
+    assert err["reason"].startswith("什么都没有输出") and "look" in err["reason"], err
+    assert err["message"] == "助手本轮未完成：模型没有给出任何修改，也没有说明原因"
+    assert "正文 0 字，思考 0 字" in err["detail"] and err["diagnostics"]["ops"] == 0
 
 
 async def test_the_eval_driver_retries_an_empty_generation_once(monkeypatch):
@@ -226,8 +229,10 @@ async def test_the_eval_driver_retries_an_empty_generation_once(monkeypatch):
             suite_id="s", suite_name="虚构题集", eval_run_id="e", case_id=None, case_seq=1, actor=None))
         t = await driver.drive()
         assert t.path == path and t.attempts == 1 and model.calls == 2, (t.path, t.attempts, model.calls, t.reason)
-        assert t.retries == ["模型没有给出任何修改，也没有说明原因"], t.retries
-        assert seen[1] == turn.retry_instruction("上周华中区销售额", t.retries[0], False), seen
+        assert len(t.retries) == 1 and t.retries[0].startswith("什么都没有输出"), t.retries
+        # 重来时问题后面附那句纠正，不原样重发
+        assert seen[1] == turn.empty_retry_instruction("上周华中区销售额", t.retries[0]) != seen[0], seen
+        assert "什么都没有输出" in seen[1]
         if path == "build_failed":
             assert t.copilot_failed and t.reason.startswith("助手本轮未完成"), t.reason
         assert t.usage["assistant"]["calls"] == 2, "两次生成都是这一题花的"

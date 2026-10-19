@@ -37,7 +37,8 @@ import asyncio
 import re
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from datetime import date, datetime
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -56,6 +57,7 @@ from app.engine.evidence import (
     ENTITY_KINDS,
     MARKER_RULES,
     SEE_AND_CODE_RULES,
+    UNIT_RULE,
     StreamRenderer,
     WriterCatalog,
     build_catalog,
@@ -63,6 +65,7 @@ from app.engine.evidence import (
     compose_doc,
     describe_violations,
     ledger_enabled,
+    period_rule,
     withhold_metrics,
     writer_catalog,
 )
@@ -234,18 +237,54 @@ def failed_queries(state: GraphState, spec: GraphSpec, node: GraphNode) -> list[
         result = outputs.get(other.id)
         if other.id not in allowed or (keep is not None and other.id not in keep) or not isinstance(result, dict):
             continue
-        for call in result.get("tool_calls") or []:
-            if not isinstance(call, dict) or call.get("repeat") or call.get("skipped") or call.get("denied"):
-                continue
+        calls = [c for c in result.get("tool_calls") or []
+                 if isinstance(c, dict) and not (c.get("repeat") or c.get("skipped") or c.get("denied"))
+                 and is_platform_query(str(c.get("tool") or ""))]
+        for i, call in enumerate(calls):
             name, said = str(call.get("tool") or ""), str(call.get("result") or "").strip()
-            if not is_platform_query(name) or not (call.get("ok") is False or said.startswith("查询失败")):
+            if not _query_failed(call):
                 continue
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            if _superseded(name, str(args.get("sql") or ""), calls[i + 1:]):
+                # 写错了一条、下一条马上改对了：这次失败已被替代，不算「没有查到」（不然写作模型会写「还有一次取数失败」，
+                # 复核据此判有缺口）
+                continue
             reason = said.splitlines()[0] if said else "没有交回结果"
             found.append({"node_id": other.id, "title": other.title or other.id, "tool": name,
                           "sql": " ".join(str(args.get("sql") or "").split())[:200],
                           "reason": reason[:FAILED_REASON_CHARS]})
     return found
+
+
+def _query_failed(call: Mapping[str, Any]) -> bool:
+    said = str(call.get("result") or "").strip()
+    return call.get("ok") is False or said.startswith("查询失败")
+
+
+def _tables(sql: str) -> set[str] | None:
+    """这条 SQL 读的表（sql_semantics.facets 的 tables，按比较用的写法）；解析不了的为 None。"""
+    from app.data.sql_semantics import facets
+
+    f = facets(sql)
+    if f.parse_error or not f.tables:
+        return None
+    return {str(p.key) for p in f.tables}
+
+
+def _superseded(tool: str, sql: str, later: list[dict[str, Any]]) -> bool:
+    """同一个节点里这次失败之后，还有一条成功的平台查询替代了它：同一个数据源（同一个查询工具）、读的表覆盖了失败那条读的
+    表；失败那条解析不了（取不出表）的，同一个数据源之后有成功的查询就算。"""
+    wanted = _tables(sql)
+    for call in later:
+        if str(call.get("tool") or "") != tool or _query_failed(call):
+            continue
+        if wanted is None:
+            return True
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        got = _tables(str(args.get("sql") or ""))
+        if got is not None and wanted <= got:
+            return True
+    return False
 
 
 def _failed_section(failed: list[dict[str, Any]], *, any_query: bool) -> str:
@@ -598,12 +637,17 @@ def _repair_request(violations: list[dict[str, Any]], failed_rule: str | None = 
     )
 
 
+def run_today() -> date:
+    """写作规则里的「今天」（period_rule）：服务端所在时区的日期，和查库时 CURRENT_DATE 一类按运行当天现算的写法同一天。"""
+    return datetime.now().astimezone().date()
+
+
 def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims: str = "off",
               failed: str | None = None) -> list[BaseMessage]:
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
-    rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}"
+    rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}\n{UNIT_RULE}\n{period_rule(run_today())}"
     if writer.guarded:
         # 写作者看不全证据（目录有省略、有来源的结构化结论为空）：「没有查到」这类结论没有依据
         rules = f"{rules}\n{ABSENCE_RULE}"
@@ -791,7 +835,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs \
             and not (repairs and not _fatal(blocking)):
         repairs += 1
-        ctx.emit(EventType.LOG, level="warn", code="report_repair",
+        ctx.emit(EventType.LOG, level="warn", code="report_repair", count=len(blocking), attempt=repairs,
                  message=f"报告有 {len(blocking)} 处未通过核对（{_named(blocking)}），"
                          f"已要求模型重写（第 {repairs} 次）")
         messages = [*messages, response, HumanMessage(content=_repair_request(blocking, failed_rule))]
@@ -979,7 +1023,7 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
     if judge_cfg["rewrite_once"] and bad:
         texts = judging.unit_texts(doc)
         sentences = [(texts.get(uid, ""), _rewrite_reason(outcome["verdicts"][uid])) for uid in bad]
-        ctx.emit(EventType.LOG, level="warn", code="report_rewrite",
+        ctx.emit(EventType.LOG, level="warn", code="report_rewrite", count=len(bad),
                  message=f"裁判认为 {len(bad)} 句结论证据不支持（{_named([{'text': t} for t, _ in sentences])}），"
                          "已退回写作模型仅修改这几句")
         again, raw = await draft([*messages, HumanMessage(content=_rewrite_request(sentences))])

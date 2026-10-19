@@ -50,6 +50,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any, Literal, TypedDict
 
@@ -60,7 +61,7 @@ from app.data.provenance_types import DOC_PROVENANCE
 from app.data.tabular import UNSHAPED_NOTE
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell
 from app.engine.guards import FALLBACK_CONTEXT
-from app.engine.issuance import _tolerance, extract_numbers, number_allowance
+from app.engine.issuance import _CN_COUNT_UNIT, _tolerance, extract_numbers, number_allowance
 from app.engine.labels import option_label
 
 DOC_SCHEMA = "agentlab.report/1"
@@ -76,10 +77,16 @@ ENTITY_SYNTAXES = frozenset({1, 2})
 #: - 1：照快照里的原样显示，ISO 日期时间带 T（2026-06-30T08:21:39）。没有这个字段的老文档按它复核
 #: - 2：ISO 日期时间显示成「2026-06-30 08:21:39」（小数秒、时区照留）。只改显示：快照里的值、引用记下的 value、
 #:   eid、证据下钻都不变
-#: 新组装的文档里真有日期时间被改写时才记 cell_display: 2（参与内容哈希），没有的文档和以前一字不差。复核必须按
+#: - 3：整表标记 rows= 的结束行越界、起始行在范围内时，截到最后一行（以前整张表算解析不了）。截完照样展开成一格格的
+#:   单元格引用、按格复核，所以这一条只影响组装；复核 3 版以前的文档时，没展开的整表标记照老规矩判，不然老文档里那句
+#:   「没有第 N 行」重新解析得了，会被当成文档被改过（render_mismatch）。另外标识列（编码、编号、分组键，见
+#:   cell_format.plain_columns）的数不分千位：编码 1203 不写成「1,203」。真有格子因此改了写法的文档记 cell_display: 3，
+#:   引用上记 plain: true（离线核对页解析不了 SQL，照它渲染）
+#: 新组装的文档里真有格子因为显示规则改了写法时才记 cell_display（参与内容哈希），记的是渲染得出这些格子的最低一版
+#: （只有日期时间被改写的记 2：标识列没有因此改写法的，3 版的整表截行不改格子的写法），没有的文档和以前一字不差。复核必须按
 #: 文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过（render_mismatch）
-CELL_DISPLAY = 2
-CELL_DISPLAYS = frozenset({1, 2})
+CELL_DISPLAY = 3
+CELL_DISPLAYS = frozenset({1, 2, 3})
 _ISO_DATETIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)$")
 
 
@@ -699,10 +706,11 @@ def render_metric(metric: dict[str, Any], conv: str | None = None) -> str:
     )
 
 
-def render_cell(value: Any, conv: str | None = None, *, kind: str | None = None) -> str:
+def render_cell(value: Any, conv: str | None = None, *, kind: str | None = None, plain: bool = False) -> str:
     """查询快照里的一格渲染成字。
 
-    - 数按千分位，小数位照值本来的样子（最多 10 位、去尾零）；DECIMAL 落盘后的数字文本
+    - 数按千分位，小数位照值本来的样子（最多 10 位、去尾零）；plain 时不分组（标识列：编码 1203 不写成「1,203」，
+      哪几列是标识列见 cell_format.plain_columns）。DECIMAL 落盘后的数字文本
       （"45678.50"，小数位为 0 的 "45678"，规则见 expressions.cell_value）按数算，用 Decimal
       渲染，不经 float 丢精度
     - kind 是这一列查询时记下的类型：text 列按文本，VARCHAR 的 "2026" 不渲染成「2,026」；
@@ -710,16 +718,17 @@ def render_cell(value: Any, conv: str | None = None, *, kind: str | None = None)
     - NULL 显示「—」：这是快照里的事实（那一格就是空的），不是缺值，更不是 0
     - 文本压成一行，竖线换成 ¦：它常常落在表格里，原样的 | 会多切出一格
     """
+    fmt = "plain" if plain else DEFAULT_FORMAT
     if isinstance(value, str) and cell_value(value, kind) is not value:
         try:
-            return _render_numeric(Decimal(value.strip()), unit="", decimals=None, fmt=DEFAULT_FORMAT, conv=conv)
+            return _render_numeric(Decimal(value.strip()), unit="", decimals=None, fmt=fmt, conv=conv)
         except RenderError:
             raise
         except (ArithmeticError, ValueError) as e:
             raise RenderError(f"「{value}」无法按规则显示") from e
     if isinstance(value, (dict, list)):
         value = json.dumps(value, ensure_ascii=False, default=str)
-    return render_number(value, fmt=DEFAULT_FORMAT, conv=conv).replace("|", "¦")
+    return render_number(value, fmt=fmt, conv=conv).replace("|", "¦")
 
 
 # --------------------------------------------------------------------------
@@ -1313,13 +1322,27 @@ class _Snapshots:
         self.syntax = ENTITY_SYNTAX if syntax is None else syntax
         #: 单元格按哪一版显示规则渲染（CELL_DISPLAY）：组装、流式渲染用当前版，复核按文档记下的版本
         self.display = CELL_DISPLAY if display is None else display
-        #: 这一次解析里有没有哪一格因为显示规则改了写法：组装时据此决定文档记不记 cell_display
-        self.reformatted = False
+        #: 这一次解析里的单元格要按哪一版显示规则才渲染得出来（有格子因为某一版的规则改了写法，就至少是那一版）：
+        #: 组装时据此决定文档记不记、记哪一版 cell_display
+        self.needed = 1
+        #: 每份查询快照里的标识列（cell_format.plain_columns），按快照的工件 id 记
+        self.plains: dict[str, frozenset[str]] = {}
+
+    def plain(self, artifact: Any, snapshot: Any) -> frozenset[str]:
+        """这份查询快照里按标识列显示（数不分千位）的结果列。3 版以前的显示规则没有这一条，一律分千位。"""
+        if self.display < 3 or not isinstance(snapshot, dict):
+            return frozenset()
+        key = str(artifact or "")
+        if key not in self.plains:
+            from app.engine.cell_format import plain_columns
+
+            self.plains[key] = plain_columns(snapshot, lambda a: self._fetch(a, "表结构快照")[0])
+        return self.plains[key]
 
     def shown(self, raw: Any) -> Any:
         """按显示规则要显示的原值：2 版起 ISO 日期时间的 T 换成空格。没改就是原值本身。"""
         if self.display >= 2 and isinstance(raw, str) and (m := _ISO_DATETIME.match(raw.strip())):
-            self.reformatted = True
+            self.needed = max(self.needed, 2)
             return f"{m.group(1)} {m.group(2)}"
         return raw
 
@@ -1337,6 +1360,7 @@ class _Snapshots:
             return self
         twin = _Snapshots(self.loader, entities=self.entities_on, syntax=syntax, display=display)
         twin.memo = self.memo
+        twin.plains = self.plains
         return twin
 
     def get(self, alias: str, artifact: Any) -> tuple[Any, str | None]:
@@ -1435,7 +1459,14 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
     try:
         raw, column = locate_cell(snapshot, parsed["row"], parsed["column"])
         kind = column_kind(snapshot, column)
-        rendered = render_cell(snaps.shown(raw), conv, kind=kind)
+        shown = snaps.shown(raw)
+        rendered = render_cell(shown, conv, kind=kind)
+        plain = column in snaps.plain(entry.get("artifact"), snapshot) \
+            and render_cell(shown, conv, kind=kind, plain=True) != rendered
+        if plain:
+            # 标识列（3 版起）：数不分千位。真改了写法才记——文档的 cell_display 记成 3，引用上记 plain，离线核对页照它渲染
+            rendered = render_cell(shown, conv, kind=kind, plain=True)
+            snaps.needed = max(snaps.needed, 3)
     except CellError as e:
         return _unresolved(marker, alias, "cell", f"{alias} {e}")
     except RenderError as e:
@@ -1446,6 +1477,8 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
             "rendered": rendered}
     if conv:
         cite["conv"] = conv
+    if plain:
+        cite["plain"] = True
     return cite
 
 
@@ -1508,12 +1541,15 @@ def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapsho
         if last < first:
             return fail(f"整表引用的行号范围格式有误，当前为「{options['rows']}」",
                         f"rows 要写成 0-4 这样从小到大的行号范围（从 0 数），写的是 {options['rows']}")
+        if first >= len(rows) or (last >= len(rows) and snaps.display < 3):
+            # 3 版以前结束行越界也算解析不了：复核老文档里没展开的整表标记照老规矩判（见 CELL_DISPLAY）
+            return fail(f"{alias} 只有 {len(rows)} 行，没有第 {first if first >= len(rows) else last} 行（行号从 0 开始）")
+        # 结束行写过了头（写作者以为有 5 行、其实只有 3 行）：起始行在范围内，就截到最后一行，不加注——表格照实只有这几行
+        last = min(last, len(rows) - 1)
         if last - first + 1 > TABLE_MAX_ROWS:
             return fail(f"整表最多 {TABLE_MAX_ROWS} 行，当前选了 {last - first + 1} 行",
                         f"整表最多 {TABLE_MAX_ROWS} 行，rows={options['rows']} 是 {last - first + 1} 行："
                         "挑出要的行，或者分成几张表")
-        if last >= len(rows):
-            return fail(f"{alias} 只有 {len(rows)} 行，没有第 {last} 行（行号从 0 开始）")
     else:
         first, last = 0, min(TABLE_DEFAULT_ROWS, len(rows)) - 1
     for c in wanted:
@@ -1683,6 +1719,41 @@ def _resolve_entity(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
             "kind": ev_kind, "role": "entity", "status": "resolved", "rendered": ref}
 
 
+#: 字段标记前面这几种连接：「产量表的」「产量表中的」「产量表里的」，或者只隔空白（_short_column）
+_SHORT_JOINERS = ("中的", "里的", "的", "")
+#: 流式渲染时为 _short_column 留着的已渲染文字有多长：表名再长也够看
+SHORT_LOOKBACK = 160
+
+
+def _short_column(before: str, ref: str) -> str | None:
+    """[[c:表.列]] 前面紧挨着（隔空白、「的」「中的」「里的」）刚写过同一张表的名字时，正文里只显示列名：交回列名，不用缩短的
+    交回 None。部署上撞过「取自 某表 的 某表.某列」。
+
+    before 是标记前面已经渲染出来的正文（[[t:表]] 渲染出来就是表名本身，写成文字的表名也算）。表名按 name_key 比（只对
+    ASCII 不分大小写），带库名的写法（db.表.列）全名、末段都认；英文名前面还连着字母、数字、下划线的不算（myorders 不是
+    orders）。粗体、斜体收尾的星号、下划线跳过。"""
+    table, dot, column = ref.strip().rpartition(".")
+    if not dot or not table or not column:
+        return None
+    tail = before.rstrip(_BLANK)
+    for joiner in _SHORT_JOINERS:
+        if joiner and not tail.endswith(joiner):
+            continue
+        head = tail[:len(tail) - len(joiner)].rstrip(_BLANK) if joiner else tail
+        if not joiner and head == before:
+            continue                                   # 什么都没隔：「产量表产量表.工厂」不是这种写法，不动
+        head = head.rstrip("*_")
+        for name in dict.fromkeys((table, table.rsplit(".", 1)[-1])):
+            start = len(head) - len(name)
+            if start < 0 or name_key(head[start:]) != name_key(name):
+                continue
+            if start > 0 and name[0].isascii() and (head[start - 1].isascii() and (head[start - 1].isalnum()
+                                                                                  or head[start - 1] == "_")):
+                continue
+            return column
+    return None
+
+
 # --------------------------------------------------------------------------
 # 引文：[[q:K1|原话]] 要在检索快照的命中片段里逐字出现
 # --------------------------------------------------------------------------
@@ -1833,6 +1904,10 @@ _UNIT_GAP = 2
 _UNIT_MAX = 10
 UNIT_LOOKAHEAD = _UNIT_GAP + _UNIT_MAX + 1
 _UNIT_KINDS = frozenset({"m", "i", "v"})
+#: 以一个字的单位打头的更长的单位：口径卡是「人」、正文紧跟着写「人次」，是另一个单位，不当重复的去掉（_tidy）
+_LONGER_UNIT = re.compile(
+    r"人次|人天|人日|人月|人年|人份|件次|台次|台套|台时|车次|架次|班次|户次|批次|个月|个季度|个工作日|个百分点"
+    r"|小时|分钟|吨公里|公里|公斤|千克|千米|千瓦|万元|亿元|美元|港元|欧元|日元|元/")
 #: 渲染结果末尾的单位：最后一个数字后面的字（12,345人次 → 人次，4.57万元 → 万元，12.5% → %）
 _UNIT_TAIL = re.compile(r"\d([^\d\s][^\d]*)$")
 _BLANK = " \t\u3000"
@@ -1888,8 +1963,9 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
     """渲染前收拾两处排版，数和引用都不动：
 
     - 数字标记后面重复写的单位去掉。[[m:visits]] 渲染出来已经带单位（12,345人次），写作者常常
-      还跟着写一遍（[[m:visits]] 人次），读者看到的是「12,345人次 人次」。单字的单位后面紧跟着字时
-      不动：写作者写的可能是另一个单位（口径卡是「人」，正文写「人次」），硬删会把不一致藏起来；
+      还跟着写一遍（[[m:visits]] 人次），读者看到的是「12,345人次 人次」。单字的单位后面紧跟着字、和它
+      连起来是一个更长的单位时（_LONGER_UNIT）不动：写作者写的是另一个单位（口径卡是「人」，正文写「人次」），
+      硬删会把不一致藏起来；连起来不是单位的（「覆盖 [[m:lines]] 条产线」，口径卡的单位是「条」）照样去掉；
     - [[see:…]] 渲染成空，它周围留下的空白、括号、标点去掉（_voids、_see_cuts）：「最高月份 [[see:Q2]]。」会剩下
       「最高月份 。」，「结果一致（[[see:Q3]]，原报告…）」会剩下「结果一致（，原报告…）」。依据（连同去掉的字）两边
       挨上的字会读成一串的，补一个空格（_glue）：「4,919.5[[see:Q1]]212 笔」会读成「4,919.5212 笔」。
@@ -1906,7 +1982,8 @@ def _tidy(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: 
         hit = re.compile(f"[{_BLANK}]{{0,{_UNIT_GAP}}}" + re.escape(unit)).match(text, marker["end"])
         if hit:
             after = text[hit.end():hit.end() + 1]
-            if len(unit) > 1 or not after.isalnum():
+            longer = _LONGER_UNIT.match(text, hit.end() - len(unit))
+            if len(unit) > 1 or not after.isalnum() or not (longer and len(longer.group(0)) > len(unit)):
                 cuts.append((marker["end"], hit.end()))
     see: list[tuple[int, int]] = []
     spaces: set[int] = set()
@@ -2112,14 +2189,19 @@ def _wordish(ch: str) -> bool:
     return ch.isdecimal() or (ch.isascii() and ch.isalnum())
 
 
-def _render(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "") -> str:
+def _render(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, prev: str = "",
+            before: str = "") -> str:
+    """before：这段文字前面已经渲染出来的正文（流式渲染分块时用），字段标记要看前面刚写过的表名（_short_column）。"""
     text = _tidy(_expand_tables(text, catalog, snaps, cells_allowed, prev), catalog, snaps, cells_allowed, prev)
     out: list[str] = []
     last = 0
     for marker in parse_markers(text):
         out.append(text[last:marker["start"]])
         if marker["kind"] != "see":
-            out.append(resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)["rendered"])
+            cite = resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps)
+            short = _short_column(before + "".join(out), cite["ref"]) \
+                if marker["kind"] == "c" and cite["status"] == "resolved" else None
+            out.append(short or cite["rendered"])
         last = marker["end"]
     out.append(text[last:])
     return "".join(out)
@@ -2205,6 +2287,8 @@ class StreamRenderer:
         self.snaps = _Snapshots(loader)
         self.pending = ""
         self.prev = ""
+        #: 已经放出去的正文的末尾一截：字段标记要看前面刚写过的表名（_short_column）
+        self.shown = ""
 
     def _has_unit(self, marker: dict[str, Any]) -> bool:
         return bool(_rendered_unit(marker, self.catalog, self.snaps, self.cells_allowed))
@@ -2212,8 +2296,9 @@ class StreamRenderer:
     def _release(self, ready: str) -> str:
         if not ready:
             return ""
-        out = _render(ready, self.catalog, self.snaps, self.cells_allowed, self.prev)
+        out = _render(ready, self.catalog, self.snaps, self.cells_allowed, self.prev, self.shown)
         self.prev = ready[-1]
+        self.shown = (self.shown + out)[-SHORT_LOOKBACK:]
         return out
 
     def feed(self, delta: str) -> str:
@@ -2826,6 +2911,9 @@ def compose_doc(
                             continue
                         cite = _stored(resolve_marker(marker, catalog, cells_allowed=cells_allowed, loader=snaps))
                         ok = cite["status"] == "resolved"
+                        if ok and marker["kind"] == "c" and (short := _short_column("".join(parts), cite["ref"])):
+                            # 紧跟在同一张表名后面：只显示列名，引用上记 short，复核照它核对（老文档没有这一项，照全名）
+                            cite = {**cite, "rendered": short, "short": True}
                         seg = {
                             "kind": _SEG_KIND.get(marker["kind"])
                             or ("number" if marker["kind"] == "m" or (ok and is_number(cite.get("value")))
@@ -2863,7 +2951,8 @@ def compose_doc(
                     unit["segments"] = _link_entities(unit["segments"], catalog, index)
         all_segments = [s for block in out_blocks for unit in block["units"] for s in unit["segments"]]
     # 裸数字单独切成片段：前端要在那几个字底下画「无出处」
-    refs = [tuple(s["span"]) for s in all_segments if s.get("ref")] + _header_masks(out_blocks, catalog)
+    refs = [tuple(s["span"]) for s in all_segments if s.get("ref")] + _header_masks(out_blocks, catalog) \
+        + _name_masks(markdown, catalog, snaps)
     syntax = [tuple(s["span"]) for s in all_segments if s["kind"] == "structural"]
     bare = _bare_numbers(markdown, refs, allow_numbers, syntax)
     for block in out_blocks:
@@ -2904,10 +2993,11 @@ def compose_doc(
     # entity_syntax：这份文档按哪一版实体语法组装，复核照它走（verify_doc）。在文档顶层，参与内容哈希
     # provenance：期 4 的文档标记（P4-SPEC 1.4）。带它的文档才有查询步骤的提示字段、推断来源、裁判摘录的新行；
     # 没有它的（期 4 之前组装的）一律按原样展示。写在顶层、参与内容哈希，事后补不上：补了哈希就变，封存链就断
-    # cell_display：有单元格因为显示规则改了写法（ISO 日期时间）才记，复核照它渲染；没有的文档和以前一字不差
+    # cell_display：有单元格因为显示规则改了写法（ISO 日期时间）才记，记的是渲染得出这些格子的最低一版，复核照它渲染；
+    # 没有的文档和以前一字不差
     doc: dict[str, Any] = {
         "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "provenance": DOC_PROVENANCE,
-        **({"cell_display": snaps.display} if snaps.reformatted and snaps.display != 1 else {}),
+        **({"cell_display": snaps.needed} if snaps.needed > 1 else {}),
         "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
@@ -2940,6 +3030,56 @@ def _header_masks(blocks: list[dict[str, Any]], catalog: dict[str, Any]) -> list
             if all(s.get("kind") == "text" for s in body) \
                     and "".join(str(s.get("text") or "") for s in body).strip() in names:
                 out.append((spans[0][0], spans[-1][1]))
+    return out
+
+
+#: 文本格的值本身是数、或者是带单位的数（「120台」「3.5万元」「45%」「约 30 天」「205L」）：不算名字（_name_masks），照抄进
+#: 正文的那个数照样要出处。单位认出具校验数量词那一套（issuance._CN_COUNT_UNIT），再加百分号、万亿千百和 1–3 个拉丁字母
+_UNIT_VALUE = re.compile(
+    r"^(?:约|共|近|超|逾|合计|总计|≈|~)?\s*[+-]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)\s*"
+    r"(?:[%％‰]|[万亿千百]?(?:" + _CN_COUNT_UNIT.pattern + r"|[A-Za-z]{1,3}))?\s*$")
+
+
+def _text_names(catalog: dict[str, Any], snaps: _Snapshots) -> set[str]:
+    """目录里每次查询的快照中，文本格里带数字的值（「冲压5线」「KX-205 线」）：至少有一个数字、至少有一个不是数字的字，
+    本身不是数、也不是带单位的数（_UNIT_VALUE）。按写作目录里显示的样子（压成一行）收。取不回的快照跳过。"""
+    names: set[str] = set()
+    for alias, entry in catalog.items():
+        if not isinstance(entry, dict) or entry.get("kind") != "query":
+            continue
+        snapshot, why = snaps.get(alias, entry.get("artifact"))
+        if why or not isinstance(snapshot, dict):
+            continue
+        columns = [str(c) for c in snapshot.get("columns") or []]
+        kinds = [column_kind(snapshot, c) for c in columns]
+        for row in snapshot.get("rows") or []:
+            cells = row if isinstance(row, list) else [row.get(c) for c in columns] if isinstance(row, dict) else []
+            for raw, kind in zip(cells, kinds):
+                if not isinstance(raw, str) or cell_value(raw, kind) is not raw:
+                    continue
+                text = _clean(raw)
+                if any(c.isdigit() for c in text) and not text.isdigit() and not _UNIT_VALUE.match(text):
+                    names.add(text)
+    return names
+
+
+def _name_masks(markdown: str, catalog: dict[str, Any], snaps: _Snapshots) -> list[tuple[int, int]]:
+    """正文里一字不差地写出了查询结果中文本格的值（_text_names）的那几段：名字里的数字不是结论数字，写作者照着查询结果
+    写名字，不该因为名字里有个 5 被打回重写。只认快照里真有的值、整段一字不差，前后紧挨着数字的不算（「冲压15线」不是
+    「冲压5线」）；同一个数单独写出来照样要出处。组装和复核用同一份目录，放过的范围一致。"""
+    out: list[tuple[int, int]] = []
+    runs = set(re.findall(r"\d+", markdown))
+    for name in _text_names(catalog, snaps) if runs else ():
+        # 名字一字不差地出现、前后不紧挨着数字，名字里的每一串数字在正文里就是完整的一串：先按它挡掉大多数名字
+        if not all(r in runs for r in re.findall(r"\d+", name)):
+            continue
+        at = markdown.find(name)
+        while at >= 0:
+            end = at + len(name)
+            before, after = markdown[at - 1:at], markdown[end:end + 1]
+            if not (before.isdigit() or before == "." or after.isdigit()):
+                out.append((at, end))
+            at = markdown.find(name, at + 1)
     return out
 
 
@@ -3127,6 +3267,10 @@ def verify_doc(
                 cite = _phase_two_cite(seg, ref, text) \
                     or resolve_ref(ref, catalog, cells_allowed=cells_allowed, loader=snaps)
                 ok = cite["status"] == "resolved"
+                if ok and ref.startswith("c:") and (seg.get("cite") or {}).get("short") is True \
+                        and "." in str(cite.get("rendered") or ""):
+                    # 组装时紧跟在同一张表名后面、只显示了列名（_short_column）：照列名核对
+                    cite = {**cite, "rendered": str(cite["rendered"]).rsplit(".", 1)[-1]}
                 # 反引号里的实体：片段的字带着两个反引号
                 shown = f"`{cite['rendered']}`" if seg.get("code") and seg.get("kind") == "entity" else cite["rendered"]
                 matches = shown == text
@@ -3209,7 +3353,7 @@ def verify_doc(
     if tiled and pos != len(markdown):
         violations.append(_violation("segment_mismatch", "正文末尾有一段不属于任何片段，文档可能被修改过"))
 
-    masks += _header_masks(list(doc.get("blocks") or []), catalog)
+    masks += _header_masks(list(doc.get("blocks") or []), catalog) + _name_masks(markdown, catalog, snaps)
     for token in _bare_numbers(markdown, masks, allow_numbers, syntax):
         owner = next(((sid, uid) for s, e, sid, uid in owners if s <= token.start < e), (None, None))
         violations.append(_violation(
@@ -3305,6 +3449,29 @@ SEE_AND_CODE_RULES = (
     "- 涉及码值（状态、类型这类用数字编码的取值）时，写它的含义，比如「作废记录」「有效记录」，不要写码值本身"
     "（「状态为 9」「类型 1」）：码值是没有出处的数字，系统会当成裸数字打回重写。"
 )
+
+#: [[m:]]、[[v:]] 渲染出来自带单位（部署上撞过「覆盖 8条 条产线」：口径卡的单位是「条」，写作者照着助手的指令又写了一个）。
+#: 渲染时紧跟着的同一个单位会去掉（_tidy），这里先说给写作者听
+UNIT_RULE = ("数字标记渲染出来自带单位（[[m:…]] 是口径卡里的单位，比如「8条」「12,345人次」），后面不要再写一遍单位："
+             "写「覆盖 [[m:line_count]] 产线」，不写「覆盖 [[m:line_count]] 条产线」。")
+
+#: 相对日期（「今天、昨天、上周、本月、去年」）一律按运行当天算（period_rule）。部署上撞过：数据只更新到两周前，查库时拿表里
+#: 最大的日期往前推七天当「上周」，写作者照着写成「上周产量……」。写作者不知道今天是哪天，就分不出数据有没有覆盖问的那段，
+#: 所以把运行当天和上周的起止日期直接告诉它：没覆盖时先照实说、写明数据最新到哪天；最近一段的数可以给，但写具体起止日期
+PERIOD_RULE = (
+    "相对日期：今天是 {today}（{weekday}），上周是 {week_start} 至 {week_end}。问题里的「今天、昨天、上周、本月、去年」"
+    "这类说法一律按今天算，不按数据里最新的日期推。查到的数据没覆盖问的那段时间时，先照实说没覆盖、数据最新到哪天"
+    "（写具体日期）；可以接着给出数据里最近一段的数，但写明它的起止日期，不要把它叫作「上周」「本月」这类相对的说法。"
+)
+_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def period_rule(today: date) -> str:
+    """写作规则里讲相对日期的那一条（PERIOD_RULE），按运行当天 today 填好：上周是上周一到上周日。"""
+    monday = today - timedelta(days=today.weekday() + 7)
+    return PERIOD_RULE.format(today=today.isoformat(), weekday=_WEEKDAYS[today.weekday()],
+                              week_start=monday.isoformat(), week_end=(monday + timedelta(days=6)).isoformat())
+
 
 #: 句中的 [[see:]]：前面是介词、后面接着句子的写法（「以 [[see:Q1]] 为依据」「根据 [[see:Q1]]，」「详见 [[see:Q1]]」）。
 #: 只认这几种拿得准的：「以」前面是「所、可、加……」的是另一个词（所以、可以），不算；「依据 [[see:…]]。」可能是
@@ -3496,7 +3663,8 @@ ENTITY_RULES = (
     "表和字段（系统会核对）：提到表名、字段名时写 [[t:表名]]、[[c:表名.字段名]]；英文的名字也可以放进反引号"
     "（`orders`），中文的表名、字段名一律用 [[t:]] / [[c:]]——反引号里的中文名系统不核对；"
     "只写下面列出的、或者这次查过的数据源里真实存在的名字——本次运行的表结构快照、查询用到的表、"
-    "查询结果列里都没有的名字，会被标成「可能是编造的名字」。\n"
+    "查询结果列里都没有的名字，会被标成「可能是编造的名字」。"
+    "紧跟在同一张表名后面的字段（「[[t:orders]] 的 [[c:orders.amount]]」）只显示字段名，不用为了不重复把字段改写成别的说法。\n"
     "说明一个数是怎么算出来的（按哪个字段去重、怎么汇总、筛了什么条件）时，句末挂 [[see:Q1]] 指向算出它的那次"
     "查询（下面每张表后面写了哪几次查询用到它）：只挂 [[t:]]、[[c:]] 指不出是哪一次查询算出的这个数。"
 )
@@ -3561,6 +3729,7 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
         return lines
     columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]
     rows = snapshot["rows"]
+    plain = snaps.plain(entry.get("artifact"), snapshot)
     example = None
     for r, record in enumerate(rows[:shown_rows]):
         cells = []
@@ -3568,7 +3737,8 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
             try:
                 raw, _ = locate_cell(snapshot, r, c)
                 kind = column_kind(snapshot, c)
-                shown, numeric = render_cell(snaps.shown(raw), kind=kind), is_number(cell_value(raw, kind))
+                shown = render_cell(snaps.shown(raw), kind=kind, plain=c in plain)
+                numeric = is_number(cell_value(raw, kind))
             except (CellError, RenderError):
                 shown, numeric = MISSING, False
             cells.append(f"{c}={shown}")
@@ -3723,7 +3893,8 @@ def _field_prompt(path: str, value: Any, ev: dict[str, Any], aliases: dict[str, 
         if why:
             raise CellError(why)
         raw, column = locate_cell(snapshot, row, column)
-        shown = render_cell(snaps.shown(raw), kind=column_kind(snapshot, column))
+        shown = render_cell(snaps.shown(raw), kind=column_kind(snapshot, column),
+                            plain=column in snaps.plain(ev.get("artifact"), snapshot))
     except (CellError, RenderError):
         try:
             shown = render_cell(value)

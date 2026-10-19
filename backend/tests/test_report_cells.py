@@ -266,8 +266,7 @@ def test_table_defaults_to_the_first_five_rows_and_all_columns(catalog):
 
 
 @pytest.mark.parametrize("marker, words", [
-    ("[[table:Q1 rows=0-25]]", "最多 20 行"),
-    ("[[table:Q1 rows=5-9]]", "只有 7 行"),
+    ("[[table:Q1 rows=7-9]]", "只有 7 行，没有第 7 行"),         # 起始行就越界了
     ("[[table:Q1 rows=3-1]]", "rows"),
     ("[[table:Q1 cols=region,gmv]]", "没有列「gmv」"),
     ("[[table:Q1 limit=3]]", "无法识别的选项"),
@@ -281,6 +280,39 @@ def test_table_problems_are_violations(catalog, marker, words):
     [(ref, message)] = bad(doc).items()
     assert ref == marker[2:-2] and words in message, message
     assert "|" not in doc["markdown"]
+
+
+def test_table_rows_past_the_end_stop_at_the_last_row(catalog):
+    """结束行写过了头（只有 7 行却写 rows=5-9）：起始行在范围内，就截到最后一行，不加注、不算违规。部署上撞过：查询回的
+    行比写作者以为的少，整张表报「没有第 N 行」被打回重写。"""
+    doc = compose_doc("[[table:Q1 cols=region rows=5-9]]", catalog)
+    assert doc["violations"] == [], doc["violations"]
+    assert doc["markdown"] == "| region |\n| --- |\n| 东北 |\n| 中部 |"
+    doc = compose_doc("[[table:Q1 cols=region rows=0-25]]", catalog)   # 要的比上限还多，截完只剩 7 行
+    assert doc["violations"] == [], doc["violations"]
+    assert {u["loc"]["row"] for u in doc["blocks"][0]["units"]} == {-1, 0, 1, 2, 3, 4, 5, 6}
+
+
+def test_an_old_document_with_an_overflowing_table_still_verifies_as_it_was(catalog, monkeypatch):
+    """改动前（2 版）组装的文档：结束行越界的整表当年判为解析不了、正文是占位。按文档记下的版本复核，照旧是解析不了，
+    不能因为今天截得了行，就把它判成「渲染对不上」（文档被改过）。"""
+    from app.engine import evidence as ev
+
+    monkeypatch.setattr(ev, "CELL_DISPLAY", 2)
+    old = compose_doc("[[table:Q1 cols=region rows=5-9]]", catalog)
+    monkeypatch.undo()
+    assert "没有第 9 行" in bad(old)["table:Q1 cols=region rows=5-9"] and "cell_display" not in old
+    codes = [v["code"] for v in verify_doc(old, catalog)["violations"]]
+    assert codes == ["unresolved_ref"], codes
+
+
+def test_table_over_the_row_limit_is_still_a_violation():
+    long = {"columns": ["n"], "rows": [[f"第{i}项"] for i in range(30)], "row_count": 30, "truncated": False,
+            "elapsed_ms": 1, "sql": "SELECT n FROM items", "source": "shop"}
+    catalog = build_catalog(nodes={}, ledger=[_query(_store(long), long)], inputs={})
+    doc = compose_doc("[[table:Q1 rows=0-25]]", catalog)
+    [(ref, message)] = bad(doc).items()
+    assert ref == "table:Q1 rows=0-25" and "最多 20 行" in message, message
 
 
 def test_table_written_inline_still_becomes_a_table(catalog):

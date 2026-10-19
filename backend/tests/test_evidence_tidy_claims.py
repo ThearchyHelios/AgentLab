@@ -37,6 +37,7 @@ CARD = {
         metric("gmv", "销售额", 45678.5, "元", 1),
         metric("yoy", "同比增幅", 12.5, "%", 1, "plain"),
         metric("gone", "缺数", None, "人次"),
+        metric("lines", "产线条数", 8, "条"),
     ],
 }
 LEDGER = [{"kind": "metric_set", "node_id": "cal", "exec": 1, "artifact": ART, "caliber": "客流口径",
@@ -108,6 +109,10 @@ def test_a_definition_with_a_number_is_still_a_claim(catalog):
     ("销售额 [[m:gmv|万]] 万元。", "销售额 4.57万元。"),
     ("同比 [[m:yoy]] %。", "同比 12.5%。"),
     ("客流 [[m:visits]] 人次的水平", "客流 12,345人次的水平"),      # 多字单位后面跟着字，照样去掉
+    # 单字的单位后面紧跟着字：和单位连起来不是一个更长的单位（「条产」），照样去掉。部署上撞过「覆盖 8条 条产线」
+    ("覆盖 [[m:lines]] 条产线。", "覆盖 8条产线。"),
+    ("覆盖[[m:lines]]条产线。", "覆盖8条产线。"),
+    ("到访 [[m:heads]] 人参加。", "到访 1,200人参加。"),
 ])
 def test_a_repeated_unit_is_dropped(catalog, raw, shown):
     doc = compose_doc(raw, catalog)
@@ -115,6 +120,17 @@ def test_a_repeated_unit_is_dropped(catalog, raw, shown):
     assert render_markers(raw, catalog) == shown
     assert doc["stats"]["numbers_cited"] == 1
     assert verify_doc(doc, catalog)["violations"] == []
+
+
+def test_the_writer_and_the_copilot_are_told_markers_carry_their_unit():
+    """助手写报告指令、写作者写正文，都先知道 [[m:]] 渲染出来自带单位、后面不要再写一遍。"""
+    from app.api.copilot import NODE_REFERENCE
+    from app.engine.evidence import UNIT_RULE
+
+    start = NODE_REFERENCE.index("- report：报告撰写")
+    report = NODE_REFERENCE[start:NODE_REFERENCE.index("\n- output 的出具契约", start)]
+    assert "自带单位" in report and "条产线" in report
+    assert "自带单位" in UNIT_RULE and "后面不要再写" in UNIT_RULE
 
 
 @pytest.mark.parametrize(("raw", "shown"), [
@@ -188,9 +204,10 @@ def _stream(catalog, raw, sizes):
 
 @pytest.mark.parametrize("size", [1, 2, 3, 5, 8, UNIT_LOOKAHEAD, 40])
 def test_stream_drops_the_repeated_unit_and_the_blank_like_the_full_render(catalog, size):
-    raw = "客流 [[m:visits]] 人次，为最高月份 [[see:m:visits]]。到访 [[m:heads]] 人次 [[see:m:heads]]\n末尾 [[m:gmv]] 元"
+    raw = ("客流 [[m:visits]] 人次，为最高月份 [[see:m:visits]]。到访 [[m:heads]] 人次 [[see:m:heads]]\n"
+           "覆盖 [[m:lines]] 条产线，末尾 [[m:gmv]] 元")
     full = render_markers(raw, catalog)
-    assert full == "客流 12,345人次，为最高月份。到访 1,200人 人次\n末尾 45,678.5元"
+    assert full == "客流 12,345人次，为最高月份。到访 1,200人 人次\n覆盖 8条产线，末尾 45,678.5元"
     out = _stream(catalog, raw, [size] * len(raw))
     assert "".join(out) == full, out
 
@@ -209,7 +226,8 @@ def test_stream_holds_the_blank_before_see_until_it_knows_what_follows(catalog, 
 def _corpus(n):
     rng = random.Random(20260930)
     pieces = ["[[m:visits]]", "[[m:gmv|万]]", "[[m:heads]]", "[[m:yoy]]", "[[see:m:visits]]", "[[see:m:yoy]]",
-              "人次", "人", "次", "万元", "元", "%", " ", "  ", "　", "\n", "。", "，", "文字", "[[", "]]", "["]
+              "[[m:lines]]", "条", "产线", "人次", "人", "次", "万元", "元", "%", " ", "  ", "　", "\n", "。", "，",
+              "文字", "[[", "]]", "["]
     return ["".join(rng.choice(pieces) for _ in range(rng.randint(1, 16))) for _ in range(n)]
 
 

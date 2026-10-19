@@ -615,11 +615,14 @@
 
   /**
    * render_cell(shown(raw))：快照里的一格。kind 是查询时记下的列类型，display 是报告文档记下的单元格显示规则版本
-   * （2 版起 ISO 日期时间的 T 换成空格）。DECIMAL 落成的数字文本按数渲染、不经 float；文字压成一行，竖线换成 ¦
+   * （2 版起 ISO 日期时间的 T 换成空格；3 版起标识列的数不分千位）。plain 是引用上记下的「这一格按标识列显示」：
+   * 哪几列是标识列服务端按 SQL 和冻结的数据目录判（cell_format.plain_columns），本页解析不了 SQL，照引用上记的渲染——
+   * 它只决定分不分千位，值本身照样逐位比对。DECIMAL 落成的数字文本按数渲染、不经 float；文字压成一行，竖线换成 ¦
    */
-  function renderCell(raw, token, conv, kind, display) {
-    if (display !== 1 && display !== 2) throw new Unshown(T.shownDisplay(display))
+  function renderCell(raw, token, conv, kind, display, plain = false) {
+    if (display !== 1 && display !== 2 && display !== 3) throw new Unshown(T.shownDisplay(display))
     if (!PY_NUMERIC || !ISO_DATETIME) throw new Unshown(T.shownOld)
+    const fmt = display >= 3 && plain === true ? 'plain' : 'thousands'
     let value = raw
     if (display >= 2 && typeof raw === 'string') {
       const m = ISO_DATETIME.exec(pyStrip(raw))
@@ -630,12 +633,12 @@
       // Python 把全角、阿拉伯文这些数字也当数（int('1٢٣') 是 123），本页只照 ASCII 算
       if (/[^\x00-\x7f]/.test(text)) throw new Unshown(T.shownDigits)
       if (!/^-?\d+$/.test(text) || text.replace('-', '').length <= INT_DIGITS) {
-        return renderNumeric(decimalOf(text), '', null, 'thousands', conv)
+        return renderNumeric(decimalOf(text), '', null, fmt, conv)
       }
     }
     // 对象、列表：服务端按 Python 的 json.dumps 写（键的先后、浮点的写法），本页没有移植
     if (isObj(value) || Array.isArray(value)) throw new Unshown(T.shownShape)
-    return renderNumber(value, token, { conv }).replace(/\|/g, '¦')
+    return renderNumber(value, token, { conv, fmt }).replace(/\|/g, '¦')
   }
 
   /**
@@ -1469,7 +1472,7 @@
     if (!sameValue(cite.value, info.truth)) return { ...info, result: FAIL, reason: T.numCellDiffers }
     const display = Object.prototype.hasOwnProperty.call(doc, 'cell_display') ? doc.cell_display : 1
     return checkShown(info, seg, () => renderCell(cell.raw, info.truthToken, convOf(cite),
-      columnKind(art.json, cell.column), display))
+      columnKind(art.json, cell.column), display, own(cite, 'plain') === true))
   }
 
   /** 引用上记的换算（|万、|pct 这类），没写是 null */

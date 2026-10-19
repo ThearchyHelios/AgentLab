@@ -206,6 +206,8 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
         elif etype == EventType.TOOL_END and tool and tool in failed_at:
             recovered.add(tool)
 
+    #: 每个报告节点最后一次 report.checked：「改过一次」的信号按最终结果定档（_settled）
+    finals = _final_checks(rows)
     #: 报过的节点失败 (节点 id, 原话)：子工作流节点跟着子图里那一步失败时认得出是同一件事
     failures: list[tuple[str, str]] = []
     for e in rows:
@@ -257,6 +259,10 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             message = str(data.get("message") or "").strip()
             code = str(data.get("code") or "")
             kind, severity = WARN_CODES.get(code, ("warn", DEGRADED))
+            if code in _SETTLED_BY_REPORT and _settled(code, finals.get(str(node_id))):
+                # 首稿没过、改过一次之后最终通过了（同一个报告节点最后一次 report.checked）：不是缺口，不进异常清单。
+                # 复核模型被别的信号叫起来时，在 notes() 里照实说「重写后已全部通过」
+                continue
             reason = data.get("reason")
             if message:
                 add(kind, message[:300], severity, reason if isinstance(reason, str) and reason else None)
@@ -280,6 +286,68 @@ def _step_name(node_id: str, titles: Mapping[str, str]) -> str:
         return titles.get(node_id) or node_id
     parts = node_id.split("/")
     return " › ".join(titles.get("/".join(parts[:i + 1])) or parts[i] for i in range(len(parts)))
+
+
+#: 报告节点「改过一次」的信号：按同一个节点最后一次 report.checked 的结果定档（最终通过的不是缺口）
+_SETTLED_BY_REPORT = ("report_repair", "report_rewrite")
+#: 证据不支持的几种判定（engine/judge 的 CONTRADICTED 加证据不足）：最终还剩这些，改写就没有改好
+_UNSUPPORTED = ("contradicted", "unsupported", "insufficient")
+
+
+def _final_checks(rows: list[Any]) -> dict[str, dict[str, Any]]:
+    """每个报告节点最后一次 report.checked 的内容（节点 id → data）。"""
+    out: dict[str, dict[str, Any]] = {}
+    for e in rows:
+        if str(_event_field(e, "type", "")) == EventType.REPORT_CHECKED:
+            data = _event_field(e, "data") or {}
+            out[str(_event_field(e, "node_id") or "")] = data if isinstance(data, dict) else {}
+    return out
+
+
+def _settled(code: str, final: Mapping[str, Any] | None) -> bool:
+    """「改过一次」之后最终是不是好了：report_repair 看最后一次核对有没有违规（ok、violations 为空）；report_rewrite
+    看最后的裁判摘要里还有没有证据不支持的句子。找不到最终结果（老运行、节点失败没写出 report.checked）的当没好。"""
+    if not final:
+        return False
+    if code == "report_repair":
+        return final.get("ok") is True and not final.get("violations")
+    counts = ((final.get("judge") or {}).get("counts") or {}) if isinstance(final.get("judge"), dict) else {}
+    return bool(counts) and not any(int(counts.get(k) or 0) for k in _UNSUPPORTED)
+
+
+def notes(events: Iterable[Any]) -> list[str]:
+    """不是异常、但复核模型被别的信号叫起来时该知道的事（review_prompt 的「已经处理好的」）：报告首稿没过核对、重写后
+    已全部通过；裁判认为证据不支持的句子改写后都有了依据。只说处理好了的，没好的照旧是信号（scan）。"""
+    rows = list(events)
+    finals = _final_checks(rows)
+    titles: dict[str, str] = {}
+    first: dict[tuple[str, str], dict[str, Any]] = {}
+    times: dict[tuple[str, str], int] = {}
+    for e in rows:
+        etype = str(_event_field(e, "type", ""))
+        data = _event_field(e, "data") or {}
+        node_id = str(_event_field(e, "node_id") or "")
+        if etype == EventType.NODE_STARTED and data.get("label"):
+            titles.setdefault(node_id, str(data["label"]))
+        if etype == EventType.LOG and data.get("code") in _SETTLED_BY_REPORT:
+            key = (node_id, str(data["code"]))
+            first.setdefault(key, data)
+            times[key] = times.get(key, 0) + 1
+    out: list[str] = []
+    for (node_id, code), data in first.items():
+        if not _settled(code, finals.get(node_id)):
+            continue
+        name = f"报告「{titles.get(node_id) or node_id}」"
+        count = data.get("count")
+        if code == "report_repair":
+            head = f"首稿有 {count} 处没过核对" if isinstance(count, int) and count > 0 else "首稿没过核对"
+            again = f"重写 {times[(node_id, code)]} 次后" if times[(node_id, code)] > 1 else "重写后"
+            out.append(f"{name}{head}，{again}已全部通过")
+        else:
+            head = f"有 {count} 句结论裁判认为证据不支持" if isinstance(count, int) and count > 0 \
+                else "有几句结论裁判认为证据不支持"
+            out.append(f"{name}{head}，改写后都有了依据")
+    return out
 
 
 def worst(signals: Iterable[Signal]) -> str:
@@ -347,19 +415,23 @@ LOCKED_NOTE = (
 )
 
 
-def review_prompt(question: str, answer: str, signals: list[Signal], *, locked: bool = False) -> str:
+def review_prompt(question: str, answer: str, signals: list[Signal], *, locked: bool = False,
+                  settled: Iterable[str] = ()) -> str:
     """拼给复核模型的请求。
 
     只给信号清单，不给原始事件流：几百条事件塞进 prompt 既贵又没用，而信号
-    已经是规则层提炼过的结论。
+    已经是规则层提炼过的结论。settled 是已经处理好的（notes()：首稿没过、重写后已全部通过……）：
+    照实告诉复核模型，免得它把「改过一次」写成「仍未全部通过、可能不准」。
     """
     lines = "\n".join(
         f"- [{'严重' if s.severity == BROKEN else '降级'}] {s.detail}" for s in signals
     )
+    done = "\n".join(f"- {n}" for n in settled)
     return (
         f"用户的问题：\n{question or '（未记录）'}\n\n"
         f"系统给出的原答案：\n{answer or '（空）'}\n\n"
         f"检测到的异常：\n{lines}"
+        + (f"\n\n已经处理好的（不是异常，不要写成缺口或「可能不准」）：\n{done}" if done else "")
         + (LOCKED_NOTE if locked else "")
     )
 
@@ -392,6 +464,7 @@ class ReviewResult:
 
 async def review(
     model: Any, *, question: str, answer: str, signals: list[Signal], locked: bool = False,
+    settled: Iterable[str] = (),
 ) -> ReviewResult:
     """叫一次模型复核。调用方负责确保 signals 非空——空信号根本不该走到这里。
 
@@ -407,7 +480,8 @@ async def review(
         s.detail for s in signals
     )
 
-    messages = [("system", REVIEW_SYSTEM), ("human", review_prompt(question, answer, signals, locked=locked))]
+    messages = [("system", REVIEW_SYSTEM),
+                ("human", review_prompt(question, answer, signals, locked=locked, settled=settled))]
     try:
         raw = await model.with_structured_output(REVIEW_SCHEMA).ainvoke(messages)
         if not isinstance(raw, dict):
