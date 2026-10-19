@@ -131,8 +131,9 @@ def test_without_a_projection_every_pair_is_exactly_the_old_result():
     ]
     for sql, columns, cited in cases:
         row = compare(sql, columns, cited)
-        # 逐格比（algo 4）是另加的 cells、one_row 两个键：整条查询这一层的结论和候选照旧一字不差
-        assert {k: v for k, v in row.items() if k not in ("cells", "one_row")} == compare(sql, columns, None), sql
+        # 逐格比（algo 4）是另加的 cells 键（one_row、ordered 两边都记：行认不认得住，指标标签要看）：整条查询这一层的
+        # 结论和候选照旧一字不差
+        assert {k: v for k, v in row.items() if k != "cells"} == compare(sql, columns, None), sql
         assert ("cells" in row) == (len(cited) >= 2 and row["status"] == "related"), sql
 
 

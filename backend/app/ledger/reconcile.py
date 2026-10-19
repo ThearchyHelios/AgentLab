@@ -296,13 +296,35 @@ def tail_nodes(plan: Plan, *, card_id: str, fetch_id: str) -> list[dict[str, Any
                            sql=align_sql(plan.keys, plan.pairs, plan.key_values)))
         for i, row in enumerate(plan.key_values):
             where = "，".join(f"{ours}={v}" for (ours, _), v in zip(plan.keys, row))
+            # 先核对第 i 行就是这一组的维度：重跑时这次的结果缺了一行、某个维度多出一行（口径那边重复），合并结果会错位，
+            # 按位置取到的是别的维度的数。对不上的记空值（对账卡 on_missing=null），不拿别的维度的数冒充
+            guard = _row_guard(i, plan.keys, row)
             for j, pair in enumerate(plan.pairs):
-                metrics += _four(f"{i}_{j}", f"{where} · {pair.name or pair.ours}",
-                                 f"cell(nodes.{ALIGN_ID}, {i}, 'ours_{j}')", f"cell(nodes.{ALIGN_ID}, {i}, 'cal_{j}')",
-                                 pair)
+                ours = f"cell(nodes.{ALIGN_ID}, {i}, 'ours_{j}')"
+                theirs = f"cell(nodes.{ALIGN_ID}, {i}, 'cal_{j}')"
+                if guard:
+                    ours, theirs = f"({ours} if {guard} else None)", f"({theirs} if {guard} else None)"
+                metrics += _four(f"{i}_{j}", f"{where} · {pair.name or pair.ours}", ours, theirs, pair)
     nodes.append(_node(RECONCILE_CARD, "metrics", "对账卡", caliber="口径对账", caliber_version="v1", on_missing="null",
                        metrics=metrics))
     return nodes
+
+
+def _row_guard(i: int, keys: list[tuple[str, str]], values: tuple[Any, ...]) -> str:
+    """对齐结果第 i 行是不是这一组（维度列的值都对得上）的条件式；维度值是空值的那一列不核对（表达式里没有空值的写法）。"""
+    import ast
+
+    from app.engine.expressions import _literal
+
+    parts = [f"cell(nodes.{_align_id()}, {i}, {ours!r}) == {ast.unparse(_literal(v))}"
+             for (ours, _), v in zip(keys, values) if v is not None and not isinstance(v, (list, dict))]
+    return " and ".join(parts)
+
+
+def _align_id() -> str:
+    from app.ledger.derive import ALIGN_ID
+
+    return ALIGN_ID
 
 
 def _numeric(rows: list[Any], index: int) -> bool:

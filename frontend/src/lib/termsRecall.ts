@@ -99,6 +99,8 @@ export const RECALL_TEXT = {
     original: '原答案当时的值',
     changed: '变了',
     same: '没变',
+    rowOrder: '行序不定',
+    rowOrderHint: '取的是多行结果里按行号的一格，查询没有排序，重新执行时这一行可能是另一行，两版按位置比不出变没变',
     masked: '已遮罩',
     missing: '—',
     answers: '用到这份口径的答案',

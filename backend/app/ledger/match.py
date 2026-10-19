@@ -98,6 +98,8 @@ SNAPSHOT_TAMPERED = "查询快照与哈希不一致，疑似被修改，不比�
 SNAPSHOT_MISSING = "查询快照读不出来，不比对"
 NO_SQL = "查询快照里没有 SQL，不比对"
 PARSE_FAILED = "这次的 SQL 无法解析，没有比对"
+#: 指标按「同一行」认来自口径，可那一行重跑时不一定还是它（说法在 labels，这里给调用方一个名字）
+ROW_ORDER_UNSTABLE = ledger_labels.ROW_ORDER_UNSTABLE
 MERGED = "合并查询的格不和口径比对（它的数来自各个输入的查询）"
 COMPOSED_UNPROVEN = "这条查询出自助手选用的口径，但和口径的取数没能证明一致（可能被改过）"
 MORE_CANDIDATES = "另有 {n} 份相关口径没有比对（每条查询最多比 {max} 份）"
@@ -546,7 +548,7 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
     等价）/ none（没有相关的口径）/ skipped（没比完：超时、解析失败、快照读不出）。composed 是 composed_nodes 的结果，
     不给就没有助手选用的。referenced 是报告引用了哪条查询的哪几列（labels.referenced_columns：{查询快照: {列名}}）：
     给了的，整条比不等价时按引用的列投影再比（_projected）；不给就只整条比。纯计算，从不抛异常。评测逐题比 SQL 也调它。"""
-    from app.data.sql_semantics import match_template, normalize_sql, one_row
+    from app.data.sql_semantics import match_template, normalize_sql, one_row, ordered
 
     out: list[dict[str, Any]] = []
     for query in queries:
@@ -567,6 +569,9 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
         if normalize_sql(query.sql, query.dialect).parse_error:
             out.append({**row, "status": "skipped", "reason": PARSE_FAILED, "candidates": []})
             continue
+        # 按行号取的那一格重跑时还是不是同一行（sql_semantics.row_stable）：指标标签按「同一行」认来自口径时要看它
+        row["ordered"] = ordered(query.sql, query.dialect)
+        row["one_row"] = one_row(query.sql, query.dialect)
         candidates: list[dict[str, Any]] = []
         for caliber, fetch in pool[:MAX_CANDIDATES]:
             if deadline is not None and time.monotonic() > deadline:
@@ -600,7 +605,6 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
         if wanted is not None and len(wanted) >= 2 and status == "related":
             # 整条（按全部引用列投影）没证明：被引用的几列逐格各比一次，每个数按它自己那一格的结论标（labels.cell_label）
             row["cells"] = _cells(query, wanted, pool[:MAX_CANDIDATES], candidates, chosen, deadline)
-            row["one_row"] = one_row(query.sql, query.dialect)
         out.append(row)
     return out
 
