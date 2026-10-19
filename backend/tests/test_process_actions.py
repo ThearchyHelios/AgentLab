@@ -96,7 +96,9 @@ async def _events(run_id: str, kind: str) -> list[RunEvent]:
 
 
 async def _confirm(run_id: str) -> Task:
-    """等确认卡出来，按卡上的内容指纹确认。"""
+    """等运行停到确认上、确认卡出来，按卡上的内容指纹确认。待办和审批同一个事务开出来，那一刻运行可能还没收成 interrupted、
+    还在跑——这时去确认会被拒（「运行正在运行，没有待处理的审批」）：先等运行停下来，再取待办。"""
+    await _wait(run_id, ("interrupted",))
     task = await _task(run_id, "action_confirm")
     card = (await tasks.detail(task.id, ANN))["payload"]
     out = await tasks.respond(task.id, ANN, decision="approve", payload_hash=card["payload_hash"])
