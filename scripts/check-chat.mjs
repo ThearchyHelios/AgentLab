@@ -1274,7 +1274,9 @@ async function driveTurn(T, epoch) {
       for (const op of got.ops) {
         if (op.gate) { await until(() => ctl[op.gate] || gone(T, epoch), 15000); continue }
         if (gone(T, epoch)) return
-        emit(T, 'op', op)
+        // 心跳不落库、不带 seq（服务端 chat/log.beat）：只记最近的一拍，流上发一条不带 seq 的；之后落了新事件就作废
+        if (op.op === 'heartbeat') T.beat = { op, at: T.events.length }
+        else emit(T, 'op', op)
         if (op.op !== 'thinking' && op.op !== 'heartbeat') ops.push(op)
         if (op.op === 'look') T.looks.push(op)
         if (op.op === 'usage') T.usage.copilot = addTotal(T.usage.copilot, op)
@@ -1500,6 +1502,9 @@ async function streamTurn(route, T, after) {
   await until(() => T.events.length > after || !turnActive(T) || T.gen !== srv.gen, 6000)
   const fresh = T.events.filter((e) => e.seq > after)
   let body = fresh.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('')
+  if (turnActive(T) && T.beat && T.beat.at === T.events.length) {
+    body += `data: ${JSON.stringify({ type: 'op', data: T.beat.op, ts: Date.now() / 1000 })}\n\n`
+  }
   if (!turnActive(T) && after + fresh.length >= T.events.length) {
     body += `data: ${JSON.stringify({ type: 'stream.end', status: T.job.status, data: { status: T.job.status } })}\n\n`
   }

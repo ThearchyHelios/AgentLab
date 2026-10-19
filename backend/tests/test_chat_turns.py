@@ -239,7 +239,8 @@ async def test_the_stream_replays_then_follows_and_reconnects_by_seq(client, mon
     first: list[dict[str, Any]] = []
     stream = turn_log.stream(turn_id, 0, active=active, heartbeat=0.2)
     async for frame in stream:
-        if frame.startswith("data: "):
+        # 助手的心跳不带 seq、不落库（chat/log.beat）：按 seq 补齐时不算它，同页面
+        if frame.startswith("data: ") and "seq" in json.loads(frame[6:]):
             first.append(json.loads(frame[6:]))
         if any(e.get("type") == "stage" for e in first):
             break
@@ -253,7 +254,9 @@ async def test_the_stream_replays_then_follows_and_reconnects_by_seq(client, mon
         if frame == turn_log.PING:
             pings += 1
             continue
-        rest.append(json.loads(frame[6:]))
+        event = json.loads(frame[6:])
+        if "seq" in event or event.get("type") == "stream.end":
+            rest.append(event)
     assert rest[-1]["type"] == "stream.end" and rest[-1]["status"] == "succeeded"
     got = [e["seq"] for e in first + rest[:-1]]
     assert got == list(range(1, len(got) + 1)), "补齐、不重复"
@@ -935,3 +938,129 @@ async def test_a_stop_that_lands_while_launching_still_cancels_the_run(client, m
         assert (await session.get(Run, job.run_id)).status == "cancelled", "这次运行跟着取消了，没有没人管的运行"
     row = await _row(turn_id)
     assert row.status == "error" and row.error == "已取消" and row.meta["runId"] == job.run_id
+
+
+# --------------------------------------------------------------------------
+# 事件日志：心跳不落库、已结束的轮次按期清理
+# --------------------------------------------------------------------------
+
+
+async def test_heartbeats_go_out_on_the_stream_but_are_not_stored(client, monkeypatch, source):
+    """心跳是纯保活（模型几秒没出声时助手发的一拍 heartbeat 操作）：只在实时流上发、不落库，重连时流自己补最近的一拍；
+    落库的事件（思考、操作、阶段……）照旧。以前每 3 秒落一条，一轮下来几百条心跳。"""
+    from app.api import copilot
+
+    gate = asyncio.Event()
+    es.use_copilot(monkeypatch, Gated(source["name"], gate))
+    monkeypatch.setattr(copilot, "_HEARTBEAT_SECONDS", 0.05)   # use_copilot 把心跳调成了一小时一拍
+    es.use_report(monkeypatch)
+    conversation_id = await _conversation(client)
+    turn_id = await _ask(client, conversation_id, datasource_ids=[source["id"]])
+    await _stage(turn_id, "build")
+
+    async def active() -> str | None:
+        return await chat_job.stream_status(turn_id)
+
+    beats: list[dict[str, Any]] = []
+    stream = turn_log.stream(turn_id, 0, active=active, heartbeat=0.2)
+    async for frame in stream:
+        if frame.startswith("data: "):
+            event = json.loads(frame[6:])
+            if event.get("type") == "op" and event["data"].get("op") == "heartbeat":
+                beats.append(event)
+        if len(beats) >= 2:
+            break
+    await stream.aclose()
+    assert all("seq" not in b for b in beats), "心跳不占 seq：重连按 seq 补齐时不会多出来、也不会漏"
+    # 重连（从最后一条落库的事件接着读）：流先补一拍最近的心跳，页面接着知道还在等模型
+    stored = await _events(turn_id)
+    again = turn_log.stream(turn_id, stored[-1]["seq"], active=active, heartbeat=0.2)
+    first = await again.__anext__()
+    await again.aclose()
+    assert first.startswith("data: ") and json.loads(first[6:])["data"]["op"] == "heartbeat"
+
+    gate.set()
+    await _done(turn_id)
+    events = await _events(turn_id)
+    assert not [e for e in events if e["type"] == "op" and e["data"].get("op") == "heartbeat"], "心跳一条都不落库"
+    assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
+    assert turn_log.latest_beat(turn_id) is None, "这一轮结束了，进程里记的那一拍跟着清掉"
+
+
+async def test_a_later_event_supersedes_the_last_heartbeat():
+    """心跳只说「上一条事件之后还在等」：之后落了新事件，重连时不再补那一拍（不然页面的进度会退回去）。"""
+    async with SessionLocal() as session:
+        conversation = Conversation(kind="chat", title="虚构")
+        session.add(conversation)
+        await session.flush()
+        turn = ConversationTurn(conversation_id=conversation.id, question="q", status="running")
+        session.add(turn)
+        await session.flush()
+        session.add(ChatTurnJob(id=turn.id, conversation_id=conversation.id, status="running"))
+        await session.commit()
+        turn_id = turn.id
+    turn_log.beat(turn_id, {"op": "heartbeat", "phase": "planning", "elapsed_ms": 3000})
+    assert turn_log.latest_beat(turn_id)["phase"] == "planning"
+    async with SessionLocal() as session:
+        await turn_log.append(session, turn_id, "stage", {"stage": "run"})
+    assert turn_log.latest_beat(turn_id) is None
+    turn_log.forget(turn_id)
+
+
+async def _finished_turn(*, days_ago: float, status: str = "succeeded", events: int = 3) -> str:
+    from datetime import timedelta
+
+    from app.db.base import utcnow
+
+    async with SessionLocal() as session:
+        conversation = Conversation(kind="chat", title="虚构的旧会话")
+        session.add(conversation)
+        await session.flush()
+        turn = ConversationTurn(conversation_id=conversation.id, question="虚构的问题", answer="虚构的回答",
+                                status="done" if status == "succeeded" else "error", meta={"outcome": "done"})
+        session.add(turn)
+        await session.flush()
+        when = utcnow() - timedelta(days=days_ago)
+        session.add(ChatTurnJob(id=turn.id, conversation_id=conversation.id, status=status, last_seq=events,
+                                finished_at=None if status in ("queued", "running") else when))
+        for seq in range(1, events + 1):
+            session.add(ChatTurnEvent(turn_id=turn.id, seq=seq, type="op", ts=0.0, data={"op": "thinking"}))
+        await session.commit()
+        return turn.id
+
+
+async def test_finished_turns_lose_their_event_log_after_the_retention_period():
+    """已结束超过保留期的轮次整轮删事件日志：页面重开已结束的一轮读的是 conversation_turns 那一行（答案、图、复核、用量都在
+    那里），不读事件日志；任务行留着，last_seq 接着发号，之后再在这一轮上重试、继续运行不撞号。还在跑的、刚结束的不动。"""
+    from app.db.base import utcnow
+
+    old = await _finished_turn(days_ago=turn_log.RETAIN_DAYS + 1)
+    stuck = await _finished_turn(days_ago=turn_log.RETAIN_DAYS + 1, status="interrupted")
+    recent = await _finished_turn(days_ago=1)
+    live = await _finished_turn(days_ago=turn_log.RETAIN_DAYS + 1, status="running")
+    purged = await turn_log.purge(utcnow())
+    assert set(purged) >= {old, stuck} and not {recent, live} & set(purged)
+    assert await _events(old) == [] and await _events(stuck) == []
+    assert len(await _events(recent)) == 3 and len(await _events(live)) == 3
+    async with SessionLocal() as session:
+        job = await session.get(ChatTurnJob, old)
+        row = await session.get(ConversationTurn, old)
+    assert job is not None and job.last_seq == 3, "任务行留着：seq 接着往下发"
+    assert row.answer == "虚构的回答", "那一行不动"
+    async with SessionLocal() as session:
+        assert await turn_log.add(session, old, "turn.attempt", {"mode": "retry"}) == 4
+        await session.rollback()
+
+
+async def test_the_cleanup_runs_in_the_background_tick(monkeypatch):
+    """清理挂在调度循环的那一拍里（scheduler/loop.process_due），一小时最多清一次。"""
+    from app.db.base import utcnow
+    from app.scheduler import loop
+
+    old = await _finished_turn(days_ago=turn_log.RETAIN_DAYS + 2)
+    monkeypatch.setattr(turn_log, "_last_purge", 0.0)
+    await loop.process_due(utcnow())
+    assert await _events(old) == []
+    again = await _finished_turn(days_ago=turn_log.RETAIN_DAYS + 2)
+    await loop.process_due(utcnow())
+    assert len(await _events(again)) == 3, "一小时内不再清第二次"

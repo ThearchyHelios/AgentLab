@@ -16,7 +16,7 @@
 
 **事件日志**（chat/log.py；每条 {seq, type, data, ts}）：
   turn.attempt {mode, attempts, scope, max_steps?}  这一次尝试开始了（发起、重试本轮、重新运行、跑一下、继续运行、接着收尾）
-  op {...}                       助手的一条操作原样（含心跳、查看、final、usage）
+  op {...}                       助手的一条操作原样（含查看、final、usage；心跳不落库，只在实时流上发，见 chat/log.beat）
   stage {stage}                  到了哪一步：build 建图、run 运行、waiting 停在审批上等人、review 复核
   run {run_id, status, run_class} 发起了一次运行（页面据此接上运行自己的实时流看过程）
   review {result}                复核结论原样（含 usage、retry_instruction）
@@ -132,6 +132,10 @@ class ChatDriver(TurnDriver):
                 await self._flush_thinking()
             return
         await self._flush_thinking()
+        if kind == "heartbeat":
+            # 纯保活：只在实时流上发、不落库（chat/log.beat；以前每 3 秒落一条）
+            turn_log.beat(self.execution.turn_id, op)
+            return
         await self.execution.emit("op", op)
         if kind == "look" and (look := record.look_event(op)) is not None:
             self.looks.append(look)
@@ -336,6 +340,12 @@ class ChatTurnExecution(runtime.JobRun):
     # ---------------- 执行 ----------------
 
     async def _run(self) -> None:
+        try:
+            await self._execute()
+        finally:
+            turn_log.forget(self.turn_id)   # 进程里记的最近一拍心跳（chat/log.beat）跟着这一次执行收掉
+
+    async def _execute(self) -> None:
         from app.api.deps import set_principal
         from app.chat import turn as policy
         from app.db.models import ConversationTurn

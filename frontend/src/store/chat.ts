@@ -1438,7 +1438,8 @@ function play(flow: Flow, serverId: string, after: number) {
         }
         return
       case 'op':
-        patch((t) => ({ ...opPatch(t, d as CopilotOp), turnSeq: e.seq }))
+        // 心跳不带 seq（不落库，chat/log.beat）：不动收到的最后一个 seq
+        patch((t) => ({ ...opPatch(t, d as CopilotOp), ...(typeof e.seq === 'number' ? { turnSeq: e.seq } : {}) }))
         return
       case 'stage': {
         const stage = String(d.stage ?? '')
