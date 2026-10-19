@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # LangGraph 的断点也放进同一个库；checkpoint_url 另给就放那里。数据目录照旧要有：工件、上传表格、沙箱等仍是文件
     database_url: str = ""
     checkpoint_url: str = ""
+    # 直连地址（可选，写法同 database_url）：普通查询走 database_url（可以是 PgBouncer），依赖会话状态的连接走这里——进程间通知的
+    # LISTEN 那一条、跨进程锁（会话级咨询锁）、断点库（预备语句、建表时的会话锁）。不设就全用 database_url
+    database_direct_url: str = ""
+    # database_url 是 PgBouncer 的事务模式（AGENTLAB_DB_PGBOUNCER=1）：应用库不用客户端连接池（交给 PgBouncer）、关掉 asyncpg 和
+    # SQLAlchemy 的预备语句缓存、预备语句用不会撞名的名字。这时必须另给 database_direct_url（事务模式下 LISTEN、会话级咨询锁不成立），
+    # 启动时检查
+    db_pgbouncer: bool = False
     # PostgreSQL 的连接池（SQLite 不用这几项）。pool_size=0 表示不用连接池、每次新建连接（前面有 PgBouncer 时用，
     # 测试里也这么用：每个测试一个事件循环，asyncpg 的连接不能跨循环）
     db_pool_size: int = 10
@@ -224,7 +231,7 @@ class Settings(BaseSettings):
             return True
         return value
 
-    @field_validator("database_url", "checkpoint_url", mode="before")
+    @field_validator("database_url", "checkpoint_url", "database_direct_url", mode="before")
     @classmethod
     def _valid_postgres_url(cls, value: object, info: Any) -> object:
         # 写错了启动时就报出来，别等到第一次查库。只认 PostgreSQL：SQLite 就是不设
@@ -235,7 +242,7 @@ class Settings(BaseSettings):
         from app.db.urls import normalize_database_url, normalize_checkpoint_url
 
         name = f"AGENTLAB_{(info.field_name or '').upper()}"
-        normalize = normalize_database_url if info.field_name == "database_url" else normalize_checkpoint_url
+        normalize = normalize_checkpoint_url if info.field_name == "checkpoint_url" else normalize_database_url
         try:
             return normalize(value.strip())
         except ValueError as e:
@@ -297,14 +304,20 @@ class Settings(BaseSettings):
         return self.data_dir / "checkpoints.db"
 
     @property
+    def session_db_url(self) -> str:
+        """依赖会话状态的连接（LISTEN、会话级咨询锁、断点库）用的应用库地址：设了直连地址用它，否则同 database_url。"""
+        return self.database_direct_url or self.database_url
+
+    @property
     def checkpoint_conninfo(self) -> str | None:
-        """PostgreSQL 断点库的 libpq 连接串（psycopg 用）：checkpoint_url 优先，否则由 database_url 换算。SQLite 时 None。"""
+        """PostgreSQL 断点库的 libpq 连接串（psycopg 用）：checkpoint_url 优先，否则由直连地址（没设就是 database_url）换算。
+        SQLite 时 None。断点库用预备语句、建表时取会话级的锁，所以缺省走直连。"""
         if self.checkpoint_url:
             return self.checkpoint_url
         if self.database_url:
             from app.db.urls import libpq_conninfo
 
-            return libpq_conninfo(self.database_url)
+            return libpq_conninfo(self.session_db_url)
         return None
 
     @property

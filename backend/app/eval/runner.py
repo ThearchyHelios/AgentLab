@@ -15,7 +15,7 @@ snapshot 视图）：起草、剖析照常进行，也不影响这次评测的�
 **并发。** 同时最多 max_parallel 题，且所有臂合起来不超过全局运行并发的四分之一。评测发起的作答、算期望的运行归「系统」类
 （app/cluster/slots.py）：全站的名额按类别有上限和优先级，评测再多也只占得到系统那一类的名额，问数据、试跑优先，不被挤占。
 A/B 的同一题几臂同时开跑。每题时限 per_case_timeout_s：作答一臂超时就取消它正在跑的运行、记超时；
-期望探针每次也按这个时限。
+期望探针每次也按这个时限。排队等运行名额的那一段不算时限（within、gold._launch_and_wait）：满载时排队不该被记成超时、触发止损。
 
 **预算**（评测-D9；单独一本账 engine/spend.eval_spend，不挤占裁判、核查的额度）：开跑前按上一次的每题平均花费估算（estimate）。
 每题开评前按估算预留——加上会超过这次评测的金额上限、或评测每日上限就不再开新题，剩下的记「已到上限」；评完按实际找补。
@@ -33,6 +33,7 @@ A/B 的同一题几臂同时开跑。每题时限 per_case_timeout_s：作答一
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
 from collections.abc import Mapping, Sequence
@@ -519,9 +520,9 @@ class EvalExecution(runtime.JobRun):
         try:
             if case.get("kind") == "workflow":
                 graph, inputs = await self._workflow_graph(case, values)
-                await asyncio.wait_for(driver.drive_workflow(graph, inputs), timeout=timeout)
+                await within(driver.drive_workflow(graph, inputs), timeout, lambda: _queued(driver))
             else:
-                await asyncio.wait_for(driver.drive(), timeout=timeout)
+                await within(driver.drive(), timeout, lambda: _queued(driver))
         except asyncio.TimeoutError:
             turn = driver.turn
             turn.timed_out = True
@@ -962,6 +963,45 @@ manager = EvalManager()
 
 def running(run: Any) -> bool:
     return manager.running(leader_of(run))
+
+
+async def _queued(driver: Any) -> bool:
+    """这一题的作答运行正排着队等名额（app/cluster/slots）：这一段不算每题的时限。"""
+    from app.cluster import slots
+    from app.engine.runner import run_manager
+
+    run_id = getattr(driver.turn, "current_run", None)
+    return bool(run_id) and await slots.waiting(run_id, here=run_manager.is_active(run_id))
+
+
+async def within(coro: Any, budget: float, paused: Any, *, tick: float = 0.5) -> Any:
+    """同 asyncio.wait_for(coro, budget)，只是 paused() 为真的那几段不算时间（复核：满载时排队等名额不该算进每题时限、触发止损）。
+    超时取消 coro、抛 TimeoutError。每隔一小段（tick，且不超过时限的 1/20）看一次；一段的头尾有一头在暂停就整段不算——
+    宁可少算一点，不把排队的时间算进去。"""
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(coro)
+    step_s = max(0.005, min(tick, budget / 20))
+    spent, last = 0.0, loop.time()
+    was_paused = await paused()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=max(0.005, min(step_s, budget - spent)))
+            if task in done:
+                return task.result()
+            now = loop.time()
+            step, last = now - last, now
+            is_paused = await paused()
+            if not (was_paused or is_paused):
+                spent += step
+            was_paused = is_paused
+            if spent >= budget:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                raise asyncio.TimeoutError()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
 
 
 def leader_of_id(rows: Sequence[EvalRun], job_id: str) -> str:

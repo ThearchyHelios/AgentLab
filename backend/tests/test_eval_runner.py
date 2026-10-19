@@ -289,6 +289,87 @@ async def test_a_case_over_its_time_limit_stops_its_run(monkeypatch):
     assert item.status == "ok" and item.path == "build_failed" and "每题时限" in item.error
 
 
+async def test_time_queued_for_a_run_slot_does_not_count_against_the_case_limit(monkeypatch):
+    """复核：满载时作答运行排队等名额的那一段不算每题时限（排了 2 秒、时限 1 秒，拿到名额后很快答完：不记超时）。"""
+    from app.cluster import slots
+
+    stored = slots.values({"max_total": 2, "interactive_reserve": 1})
+
+    async def fixed(*, fresh: bool = False):  # noqa: ARG001
+        return stored
+
+    monkeypatch.setattr(slots, "policy", fixed)
+    slots.forget_policy()
+    gate = asyncio.Event()
+
+    async def blocker() -> None:
+        async with slots.hold("eval-slot-blocker", "eval"):
+            await gate.wait()
+
+    async def drive(self):
+        self.turn.current_run = "eval-answer-in-queue"
+        await self._phase("build")
+        async with slots.hold(self.turn.current_run, "eval"):
+            await asyncio.sleep(0.05)
+        self.turn.path = "asked"
+        self.turn.usage["assistant"] = {"by_model": {}, "input_tokens": 0, "output_tokens": 0, "calls": 1,
+                                        "cost_usd": 0.0, "unpriced_calls": 0}
+        return self.turn
+
+    monkeypatch.setattr(answer_mod.Driver, "drive", drive)
+    original = runner.EvalExecution._prepare
+
+    async def prepare(self):
+        units = await original(self)
+        self.budget["per_case_timeout_s"] = 1.0
+        return units
+
+    monkeypatch.setattr(runner.EvalExecution, "_prepare", prepare)
+    held = asyncio.create_task(blocker())
+    try:
+        while not (await slots.snapshot())["classes"]["system"]["running"]:
+            await asyncio.sleep(0.02)
+        suite_id = await es.make_suite("none", cases=ask_cases(1))
+        [run] = await start(suite_id)
+        while not await slots.waiting("eval-answer-in-queue"):
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(2.0)
+        gate.set()
+        await es.wait_eval(run.id)
+    finally:
+        gate.set()
+        await held
+    [item] = await results(run.id)
+    assert item.status == "ok" and item.path == "asked" and not item.error, item.error
+
+
+async def test_within_does_not_count_the_paused_stretches():
+    paused = {"now": True}
+
+    async def is_paused() -> bool:
+        return paused["now"]
+
+    async def work() -> str:
+        await asyncio.sleep(0.5)
+        paused["now"] = False
+        await asyncio.sleep(0.05)
+        return "done"
+
+    assert await runner.within(work(), 0.2, is_paused, tick=0.02) == "done", "暂停的那 0.5 秒不算"
+
+    async def never():
+        await asyncio.sleep(10)
+
+    async def awake() -> bool:
+        return False
+
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    with pytest.raises(asyncio.TimeoutError):
+        await runner.within(never(), 0.2, awake, tick=0.02)
+    assert loop.time() - t0 < 1.0
+
+
 async def test_a_run_stopped_at_an_approval_is_cancelled_not_approved(client, monkeypatch, tmp_path):
     from app.eval.answer import APPROVAL_REASON
 

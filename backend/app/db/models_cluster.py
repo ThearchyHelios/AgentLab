@@ -38,6 +38,9 @@ class ClusterWorker(Base):
     lease_until: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True)
     #: 版本、数据目录之类给人看的信息
     info: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    #: 代码版本、库结构版本（app/cluster/version.py）：库里有活着的、版本不同的进程时新进程不许加入
+    code_version: Mapped[str | None] = mapped_column(String(200), default=None)
+    schema_version: Mapped[str | None] = mapped_column(String(64), default=None)
 
 
 class ClusterLease(Base):

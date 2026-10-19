@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 _handlers: dict[str, Callable[[str | None], Any]] = {}
 _last_seen: int | None = None
+#: 往回多读几条（复核 R-b5）：id 是先取后提交的，id 大的先提交时游标会越过 id 小的那一条——每次从游标往回留这么多条重读，按处理过
+#: 的 id 去重
+LOOKBACK = 200
+_done: set[int] = set()
 _lock: asyncio.Lock | None = None
 
 
@@ -58,12 +62,18 @@ async def broadcast(name: str, key: str | None = None) -> None:
 
 async def start() -> None:
     """起服务时：从现在的最后一条往后读（之前的变化，自己启动时读进来的已经是新的）。"""
-    global _last_seen
+    global _last_seen, _floor
     from app.db.models_cluster import CacheEvent
 
     signals.on("cache", lambda _parts: asyncio.ensure_future(poll()))
     async with SessionLocal() as session:
         _last_seen = int(await session.scalar(select(func.coalesce(func.max(CacheEvent.id), 0))) or 0)
+    _floor = _last_seen
+    _done.clear()
+
+
+#: 起服务时已有的最后一条：往回重读不越过它（那之前的变化，自己启动时读进来的已经是新的）
+_floor = 0
 
 
 async def poll() -> int:
@@ -77,10 +87,13 @@ async def poll() -> int:
         _lock = asyncio.Lock()
     async with _lock:
         async with SessionLocal() as session:
-            rows = (await session.execute(select(CacheEvent).where(CacheEvent.id > _last_seen)
+            rows = (await session.execute(select(CacheEvent).where(CacheEvent.id > max(_floor, _last_seen - LOOKBACK))
                                           .order_by(CacheEvent.id).limit(500))).scalars().all()
         done = 0
         for row in rows:
+            if int(row.id) in _done:
+                continue
+            _done.add(int(row.id))
             _last_seen = max(_last_seen, int(row.id))
             if row.owner == identity.owner():
                 continue
@@ -94,6 +107,9 @@ async def poll() -> int:
                 done += 1
             except Exception:  # noqa: BLE001
                 logger.exception("按别的进程的通知重读缓存「%s」出错", row.name)
+        if len(_done) > 4 * LOOKBACK:
+            low = _last_seen - 2 * LOOKBACK
+            _done.difference_update({i for i in _done if i <= low})
         return done
 
 

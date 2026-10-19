@@ -1155,3 +1155,17 @@ async def test_a_downgraded_account_that_can_still_chat_finishes_as_who_they_are
     row = await _row(turn_id)
     assert row.status == "done" and row.answer == "华东 300。"
     assert seen and seen[-1].username == "bob" and seen[-1].role == "user"
+
+
+async def test_the_cleanup_tick_without_a_time_uses_now(monkeypatch):
+    """调度循环那一拍不一定给 now（process_due(None)）：清理按当前时间算，不报错。"""
+    from app.scheduler import loop
+
+    old = await _finished_turn(days_ago=turn_log.RETAIN_DAYS + 2)
+    monkeypatch.setattr(turn_log, "_last_purge", 0.0)
+    assert old in await turn_log.purge_tick()
+    assert await _events(old) == []
+    again = await _finished_turn(days_ago=turn_log.RETAIN_DAYS + 2)
+    monkeypatch.setattr(turn_log, "_last_purge", 0.0)
+    await loop.process_due(None)
+    assert await _events(again) == []

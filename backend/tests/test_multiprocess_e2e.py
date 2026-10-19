@@ -6,11 +6,14 @@
    进程只执行一次；两边的事件流都按 seq 递增、不重不漏，封存核对得上；
 3. 在 A 上跑的运行，从 B 停止：照本进程的停止办（run.cancelled 带上是谁停的）；
 4. 定时任务到点只触发一次（两个进程都起着调度循环，只有当班的做）；
-5. 评测和问数据并发时优先级生效：全站只给 1 个名额，评测的作答运行（系统类，由本测试进程作为第三个登记的工作进程以评测的
-   来源发起——工作进程里发起评测要真的去调模型建图）排着队时，后来的问数据运行（交互类，经 A 的接口发起）先拿到名额；
+5. 评测和问数据并发时优先级生效：全站只给 1 个名额（没有留底），评测的作答运行（系统类，由本测试进程作为第三个登记的工作进程
+   以评测的来源发起——工作进程里发起评测要真的去调模型建图）排着队时，后来的问数据运行（交互类，经 A 的接口发起）先拿到名额；
+   全站 2 个、给交互留底 1 个：评测借满了别的名额、还有题排着，问数据一来马上拿到留底，不等评测跑完；
 6. 每日花费上限跨进程不越过：两个进程同时往同一本账上记，记下的合计不超过上限；
 7. 强杀 B：租约过期后，B 上在跑的运行被照实标中断（可从断点继续），停在审批上的运行照常能在 A 上批、接着跑完；B 当着调度班的
-   话 A 接班。
+   话 A 接班；
+8. 卡住但没死（复核 R-b1）：A 在跑一次运行时被 SIGSTOP，B 等它的租约过期两倍时长后接手、标中断；A 缓过来（SIGCONT）之后发现续晚了，
+   停手、不写终态、不写事件，换一个身份重新登记——不管 B 有没有在这期间把那次运行接着跑完，都不双写、不盖掉终态、序号不重。
 
 缺省不跑：要 AGENTLAB_MULTIPROCESS_E2E=1 和 PostgreSQL 测试库（scripts/test-multiprocess.sh 起临时容器、设好这两样）。
 """
@@ -87,8 +90,16 @@ class Worker:
             self.proc.send_signal(signal.SIGKILL)
             self.proc.wait(timeout=10)
 
+    def pause(self) -> None:
+        self.proc.send_signal(signal.SIGSTOP)
+
+    def resume(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGCONT)
+
     def stop(self) -> None:
         if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGCONT)
             self.proc.send_signal(signal.SIGTERM)
             try:
                 self.proc.wait(timeout=15)
@@ -97,7 +108,7 @@ class Worker:
 
     def tail(self) -> str:
         try:
-            return self.log.read_text(encoding="utf-8", errors="replace")[-4000:]
+            return self.log.read_text(encoding="utf-8", errors="replace")[-12000:]
         except OSError:
             return ""
 
@@ -404,6 +415,55 @@ async def test_5_chat_goes_before_queued_evaluation_runs(workers, monkeypatch):
             await client.put(f"{a.base}/api/settings", json={"values": {"concurrency": slots.defaults()}})
 
 
+async def test_5b_the_interactive_reserve_is_there_when_evaluations_fill_the_rest(workers, monkeypatch):
+    """全站 2 个名额、留底 1 个：评测（系统类）只借得到 1 个，第二题排着；问数据一来马上拿到留底，评测的第一题还在跑。"""
+    from app import cluster
+    from app.cluster import slots
+    from app.cluster.relay import relay
+    from app.core.config import settings
+    from app.db.base import SessionLocal
+    from app.db.models import Run
+    from app.engine.runner import run_manager
+
+    a = workers["A"]
+    async with await _client() as client:
+        put = await client.put(f"{a.base}/api/settings", json={"values": {"concurrency": {
+            "max_total": 2, "interactive_reserve": 1, "classes": {}}}})
+        assert put.status_code == 200, put.text
+        got = put.json()["concurrency"]
+        assert got["max_total"] - got["interactive_reserve"] == 1, "别的类最多借得到 全站 − 留底 = 1 个"
+        slots.forget_policy()
+        monkeypatch.setattr(settings, "sandbox_backend", "local")
+        await cluster.start()
+        await relay.start()
+        await run_manager.setup()
+        try:
+            evals = [await run_manager.start(graph=slow_graph(3), input_payload={"question": f"评测 {i}"},
+                                             origin_kind="eval", origin={"kind": "eval"}) for i in range(2)]
+
+            async def first_running() -> Any:
+                async with SessionLocal() as session:
+                    return (await session.get(Run, evals[0].id)).status == "running"
+
+            await _until(first_running, what="第一题的作答运行拿到名额")
+            chat_id = (await client.post(f"{a.base}/api/runs", json={
+                "graph": slow_graph(0.2), "input": {"question": "问数据"}, "origin": "chat"})).json()["id"]
+
+            async def all_done() -> Any:
+                async with SessionLocal() as session:
+                    rows = [await session.get(Run, rid, populate_existing=True) for rid in [*[e.id for e in evals], chat_id]]
+                return rows if all(r.status in ("succeeded", "failed") for r in rows) else None
+
+            e1, e2, chat = await _until(all_done, timeout=60, what="都跑完")
+            assert chat.started_at < e1.finished_at, "问数据拿到的是留底：评测的第一题还没跑完它就开始了"
+            assert e2.started_at >= e1.finished_at, "评测的第二题借不到留底，等第一题跑完"
+        finally:
+            await run_manager.shutdown()
+            await relay.stop()
+            await cluster.stop()
+            await client.put(f"{a.base}/api/settings", json={"values": {"concurrency": slots.defaults()}})
+
+
 def test_6_the_daily_cap_holds_across_processes(workers):
     """两个进程同时往评测那本账上各记 20 次、每次 0.1 美元，上限 1 美元：合计记下的正好 10 次、不超过上限。"""
     script = (
@@ -429,6 +489,88 @@ async def _spent() -> float:
     from app.engine.spend import Ledger
 
     return float((await Ledger("e2e_spend").daily())["usd"])
+
+
+async def _stall_a_during_a_run(client, a: Worker, b: Worker, seconds: float) -> str:
+    """A 上发起一次运行，跑起来之后 SIGSTOP A，等 B 接手（标中断）。交回运行 id（A 还停着，调用方负责 SIGCONT）。"""
+    run_id = (await client.post(f"{a.base}/api/runs", json={"graph": slow_graph(seconds), "input": {"question": "q"},
+                                                             "origin": "canvas"})).json()["id"]
+    await _until(lambda: _owner_while_active(run_id), what="A 认领了运行")
+    await asyncio.sleep(0.5)
+    a.pause()
+
+    async def taken_over() -> Any:
+        row = await _run(client, b, run_id)
+        return row if row["status"] == "interrupted" else None
+
+    await _until(taken_over, timeout=LEASE_S * 6 + 10, what="B 接手了卡住的 A 上的运行")
+    return run_id
+
+
+async def _a_reidentified(client, a: Worker) -> None:
+    """A 缓过来之后换了身份重新登记：fixture 里记的 owner 跟着换。"""
+    old = a.owner
+
+    async def fresh() -> Any:
+        try:
+            me = (await client.get(f"{a.base}/api/system")).json()["cluster"]["me"]
+        except Exception:  # noqa: BLE001
+            return None
+        return me if me != old else None
+
+    a.owner = await _until(fresh, timeout=15, what="A 换身份重新登记")
+
+
+async def _settled_events(client, worker: Worker, run_id: str) -> list[dict[str, Any]]:
+    return (await client.get(f"{worker.base}/api/runs/{run_id}/events")).json()
+
+
+def _seqs_unique(events: list[dict[str, Any]]) -> None:
+    seqs = [e["seq"] for e in events]
+    assert len(seqs) == len(set(seqs)), f"撞号：{sorted(seqs)}"
+
+
+async def test_6b_a_stalled_worker_does_not_write_after_it_was_taken_over(workers):
+    a, b = workers["A"], workers["B"]
+    async with await _client() as client:
+        try:
+            run_id = await _stall_a_during_a_run(client, a, b, 6)
+        finally:
+            a.resume()
+        await _a_reidentified(client, a)
+        await asyncio.sleep(max(4.0, 3 * HEARTBEAT_S))     # A 手上那一步本来再过几秒就跑完：给它机会（它不该写）
+        row = await _run(client, b, run_id)
+        assert row["status"] == "interrupted", f"接手之后的状态被盖掉了：{row['status']}"
+        events = await _settled_events(client, b, run_id)
+        assert not [e for e in events if e["type"] in ("run.finished", "run.failed", "run.cancelled")]
+        assert any(e["type"] == "log" and e["data"].get("code") == "server_shutdown" for e in events)
+        _seqs_unique(events)
+
+
+async def test_6c_a_run_continued_by_the_other_worker_is_not_written_twice(workers):
+    a, b = workers["A"], workers["B"]
+    async with await _client() as client:
+        try:
+            run_id = await _stall_a_during_a_run(client, a, b, 3)
+            cont = await client.post(f"{b.base}/api/runs/{run_id}/continue", json={})
+            assert cont.status_code == 200, cont.text
+        finally:
+            a.resume()
+        await _a_reidentified(client, a)
+
+        async def done() -> Any:
+            row = await _run(client, b, run_id)
+            return row if row["status"] in ("succeeded", "failed") and row.get("manifest_hash") else None
+
+        row = await _until(done, timeout=60, what="B 接着跑完")
+        await asyncio.sleep(2.0)
+        assert row["status"] == "succeeded", row
+        assert (await _run(client, b, run_id))["status"] == "succeeded", "A 缓过来之后没有把终态改掉"
+        events = await _settled_events(client, b, run_id)
+        assert len([e for e in events if e["type"] == "run.finished"]) == 1
+        _seqs_unique(events)
+        verified = (await client.get(f"{b.base}/api/runs/{run_id}/verify")).json()
+        assert verified["ok"] is True, verified
 
 
 async def test_7_kill_a_worker(workers):

@@ -221,12 +221,13 @@ async def _stream(turn_id: str, after: int, *, active: Callable[[], Awaitable[st
                 yield PING
 
 
-async def purge(now: datetime, *, retain_days: float = RETAIN_DAYS, limit: int = PURGE_BATCH) -> list[str]:
+async def purge(now: datetime | None = None, *, retain_days: float = RETAIN_DAYS, limit: int = PURGE_BATCH) -> list[str]:
     """结束超过 retain_days 天的轮次整轮删事件日志（见模块说明），交回清了哪几轮。任务行、conversation_turns 那一行不动。
     结束的时刻按任务的 finished_at，没记的按 updated_at。"""
+    from app.db.base import utcnow
     from app.db.models_chat import ChatTurnEvent, ChatTurnJob
 
-    cutoff = now - timedelta(days=retain_days)
+    cutoff = (now or utcnow()) - timedelta(days=retain_days)
     async with SessionLocal() as session:
         ended = select(ChatTurnJob.id).where(ChatTurnJob.status.in_(FINISHED),
                                              func.coalesce(ChatTurnJob.finished_at, ChatTurnJob.updated_at) < cutoff)
@@ -242,16 +243,13 @@ async def purge(now: datetime, *, retain_days: float = RETAIN_DAYS, limit: int =
 _last_purge = 0.0
 
 
-async def purge_tick(now: datetime | None) -> list[str]:
-    """调度循环每一拍调（scheduler/loop.process_due）：一小时最多清一次。"""
+async def purge_tick(now: datetime | None = None) -> list[str]:
+    """调度循环每一拍调（scheduler/loop.process_due，那一拍不一定给 now）：一小时最多清一次，不给 now 按当前时间算。"""
     global _last_purge
     if time.monotonic() - _last_purge < PURGE_EVERY_S and _last_purge:
         return []
     _last_purge = time.monotonic()
-    # 调度循环那一拍不带时刻（process_due() 的 now 缺省为 None）：按现在算
-    from app.db.base import utcnow
-
-    return await purge(now or utcnow())
+    return await purge(now)
 
 
 __all__ = ["FINISHED", "HEARTBEAT_S", "PING", "READ_BATCH", "RETAIN_DAYS", "STREAM_END", "add", "append", "beat", "forget",

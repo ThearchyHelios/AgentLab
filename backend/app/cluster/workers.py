@@ -2,7 +2,7 @@
 
 - register / renew / unregister：启动时登记、隔一拍心跳续租约、平稳关停时删掉自己那一行（别的进程马上就知道它不在了，
   不必等租约到期）。
-- liveness()：现在哪些别的进程还活着（租约没过期）。各种「启动整理」「接手」都只碰属主不在了的行：
+- liveness()：现在哪些别的进程还活着（租约过期不到一个租约时长：再晚才算不在了，见 cluster/fence.py）。各种「启动整理」「接手」都只碰属主不在了的行：
   Liveness.alive(owner, local=…) —— 属主是别的进程：看它的租约；属主是自己：看这一行在本进程里是不是真的在跑（local），
   同一个进程里前一次起停留下的（测试里一个进程起停多次服务）照样算不在了；没有属主（升级前的行）算不在了。
 
@@ -23,6 +23,10 @@ from app.core.config import settings
 from app.db.base import SessionLocal, utcnow
 
 logger = logging.getLogger(__name__)
+
+
+#: 登记时全站串行用的事务级咨询锁的号
+_REGISTER_KEY = 0x4167576F726B6572  # "AgWorker"
 
 
 def lease_s() -> float:
@@ -61,9 +65,12 @@ async def liveness(now: datetime | None = None) -> Liveness:
 
     now = now or utcnow()
     me = identity.owner()
+    # 租约过期之后再多等一个租约时长才算不在了：卡住了但没死的进程（SIGSTOP、虚拟机暂停、库一时连不上）自己在一个租约时长时就
+    # 停手（cluster/fence.py），两边中间留着一段，不会它还在写、这边已经接手
+    floor = now - timedelta(seconds=lease_s())
     async with SessionLocal() as session:
         ids = (await session.execute(select(ClusterWorker.id).where(
-            ClusterWorker.lease_until > now, ClusterWorker.id != me))).scalars().all()
+            ClusterWorker.lease_until > floor, ClusterWorker.id != me))).scalars().all()
     return Liveness(frozenset(ids))
 
 
@@ -83,15 +90,25 @@ async def register(*, exclusive: bool = False) -> None:
     守卫已经确认没有别的进程在用这个数据目录，见 cluster/guard.py）。"""
     from app.db.models_cluster import ClusterWorker
 
+    from app.cluster import version
+
     me = identity.owner()
     now = utcnow()
     async with SessionLocal() as session:
         if exclusive:
             await session.execute(delete(ClusterWorker).where(ClusterWorker.id != me))
+        elif session.get_bind().dialect.name == "postgresql":
+            # 查「还有没有活着的、版本不同的进程」和登记在同一个事务里、全站串行：两个不同版本同时启动只有先登记上的起得来
+            from sqlalchemy import text
+
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _REGISTER_KEY})
+            others = (await session.execute(select(ClusterWorker).where(ClusterWorker.id != me))).scalars().all()
+            version.check_rows(list(others), now)
         row = await session.get(ClusterWorker, me)
         if row is None:
             session.add(ClusterWorker(id=me, host=identity.host(), pid=os.getpid(), started_at=now, heartbeat_at=now,
-                                      lease_until=now + timedelta(seconds=lease_s()), info=_info()))
+                                      lease_until=now + timedelta(seconds=lease_s()), info=_info(),
+                                      code_version=version.code_version(), schema_version=version.schema_version()))
         else:
             row.heartbeat_at, row.lease_until = now, now + timedelta(seconds=lease_s())
         await session.commit()
@@ -137,6 +154,7 @@ async def listing() -> list[dict[str, Any]]:
     async with SessionLocal() as session:
         rows = (await session.execute(select(ClusterWorker).order_by(ClusterWorker.started_at, ClusterWorker.id))).scalars().all()
     return [{"id": r.id, "host": r.host, "pid": r.pid, "alive": r.lease_until > now, "me": r.id == identity.owner(),
+             "code_version": r.code_version, "schema_version": r.schema_version,
              "started_at": r.started_at.isoformat() if r.started_at else None,
              "heartbeat_at": r.heartbeat_at.isoformat() if r.heartbeat_at else None} for r in rows]
 

@@ -93,6 +93,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --start-interval=2s -
 
 # 版本号放在最后：它每次打包都不同，放前面会让装依赖那几层的缓存全部失效
 ARG VERSION=dev
+# 进程登记时带上构建号（app/cluster/version.py：库里还有活着的、版本不同的进程时新进程不许加入）
+ENV AGENTLAB_BUILD=${VERSION}
 LABEL org.opencontainers.image.title="AgentLab" \
       org.opencontainers.image.description="可视化 Agent 编排实验台" \
       org.opencontainers.image.version="${VERSION}" \
@@ -100,4 +102,5 @@ LABEL org.opencontainers.image.title="AgentLab" \
 
 # 工作进程数照 AGENTLAB_WORKERS（缺省 1）。大于 1 要应用库是 PostgreSQL（AGENTLAB_DATABASE_URL）：SQLite 只支持单进程，
 # 服务启动时拒绝第二个进程（app/cluster/guard.py）。exec：uvicorn 直接收 SIGTERM，走完整的优雅退出
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers \"${AGENTLAB_WORKERS:-1}\""]
+# 进程数问后端（python -m app.cluster workers，环境变量和 .env 一起读；SQLite 而大于 1 时照实报错、不起）
+CMD ["sh", "-c", "n=\"$(python -m app.cluster workers)\" || exit 2; exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers \"$n\""]

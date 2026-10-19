@@ -388,7 +388,7 @@ _LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _lock(key: str) -> Any:
-    """按需视图的单飞锁（app/cluster/mutex，多进程之间也是一把）：按应用取，同一个键正在运行的那次接上、不另发，每日上限也数得准。"""
+    """按需视图的单飞锁（app/cluster/mutex，多进程之间也是一把）：按缓存键（视图 + 参数）取，同一个键正在运行的那次接上、不另发。"""
     from app.cluster import mutex
 
     return mutex.lock(f"app-view:{key}")
@@ -471,25 +471,35 @@ async def run_view(session: AsyncSession, *, app: Any, version: AppVersion, view
             raise FormRejected(errors)
     inputs = normalize_params(form, params)
     key = await cache_key(session, state, inputs)
-    # 按应用一把锁（不按缓存键）：同一个键正在运行的那次接上不另发，每日上限的「数一数再发」几个进程、几个键之间也不越过
-    async with _lock(app.id):
+    # 锁按缓存键（这个视图、这组参数）：管的是去重——同一个键正在运行的那次接上，不另算一遍。每日上限不靠它：发起之前在库里先占
+    # 一份这个应用今天的额度（app/cluster/quota，带条件的加一），几个键、几个进程同时刷新也正好到上限为止，发起不成退回
+    from app.cluster import quota
+
+    async with _lock(key):
         run = await _cached(session, key)
         if run is not None:
             return run, run.status == "succeeded"
-        # 「每天」按服务端所在时区的自然日算
-        start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-        used = await session.scalar(select(func.count(Run.id)).where(
-            Run.app_id == app.id, Run.origin_kind == "app_view", Run.created_at >= start))
         limit = await daily_limit(session)
-        if int(used or 0) >= limit:
+
+        async def used_today(s: AsyncSession) -> int:
+            # 「每天」按服务端所在时区的自然日算
+            start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            return int(await s.scalar(select(func.count(Run.id)).where(
+                Run.app_id == app.id, Run.origin_kind == "app_view", Run.created_at >= start)) or 0)
+
+        if not await quota.take(f"app_view:{app.id}", limit, seed=used_today):
             raise ViewRefused(429, f"这个应用今天的按需运行已达到上限（{limit} 次），请明天再试，或请管理员调整上限",
                               DAILY_LIMIT)
-        run = await launch_run(
-            session, workflow_id=state.pin["workflow_id"], run_class="formal", version=state.pin["version"],
-            expect_hash=state.pin.get("graph_hash"), input_payload=inputs, actor=actor, origin_kind="app_view",
-            app_id=app.id, app_version=version.version,
-            origin={"view": view_id, "spec_hash": version.spec_hash, "actor_verified": principal.verified,
-                    "auth_mode": principal.mode, **_key_trace(principal)})
+        try:
+            run = await launch_run(
+                session, workflow_id=state.pin["workflow_id"], run_class="formal", version=state.pin["version"],
+                expect_hash=state.pin.get("graph_hash"), input_payload=inputs, actor=actor, origin_kind="app_view",
+                app_id=app.id, app_version=version.version,
+                origin={"view": view_id, "spec_hash": version.spec_hash, "actor_verified": principal.verified,
+                        "auth_mode": principal.mode, **_key_trace(principal)})
+        except BaseException:
+            await quota.give_back(f"app_view:{app.id}")
+            raise
         ttl = source.get("ttl_s")
         if ttl is None and await reads_live(session, state.graph):
             ttl = TTL_DEFAULT

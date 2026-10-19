@@ -55,9 +55,9 @@ class ClusterLock:
         try:
             from sqlalchemy import text
 
-            from app.db.base import engine
+            from app.db.base import session_engine
 
-            conn = await engine.connect()
+            conn = await session_engine().connect()
             try:
                 conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
                 got = bool(await conn.scalar(text("SELECT pg_try_advisory_lock(:k)"), {"k": self.key}))
@@ -86,9 +86,11 @@ class ClusterLock:
         try:
             from sqlalchemy import text
 
-            from app.db.base import engine
+            from app.db.base import session_engine
 
-            conn = await engine.connect()
+            # 会话级的锁：走直连（AGENTLAB_DATABASE_DIRECT_URL，没设就是应用库）——PgBouncer 事务模式下取锁、放锁可能落在
+            # 两条不同的服务端连接上
+            conn = await session_engine().connect()
             try:
                 conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
                 await conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": self.key})

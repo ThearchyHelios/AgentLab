@@ -1234,7 +1234,9 @@ async def startup(*, resume: bool | None = None, live: Any = None) -> dict[str, 
             await session.commit()
         for turn_id in gone:
             turn_log.notify(turn_id)
-    for row in legacy:
+    # 老轮次（没有任务行）只在启动时整理：当班进程隔一会儿来的那一次（live.trust_mine）不碰——老页面开的轮次（不占锁的写入）
+    # 正在建图时也是这个样子
+    for row in [] if live.trust_mine else legacy:
         if turn_run_id(row):
             continue   # 有运行的老轮次：页面打开时请服务端接着收尾
         async with SessionLocal() as session:

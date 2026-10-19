@@ -26,6 +26,7 @@ USAGE
 HOST="127.0.0.1"
 PORT="${AGENTLAB_PORT:-8000}"
 WORKERS="${AGENTLAB_WORKERS:-1}"
+WORKERS_CLI=""
 BUILD="auto"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,8 +37,8 @@ while [ $# -gt 0 ]; do
     --port=*) PORT="${1#--port=}" ;;
     --workers)
       [ $# -ge 2 ] || { echo "--workers 后面要跟进程数"; echo; usage; exit 2; }
-      WORKERS="$2"; shift ;;
-    --workers=*) WORKERS="${1#--workers=}" ;;
+      WORKERS="$2"; WORKERS_CLI=1; shift ;;
+    --workers=*) WORKERS="${1#--workers=}"; WORKERS_CLI=1 ;;
     --build) BUILD="always" ;;
     --no-build) BUILD="never" ;;
     -h|--help) usage; exit 0 ;;
@@ -57,12 +58,7 @@ esac
 if [ "$WORKERS" -lt 1 ]; then
   echo "进程数至少是 1：$WORKERS"; exit 2
 fi
-# SQLite 只支持单进程（服务自己也会拒绝启动第二个进程，app/cluster/guard.py）：在这里先说清楚，免得 uvicorn 一遍遍重起被拒的进程
-if [ "$WORKERS" -gt 1 ] && [ -z "${AGENTLAB_DATABASE_URL:-}" ]; then
-  echo "应用库是 SQLite 时只支持单进程：要 --workers $WORKERS，先设 AGENTLAB_DATABASE_URL 换成 PostgreSQL（README「用 PostgreSQL」「多进程」）"
-  exit 2
-fi
-export AGENTLAB_WORKERS="$WORKERS"
+# 命令行给了 --workers 才写进环境变量（见下面问后端的那一句）；没给的话照后端自己的配置（环境变量和 .env）
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/frontend/dist"
@@ -169,6 +165,10 @@ fi
 
 echo "==> 启动 $URLS"
 cd "$ROOT/backend"
+# 起几个进程问后端（python -m app.cluster workers）：它照环境变量和 .env 一起读应用库、进程数——写在 .env 里的 AGENTLAB_DATABASE_URL、
+# AGENTLAB_WORKERS 这里也算数；应用库是 SQLite 而进程数大于 1 时它照实报错（SQLite 只支持单进程），这里不起
+[ -n "$WORKERS_CLI" ] && export AGENTLAB_WORKERS="$WORKERS"
+WORKERS="$("$PY_BIN" -m app.cluster workers)" || exit 2
 # exec：让 uvicorn 直接收 Ctrl-C / SIGTERM，一个信号就走完整的优雅退出（收尾运行、关沙箱）。
 # 要是包一层 shell 再转发，终端的 Ctrl-C 会让 uvicorn 收到两次信号，第二次直接强退、跳过收尾
 # 多进程（--workers 大于 1，PostgreSQL）：uvicorn 起几个工作进程共用这个端口，各自在库里登记、续租约（app/cluster）

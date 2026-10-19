@@ -24,7 +24,7 @@ app/chat/job.py），生成过程是 api/copilot.answer_ops，几个「决定」
 用量按角色记（做法 3、11）：助手 = 生成（answer_ops 末尾的 usage）+ 复核（review_of_run 的 usage）；写作 = 答案运行里的
 llm.end（按模型分）。重来的话两次都算——那都是这一题花的钱。
 
-时限、停止由调用方管（runner.py 用 asyncio.wait_for 包住 drive）：这里随时把正在跑的那次运行记在 current_run，调用方
+时限、停止由调用方管（runner.py 用 within 包住 drive，排队等名额的那一段不算）：这里随时把正在跑的那次运行记在 current_run，调用方
 超时、停止时据此取消它（stop_run）。
 """
 from __future__ import annotations

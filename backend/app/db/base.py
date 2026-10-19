@@ -188,12 +188,45 @@ def pg_json_dumps(value: Any) -> str:
 APPLICATION_NAME = "agentlab"
 
 
-def make_engine(url: str | None = None, *, application_name: str = APPLICATION_NAME) -> AsyncEngine:
+def pg_engine_kwargs(*, application_name: str = APPLICATION_NAME, pgbouncer: bool = False,
+                     pool_size: int | None = None) -> dict[str, Any]:
+    """PostgreSQL 引擎的连接池和连接参数。pgbouncer：这个地址是 PgBouncer 的事务模式（AGENTLAB_DB_PGBOUNCER）——
+
+    - 不用客户端的连接池（NullPool，连接池交给 PgBouncer；SQLAlchemy 的说明里同样这么建议）；
+    - SQLAlchemy 的预备语句缓存（prepared_statement_cache_size）和 asyncpg 自己的（statement_cache_size）都关掉：事务模式下同一个
+      客户端连接的下一条语句可能落在另一条服务端连接上，缓存着的预备语句在那边不存在；
+    - asyncpg 每条语句仍要先预备再执行（SQLAlchemy 的 asyncpg 方言一律这么做，同一个事务里，落在同一条服务端连接上），名字用随机的
+      （prepared_statement_name_func），不和别的客户端在同一条服务端连接上留下的撞名。PgBouncer 要配 server_reset_query=DISCARD ALL
+      （且 server_reset_query_always=1）收掉留下的预备语句，或用 1.21 以上开 max_prepared_statements。
+    事务级的咨询锁（pg_advisory_xact_lock，发名额、同源队、建表时用）在事务模式下照常成立：取锁和放锁都在同一个事务里。"""
+    connect_args: dict[str, Any] = {
+        # 会话时区定成 UTC：时间列是不带时区的 UTC（UTCDateTime），库里 now() 之类的也按 UTC 算
+        "server_settings": {"application_name": application_name, "timezone": "UTC"}}
+    size = settings.db_pool_size if pool_size is None else pool_size
+    if pgbouncer:
+        connect_args.update(statement_cache_size=0, prepared_statement_cache_size=0,
+                            prepared_statement_name_func=_unique_statement_name)
+        return {"poolclass": NullPool, "connect_args": connect_args}
+    if size <= 0:
+        return {"poolclass": NullPool, "connect_args": connect_args}
+    return {"pool_size": size, "max_overflow": max(settings.db_max_overflow, 0), "pool_timeout": settings.db_pool_timeout,
+            "pool_recycle": settings.db_pool_recycle, "connect_args": connect_args}
+
+
+def _unique_statement_name() -> str:
+    return f"__agentlab_{uuid.uuid4().hex}__"
+
+
+def make_engine(url: str | None = None, *, application_name: str = APPLICATION_NAME, pgbouncer: bool | None = None,
+                pool_size: int | None = None) -> AsyncEngine:
     """应用库的引擎。SQLite：WAL、外键、忙等，单个文件；PostgreSQL：连接池、方言调整（db/postgres.py）。
 
     copy-to-postgres 建目标库的引擎也走这里，两边的列类型、排序规则是同一套。
     """
     url = url or settings.db_url
+    if pgbouncer is None:
+        # 只有应用库的普通地址按 AGENTLAB_DB_PGBOUNCER 处理：直连地址、copy-to-postgres 给的目标库照常
+        pgbouncer = bool(settings.db_pgbouncer) and url == settings.database_url
     if url.startswith("sqlite"):
         # pool_pre_ping：取连接前先探一下活。取消异常打进 SQLAlchemy 的清理流程时
         # （_close_connection 记完日志会把 CancelledError 原样抛出，跳过了把连接记录
@@ -206,15 +239,9 @@ def make_engine(url: str | None = None, *, application_name: str = APPLICATION_N
     from app.db import postgres
 
     _require_postgres_driver("asyncpg")
-    pool: dict[str, Any] = (
-        {"poolclass": NullPool} if settings.db_pool_size <= 0 else {
-            "pool_size": settings.db_pool_size, "max_overflow": max(settings.db_max_overflow, 0),
-            "pool_timeout": settings.db_pool_timeout, "pool_recycle": settings.db_pool_recycle})
-    made = create_async_engine(
-        url, echo=False, future=True, pool_pre_ping=True, json_serializer=pg_json_dumps,
-        # 会话时区定成 UTC：时间列是不带时区的 UTC（UTCDateTime），库里 now() 之类的也按 UTC 算
-        connect_args={"server_settings": {"application_name": application_name, "timezone": "UTC"}},
-        **pool)
+    made = create_async_engine(url, echo=False, future=True, pool_pre_ping=True, json_serializer=pg_json_dumps,
+                               **pg_engine_kwargs(application_name=application_name, pgbouncer=pgbouncer,
+                                                  pool_size=pool_size))
     postgres.install(made.sync_engine.dialect)
     event.listen(made.sync_engine, "before_cursor_execute", postgres.strip_nul, retval=True)
     return made
@@ -249,6 +276,35 @@ def describe_database() -> str:
 engine = make_engine()
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+_session_engine: AsyncEngine | None = None
+
+
+def session_engine() -> AsyncEngine:
+    """依赖会话状态的连接用的引擎（跨进程锁的会话级咨询锁，app/cluster/mutex）：设了 AGENTLAB_DATABASE_DIRECT_URL 时是直连那个库的
+    一个小池子，否则就是应用库的引擎。"""
+    global _session_engine
+    if not settings.database_direct_url or settings.database_direct_url == settings.database_url:
+        return engine
+    if _session_engine is None:
+        _session_engine = make_engine(settings.database_direct_url, pgbouncer=False, pool_size=max(2, min(settings.db_pool_size or 5, 10)))
+    return _session_engine
+
+
+async def dispose_session_engine() -> None:
+    """关停时关掉直连那个小池子（没另建就什么都不做）。"""
+    global _session_engine
+    if _session_engine is not None:
+        await _session_engine.dispose()
+        _session_engine = None
+
+
+def check_pgbouncer() -> None:
+    """AGENTLAB_DB_PGBOUNCER=1 却没给直连地址：拒绝启动（事务模式下 LISTEN、会话级咨询锁不成立，跨进程的锁会锁不住、放不掉）。"""
+    if settings.db_pgbouncer and settings.db_dialect == "postgresql" and not settings.database_direct_url:
+        raise RuntimeError("AGENTLAB_DB_PGBOUNCER=1（应用库地址是 PgBouncer 的事务模式）时要另给 AGENTLAB_DATABASE_DIRECT_URL："
+                           "进程间通知（LISTEN）、跨进程的锁（会话级咨询锁）、断点库要直连 PostgreSQL（或 PgBouncer 的会话模式）。"
+                           "见 README「用 PostgreSQL」里的三种部署")
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -398,6 +454,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("publish_plans", "owner", "VARCHAR(120)"),
     # 问数据：等不及的那次复核还在后台跑（实时流在它回来之前不关；多进程时别的进程上的流也看得到）
     ("chat_turn_jobs", "late_review_at", "DATETIME"),
+    # 工作进程登记的代码版本、库结构版本（app/cluster/version.py：不许新旧版本混跑）
+    ("cluster_workers", "code_version", "VARCHAR(200)"),
+    ("cluster_workers", "schema_version", "VARCHAR(64)"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。
@@ -512,6 +571,7 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
         cols = columns.get(table) or set()
         if all(c in cols for c in wanted):
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({', '.join(wanted)})"))
+    _unique_run_event_seq(conn, columns)
     for name, table, wanted, where, dedupe in _UNIQUE_INDEX_MIGRATIONS:
         cols = columns.get(table) or set()
         if not all(c in cols for c in wanted):
@@ -522,6 +582,29 @@ def _migrate(conn) -> None:  # pragma: no cover - 同步回调
         conn.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({', '.join(wanted)})"
                           + (f" WHERE {where.format(**literals)}" if where else "")))
     _backfill_not_null(conn, columns)
+
+
+def _unique_run_event_seq(conn: Any, columns: dict[str, set[str]]) -> None:  # pragma: no cover - 同步回调
+    """run_events 的 (run_id, seq) 补唯一索引（ux_run_events_run_seq，换掉原来不唯一的 ix_run_events_run_seq）。存量库里可能已经
+    有撞了号的（多进程之前的进程内计数、按需裁判的老写法）：先数一数，有就照实记日志、这一次不建（照旧用不唯一的索引），不让启动
+    失败——那几次运行的封存核对本来就对不上，删哪一条都不对，要人看。"""
+    from sqlalchemy import inspect, text
+
+    if "run_events" not in columns:
+        return
+    names = {ix["name"] for ix in inspect(conn).get_indexes("run_events")}
+    if "ux_run_events_run_seq" in names:
+        return
+    dupes = conn.execute(text("SELECT run_id, seq, COUNT(*) FROM run_events GROUP BY run_id, seq HAVING COUNT(*) > 1 "
+                              "LIMIT 20")).all()
+    if dupes:
+        runs = sorted({str(r[0]) for r in dupes})
+        logger.warning("run_events 里有撞了号的事件（%d 处以上，涉及运行 %s）：这一次不建 (run_id, seq) 的唯一索引。"
+                       "这几次运行的封存核对对不上，请人工核对后处理", len(dupes), "、".join(runs[:5]))
+        return
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_run_events_run_seq ON run_events (run_id, seq)"))
+    if "ix_run_events_run_seq" in names:
+        conn.execute(text("DROP INDEX IF EXISTS ix_run_events_run_seq"))
 
 
 #: init_db 在 PostgreSQL 上拿的会话级咨询锁的号：几个进程同时启动时，建表和迁移一个一个来（同一个号别处别用）

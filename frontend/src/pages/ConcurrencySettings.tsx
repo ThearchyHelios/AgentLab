@@ -8,17 +8,19 @@ import { atLeast, usePrincipal } from '../store/auth'
 
 const T = CONCURRENCY_TEXT
 type Klass = (typeof CONCURRENCY_CLASSES)[number]
-interface Draft { total: string; limits: Record<Klass, string>; priorities: Record<Klass, string> }
+interface Draft { total: string; reserve: string; limits: Record<Klass, string>; priorities: Record<Klass, string> }
 type Now = Partial<Record<Klass, { running?: number; waiting?: number }>>
 
 const draftOf = (group: Record<string, any> | undefined): Draft => ({
   total: group?.max_total == null ? '' : String(group.max_total),
+  reserve: group?.interactive_reserve == null ? '' : String(group.interactive_reserve),
   limits: Object.fromEntries(CONCURRENCY_CLASSES.map((k) => [k, String(group?.classes?.[k]?.limit ?? '')])) as Record<Klass, string>,
   priorities: Object.fromEntries(CONCURRENCY_CLASSES.map((k) => [k, String(group?.classes?.[k]?.priority ?? '')])) as Record<Klass, string>,
 })
 
 const changedCount = (a: Draft, b: Draft): number =>
   (a.total.trim() !== b.total ? 1 : 0)
+  + (a.reserve.trim() !== b.reserve ? 1 : 0)
   + CONCURRENCY_CLASSES.filter((k) => a.limits[k].trim() !== b.limits[k]).length
   + CONCURRENCY_CLASSES.filter((k) => a.priorities[k].trim() !== b.priorities[k]).length
 
@@ -62,6 +64,7 @@ export function ConcurrencySettingsSection() {
     try {
       const value = {
         max_total: Number(cur.total.trim()),
+        interactive_reserve: Number(cur.reserve.trim()),
         classes: Object.fromEntries(CONCURRENCY_CLASSES.map((k) => [k, {
           limit: Number(cur.limits[k].trim()), priority: Number(cur.priorities[k].trim()),
         }])),
@@ -80,6 +83,8 @@ export function ConcurrencySettingsSection() {
   }
 
   if (loadError || !cur) return null
+  // 借用的上限按存着的算（服务端生效的那份），改到一半的输入不跟着跳
+  const borrow = saved && saved.total !== '' && saved.reserve !== '' ? Math.max(0, Number(saved.total) - Number(saved.reserve)) : null
   const edit = (patch: Partial<Draft>) => {
     setError(null)
     setDraft({ ...cur, ...patch, limits: { ...cur.limits, ...(patch.limits ?? {}) },
@@ -89,12 +94,21 @@ export function ConcurrencySettingsSection() {
     <section data-concurrency-settings="">
       <SectionBar title={T.title} hint={T.hint} />
       <fieldset disabled={!admin || saving} className="m-0 min-w-0 space-y-3 border-0 p-0">
-        <Field label={T.maxTotal} htmlFor="pref-concurrency-total">
-          {(p) => (
-            <input {...p} className="field tnum max-w-40" inputMode="numeric" value={cur.total}
-                   onChange={(e) => edit({ total: e.target.value })} data-concurrency-setting="max_total" />
-          )}
-        </Field>
+        <div className="grid grid-cols-2 gap-3 max-sm:grid-cols-1">
+          <Field label={T.maxTotal} htmlFor="pref-concurrency-total">
+            {(p) => (
+              <input {...p} className="field tnum max-w-40" inputMode="numeric" value={cur.total}
+                     onChange={(e) => edit({ total: e.target.value })} data-concurrency-setting="max_total" />
+            )}
+          </Field>
+          <Field label={T.reserve} htmlFor="pref-concurrency-reserve" hint={T.reserveHint}>
+            {(p) => (
+              <input {...p} className="field tnum max-w-40" inputMode="numeric" value={cur.reserve}
+                     onChange={(e) => edit({ reserve: e.target.value })} data-concurrency-setting="interactive_reserve" />
+            )}
+          </Field>
+        </div>
+        {borrow != null && <p className="text-2xs text-dim" data-concurrency-borrow="">{T.borrow(borrow)}</p>}
         <div className="space-y-2">
           {CONCURRENCY_CLASSES.map((k) => {
             const info = T.classes[k]
@@ -106,7 +120,7 @@ export function ConcurrencySettingsSection() {
                   <div className="text-2xs leading-relaxed text-faint">{info.hint}</div>
                   {live && <div className="text-2xs text-dim" data-concurrency-now={k}>{T.now(live.running ?? 0, live.waiting ?? 0)}</div>}
                 </div>
-                <Field label={T.limit} htmlFor={`pref-concurrency-${k}-limit`}>
+                <Field label={T.limit} htmlFor={`pref-concurrency-${k}-limit`} hint={k === 'app' ? T.limitHint : undefined}>
                   {(p) => (
                     <input {...p} className="field tnum max-w-32" inputMode="numeric" value={cur.limits[k]}
                            onChange={(e) => edit({ limits: { [k]: e.target.value } as Record<Klass, string> })}

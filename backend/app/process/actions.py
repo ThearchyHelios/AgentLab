@@ -399,6 +399,10 @@ async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, ex
              else "演练：探索运行里端点没有测试环境，没有发送请求")
         return _output(action_id, prep, "simulated", None, receipt)
 
+    # 本进程续不上租约了（cluster/fence.py）就不发：这次运行可能已经被别的进程接手
+    from app.cluster import fence
+
+    fence.check()
     # 先记 sent 再发：发到一半进程没了，重启后看到的是 sent，只能核实，不会当成没发过再发一次
     if not await _set(action_id, ("pending",), state="sent", request_at=utcnow()):
         raise ActionPending(action_id)
@@ -725,7 +729,8 @@ async def startup(*, live: Any = None) -> int:
     """启动时：上次进程没了的时候已经发出（sent）、还没拿到结果的动作收成结果未知，安排核实；结果未知却还没安排核实的
     （挂起之后、安排之前进程没了）补上。返回处理的条数。
 
-    多进程：所属的运行还在别的活着的进程里执行的不碰（那边正在发、正在等结果）。"""
+    多进程：所属的运行还在别的活着的进程里执行的不碰（那边正在发、正在等结果）；当班进程隔一会儿来的那一次只收拾停了两个租约
+    时长以上的。"""
     from app.cluster import state
     from app.db.models import Run
     from app.engine.runner import run_manager
@@ -737,6 +742,16 @@ async def startup(*, live: Any = None) -> int:
             ActionRecord.state.in_(("sent", "unknown")), ActionRecord.resolution.is_(None)))).all()
     ids = [action_id for action_id, run_id, status, owner in rows
            if not (status in ("running", "queued") and live.alive(owner, local=run_manager.is_active(run_id)))]
+    if live.trust_mine and ids:
+        # 当班进程隔一会儿来的那一次：刚挂起、执行它的进程正在安排核实的（收尾和安排核实之间）不碰，只收拾停了两个租约时长以上的
+        from datetime import timedelta
+
+        from app.cluster.workers import lease_s
+
+        floor = utcnow() - timedelta(seconds=2 * lease_s())
+        async with SessionLocal() as session:
+            ids = list((await session.execute(select(ActionRecord.id).where(
+                ActionRecord.id.in_(ids), ActionRecord.updated_at < floor))).scalars())
     for action_id in ids:
         try:
             await on_unknown(action_id)
