@@ -58,6 +58,7 @@ export const RECALL_TEXT = {
       const parts = [
         c.changed ? `数变了 ${n(c.changed)} 组` : '',
         c.unchanged ? `没变 ${n(c.unchanged)} 组` : '',
+        c.row_order ? `核对不了（行序不定）${n(c.row_order)} 组` : '',
         c.running ? `正在重算 ${n(c.running)} 组` : '',
         c.failed ? `重算失败 ${n(c.failed)} 组` : '',
         c.not_recomputable ? `无法重算 ${n(c.not_recomputable)} 组` : '',
@@ -65,7 +66,8 @@ export const RECALL_TEXT = {
       return parts.join('，')
     },
     state: {
-      changed: '数变了', unchanged: '没变', failed: '重算失败', running: '正在重算', pending: '未重算',
+      changed: '数变了', unchanged: '没变', row_order: '核对不了（行序不定）', failed: '重算失败', running: '正在重算',
+      pending: '未重算',
       not_recomputable: '无法重算',
     } as Record<string, string>,
     reason: (state: string, reason: string) => (state === 'not_recomputable' ? `无法重算：${reason}` : reason),

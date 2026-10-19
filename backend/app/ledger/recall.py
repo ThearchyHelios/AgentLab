@@ -82,7 +82,7 @@ REASONS = ("caliber", "catalog", "structure")
 #: 发起的批次：发布后自动的、版本历史里手动接着算的
 BATCHES = ("auto", "manual")
 #: 一组的结论
-OUTCOMES = ("changed", "unchanged", "failed", "running", "pending", "not_recomputable")
+OUTCOMES = ("changed", "unchanged", "row_order", "failed", "running", "pending", "not_recomputable")
 #: 启动时接着做最近几天发布的
 RESUME_DAYS = 7
 #: 目录、表结构变了时最多看多少次探索运行（新的在前）
@@ -109,6 +109,8 @@ SUPERSEDED = "已有更新的发布版 v{latest}，召回在 v{latest} 那一版
 NOT_CURRENT = "v{version} 已不是当前发布版，召回不再接着算"
 #: 收尾
 CHANGED_TITLE = "口径「{name}」升到 v{version}，答案的数变了"
+#: 全部指标行序不定、核对不了时的待办标题（settle 的 row_order）
+ROW_ORDER_TITLE = "口径「{name}」升到 v{version}，答案里的数行序不定、没能核对，请人工核对"
 CATALOG_TITLE = "答案依据的数据目录有变：按新目录检查出了新的问题"
 STRUCTURE_TITLE = "口径「{name}」v{version} 依据的表结构变了，试算没有算出来"
 #: 依据有变的四种（ledger.basis_changed 的 kind）
@@ -531,11 +533,12 @@ def _reasons(plan: Plan) -> list[dict[str, Any]]:
 
 
 async def outcome_of(session: Any, run: Run) -> tuple[str, dict[str, Any]]:
-    """一次召回运行的结论：(changed / unchanged / failed / running, 收尾时记下的那一条 ledger.recalled 的内容)。"""
+    """一次召回运行的结论：(changed / unchanged / row_order（全部指标行序不定、核对不了）/ failed / running, 收尾时记下的那一条
+    ledger.recalled 的内容)。"""
     data = await _settled(session, run.id)
     if data is not None:
-        if data.get("outcome") == "failed":
-            return "failed", data
+        if data.get("outcome") in ("failed", "row_order"):
+            return str(data["outcome"]), data
         return ("changed" if data.get("changed") else "unchanged"), data
     if run.status in ("failed", "cancelled"):
         return "failed", {"error": run.error}
@@ -714,24 +717,33 @@ async def settle(run_id: str) -> str | None:
             await _mark(run_id, {**base, "outcome": "failed", "changed": None, "error": CARD_UNREADABLE})
             return "failed"
         results = compare(meta, values)
-        changed = any(r["changed"] for r in results)
+        # 行序不定的（recall_card 记的 row_order）比不出变没变：不算「没变」。全部都行序不定的结论写核对不了、开待办请人核对；
+        # 部分行序不定的，已判定的照常判，行序不定的那几项在结论、待办、原答案的记账里照实列出
+        unstable = [r["name"] for r in results if r.get("row_order") == "unstable"]
+        decided = [r for r in results if r.get("row_order") != "unstable"]
+        changed = any(r["changed"] for r in decided)
+        outcome = "row_order" if not decided else "changed" if changed else "unchanged"
         answers = list(dict.fromkeys(str(u.get("run_id")) for u in origin.get("uses") or [] if u.get("run_id")))
         tasks: list[str] = []
-        if changed:
-            tasks = await open_tasks(run, reason="caliber")
+        if outcome in ("changed", "row_order"):
+            tasks = await open_tasks(run, reason="caliber", row_order=outcome == "row_order")
         else:
             for answer in answers:
-                await _mark_answer(answer, run)
-        await _mark(run_id, {**base, "outcome": "changed" if changed else "unchanged", "changed": changed,
+                await _mark_answer(answer, run, row_order=unstable)
+        await _mark(run_id, {**base, "outcome": outcome, "changed": changed if decided else None,
                              "answers": len(answers), "tasks": tasks,
-                             "metrics": [{"k": r["k"], "name": r["name"], "changed": r["changed"]} for r in results]})
-        return "changed" if changed else "unchanged"
+                             **({"row_order_metrics": unstable} if unstable else {}),
+                             "metrics": [{"k": r["k"], "name": r["name"], "changed": r["changed"],
+                                          **({"row_order": "unstable"} if r.get("row_order") else {})}
+                                         for r in results]})
+        return outcome
     finally:
         _settling.discard(run_id)
 
 
-async def _mark_answer(answer_id: str, recall_run: Run) -> None:
-    """数没变：在原答案的运行上记一条 ledger.recalled（已按 vN 核对，不影响）。这次召回记过的不再记。"""
+async def _mark_answer(answer_id: str, recall_run: Run, *, row_order: Sequence[str] = ()) -> None:
+    """数没变：在原答案的运行上记一条 ledger.recalled（已按 vN 核对，不影响）。这次召回记过的不再记。row_order 是行序不定、
+    没能核对的那几项（照实列出，不算进「不影响」）。"""
     origin = recall_run.origin if isinstance(recall_run.origin, dict) else {}
     async with SessionLocal() as session:
         rows = (await session.execute(select(RunEvent.data).where(
@@ -740,7 +752,8 @@ async def _mark_answer(answer_id: str, recall_run: Run) -> None:
             return
     await _mark(answer_id, {"role": "answer", "changed": False, "recall_run": recall_run.id,
                             "workflow_id": origin.get("workflow_id"), "from_version": origin.get("from_version"),
-                            "to_version": origin.get("to_version")})
+                            "to_version": origin.get("to_version"),
+                            **({"row_order_metrics": list(row_order)} if row_order else {})})
 
 
 # ==========================================================================
@@ -775,7 +788,7 @@ def correlation(run_id: str, owner: tuple[str, str], reason: str = "caliber", ex
 
 
 async def open_tasks(run: Run, *, reason: str, owners: Iterable[tuple[str, str]] | None = None,
-                     title: str | None = None, extra: str = "") -> list[str]:
+                     title: str | None = None, extra: str = "", row_order: bool = False) -> list[str]:
     """给答案的主人开 recall 待办（挂在 run 上）。owners 不给就按召回运行 origin 里各答案的主人。按 correlation_key 认同一条，
     开过的不再开。提交之后推通知。返回这次新开的待办 id。"""
     from app.process import tasks as process_tasks
@@ -787,7 +800,8 @@ async def open_tasks(run: Run, *, reason: str, owners: Iterable[tuple[str, str]]
         targets = await _owner_targets(session, owners)
         name = await ledger_uses.workflow_name(session, str(origin.get("workflow_id") or ""))
         if title is None:
-            title = CHANGED_TITLE.format(name=name or "口径", version=origin.get("to_version"))
+            title = (ROW_ORDER_TITLE if row_order else CHANGED_TITLE).format(name=name or "口径",
+                                                                            version=origin.get("to_version"))
         opened: list[str] = []
         for owner in targets:
             key = correlation(run.id, owner, reason, extra)
@@ -1007,7 +1021,10 @@ async def answer_marks(session: Any, run_id: str, principal: Any) -> dict[str, A
         data = data if isinstance(data, dict) else {}
         if etype == EventType.LEDGER_RECALLED and data.get("role") == "answer":
             checked.append({k: data.get(k) for k in ("workflow_id", "from_version", "to_version", "recall_run")}
-                           | {"changed": bool(data.get("changed")), "at": at(ts)})
+                           | {"changed": bool(data.get("changed")), "at": at(ts)}
+                           # 行序不定、没能核对的那几项（只列名字）：不算进「不影响」
+                           | ({"row_order_metrics": [str(x) for x in data["row_order_metrics"]]}
+                              if isinstance(data.get("row_order_metrics"), list) and data["row_order_metrics"] else {}))
             workflows.add(str(data.get("workflow_id") or ""))
         elif etype == EventType.LEDGER_BASIS_CHANGED:
             items = data.get("items")

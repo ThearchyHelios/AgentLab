@@ -42,7 +42,8 @@ export interface RecallPreview {
   reasons: { reason: string; groups: number }[]
 }
 
-export type RecallGroupState = 'changed' | 'unchanged' | 'failed' | 'running' | 'pending' | 'not_recomputable'
+/** row_order：全部指标行序不定、核对不了（服务端 ledger/recall.settle），已开待办请人核对 */
+export type RecallGroupState = 'changed' | 'unchanged' | 'row_order' | 'failed' | 'running' | 'pending' | 'not_recomputable'
 
 /** 召回批次里的一组 */
 export interface RecallGroup {

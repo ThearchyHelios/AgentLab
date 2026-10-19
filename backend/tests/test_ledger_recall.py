@@ -991,3 +991,53 @@ async def test_probe_notes_and_change_refreshes_do_not_overwrite_each_other(engi
         row = (await session.execute(select(SourceChange).where(SourceChange.id == out["id"]))).scalar_one()
     assert sorted(p["workflow_id"] for p in row.affects["probes"]) == [f"wf-{i}" for i in range(6)], row.affects
     assert row.affects["rules_touched"] is True, "探查刷新的那一份也在"
+
+
+# --------------------------------------------------------------------------
+# 行序不定的指标（召回比不出变没变）：不当「没变」
+# --------------------------------------------------------------------------
+
+
+async def test_all_metrics_with_unstable_row_order_cannot_be_checked_and_open_a_task(monkeypatch):
+    """全部指标都行序不定：结论写「核对不了（行序不定）」，开召回待办请人核对，不在原答案上记「已核对，不影响」。"""
+    wf = await S.publish()
+    a1 = await answer(monkeypatch)
+    graph = S.caliber_graph()
+    graph["nodes"][3]["data"]["config"]["instructions"] = "写周销售（新的写法）"
+    await publish_v2(wf, graph=graph)
+    monkeypatch.setattr(recall, "_rows_stable", lambda pinned, metric: False)
+    [done] = await run_recall(wf)
+    assert done.status == "succeeded", done.error
+    [settled] = [d for d in await events(done.id, EventType.LEDGER_RECALLED) if d.get("role") == "recall"]
+    assert settled["outcome"] == "row_order" and settled["changed"] is None
+    assert settled["row_order_metrics"] == ["销售额"] and settled["metrics"][0]["row_order"] == "unstable"
+    [task] = await recall_tasks(done.id)
+    assert task.title == "口径「周销售」升到 v2，答案里的数行序不定、没能核对，请人工核对"
+    assert await events(a1.id, EventType.LEDGER_RECALLED) == [], "核对不了的不在原答案上记「不影响」"
+    async with SessionLocal() as session:
+        view = await recall.batches(session, wf, 2)
+        state, _ = await recall.outcome_of(session, done)
+    assert state == "row_order" and view["groups"][0]["state"] == "row_order" and view["counts"]["row_order"] == 1
+
+
+async def test_some_metrics_with_unstable_row_order_are_listed_and_the_rest_decide(monkeypatch):
+    """部分行序不定：已判定的照常判（数没变就在原答案上记不影响），行序不定的那几项在结论和原答案的记账里照实列出。"""
+    two = S.caliber_graph()
+    card = two["nodes"][2]["data"]["config"]
+    card["metrics"] = [*card["metrics"], {**card["metrics"][0], "id": "gmv2", "name": "销售额（另算）"}]
+    wf = await S.publish(graph=two)
+    a1 = await answer(monkeypatch)
+    v2 = S.caliber_graph()
+    v2["nodes"][2]["data"]["config"]["metrics"] = card["metrics"]
+    v2["nodes"][3]["data"]["config"]["instructions"] = "写周销售（新的写法）"
+    await publish_v2(wf, graph=v2)
+    monkeypatch.setattr(recall, "_rows_stable", lambda pinned, metric: metric.get("id") != "gmv2")
+    [done] = await run_recall(wf)
+    assert done.status == "succeeded", done.error
+    [settled] = [d for d in await events(done.id, EventType.LEDGER_RECALLED) if d.get("role") == "recall"]
+    assert settled["outcome"] == "unchanged" and settled["changed"] is False
+    assert settled["row_order_metrics"] == ["销售额（另算）"]
+    assert [m.get("changed") for m in settled["metrics"]] == [False, None]
+    [booked] = await events(a1.id, EventType.LEDGER_RECALLED)
+    assert booked["changed"] is False and booked["row_order_metrics"] == ["销售额（另算）"]
+    assert await recall_tasks(done.id) == []
