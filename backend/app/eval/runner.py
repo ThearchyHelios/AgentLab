@@ -12,9 +12,10 @@ EvalResult：建评测时就全部建好（pending），进度、「正在做什
 snapshot 视图）：起草、剖析照常进行，也不影响这次评测的可比性。各数据源的上传表格版本、表结构哈希开始和结束各记一次，
 变了在指纹里标出（sources_changed）。
 
-**并发。** 同时最多 max_parallel 题，且所有臂合起来不超过全局运行并发的四分之一（全局只有一个信号量、没有优先级，评测不能
-挤占真实用户的运行）。A/B 的同一题几臂同时开跑。每题时限 per_case_timeout_s：作答一臂超时就取消它正在跑的运行、记超时；
-期望探针每次也按这个时限。
+**并发。** 同时最多 max_parallel 题，且所有臂合起来不超过全局运行并发的四分之一。评测发起的作答、算期望的运行归「系统」类
+（app/cluster/slots.py）：全站的名额按类别有上限和优先级，评测再多也只占得到系统那一类的名额，问数据、试跑优先，不被挤占。
+A/B 的同一题几臂同时开跑。每题时限 per_case_timeout_s：作答一臂超时就取消它正在跑的运行、记超时；
+期望探针每次也按这个时限。排队等运行名额的那一段不算时限（within、gold._launch_and_wait）：满载时排队不该被记成超时、触发止损。
 
 **预算**（评测-D9；单独一本账 engine/spend.eval_spend，不挤占裁判、核查的额度）：开跑前按上一次的每题平均花费估算（estimate）。
 每题开评前按估算预留——加上会超过这次评测的金额上限、或评测每日上限就不再开新题，剩下的记「已到上限」；评完按实际找补。
@@ -32,6 +33,7 @@ snapshot 视图）：起草、剖析照常进行，也不影响这次评测的�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
 from collections.abc import Mapping, Sequence
@@ -43,7 +45,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import job_runtime as runtime
-from app.db.base import SessionLocal, utcnow
+from app.db.base import current_owner, SessionLocal, utcnow
 from app.db.models_eval import EvalCase, EvalResult, EvalRun, EvalSuite
 from app.eval.cases import CaseInvalid
 
@@ -131,7 +133,7 @@ async def estimate(session: AsyncSession, suite_id: str, items: int) -> dict[str
     平均记成 0、却有估不出的调用的，也按估不出算。"""
     row = (await session.execute(select(EvalRun).where(
         EvalRun.suite_id == suite_id, EvalRun.status.in_(("succeeded", "partial")))
-        .order_by(EvalRun.created_at.desc()).limit(1))).scalar_one_or_none()
+        .order_by(EvalRun.created_at.desc(), EvalRun.id.desc()).limit(1))).scalar_one_or_none()
     if row is None:
         return {"items": items, "per_item_usd": None, "total_usd": None, "basis": None,
                 "note": "这个题集还没有评完过，估不出花费：按每题开评前的实际花费累计，到了上限就停"}
@@ -321,7 +323,7 @@ class EvalExecution(runtime.JobRun):
         async with SessionLocal() as session:
             leader = await session.get(EvalRun, self.job_id)
             runs = [leader] if not leader.pair_id else list((await session.execute(
-                select(EvalRun).where(EvalRun.pair_id == leader.pair_id).order_by(EvalRun.created_at))).scalars())
+                select(EvalRun).where(EvalRun.pair_id == leader.pair_id).order_by(EvalRun.created_at, EvalRun.id))).scalars())
             suite = await session.get(EvalSuite, leader.suite_id)
             if suite is None:
                 raise runtime.JobFailed("题集不存在，可能已被删除")
@@ -397,7 +399,7 @@ class EvalExecution(runtime.JobRun):
                 unrestricted = True
         if unrestricted:
             ids += list((await session.execute(select(DataSource.id).where(DataSource.enabled.is_(True))
-                                               .order_by(DataSource.created_at))).scalars())
+                                               .order_by(DataSource.created_at, DataSource.id))).scalars())
         return list(dict.fromkeys(ids))
 
     # ---------------------------------------------------------------- 主循环
@@ -518,9 +520,9 @@ class EvalExecution(runtime.JobRun):
         try:
             if case.get("kind") == "workflow":
                 graph, inputs = await self._workflow_graph(case, values)
-                await asyncio.wait_for(driver.drive_workflow(graph, inputs), timeout=timeout)
+                await within(driver.drive_workflow(graph, inputs), timeout, lambda: _queued(driver))
             else:
-                await asyncio.wait_for(driver.drive(), timeout=timeout)
+                await within(driver.drive(), timeout, lambda: _queued(driver))
         except asyncio.TimeoutError:
             turn = driver.turn
             turn.timed_out = True
@@ -963,22 +965,69 @@ def running(run: Any) -> bool:
     return manager.running(leader_of(run))
 
 
+async def _queued(driver: Any) -> bool:
+    """这一题的作答运行正排着队等名额（app/cluster/slots）：这一段不算每题的时限。"""
+    from app.cluster import slots
+    from app.engine.runner import run_manager
+
+    run_id = getattr(driver.turn, "current_run", None)
+    return bool(run_id) and await slots.waiting(run_id, here=run_manager.is_active(run_id))
+
+
+async def within(coro: Any, budget: float, paused: Any, *, tick: float = 0.5) -> Any:
+    """同 asyncio.wait_for(coro, budget)，只是 paused() 为真的那几段不算时间（复核：满载时排队等名额不该算进每题时限、触发止损）。
+    超时取消 coro、抛 TimeoutError。每隔一小段（tick，且不超过时限的 1/20）看一次；一段的头尾有一头在暂停就整段不算——
+    宁可少算一点，不把排队的时间算进去。"""
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(coro)
+    step_s = max(0.005, min(tick, budget / 20))
+    spent, last = 0.0, loop.time()
+    was_paused = await paused()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=max(0.005, min(step_s, budget - spent)))
+            if task in done:
+                return task.result()
+            now = loop.time()
+            step, last = now - last, now
+            is_paused = await paused()
+            if not (was_paused or is_paused):
+                spent += step
+            was_paused = is_paused
+            if spent >= budget:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                raise asyncio.TimeoutError()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
+def leader_of_id(rows: Sequence[EvalRun], job_id: str) -> str:
+    """rows 里 id 是 job_id 的那一臂由哪一臂的任务在跑（A/B 几臂共用领头那一臂的后台任务）。"""
+    row = next((r for r in rows if r.id == job_id), None)
+    return leader_of(row) if row is not None else job_id
+
+
 async def reconcile_stale(session: AsyncSession, rows: Sequence[EvalRun]) -> None:
     """读接口当场整理：记着排队、进行中，这个进程里却没在跑（服务重启过）的，照实标中断。"""
-    stale = [r for r in rows if r.status in runtime.ACTIVE and not running(r)]
+    # 属主不在了才算：多进程时别的进程正在跑的评测，这里看不到它的任务，却不能标中断（runtime.stale 按租约判断）
+    stale = await runtime.stale(list(rows), running=lambda job_id: manager.running(leader_of_id(rows, job_id)))
     for row in stale:
         await runtime.close_job(session, EvalRun, EvalResult, row.id, "interrupted", None, "cancelled",
                                 INTERRUPTED, finish=_closing(row.id, INTERRUPTED))
         await session.refresh(row)
 
 
-async def startup() -> int:
-    """服务启动时：没结束的评测标中断（没结束的项记停止），不自动续跑。"""
+async def startup(*, live: Any = None) -> int:
+    """服务启动时（多进程时当班进程隔一会儿再来一次）：属主不在了的评测标中断（没结束的项记停止），不自动续跑。"""
     async def close(session: AsyncSession, job_id: str) -> None:
         await runtime.close_job(session, EvalRun, EvalResult, job_id, "interrupted", None, "cancelled",
                                 INTERRUPTED, finish=_closing(job_id, INTERRUPTED))
 
-    return await runtime.interrupt_on_startup(EvalRun, close, running=manager.running)
+    # 几臂共用领头那一臂的后台任务，各臂的属主是同一个进程：按属主判断就够了（running 只在属主是本进程时看）
+    return await runtime.interrupt_on_startup(EvalRun, close, running=manager.running, live=live)
 
 
 async def stop(run_id: str) -> bool:
@@ -1035,6 +1084,7 @@ async def retry(run_id: str) -> list[str]:
                     setattr(r, key, value)
         for arm in arms:
             arm.status, arm.error, arm.stop_reason, arm.finished_at = "queued", None, None, None
+            arm.owner = current_owner()   # 重新排队的这一次由本进程认领（多进程：别把它当成原来那个进程的）
         await session.flush()
         for arm in arms:
             await _recount(session, arm.id)

@@ -42,7 +42,8 @@ export interface RecallPreview {
   reasons: { reason: string; groups: number }[]
 }
 
-export type RecallGroupState = 'changed' | 'unchanged' | 'failed' | 'running' | 'pending' | 'not_recomputable'
+/** row_order：全部指标行序不定、核对不了（服务端 ledger/recall.settle），已开待办请人核对 */
+export type RecallGroupState = 'changed' | 'unchanged' | 'row_order' | 'failed' | 'running' | 'pending' | 'not_recomputable'
 
 /** 召回批次里的一组 */
 export interface RecallGroup {
@@ -151,7 +152,10 @@ export interface RecallTaskPayload {
     k: number
     name: string
     unit: string
-    changed: boolean
+    /** 行序不定（row_order）时为 null：按位置比不出变没变 */
+    changed: boolean | null
+    /** 两版都按行号取多行结果里的一格、查询没有 ORDER BY：重跑时第几行不一定是同一行（服务端 ledger/recall.recall_card） */
+    row_order?: 'unstable'
     card: string
     metric: string
     old: RecallCell

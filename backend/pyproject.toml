@@ -20,6 +20,9 @@ dependencies = [
     # 所以上限卡到下一个小版本——升级要主动改这里、重新锁、跑一遍测试。
     # 精确版本在 requirements.lock 里
     "langgraph>=1.2.11,<1.3",
+    # 断点的序列化格式就在这个包里（langgraph 只要求 <5，上面那条卡不住它）；SQLite、PostgreSQL 两种断点库
+    # 共用这一份格式，copy-to-postgres 搬断点也靠它前后一致
+    "langgraph-checkpoint>=4.2.0,<4.3",
     "langgraph-checkpoint-sqlite>=3.1.1,<3.2",
     "langchain-core>=1.6.3,<1.7",
     "langchain-anthropic>=1.7.2,<1.8",
@@ -49,6 +52,15 @@ docs = ["pypdf>=5.0", "python-docx>=1.1", "python-pptx>=1.0", "openpyxl>=3.1"]
 # 数据库接入。三个驱动都是 asyncio 原生且免装数据库客户端——
 # oracledb 走 thin 模式，省掉了 Oracle Instant Client 这个历来最劝退的一步。
 db = ["aiomysql>=0.2", "oracledb>=2.0", "asyncpg>=0.30"]
+# 应用自己的库用 PostgreSQL（AGENTLAB_DATABASE_URL=postgresql+asyncpg://…）。应用库走 asyncpg；LangGraph 的断点
+# 走官方的 langgraph-checkpoint-postgres，它只认 psycopg 3 和它的连接池。psycopg 带 binary：wheel 里自带 libpq，
+# 镜像和本机都不用另装 PostgreSQL 客户端。断点格式归 LangGraph 一族管，上限同上卡到下一个小版本
+postgres = [
+    "asyncpg>=0.30",
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+    "langgraph-checkpoint-postgres>=3.1.2,<3.2",
+]
 
 [build-system]
 requires = ["hatchling"]

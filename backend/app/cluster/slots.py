@@ -1,0 +1,436 @@
+"""运行的并发名额（run_slots，docs/design/orchestration-round/00-总方案.md §5 W2-b「优先级与并发」）。
+
+**为什么。** 以前是 runner 里一把进程内的信号量（AGENTLAB_MAX_CONCURRENT_RUNS，缺省 20），谁先到谁先跑：一次评测几十道题、
+一批口径召回，就能把 20 个名额占满，问数据、画布试跑在后面排队。多进程之后信号量也只管得了本进程。
+
+**现在。** 每段执行（发起、审批之后接着跑、继续运行；停在审批上的不占）开始前要一个名额，按运行的来源归四类：
+
+  交互 interactive：问数据、画布试跑、正式运行（手动点的）、蓝图试运行、个人应用的刷新——有人在屏幕前等
+  应用 app：应用入口、按需视图、外部系统的钩子、接口
+  定时 schedule：定时任务（含事件触发）
+  系统 system：评测、口径召回、对账、补算、按口径正式出具——服务端替人跑的
+
+每类有全站的并发上限和优先级（设置里「运行并发」一组，管理员可调），另有全站总上限，和一个**交互留底**：
+
+- 留底：全站名额里永远留给交互类的那几个（缺省全站上限的 1/4、至少 1；至多全站上限减 1）。应用、定时、系统三类合起来
+  永远用不到这一部分——有人问数据、试跑时总有名额，不用等评测、召回跑完。
+- 借用：没人问数据时，别的类可以借满到「全站上限 − 留底」（三类各自的上限缺省就是这个数，设置里可以调小）。评测照旧跑得快。
+- 交互自己的上限缺省 = 全站上限：留底之外空着的名额它也能用。
+
+等着的按优先级高的先、同一优先级先来先得（缺省交互 40 > 应用 30 > 定时 20 > 系统 10）；已经在跑的不抢。单进程时总上限和以前的
+信号量一样大。
+
+**怎么发。** 要名额的一方先在本进程登记、再插一行「等着」，然后自己去发一次（grant：把所有等着的按规矩过一遍，谁够格就
+改成「已发」）；没轮到就等叫醒（本进程放名额时叫醒，PostgreSQL 上别的进程放名额时 NOTIFY slot 叫醒），另隔一会儿自己再
+发一次兜底。发的那一下全站串行：PostgreSQL 上在事务里取咨询锁，SQLite 只有一个进程，本进程的锁就够。名额用完删掉那一行。
+属主不在了的行（进程没了；本进程里登记已经没了的——测试里事件循环关了留下的）发的时候顺手删掉，名额不会漏。
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import time
+import weakref
+from collections import Counter
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from typing import Any
+
+from sqlalchemy import delete, select, text, update
+
+from app.cluster import identity
+from app.cluster.signal import signals
+from app.core.config import settings
+from app.db.base import SessionLocal, utcnow
+
+logger = logging.getLogger(__name__)
+
+CLASSES = ("interactive", "app", "schedule", "system")
+CLASS_LABEL = {"interactive": "交互", "app": "应用", "schedule": "定时", "system": "系统"}
+#: 运行来源 → 类别（engine/origin.ORIGIN_KINDS）。没记来源的（直接调 run_manager.start、升级前的）算交互：同以前不设限
+ORIGIN_CLASS = {
+    "chat": "interactive", "canvas": "interactive", "launcher": "interactive", "trial": "interactive",
+    "personal_app": "interactive",
+    "app_entry": "app", "app_view": "app", "hook": "app", "api": "app",
+    "schedule": "schedule",
+    "eval": "system", "recall": "system", "reconcile": "system", "app_backfill": "system", "ledger_issue": "system",
+}
+SETTING_KEY = "concurrency"
+DEFAULT_PRIORITY = {"interactive": 40, "app": 30, "schedule": 20, "system": 10}
+#: 上限、优先级的取值范围
+LIMIT_MAX = 1000
+PRIORITY_MAX = 100
+#: 等名额时隔多久自己再发一次（秒）：PostgreSQL 上别的进程放的名额靠 NOTIFY 叫醒，这是兜底；SQLite 只有本进程放名额
+POLL_S = {"postgresql": 1.0, "sqlite": 5.0}
+#: 设置读一次管多久（秒）：改了设置，最迟这么久之后各进程按新的发
+POLICY_TTL_S = 3.0
+#: 咨询锁的号（发名额那一下全站串行）
+_GRANT_KEY = 0x4167536C6F747321  # "AgSlots!"
+
+
+def class_of(origin_kind: str | None) -> str:
+    return ORIGIN_CLASS.get(origin_kind or "", "interactive")
+
+
+def _reserve_of(total: int, reserve: int | None) -> int:
+    """生效的交互留底：缺省全站上限的 1/4、至少 1；至多全站上限减 1（全站只有 1 个名额时没有留底，别的类才跑得起来）。"""
+    wanted = max(1, total // 4) if reserve is None else int(reserve)
+    return max(0, min(wanted, total - 1))
+
+
+def defaults(total: int | None = None, reserve: int | None = None) -> dict[str, Any]:
+    """缺省的设置（总上限取 AGENTLAB_MAX_CONCURRENT_RUNS）：交互上限 = 全站上限，别的三类 = 全站上限 − 交互留底。"""
+    total = max(1, int(total if total is not None else settings.max_concurrent_runs))
+    kept = _reserve_of(total, reserve)
+    others = max(1, total - kept)
+    return {"max_total": total, "interactive_reserve": kept,
+            "classes": {k: {"limit": total if k == "interactive" else others, "priority": DEFAULT_PRIORITY[k]}
+                        for k in CLASSES}}
+
+
+def _int_in(value: Any, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def values(stored: Any) -> dict[str, Any]:
+    """存着的（可能缺项、存坏了）→ 生效的：缺的、坏的补缺省（缺省按存着的全站上限、留底算）。"""
+    stored = stored if isinstance(stored, dict) else {}
+    total = stored.get("max_total") if _int_in(stored.get("max_total"), 1, LIMIT_MAX) else None
+    reserve = stored.get("interactive_reserve") if _int_in(stored.get("interactive_reserve"), 0, LIMIT_MAX) else None
+    out = defaults(total, reserve)
+    classes = stored.get("classes") if isinstance(stored.get("classes"), dict) else {}
+    for k in CLASSES:
+        item = classes.get(k) if isinstance(classes.get(k), dict) else {}
+        if _int_in(item.get("limit"), 1, LIMIT_MAX):
+            out["classes"][k]["limit"] = item["limit"]
+        if _int_in(item.get("priority"), 0, PRIORITY_MAX):
+            out["classes"][k]["priority"] = item["priority"]
+    return out
+
+
+def borrowable(pol: dict[str, Any]) -> int:
+    """应用、定时、系统三类合起来最多用几个名额：全站上限 − 交互留底。"""
+    return max(0, int(pol["max_total"]) - int(pol.get("interactive_reserve") or 0))
+
+
+def problem(sent: Any) -> str | None:
+    """设置接口写进来的这一组有没有问题（说明给人看）。只核对给了的项。"""
+    if not isinstance(sent, dict):
+        return "运行并发的设置需要是对象"
+    total = sent.get("max_total")
+    if total is not None and (not isinstance(total, int) or isinstance(total, bool) or not 1 <= total <= LIMIT_MAX):
+        return f"全站同时运行的上限需要是 1 到 {LIMIT_MAX} 之间的整数"
+    reserve = sent.get("interactive_reserve")
+    if reserve is not None and not _int_in(reserve, 0, LIMIT_MAX):
+        return f"给交互留底的名额需要是 0 到 {LIMIT_MAX} 之间的整数"
+    if reserve is not None and isinstance(total, int) and total > 1 and reserve >= total:
+        return "给交互留底的名额要小于全站同时运行的上限：留底占满了，应用、定时、系统就一个都运行不了"
+    classes = sent.get("classes")
+    if classes is None:
+        return None
+    if not isinstance(classes, dict):
+        return "各类运行的设置需要是对象"
+    for k, item in classes.items():
+        if k not in CLASSES:
+            return f"没有「{k}」这一类运行（只有交互、应用、定时、系统）"
+        if not isinstance(item, dict):
+            return f"「{CLASS_LABEL[k]}」类的设置需要是对象"
+        limit, prio = item.get("limit"), item.get("priority")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= LIMIT_MAX):
+            return f"「{CLASS_LABEL[k]}」类的并发上限需要是 1 到 {LIMIT_MAX} 之间的整数"
+        if prio is not None and (not isinstance(prio, int) or isinstance(prio, bool) or not 0 <= prio <= PRIORITY_MAX):
+            return f"「{CLASS_LABEL[k]}」类的优先级需要是 0 到 {PRIORITY_MAX} 之间的整数"
+    return None
+
+
+def merged(saved: Any, sent: dict[str, Any]) -> dict[str, Any]:
+    """只给了一部分的（只改一类的上限）补上存着的另几项。存的是原样（没给的类别上限不写，按全站上限、留底现算缺省）。"""
+    base = dict(saved) if isinstance(saved, dict) else {}
+    out: dict[str, Any] = {k: base[k] for k in ("max_total", "interactive_reserve") if k in base}
+    for key in ("max_total", "interactive_reserve"):
+        if sent.get(key) is not None:
+            out[key] = sent[key]
+    classes = {k: dict(v) for k, v in (base.get("classes") or {}).items() if k in CLASSES and isinstance(v, dict)}
+    for k, item in (sent.get("classes") or {}).items():
+        for field_ in ("limit", "priority"):
+            if item.get(field_) is not None:
+                classes.setdefault(k, {})[field_] = item[field_]
+    out["classes"] = classes
+    return out
+
+
+_policy: tuple[float, dict[str, Any]] | None = None
+
+
+async def policy(*, fresh: bool = False) -> dict[str, Any]:
+    """现在生效的设置（读一次管 POLICY_TTL_S 秒）。"""
+    global _policy
+    now = time.monotonic()
+    if not fresh and _policy is not None and now - _policy[0] < POLICY_TTL_S:
+        return _policy[1]
+    from app.db.models import Setting
+
+    async with SessionLocal() as session:
+        row = await session.get(Setting, SETTING_KEY)
+    value = values(row.value if row is not None else None)
+    _policy = (now, value)
+    return value
+
+
+def forget_policy() -> None:
+    """设置刚改了：本进程下一次重读（别的进程最迟 POLICY_TTL_S 秒）。"""
+    global _policy
+    _policy = None
+
+
+# --------------------------------------------------------------------------
+# 本进程里要名额的登记
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _Holder:
+    run_id: str
+    loop: asyncio.AbstractEventLoop
+    woke: asyncio.Event = field(default_factory=asyncio.Event)
+    #: 还在排队等名额（发下来之前）
+    queued: bool = True
+    #: 要名额时本进程的身份（名额行记的属主）：放的时候按它删——隔离之后换了身份也删得到（复核 R-b10）
+    owner: str = ""
+
+
+_holders: dict[str, _Holder] = {}
+_grant_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
+
+
+def _local(run_id: str) -> bool:
+    """这一行在本进程里还有人在要 / 在用（别的事件循环留下的不算：那个循环已经没人会放它了）。"""
+    holder = _holders.get(run_id)
+    if holder is None:
+        return False
+    try:
+        return holder.loop is asyncio.get_running_loop() and not holder.loop.is_closed()
+    except RuntimeError:
+        return False
+
+
+def wake_local() -> None:
+    for holder in list(_holders.values()):
+        if not holder.loop.is_closed():
+            holder.loop.call_soon_threadsafe(holder.woke.set)
+
+
+def _grant_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _grant_locks.get(loop)
+    if lock is None:
+        lock = _grant_locks[loop] = asyncio.Lock()
+    return lock
+
+
+@dataclass
+class _MemRow:
+    run_id: str
+    klass: str
+    priority: int
+    requested_at: Any
+    owner: str = ""
+    granted: bool = False
+
+
+#: SQLite 时的名额（复核 R-b3）：只有一个进程，规矩照同一套、只是不落库——一段运行不为要名额多写三次库
+_mem: dict[str, _MemRow] = {}
+
+
+def _in_memory() -> bool:
+    return settings.db_dialect == "sqlite"
+
+
+def _pick(rows: list[Any], pol: dict[str, Any]) -> list[str]:
+    """按规矩挑这一次发给谁（库里的行、进程里的行同一套）：优先级高的先、同级先来先得，类别上限、全站上限、交互留底。"""
+    used = Counter(r.klass for r in rows if r.granted)
+    total = sum(used.values())
+    # 交互以外的三类合起来用了几个：到了「全站上限 − 交互留底」就不再发给它们（留底永远给交互）
+    others = total - used["interactive"]
+    others_cap = borrowable(pol)
+    limits = {k: int(v["limit"]) for k, v in pol["classes"].items()}
+    granted: list[str] = []
+    waiting = sorted((r for r in rows if not r.granted), key=lambda r: (-int(r.priority or 0), r.requested_at, r.run_id))
+    for row in waiting:
+        if total >= int(pol["max_total"]):
+            break
+        if used[row.klass] >= limits.get(row.klass, int(pol["max_total"])):
+            continue
+        if row.klass != "interactive" and others >= others_cap:
+            continue
+        used[row.klass] += 1
+        total += 1
+        if row.klass != "interactive":
+            others += 1
+        granted.append(row.run_id)
+    return granted
+
+
+async def grant() -> list[str]:
+    """把等着的按规矩过一遍，够格的改成已发；属主不在了的行删掉。交回这一次发出去的。全站串行（见模块说明）。"""
+    if _in_memory():
+        pol = await policy()
+        for run_id in [r for r in _mem if not _local(r)]:
+            _mem.pop(run_id, None)
+        granted = _pick(list(_mem.values()), pol)
+        for run_id in granted:
+            _mem[run_id].granted = True
+        if granted:
+            wake_local()
+        return granted
+    from app.cluster import state
+    from app.db.models_cluster import RunSlot
+
+    pol = await policy()
+    # 拿锁之前先备好「谁还活着」（必要时这时候查库），持锁期间只用持锁的那条连接
+    live = await state.current()
+    known_dead = await _known_dead(live)
+    async with _grant_lock():
+        async with SessionLocal() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _GRANT_KEY})
+            rows = list((await session.execute(select(RunSlot))).scalars())
+            # 持着全站的锁时不另取连接查库（复核：连接池用尽时会卡到取连接超时）：用锁之前拿好的那一份「谁还活着」，不认识的属主
+            # 这一次当活着（不删它的行），下一次手上那份更新了再说
+            me = identity.owner()
+            dead = [r.run_id for r in rows
+                    if (r.owner == me and not _local(r.run_id)) or (r.owner != me and r.owner in known_dead)]
+            if dead:
+                await session.execute(delete(RunSlot).where(RunSlot.run_id.in_(dead)))
+            rows = [r for r in rows if r.run_id not in set(dead)]
+            granted = _pick(rows, pol)
+            now = utcnow()
+            if granted:
+                await session.execute(update(RunSlot).where(RunSlot.run_id.in_(granted))
+                                      .values(granted=True, granted_at=now).execution_options(synchronize_session=False))
+            await session.commit()
+    if dead:
+        logger.info("运行名额：收回了 %d 个属主已经不在的名额", len(dead))
+    if granted:
+        wake_local()
+        signals.publish("slot")
+    return granted
+
+
+async def _known_dead(live: Any) -> set[str]:
+    """名额表里属主不在手上那份「活着」里的那几个，拿锁之前当场再查一次登记：仍不在的算没了。"""
+    from app.cluster import state
+    from app.db.models_cluster import RunSlot
+
+    async with SessionLocal() as session:
+        owners = set((await session.execute(select(RunSlot.owner).distinct())).scalars())
+    unknown = {o for o in owners if o and o != identity.owner() and o not in live.others}
+    if not unknown:
+        return set()
+    fresh = await state.current(fresh=True)
+    return {o for o in unknown if o not in fresh.others}
+
+
+async def _granted(run_id: str) -> bool | None:
+    """这一行发了没有：True 发了，False 还在等，None 这一行不见了（被当成属主不在了删掉）。"""
+    if _in_memory():
+        row = _mem.get(run_id)
+        return None if row is None else row.granted
+    from app.db.models_cluster import RunSlot
+
+    async with SessionLocal() as session:
+        return await session.scalar(select(RunSlot.granted).where(RunSlot.run_id == run_id))
+
+
+async def _request(run_id: str, klass: str, priority: int) -> str:
+    """排进名额的队。交回这一行记的属主（本进程此刻的身份）。"""
+    me = identity.owner()
+    if _in_memory():
+        _mem[run_id] = _MemRow(run_id, klass, priority, utcnow(), me)
+        return me
+    from app.db.models_cluster import RunSlot
+
+    async with SessionLocal() as session:
+        await session.execute(delete(RunSlot).where(RunSlot.run_id == run_id))
+        session.add(RunSlot(run_id=run_id, klass=klass, priority=priority, owner=me, granted=False,
+                            requested_at=utcnow()))
+        await session.commit()
+    return me
+
+
+async def _release(run_id: str, owner: str) -> None:
+    if _in_memory():
+        _mem.pop(run_id, None)
+        return
+    from app.db.models_cluster import RunSlot
+
+    async with SessionLocal() as session:
+        await session.execute(delete(RunSlot).where(RunSlot.run_id == run_id, RunSlot.owner == owner))
+        await session.commit()
+
+
+@contextlib.asynccontextmanager
+async def hold(run_id: str, origin_kind: str | None) -> AsyncIterator[str]:
+    """要一个名额（等到发给自己），出来时放掉。交回类别。取消（停止运行）在等的时候也照常生效。"""
+    klass = class_of(origin_kind)
+    pol = await policy()
+    priority = int(pol["classes"][klass]["priority"])
+    holder = _Holder(run_id, asyncio.get_running_loop())
+    _holders[run_id] = holder
+    poll = POLL_S.get(settings.db_dialect, 5.0)
+    try:
+        holder.owner = await _request(run_id, klass, priority)
+        while True:
+            holder.woke.clear()
+            await grant()
+            got = await _granted(run_id)
+            if got:
+                holder.queued = False
+                break
+            if got is None:
+                holder.owner = await _request(run_id, klass, priority)
+                continue
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(holder.woke.wait(), timeout=poll)
+        yield klass
+    finally:
+        if _holders.get(run_id) is holder:
+            _holders.pop(run_id, None)
+        try:
+            await asyncio.shield(_release(run_id, holder.owner or identity.owner()))
+        except Exception:  # noqa: BLE001 - 放不掉的名额下次发的时候按「本进程里已经没人用」收回
+            logger.exception("运行 %s 的名额没放掉，下次发名额时收回", run_id)
+        wake_local()
+        signals.publish("slot")
+
+
+async def waiting(run_id: str, *, here: bool = False) -> bool:
+    """这次运行是不是正排着队等名额（评测每题的时限、算期望的时限不算这一段，eval/runner、eval/gold）。
+    here：这次运行的执行任务在本进程里（还没开始要、或者已经放掉了名额的就不是在等，不用查库）。"""
+    holder = _holders.get(run_id)
+    if holder is not None:
+        return holder.queued
+    if here:
+        return False
+    return (await _granted(run_id)) is False
+
+
+async def snapshot() -> dict[str, Any]:
+    """现在各类在跑、在等几个（系统信息、验收脚本看）。"""
+    if _in_memory():
+        rows = [(r.klass, r.granted) for r in _mem.values() if _local(r.run_id)]
+    else:
+        from app.db.models_cluster import RunSlot
+
+        async with SessionLocal() as session:
+            rows = list((await session.execute(select(RunSlot.klass, RunSlot.granted))).all())
+    out = {k: {"running": 0, "waiting": 0} for k in CLASSES}  # noqa: C420
+    for klass, granted in rows:
+        out.setdefault(klass, {"running": 0, "waiting": 0})["running" if granted else "waiting"] += 1
+    return {"policy": await policy(), "classes": out}
+
+
+__all__ = ["CLASSES", "CLASS_LABEL", "ORIGIN_CLASS", "SETTING_KEY", "borrowable", "class_of", "defaults", "forget_policy", "grant",
+           "waiting",
+           "hold", "merged", "policy", "problem", "snapshot", "values", "wake_local"]

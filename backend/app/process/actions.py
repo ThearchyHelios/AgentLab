@@ -236,10 +236,57 @@ class Prepared:
     run: dict[str, Any] = field(default_factory=dict)
     #: 按参数定义收好类型的参数（typed_args）：哈希、预览按它算，send 发的也是它
     args: dict[str, Any] = field(default_factory=dict)
+    #: 记录上写的节点 id：认出升级前那种键（legacy_node_id）时照它记，同一个键下的记录 node_id 一致，下一次还认得出
+    node_id: str | None = None
 
     @property
     def idem_key(self) -> str:
         return f"{self.key}:{self.attempt}"
+
+
+#: 按自己的键找到别人的那一笔时换用的键的前缀（prepare）：节点 id 里不会有这个字符
+OWN_KEY_MARK = "\x1e"
+#: 带 action_id 的那几种事件：认一条记录是哪个节点写的（_owner）
+_ACTION_EVENTS = (EventType.ACTION_PREPARED, EventType.ACTION_SENT, EventType.ACTION_CONFIRMED, EventType.ACTION_FAILED,
+                  EventType.ACTION_UNKNOWN, EventType.ACTION_SIMULATED)
+
+
+async def _owner(session: AsyncSession, rec: ActionRecord) -> str | None:
+    """这条记录是哪个节点写的（这次运行里的 id，子工作流里的带前缀）：按它的 action.* 事件上记的 node_id。记录上的 node_id
+    升级前子工作流里记的是子图里的 id，和父图同名的节点分不开；事件一向按这次运行里的 id 记。认不出（事件没写上）为 None。"""
+    from app.db.models import RunEvent
+
+    rows = (await session.execute(select(RunEvent.node_id, RunEvent.data).where(
+        RunEvent.run_id == rec.run_id, RunEvent.type.in_([str(t) for t in _ACTION_EVENTS])))).all()
+    return next((str(node) for node, data in rows if node and isinstance(data, dict) and data.get("action_id") == rec.id),
+                None)
+
+
+def _same_payload(rec: ActionRecord, capability: Any, args: dict[str, Any]) -> bool | None:
+    """这条记录是不是这一次要发的内容：能力相同、内容指纹等于这一次参数收好类型之后的指纹。收不成类型（参数定义改了）的
+    比不了，为 None。"""
+    name = capability.name
+    if rec.capability != name:
+        return False
+    try:
+        typed = typed_args(capability, args)
+    except ActionFailed:
+        return None
+    return rec.payload_hash == payload_hash(name, typed)
+
+
+async def _belongs(session: AsyncSession, rec: ActionRecord, node_id: str, capability: Any, args: dict[str, Any], *,
+                   strict: bool = False) -> bool:
+    """这条记录是不是这个节点（node_id，这次运行里的 id）的。事件认得出是谁写的就按事件；认不出的按内容（能力、内容指纹），
+    比不了的当是（以前就是这样认的）。strict（认升级前的旧键时）：事件说是这个节点的，内容也要对得上——循环跨了升级时，
+    同一个节点第二轮按老算法同样是第 1 次执行，找到的是第一轮那一笔；比不了内容（参数定义改了）的照事件认。"""
+    owner = await _owner(session, rec)
+    same = _same_payload(rec, capability, args)
+    if owner is not None and owner != node_id:
+        return False
+    if owner is not None and not strict:
+        return True
+    return same is not False
 
 
 async def latest(session: AsyncSession, key: str) -> ActionRecord | None:
@@ -247,8 +294,11 @@ async def latest(session: AsyncSession, key: str) -> ActionRecord | None:
                                 .order_by(ActionRecord.attempt.desc()).limit(1))
 
 
-async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, args: dict[str, Any]) -> Prepared:
-    """节点每次执行都先走这里：按 action_key 查记录，决定发不发、第几次发、走哪个环境。
+async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, args: dict[str, Any],
+                  legacy_node_id: str | None = None) -> Prepared:
+    """节点每次执行都先走这里：按 action_key 查记录，决定发不发、第几次发、走哪个环境。node_id 是这次运行里的节点 id
+    （子工作流里的带前缀）；legacy_node_id 是升级前子工作流里按子图里的 id 记的那种（tools._run_write 交进来），按它也没查到
+    才算头一次。
 
     sent / unknown 抛 ActionPending（不发）；failed 且没有人核实为「重新发送」的抛 ActionFailed。先查记录再收类型：已生效
     （演练过）的交回存下的回执、已发出 / 结果未知的挂起，都和这一次渲染出来的参数无关——发出之后能力的参数定义改了、手上的
@@ -263,13 +313,29 @@ async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, a
         run = await session.get(Run, run_id)
         endpoint = await _endpoint(session, capability)
         prev = await latest(session, key)
+        if prev is not None and not await _belongs(session, prev, node_id, capability, args):
+            # 按自己的键找到的是别的节点的那一笔：升级前子工作流里同名的节点按子图里的 id 记的键，和父图这个节点的一样。
+            # 那一笔不是这个节点的，换一个只属于这个节点的键（同样的输入永远算出同一个）
+            key = action_key(run_id, f"{OWN_KEY_MARK}{node_id}", exec_no)
+            prev = await latest(session, key)
+        if prev is None and legacy_node_id:
+            # 升级前子工作流里的写入按子图里的节点 id 记幂等键（node_id 也记成它）：写入节点本身重新执行时（结果未知核实之后、
+            # 失败后接着跑）照那个键认出已经记下的那一笔，接着用它的键（不重发、第几次发送接着数）。只认这个节点的、这一次的：
+            # 那一笔的事件记着是这个节点写的（父图里同名的节点按同一个键写过），内容指纹也和这一次的一样（循环跨了升级时，
+            # 第二轮按老算法同样是第 1 次执行，找到的是第一轮那一笔）
+            old_key = action_key(run_id, legacy_node_id, exec_no)
+            old = await latest(session, old_key)
+            if old is not None and old.node_id == legacy_node_id \
+                    and await _belongs(session, old, node_id, capability, args, strict=True):
+                key, prev, node_id = old_key, old, legacy_node_id
     facts = {"app_id": run.app_id, "workflow_id": run.workflow_id, "workflow_version": run.version,
              "graph_hash": run.version_hash, "started_by": run.started_by} if run is not None else {}
     endpoint_name = endpoint.name if endpoint is not None else None
     if prev is not None and prev.state in ("confirmed", "simulated"):
         # 交回的是生效的那一次：指纹、预览、环境、第几次都照记录，不按这一次的参数重算
         return Prepared(key=key, attempt=prev.attempt, payload_hash=prev.payload_hash, preview=prev.preview,
-                        environment=prev.environment, endpoint=endpoint_name, receipt=_receipt_of(prev), run=facts)
+                        environment=prev.environment, endpoint=endpoint_name, receipt=_receipt_of(prev), run=facts,
+                        node_id=node_id)
     if prev is not None and prev.state in ("sent", "unknown"):
         raise ActionPending(prev.id)
     formal = run is not None and run.run_class == "formal"
@@ -290,15 +356,18 @@ async def prepare(*, run_id: str, node_id: str, exec_no: int, capability: Any, a
     args = typed_args(capability, args)
     return Prepared(key=key, attempt=attempt, payload_hash=payload_hash(name, args),
                     preview=masked(args, masked_paths(capability)), environment=environment, endpoint=endpoint_name,
-                    run=facts, args=args)
+                    run=facts, args=args, node_id=node_id)
 
 
 async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, exec_no: int,
-               emit: Callable[..., None], on_behalf: str | dict[str, Any] | None = None) -> dict[str, Any]:
+               emit: Callable[..., None], on_behalf: str | dict[str, Any] | None = None,
+               confirm_node: str | None = None) -> dict[str, Any]:
     """先写记录再发送。返回节点的产出；结果未知抛 ActionPending，确定失败抛 ActionFailed。发的是 prepare 收好类型的
     那一份参数（prep.args），和确认卡上的哈希是同一份。
 
-    on_behalf 原样交给平台执行器写身份断言：{"sub": 运行的发起人, "act": 确认人}（capabilities.endpoints.on_behalf_parts）。"""
+    on_behalf 原样交给平台执行器写身份断言：{"sub": 运行的发起人, "act": 确认人}（capabilities.endpoints.on_behalf_parts）。
+    记录上的节点 id 照 prepare 认定的（prep.node_id）；confirm_node 是动作确认待办上记的节点 id（确认卡上的，子工作流里是
+    子图里的 id），不给就按 node_id 找。"""
     from app.capabilities.registry import endpoint_request, masked_paths
 
     name = capability.name
@@ -306,11 +375,12 @@ async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, ex
         rec = await session.scalar(select(ActionRecord).where(ActionRecord.idem_key == prep.idem_key))
         if rec is None:
             rec = ActionRecord(
-                action_key=prep.key, attempt=prep.attempt, idem_key=prep.idem_key, run_id=run_id, node_id=node_id,
+                action_key=prep.key, attempt=prep.attempt, idem_key=prep.idem_key, run_id=run_id,
+                node_id=prep.node_id or node_id,
                 exec_no=exec_no, capability=name, capability_version=getattr(capability, "version", None),
                 endpoint_id=getattr(capability, "endpoint_id", None), environment=prep.environment,
                 payload_hash=prep.payload_hash, preview=prep.preview, state="pending",
-                confirm_task_id=await _confirm_task(session, run_id, node_id),
+                confirm_task_id=await _confirm_task(session, run_id, confirm_node or node_id),
                 app_id=prep.run.get("app_id"), workflow_id=prep.run.get("workflow_id"),
                 workflow_version=prep.run.get("workflow_version"), graph_hash=prep.run.get("graph_hash"))
             session.add(rec)
@@ -329,6 +399,10 @@ async def send(prep: Prepared, capability: Any, *, run_id: str, node_id: str, ex
              else "演练：探索运行里端点没有测试环境，没有发送请求")
         return _output(action_id, prep, "simulated", None, receipt)
 
+    # 本进程续不上租约了（cluster/fence.py）就不发：这次运行可能已经被别的进程接手
+    from app.cluster import fence
+
+    fence.check()
     # 先记 sent 再发：发到一半进程没了，重启后看到的是 sent，只能核实，不会当成没发过再发一次
     if not await _set(action_id, ("pending",), state="sent", request_at=utcnow()):
         raise ActionPending(action_id)
@@ -449,7 +523,7 @@ async def _confirm_task(session: AsyncSession, run_id: str, node_id: str) -> str
 
     return await session.scalar(select(Task.id).where(Task.run_id == run_id, Task.node_id == node_id,
                                                       Task.kind == "action_confirm")
-                                .order_by(Task.created_at.desc()).limit(1))
+                                .order_by(Task.created_at.desc(), Task.id.desc()).limit(1))
 
 
 # --------------------------------------------------------------------------
@@ -651,12 +725,33 @@ async def _lookup(action_id: str, claimed_at: datetime, now: datetime) -> int:
     return 1
 
 
-async def startup() -> int:
+async def startup(*, live: Any = None) -> int:
     """启动时：上次进程没了的时候已经发出（sent）、还没拿到结果的动作收成结果未知，安排核实；结果未知却还没安排核实的
-    （挂起之后、安排之前进程没了）补上。返回处理的条数。"""
+    （挂起之后、安排之前进程没了）补上。返回处理的条数。
+
+    多进程：所属的运行还在别的活着的进程里执行的不碰（那边正在发、正在等结果）；当班进程隔一会儿来的那一次只收拾停了两个租约
+    时长以上的。"""
+    from app.cluster import state
+    from app.db.models import Run
+    from app.engine.runner import run_manager
+
+    live = live if live is not None else await state.current(fresh=True)
     async with SessionLocal() as session:
-        ids = list((await session.execute(select(ActionRecord.id).where(
-            ActionRecord.state.in_(("sent", "unknown")), ActionRecord.resolution.is_(None)))).scalars())
+        rows = (await session.execute(select(ActionRecord.id, ActionRecord.run_id, Run.status, Run.owner)
+                                      .outerjoin(Run, Run.id == ActionRecord.run_id).where(
+            ActionRecord.state.in_(("sent", "unknown")), ActionRecord.resolution.is_(None)))).all()
+    ids = [action_id for action_id, run_id, status, owner in rows
+           if not (status in ("running", "queued") and live.alive(owner, local=run_manager.is_active(run_id)))]
+    if live.trust_mine and ids:
+        # 当班进程隔一会儿来的那一次：刚挂起、执行它的进程正在安排核实的（收尾和安排核实之间）不碰，只收拾停了两个租约时长以上的
+        from datetime import timedelta
+
+        from app.cluster.workers import lease_s
+
+        floor = utcnow() - timedelta(seconds=2 * lease_s())
+        async with SessionLocal() as session:
+            ids = list((await session.execute(select(ActionRecord.id).where(
+                ActionRecord.id.in_(ids), ActionRecord.updated_at < floor))).scalars())
     for action_id in ids:
         try:
             await on_unknown(action_id)

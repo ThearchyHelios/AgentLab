@@ -83,7 +83,7 @@ async def clean_suite(suite_id: str, *, keep: int | None = None) -> dict[str, An
         if keep is None:
             keep = int((await eval_settings(session))["keep_runs"])
         runs = list((await session.execute(select(EvalRun).where(EvalRun.suite_id == suite_id)
-                                           .order_by(EvalRun.created_at.desc()))).scalars())
+                                           .order_by(EvalRun.created_at.desc(), EvalRun.id.desc()))).scalars())
         kept = keep_set(runs, keep)
         targets = [r for r in runs if r.id not in kept and r.cleaned_at is None]
         results = removed = 0
@@ -119,8 +119,10 @@ def spawn(suite_id: str) -> None:
 
 async def drain() -> None:
     """等后台的清理做完（测试、关停用）。"""
-    while _background:
-        await asyncio.gather(*list(_background), return_exceptions=True)
+    from app.core.background import drain as drain_tasks
+
+    # 不写成 while _background: await gather(...)：别的事件循环上做完、还没摘掉的任务会让那样的循环空转（core/background）
+    await drain_tasks(_background)
 
 
 __all__ = ["clean_suite", "drain", "keep_set", "spawn"]

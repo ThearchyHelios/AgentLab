@@ -11,6 +11,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+from app.core import atomic
 from app.core.config import settings, sanitize_session
 from app.core.errors import describe_exception, raw
 from app.sandbox import interpreter
@@ -131,9 +132,14 @@ class BubblewrapSandbox(Sandbox):
 
         return _apply
 
-    def _argv(self, workdir: Path, limits: SandboxLimits, cmd: list[str]) -> list[str]:
+    def _argv(self, workdir: Path, limits: SandboxLimits, cmd: list[str],
+              env: dict[str, str] | None = None) -> list[str]:
         argv = [
             self._bwrap or "bwrap",
+            # 先清空环境变量，再一条条设：bwrap 按参数的先后处理，--clearenv 要在所有 --setenv 前面。以前不清，被执行的
+            # 代码看得到后端进程的全部环境变量（模型的 API Key、带密码的 AGENTLAB_DATABASE_URL）；local、seatbelt 一直只给
+            # 最小的一套
+            "--clearenv",
             "--unshare-all",              # mount/pid/ipc/uts/cgroup/net 全部隔离
             *(["--share-net"] if limits.network else []),
             "--die-with-parent",          # 父进程没了，沙箱跟着走
@@ -146,8 +152,11 @@ class BubblewrapSandbox(Sandbox):
             "--setenv", "HOME", "/work",
             "--setenv", "TMPDIR", "/tmp",
             "--setenv", "PATH", "/usr/bin:/bin",
+            "--setenv", "LANG", "C.UTF-8",
             "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
         ]
+        for key, value in (env or {}).items():
+            argv += ["--setenv", key, value]
         for path in _RO_BINDS:
             if Path(path).exists():
                 argv += ["--ro-bind", path, path]
@@ -176,22 +185,22 @@ class BubblewrapSandbox(Sandbox):
         entry = entry_name(ext)
         cmd = [*cmd_prefix, f"/work/{entry}"]
         workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}")
-        (workdir / entry).write_text(code)
+        atomic.write_text(workdir / entry, code)
         for rel, content in (files or {}).items():
             target = (workdir / rel).resolve()
             if not str(target).startswith(str(workdir.resolve())):
                 return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
+            atomic.write_text(target, content)
 
-        argv = self._argv(workdir, limits, cmd)
-        for key, value in (env or {}).items():
-            argv[1:1] = ["--setenv", key, value]
+        argv = self._argv(workdir, limits, cmd, env)
 
         started = time.perf_counter()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
+                # bwrap 自己也只拿最小的环境：沙箱里的进程靠上面的 --setenv，不从这里继承
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 preexec_fn=self._preexec(limits),

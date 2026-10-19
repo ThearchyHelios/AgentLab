@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.core import atomic
 from app.core.config import settings
 from app.tools.registry import ToolContext, register
 
@@ -74,9 +75,12 @@ async def file_write(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
         target = _resolve(args.path, ctx)
     except ValueError as e:
         return {"error": str(e)}
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a" if args.append else "w", encoding="utf-8") as f:
-        f.write(args.content)
+    # 覆盖：先写临时文件再改名（core/atomic），读的一方看到的要么是旧的整份、要么是新的整份，权限照旧。追加：原地追加写
+    # （O_APPEND），不整份重写——文件的 inode、权限不变，原有内容不动，读的一方最多看到半截新内容
+    if args.append:
+        atomic.append_bytes(target, args.content.encode("utf-8"))
+    else:
+        atomic.write_bytes(target, args.content.encode("utf-8"))
     return {"path": args.path, "bytes": target.stat().st_size, "ok": True}
 
 

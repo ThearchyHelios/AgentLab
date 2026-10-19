@@ -34,9 +34,9 @@ async def start(*, interval: float | None = None, config: Settings | None = None
     if not scheduler_enabled(config):
         logger.info("定时任务调度已关闭（AGENTLAB_SCHEDULER），不会自动发起运行")
         return False
-    from app.scheduler.loop import TICK_SECONDS, runner
+    from app.scheduler.loop import runner
 
-    await runner.start(interval if interval is not None else TICK_SECONDS)
+    await runner.start(interval if interval is not None else float((config or settings).scheduler_tick_s))
     return True
 
 

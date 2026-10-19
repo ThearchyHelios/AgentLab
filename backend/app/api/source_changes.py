@@ -79,7 +79,7 @@ async def upkeep(session: AsyncSession = Depends(get_session)) -> dict[str, Any]
     counts = await sc.counts_by_source(session, ids)
     schedules: dict[str, list[dict[str, Any]]] = {}
     for r in (await session.execute(select(Schedule).where(Schedule.target_kind == "source_maintenance")
-                                    .order_by(Schedule.created_at))).scalars():
+                                    .order_by(Schedule.created_at, Schedule.id))).scalars():
         schedules.setdefault(r.target_id or "", []).append({
             "id": r.id, "enabled": r.enabled, "cron": r.cron, "timezone": r.timezone,
             "description_text": _describe(r.cron, r.timezone),
@@ -249,7 +249,7 @@ async def get_maintenance(source_id: str, session: AsyncSession = Depends(get_se
     row = await _source(session, source_id)
     rows = list((await session.execute(select(Schedule).where(
         Schedule.target_kind == "source_maintenance", Schedule.target_id == row.id)
-        .order_by(Schedule.created_at))).scalars())
+        .order_by(Schedule.created_at, Schedule.id))).scalars())
     outs = await _schedule_outs(session, rows)
     fire_ids = [o["last_fire"]["id"] for o in outs if o.get("last_fire")]
     inputs = dict((await session.execute(select(ScheduleFire.id, ScheduleFire.inputs).where(
@@ -310,7 +310,7 @@ async def background_jobs(source_id: str, session: AsyncSession = Depends(get_se
         brief = await module.job_brief(session, job) if job is not None else None
         if job is None or brief is None:
             continue
-        ahead = runtime.lanes.ahead(row.id, job.id)
+        ahead = await runtime.lanes.ahead(row.id, job.id)
         position = len(ahead) if ahead is not None else None
         found.append((position, job.created_at, {
             "kind": kind, "id": job.id, "status": brief["status"], "total": brief.get("total", 0),

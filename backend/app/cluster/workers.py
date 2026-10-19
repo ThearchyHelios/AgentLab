@@ -1,0 +1,187 @@
+"""工作进程的登记和租约（cluster_workers），以及「这一行的属主还在不在」。
+
+- register / renew / unregister：启动时登记、隔一拍心跳续租约、平稳关停时删掉自己那一行（别的进程马上就知道它不在了，
+  不必等租约到期）。
+- liveness()：现在哪些别的进程还活着（租约过期不到一个租约时长：再晚才算不在了，见 cluster/fence.py）。各种「启动整理」「接手」都只碰属主不在了的行：
+  Liveness.alive(owner, local=…) —— 属主是别的进程：看它的租约；属主是自己：看这一行在本进程里是不是真的在跑（local），
+  同一个进程里前一次起停留下的（测试里一个进程起停多次服务）照样算不在了；没有属主（升级前的行）算不在了。
+
+租约用库的时钟（复核 R-b7）：PostgreSQL 上续租、登记写的是 lease_until = 库的 now() + 租约，判活比的也是库的 now()——租约由
+各台机器续、由别的机器判，用同一只钟，机器之间墙钟差多少都不起作用（cluster/leader 的当班租约同理）。SQLite 只有一个进程，用本机
+的钟。别处按「停了两个租约时长」判的时间（待办、动作的 updated_at）仍是各进程按本机时钟写的：各台机器还是要对时（NTP）。
+"""
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import DateTime, delete, func, select, update
+
+from app.cluster import identity
+from app.core.config import settings
+from app.db.base import SessionLocal, utcnow
+
+logger = logging.getLogger(__name__)
+
+
+#: 登记时全站串行用的事务级咨询锁的号
+_REGISTER_KEY = 0x4167576F726B6572  # "AgWorker"
+
+
+def lease_s() -> float:
+    """租约多长（秒）：至少是心跳间隔的三倍——库一时慢了、一拍没续上，不算进程没了。"""
+    return max(float(settings.worker_lease_s), 3.0 * float(settings.worker_heartbeat_s))
+
+
+def heartbeat_s() -> float:
+    return float(settings.worker_heartbeat_s)
+
+
+def _postgres(session: Any) -> bool:
+    return session.get_bind().dialect.name == "postgresql"
+
+
+def clock(session: Any) -> Any:
+    """判租约用的「现在」（写进 UTCDateTime 列、跟它比的那种：UTC、不带时区）。PostgreSQL 是库的时钟（SQL 表达式），SQLite
+    是本机的（只有一个进程）。"""
+    if _postgres(session):
+        return func.timezone("UTC", func.clock_timestamp(), type_=DateTime())
+    return utcnow()
+
+
+async def db_now(session: Any) -> datetime:
+    """库的时钟此刻的读数（带时区的 UTC）：要在 Python 里拿它算、比的时候用（登记、当班）。"""
+    if _postgres(session):
+        value = await session.scalar(select(func.timezone("UTC", func.clock_timestamp())))
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return utcnow()
+
+
+@dataclass(frozen=True)
+class Liveness:
+    """某一刻还活着的别的进程。"""
+
+    others: frozenset[str] = frozenset()
+    #: 属主是自己的行一律算活着（当班进程隔一会儿接手时用：自己刚建、还没交给后台任务的行不能当成没人管）。启动时的那一次
+    #: 不信：那时本进程什么都还没在跑，属主是自己的只会是同一个进程里前一次起停留下的
+    trust_mine: bool = False
+
+    def alive(self, owner: str | None, *, local: bool = False) -> bool:
+        """这一行的属主还在不在。local：这一行在本进程里是不是真的在跑（属主是自己时只看它）。"""
+        if not owner:
+            return False
+        if owner == identity.owner():
+            return local or self.trust_mine
+        return owner in self.others
+
+    def trusting(self) -> Liveness:
+        return Liveness(self.others, trust_mine=True)
+
+
+async def liveness(now: datetime | None = None) -> Liveness:
+    """现在还活着（租约没过期）的别的进程。now 只给测试用（不给就是库的时钟）。"""
+    from app.db.models_cluster import ClusterWorker
+
+    me = identity.owner()
+    # 租约过期之后再多等一个租约时长才算不在了：卡住了但没死的进程（SIGSTOP、虚拟机暂停、库一时连不上）自己在一个租约时长时就
+    # 停手（cluster/fence.py），两边中间留着一段，不会它还在写、这边已经接手
+    async with SessionLocal() as session:
+        floor = (now if now is not None else clock(session)) - timedelta(seconds=lease_s())
+        ids = (await session.execute(select(ClusterWorker.id).where(
+            ClusterWorker.lease_until > floor, ClusterWorker.id != me))).scalars().all()
+    return Liveness(frozenset(ids))
+
+
+async def alive(owner: str | None, *, local: bool = False) -> bool:
+    """单独问一个属主（停止时找收件人用）。"""
+    if not owner or owner == identity.owner():
+        return bool(owner) and local
+    return (await liveness()).alive(owner)
+
+
+def _info() -> dict[str, Any]:
+    return {"data_dir": str(settings.data_dir), "workers": settings.workers}
+
+
+async def register(*, exclusive: bool = False) -> None:
+    """登记自己（已有就续上）。exclusive：库里别的进程一律当成已经不在了，删掉它们的登记（SQLite：只有一个进程，
+    守卫已经确认没有别的进程在用这个数据目录，见 cluster/guard.py）。"""
+    from app.db.models_cluster import ClusterWorker
+
+    from app.cluster import version
+
+    me = identity.owner()
+    async with SessionLocal() as session:
+        now = await db_now(session)
+        if exclusive:
+            await session.execute(delete(ClusterWorker).where(ClusterWorker.id != me))
+        elif session.get_bind().dialect.name == "postgresql":
+            # 查「还有没有活着的、版本不同的进程」和登记在同一个事务里、全站串行：两个不同版本同时启动只有先登记上的起得来
+            from sqlalchemy import text
+
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _REGISTER_KEY})
+            now = await db_now(session)   # 等锁可能等了一会儿：按拿到锁之后的库时钟
+            others = (await session.execute(select(ClusterWorker).where(ClusterWorker.id != me))).scalars().all()
+            version.check_rows(list(others), now)
+        row = await session.get(ClusterWorker, me)
+        if row is None:
+            session.add(ClusterWorker(id=me, host=identity.host(), pid=os.getpid(), started_at=now, heartbeat_at=now,
+                                      lease_until=now + timedelta(seconds=lease_s()), info=_info(),
+                                      code_version=version.code_version(), schema_version=version.schema_version()))
+        else:
+            row.heartbeat_at, row.lease_until = now, now + timedelta(seconds=lease_s())
+        await session.commit()
+
+
+async def renew() -> bool:
+    """续一拍租约（走连接池的那一种；服务里续租在专用连接上，见 cluster/service.renew）。自己那一行不见了、或者按库的时钟已经
+    过期了返回 False（不续）。"""
+    from app.db.models_cluster import ClusterWorker
+
+    async with SessionLocal() as session:
+        now = clock(session)
+        done = await session.execute(update(ClusterWorker).where(
+            ClusterWorker.id == identity.owner(), ClusterWorker.lease_until >= now).values(
+            heartbeat_at=now, lease_until=now + timedelta(seconds=lease_s()))
+            .execution_options(synchronize_session=False))
+        await session.commit()
+    return done.rowcount == 1
+
+
+async def unregister() -> None:
+    from app.db.models_cluster import ClusterWorker
+
+    async with SessionLocal() as session:
+        await session.execute(delete(ClusterWorker).where(ClusterWorker.id == identity.owner()))
+        await session.commit()
+
+
+async def prune(now: datetime | None = None) -> int:
+    """删掉早就过期的登记（当班进程做）：租约过期超过十倍租约时长的。它们认领的行早已被接手。"""
+    from app.db.models_cluster import ClusterWorker
+
+    async with SessionLocal() as session:
+        floor = (now if now is not None else clock(session)) - timedelta(seconds=10 * lease_s())
+        done = await session.execute(delete(ClusterWorker).where(ClusterWorker.lease_until < floor))
+        await session.commit()
+    return int(done.rowcount or 0)
+
+
+async def listing() -> list[dict[str, Any]]:
+    """现在登记着的进程（系统信息页、验收脚本看）。"""
+    from app.db.models_cluster import ClusterWorker
+
+    async with SessionLocal() as session:
+        now = await db_now(session)
+        rows = (await session.execute(select(ClusterWorker).order_by(ClusterWorker.started_at, ClusterWorker.id))).scalars().all()
+    return [{"id": r.id, "host": r.host, "pid": r.pid, "alive": r.lease_until > now, "me": r.id == identity.owner(),
+             "code_version": r.code_version, "schema_version": r.schema_version,
+             "started_at": r.started_at.isoformat() if r.started_at else None,
+             "heartbeat_at": r.heartbeat_at.isoformat() if r.heartbeat_at else None} for r in rows]
+
+
+__all__ = ["Liveness", "alive", "clock", "db_now", "heartbeat_s", "lease_s", "listing", "liveness", "prune", "register",
+           "renew", "unregister"]

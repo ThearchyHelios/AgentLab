@@ -86,7 +86,7 @@ async def effects(workflow_id: str | None = None, version: int | None = None, ap
         query = query.where(ActionRecord.state == state)
     if capability:
         query = query.where(ActionRecord.capability == capability)
-    rows = (await session.execute(query.order_by(ActionRecord.created_at.desc()).limit(limit))).scalars()
+    rows = (await session.execute(query.order_by(ActionRecord.created_at.desc(), ActionRecord.id.desc()).limit(limit))).scalars()
     return {"items": [effect_row(r) for r in rows]}
 
 

@@ -34,6 +34,7 @@ import {
 } from './VerifySettings'
 import { DraftModelSection } from './DraftModelSettings'
 import { EvalSettingsSection } from './EvalSettings'
+import { ConcurrencySettingsSection } from './ConcurrencySettings'
 import { GeneralTab } from './settings/GeneralTab'
 import { IdentityTab } from './settings/IdentityTab'
 import { NotifyTab } from './settings/NotifyTab'
@@ -1203,6 +1204,8 @@ function PrefsTab() {
                                            errors={fieldError?.field === 'verify.provider' ? { ...verifyErrs, provider: fieldError.message } : verifyErrs} />}
 
           {values.eval && <EvalSettingsSection />}
+
+          {values.concurrency && <ConcurrencySettingsSection />}
 
           {values.ledger && <LedgerSection cur={ledgerCur} errors={ledgerErrs} onEdit={editLedger} />}
 

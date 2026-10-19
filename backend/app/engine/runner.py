@@ -10,11 +10,13 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 from sqlalchemy import case, func, select, update
 
+from app.cluster import fence, identity
+from app.cluster.fence import Fenced
 from app.core.bus import bus
 from app.core.config import settings
 from app.core.errors import describe_exception, raw_detail
@@ -56,6 +58,9 @@ REJECTED_CONTINUE = "被驳回的运行不能继续运行：改好内容后重�
 REJECTED_RESUME = "这次运行已被驳回，没有待处理的审批，无法恢复：改好内容后重新发起"
 #: 服务重启时还在排队的运行改成失败时写的话（run.error 和补发的 run.failed 是同一句）
 QUEUED_AT_RESTART = "服务重启时这次运行仍在排队，没有可恢复的进度，请重新发起运行"
+#: 本进程隔离（续不上租约）之后没能重新登记，这一段执行没有开始（cluster/fence.ready 等不到）
+NOT_REREGISTERED_QUEUED = "本进程隔离后没能重新登记，这次运行没有开始执行，请重新发起运行"
+NOT_REREGISTERED_RESUMABLE = "本进程隔离后没能重新登记，这次运行没有接着执行，已挂起，可从断点继续运行"
 
 
 class ContinueRefused(ValueError):
@@ -71,9 +76,10 @@ class RunManager:
 
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        self._checkpointer: AsyncSqliteSaver | None = None
+        self._checkpointer: BaseCheckpointSaver | None = None
         self._cm: Any = None
-        self._semaphore = asyncio.Semaphore(settings.max_concurrent_runs)
+        # 并发上限以前是这里一把进程内的信号量（max_concurrent_runs）；现在是库里按类别发的名额（app/cluster/slots.py），
+        # 几个进程合起来算，评测、召回这些系统运行不再挤占问数据和试跑
         #: 正在关停。此时收到的取消来自关停而不是用户，运行要记成可恢复的中断
         self._closing = False
         #: 已经跑完、正在落状态和封存的运行。关停不去打断它们
@@ -86,8 +92,11 @@ class RunManager:
     async def setup(self) -> None:
         self._closing = False
         settings.ensure_dirs()
-        self._cm = AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path))
-        self._checkpointer = await self._cm.__aenter__()
+        # SQLite：数据目录里的 checkpoints.db；PostgreSQL：同一个库（或 AGENTLAB_CHECKPOINT_URL），见 engine/checkpoints.py
+        from app.engine.checkpoints import open_saver
+
+        self._cm = open_saver()
+        self._checkpointer = _fenced_saver(await self._cm.__aenter__())
         # 上次进程被强杀时留下的记录。running 和 queued 要分开处理：
         # running 至少跑过一步、有 checkpoint，可以续；queued 还在排队，
         # 一个 checkpoint 都没写过，"恢复"它只会从 START 用默认值重跑一遍，
@@ -102,44 +111,68 @@ class RunManager:
                 update(Run).where(func.coalesce(Run.last_seq, 0) < latest)
                 .values(last_seq=latest, updated_at=Run.updated_at)
                 .execution_options(synchronize_session=False))
-            stranded = list((await session.execute(
-                select(Run.id, Run.last_seq).where(Run.status == "running")
-            )).all())
-            queued = list((await session.execute(
-                select(Run.id, Run.last_seq).where(Run.status == "queued")
-            )).all())
-            await session.execute(
-                update(Run)
-                .where(Run.status == "running")
-                .values(status="interrupted", error="服务重启，运行已挂起，可从断点继续运行")
-            )
-            await session.execute(
-                update(Run)
-                .where(Run.status == "queued")
-                .values(status="failed", error=QUEUED_AT_RESTART)
-            )
             await session.commit()
-        # 进程被强杀时连 server_shutdown 日志都来不及发，事件流停在半路。补上这一条，
-        # 回放它的客户端才知道它是挂起了，而不是还在跑
-        for run_id, last_seq in stranded:
-            bus.set_seq(run_id, last_seq or 0)
-            await self._emit(run_id, EventType.LOG, data={
-                "level": "warn", "code": "server_shutdown",
-                "message": "服务上次未正常关闭，这次运行已中断；可从断点继续运行",
-            })
-        # 排队中的改成了失败，也补一条 run.failed：以前只改状态，时间线里没有失败原因这一行（05-已知遗留 (h)）。
-        # 不写结束时间、不封存：它从没开始执行，同以前（定时通知按「没有开始时间」认出它，scheduler/webhook.py）
-        for run_id, last_seq in queued:
-            bus.set_seq(run_id, last_seq or 0)
-            await self._emit(run_id, EventType.RUN_FAILED, data={"error": QUEUED_AT_RESTART})
+        # 上次进程被强杀时留下的记录：只碰属主不在了的（多进程时别的活着的进程在跑的一概不碰，见 reap）
+        from app.cluster import state
+
+        await self.reap(await state.current(fresh=True))
         # 口径账本：最近几天封存了、一次都没比过的探索运行，在后台补比一次（ledger/match.py）。只读工件和版本表，不查业务库、
         # 不调模型；和调度循环同一个开关，拷来的数据目录、测试不补
         from app.ledger import match as ledger_match
         from app.ledger import recall as ledger_recall
 
-        ledger_match.start_backfill()
-        # 口径召回（ledger/recall.py）：最近发布、自动那一批没发完的接着发，结束了还没收尾的召回运行补上收尾。同一个开关
-        ledger_recall.start_resume()
+        # 多进程时只由调度当班的进程做（app/cluster；单进程时本进程启动就当班）：几个进程各补一遍会重复比对、重复召回
+        from app.cluster.service import leading
+
+        if leading():
+            ledger_match.start_backfill()
+            # 口径召回（ledger/recall.py）：最近发布、自动那一批没发完的接着发，结束了还没收尾的召回运行补上收尾。同一个开关
+            ledger_recall.start_resume()
+
+    async def reap(self, live: Any) -> int:
+        """接手属主不在了的运行（启动时；多进程时当班进程隔一会儿再来一次，app/cluster/reaper.py）。规矩同以前的启动整理：
+
+        - running 至少跑过一步、有断点：标 interrupted（可从断点继续运行），补一条 server_shutdown 日志——进程被强杀时连这一条
+          都来不及发，事件流停在半路，回放它的客户端才知道它是挂起了而不是还在跑；
+        - queued 还在排队，一个断点都没写过，「恢复」它只会从 START 用默认值重跑一遍、还丢掉 run.input，那不是恢复是伪造：
+          标 failed，补一条 run.failed（不写结束时间、不封存：它从没开始执行，同以前）。
+
+        不自动重跑有副作用的步骤：人看了再点「继续运行」。属主还活着的（别的进程正在跑、本进程里正在跑）一概不碰；认领那一下是
+        带条件的 UPDATE（状态、属主都还是刚才看到的），几个进程同时接手同一次运行只有一个改得动。交回整理了几次运行。"""
+        from app.cluster.claims import same
+
+        async with SessionLocal() as session:
+            rows = (await session.execute(select(Run.id, Run.owner, Run.status).where(
+                Run.status.in_(("running", "queued"))))).all()
+        done = 0
+        for run_id, owner, status in rows:
+            if live.alive(owner, local=self.is_active(run_id)):
+                continue
+            event: RunEventModel | None = None
+            async with SessionLocal() as session:
+                values: dict[str, Any] = (
+                    {"status": "interrupted", "error": "服务重启，运行已挂起，可从断点继续运行"} if status == "running"
+                    else {"status": "failed", "error": QUEUED_AT_RESTART})
+                claimed = await session.execute(update(Run).where(Run.id == run_id, Run.status == status,
+                                                                  same(Run.owner, owner))
+                                                .values(owner=None, **values).execution_options(synchronize_session=False))
+                if claimed.rowcount != 1:
+                    await session.rollback()
+                    continue
+                run = await session.get(Run, run_id)
+                bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq if run else 0))
+                event = self._event(run_id, EventType.LOG, data={
+                    "level": "warn", "code": "server_shutdown",
+                    "message": "服务上次未正常关闭，这次运行已中断；可从断点继续运行",
+                }) if status == "running" else self._event(run_id, EventType.RUN_FAILED, data={"error": QUEUED_AT_RESTART})
+                await _stage(session, event, run)
+                await session.commit()
+            await bus.publish(event)
+            await bus.close(run_id)
+            done += 1
+        if done:
+            logger.warning("接手了 %d 次属主已经不在的运行（在跑的标中断、排队的标失败）", done)
+        return done
 
     async def shutdown(self) -> None:
         self._closing = True
@@ -163,7 +196,7 @@ class RunManager:
                 await self._cm.__aexit__(None, None, None)
 
     @property
-    def checkpointer(self) -> AsyncSqliteSaver:
+    def checkpointer(self) -> BaseCheckpointSaver:
         if self._checkpointer is None:
             raise RuntimeError("RunManager 还没初始化")
         return self._checkpointer
@@ -180,6 +213,8 @@ class RunManager:
         persist: bool = True,
         ts: float | None = None,
     ) -> None:
+        # 执行这次运行的那段（cluster/fence 绑定过世代的）写之前问一句：租约续晚了就不写（可能已经被别的进程接手）
+        fence.check()
         event = self._event(run_id, event_type, node_id=node_id, data=data, ts=ts)
         # 先落库，再广播。顺序反过来会漏事件，而且是结构性的漏：
         #
@@ -221,7 +256,20 @@ class RunManager:
         self, run_id: str, event_type: EventType | str, *, node_id: str | None = None,
         **data: Any,
     ) -> None:
-        """给运行之外的代码往运行里记一条事件。发起时就定下的事件不走这里，交给 start 的 notes。"""
+        """给运行之外的代码往运行里记一条事件。发起时就定下的事件不走这里，交给 start 的 notes。
+
+        执行中的运行，序号由执行它的进程发（core/bus 的进程内计数）：运行在别的活着的进程里执行时交给它记（cluster/requests），
+        不在这里取号——这里的计数和那边的不是同一个，直接写会撞号。"""
+        if not self.is_active(run_id):
+            from app.cluster import requests, workers
+
+            async with SessionLocal() as session:
+                row = (await session.execute(select(Run.status, Run.owner).where(Run.id == run_id))).first()
+            if row is not None and row.status in ("running", "queued") and row.owner \
+                    and row.owner != identity.owner() and await workers.alive(row.owner):
+                await requests.send(row.owner, "note", "run", run_id, payload={
+                    "type": str(event_type), "node_id": node_id, "data": data})
+                return
         await self._emit(run_id, event_type, node_id=node_id, data=data)
 
     # ---------------- 启动 ----------------
@@ -331,6 +379,7 @@ class RunManager:
                 agent_limits=agent_limits,
                 data_versions=data_versions,
                 options=options,
+                origin_kind=origin_kind,
             )
         )
         return run
@@ -641,6 +690,19 @@ class RunManager:
             self._stopped_by[run_id] = actor
             task.cancel()
             return "stopping"
+        # 不在本进程里执行（多进程，app/cluster）：在别的活着的进程里跑（或排队）的给它发停止请求，它照本进程的规矩停、发
+        # run.cancelled（带上是谁停的），界面上同样是「正在停止」；属主不在了的照租约过期接手（标中断），再按停在断点上的放弃
+        from app.cluster import requests, workers
+
+        async with SessionLocal() as session:
+            row = (await session.execute(select(Run.status, Run.owner).where(Run.id == run_id))).first()
+        if row is not None and row.status in ("running", "queued") and row.owner and row.owner != identity.owner():
+            if await workers.alive(row.owner):
+                await requests.send(row.owner, "stop", "run", run_id, actor=actor)
+                return "stopping"
+            from app.cluster import state
+
+            await self.reap((await state.current(fresh=True)).trusting())
         return "cancelled" if await self._abandon(run_id, actor) else None
 
     async def _abandon(self, run_id: str, actor: str | None) -> bool:
@@ -714,7 +776,10 @@ class RunManager:
         options: dict[str, Any] | None = None,
         resumed: list[str] | tuple[str, ...] = (),
         actors: dict[str, str | None] | None = None,
+        origin_kind: str | None = None,
     ) -> None:
+        from app.cluster import slots
+
         started = time.perf_counter()
         status = "succeeded"
         error: str | None = None
@@ -732,12 +797,32 @@ class RunManager:
         # 等待从 run.interrupted 算起——以前执行一直计到 finally，收尾那一截执行和等待两边都算，
         # active + wait 比墙钟还长（机器一忙就差出几十毫秒）
         paused: float | None = None
-        async with self._semaphore:
+        # 这段执行属于现在这一世代（cluster/fence.py）：本进程隔离之后，它不再写。隔离之后新身份还没登记上时先等一等
+        try:
+            await fence.ready()
+        except Fenced:
+            await self._not_reregistered(run_id)
+            return
+        fence.bind()
+        mine = identity.owner()
+        #: 被隔离了（续不上租约）：停手，不写终态（这次运行由接手的进程按「属主不在了」处理）
+        fenced = False
+        # 先要并发名额（app/cluster/slots.py）。等名额的时候被停止（或者关停）也要照实收尾，见 _stopped_in_queue
+        slot = slots.hold(run_id, origin_kind)
+        try:
+            await slot.__aenter__()
+        except asyncio.CancelledError:
+            await self._stopped_in_queue(run_id)
+            raise
+        try:
+            # 执行时长从拿到名额算起：排队等名额的那一段不算执行（墙钟从 started_at 算，started_at 也是拿到名额之后才写）
+            started = time.perf_counter()
             try:
                 async with SessionLocal() as session:
                     row = await session.get(Run, run_id)
                     if row is not None:
                         row.status = "running"
+                        row.owner = mine
                         # started_at 只在第一次开始时写。以前每段 _drive 都覆盖它，
                         # 审批恢复、接着跑之后，运行的"开始时间"就成了最后一段的开始
                         if row.started_at is None:
@@ -822,7 +907,13 @@ class RunManager:
                 elif snapshot.next:
                     status = "interrupted"
 
+            except Fenced:
+                fenced = True
+                logger.error("运行 %s：本进程续不上租约，停手、不写终态（由接手的进程按「属主不在了」处理）", run_id)
             except asyncio.CancelledError:
+                if fence.fenced_here():
+                    fenced = True
+                    raise
                 if self._closing:
                     # 服务关停（dev.sh 的 --reload 改一个文件就是一次）不是用户取消。
                     # checkpoint 完好，记成中断、重启后从断点接着跑——和强杀后启动
@@ -887,8 +978,18 @@ class RunManager:
                 elapsed = int((stop - started) * 1000)
                 self._finalizing.add(run_id)
                 try:
-                    await self._finalize(run_id, status, error, final_state, elapsed,
-                                         terminal=terminal, error_node=error_node, end_reason=end_reason)
+                    if not fenced:
+                        await self._finalize(run_id, status, error, final_state, elapsed, terminal=terminal,
+                                             error_node=error_node, end_reason=end_reason, owner=mine)
+                    # 记 action.unknown、安排核实也算收尾：做完才把自己摘掉。以前摘掉之后才做，等运行「不在跑了」
+                    # 再去读事件的一方（接口、测试）有一小段读不到这一条；库慢一点（PostgreSQL 满载时）就读不到
+                    if pending_action is not None and not fenced:
+                        from app.process.actions import on_unknown
+
+                        try:
+                            await on_unknown(pending_action)
+                        except Exception:  # noqa: BLE001 - 运行已经收成挂起；没安排上的核实，下次启动时 actions.startup 补上
+                            logger.exception("run %s 的动作 %s 结果未知，安排核实时出错", run_id, pending_action)
                 finally:
                     # 收尾被打断（关停时的取消、库连接出错）也得把自己摘掉。以前写在
                     # _finalize 后面，一被打断就漏掉，留下的任务让下一次 shutdown 的
@@ -896,22 +997,74 @@ class RunManager:
                     self._finalizing.discard(run_id)
                     self._tasks.pop(run_id, None)
                     self._stopped_by.pop(run_id, None)
-                if pending_action is not None:
-                    from app.process.actions import on_unknown
-
-                    try:
-                        await on_unknown(pending_action)
-                    except Exception:  # noqa: BLE001 - 运行已经收成挂起；没安排上的核实，下次启动时 actions.startup 补上
-                        logger.exception("run %s 的动作 %s 结果未知，安排核实时出错", run_id, pending_action)
                 # 运行到终态就把沙箱会话收掉。thread_id 每个 run 都是新的，
                 # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），
                 # 而且没有任何自动回收路径会碰它——闲置回收只在"下次有人执行
                 # 代码"时才触发。interrupted 要留着，人回来还得接着跑。
-                if status in ("succeeded", "failed", "cancelled"):
+                if status in ("succeeded", "failed", "cancelled") and not fenced:
                     with contextlib.suppress(Exception):
                         from app.sandbox.manager import sandbox_manager
 
                         await sandbox_manager.cleanup(run_id)
+        finally:
+            await slot.__aexit__(None, None, None)
+
+    async def _not_reregistered(self, run_id: str) -> None:
+        """隔离之后新身份一直没登记上、这一段执行不开始了（fence.ready 等不到，复核 R-b15）：照实收尾，不留给别的进程按「服务
+        重启时还在排队」去标。排队中的（一步都没执行过）收成失败；已经执行过、停在断点上又要接着执行的收成中断（断点完好，可以
+        继续运行）。条件更新：状态、属主还是刚才看到的才改（别的进程先接手了就不动）。"""
+        from app.cluster.claims import same
+
+        logger.error("运行 %s：本进程隔离之后一直没重新登记上，这一段执行不开始", run_id)
+        try:
+            event: RunEventModel | None = None
+            async with SessionLocal() as session:
+                seen = (await session.execute(select(Run.status, Run.owner).where(Run.id == run_id))).first()
+                if seen is None or seen.status not in ("queued", "running"):
+                    return
+                if seen.status == "queued":
+                    values: dict[str, Any] = {"status": "failed", "error": NOT_REREGISTERED_QUEUED}
+                else:
+                    values = {"status": "interrupted", "error": NOT_REREGISTERED_RESUMABLE}
+                claimed = await session.execute(update(Run).where(
+                    Run.id == run_id, Run.status == seen.status, same(Run.owner, seen.owner))
+                    .values(owner=None, **values).execution_options(synchronize_session=False))
+                if claimed.rowcount != 1:
+                    await session.rollback()
+                    return
+                run = await session.get(Run, run_id)
+                bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq if run else 0))
+                event = (self._event(run_id, EventType.RUN_FAILED, data={"error": NOT_REREGISTERED_QUEUED})
+                         if seen.status == "queued" else
+                         self._event(run_id, EventType.LOG, data={"level": "warn", "code": "not_reregistered",
+                                                                  "message": NOT_REREGISTERED_RESUMABLE}))
+                await _stage(session, event, run)
+                await session.commit()
+            await bus.publish(event)
+            await bus.close(run_id)
+        except Exception:  # noqa: BLE001 - 收不了尾的留给别的进程按「属主不在了」处理
+            logger.exception("运行 %s：收尾时出错，留给别的进程按属主不在了处理", run_id)
+        finally:
+            self._tasks.pop(run_id, None)
+            self._stopped_by.pop(run_id, None)
+
+    async def _stopped_in_queue(self, run_id: str) -> None:
+        """还在等并发名额时被取消。关停：什么都不写（还是排队中 / 刚认领的样子），照「属主不在了」的规矩由下次启动或别的
+        进程接手（排队的标失败、认领了的标中断）；人点了停止：收成 cancelled，同执行中停止（run.cancelled 带上是谁停的、封存）。"""
+        try:
+            if self._closing:
+                return
+            if fence.fenced_here():
+                return
+            actor = self._stopped_by.pop(run_id, None)
+            self._finalizing.add(run_id)
+            await self._finalize(run_id, "cancelled", "用户取消", {}, 0,
+                                 terminal=(EventType.RUN_CANCELLED, {"reason": END_STOPPED, "actor": actor}),
+                                 end_reason=END_STOPPED, owner=identity.owner())
+        finally:
+            self._finalizing.discard(run_id)
+            self._tasks.pop(run_id, None)
+            self._stopped_by.pop(run_id, None)
 
     async def _handle_custom(self, run_id: str, chunk: Any) -> None:
         """节点通过 get_stream_writer 发来的事件。"""
@@ -932,6 +1085,7 @@ class RunManager:
         interrupts = chunk.get("__interrupt__")
         if not interrupts:
             return False
+        fence.check()
 
         for item in interrupts:
             value = getattr(item, "value", item)
@@ -993,7 +1147,9 @@ class RunManager:
         terminal: tuple[EventType, dict[str, Any]] | None = None,
         error_node: str | None = None,
         end_reason: str | None = None,
+        owner: str | None = None,
     ) -> None:
+        """收尾。owner：执行这一段的属主——运行那一行的属主已经不是它（被别的进程当成没了接手了，cluster/fence.py）就什么都不写。"""
         usage = dict(state.get("usage") or {})
         output = dict(state.get("output") or {})
         now = datetime.now(timezone.utc)
@@ -1011,7 +1167,13 @@ class RunManager:
         run_class: str | None = None
         origin_kind: str | None = None
         async with SessionLocal() as session:
-            run = await session.get(Run, run_id)
+            # 先占住这一行再看属主（PostgreSQL 上 FOR UPDATE；SQLite 只有一个进程）：接手的进程改属主用的是带条件的 UPDATE，
+            # 两边一个接一个，被接手了的这边不写
+            run = (await session.execute(select(Run).where(Run.id == run_id).with_for_update())).scalar_one_or_none()
+            if run is not None and owner is not None and run.owner != owner:
+                logger.error("运行 %s 已经被别的进程接手（属主 %s），本进程不写终态", run_id, identity.describe(run.owner))
+                await session.rollback()
+                return
             if run:
                 app_id = run.app_id
                 run_class, origin_kind = run.run_class, run.origin_kind
@@ -1056,6 +1218,10 @@ class RunManager:
                 run.end_reason = end_reason
                 if status != "interrupted":
                     run.finished_at = now
+                else:
+                    # 停在审批上（或挂起）的运行不属于任何进程：谁收到决定谁接着跑（resume / continue_failed 的条件 UPDATE
+                    # 认领，同一个决定只会被一个进程执行）
+                    run.owner = None
                 if status in ("failed", "cancelled"):
                     # 并行支路上已经停下来等人的那张审批卡，运行结束了它也就没有意义了；
                     # 留着的话它一直挂在全局待办里，批了也只会被告知运行不在断点上
@@ -1242,6 +1408,8 @@ def _carried(run: Run) -> dict[str, Any]:
         "data_versions": run.data_versions,
         # 运行选项同理：照发起时的快照，不重新读设置
         "options": run.options or {},
+        # 并发名额按来源归类（app/cluster/slots.py）：恢复、接着跑的那一段和第一段同一类
+        "origin_kind": run.origin_kind,
     }
 
 
@@ -1353,7 +1521,8 @@ def _rejected_via(state: dict[str, Any]) -> dict[str, Any]:
     """这次运行途经的驳回出口（engine/compiler._rejected_exit 记在 trail 上的 outcome=rejected）：{rejected_via: [{node_id,
     label, kind, decision, actor, note, to}]}，按先后。终态事件带上它，运行照它的路径结束（成功结束也一样）照实说「途经
     驳回」；没有途经的不带这个键，终态事件和以前一字不差。读的是收尾时的状态：节点出错、被驳回结束的那几种收尾拿不到
-    状态（final_state 为空），不带；子工作流里的驳回出口不在这里（它的 trail 是子工作流自己的状态）。"""
+    状态（final_state 为空），不带。子工作流里走了驳回出口的那几步也在这里：子图跑过的步骤交回父图的 trail（节点 id 带
+    「子工作流节点 id/」前缀、名字写「子工作流 › x」，engine/nodes/multi.run_subgraph）。"""
     via = [{k: t.get(k) for k in ("node_id", "label", "kind", "decision", "actor", "note", "to")}
            for t in state.get("trail") or [] if isinstance(t, dict) and t.get("outcome") == "rejected"]
     return {"rejected_via": via} if via else {}
@@ -1489,7 +1658,7 @@ async def _claim(
     """只在状态仍是 expected 时把运行改成 running；已经被别人改过就回滚、说明原因。"""
     claimed = await session.execute(
         update(Run).where(Run.id == run_id, Run.status.in_(expected))
-        .values(status="running", error=None, **values)
+        .values(status="running", error=None, owner=identity.owner(), **values)
     )
     if claimed.rowcount != 1:
         await session.rollback()
@@ -1661,3 +1830,58 @@ async def _timing(session: Any, run: Run, elapsed_ms: int, now: datetime) -> dic
 
 
 run_manager = RunManager()
+
+
+def _fenced_saver(saver: BaseCheckpointSaver) -> BaseCheckpointSaver:
+    """断点库的写也要过 cluster/fence：本进程续不上租约之后，手上的执行不再写断点（接手的进程会从断点接着跑，两边都写就分叉了）。
+
+    包成协程、在协程里查（复核 R-b8）：LangGraph 在节点的完成回调里调 aput_writes 拿协程交给后台任务——同步包装在回调里就抛了，
+    每次隔离 asyncio 都记一条「Exception in callback … FuturesDict.on_done」；在协程里抛，异常留在写断点的那个任务里，由 LangGraph
+    照常收走。"""
+    for name in ("aput", "aput_writes"):
+        original = getattr(saver, name, None)
+        if original is None:
+            continue
+
+        async def guarded(*args: Any, __original: Any = original, **kwargs: Any) -> Any:
+            fence.check()
+            return await __original(*args, **kwargs)
+
+        setattr(saver, name, guarded)
+    return saver
+
+
+def _stop_fenced() -> None:
+    """隔离了：停掉本进程在执行的运行（停的时候不写终态，见 _drive 的 fenced）。"""
+    for task in list(run_manager._tasks.values()):
+        if not task.done():
+            task.cancel()
+
+
+fence.on_trip(_stop_fenced)
+
+
+def _register_requests() -> None:
+    """别的进程发来的：停止本进程在执行的运行、往它里面记一条事件（app/cluster/requests.py）。"""
+    from app.cluster import requests
+
+    @requests.handle("stop", "run")
+    async def _stop(run_id: str, actor: str | None, _payload: dict[str, Any]) -> None:
+        # 不在本进程执行的也照停止的规矩办（cancel 自己看属主）：在别的活着的进程里执行就转给它，属主不在了就接手、放弃，停在
+        # 断点上的收成 cancelled，已经结束的什么都不做。隔离之后转到新身份名下的停止请求就是这样落下的（复核 R-b10）
+        await run_manager.cancel(run_id, actor=actor)
+
+    @requests.handle("note", "run")
+    async def _note(run_id: str, _actor: str | None, payload: dict[str, Any]) -> None:
+        kind, node_id, data = payload.get("type") or EventType.LOG, payload.get("node_id"), dict(payload.get("data") or {})
+        if run_manager.is_active(run_id):
+            await run_manager._emit(run_id, kind, node_id=node_id, data=data)
+            return
+        # 收到时运行已经停下了：停在审批上的接在库里最后一条后面记（同 process/events.record），别的不记
+        from app.engine.run_append import append_events
+
+        if await append_events(run_id, [(kind, node_id, data)], require="interrupted") is None:
+            logger.info("运行 %s 已经不在执行，别的进程要记的一条 %s 没有记", run_id, kind)
+
+
+_register_requests()

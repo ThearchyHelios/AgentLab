@@ -187,7 +187,7 @@ class Fake:
         return artifact
 
     def side(self):
-        def sources(started):
+        def sources(started, card_node=""):
             outputs = {}
             for seq, etype, nid, data in self.events:
                 if seq < started and etype == "node.finished" and data.get("artifact"):

@@ -390,7 +390,7 @@ async def list_conversations(
         # 开登录后的 user 角色：只列自己建的；建立人为空的老对话不列
         query = query.where(Conversation.created_by == mine)
     rows = list((await session.execute(
-        query.order_by(Conversation.last_active_at.desc())
+        query.order_by(Conversation.last_active_at.desc(), Conversation.id.desc())
     )).scalars())
     # 应用的助手对话只列能管理的应用的（一个应用一次判断）
     managed: dict[str, bool] = {}

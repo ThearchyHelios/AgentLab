@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from starlette.requests import HTTPConnection
 
 from app.api.coded import CodedHTTPException
@@ -253,6 +253,16 @@ async def introspect(session: Any, principal: Any) -> dict[str, Any]:
 
 #: 密钥 id → (还剩几个令牌, 上次补的时刻)
 _BUCKETS: dict[str, tuple[float, float]] = {}
+
+
+async def take_shared(key_id: str) -> int:
+    """同 take，多进程（PostgreSQL）时几个进程共用一个桶（记在库里，app/cluster/counters.py）：不然每个进程各有一个满桶，
+    实际的上限是进程数乘每分钟 RATE_PER_MINUTE 次。SQLite 只有一个进程，照旧用进程里的桶。"""
+    from app.cluster import counters
+
+    if counters.shared():
+        return await counters.take_token(f"key:{key_id}", per_minute=RATE_PER_MINUTE)
+    return take(key_id)
 
 
 def take(key_id: str, *, now: float | None = None) -> int:
@@ -535,12 +545,13 @@ async def started_before(principal: Any, idem_key: str) -> str | None:
     """拥有者按这个幂等键用密钥发起过的实例（来源里记着 idempotency_key）：处理到一半服务停了、同一个键重新认领时交回它。"""
     from app.db.base import SessionLocal
     from app.db.models import Run
+    from app.db.portable import json_eq
 
     async with SessionLocal() as session:
         return await session.scalar(select(Run.id).where(
             Run.origin_kind == "app_entry", Run.started_by == principal.username,
-            func.json_extract(Run.origin, "$.idempotency_key") == idem_key,
-            func.json_extract(Run.origin, "$.via") == "key").order_by(Run.created_at.desc()).limit(1))
+            json_eq(Run.origin, "idempotency_key", idem_key),
+            json_eq(Run.origin, "via", "key")).order_by(Run.created_at.desc(), Run.id.desc()).limit(1))
 
 
 # ---------------------------------------------------------------- 请求记录（A6）
@@ -649,7 +660,8 @@ async def recent_requests(session: Any, key_id: str, limit: int = 100) -> list[d
     except Exception:  # noqa: BLE001 - 写不进去只是少几条最新的，照常给库里有的
         logger.exception("访问密钥的请求记录写库失败")
     rows = (await session.execute(select(AccessKeyRequest).where(AccessKeyRequest.key_id == key_id)
-                                  .order_by(AccessKeyRequest.at.desc()).limit(max(1, min(limit, 200))))).scalars()
+                                  .order_by(AccessKeyRequest.at.desc(), AccessKeyRequest.id.desc())
+                                  .limit(max(1, min(limit, 200))))).scalars()
     return [{"at": r.at.isoformat() if r.at else None, "method": r.method, "route": r.route, "status": r.status,
              "run_id": r.run_id, "ip": r.ip} for r in rows]
 

@@ -127,10 +127,9 @@ async def _discover(session: AsyncSession) -> dict[str, dict[str, Any]]:
 
 async def sync_all(session: AsyncSession) -> int:
     """把内置工具、数据源、自定义工具、MCP 同步进 capabilities。返回变动的行数。启动时和各对象增删改时调。"""
-    from sqlalchemy.dialects.sqlite import insert
-
     from app.db.base import utcnow
     from app.db.models import Capability
+    from app.db.portable import insert_ignore
 
     found = await _discover(session)
     existing = {row.name: row for row in (await session.execute(select(Capability))).scalars()}
@@ -169,8 +168,10 @@ async def sync_all(session: AsyncSession) -> int:
             row.synced_at = now
             changed += 1
     if fresh:
-        # 两个请求同时同步（列表页和发起运行撞在一起）：后到的那条插入什么都不做，不报主键冲突。不加锁（单进程 + SQLite）
-        done = await session.execute(insert(Capability).values(fresh).on_conflict_do_nothing(index_elements=["name"]))
+        # 两个请求同时同步（列表页和发起运行撞在一起）：后到的那条插入什么都不做，不报主键冲突。不加锁：两种库都是同一条
+        # INSERT … ON CONFLICT DO NOTHING，多个进程同时同步也一样
+        done = await session.execute(
+            insert_ignore(session, Capability).values(fresh).on_conflict_do_nothing(index_elements=["name"]))
         changed += done.rowcount or 0
     if changed or fresh:
         await session.commit()
@@ -183,7 +184,7 @@ def _platform_defaults_apply(row: Any, name: str) -> bool:
     return name in GOVERNANCE_DEFAULTS and row.version == 1 and row.updated_by is None
 
 
-async def refresh_cache(session: AsyncSession) -> None:
+async def refresh_cache(session: AsyncSession, *, broadcast: bool = True) -> None:
     """重算登记的进程内快照。能作证的端点读取：绑定登记端点的 http 自定义工具，治理后效果为 read，声明了 tabular。
     Python 自定义工具（用户代码在算）和 MCP（没有结构化回执）不算，不管登记里写了什么。"""
     from app.capabilities.endpoints import bound_endpoint_ref
@@ -199,6 +200,11 @@ async def refresh_cache(session: AsyncSession) -> None:
     _endpoint_prod.clear()
     _endpoint_prod.update({e.id: bool((e.environments or {}).get("prod"))
                            for e in (await session.execute(select(Endpoint))).scalars()})
+    if broadcast:
+        # 多进程：别的进程的这份快照也要重算（app/cluster/caches.py）
+        from app.cluster import caches
+
+        await caches.broadcast("capabilities")
 
 
 def cached_view(name: str) -> dict[str, Any] | None:

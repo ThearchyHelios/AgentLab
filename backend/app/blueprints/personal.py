@@ -342,8 +342,11 @@ async def event(session: AsyncSession, blueprint: Any, op: str, principal: Any, 
 _LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def _lock(who: str | None) -> asyncio.Lock:
-    return _LOCKS.setdefault(who or "", asyncio.Lock())
+def _lock(who: str | None) -> Any:
+    """跨进程的锁（app/cluster/mutex）：查上限和发起在一起，多进程时同一个人连点两下也不会多跑一次。"""
+    from app.cluster import mutex
+
+    return mutex.lock(f"personal-refresh:{who or ''}")
 
 
 def _today_start() -> datetime:
@@ -416,9 +419,10 @@ async def refresh(session: AsyncSession, app: Any, *, principal: Any) -> tuple[A
 
 def _runs_of(app_id: str, graph_hash: str) -> Any:
     from app.db.models import Run
+    from app.db.portable import json_eq
 
     return select(Run).where(Run.app_id == app_id, Run.origin_kind == ORIGIN,
-                             func.json_extract(Run.origin, "$.graph_hash") == graph_hash)
+                             json_eq(Run.origin, "graph_hash", graph_hash))
 
 
 async def latest_refresh(session: AsyncSession, app_id: str, graph_hash: str, *, active_only: bool = False) -> Any:
@@ -428,7 +432,7 @@ async def latest_refresh(session: AsyncSession, app_id: str, graph_hash: str, *,
     query = _runs_of(app_id, graph_hash)
     if active_only:
         query = query.where(Run.status.in_(("queued", "running", "interrupted")))
-    return (await session.execute(query.order_by(Run.created_at.desc()).limit(1))).scalars().first()
+    return (await session.execute(query.order_by(Run.created_at.desc(), Run.id.desc()).limit(1))).scalars().first()
 
 
 async def exploratory_runs(session: AsyncSession, app_id: str, graph_hash: str | None, n: int,
@@ -444,7 +448,7 @@ async def exploratory_runs(session: AsyncSession, app_id: str, graph_hash: str |
     query = _runs_of(app_id, graph_hash).where(Run.status == "succeeded")
     if owner:
         query = query.where(Run.started_by == owner)
-    rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc())
+    rows = list((await session.execute(query.order_by(Run.finished_at.desc(), Run.created_at.desc(), Run.id.desc())
                                        .limit(max(n, 1) * 3 + 5))).scalars())
     out = []
     for run in rows:
@@ -467,7 +471,7 @@ async def review_task(session: AsyncSession, blueprint_id: str, *, pending: bool
     query = select(Task).where(Task.kind == REVIEW, Task.correlation_key == f"{REVIEW_KEY}{blueprint_id}")
     if pending:
         query = query.where(Task.status == "pending")
-    return (await session.execute(query.order_by(Task.created_at.desc()).limit(1))).scalars().first()
+    return (await session.execute(query.order_by(Task.created_at.desc(), Task.id.desc()).limit(1))).scalars().first()
 
 
 async def _review_targets(session: AsyncSession, to: Any) -> list[tuple[str, str]]:
@@ -567,7 +571,7 @@ async def _copy_by(session: AsyncSession, blueprint_id: str, who: str | None) ->
 
     query = select(Blueprint).where(Blueprint.copied_from == blueprint_id)
     query = query.where(Blueprint.owner == who) if who else query.where(Blueprint.owner.is_(None))
-    return (await session.execute(query.order_by(Blueprint.created_at.desc()).limit(1))).scalars().first()
+    return (await session.execute(query.order_by(Blueprint.created_at.desc(), Blueprint.id.desc()).limit(1))).scalars().first()
 
 
 async def review_published(session: AsyncSession, blueprint: Any, *, app_id: str, principal: Any) -> str | None:
@@ -607,7 +611,7 @@ async def settle_review(session: AsyncSession, original: Any) -> str | None:
         return None
     published = (await session.execute(select(Blueprint).where(
         Blueprint.copied_from == original.id, Blueprint.status == "published", Blueprint.app_id.is_not(None))
-        .order_by(Blueprint.updated_at.desc()).limit(1))).scalars().first()
+        .order_by(Blueprint.updated_at.desc(), Blueprint.id.desc()).limit(1))).scalars().first()
     if published is None or await review_task(session, original.id) is None:
         return None
     publisher = SimpleNamespace(username=published.owner, verified=False, groups=(), mode="local",
@@ -666,7 +670,7 @@ async def review_payload(session: AsyncSession, task: Any) -> dict[str, Any]:
         .order_by(BlueprintEvent.seq.desc()).limit(1))).scalars().first()
     copies = (await session.execute(select(Blueprint.id, Blueprint.owner, Blueprint.status, Blueprint.app_id)
                                     .where(Blueprint.copied_from == blueprint.id)
-                                    .order_by(Blueprint.created_at))).all()
+                                    .order_by(Blueprint.created_at, Blueprint.id))).all()
     return {"kind": REVIEW, "blueprint_id": blueprint.id, "app_id": task.app_id, "name": blueprint.name,
             "purpose": _purpose(blueprint), "template_id": blueprint.template_id,
             "submitted_by": submitted.actor if submitted is not None else blueprint.owner,

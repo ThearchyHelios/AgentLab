@@ -21,6 +21,7 @@ import { signerNow } from '../../store/auth'
 import { explainRunError, explainStartError } from '../../lib/explain'
 import { canLeave, leavePass } from '../../lib/leave'
 import { SIGNER_TEXT, UNSAVED_HINT, isUnsaved, runName } from '../../lib/terms'
+import { rejectRouteOf } from '../../lib/termsApp'
 import {
   asView, duplicateNames, graphShape, idTail, isLiveRun, runScope, type DetailView,
 } from './model'
@@ -347,7 +348,11 @@ export function RunDetailView({ runId, onChange, onDeleted }: {
       setFeedback({
         kind: 'decided', approved, node: a.node_label ?? labelOf(a.node_id) ?? a.node_id,
         by: done?.resolved_by, at: done?.resolved_at ?? new Date().toISOString(),
-        terminates: approved === false && a.mode !== 'approve',
+        // 驳回之后去哪按中断内容的 reject_route（接了驳回出口的不终止，没接的工具 / 代码审批会终止）；老审批没带的照旧按模式猜
+        terminates: approved === false && (() => {
+          const route = rejectRouteOf(a.payload as Record<string, unknown> | undefined)
+          return route ? 'ends' in route && route.ends === 'run' : a.mode !== 'approve'
+        })(),
       })
       // 批完要能看着它往下跑：接上实时流，时间线继续长
       d.follow(next)

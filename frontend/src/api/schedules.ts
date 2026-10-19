@@ -36,8 +36,12 @@ export const schedules = {
    */
   eventVariables: (event: ScheduleEventKind, opts?: RequestOptions) =>
     get<ScheduleVariable[]>(`/schedules/variables${qs({ trigger_kind: 'event', event })}`, opts),
-  /** 新建、修改事件触发任务时能选的对象（能不能选、为什么由服务端判）、来源、应用。老服务端没有，回 404 */
-  triggerOptions: (opts?: RequestOptions) => get<ScheduleTriggerOptions>('/schedules/trigger-options', opts),
+  /**
+   * 新建、修改事件触发任务时能选的对象（能不能选、为什么由服务端判）、来源、应用。老服务端没有，回 404。对象一页有上限
+   * （more 为真时没给完）：按事件种类、名字里的关键字再查；selected 是当前选中的那一个，总在结果里
+   */
+  triggerOptions: (find?: { event?: ScheduleEventKind; q?: string; selected?: string }, opts?: RequestOptions) =>
+    get<ScheduleTriggerOptions>(`/schedules/trigger-options${qs(find)}`, opts),
   /** 立即运行一次：记一条手动触发，上一次还没结束时照样按重叠策略跳过 */
   run: (id: string) => post<ScheduleRunResult>(`${at(id)}/run`),
   /** 触发历史，新的在前。before 是上一页给的 next_before */

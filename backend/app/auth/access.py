@@ -62,6 +62,7 @@ def hidden_runs(principal: Any) -> Any:
     from app.db.models import Run
     from app.db.models_apps import App
     from app.db.models_blueprints import Blueprint
+    from app.db.portable import json_text
 
     if principal.mode == "off":
         return false()
@@ -72,7 +73,7 @@ def hidden_runs(principal: Any) -> Any:
     kind = func.coalesce(Run.origin_kind, "")
     return or_(
         and_(kind == "personal_app", or_(Run.app_id.is_(None), Run.app_id.not_in(mine))),
-        and_(kind == "trial", func.coalesce(func.json_extract(Run.origin, "$.blueprint_id"), "").in_(others)),
+        and_(kind == "trial", func.coalesce(json_text(Run.origin, "blueprint_id"), "").in_(others)),
     )
 
 

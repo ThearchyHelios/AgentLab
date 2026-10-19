@@ -152,8 +152,14 @@ async def _verified_reuse(session: AsyncSession, op: dict[str, Any]) -> dict[str
 
 
 async def _next_seq(session: AsyncSession, blueprint_id: str) -> int:
-    from app.db.models_blueprints import BlueprintEvent
+    """这个蓝图下一条留痕的序号。先占住蓝图那一行（PostgreSQL 上是行锁，SQLite 上拿到写锁）再取最大值往下接：多进程时同一个
+    蓝图同时两处记留痕（卡片上改、助手提的），一个接一个，不撞 (blueprint_id, seq) 的唯一约束。updated_at 不动。"""
+    from sqlalchemy import update
 
+    from app.db.models_blueprints import Blueprint, BlueprintEvent
+
+    await session.execute(update(Blueprint).where(Blueprint.id == blueprint_id)
+                          .values(updated_at=Blueprint.updated_at).execution_options(synchronize_session=False))
     return int((await session.execute(select(func.coalesce(func.max(BlueprintEvent.seq), 0))
                                       .where(BlueprintEvent.blueprint_id == blueprint_id))).scalar_one()) + 1
 

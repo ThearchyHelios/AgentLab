@@ -8,7 +8,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.db.base import Base, TimestampMixin, UTCDateTime, new_id, utcnow
+from app.db.base import Base, current_owner, TimestampMixin, UTCDateTime, new_id, utcnow
 
 # --------------------------------------------------------------------------
 # 设置：模型供应商 / 用户偏好 / MCP / 自定义工具
@@ -362,13 +362,16 @@ class CatalogDraftJob(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_catalog_draft_jobs_source_created", "source_id", "created_at"),
         Index("ux_catalog_draft_jobs_active", "source_id", unique=True,
-              sqlite_where=text("status IN ('queued', 'running')")),
+              sqlite_where=text("status IN ('queued', 'running')"),
+              postgresql_where=text("status IN ('queued', 'running')")),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"))
     # queued | running | succeeded | partial | failed | cancelled | interrupted
     status: Mapped[str] = mapped_column(String(20), default="queued")
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     use_model: Mapped[bool] = mapped_column(default=False)
     # 实际用的模型 id（用模型时开始起草后写上）
     model: Mapped[str | None] = mapped_column(String(200), default=None)
@@ -450,13 +453,16 @@ class CatalogProfileJob(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_catalog_profile_jobs_source_created", "source_id", "created_at"),
         Index("ux_catalog_profile_jobs_active", "source_id", unique=True,
-              sqlite_where=text("status IN ('queued', 'running')")),
+              sqlite_where=text("status IN ('queued', 'running')"),
+              postgresql_where=text("status IN ('queued', 'running')")),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"))
     # queued | running | succeeded | partial | failed | cancelled | interrupted
     status: Mapped[str] = mapped_column(String(20), default="queued")
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     # selected 指定的表 | needed 需要剖析的表 | all 全部表
     scope: Mapped[str] = mapped_column(String(20), default="selected")
     # 建任务时的剖析设置快照（catalog_profile.ProfileSettings.to_dict）
@@ -655,6 +661,8 @@ class Run(Base, TimestampMixin):
     thread_id: Mapped[str] = mapped_column(String(64), index=True, default=new_id)
     # queued | running | interrupted | succeeded | failed | cancelled
     status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     graph: Mapped[dict[str, Any]] = mapped_column(default=dict)  # 执行时的图快照
     input: Mapped[dict[str, Any]] = mapped_column(default=dict)
     output: Mapped[dict[str, Any]] = mapped_column(default=dict)
@@ -713,7 +721,9 @@ class RunEvent(Base):
     """完整事件流落库 —— 这既是 trace，也是页面刷新后重建时间线的依据。"""
 
     __tablename__ = "run_events"
-    __table_args__ = (Index("ix_run_events_run_seq", "run_id", "seq"),)
+    # (run_id, seq) 唯一（编排完善第 2 波 W2-b）：撞号时报错，不悄悄写两条——封存按 seq 排序算哈希，撞了号核对时对时不对。
+    # 存量库由 db/base._migrate 补建（先查有没有重复，有就照实记日志、不建）
+    __table_args__ = (Index("ux_run_events_run_seq", "run_id", "seq", unique=True),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
@@ -809,6 +819,8 @@ class Document(Base, TimestampMixin):
     # 压在 HTTP 请求里必然超时——而后端其实还在跑，界面显示失败、数据其实成功，
     # 比直接拒绝还糟。ready | processing | failed
     status: Mapped[str] = mapped_column(String(20), default="ready")
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     error: Mapped[str] = mapped_column(Text, default="")
 
     chunks: Mapped[list["Chunk"]] = relationship(
@@ -904,7 +916,8 @@ class Conversation(Base, TimestampMixin):
     # 一个人在一个应用里只有一段（未归档的）助手对话（D-e）。存量库由 db/base.py 的 _UNIQUE_INDEX_MIGRATIONS 补建。
     # created_by 为空（关登录又没填署名）的不受约束：SQLite 的唯一索引里 NULL 互不相等，那种情况靠接口里的进程内锁
     __table_args__ = (Index("ux_conversations_app_owner", "app_id", "created_by", unique=True,
-                            sqlite_where=text("kind = 'app' AND archived = 0")),)
+                            sqlite_where=text("kind = 'app' AND archived = 0"),
+                            postgresql_where=text("kind = 'app' AND archived = false")),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     title: Mapped[str] = mapped_column(String(200), default="")
@@ -1096,3 +1109,6 @@ from app.db.models_blueprints import (  # noqa: E402,F401
 from app.db import models_chat, models_eval, models_sources  # noqa: E402,F401
 # 编排完善第 1 波（docs/design/orchestration-round/00-总方案.md §4）：数据事件触发的待派发事件和去抖等待
 from app.db import models_triggers  # noqa: E402,F401
+# 编排完善第 2 波 W2-b（docs/design/orchestration-round/00-总方案.md §5）：多进程协调——工作进程的登记和租约、调度当班、
+# 跨进程的请求、运行的并发名额、同源队、按时间窗的计数
+from app.db import models_cluster  # noqa: E402,F401

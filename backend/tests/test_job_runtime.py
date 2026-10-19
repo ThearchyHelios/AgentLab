@@ -32,7 +32,7 @@ def test_an_unregistered_kind_is_refused():
 
     async def go() -> None:
         with pytest.raises(ValueError, match="没有登记"):
-            lanes.enter("src", "nonsense-kind")
+            await lanes.enter("src", "nonsense-kind")
 
     asyncio.run(go())
 
@@ -52,16 +52,16 @@ def test_a_new_kind_queues_behind_the_existing_ones_on_the_same_source():
     lanes = job_runtime.SourceLanes()
 
     async def go() -> None:
-        first = lanes.enter("src-a", "draft", "job-1")
-        second = lanes.enter("src-a", "test-introspect", "job-2")
-        other = lanes.enter("src-b", "test-introspect", "job-3")
+        first = await lanes.enter("src-a", "draft", "job-1")
+        second = await lanes.enter("src-a", "test-introspect", "job-2")
+        other = await lanes.enter("src-b", "test-introspect", "job-3")
         assert first.granted.is_set() and not second.granted.is_set()
         assert other.granted.is_set(), "不同源并行"
-        assert lanes.ahead("src-a", "job-2") == ["draft"]
-        first.release()
+        assert await lanes.ahead("src-a", "job-2") == ["draft"]
+        await first.release()
         await asyncio.wait_for(second.wait(), timeout=1)
-        second.release()
-        other.release()
+        await second.release()
+        await other.release()
 
     asyncio.run(go())
 

@@ -467,12 +467,12 @@ async def _fire_outs(session: AsyncSession, fires: list[ScheduleFire]) -> list[d
     if fires:
         rows = (await session.execute(
             select(WebhookDelivery).where(WebhookDelivery.fire_id.in_([f.id for f in fires]))
-            .order_by(WebhookDelivery.created_at)
+            .order_by(WebhookDelivery.created_at, WebhookDelivery.id)
         )).scalars()
         for d in rows:
             notified.setdefault(d.fire_id, []).append({"event": d.event, "status": d.status, "at": _iso(d.created_at)})
     # 正在发起的触发：库里是占位的「未能发起」（为了进程被强杀时照实说），进程还在、只是还没发起完，按已发起给
-    launching = {f.id for f in fires if service.launching(f.id)}
+    launching = {f.id for f in fires if service.launching(f.id, f)}
     return [{
         "id": f.id,
         "fire_at": _iso(f.fire_at),
@@ -516,9 +516,9 @@ async def _schedule_outs(session: AsyncSession, rows: list[Schedule]) -> list[di
         from app import scheduler
 
         on = scheduler.scheduler_enabled()
-        for r in rows:
-            if _event_kind(r):
-                states[r.id] = {**await outbox.pending_for(session, r), "scheduler_on": on}
+        # 一次查齐（outbox.pending_for_many），不再每行各查一次
+        waiting = await outbox.pending_for_many(session, [r for r in rows if _event_kind(r)])
+        states = {sid: {**state, "scheduler_on": on} for sid, state in waiting.items()}
 
     def target(r: Schedule) -> dict[str, Any]:
         kind, target_id = service.target_of(r)
@@ -592,36 +592,73 @@ async def list_variables(tz: str | None = Query(default=None, alias="timezone"),
     return service.variables(tz=zone, event=event)
 
 
+#: 选对象时一页最多给几个（按名字排；更多的按关键字查）
+TRIGGER_OPTIONS_LIMIT = 100
+
+
 @router.get("/trigger-options")
-async def trigger_options(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+async def trigger_options(event: str | None = None, q: str | None = None, selected: str | None = None,
+                          limit: int = Query(default=TRIGGER_OPTIONS_LIMIT, ge=1, le=500),
+                          session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """新建、修改事件触发任务时能选的：每种事件的对象（能不能选、为什么不能，由这里判，界面不自己判）、「只认某种来源」的
     来源、「只认某个应用」的应用、去抖的缺省值、触发链的上限。
 
-    {events: [{event, label, subject_label, objects: [{id, name, ok, reason}]}], origins: [{kind, label}],
+    对象按名字排、一页最多 limit 个，more 说后面还有没有：数据源、工作流成百上千时不一次全给，界面按关键字（q，名字里含它）
+    再查。event 给了只查这一种事件的对象；selected 是当前选中的那一个（修改时），总在里面，不被分页挤掉、不显示成「已不存在」。
+
+    {events: [{event, label, subject_label, objects: [{id, name, ok, reason}], more}], origins: [{kind, label}],
      apps: [{id, name}], default_debounce_s, max_debounce_s, max_depth}"""
     from app.db.models import App, DataSource
 
-    sources = list((await session.execute(select(DataSource).order_by(DataSource.name))).scalars())
-    flows = list((await session.execute(select(Workflow).where(Workflow.is_template.is_(False))
-                                        .order_by(Workflow.name))).scalars())
-    tables = []
-    for src in sources:
-        if (src.origin or "manual") != "upload":
-            continue
-        ok = await triggers.accumulating(session, src)
-        tables.append({"id": src.id, "name": src.name, "ok": ok,
-                       "reason": None if ok else "每次上传替换整张表，没有「新的一期」：要用这个事件请在导入设置里改为按期累积"})
-    objects = {
-        "table.version": tables,
-        "workflow.finished": [{"id": w.id, "name": w.name, "ok": bool(w.published_version),
-                               "reason": None if w.published_version else "还没有发布版本：只有正式运行成功结束才算事件"}
-                              for w in flows],
-        "source.changed": [{"id": src.id, "name": src.name, "ok": True, "reason": None} for src in sources],
-    }
-    apps = (await session.execute(select(App.id, App.name).where(App.status != "archived").order_by(App.name))).all()
+    if event is not None and event not in triggers.EVENTS:
+        raise _invalid(f"不认识的事件种类：{event}", "event")
+    wanted = [event] if event else list(triggers.EVENTS)
+    words = (q or "").strip()
+
+    async def page(model: Any, *conds: Any) -> tuple[list[Any], bool]:
+        query = select(model).where(*conds)
+        if words:
+            # 名字里含这几个字，不分大小写：两种库同一个说法（db/portable.contains_ci，PostgreSQL 上按库的区域设置折大小写）
+            from app.db.portable import contains_ci
+
+            query = query.where(contains_ci(model.name, words))
+        rows = list((await session.execute(query.order_by(model.name, model.id).limit(limit + 1))).scalars())
+        more = len(rows) > limit
+        rows = rows[:limit]
+        if selected and all(r.id != selected for r in rows):
+            if (picked := (await session.execute(select(model).where(model.id == selected, *conds))).scalar_one_or_none()):
+                rows.append(picked)
+        return rows, more
+
+    async def tables() -> tuple[list[dict[str, Any]], bool]:
+        # 只有上传表格有「新的一期」：按来源筛在库里做（老行没写来源的是手工接的源）
+        rows, more = await page(DataSource, DataSource.origin == "upload")
+        out = []
+        for src in rows:
+            ok = await triggers.accumulating(session, src)
+            out.append({"id": src.id, "name": src.name, "ok": ok,
+                        "reason": None if ok else "每次上传替换整张表，没有「新的一期」：要用这个事件请在导入设置里改为按期累积"})
+        return out, more
+
+    async def flows() -> tuple[list[dict[str, Any]], bool]:
+        rows, more = await page(Workflow, Workflow.is_template.is_(False))
+        return [{"id": w.id, "name": w.name, "ok": bool(w.published_version),
+                 "reason": None if w.published_version else "还没有发布版本：只有正式运行成功结束才算事件"}
+                for w in rows], more
+
+    async def sources() -> tuple[list[dict[str, Any]], bool]:
+        rows, more = await page(DataSource)
+        return [{"id": src.id, "name": src.name, "ok": True, "reason": None} for src in rows], more
+
+    makers = {"table.version": tables, "workflow.finished": flows, "source.changed": sources}
+    entries = []
+    for e in wanted:
+        objects, more = await makers[e]()
+        entries.append({"event": e, "label": triggers.EVENT_LABEL[e], "subject_label": triggers.SUBJECT_LABEL[e],
+                        "objects": objects, "more": more})
+    apps = (await session.execute(select(App.id, App.name).where(App.status != "archived").order_by(App.name, App.id))).all()
     return {
-        "events": [{"event": e, "label": triggers.EVENT_LABEL[e], "subject_label": triggers.SUBJECT_LABEL[e],
-                    "objects": objects[e]} for e in triggers.EVENTS],
+        "events": entries,
         "origins": [{"kind": k, "label": triggers.ORIGIN_LABEL[k]} for k in triggers.FORMAL_ORIGINS],
         "apps": [{"id": i, "name": n} for i, n in apps],
         "default_debounce_s": triggers.DEFAULT_DEBOUNCE_S, "max_debounce_s": triggers.MAX_DEBOUNCE_S,
@@ -700,7 +737,7 @@ async def _preview_event(session: AsyncSession, body: dict[str, Any]) -> dict[st
 
 @router.get("")
 async def list_schedules(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    rows = list((await session.execute(select(Schedule).order_by(Schedule.created_at.desc()))).scalars())
+    rows = list((await session.execute(select(Schedule).order_by(Schedule.created_at.desc(), Schedule.id.desc()))).scalars())
     return {"items": await _schedule_outs(session, rows)}
 
 

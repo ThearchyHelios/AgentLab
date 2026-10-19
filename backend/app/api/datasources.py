@@ -280,7 +280,7 @@ async def _recipe_infos(session: AsyncSession, rows: list[DataSource]) -> dict[s
         for st in (await session.execute(
             select(ImportStaging).where(
                 ImportStaging.source_id.in_(ids), ImportStaging.status.in_(table_versions.STAGING_OPEN),
-            ).order_by(ImportStaging.created_at)
+            ).order_by(ImportStaging.created_at, ImportStaging.id)
         )).scalars():
             # 按创建时间升序，后面的覆盖前面的：留下最近的那一个
             out.setdefault(st.source_id, {})["open_staging"] = {

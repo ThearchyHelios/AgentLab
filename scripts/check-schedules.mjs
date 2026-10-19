@@ -2349,6 +2349,41 @@ await section('事件触发：新建的请求体', async () => {
   check('没有页面报错、原生对话框', !errors.length, errors.join(' ｜ '))
 })
 
+await section('事件触发：对象太多时按名称查找', async () => {
+  // 服务端一页没给完（more）：选择框上面多一个查找框，输入后按事件种类、关键字再查，结果只换这一种事件的对象
+  const many = { ...TRIGGER_OPTIONS, events: TRIGGER_OPTIONS.events.map((e) => (e.event === 'workflow.finished'
+    ? { ...e, more: true } : e)) }
+  const queries = []
+  const override = (method, path, _body, url) => {
+    if (method !== 'GET' || path !== '/schedules/trigger-options') return null
+    const q = url.searchParams.get('q')
+    if (!q) return { json: many }
+    queries.push({ event: url.searchParams.get('event'), q })
+    return { json: { ...many, events: [{ event: 'workflow.finished', label: '上游工作流运行成功结束', subject_label: '工作流',
+      more: false, objects: [{ id: 'wf-far', name: `${q}周报（第 301 个）`, ok: true, reason: null }] }] } }
+  }
+  const { page, errors } = await open('/schedules/new', { state: { ...freshState(), override } })
+  await page.locator('[data-schedule-form]').waitFor()
+  await page.locator('[data-trigger-mode="event"]').click()
+  await page.locator('[data-trigger-event="workflow.finished"]').click()
+  const search = page.locator('[data-trigger-subject-search]')
+  await search.waitFor()
+  check('一页没列完：选择框上面有按名称查找', await search.isVisible())
+  check('上传表格一页列完了：没有查找框', await (async () => {
+    await page.locator('[data-trigger-event="table.version"]').click()
+    const none = await page.locator('[data-trigger-subject-search]').count() === 0
+    await page.locator('[data-trigger-event="workflow.finished"]').click()
+    return none
+  })())
+  await page.locator('[data-trigger-subject-search]').fill('华东')
+  const far = page.locator('[data-trigger-subject="workflow.finished"] option[value="wf-far"]')
+  await far.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {})
+  check('按关键字查到的对象换进选择框', await far.count() === 1, String(await far.count()))
+  check('查的是这一种事件、带着关键字', queries.some((x) => x.event === 'workflow.finished' && x.q === '华东'),
+    JSON.stringify(queries))
+  check('没有未捕获的运行时错误', errors.length === 0, errors[0] ?? '')
+})
+
 await section('事件触发：上游工作流的请求体（途经驳回、应用补算）', async () => {
   const { page, sent, errors } = await open('/schedules/new')
   await page.locator('[data-schedule-form]').waitFor()

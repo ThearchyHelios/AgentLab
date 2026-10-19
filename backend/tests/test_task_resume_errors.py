@@ -84,3 +84,32 @@ async def test_any_resume_error_puts_the_task_back(monkeypatch):
     out = await tasks.respond(task.id, ANN, decision="approve")
     assert out["resolved"] is True
     assert (await _wait(run.id, ("succeeded", "failed"))).status == "succeeded"
+
+
+async def test_the_periodic_takeover_leaves_a_task_that_is_being_resolved_alone(monkeypatch):
+    """复核 R-b2：当班进程隔一会儿的那一次接手（live.trust_mine）撞上一次正在判定、恢复的待办（停在 resolving 的那几秒），
+    单进程时也不能把它退回 pending、撤回那一票——只收拾停了两个租约时长以上的。启动时、又没有别的进程的那一次照旧全收拾。"""
+    from app.cluster.workers import Liveness
+
+    run = await run_manager.start(graph=FLOW, input_payload={"q": "x"})
+    await _wait(run.id, ("interrupted",))
+    task = await _pending(run.id)
+    real = run_manager.resume
+    reaped = asyncio.Event()
+
+    async def slow(*a, **k):
+        await asyncio.sleep(0.3)
+        await tasks.startup(live=Liveness().trusting())   # 判定到一半，当班进程来了一次
+        reaped.set()
+        return await real(*a, **k)
+
+    monkeypatch.setattr(run_manager, "resume", slow)
+    out = await tasks.respond(task.id, ANN, decision="approve")
+    assert reaped.is_set() and out["resolved"] is True
+    assert (await _wait(run.id, ("succeeded", "failed"))).status == "succeeded"
+    async with SessionLocal() as session:
+        row = await session.get(Task, task.id)
+        mine = (await session.execute(select(TaskAssignment).where(TaskAssignment.task_id == task.id))).scalars().all()
+    assert row.status == "resolved", row.status
+    assert mine and all(a.responded_by == "ann" and a.status not in ("pending", "withdrawn") for a in mine), \
+        [(a.status, a.responded_by) for a in mine]

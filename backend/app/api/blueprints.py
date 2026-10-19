@@ -264,13 +264,14 @@ async def list_blueprints(scope: Literal["shared", "personal"] | None = None,
             # 候选只有自己的、发布成了应用的（要不要列看应用的管理权，shared_listed 逐个应用核对）
             query = query.where(or_(Blueprint.owner == (principal.username or ""), Blueprint.app_id.is_not(None)))
         else:
-            query = query.order_by(Blueprint.updated_at.desc()).limit(_LIST_MAX)
+            query = query.order_by(Blueprint.updated_at.desc(), Blueprint.id.desc()).limit(_LIST_MAX)
         rows += await shared_listed(session, principal, list((await session.execute(query)).scalars()))
     if scope in (None, "personal") and await allowed(session, principal):
         mine = Blueprint.scope == "personal"
         if principal.mode != "off":
             mine = mine & (Blueprint.owner == (principal.username or ""))
-        rows += list((await session.execute(select(Blueprint).where(mine).order_by(Blueprint.updated_at.desc())
+        rows += list((await session.execute(select(Blueprint).where(mine)
+                                            .order_by(Blueprint.updated_at.desc(), Blueprint.id.desc())
                                             .limit(_LIST_MAX))).scalars())
     rows.sort(key=lambda bp: bp.updated_at or bp.created_at, reverse=True)
     return {"items": [await blueprint_out(session, bp) for bp in rows[:_LIST_MAX]]}

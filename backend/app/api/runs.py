@@ -213,7 +213,7 @@ async def list_runs(
     """
     stmt = _filtered(select(Run), workflow_id=workflow_id, status=status, run_class=run_class, q=q,
                      schedule_id=schedule_id, origin_kind=origin_kind)
-    stmt = stmt.order_by(Run.created_at.desc()).limit(limit)
+    stmt = stmt.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit)
     if before is not None:
         stmt = stmt.where(Run.created_at < before)
     return list((await session.execute(stmt)).scalars())
@@ -265,7 +265,10 @@ def _filtered(stmt: Any, *, workflow_id: str | None, status: str | None, run_cla
     if classes := _csv(run_class):
         stmt = stmt.where(Run.run_class.in_(classes))
     if q and q.strip():
-        stmt = stmt.where(Run.workflow_name.ilike(f"%{_like(q.strip())}%", escape="\\"))
+        # 不分大小写（db/portable.contains_ci）：PostgreSQL 的文本列按字节排序（COLLATE "C"），列上的 ILIKE 只认 ASCII 的大小写
+        from app.db.portable import contains_ci
+
+        stmt = stmt.where(contains_ci(Run.workflow_name, q.strip()))
     if schedule_id:
         stmt = stmt.where(Run.schedule_id == schedule_id)
     if origins := _csv(origin_kind):
@@ -279,11 +282,6 @@ def _filtered(stmt: Any, *, workflow_id: str | None, status: str | None, run_cla
 
 def _csv(value: str | None) -> list[str]:
     return [v.strip() for v in (value or "").split(",") if v.strip()]
-
-
-def _like(text: str) -> str:
-    """用户输入里的 % 和 _ 按字面匹配，不当通配符。"""
-    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @router.get("/{run_id}", response_model=RunOut)
@@ -343,7 +341,7 @@ async def list_artifacts(
 ) -> list[dict[str, Any]]:
     """这次运行产出的全部工件引用。审阅出具物时从这里下钻到完整证据。"""
     rows = await session.execute(
-        select(Artifact).where(Artifact.run_id == run_id).order_by(Artifact.created_at)
+        select(Artifact).where(Artifact.run_id == run_id).order_by(Artifact.created_at, Artifact.id)
     )
     return [
         {
@@ -637,18 +635,22 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
             await _end(websocket, run.status if run else None)
             return
 
-        # 占位期间攒下的那几条历史里也有，按 seq 滤掉，否则前端同一步收两遍
-        pump = asyncio.create_task(_pump(websocket, subscription.stream(after=last_seq), run_id))
-        try:
-            # 客户端断开时读操作会抛异常，用它来结束这条连接
-            while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            pass
-        finally:
-            pump.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pump
+        # 占位期间攒下的那几条历史里也有，按 seq 滤掉，否则前端同一步收两遍。多进程时这次运行可能在别的进程里执行：
+        # 跟随它（app/cluster/relay.py），本进程从库里按 seq 追、在本进程的总线上发布，这里收到的和在执行的进程上一样
+        from app.cluster.relay import relay
+
+        with relay.follow_run(run_id, last_seq):
+            pump = asyncio.create_task(_pump(websocket, subscription.stream(after=last_seq), run_id))
+            try:
+                # 客户端断开时读操作会抛异常，用它来结束这条连接
+                while True:
+                    await websocket.receive_text()
+            except WebSocketDisconnect:
+                pass
+            finally:
+                pump.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pump
     except WebSocketDisconnect:
         return
     except Exception:  # noqa: BLE001
@@ -753,7 +755,7 @@ async def list_approvals(
         .join(Task, Task.approval_id == Approval.id, isouter=True)
         # 别人的个人应用刷新、个人蓝图试运行上的审批不列（只给拥有者，同运行列表）
         .where(or_(Run.id.is_(None), not_(hidden_runs(current_principal()))))
-        .order_by(Approval.created_at.desc())
+        .order_by(Approval.created_at.desc(), Approval.id.desc())
         .limit(limit)
     )
     if status != "all" and (statuses := _csv(status)):

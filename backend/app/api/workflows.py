@@ -131,7 +131,7 @@ async def _workflow_out(session: AsyncSession, workflow: Workflow) -> WorkflowOu
 @router.get("", response_model=list[WorkflowOut])
 async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[WorkflowOut]:
     rows = list(
-        (await session.execute(select(Workflow).order_by(Workflow.updated_at.desc()))).scalars()
+        (await session.execute(select(Workflow).order_by(Workflow.updated_at.desc(), Workflow.id.desc()))).scalars()
     )
     counts = await _run_counts(session)
     levels = await _published_levels(session)

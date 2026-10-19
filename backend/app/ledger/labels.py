@@ -47,6 +47,9 @@ METRIC_GONE = "指标集里没有这个指标，没有比对"
 UNFINISHED = "比对没有做完"
 #: related 的几种说明
 FORMULA_DIFFERS = "取数和口径等价，但指标的算法和口径卡上的不同"
+#: 指标按「同一行」认来自口径，可那一行重跑时不一定还是它：多行结果、查询又没有 ORDER BY（sql_semantics.row_stable）
+ROW_ORDER_UNSTABLE = ("指标取的是多行结果里按行号的一格，查询没有 ORDER BY，行序不定：重新执行时这一行可能是另一行，"
+                      "不能认定对应口径的同一格")
 INPUTS_ELSEWHERE = "指标有的输入不来自查询（运行输入、整形或代码），不能算来自口径"
 MIXED_CALIBERS = "指标的几个输入分别对上了不同的口径"
 BINDING_CONFLICT = "指标的几个输入对上了同一份口径，但参数不一致"
@@ -141,6 +144,15 @@ def cell_label(artifact: str, column: Any, queries: Mapping[str, Mapping[str, An
     if status == "none":
         return {"kind": "reasoning", "query": artifact}
     return {**_unknown(str(query.get("reason") or UNFINISHED)), "query": artifact}
+
+
+def _row_stable(query: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
+    """这个输入取的那一行重跑时还认得住（match 记的 ordered / one_row，sql_semantics.row_stable 的认法）：最外层带 ORDER BY，
+    或者一定只出一行、取的是第 0 行。老的比对记录没记 ordered 的照旧（当时不判）。"""
+    if "ordered" not in query:
+        return True
+    where = item.get("locator") if isinstance(item.get("locator"), dict) else {}
+    return bool(query.get("ordered")) or (where.get("row") in (0, None) and bool(query.get("one_row")))
 
 
 def _leaf_token(node_id: Any, row: Any, column: Any) -> str:
@@ -307,6 +319,10 @@ def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mappin
             return {"kind": "related", "related": nearby, "reason": MIXED_CALIBERS, **queried}
         related = next((q for q in queries_found if q.get("status") == "related"), None)
         return {**_related(related), **queried} if related is not None else {"kind": "reasoning", **queried}
+    if unstable := [i for i, q in zip(from_queries, queries_found) if not _row_stable(q, i)]:
+        # 按「同一行」认来自口径（_leaf_token 记的是行号）：多行结果又没有 ORDER BY 的，重跑时第几行不一定是哪一行，
+        # 照实标相关、写明行序不定，不认成来自口径
+        return {"kind": "related", "related": nearby, "reason": ROW_ORDER_UNSTABLE, **queried}
     reason = FORMULA_DIFFERS
     for key in sorted(common):
         chosen = [next(c for c in _proven(q) if c.get("caliber") == key) for q in queries_found]

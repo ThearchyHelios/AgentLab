@@ -79,9 +79,11 @@ async def append_action(args: dict[str, Any], *, idem_key: str | None, run_id: s
                        environment=environment)
     try:
         columns = columns_of(table)
-        done = await asyncio.to_thread(
-            store.append, path_of(table), columns, values, version=table.version, run_id=run_id,
-            actor=actor, action_key=action_key_of(idem_key), supersedes=supersedes)
+        # 多进程时几个进程会往同一个记录表文件里追加：库里的锁（store.write_lock）一个接一个，进程里的 _WRITE_LOCK 照旧
+        async with store.write_lock():
+            done = await asyncio.to_thread(
+                store.append, path_of(table), columns, values, version=table.version, run_id=run_id,
+                actor=actor, action_key=action_key_of(idem_key), supersedes=supersedes)
     except store.RecordsRefused as e:
         return _result(None, error=e.message, environment=environment)
     if not done.duplicate:

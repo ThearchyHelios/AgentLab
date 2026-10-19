@@ -263,7 +263,9 @@ async def test_the_reconcile_view_gives_the_panel_what_it_draws(client, monkeypa
     body = {"query": action["query"], "workflow_id": wf, "version": 1, "inputs": CHECKED, "confirm": True}
     res = await client.post(f"/api/ledger/answers/{row.id}/reconcile", json=body)
     assert res.status_code == 409 and res.json()["code"] == ledger_reconcile.NEEDS_PAIRS
-    assert res.json()["options"] == {"columns": ["gmv"], "metrics": [{"id": "gmv", "name": "销售额", "unit": "元"}]}
+    # suggested：逐格证明了的预选（这条查询只引用了一列，没有逐格比，空）
+    assert res.json()["options"] == {"columns": ["gmv"], "metrics": [{"id": "gmv", "name": "销售额", "unit": "元"}],
+                                     "suggested": []}
     done = await reconcile(client, row.id, {**body, "pairs": [{"ours": "gmv", "metric": "gmv"}]})
     [listed] = (await ledger_of(client, row.id))["reconciled"]
     assert listed["run_id"] == done.id and listed["card"] == "reconcile"
@@ -280,3 +282,18 @@ async def test_multi_row_reconcile_groups_carry_the_row_labels(client, monkeypat
     assert [g["label"] for g in listed["groups"]] == ["区域=east · gmv", "区域=west · gmv"]
     assert listed["groups"][1] == {"label": "区域=west · gmv", "ours": "ours_1_0", "caliber": "cal_1_0", "diff": "diff_1_0",
                                    "rel": "rel_1_0"}
+
+
+async def test_a_related_query_prefills_the_pairing_from_the_cells_that_were_proven(client, monkeypatch):
+    """要人选对照时，按逐格比过的结论预选：这次的 gmv 那一列单独比是和口径取数的 gmv 等价的（逐格证明了），口径卡上读这一列的
+    指标就是它最可能的对照，options.suggested 给出来，界面预选上、人可以改；单数那一列没有证明，不替人猜。"""
+    wf = await S.publish(graph=S.caliber_graph(expression="cell(nodes.fetch, 0, 'gmv') * 1"))
+    sql = ("SELECT SUM(amount) AS gmv, COUNT(*) AS 单数 FROM orders WHERE status = 'paid' "
+           "AND paid_at >= '2026-09-01' AND paid_at < '2026-09-08'")
+    row = await S.explore(monkeypatch, sql, text="本周销售额 [[v:Q1.r0.gmv]]，共 [[v:Q1.r0.单数]] 单。")
+    [action] = [a for a in (await ledger_of(client, row.id))["actions"] if a["kind"] == "reconcile"]
+    body = {"query": action["query"], "workflow_id": wf, "version": 1, "inputs": CHECKED, "confirm": True}
+    res = await client.post(f"/api/ledger/answers/{row.id}/reconcile", json=body)
+    assert res.status_code == 409 and res.json()["code"] == ledger_reconcile.NEEDS_PAIRS, res.text
+    options = res.json()["options"]
+    assert options["suggested"] == [{"ours": "gmv", "metric": "gmv"}], options

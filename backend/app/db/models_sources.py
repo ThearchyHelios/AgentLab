@@ -19,10 +19,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base, UTCDateTime, new_id, utcnow
+from app.db.base import Base, current_owner, PortableJSON, UTCDateTime, new_id, utcnow
 
 
 class SourceObject(Base):
@@ -92,13 +92,16 @@ class IntrospectJob(Base):
     __table_args__ = (
         Index("ix_introspect_jobs_source_created", "source_id", "created_at"),
         Index("ux_introspect_jobs_active", "source_id", unique=True,
-              sqlite_where=text("status IN ('queued', 'running')")),
+              sqlite_where=text("status IN ('queued', 'running')"),
+              postgresql_where=text("status IN ('queued', 'running')")),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     source_id: Mapped[str] = mapped_column(ForeignKey("data_sources.id", ondelete="CASCADE"))
     # queued | running | succeeded | partial | failed | cancelled | interrupted
     status: Mapped[str] = mapped_column(String(20), default="queued")
+    #: 认领这一行的工作进程（app/cluster；缺省是建它的进程）。多进程时启动整理、接手只碰属主不在了的行
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
     #: manual 人点的 | schedule 定时维护（第 3 波）
     trigger: Mapped[str] = mapped_column(String(20), default="manual")
     #: 这次探查的是哪个 schema（"" 是默认 schema）
@@ -219,8 +222,8 @@ class SourceChange(Base):
     seen_count: Mapped[int] = mapped_column(Integer, default=1)
     detected_by: Mapped[dict[str, Any]] = mapped_column(default=dict)
     basis: Mapped[dict[str, Any] | None] = mapped_column(default=None)
-    before: Mapped[Any] = mapped_column(JSON, nullable=True, default=None)
-    after: Mapped[Any] = mapped_column(JSON, nullable=True, default=None)
+    before: Mapped[Any] = mapped_column(PortableJSON, nullable=True, default=None)
+    after: Mapped[Any] = mapped_column(PortableJSON, nullable=True, default=None)
     affects: Mapped[dict[str, Any] | None] = mapped_column(default=None)
     struct_version_before: Mapped[int | None] = mapped_column(Integer, default=None)
     struct_version_after: Mapped[int | None] = mapped_column(Integer, default=None)

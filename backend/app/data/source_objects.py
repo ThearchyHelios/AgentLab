@@ -47,6 +47,7 @@ from app.core.errors import describe_exception, first_line
 from app.data.names import name_key
 from app.db.base import SessionLocal, utcnow
 from app.db.models_sources import SourceObject
+from app.db.portable import contains_ci
 
 logger = logging.getLogger(__name__)
 
@@ -405,20 +406,13 @@ def target_schema(row: Any) -> str | None:
     return index_schema(row) or None
 
 
-_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]]" = weakref.WeakKeyDictionary()
+def source_lock(source_id: str) -> Any:
+    """写一个源的对象索引和 schema_cache 时持的锁：后台探查的开头和收尾、按需加入、加入范围都持它。跨进程的锁
+    （app/cluster/mutex：本进程按事件循环各一把 asyncio 锁，PostgreSQL 时另取咨询锁）：多进程时按需探查、加入范围也是
+    一个接一个，schema_cache、结构版本不会被两个进程各写一半。"""
+    from app.cluster import mutex
 
-
-def source_lock(source_id: str) -> asyncio.Lock:
-    """写一个源的对象索引和 schema_cache 时持的锁（进程内，按事件循环各一份：asyncio.Lock 不能跨循环用）。后台探查的开头
-    和收尾、按需加入、加入范围都持它。"""
-    loop = asyncio.get_running_loop()
-    by_source = _locks.get(loop)
-    if by_source is None:
-        by_source = _locks[loop] = {}
-    lock = by_source.get(source_id)
-    if lock is None:
-        lock = by_source[source_id] = asyncio.Lock()
-    return lock
+    return mutex.lock(f"source-objects:{source_id}")
 
 
 def _scope_filter(source_id: str, schema: str) -> tuple[Any, ...]:
@@ -886,8 +880,8 @@ async def search_index(session: AsyncSession, row: Any, query: str, *, limit: in
         return [], 0
     key = name_key(text.rsplit(".", 1)[-1])
     filt = (*_scope_filter(row.id, index_schema(row)), SourceObject.removed_at.is_(None),
-            or_(SourceObject.name_key.contains(key, autoescape=True),
-                SourceObject.comment.contains(text, autoescape=True)))
+            # 名字比的是 name_key（ASCII 已转小写）；注释要不分大小写（db/portable.contains_ci：两种库都折 Unicode 的大小写）
+            or_(SourceObject.name_key.contains(key, autoescape=True), contains_ci(SourceObject.comment, text)))
     total = int((await session.execute(select(func.count()).select_from(SourceObject).where(*filt))).scalar() or 0)
     rows = (await session.execute(
         select(SourceObject.name, SourceObject.name_key, SourceObject.kind, SourceObject.comment,

@@ -65,7 +65,7 @@ async def derive_app(session: AsyncSession, workflow_id: str, version: int, *, n
     state = PinState(alias=PIN, pin={"workflow_id": workflow_id, "version": version}, workflow=workflow, row=row)
     schedule = (await session.execute(select(Schedule).where(
         Schedule.workflow_id == workflow_id, Schedule.run_class == "formal", Schedule.enabled.is_(True))
-        .order_by(Schedule.created_at))).scalars().first()
+        .order_by(Schedule.created_at, Schedule.id))).scalars().first()
     return await _derive(session, row.graph or {}, title=workflow.name, name=name,
                          description=workflow.description or "",
                          pin={"alias": PIN, "workflow_id": workflow_id, "version": version, "graph_hash": state.hash,

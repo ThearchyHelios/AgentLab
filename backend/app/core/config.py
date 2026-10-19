@@ -31,6 +31,10 @@ def sanitize_session(session_id: str | None) -> str:
     return safe[:_SESSION_MAX] or "default"
 
 
+#: 数据目录里的标记文件（Settings.ensure_dirs 建，deploy/deploy.sh 认）
+DATA_DIR_MARKER = ".agentlab-data"
+
+
 class Settings(BaseSettings):
     """全局配置。所有项都可以用 AGENTLAB_ 前缀的环境变量覆盖。"""
 
@@ -47,6 +51,36 @@ class Settings(BaseSettings):
 
     # --- 存储 ---
     data_dir: Path = PROJECT_DIR / "data"
+    # 应用自己的库（工作流、运行、事件、审批……）。不设：数据目录里的 SQLite（agentlab.db，断点在 checkpoints.db），
+    # 单机单进程。设成 postgresql+asyncpg://用户:密码@主机:端口/库名（postgresql:// 也认）时整个应用库用 PostgreSQL，
+    # LangGraph 的断点也放进同一个库；checkpoint_url 另给就放那里。数据目录照旧要有：工件、上传表格、沙箱等仍是文件
+    database_url: str = ""
+    checkpoint_url: str = ""
+    # 直连地址（可选，写法同 database_url）：普通查询走 database_url（可以是 PgBouncer），依赖会话状态的连接走这里——进程间通知的
+    # LISTEN 那一条、跨进程锁（会话级咨询锁）、断点库（预备语句、建表时的会话锁）。不设就全用 database_url
+    database_direct_url: str = ""
+    # database_url 是 PgBouncer 的事务模式（AGENTLAB_DB_PGBOUNCER=1）：应用库不用客户端连接池（交给 PgBouncer）、关掉 asyncpg 和
+    # SQLAlchemy 的预备语句缓存、预备语句用不会撞名的名字。这时必须另给 database_direct_url（事务模式下 LISTEN、会话级咨询锁不成立），
+    # 启动时检查
+    db_pgbouncer: bool = False
+    # PostgreSQL 的连接池（SQLite 不用这几项）。pool_size=0 表示不用连接池、每次新建连接（前面有 PgBouncer 时用，
+    # 测试里也这么用：每个测试一个事件循环，asyncpg 的连接不能跨循环）
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout: int = 30
+    db_pool_recycle: int = 1800
+    # 启动时库还连不上（和 PostgreSQL 容器一起起、库还在初始化）最多等多少秒，按退避重试、照实打日志；过了再报错退出。
+    # 密码不对、库不存在这种等也没用的不等
+    db_startup_timeout: int = 90
+
+    # --- 多进程（app/cluster，docs/design/orchestration-round §5 W2-b）---
+    # 几个工作进程（scripts/prod.sh、Docker 的入口按它给 uvicorn --workers）。只有应用库是 PostgreSQL 时才能大于 1：
+    # SQLite 只支持单进程，启动时拒绝（app/cluster/guard.py）
+    workers: int = 1
+    # 每个工作进程在库里登记一行：隔 worker_heartbeat_s 秒续一次租约，租约长 worker_lease_s 秒。进程没了（强杀、断电）
+    # 租约到期后，别的进程接手它认领的运行、问数据、后台任务（各按各的规矩）。租约要比心跳长几倍：库一时慢了不算进程没了
+    worker_lease_s: float = 30.0
+    worker_heartbeat_s: float = 5.0
 
     # --- 前端构建产物（生产部署用）---
     # 设了就由服务端一并托管页面（见 app/web.py），页面和接口同源、只起一个进程。
@@ -115,6 +149,8 @@ class Settings(BaseSettings):
     # （检查脚本的 --stacks、沙箱）必须关：库里的定时任务会照常到点发起运行、发出 webhook，
     # 拷贝里的任务和原库的是同一批，等于同一件事做两遍
     scheduler: bool = True
+    # 调度循环一拍的间隔（秒）：定时认领、事件派发、流程的时限和核实都按它查一次。缺省 15；验收脚本（多进程端到端）调小
+    scheduler_tick_s: float = 15.0
 
     # --- 工具 ---
     http_tool_timeout: int = 20
@@ -195,6 +231,37 @@ class Settings(BaseSettings):
             return True
         return value
 
+    @field_validator("database_url", "checkpoint_url", "database_direct_url", mode="before")
+    @classmethod
+    def _valid_postgres_url(cls, value: object, info: Any) -> object:
+        # 写错了启动时就报出来，别等到第一次查库。只认 PostgreSQL：SQLite 就是不设
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return ""
+        if not isinstance(value, str):
+            return value
+        from app.db.urls import normalize_database_url, normalize_checkpoint_url
+
+        name = f"AGENTLAB_{(info.field_name or '').upper()}"
+        normalize = normalize_checkpoint_url if info.field_name == "checkpoint_url" else normalize_database_url
+        try:
+            return normalize(value.strip())
+        except ValueError as e:
+            raise ValueError(f"{name}：{e}") from None
+
+    @field_validator("workers")
+    @classmethod
+    def _valid_workers(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("AGENTLAB_WORKERS 至少是 1")
+        return value
+
+    @field_validator("worker_heartbeat_s", "worker_lease_s")
+    @classmethod
+    def _positive_seconds(cls, value: float, info: Any) -> float:
+        if value <= 0:
+            raise ValueError(f"AGENTLAB_{(info.field_name or '').upper()} 要大于 0")
+        return value
+
     @field_validator("web_dist", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object) -> object:
@@ -223,12 +290,35 @@ class Settings(BaseSettings):
 
     @property
     def db_url(self) -> str:
-        return f"sqlite+aiosqlite:///{self.db_path}"
+        """应用库的 SQLAlchemy 地址：设了 database_url 用它（已规范成 postgresql+asyncpg://），否则数据目录里的 SQLite。"""
+        return self.database_url or f"sqlite+aiosqlite:///{self.db_path}"
+
+    @property
+    def db_dialect(self) -> str:
+        """"sqlite" 或 "postgresql"。"""
+        return "postgresql" if self.database_url else "sqlite"
 
     @property
     def checkpoint_path(self) -> Path:
-        """LangGraph checkpointer 用独立的库文件，避免和业务表抢写锁。"""
+        """LangGraph checkpointer 用独立的库文件，避免和业务表抢写锁。只在 SQLite 时用。"""
         return self.data_dir / "checkpoints.db"
+
+    @property
+    def session_db_url(self) -> str:
+        """依赖会话状态的连接（LISTEN、会话级咨询锁、断点库）用的应用库地址：设了直连地址用它，否则同 database_url。"""
+        return self.database_direct_url or self.database_url
+
+    @property
+    def checkpoint_conninfo(self) -> str | None:
+        """PostgreSQL 断点库的 libpq 连接串（psycopg 用）：checkpoint_url 优先，否则由直连地址（没设就是 database_url）换算。
+        SQLite 时 None。断点库用预备语句、建表时取会话级的锁，所以缺省走直连。"""
+        if self.checkpoint_url:
+            return self.checkpoint_url
+        if self.database_url:
+            from app.db.urls import libpq_conninfo
+
+            return libpq_conninfo(self.session_db_url)
+        return None
 
     @property
     def workspace_dir(self) -> Path:
@@ -257,6 +347,16 @@ class Settings(BaseSettings):
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.workspace_dir, self.uploads_dir):
             d.mkdir(parents=True, exist_ok=True)
+        # 认得出「这是 AgentLab 的数据目录」的标记：应用库放在 PostgreSQL 时这里没有 agentlab.db，设了 AGENTLAB_SECRET_KEY
+        # 时也没有 .secret_key。deploy.sh 改属主前按它认，免得 DATA_DIR 写错把别人的目录 chown 了。只建一次，不覆盖
+        marker = self.data_dir / DATA_DIR_MARKER
+        if not marker.exists():
+            from app.core import atomic
+
+            try:
+                atomic.create_text(marker, "AgentLab 的数据目录（deploy.sh 按这个文件认，别删）\n")
+            except OSError:
+                pass
 
 
 @lru_cache

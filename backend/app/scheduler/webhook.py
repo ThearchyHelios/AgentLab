@@ -77,6 +77,8 @@ RERUN_ACTION = "如需重新发起，请在 AgentLab 的「定时任务」中点
 REJECTED_HEADLINE = "未出具（被驳回）"
 REJECTED_STATUS = "被驳回"
 REJECTED_ACTION = "驳回的说明请在 AgentLab 的「记录」中查看"
+#: 照驳回那条路成功结束的（驳回出口）：标题、状态后面接这一句
+VIA_REJECTED = "（途经驳回）"
 
 
 # --------------------------------------------------------------------------
@@ -118,6 +120,9 @@ class Notice:
     error_node: str | None = None
     #: 运行结束在 cancelled 的原因（Run.end_reason）：rejected 时按「未出具（被驳回）」说，error_node 是驳回的那一步
     end_reason: str | None = None
+    #: 照驳回那条路成功结束的运行途经的驳回出口（run.finished 的 rejected_via，engine/runner._rejected_via）：标题、状态写
+    #: 途经驳回，另起一行写谁被驳回、转到哪一步（同实例页 apps/resolve.rejected_exit_text）。没途经驳回的为 None
+    rejected_via: list[dict[str, Any]] | None = None
     next_fire: bool = False
     #: 事件触发的那一次（fire_kind=event）：事件的说法（scheduler/triggers.event_text），不含出口字段的值、变化的内容
     trigger_text: str | None = None
@@ -129,6 +134,11 @@ class Notice:
     @property
     def rejected(self) -> bool:
         return self.status == "cancelled" and self.end_reason == "rejected"
+
+    @property
+    def via_rejection(self) -> bool:
+        """成功结束、途经驳回出口（审批接了驳回出口、按驳回那条路走完）：状态是 succeeded，但不能只说「运行完成」。"""
+        return self.status == "succeeded" and bool(self.rejected_via)
 
     @property
     def never_started(self) -> bool:
@@ -160,10 +170,18 @@ def message(notice: Notice) -> tuple[str, list[tuple[str, str]], str | None]:
         headline = REJECTED_HEADLINE
     else:
         headline = _HEADLINE.get(notice.event, notice.event)
+        if notice.via_rejection:
+            headline += VIA_REJECTED
     title = f"定时任务「{notice.schedule_name}」{headline}"
     lines: list[tuple[str, str]] = []
     if notice.status:
         lines.append(("状态", _status_label(notice)))
+    if notice.via_rejection:
+        from app.apps.resolve import rejected_exit_text
+
+        # 一个关卡一句：「「把关」被驳回，转到「退回申请人」」（名字是搭图时起的，不带查询到的数据）
+        lines.append(("驳回", "；".join(f"「{str(v.get('label') or v.get('node_id') or '')[:80]}」{rejected_exit_text(v)}"
+                                       for v in notice.rejected_via or [] if isinstance(v, dict))))
     if notice.tier:
         gaps = f"（缺口 {notice.gaps} 条）" if notice.gaps is not None else ""
         lines.append(("出具档位", f"{ISSUANCE_LABEL.get(notice.tier, notice.tier)}{gaps}"))
@@ -244,6 +262,8 @@ def _status_label(notice: Notice) -> str:
         return "已挂起，等待核实" if notice.action_pending else "已挂起，可继续运行"
     if notice.rejected:
         return REJECTED_STATUS
+    if notice.via_rejection:
+        return f"{_STATUS_LABEL['succeeded']}{VIA_REJECTED}"
     return _STATUS_LABEL.get(notice.status or "", notice.status or "")
 
 
@@ -426,7 +446,7 @@ async def notify_due(now: datetime | None = None) -> int:
                     and_(ScheduleFire.status == "started", Run.status.in_(_WATCHED),
                          or_(ScheduleFire.notified_status.is_(None), ScheduleFire.notified_status != Run.status)),
                 ))
-                .order_by(ScheduleFire.created_at)
+                .order_by(ScheduleFire.created_at, ScheduleFire.id)
             )).all()
             if rows:
                 # 链接里的地址：全站同一个对外访问地址（环境变量优先，其次设置，core/public_url.py）
@@ -554,10 +574,21 @@ async def _notice(session: Any, schedule: Schedule, fire: ScheduleFire, run: Run
         error_node=_failed_node(run, await _end_label(session, run))
         if run is not None and (run.status == "failed" or run.end_reason == "rejected") else None,
         end_reason=run.end_reason if run is not None else None,
+        rejected_via=await _rejected_via_of(session, run) if run is not None and run.status == "succeeded" else None,
         # 事件触发的任务没有下一次「到点」，启用着就是下一次事件来了照常发起
         next_fire=bool(schedule.enabled and (schedule.next_run_at is not None or schedule.trigger_kind == "event")),
         trigger_text=_trigger_text(fire),
     )
+
+
+async def _rejected_via_of(session: Any, run: Run) -> list[dict[str, Any]] | None:
+    """这次运行途经的驳回出口：最后一条 run.finished 上的 rejected_via（子工作流里的那几步名字写「子工作流 › x」），没有为 None。"""
+    data = await session.scalar(select(RunEvent.data).where(RunEvent.run_id == run.id, RunEvent.type == "run.finished")
+                                .order_by(RunEvent.seq.desc()).limit(1))
+    via = data.get("rejected_via") if isinstance(data, dict) else None
+    if not isinstance(via, list):
+        return None
+    return [v for v in via if isinstance(v, dict)] or None
 
 
 def _trigger_text(fire: ScheduleFire) -> str | None:

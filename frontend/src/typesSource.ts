@@ -54,6 +54,22 @@ export interface SourceChangeAffects {
   templates: SourceChangeTemplate[]
   /** 有效记录条件用到了这一列 */
   rules_touched: boolean
+  /**
+   * 表结构变了之后口径没能试算的那几版（服务端 ledger/recall._probe_skipped）：缺哪几个参数、原因原话、参数本来从哪来。
+   * 只记没试算的；试算了的结论在召回待办里
+   */
+  probes?: SourceChangeProbe[]
+}
+
+export interface SourceChangeProbe {
+  workflow_id: string
+  version: number
+  name: string
+  outcome: 'skipped'
+  missing: string[]
+  reason: string
+  /** formal 最近一次正式运行 / answer 等价的问数回答 / defaults 入口的缺省值 */
+  inputs_from?: string
 }
 
 /** 现在能做的一个处理动作；ok 为假时 reason 写为什么做不了 */

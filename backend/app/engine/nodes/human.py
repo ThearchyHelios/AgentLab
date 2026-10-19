@@ -227,7 +227,8 @@ def _reviewed_reports(state: GraphState, ctx: NodeContext) -> list[dict[str, Any
                 or not isinstance(result.get("stats"), dict):
             continue
         item: dict[str, Any] = {
-            "node_id": rid, "label": node.title,
+            # 按这次运行里的 id 记（子工作流里的写「子工作流节点 id/报告」）：审批卡据此打开证据面板（?report=）
+            "node_id": ctx.run.global_id(rid), "label": node.title,
             "stats": {k: v for k, v in result["stats"].items() if isinstance(v, int) and not isinstance(v, bool)},
             "claims": result.get("claims") or "off",
         }

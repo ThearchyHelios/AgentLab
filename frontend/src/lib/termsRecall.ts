@@ -58,6 +58,7 @@ export const RECALL_TEXT = {
       const parts = [
         c.changed ? `数变了 ${n(c.changed)} 组` : '',
         c.unchanged ? `没变 ${n(c.unchanged)} 组` : '',
+        c.row_order ? `核对不了（行序不定）${n(c.row_order)} 组` : '',
         c.running ? `正在重算 ${n(c.running)} 组` : '',
         c.failed ? `重算失败 ${n(c.failed)} 组` : '',
         c.not_recomputable ? `无法重算 ${n(c.not_recomputable)} 组` : '',
@@ -65,7 +66,8 @@ export const RECALL_TEXT = {
       return parts.join('，')
     },
     state: {
-      changed: '数变了', unchanged: '没变', failed: '重算失败', running: '正在重算', pending: '未重算',
+      changed: '数变了', unchanged: '没变', row_order: '核对不了（行序不定）', failed: '重算失败', running: '正在重算',
+      pending: '未重算',
       not_recomputable: '无法重算',
     } as Record<string, string>,
     reason: (state: string, reason: string) => (state === 'not_recomputable' ? `无法重算：${reason}` : reason),
@@ -99,6 +101,8 @@ export const RECALL_TEXT = {
     original: '原答案当时的值',
     changed: '变了',
     same: '没变',
+    rowOrder: '行序不定',
+    rowOrderHint: '取的是多行结果里按行号的一格，查询没有排序，重新执行时这一行可能是另一行，两版按位置比不出变没变',
     masked: '已遮罩',
     missing: '—',
     answers: '用到这份口径的答案',

@@ -144,10 +144,18 @@ def normalize_fields(existing: Mapping[str, Any] | None, submitted: Any, *, at: 
 
 async def run_counts(session: AsyncSession) -> dict[str, int]:
     """每项能力被几次运行用到：{能力名: 运行次数}，没用过的不出现。按运行发起时记下的能力治理快照数
-    （Run.options["capabilities"]，一次运行里一项能力只记一次）。只用 SQLite 的 json_each，一次查询。"""
-    rows = await session.execute(text(
-        "SELECT j.key, COUNT(*) FROM runs, json_each(runs.options, '$.capabilities') AS j "
-        "WHERE json_valid(runs.options) GROUP BY j.key"))
+    （Run.options["capabilities"]，一次运行里一项能力只记一次）。一次查询：两种库都用 json_each（PostgreSQL 的碰到不是
+    对象的值会报错，先按类型挑出来）。"""
+    from app.db.portable import dialect_of
+
+    if dialect_of(session) == "postgresql":
+        sql = ("SELECT j.key, COUNT(*) FROM runs CROSS JOIN LATERAL json_each(CASE WHEN "
+               "json_typeof(runs.options -> 'capabilities') = 'object' THEN runs.options -> 'capabilities' "
+               "ELSE '{}'::json END) AS j GROUP BY j.key")
+    else:
+        sql = ("SELECT j.key, COUNT(*) FROM runs, json_each(runs.options, '$.capabilities') AS j "
+               "WHERE json_valid(runs.options) GROUP BY j.key")
+    rows = await session.execute(text(sql))
     return {str(name): int(count) for name, count in rows.all()}
 
 

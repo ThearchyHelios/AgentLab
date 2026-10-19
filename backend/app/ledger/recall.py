@@ -66,11 +66,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, not_, select, update
 
 from app.core.events import EventType
 from app.db.base import SessionLocal, utcnow
 from app.db.models import Run, RunEvent, Workflow
+from app.db.portable import json_eq, json_flag, json_text
 from app.ledger import uses as ledger_uses
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ REASONS = ("caliber", "catalog", "structure")
 #: 发起的批次：发布后自动的、版本历史里手动接着算的
 BATCHES = ("auto", "manual")
 #: 一组的结论
-OUTCOMES = ("changed", "unchanged", "failed", "running", "pending", "not_recomputable")
+OUTCOMES = ("changed", "unchanged", "row_order", "failed", "running", "pending", "not_recomputable")
 #: 启动时接着做最近几天发布的
 RESUME_DAYS = 7
 #: 目录、表结构变了时最多看多少次探索运行（新的在前）
@@ -109,6 +110,8 @@ SUPERSEDED = "已有更新的发布版 v{latest}，召回在 v{latest} 那一版
 NOT_CURRENT = "v{version} 已不是当前发布版，召回不再接着算"
 #: 收尾
 CHANGED_TITLE = "口径「{name}」升到 v{version}，答案的数变了"
+#: 全部指标行序不定、核对不了时的待办标题（settle 的 row_order）
+ROW_ORDER_TITLE = "口径「{name}」升到 v{version}，答案里的数行序不定、没能核对，请人工核对"
 CATALOG_TITLE = "答案依据的数据目录有变：按新目录检查出了新的问题"
 STRUCTURE_TITLE = "口径「{name}」v{version} 依据的表结构变了，试算没有算出来"
 #: 依据有变的四种（ledger.basis_changed 的 kind）
@@ -225,11 +228,10 @@ def source_cards(graph: Any) -> list[str]:
 async def recall_runs(session: Any, workflow_id: str, new_version: int | None = None) -> list[Run]:
     """以 W（新版本 N）发起过的召回运行（试算的不算），新的在前。origin_kind 有索引，先按它筛再看 origin。"""
     stmt = select(Run).where(Run.origin_kind == ORIGIN,
-                             func.json_extract(Run.origin, "$.workflow_id") == workflow_id,
-                             func.coalesce(func.json_extract(Run.origin, "$.probe"), 0) == 0)
+                             json_eq(Run.origin, "workflow_id", workflow_id), not_(json_flag(Run.origin, "probe")))
     if new_version is not None:
-        stmt = stmt.where(func.json_extract(Run.origin, "$.to_version") == int(new_version))
-    return list((await session.execute(stmt.order_by(Run.created_at.desc()))).scalars())
+        stmt = stmt.where(json_eq(Run.origin, "to_version", int(new_version)))
+    return list((await session.execute(stmt.order_by(Run.created_at.desc(), Run.id.desc()))).scalars())
 
 
 async def build_plan(session: Any, workflow_id: str, new_version: int) -> Plan:
@@ -364,13 +366,46 @@ def recall_card(pairs: Sequence[Pair]) -> tuple[dict[str, Any], list[dict[str, A
                         _metric(f"new_{k}", f"{name} · 新版 v{pair.new.version}", new_expr, nm),
                         _metric(f"diff_{k}", f"{name} · 两版之差", f"({new_expr}) - ({old_expr})", nm)]
             # 旧版的式子（定义，不是数）一并记下：问数回答当时的值要按它找到答案里对应的那一格（original_values）
-            meta.append({"k": k, "card": pair.old.node_id, "metric": m["id"], "name": name,
-                         "unit": str(nm.get("unit") or ""), "decimals": nm.get("decimals"), "format": nm.get("format"),
-                         "expression": str(m.get("expression") or "")})
+            item = {"k": k, "card": pair.old.node_id, "metric": m["id"], "name": name,
+                    "unit": str(nm.get("unit") or ""), "decimals": nm.get("decimals"), "format": nm.get("format"),
+                    "expression": str(m.get("expression") or "")}
+            if not (_rows_stable(pair.old, m) and _rows_stable(pair.new, nm)):
+                # 两版都按行号取多行结果里的一格、查询又没有 ORDER BY：两次查询交回的行序可能不同，第几行不一定是同一行，
+                # 按位置比出来的「变了 / 没变」都不可信（compare 照实记行序不定）
+                item["row_order"] = "unstable"
+            meta.append(item)
             k += 1
     node = derive._node(derive.RECALL_CARD, "metrics", "召回卡", caliber="口径召回", caliber_version="v1",
                         on_missing="null", metrics=metrics)
     return node, meta
+
+
+def _rows_stable(pinned: Any, metric: Mapping[str, Any]) -> bool:
+    """这个指标按行号取的每一格（cell(nodes.<取数>, 行, '列')），在那一版的取数 SQL 上重跑时还是同一行（sql_semantics.row_stable）。
+    行号、SQL 认不出来的照旧当认得住（以前就是按位置比的，不凭猜测改结论）。"""
+    import ast
+
+    from app.data.sql_semantics import row_stable
+    from app.engine.expressions import ExpressionError, cell_parts, leaf_refs, parse_expression
+
+    sql_of = {str(n.get("id")): ((n.get("data") or {}).get("config") or {}).get("args", {}).get("sql")
+              for n in pinned.fetches if isinstance(n, dict)}
+    try:
+        leaves = leaf_refs(parse_expression(str(metric.get("expression") or ""))[0])
+    except ExpressionError:
+        return True
+    for leaf in leaves:
+        parts = cell_parts(str(leaf))
+        if parts is None or not parts[0].startswith("nodes."):
+            continue
+        sql = sql_of.get(parts[0].removeprefix("nodes."))
+        try:
+            row = ast.literal_eval(parts[1].strip())
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(sql, str) and isinstance(row, int) and not row_stable(sql, row):
+            return False
+    return True
 
 
 def build_graph(group: Group, pairs: Sequence[Pair]) -> tuple[Any, list[dict[str, Any]]]:
@@ -413,9 +448,11 @@ _locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, in
     weakref.WeakKeyDictionary()
 
 
-def _lock(key: tuple[str, int]) -> asyncio.Lock:
-    group = _locks.setdefault(asyncio.get_running_loop(), {})
-    return group.setdefault(key, asyncio.Lock())
+def _lock(key: tuple[str, int]) -> Any:
+    """跨进程的锁（app/cluster/mutex）：同一（W、N）的计划和发起多进程时也串行，「已经自动发过几次」读得准。"""
+    from app.cluster import mutex
+
+    return mutex.lock(f"ledger-recall:{key[0]}:{key[1]}")
 
 
 async def launch(workflow_id: str, new_version: int, *, batch: str = "auto", actor: str | None = None) -> list[str]:
@@ -498,11 +535,12 @@ def _reasons(plan: Plan) -> list[dict[str, Any]]:
 
 
 async def outcome_of(session: Any, run: Run) -> tuple[str, dict[str, Any]]:
-    """一次召回运行的结论：(changed / unchanged / failed / running, 收尾时记下的那一条 ledger.recalled 的内容)。"""
+    """一次召回运行的结论：(changed / unchanged / row_order（全部指标行序不定、核对不了）/ failed / running, 收尾时记下的那一条
+    ledger.recalled 的内容)。"""
     data = await _settled(session, run.id)
     if data is not None:
-        if data.get("outcome") == "failed":
-            return "failed", data
+        if data.get("outcome") in ("failed", "row_order"):
+            return str(data["outcome"]), data
         return ("changed" if data.get("changed") else "unchanged"), data
     if run.status in ("failed", "cancelled"):
         return "failed", {"error": run.error}
@@ -567,9 +605,8 @@ async def version_recall_counts(session: Any, workflow_id: str, version: int) ->
         state, _ = await outcome_of(session, run)
         changed += state == "changed"
     as_old = int(await session.scalar(select(func.count()).select_from(Run).where(
-        Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.workflow_id") == workflow_id,
-        func.json_extract(Run.origin, "$.from_version") == int(version),
-        func.coalesce(func.json_extract(Run.origin, "$.probe"), 0) == 0)) or 0)
+        Run.origin_kind == ORIGIN, json_eq(Run.origin, "workflow_id", workflow_id),
+        json_eq(Run.origin, "from_version", int(version)), not_(json_flag(Run.origin, "probe")))) or 0)
     return {"groups": len(as_new), "changed": changed, "recalled_from": as_old}
 
 
@@ -607,11 +644,14 @@ def compare(meta: Sequence[Mapping[str, Any]], values: Mapping[str, Mapping[str,
     for item in meta:
         k = item.get("k")
         old, new, diff = (values.get(f"{p}_{k}") or {} for p in ("old", "new", "diff"))
-        changed = str(old.get("rendered")) != str(new.get("rendered"))
+        unstable = item.get("row_order") == "unstable"
+        # 行序不定的（recall_card 记的）：按位置比不出变没变，changed 为空，照实记 row_order，不假装对上
+        changed = None if unstable else str(old.get("rendered")) != str(new.get("rendered"))
         out.append({"k": k, "card": item.get("card"), "metric": item.get("metric"), "name": item.get("name"),
                     "unit": item.get("unit"), "old": old.get("value"), "new": new.get("value"),
                     "diff": diff.get("value"), "old_text": old.get("rendered"), "new_text": new.get("rendered"),
-                    "diff_text": diff.get("rendered"), "changed": changed})
+                    "diff_text": diff.get("rendered"), "changed": changed,
+                    **({"row_order": "unstable"} if unstable else {})})
     return out
 
 
@@ -654,48 +694,65 @@ async def settle(run_id: str) -> str | None:
         return None
     _settling.add(run_id)
     try:
-        async with SessionLocal() as session:
-            run = await session.get(Run, run_id)
-            if run is None or run.origin_kind != ORIGIN or run.status not in ("succeeded", "failed", "cancelled") \
-                    or not run.manifest_hash:
-                return None
-            if await _settled(session, run_id) is not None:
-                return None
-        origin = run.origin if isinstance(run.origin, dict) else {}
-        if origin.get("probe"):
-            return await _settle_probe(run)
-        base = {"role": "recall", "workflow_id": origin.get("workflow_id"), "from_version": origin.get("from_version"),
-                "to_version": origin.get("to_version")}
-        if run.status != "succeeded":
-            await _mark(run_id, {**base, "outcome": "failed", "changed": None,
-                                 "error": str(run.error or "运行没有成功结束")[:300]})
-            return "failed"
-        meta = origin.get("metrics") or []
-        values = await card_values(run_id)
-        # 读不出召回卡、少了哪个比较的旧值或新值：两边都是空，按渲染比会被当成「没变」，给每个原答案盖上「已核对，不影响」
-        # ——照实记重算失败，原答案一个不动（收过尾就不再核对，盖错了收不回来）
-        if not meta or any(f"{side}_{m.get('k')}" not in values for m in meta for side in ("old", "new")):
-            await _mark(run_id, {**base, "outcome": "failed", "changed": None, "error": CARD_UNREADABLE})
-            return "failed"
-        results = compare(meta, values)
-        changed = any(r["changed"] for r in results)
-        answers = list(dict.fromkeys(str(u.get("run_id")) for u in origin.get("uses") or [] if u.get("run_id")))
-        tasks: list[str] = []
-        if changed:
-            tasks = await open_tasks(run, reason="caliber")
-        else:
-            for answer in answers:
-                await _mark_answer(answer, run)
-        await _mark(run_id, {**base, "outcome": "changed" if changed else "unchanged", "changed": changed,
-                             "answers": len(answers), "tasks": tasks,
-                             "metrics": [{"k": r["k"], "name": r["name"], "changed": r["changed"]} for r in results]})
-        return "changed" if changed else "unchanged"
+        # 多进程：收尾的进程（runner 收尾时）和当班进程启动时的「补上收尾」可能同时来，跨进程的锁里先看收过没有
+        from app.cluster import mutex
+
+        async with mutex.lock(f"ledger-settle:{run_id}"):
+            return await _settle(run_id)
     finally:
         _settling.discard(run_id)
 
 
-async def _mark_answer(answer_id: str, recall_run: Run) -> None:
-    """数没变：在原答案的运行上记一条 ledger.recalled（已按 vN 核对，不影响）。这次召回记过的不再记。"""
+async def _settle(run_id: str) -> str | None:
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        if run is None or run.origin_kind != ORIGIN or run.status not in ("succeeded", "failed", "cancelled") \
+                or not run.manifest_hash:
+            return None
+        if await _settled(session, run_id) is not None:
+            return None
+    origin = run.origin if isinstance(run.origin, dict) else {}
+    if origin.get("probe"):
+        return await _settle_probe(run)
+    base = {"role": "recall", "workflow_id": origin.get("workflow_id"), "from_version": origin.get("from_version"),
+            "to_version": origin.get("to_version")}
+    if run.status != "succeeded":
+        await _mark(run_id, {**base, "outcome": "failed", "changed": None,
+                             "error": str(run.error or "运行没有成功结束")[:300]})
+        return "failed"
+    meta = origin.get("metrics") or []
+    values = await card_values(run_id)
+    # 读不出召回卡、少了哪个比较的旧值或新值：两边都是空，按渲染比会被当成「没变」，给每个原答案盖上「已核对，不影响」
+    # ——照实记重算失败，原答案一个不动（收过尾就不再核对，盖错了收不回来）
+    if not meta or any(f"{side}_{m.get('k')}" not in values for m in meta for side in ("old", "new")):
+        await _mark(run_id, {**base, "outcome": "failed", "changed": None, "error": CARD_UNREADABLE})
+        return "failed"
+    results = compare(meta, values)
+    # 行序不定的（recall_card 记的 row_order）比不出变没变：不算「没变」。全部都行序不定的结论写核对不了、开待办请人核对；
+    # 部分行序不定的，已判定的照常判，行序不定的那几项在结论、待办、原答案的记账里照实列出
+    unstable = [r["name"] for r in results if r.get("row_order") == "unstable"]
+    decided = [r for r in results if r.get("row_order") != "unstable"]
+    changed = any(r["changed"] for r in decided)
+    outcome = "row_order" if not decided else "changed" if changed else "unchanged"
+    answers = list(dict.fromkeys(str(u.get("run_id")) for u in origin.get("uses") or [] if u.get("run_id")))
+    tasks: list[str] = []
+    if outcome in ("changed", "row_order"):
+        tasks = await open_tasks(run, reason="caliber", row_order=outcome == "row_order")
+    else:
+        for answer in answers:
+            await _mark_answer(answer, run, row_order=unstable)
+    await _mark(run_id, {**base, "outcome": outcome, "changed": changed if decided else None,
+                         "answers": len(answers), "tasks": tasks,
+                         **({"row_order_metrics": unstable} if unstable else {}),
+                         "metrics": [{"k": r["k"], "name": r["name"], "changed": r["changed"],
+                                      **({"row_order": "unstable"} if r.get("row_order") else {})}
+                                     for r in results]})
+    return outcome
+
+
+async def _mark_answer(answer_id: str, recall_run: Run, *, row_order: Sequence[str] = ()) -> None:
+    """数没变：在原答案的运行上记一条 ledger.recalled（已按 vN 核对，不影响）。这次召回记过的不再记。row_order 是行序不定、
+    没能核对的那几项（照实列出，不算进「不影响」）。"""
     origin = recall_run.origin if isinstance(recall_run.origin, dict) else {}
     async with SessionLocal() as session:
         rows = (await session.execute(select(RunEvent.data).where(
@@ -704,7 +761,8 @@ async def _mark_answer(answer_id: str, recall_run: Run) -> None:
             return
     await _mark(answer_id, {"role": "answer", "changed": False, "recall_run": recall_run.id,
                             "workflow_id": origin.get("workflow_id"), "from_version": origin.get("from_version"),
-                            "to_version": origin.get("to_version")})
+                            "to_version": origin.get("to_version"),
+                            **({"row_order_metrics": list(row_order)} if row_order else {})})
 
 
 # ==========================================================================
@@ -739,7 +797,7 @@ def correlation(run_id: str, owner: tuple[str, str], reason: str = "caliber", ex
 
 
 async def open_tasks(run: Run, *, reason: str, owners: Iterable[tuple[str, str]] | None = None,
-                     title: str | None = None, extra: str = "") -> list[str]:
+                     title: str | None = None, extra: str = "", row_order: bool = False) -> list[str]:
     """给答案的主人开 recall 待办（挂在 run 上）。owners 不给就按召回运行 origin 里各答案的主人。按 correlation_key 认同一条，
     开过的不再开。提交之后推通知。返回这次新开的待办 id。"""
     from app.process import tasks as process_tasks
@@ -751,7 +809,8 @@ async def open_tasks(run: Run, *, reason: str, owners: Iterable[tuple[str, str]]
         targets = await _owner_targets(session, owners)
         name = await ledger_uses.workflow_name(session, str(origin.get("workflow_id") or ""))
         if title is None:
-            title = CHANGED_TITLE.format(name=name or "口径", version=origin.get("to_version"))
+            title = (ROW_ORDER_TITLE if row_order else CHANGED_TITLE).format(name=name or "口径",
+                                                                            version=origin.get("to_version"))
         opened: list[str] = []
         for owner in targets:
             key = correlation(run.id, owner, reason, extra)
@@ -810,6 +869,7 @@ async def task_payload(session: Any, task: Any, principal: Any) -> dict[str, Any
             cells[side] = {"value": None if masked else value, "text": "已遮罩" if masked else text,
                            "metric": f"{side}_{item['k']}", "masked": masked}
         metrics.append({"k": item["k"], "name": item["name"], "unit": item["unit"], "changed": item["changed"],
+                        **({"row_order": item["row_order"]} if item.get("row_order") else {}),
                         "card": item["card"], "metric": item["metric"], **cells})
     answers = []
     for use in _uses_of(origin, _owner_of_key(key)):
@@ -970,7 +1030,10 @@ async def answer_marks(session: Any, run_id: str, principal: Any) -> dict[str, A
         data = data if isinstance(data, dict) else {}
         if etype == EventType.LEDGER_RECALLED and data.get("role") == "answer":
             checked.append({k: data.get(k) for k in ("workflow_id", "from_version", "to_version", "recall_run")}
-                           | {"changed": bool(data.get("changed")), "at": at(ts)})
+                           | {"changed": bool(data.get("changed")), "at": at(ts)}
+                           # 行序不定、没能核对的那几项（只列名字）：不算进「不影响」
+                           | ({"row_order_metrics": [str(x) for x in data["row_order_metrics"]]}
+                              if isinstance(data.get("row_order_metrics"), list) and data["row_order_metrics"] else {}))
             workflows.add(str(data.get("workflow_id") or ""))
         elif etype == EventType.LEDGER_BASIS_CHANGED:
             items = data.get("items")
@@ -986,7 +1049,7 @@ async def answer_marks(session: Any, run_id: str, principal: Any) -> dict[str, A
         select(Task, Run.origin).join(Run, Run.id == Task.run_id)
         .where(Task.kind == TASK_KIND, Task.status == "pending",
                (Task.run_id == run_id) | ((Run.origin_kind == ORIGIN)
-                                          & (func.instr(func.json_extract(Run.origin, "$.uses"), run_id) > 0)))
+                                          & json_text(Run.origin, "uses").contains(run_id, autoescape=True)))
         .order_by(Task.created_at, Task.id))).all()
     mine = await _assignments(session, [t.id for t, _ in candidates])
     tasks: list[dict[str, Any]] = []
@@ -1134,8 +1197,8 @@ async def _explore_snapshots(session: Any, source: Any, tables: Iterable[str], *
     stmt = (select(Artifact.id, Artifact.meta, Run.id, Run.finished_at).join(Run, Run.id == Artifact.run_id)
             .where(Artifact.kind == QUERY_SNAPSHOT_KIND, Run.run_class == "exploratory", Run.status == "succeeded",
                    Run.manifest_hash.is_not(None), counted_runs(),
-                   or_(func.json_extract(Artifact.meta, "$.source_id") == source.id,
-                       func.json_extract(Artifact.meta, "$.source") == source.name))
+                   or_(json_eq(Artifact.meta, "source_id", source.id),
+                       json_eq(Artifact.meta, "source", source.name)))
             .order_by(Run.finished_at.desc(), Run.id, Artifact.id))
     cut = _aware(before)
     offset = 0
@@ -1263,8 +1326,10 @@ _catalog_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, 
     weakref.WeakKeyDictionary()
 
 
-def _catalog_lock(source_id: str) -> asyncio.Lock:
-    return _catalog_locks.setdefault(asyncio.get_running_loop(), {}).setdefault(source_id, asyncio.Lock())
+def _catalog_lock(source_id: str) -> Any:
+    from app.cluster import mutex
+
+    return mutex.lock(f"ledger-catalog:{source_id}")
 
 
 async def catalog_pass(source_id: str, edits: Sequence[CatalogEdit]) -> int:
@@ -1473,15 +1538,15 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
             continue
         async with SessionLocal() as session:
             done = await session.scalar(select(func.count()).select_from(Run).where(
-                Run.origin_kind == ORIGIN, func.json_extract(Run.origin, "$.probe") == 1,
-                func.json_extract(Run.origin, "$.workflow_id") == caliber.workflow_id,
-                func.json_extract(Run.origin, "$.version") == caliber.version,
-                func.json_extract(Run.origin, "$.change") == change.get("id")))
+                Run.origin_kind == ORIGIN, json_flag(Run.origin, "probe"),
+                json_eq(Run.origin, "workflow_id", caliber.workflow_id),
+                json_eq(Run.origin, "version", caliber.version),
+                json_eq(Run.origin, "change", change.get("id"))))
             if done:
                 continue
             latest = (await session.execute(select(Run.input).where(
                 Run.workflow_id == caliber.workflow_id, Run.version == caliber.version, Run.run_class == "formal",
-                Run.status == "succeeded").order_by(Run.finished_at.desc()).limit(1))).scalar_one_or_none()
+                Run.status == "succeeded").order_by(Run.finished_at.desc(), Run.id.desc()).limit(1))).scalar_one_or_none()
             inputs_from = "formal" if latest else "defaults"
             if not latest:
                 # 这一版还没有正式运行：退回最近一次等价于它的问数回答绑定出的参数，再没有才只用入口的缺省值
@@ -1490,11 +1555,16 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
                 if answer is not None:
                     latest, inputs_from = dict(answer.binding), "answer"
             for card in caliber.cards[:1]:
+                pinned = None
                 try:
                     pinned = await derive.load_pinned(session, caliber.workflow_id, caliber.version, card)
                     names = {str(f.get("name")) for f in pinned.entry_fields}
-                    inputs = compose.check_inputs(pinned, {k: v for k, v in (latest or {}).items() if k in names})
-                except (derive.NotDerivable, compose.ComposeRefused):
+                    given = {k: v for k, v in (latest or {}).items() if k in names}
+                    inputs = compose.check_inputs(pinned, given)
+                except (derive.NotDerivable, compose.ComposeRefused) as e:
+                    # 凑不齐参数（这一版没有正式运行、也没有等价的问数回答，必填的入口字段又没有缺省值）或者派生不了：不试算，
+                    # 照实记一条缺哪几个参数——日志里一条，变化记录的影响里一条（变化页照它写），不再一声不响地跳过
+                    await _probe_skipped(change, caliber, pinned, latest, inputs_from, e.message)
                     continue
                 probe = derive.caliber_probe(pinned)
                 origin = {"probe": 1, "workflow_id": caliber.workflow_id, "version": caliber.version,
@@ -1512,6 +1582,52 @@ async def _probe_calibers(change: Mapping[str, Any]) -> list[str]:
                     continue
                 launched.append(run.id)
     return launched
+
+
+#: 变化记录 affects 里试算情况的键（data/source_changes 再次探查到同一条变化时保留它）
+PROBES_KEY = "probes"
+
+
+def missing_inputs(pinned: Any, given: Mapping[str, Any] | None) -> list[str]:
+    """口径入口里必填、又没给值也没有缺省值的字段（按入口字段的先后）。"""
+    out = []
+    for f in pinned.entry_fields if pinned is not None else ():
+        name = str(f.get("name") or "").strip()
+        if not name or not f.get("required") or f.get("default") not in (None, ""):
+            continue
+        if (given or {}).get(name) in (None, ""):
+            out.append(name)
+    return out
+
+
+async def _probe_skipped(change: Mapping[str, Any], caliber: Any, pinned: Any, given: Mapping[str, Any] | None,
+                         inputs_from: str, reason: str) -> None:
+    """表结构变了、这一版口径没能试算：记一条日志，写进变化记录的 affects.probes（同一版只记一条，换成最新的说法）。"""
+    from app.db.models_sources import SourceChange
+
+    missing = missing_inputs(pinned, given)
+    name = getattr(pinned, "workflow_name", None) or caliber.workflow_id
+    said = f"缺少参数 {'、'.join(missing)}" if missing else reason
+    logger.info("表结构变了之后口径「%s」v%s 没有试算：%s（参数来自%s）", name, caliber.version, said,
+                {"formal": "最近一次正式运行", "answer": "等价的问数回答", "defaults": "入口的缺省值"}.get(inputs_from, inputs_from))
+    note = {"workflow_id": caliber.workflow_id, "version": caliber.version, "name": str(name), "outcome": "skipped",
+            "missing": missing, "reason": reason, "inputs_from": inputs_from}
+    async with SessionLocal() as session:
+        # 先占住那一行再读改写（SQLite 上拿到写锁、PostgreSQL 上锁住这一行）：几版口径同时记、探查同时刷新影响
+        # （source_changes.record）时一个接一个来，谁也不盖掉谁
+        await session.execute(update(SourceChange).where(SourceChange.id == change.get("id"))
+                              .values(seen_count=SourceChange.seen_count).execution_options(synchronize_session=False))
+        row = (await session.execute(select(SourceChange).where(SourceChange.id == change.get("id"))
+                                     .execution_options(populate_existing=True))).scalar_one_or_none()
+        if row is None:
+            await session.rollback()
+            return
+        affects = dict(row.affects or {})
+        kept = [p for p in affects.get(PROBES_KEY) or [] if isinstance(p, dict)
+                and (p.get("workflow_id"), p.get("version")) != (caliber.workflow_id, caliber.version)]
+        affects[PROBES_KEY] = [*kept, note]
+        row.affects = affects
+        await session.commit()
 
 
 async def _settle_probe(run: Run) -> str:
@@ -1568,24 +1684,32 @@ async def consume_source_changes() -> int:
         return 0
     _consuming.add(loop)
     try:
-        count = 0
-        while True:
-            async with SessionLocal() as session:
-                since = await _cursor(session)
-                batch = await source_changes.list_changes(session, since_seq=since, limit=200)
-            if not batch:
-                return count
-            for change in batch:
-                try:
-                    if basis_kind(change) is not None:
-                        await process_change(change)
-                        count += 1
-                except Exception:  # noqa: BLE001 - 一条出错不挡后面的
-                    logger.exception("召回处理变化记录 #%s 出错", change.get("seq"))
-            async with SessionLocal() as session:
-                await _set_cursor(session, int(batch[-1]["seq"]))
+        # 多进程：几个进程的探查、剖析结束时都会来拉，游标是设置表里先读后写的一行——跨进程的锁里一份接一份，后来的接着游标往下拉
+        from app.cluster import mutex
+
+        async with mutex.lock("ledger-consume-changes"):
+            return await _consume(source_changes)
     finally:
         _consuming.discard(loop)
+
+
+async def _consume(source_changes: Any) -> int:
+    count = 0
+    while True:
+        async with SessionLocal() as session:
+            since = await _cursor(session)
+            batch = await source_changes.list_changes(session, since_seq=since, limit=200)
+        if not batch:
+            return count
+        for change in batch:
+            try:
+                if basis_kind(change) is not None:
+                    await process_change(change)
+                    count += 1
+            except Exception:  # noqa: BLE001 - 一条出错不挡后面的
+                logger.exception("召回处理变化记录 #%s 出错", change.get("seq"))
+        async with SessionLocal() as session:
+            await _set_cursor(session, int(batch[-1]["seq"]))
 
 
 # ==========================================================================

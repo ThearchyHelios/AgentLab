@@ -136,9 +136,13 @@ langgraph==1.2.11
     # via agentlab-backend (pyproject.toml)
 langgraph-checkpoint==4.2.0
     # via
+    #   agentlab-backend (pyproject.toml)
     #   langgraph
+    #   langgraph-checkpoint-postgres
     #   langgraph-checkpoint-sqlite
     #   langgraph-prebuilt
+langgraph-checkpoint-postgres==3.1.2
+    # via agentlab-backend (pyproject.toml)
 langgraph-checkpoint-sqlite==3.1.1
     # via agentlab-backend (pyproject.toml)
 langgraph-prebuilt==1.1.0
@@ -167,6 +171,7 @@ oracledb==26.0.0
     # via agentlab-backend (pyproject.toml)
 orjson==3.12.0
     # via
+    #   langgraph-checkpoint-postgres
     #   langgraph-sdk
     #   langsmith
 ormsgpack==1.12.2
@@ -180,6 +185,16 @@ pillow==12.3.0
     # via python-pptx
 pluggy==1.6.0
     # via pytest
+psycopg==3.3.6
+    # via
+    #   agentlab-backend (pyproject.toml)
+    #   langgraph-checkpoint-postgres
+psycopg-binary==3.3.6 ; implementation_name != 'pypy'
+    # via psycopg
+psycopg-pool==3.3.3
+    # via
+    #   agentlab-backend (pyproject.toml)
+    #   langgraph-checkpoint-postgres
 pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
 pydantic==2.13.5
@@ -294,6 +309,8 @@ typing-extensions==4.16.0
     #   mcp
     #   openai
     #   oracledb
+    #   psycopg
+    #   psycopg-pool
     #   pydantic
     #   pydantic-core
     #   pytest-asyncio
@@ -309,6 +326,8 @@ typing-inspection==0.4.4
     #   mcp
     #   pydantic
     #   pydantic-settings
+tzdata==2026.5 ; sys_platform == 'win32'
+    # via psycopg
 urllib3==2.7.0
     # via requests
 uuid-utils==0.17.1

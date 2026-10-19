@@ -178,7 +178,9 @@ async def test_a_second_reindex_while_one_is_running_is_refused(client, monkeypa
 
     async def slow(session, collection=None, *, on_progress=None):
         await gate.wait()
-        return await real(session, collection, on_progress=on_progress)
+        # 放行之后只重建一个空集合：这里测的是「同时只跑一个」，不是重建本身。按全部集合重建要把同一个 xdist 进程里
+        # 别的测试留下的几百段都重算一遍，满载时超过 _wait_done 的 10 秒，后面两条测试跟着撞上「正在重建」
+        return await real(session, "reindex_gate_empty", on_progress=on_progress)
 
     monkeypatch.setattr(kb, "reindex", slow)
     try:
@@ -211,7 +213,7 @@ async def test_two_reindexes_started_at_the_same_moment_do_not_both_run(client, 
     async def slow(session, collection=None, *, on_progress=None):
         started.append(collection)
         await gate.wait()
-        return await real(session, collection, on_progress=on_progress)
+        return await real(session, "reindex_gate_empty", on_progress=on_progress)  # 理由同上一条
 
     monkeypatch.setattr(kb, "reindex", slow)
     try:

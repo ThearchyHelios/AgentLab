@@ -274,9 +274,14 @@ async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[
     from app.process import actions
 
     exec_no = next_exec(state, ctx.node.id)
+    # 幂等键按这次运行里的节点 id 算（子工作流里的写「sub/pay」）：以前按子图里的 id（pay）算，父图里同名的节点、套同一个
+    # 工作流的两个子工作流节点撞同一个键，后发的那一笔交回先发的回执、不发送。升级前子工作流里的写入按子图里的 id 记过键：
+    # 写入节点本身重新执行时（结果未知核实之后、失败后接着跑；审批恢复时子图从自己的断点接着跑，不走到这里）照旧认那个键
+    # （legacy_node_id），是不是这个节点的那一笔、是不是这一次的内容，由 actions.prepare 按那条记录的事件和内容指纹认
+    node_id, legacy = _action_ids(ctx)
     try:
-        prep = await actions.prepare(run_id=ctx.run.run_id, node_id=ctx.node.id, exec_no=exec_no,
-                                     capability=capability, args=args)
+        prep = await actions.prepare(run_id=ctx.run.run_id, node_id=node_id, exec_no=exec_no,
+                                     capability=capability, args=args, legacy_node_id=legacy)
     except actions.ActionFailed as e:
         raise NodeError(ctx.node.id, str(e)) from e
     if prep.receipt is not None:
@@ -317,11 +322,17 @@ async def _run_write(state: GraphState, ctx: NodeContext, name: str, args: dict[
     # 外部系统会把审批人当成申请人；无人值守的写入没有人确认，不写 act
     on_behalf = {"sub": prep.run.get("started_by"), "act": confirmer}
     try:
-        result = await actions.send(prep, capability, run_id=ctx.run.run_id, node_id=ctx.node.id,
-                                    exec_no=exec_no, emit=ctx.emit, on_behalf=on_behalf)
+        result = await actions.send(prep, capability, run_id=ctx.run.run_id, node_id=node_id,
+                                    exec_no=exec_no, emit=ctx.emit, on_behalf=on_behalf, confirm_node=ctx.node.id)
     except actions.ActionFailed as e:
         raise NodeError(ctx.node.id, str(e)) from e
     return _write_updates(ctx, result)
+
+
+def _action_ids(ctx: NodeContext) -> tuple[str, str | None]:
+    """写入的幂等键按哪个节点 id 算：(这次运行里的 id, 升级前按子图里的 id 记过的那种；最外层的为 None)。"""
+    node_id = ctx.run.global_id(ctx.node.id)
+    return node_id, ctx.node.id if node_id != ctx.node.id else None
 
 
 async def _confirmed_by(run_id: str, node_id: str) -> str | None:
@@ -334,7 +345,7 @@ async def _confirmed_by(run_id: str, node_id: str) -> str | None:
     async with SessionLocal() as session:
         return await session.scalar(select(Task.resolved_by).where(
             Task.run_id == run_id, Task.node_id == node_id, Task.kind == "action_confirm",
-            Task.status == "resolved").order_by(Task.created_at.desc()).limit(1))
+            Task.status == "resolved").order_by(Task.created_at.desc(), Task.id.desc()).limit(1))
 
 
 def _write_updates(ctx: NodeContext, result: dict[str, Any]) -> dict[str, Any]:

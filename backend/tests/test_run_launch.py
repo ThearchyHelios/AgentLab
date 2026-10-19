@@ -322,15 +322,16 @@ async def test_launch_events_are_written_with_the_run_or_not_at_all():
 
     from app.db.base import engine
     from app.engine.launch import launch_run
+    from tests.appdb import refuse_inserts
 
     lib = await upstream_with_two_versions()
     wf, _ = await workflow(weekly(lib, upgrade_policy="dual"), published=1, versions=(1,))
     before = await _run_count()
     # 口径升版处置那条写不进去。走异步引擎建删触发器：同步连接等写锁时会卡住事件循环，而持锁的正是这个循环里的写入
+    create, drop = refuse_inserts("run_events", "NEW.type = 'caliber.upgrade'", name="refuse_upgrade_note")
     async with engine.begin() as conn:
-        await conn.execute(text(
-            "CREATE TRIGGER refuse_upgrade_note BEFORE INSERT ON run_events WHEN NEW.type = 'caliber.upgrade' "
-            "BEGIN SELECT RAISE(ABORT, 'refused by test'); END"))
+        for sql in create:
+            await conn.execute(text(sql))
     try:
         async with SessionLocal() as session:
             with pytest.raises(IntegrityError):
@@ -338,7 +339,8 @@ async def test_launch_events_are_written_with_the_run_or_not_at_all():
         assert await _run_count() == before, "没写进治理事件，却留下了一条运行"
     finally:
         async with engine.begin() as conn:
-            await conn.execute(text("DROP TRIGGER IF EXISTS refuse_upgrade_note"))
+            for sql in drop:
+                await conn.execute(text(sql))
 
 
 async def test_an_exploratory_launch_takes_the_saved_graph_and_the_run_defaults():

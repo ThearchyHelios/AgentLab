@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from app.core import atomic
 from app.core.config import settings, sanitize_session
 from app.core.errors import describe_exception, raw
 from app.sandbox import interpreter
@@ -107,13 +108,13 @@ class LocalSandbox(Sandbox):
             )
 
         workdir = self._session_dir(session_id or f"tmp-{int(time.time()*1000)}")
-        (workdir / entry).write_text(code)
+        atomic.write_text(workdir / entry, code)
         for rel, content in (files or {}).items():
             target = (workdir / rel).resolve()
             if not str(target).startswith(str(workdir.resolve())):
                 return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
+            atomic.write_text(target, content)
 
         # 只透传最小环境变量，避免把宿主机的 API key 泄漏给被执行的代码
         child_env = {

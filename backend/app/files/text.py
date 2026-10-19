@@ -20,6 +20,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from app.core import atomic
 from app.files.store import as_ref, bound_files, files_root, read_blob
 
 logger = logging.getLogger(__name__)
@@ -73,10 +74,8 @@ def extract_text(sha: str, name: str, mime: str) -> tuple[str | None, str | None
         if text is not None and not text.strip():
             text, problem = None, "没有抽出文字（可能是扫描件）"
     try:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"text": text, "problem": problem}, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(cache)
+        # 临时文件名带随机后缀（core/atomic）：两个进程同时抽同一个附件，不会一个把另一个写到一半的改名过去
+        atomic.write_text(cache, json.dumps({"text": text, "problem": problem}, ensure_ascii=False))
     except OSError:
         logger.warning("附件 %s 抽出的文字没能缓存", name, exc_info=True)
     return text, problem

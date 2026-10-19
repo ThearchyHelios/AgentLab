@@ -35,6 +35,7 @@ from app.db.base import SessionLocal, utcnow
 from app.db.models import (
     App, Approval, AppVersion, AuditEvent, Group, GroupMember, Run, Task, TaskAssignment, User,
 )
+from app.db.portable import json_text
 from app.engine.lint_process import normalize_policy, parse_duration
 from app.process.events import record
 
@@ -913,7 +914,7 @@ async def tick(now: datetime | None = None) -> list[str]:
     """调度循环每一拍：提醒、升级、超时驳回（永不自动批准）。交回这一拍处理过的待办 id（生效可查：办了哪几条，
     不只是几条；测试按自己造的那条断言，不受同一个库里别的待办影响）。试运行的待办不处理（只显示时限）。"""
     now = now or utcnow()
-    action = func.json_extract(Task.on_timeout, "$.action")
+    action = json_text(Task.on_timeout, "action")
     trial = select(Run.id).where(Run.origin_kind == TRIAL_ORIGIN)
     async with SessionLocal() as session:
         due = list((await session.execute(select(Task.id).where(
@@ -921,7 +922,7 @@ async def tick(now: datetime | None = None) -> list[str]:
                 and_(Task.remind_at.is_not(None), Task.remind_at <= now),
                 and_(Task.due_at.is_not(None), Task.due_at <= now, action == "reject"),
                 and_(Task.due_at.is_not(None), Task.due_at <= now, action == "escalate", Task.escalation_level == 0),
-            )).order_by(Task.due_at))).scalars())
+            )).order_by(Task.due_at, Task.id))).scalars())
     done: list[str] = []
     for task_id in due:
         try:
@@ -1022,16 +1023,27 @@ def _aware(moment: datetime) -> datetime:
 # --------------------------------------------------------------------------
 
 
-async def startup() -> int:
+async def startup(*, live: Any = None) -> int:
     """启动时：存量的待审批补建 Task（派给任何人，幂等）；上次停在 resolving 的（判定之后、恢复之前进程没了）按 Approval
-    的状态收拾——还在等的退回 pending、撤回那一票，已经交给引擎的记成已处理。返回补建的条数。"""
+    的状态收拾——还在等的退回 pending、撤回那一票，已经交给引擎的记成已处理。返回补建的条数。
+
+    多进程：别的进程活着时，resolving 可能正是它在判定、恢复（几秒的事），只收拾停在 resolving 超过两个租约时长的；当班进程隔一会儿
+    来的那一次（live.trust_mine）不论有没有别的进程都这样——本进程自己也可能正在判定。只有启动时、又没有别的进程的那一次全收拾。"""
+    from datetime import timedelta
+
+    from app.cluster import state
+    from app.cluster.workers import lease_s
+
+    live = live if live is not None else await state.current(fresh=True)
+    stale_before = utcnow() - timedelta(seconds=2 * lease_s()) if (live.others or live.trust_mine) else None
     async with SessionLocal() as session:
         orphans = list((await session.execute(
             select(Approval).outerjoin(Task, Task.approval_id == Approval.id)
             .where(Approval.status == "pending", Task.id.is_(None)))).scalars())
         for approval in orphans:
             await open_task(session, approval)
-        stuck = list((await session.execute(select(Task).where(Task.status == "resolving"))).scalars())
+        stuck = list((await session.execute(select(Task).where(
+            Task.status == "resolving", *((Task.updated_at < stale_before,) if stale_before is not None else ())))).scalars())
         for task in stuck:
             waiting = task.approval_id and await session.scalar(
                 select(Approval.status).where(Approval.id == task.approval_id)) == "pending"
@@ -1093,7 +1105,8 @@ async def _assignments(session: AsyncSession, task_ids: list[str], *, fresh: boo
                        ) -> dict[str, list[TaskAssignment]]:
     if not task_ids:
         return {}
-    stmt = select(TaskAssignment).where(TaskAssignment.task_id.in_(task_ids)).order_by(TaskAssignment.created_at)
+    stmt = (select(TaskAssignment).where(TaskAssignment.task_id.in_(task_ids))
+            .order_by(TaskAssignment.created_at, TaskAssignment.id))
     if fresh:
         stmt = stmt.execution_options(populate_existing=True)
     out: dict[str, list[TaskAssignment]] = {}
@@ -1124,7 +1137,7 @@ def _mine(principal: Any) -> Any:
 async def list_tasks(principal: Any, *, assigned: str = "me", statuses: list[str] | None = None,
                      app_id: str | None = None, run_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     async with SessionLocal() as session:
-        stmt = select(Task).order_by(Task.created_at.desc()).limit(limit)
+        stmt = select(Task).order_by(Task.created_at.desc(), Task.id.desc()).limit(limit)
         if statuses:
             stmt = stmt.where(Task.status.in_(statuses))
         if app_id:

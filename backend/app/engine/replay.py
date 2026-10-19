@@ -75,4 +75,32 @@ async def ask(ctx: NodeContext, payload: dict[str, Any], **request: Any) -> Any:
     答复真正到达的那次执行里出现。
     """
     await once(ctx, EventType.HUMAN_REQUESTED, **request)
-    return interrupt(payload)
+    route = reject_route(ctx) if isinstance(payload, dict) else None
+    return interrupt({**payload, "reject_route": route} if route else payload)
+
+
+def reject_route(ctx: NodeContext) -> dict[str, Any] | None:
+    """驳回之后去哪（总方案 §3 的驳回出口），放进中断内容：待办卡的提示、驳回之后的那句、处理过的结果照它说，不再一律写
+    「转入驳回分支」或「本次运行终止」。
+
+    - {"to": [{node_id, label}]}：接了驳回出口，驳回后转到这几步（节点 id、名字按这次运行的说法：子工作流里的写
+      「子工作流 › x」，同 compiler._rejected_exit 记在 node.finished 上的 to）；
+    - {"ends": "run"}：运行就此结束、记为被驳回（没接驳回出口的关卡；审批设了驳回即终止时驳回出口走不到，也是这样）；
+    - {"ends": "path"}：审批模式没接驳回出口、没设驳回即终止：这一路到审批为止，不再往下走（engine/nodes/human）。
+
+    不是关卡的节点（agent 自己调工具时的审批：驳回了 agent 照常往下想）为 None，中断内容和以前一字不差。"""
+    from app.engine.schema import GATE_TYPES, approve_mode, reject_targets
+
+    node, spec = ctx.node, ctx.run.spec
+    if node.type not in GATE_TYPES:
+        return None
+    approving = approve_mode(spec, node)
+    if approving and bool(ctx.cfg("stop_on_reject", False)):
+        return {"ends": "run"}
+    targets = reject_targets(spec, node)
+    if targets:
+        nodes = spec.node_map()
+        return {"to": [{"node_id": ctx.run.global_id(t),
+                        "label": ctx.run.global_label(nodes[t].title if t in nodes else t)}
+                       for t in dict.fromkeys(targets)]}
+    return {"ends": "path" if approving else "run"}

@@ -297,6 +297,28 @@ async def test_users_issue_only_versions_pinned_by_apps_they_can_use(monkeypatch
     assert created and formal.started_by == "carol" and formal.origin["granted_by_app"] == board_id
 
 
+async def test_different_answers_issued_at_once_stop_exactly_at_the_daily_limit(monkeypatch):
+    """几份不同的答案同时出具（不再一把全站锁一个接一个）：先在库里占今天的额度再发起，正好到上限为止，多出来的回 429。"""
+    wf = await S.publish(level="published")
+    rows = [await equivalent_run(monkeypatch) for _ in range(3)]
+    from app.cluster import quota
+
+    async with SessionLocal() as session:
+        issued = await ledger_issue.issued_today(session)
+    # 今天的额度在库里记着（同一个测试进程里前面的测试也出具过）；还没记过的按今天已出具的起算
+    already = await quota.used(ledger_issue.QUOTA)
+    already = issued if already is None else already
+    await set_ledger(issue_daily_limit=max(already, issued) + 2)
+    results = await asyncio.gather(*(ledger_issue.issue(r.id, wf, 1, principal=ADMIN) for r in rows),
+                                   return_exceptions=True)
+    made = [r for r in results if not isinstance(r, BaseException)]
+    refused = [r for r in results if isinstance(r, ledger_issue.IssueRefused)]
+    assert len(made) == 2 and all(created for _, created in made), results
+    assert len(refused) == 1 and refused[0].status_code == 429 and refused[0].code == ledger_issue.DAILY_LIMIT
+    async with SessionLocal() as session:
+        assert await ledger_issue.issued_today(session) == issued + 2
+
+
 async def test_concurrent_requests_issue_once(monkeypatch):
     wf = await S.publish(level="published")
     row = await equivalent_run(monkeypatch)

@@ -53,7 +53,7 @@ async def pick_baseline(session: AsyncSession, run: Any, *, explicit: str | None
     rows = (await session.execute(
         select(EvalRun).where(EvalRun.suite_id == run.suite_id, EvalRun.id != run.id,
                               EvalRun.created_at < run.created_at, EvalRun.status.in_(BASELINE_STATUSES))
-        .order_by(EvalRun.created_at.desc()).limit(200))).scalars().all()
+        .order_by(EvalRun.created_at.desc(), EvalRun.id.desc()).limit(200))).scalars().all()
     same = [r for r in rows if (r.fingerprint or {}).get("variant_key") == key]
     pinned = next((r for r in same if r.pinned), None)
     return pinned or (same[0] if same else None)

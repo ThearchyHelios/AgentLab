@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import defaultdict
+from collections.abc import Callable
 from typing import AsyncIterator
 
 from app.core.events import RunEventModel
@@ -23,12 +24,16 @@ class EventBus:
 
     只负责实时分发；历史事件由 DB 承担，订阅者接入时先读库补齐再接实时流，
     这样刷新页面或中途接入都能看到完整时间线。
+
+    多进程（app/cluster/relay.py）：本进程发布的每一条也交给 tap（转发器据此给别的进程发通知、给在看的进程转流式增量）；
+    别的进程执行的运行，转发器从库里按 seq 读出来再在本进程发布一遍（relayed=True，不再交给 tap，免得来回转）。
     """
 
     def __init__(self) -> None:
         self._subs: dict[str, set[_Subscriber]] = defaultdict(set)
         self._seq: dict[str, int] = defaultdict(int)
         self._lock = asyncio.Lock()
+        self.tap: Callable[[RunEventModel], None] | None = None
 
     def next_seq(self, run_id: str) -> int:
         self._seq[run_id] += 1
@@ -38,7 +43,12 @@ class EventBus:
         """恢复一个已存在的 run 时，把序号接上，保证前端排序不乱。"""
         self._seq[run_id] = max(self._seq[run_id], value)
 
-    async def publish(self, event: RunEventModel) -> None:
+    async def publish(self, event: RunEventModel, *, relayed: bool = False) -> None:
+        if not relayed and self.tap is not None:
+            try:
+                self.tap(event)
+            except Exception:  # noqa: BLE001 - 转发出错不能拦住本进程的推送
+                pass
         for sub in list(self._subs.get(event.run_id, ())):
             try:
                 sub.queue.put_nowait(event)

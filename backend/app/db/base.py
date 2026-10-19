@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import json
+import logging
+import math
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
-from sqlalchemy import JSON, DateTime, MetaData, event
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import JSON, BigInteger, Column, DateTime, Integer, MetaData, event
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import NullPool
+from sqlalchemy.engine import make_url
 from sqlalchemy.types import TypeDecorator
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -25,6 +33,14 @@ def utcnow() -> datetime:
 
 def new_id() -> str:
     return uuid.uuid4().hex
+
+
+def current_owner() -> str:
+    """认领一行时记的属主：这个工作进程（app/cluster/identity.OWNER）。运行、问数据的一轮、各种后台任务表的 owner 列缺省取它：
+    建这一行的进程就是认领它的进程，和这一行同一个事务写下，不会有「行建好了、还没人认领」的空档（多进程，W2-b）。"""
+    from app.cluster.identity import owner
+
+    return owner()
 
 
 class UTCDateTime(TypeDecorator):
@@ -57,11 +73,31 @@ class UTCDateTime(TypeDecorator):
         return value.astimezone(timezone.utc)
 
 
+#: 应用库的 JSON 列：两种库上都是存原文的 JSON（PostgreSQL 的 json，不是 JSONB）。JSONB 会把对象里的键重新排序：
+#: 应用里不少地方按存进去的键的先后出东西（快照的列、表的先后、复核结论各段的先后），换成 JSONB 读回来就变了样，
+#: 测试当场抓到好几处。json 的代价是没有相等运算符：== 比较、DISTINCT、GROUP BY、ORDER BY 不能直接作用在整列上
+#: （应用里没有这种写法，test_db_portable 守着）；按里面某个键筛选走 db/portable 的 json_eq 等，只把取出来的那一小段
+#: 转成 JSONB 比较
+PortableJSON = JSON()
+
+
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
-    # 图定义、节点配置、事件负载都是任意形状的 JSON，统一映射到 SQLite 的 JSON 列
-    type_annotation_map = {dict[str, Any]: JSON, list[Any]: JSON, datetime: UTCDateTime}
+    # 图定义、节点配置、事件负载都是任意形状的 JSON，统一映射到 JSON 列（见 PortableJSON）
+    type_annotation_map = {dict[str, Any]: PortableJSON, list[Any]: PortableJSON, datetime: UTCDateTime}
+
+
+@event.listens_for(Column, "after_parent_attach")
+def _portable_integer(column: Column, table: Any) -> None:
+    """应用库的 Integer 列在 PostgreSQL 上换成 BIGINT（SQLite 照旧是 INTEGER，主键照旧是 rowid）。
+
+    SQLite 的 INTEGER 是 64 位，PostgreSQL 的只有 32 位：行数估计、字节数、累计的计数都可能过 21 亿。在列挂到表上
+    的那一刻换（定义模型时，任何查询之前）：建表是 BIGINT（自增主键是 BIGSERIAL），和这一列比较、写进这一列的绑定
+    参数也按 BIGINT 转换。只管挂在应用 metadata 上、类型正好是 Integer 的列；业务数据源那边的表不受影响。"""
+    if getattr(table, "metadata", None) is Base.metadata and type(column.type) is Integer \
+            and not column.type._variant_mapping:
+        column.type = Integer().with_variant(BigInteger(), "postgresql")
 
 
 class TimestampMixin:
@@ -101,16 +137,10 @@ def _stop_aiosqlite_once() -> None:
     aiosqlite.Connection.stop = stop  # type: ignore[method-assign]
 
 
+# 应用库是 PostgreSQL 时也照样打：上传表格、手工登记的 SQLite 业务库（data/engine）还是走 aiosqlite 的连接池
 _stop_aiosqlite_once()
-# pool_pre_ping：取连接前先探一下活。取消异常打进 SQLAlchemy 的清理流程时
-# （_close_connection 记完日志会把 CancelledError 原样抛出，跳过了把连接记录
-# 清空的那一行），已经关掉的连接会留在池里，下一个取到它的人拿到的是
-# "no active connection"。探活失败会被当成断开，换一条新的——SQLite 本地一次
-# SELECT 1 的代价，换池子不被污染。
-engine = create_async_engine(settings.db_url, echo=False, future=True, pool_pre_ping=True)
 
 
-@event.listens_for(engine.sync_engine, "connect")
 def _set_sqlite_pragma(dbapi_conn, _record):  # pragma: no cover - 驱动回调
     """WAL + 外键约束。WAL 让读写不互相阻塞，事件写入和前端轮询能并行。"""
     cur = dbapi_conn.cursor()
@@ -120,7 +150,191 @@ def _set_sqlite_pragma(dbapi_conn, _record):  # pragma: no cover - 驱动回调
     cur.close()
 
 
+def _finite(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
+
+
+def _no_nul(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {_no_nul(k): _no_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_no_nul(v) for v in value]
+    return value
+
+
+def pg_json_dumps(value: Any) -> str:
+    """PostgreSQL 上写 JSON 列。它不收 NaN / Infinity（SQLite 照存）；字符串里的 \\u0000 json 列收，但一转成 JSONB
+    （按键筛选时，db/portable）、一取成文本就报错，那一整条查询跟着失败。
+
+    非有限的浮点写成 null（同浏览器的 JSON.stringify），字符串里的 NUL 字符去掉；平常的值一次 dumps 就过，
+    只有碰上了才多走一遍。"""
+    try:
+        text = json.dumps(value, allow_nan=False)
+    except ValueError:
+        text = json.dumps(_finite(value), allow_nan=False)
+    if "\\u0000" in text:
+        text = json.dumps(_no_nul(json.loads(text)), allow_nan=False)
+    return text
+
+
+#: 应用连 PostgreSQL 时报的 application_name。copy-to-postgres 按它认目标库上还有没有服务连着（它自己报的是 agentlab-copy）
+APPLICATION_NAME = "agentlab"
+
+
+def pg_engine_kwargs(*, application_name: str = APPLICATION_NAME, pgbouncer: bool = False,
+                     pool_size: int | None = None) -> dict[str, Any]:
+    """PostgreSQL 引擎的连接池和连接参数。pgbouncer：这个地址是 PgBouncer 的事务模式（AGENTLAB_DB_PGBOUNCER）——
+
+    - 不用客户端的连接池（NullPool，连接池交给 PgBouncer；SQLAlchemy 的说明里同样这么建议）；
+    - SQLAlchemy 的预备语句缓存（prepared_statement_cache_size）和 asyncpg 自己的（statement_cache_size）都关掉：事务模式下同一个
+      客户端连接的下一条语句可能落在另一条服务端连接上，缓存着的预备语句在那边不存在；
+    - asyncpg 每条语句仍要先预备再执行（SQLAlchemy 的 asyncpg 方言一律这么做，同一个事务里，落在同一条服务端连接上），名字用随机的
+      （prepared_statement_name_func），不和别的客户端在同一条服务端连接上留下的撞名。PgBouncer 要配 server_reset_query=DISCARD ALL
+      （且 server_reset_query_always=1）收掉留下的预备语句，或用 1.21 以上开 max_prepared_statements。
+    事务级的咨询锁（pg_advisory_xact_lock，发名额、同源队、建表时用）在事务模式下照常成立：取锁和放锁都在同一个事务里。"""
+    connect_args: dict[str, Any] = {
+        # 会话时区定成 UTC：时间列是不带时区的 UTC（UTCDateTime），库里 now() 之类的也按 UTC 算
+        "server_settings": {"application_name": application_name, "timezone": "UTC"}}
+    size = settings.db_pool_size if pool_size is None else pool_size
+    if pgbouncer:
+        connect_args.update(statement_cache_size=0, prepared_statement_cache_size=0,
+                            prepared_statement_name_func=_unique_statement_name)
+        return {"poolclass": NullPool, "connect_args": connect_args}
+    if size <= 0:
+        return {"poolclass": NullPool, "connect_args": connect_args}
+    return {"pool_size": size, "max_overflow": max(settings.db_max_overflow, 0), "pool_timeout": settings.db_pool_timeout,
+            "pool_recycle": settings.db_pool_recycle, "connect_args": connect_args}
+
+
+def _unique_statement_name() -> str:
+    return f"__agentlab_{uuid.uuid4().hex}__"
+
+
+def make_engine(url: str | None = None, *, application_name: str = APPLICATION_NAME, pgbouncer: bool | None = None,
+                pool_size: int | None = None) -> AsyncEngine:
+    """应用库的引擎。SQLite：WAL、外键、忙等，单个文件；PostgreSQL：连接池、方言调整（db/postgres.py）。
+
+    copy-to-postgres 建目标库的引擎也走这里，两边的列类型、排序规则是同一套。
+    """
+    url = url or settings.db_url
+    if pgbouncer is None:
+        # 只有应用库的普通地址按 AGENTLAB_DB_PGBOUNCER 处理：直连地址、copy-to-postgres 给的目标库照常
+        pgbouncer = bool(settings.db_pgbouncer) and url == settings.database_url
+    if url.startswith("sqlite"):
+        # pool_pre_ping：取连接前先探一下活。取消异常打进 SQLAlchemy 的清理流程时
+        # （_close_connection 记完日志会把 CancelledError 原样抛出，跳过了把连接记录
+        # 清空的那一行），已经关掉的连接会留在池里，下一个取到它的人拿到的是
+        # "no active connection"。探活失败会被当成断开，换一条新的——SQLite 本地一次
+        # SELECT 1 的代价，换池子不被污染。
+        made = create_async_engine(url, echo=False, future=True, pool_pre_ping=True)
+        event.listen(made.sync_engine, "connect", _set_sqlite_pragma)
+        return made
+    from app.db import postgres
+
+    _require_postgres_driver("asyncpg")
+    made = create_async_engine(url, echo=False, future=True, pool_pre_ping=True, json_serializer=pg_json_dumps,
+                               **pg_engine_kwargs(application_name=application_name, pgbouncer=pgbouncer,
+                                                  pool_size=pool_size))
+    postgres.install(made.sync_engine.dialect)
+    event.listen(made.sync_engine, "before_cursor_execute", postgres.strip_nul, retval=True)
+    return made
+
+
+def _require_postgres_driver(*modules: str) -> None:
+    """设了 AGENTLAB_DATABASE_URL 却没装 [postgres]：说清楚要装什么，不丢一个光秃秃的 ModuleNotFoundError。"""
+    import importlib.util
+
+    missing = [m for m in modules if importlib.util.find_spec(m) is None]
+    if missing:
+        raise RuntimeError(
+            f"应用库设成了 PostgreSQL（AGENTLAB_DATABASE_URL），但没装它要的包（{'、'.join(missing)}）："
+            "pip install -e 'backend[postgres]' -c backend/requirements.lock")
+
+
+def describe_database() -> str:
+    """启动日志里的一句：用的是哪种库、在哪（不写密码）。"""
+    from app.db.urls import describe
+
+    if settings.checkpoint_url:
+        points = f"断点在 PostgreSQL {describe(settings.checkpoint_url)}"
+    elif settings.db_dialect == "sqlite":
+        points = f"断点 {settings.checkpoint_path}"
+    else:
+        points = "断点在同一个库"
+    if settings.db_dialect == "sqlite":
+        return f"SQLite（{settings.db_path}，{points}）"
+    return f"PostgreSQL（{describe(settings.db_url)}，{points}）"
+
+
+engine = make_engine()
+
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+_session_engine: AsyncEngine | None = None
+
+
+def session_engine() -> AsyncEngine:
+    """依赖会话状态的连接用的引擎（跨进程锁的会话级咨询锁，app/cluster/mutex）：设了 AGENTLAB_DATABASE_DIRECT_URL 时是直连那个库的
+    一个小池子，否则就是应用库的引擎。"""
+    global _session_engine
+    if not settings.database_direct_url or settings.database_direct_url == settings.database_url:
+        return engine
+    if _session_engine is None:
+        _session_engine = make_engine(settings.database_direct_url, pgbouncer=False, pool_size=max(2, min(settings.db_pool_size or 5, 10)))
+    return _session_engine
+
+
+async def dispose_session_engine() -> None:
+    """关停时关掉直连那个小池子（没另建就什么都不做）。"""
+    global _session_engine
+    if _session_engine is not None:
+        await _session_engine.dispose()
+        _session_engine = None
+
+
+def check_pgbouncer() -> None:
+    """AGENTLAB_DB_PGBOUNCER=1 时直连地址要真的是直连：没给、或者给的和应用库地址指着同一个主机端口（还是那个 PgBouncer），都拒绝
+    启动（事务模式下 LISTEN、会话级咨询锁不成立，跨进程的锁会锁不住、放不掉；复核 R-b12）。"""
+    if not (settings.db_pgbouncer and settings.db_dialect == "postgresql"):
+        return
+    if not settings.database_direct_url:
+        raise RuntimeError("AGENTLAB_DB_PGBOUNCER=1（应用库地址是 PgBouncer 的事务模式）时要另给 AGENTLAB_DATABASE_DIRECT_URL："
+                           "进程间通知（LISTEN）、跨进程的锁（会话级咨询锁）、断点库要直连 PostgreSQL（或 PgBouncer 的会话模式）。"
+                           "见 README「多进程」里的「直连与 PgBouncer」")
+    if _endpoint(settings.database_direct_url) == _endpoint(settings.database_url):
+        from app.db.urls import describe
+
+        raise RuntimeError(f"AGENTLAB_DATABASE_DIRECT_URL 和 AGENTLAB_DATABASE_URL 指着同一个地址（{describe(settings.database_url)}）："
+                           "AGENTLAB_DB_PGBOUNCER=1 说应用库地址是 PgBouncer 的事务模式，直连地址要绕过它、直接连 PostgreSQL"
+                           "（或者 PgBouncer 的会话模式那个端口）。见 README「多进程」里的「直连与 PgBouncer」")
+
+
+def _endpoint(url: str) -> tuple[str, int]:
+    """地址连的是哪个主机端口（端口不写按 5432）。主机名规范化：localhost、127.x.x.x、::1 都算本机回环；IP 地址按地址比
+    （::ffff:10.0.0.5 和 10.0.0.5 相同）；解析不成 IP 的按字面（小写）比，不查 DNS。"""
+    import ipaddress
+
+    parsed = make_url(url)
+    host = (parsed.host or "").strip().strip("[]").lower().rstrip(".")
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if host == "localhost" or host.endswith(".localhost") or (addr is not None and addr.is_loopback):
+        host = "loopback"
+    elif addr is not None:
+        host = str(addr)
+    return host, int(parsed.port or 5432)
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -129,8 +343,10 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
-# 轻量迁移：create_all 只建新表，不给已有表加列。SQLite 的 ADD COLUMN
-# 便宜且带默认值回填，够用；等真需要改列类型再考虑 alembic。
+# 轻量迁移：create_all 只建新表，不给已有表加列。ADD COLUMN 便宜且带默认值回填，够用；等真需要改列类型再考虑 alembic。
+# 第三项照 SQLite 写（类型和缺省值的字面量）。PostgreSQL 上类型取模型里这一列的（按应用库的方言调整编译：String(n)
+# 是 VARCHAR、Integer 是 BIGINT、JSON 是 json、时间是 TIMESTAMP），缺省值取这里写的，布尔的 0 / 1 换成 false / true
+# （_column_ddl）。所以这里加的每一列模型里都得有：test_db_portable 守着
 _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("runs", "run_class", "TEXT DEFAULT 'exploratory'"),
     ("runs", "version", "INTEGER"),
@@ -247,12 +463,30 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("schedule_fires", "eval_run_id", "VARCHAR(32)"),
     # 编排完善（docs/design/orchestration-round/00-总方案.md §4）：定时任务的触发方式。存量行都是 cron
     ("schedules", "trigger_kind", "VARCHAR(20) DEFAULT 'cron'"),
-    ("schedules", "trigger", "JSON"),
+    # 第一版补这一列时没带缺省值：在那之前建过定时任务的库里这一列是 NULL（读时 or {} 兜着），模型是 NOT NULL。
+    # 现在带上缺省值；已经补过、留着 NULL 的由 _NOT_NULL_BACKFILLS 填上
+    ("schedules", "trigger", "JSON DEFAULT '{}'"),
     # 第 2 波：服务账号（users.kind）；剖析上传表格源时的快照
     ("users", "kind", "VARCHAR(20) DEFAULT 'person'"),
     ("catalog_profile_tasks", "snapshot_id", "VARCHAR(32)"),
     # 第 3 波：发布时这一版引用的表的结构版本
     ("workflow_versions", "schema_versions", "JSON"),
+    # 编排完善第 2 波 W2-b（多进程协调）：认领这一行的工作进程（app/cluster）。存量行为空：升级前的进程认领的，按「属主不在了」
+    # 处理（升级要停掉全部进程再起）
+    ("runs", "owner", "VARCHAR(120)"),
+    ("chat_turn_jobs", "owner", "VARCHAR(120)"),
+    ("catalog_draft_jobs", "owner", "VARCHAR(120)"),
+    ("catalog_profile_jobs", "owner", "VARCHAR(120)"),
+    ("introspect_jobs", "owner", "VARCHAR(120)"),
+    ("eval_runs", "owner", "VARCHAR(120)"),
+    ("eval_catalog_snapshots", "owner", "VARCHAR(120)"),
+    ("documents", "owner", "VARCHAR(120)"),
+    ("publish_plans", "owner", "VARCHAR(120)"),
+    # 问数据：等不及的那次复核还在后台跑（实时流在它回来之前不关；多进程时别的进程上的流也看得到）
+    ("chat_turn_jobs", "late_review_at", "DATETIME"),
+    # 工作进程登记的代码版本、库结构版本（app/cluster/version.py：不许新旧版本混跑）
+    ("cluster_workers", "code_version", "VARCHAR(200)"),
+    ("cluster_workers", "schema_version", "VARCHAR(64)"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。
@@ -272,46 +506,286 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
 ]
 
 
+#: 补列时没带缺省值、存量行留着 NULL 的 NOT NULL 列：每次启动按模型的缺省值填上（UPDATE … WHERE 列 IS NULL，填完再跑
+#: 什么都不改）。两种库存的才一样，导入 PostgreSQL 时这一列也不会撞 NOT NULL。以后新加的 NOT NULL 列在迁移表里一律带
+#: DEFAULT（test_db_portable 守着），就不用往这里加
+_NOT_NULL_BACKFILLS: list[tuple[str, str]] = [("schedules", "trigger")]
+
+
+def model_default(column: Any) -> tuple[bool, Any]:
+    """模型列的缺省值：(有没有, 值)。标量原样，无参的可调用（dict、list、utcnow 之类）调一次；要按执行上下文算的不算。"""
+    default = getattr(column, "default", None)
+    if default is None:
+        return False, None
+    if default.is_scalar:
+        return True, default.arg
+    if default.is_callable:
+        try:
+            return True, default.arg(None)
+        except Exception:  # noqa: BLE001 - 要读执行上下文的缺省值：这里给不出
+            return False, None
+    return False, None
+
+
+def _backfill_not_null(conn: Any, columns: dict[str, set[str]]) -> None:
+    from sqlalchemy import Table, update
+
+    for table_name, column_name in _NOT_NULL_BACKFILLS:
+        if column_name not in (columns.get(table_name) or set()):
+            continue
+        model = Base.metadata.tables[table_name].c[column_name]
+        known, value = model_default(model)
+        if not known:
+            continue
+        # 只带这一列的表：模型表上 updated_at 的 onupdate 会跟着改（这是补数据，不是改了这一行），老库也未必有那一列
+        bare = Table(table_name, MetaData(), Column(column_name, model.type))
+        conn.execute(update(bare).where(bare.c[column_name].is_(None)).values({column_name: value}))
+
+
 #: 迁移补建的唯一索引：(索引名, 表, 列, 部分索引的条件, 建之前的去重语句)。只在索引还不存在时先去重再建——存量库里可能
 #: 已经有并发留下的重复行，直接建会失败。去重的规矩写在各自的语句里：多出的钩子行删掉（只留最早的那一行，它的密钥照旧
-#: 能用），多出的助手对话归档（不删，历史还在）
+#: 能用），多出的助手对话归档（不删，历史还在）。条件和语句里的 {false} / {true} 按方言换成布尔的字面量（SQLite 是 0 / 1）
 _UNIQUE_INDEX_MIGRATIONS: list[tuple[str, str, tuple[str, ...], str | None, str]] = [
     ("ux_app_hooks_app_name", "app_hooks", ("app_id", "name"), None,
      "DELETE FROM app_hooks WHERE id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER "
-     "(PARTITION BY app_id, name ORDER BY created_at, id) AS rn FROM app_hooks) WHERE rn = 1)"),
-    ("ux_conversations_app_owner", "conversations", ("app_id", "created_by"), "kind = 'app' AND archived = 0",
-     "UPDATE conversations SET archived = 1 WHERE kind = 'app' AND archived = 0 AND created_by IS NOT NULL "
+     "(PARTITION BY app_id, name ORDER BY created_at, id) AS rn FROM app_hooks) AS ranked WHERE rn = 1)"),
+    ("ux_conversations_app_owner", "conversations", ("app_id", "created_by"), "kind = 'app' AND archived = {false}",
+     "UPDATE conversations SET archived = {true} WHERE kind = 'app' AND archived = {false} AND created_by IS NOT NULL "
      "AND id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY app_id, created_by "
-     "ORDER BY last_active_at DESC, id) AS rn FROM conversations WHERE kind = 'app' AND archived = 0 "
-     "AND created_by IS NOT NULL) WHERE rn = 1)"),
+     "ORDER BY last_active_at DESC, id) AS rn FROM conversations WHERE kind = 'app' AND archived = {false} "
+     "AND created_by IS NOT NULL) AS ranked WHERE rn = 1)"),
 ]
+
+#: 布尔字面量：SQLite 的布尔列存 0 / 1
+_BOOL_LITERALS = {"sqlite": {"false": "0", "true": "1"}, "postgresql": {"false": "false", "true": "true"}}
+
+_DEFAULT = re.compile(r"\s+DEFAULT\s+(.+)$", re.I | re.S)
+
+
+def _column_ddl(dialect: Any, table: str, column: str, ddl: str) -> str:
+    """ADD COLUMN 里列名后面那一段。SQLite 原样用迁移表里写的；PostgreSQL 类型取模型里这一列的，缺省值取迁移表里的。"""
+    if dialect.name == "sqlite":
+        return ddl
+    from sqlalchemy import Boolean
+
+    from app.db.postgres import AppTypeCompiler
+
+    col = Base.metadata.tables[table].c[column]
+    out = AppTypeCompiler(dialect).process(col.type, type_expression=col)
+    if match := _DEFAULT.search(ddl):
+        default = match.group(1).strip()
+        if isinstance(col.type, Boolean):
+            default = {"0": "false", "1": "true"}.get(default, default)
+        out += f" DEFAULT {default}"
+    return out
 
 
 def _migrate(conn) -> None:  # pragma: no cover - 同步回调
-    from sqlalchemy import text
+    """给老库补列、补索引。已有的列和索引按 inspector 认（两种库同一套），再跑一遍什么都不做。"""
+    from sqlalchemy import inspect, text
 
+    dialect = conn.dialect
+    literals = _BOOL_LITERALS.get(dialect.name, _BOOL_LITERALS["postgresql"])
+    inspector = inspect(conn)
+    tables = set(inspector.get_table_names())
+    columns = {t: {c["name"] for c in inspector.get_columns(t)} for t in tables}
+    # IF NOT EXISTS：PostgreSQL 上多个进程同时启动，各自的检查和补列之间别人可能已经补上了（init_db 另外拿着锁）
+    add = "ADD COLUMN IF NOT EXISTS" if dialect.name == "postgresql" else "ADD COLUMN"
     for table, column, ddl in _COLUMN_MIGRATIONS:
-        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+        cols = columns.get(table)
         if cols and column not in cols:
-            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
-    for name, table, columns in _INDEX_MIGRATIONS:
-        wanted = (columns,) if isinstance(columns, str) else columns
-        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+            conn.execute(text(f"ALTER TABLE {table} {add} {column} {_column_ddl(dialect, table, column, ddl)}"))
+            cols.add(column)
+    for name, table, wanted in _INDEX_MIGRATIONS:
+        wanted = (wanted,) if isinstance(wanted, str) else wanted
+        cols = columns.get(table) or set()
         if all(c in cols for c in wanted):
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({', '.join(wanted)})"))
-    for name, table, columns, where, dedupe in _UNIQUE_INDEX_MIGRATIONS:
-        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
-        exists = conn.execute(text("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :n"), {"n": name}).first()
-        if exists or not all(c in cols for c in columns):
+    _unique_run_event_seq(conn, columns)
+    for name, table, wanted, where, dedupe in _UNIQUE_INDEX_MIGRATIONS:
+        cols = columns.get(table) or set()
+        if not all(c in cols for c in wanted):
             continue
-        conn.execute(text(dedupe))
-        conn.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({', '.join(columns)})"
-                          + (f" WHERE {where}" if where else "")))
+        if any(ix["name"] == name for ix in inspect(conn).get_indexes(table)):
+            continue
+        conn.execute(text(dedupe.format(**literals)))
+        conn.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({', '.join(wanted)})"
+                          + (f" WHERE {where.format(**literals)}" if where else "")))
+    _backfill_not_null(conn, columns)
+
+
+#: 存量库里 run_events 撞了号、这一次没建唯一索引时记下的结果（settings 表里；cluster: 开头的不是用户设置，api/settings 不列）
+SEQ_DUPLICATES_KEY = "cluster:run_events_seq_duplicates"
+#: 记下的撞号最多几处（之后启动只核对这几处还在不在）
+SEQ_DUPLICATES_KEPT = 200
+
+
+def _unique_run_event_seq(conn: Any, columns: dict[str, set[str]]) -> None:  # pragma: no cover - 同步回调
+    """run_events 的 (run_id, seq) 补唯一索引（ux_run_events_run_seq，换掉原来不唯一的 ix_run_events_run_seq）。存量库里可能已经
+    有撞了号的（多进程之前的进程内计数、按需裁判的老写法）：先数一数，有就照实记日志、这一次不建（照旧用不唯一的索引），不让启动
+    失败——那几次运行的封存核对本来就对不上，删哪一条都不对，要人看。
+
+    数一次就记下结果（settings 表的 SEQ_DUPLICATES_KEY：撞了号的那几处），之后启动不再整表 GROUP BY（复核 R-b13）：只按索引核对
+    记下的那几处还撞不撞，还撞着就一句话带过；都清掉了才再整表数一遍、建索引、删掉这条记录。"""
+    from sqlalchemy import inspect, text
+
+    if "run_events" not in columns:
+        return
+    names = {ix["name"] for ix in inspect(conn).get_indexes("run_events")}
+    if "ux_run_events_run_seq" in names:
+        return
+    known = _known_seq_duplicates(conn, columns)
+    if known:
+        still = _still_duplicated(conn, known["pairs"])
+        if still:
+            logger.info("run_events 里还有撞了号的事件（%s 记下的 %d 处里还剩 %d 处）：(run_id, seq) 的唯一索引照旧不建，"
+                        "处理掉之后下次启动会再核对一遍", known.get("found_at") or "之前", len(known["pairs"]), still)
+            return
+    dupes = conn.execute(text("SELECT run_id, seq FROM run_events GROUP BY run_id, seq HAVING COUNT(*) > 1 LIMIT :n"),
+                         {"n": SEQ_DUPLICATES_KEPT + 1}).all()
+    if dupes:
+        runs = sorted({str(r[0]) for r in dupes})
+        logger.warning("run_events 里有撞了号的事件（%d 处%s，涉及运行 %s）：这一次不建 (run_id, seq) 的唯一索引。"
+                       "这几次运行的封存核对对不上，请人工核对后处理（之后启动只核对这几处，不再整表查）",
+                       min(len(dupes), SEQ_DUPLICATES_KEPT), "以上" if len(dupes) > SEQ_DUPLICATES_KEPT else "",
+                       "、".join(runs[:5]))
+        _remember_seq_duplicates(conn, [[str(r[0]), int(r[1])] for r in dupes[:SEQ_DUPLICATES_KEPT]],
+                                 more=len(dupes) > SEQ_DUPLICATES_KEPT)
+        return
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_run_events_run_seq ON run_events (run_id, seq)"))
+    if "ix_run_events_run_seq" in names:
+        conn.execute(text("DROP INDEX IF EXISTS ix_run_events_run_seq"))
+    if known is not None:
+        _forget_seq_duplicates(conn)
+        logger.info("run_events 里的撞号都处理掉了：补上了 (run_id, seq) 的唯一索引")
+
+
+def _known_seq_duplicates(conn: Any, columns: dict[str, set[str]]) -> dict[str, Any] | None:  # pragma: no cover
+    if "settings" not in columns:
+        return None
+    from sqlalchemy import select
+
+    from app.db.models import Setting
+
+    row = conn.execute(select(Setting.value).where(Setting.key == SEQ_DUPLICATES_KEY)).first()
+    value = row[0] if row else None
+    if not isinstance(value, dict) or not isinstance(value.get("pairs"), list):
+        return None
+    return value
+
+
+def _still_duplicated(conn: Any, pairs: list[Any]) -> int:  # pragma: no cover
+    """记下的那几处里还撞着的有几处（每处按 (run_id, seq) 索引查一次）。"""
+    from sqlalchemy import func, select
+
+    from app.db.models import RunEvent
+
+    left = 0
+    for pair in pairs:
+        if not (isinstance(pair, list) and len(pair) == 2):
+            continue
+        n = conn.execute(select(func.count()).select_from(RunEvent).where(
+            RunEvent.run_id == str(pair[0]), RunEvent.seq == int(pair[1]))).scalar()
+        left += int((n or 0) > 1)
+    return left
+
+
+def _remember_seq_duplicates(conn: Any, pairs: list[list[Any]], *, more: bool) -> None:  # pragma: no cover
+    from app.db.models import Setting
+
+    _forget_seq_duplicates(conn)
+    conn.execute(Setting.__table__.insert().values(
+        key=SEQ_DUPLICATES_KEY, value={"pairs": pairs, "more": more, "found_at": utcnow().isoformat(timespec="seconds")}))
+
+
+def _forget_seq_duplicates(conn: Any) -> None:  # pragma: no cover
+    from sqlalchemy import delete
+
+    from app.db.models import Setting
+
+    conn.execute(delete(Setting).where(Setting.key == SEQ_DUPLICATES_KEY))
+
+
+#: init_db 在 PostgreSQL 上拿的会话级咨询锁的号：几个进程同时启动时，建表和迁移一个一个来（同一个号别处别用）
+_INIT_LOCK = 0x4167656E744C6162  # "AgentLab"
+
+
+async def create_schema(target: AsyncEngine) -> None:
+    """建表、补列补索引（create_all 只建新表，老库的新列靠 _migrate）。两种库同一套；copy-to-postgres 建目标库也用它。"""
+    from app.db import models  # noqa: F401  确保模型已注册到 metadata
+
+    async with target.begin() as conn:
+        if conn.dialect.name == "postgresql":
+            # 事务结束自动放锁。CREATE TABLE IF NOT EXISTS 在 PostgreSQL 上并发执行也会撞（系统表的唯一约束）
+            from sqlalchemy import text
+
+            await conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _INIT_LOCK})
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate)
+
+
+#: 连不上时等也没用的错误（SQLSTATE 的类）：28 认证失败、3D 库不存在、42 语法或权限。别的（拒绝连接、库正在启动 57P03、
+#: 超时、网络断了）按「还没就绪」退避重试
+_NOT_TRANSIENT_SQLSTATES = ("28", "3D", "42")
+
+
+def _not_transient(error: BaseException) -> bool:
+    from app.db.portable import _driver_error
+
+    seen: Any = error
+    for _ in range(4):
+        state = str(getattr(seen, "sqlstate", "") or "")
+        if state and state != "57P03":
+            return state.startswith(_NOT_TRANSIENT_SQLSTATES)
+        seen = getattr(seen, "__cause__", None) or getattr(seen, "orig", None)
+        if seen is None:
+            break
+    cause = _driver_error(error)
+    return bool(cause is not None and str(cause.sqlstate).startswith(_NOT_TRANSIENT_SQLSTATES))
+
+
+async def wait_for_database(target: AsyncEngine | None = None, *, timeout: float | None = None,
+                            sleep: Any = None, clock: Any = None) -> None:
+    """PostgreSQL 还连不上时按退避（1、2、4、5、5… 秒）重试，每次照实打一条日志，等够 timeout 秒（缺省
+    AGENTLAB_DB_STARTUP_TIMEOUT）还不行就把最后一次的错抛出去。和数据库容器一起起、库还在初始化时，应用不至于一上来就崩。
+    密码不对、库不存在这种等也没用的立刻抛出。SQLite 不等。"""
+    import asyncio
+    import time
+
+    from sqlalchemy import text
+
+    from app.core.errors import first_line
+
+    target = target or engine
+    if target.dialect.name != "postgresql":
+        return
+    budget = settings.db_startup_timeout if timeout is None else timeout
+    pause = sleep or asyncio.sleep
+    now = clock or time.monotonic
+    started = now()
+    delay = 1.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with target.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            if attempt > 1:
+                logger.info("应用库连上了（第 %d 次，等了 %.0f 秒）", attempt, now() - started)
+            return
+        except Exception as e:  # noqa: BLE001 - 判断完是不是该等再决定抛不抛
+            waited = now() - started
+            if _not_transient(e) or waited + delay > budget:
+                logger.error("应用库连不上，不再等了（等了 %.0f 秒）：%s", waited, first_line(e))
+                raise
+            logger.warning("应用库还没就绪（%s），%.0f 秒后重试（已等 %.0f 秒，最多 %d 秒）",
+                           first_line(e), delay, waited, budget)
+        await pause(delay)
+        delay = min(delay * 2, 5.0)
 
 
 async def init_db() -> None:
-    from app.db import models  # noqa: F401  确保模型已注册到 metadata
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_migrate)
+    logger.info("应用库：%s", describe_database())
+    # 库还没起来（和 PostgreSQL 容器一起起）时先等它；建表、补列、补索引在库里的咨询锁里做，几个工作进程同时启动只做一次
+    await wait_for_database()
+    await create_schema(engine)

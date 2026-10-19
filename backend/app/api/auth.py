@@ -94,13 +94,13 @@ async def login(payload: LoginIn, request: Request, response: Response,
     if mode == "off":
         raise HTTPException(409, "未开启登录，无需登录")
     keys = (f"u:{payload.username.strip().lower()}", f"ip:{_client_ip(request)}")
-    if wait := sessions.wait_seconds(*keys):
+    if wait := await sessions.wait_for(*keys):
         raise HTTPException(429, f"登录失败次数过多，请 {wait} 秒后再试")
     user = (await session.execute(select(User).where(User.username == payload.username.strip()))).scalar_one_or_none()
     if user is None or user.disabled or not verify_password(payload.password, user.password_hash):
-        sessions.failed(*keys)
+        await sessions.note_failed(*keys)
         raise HTTPException(401, "用户名或密码不正确")
-    sessions.succeeded(*keys)
+    await sessions.note_succeeded(*keys)
     token = await sessions.create_session(session, user, ip=_client_ip(request),
                                           user_agent=request.headers.get("user-agent"))
     await session.commit()
@@ -317,6 +317,10 @@ async def put_settings(payload: SettingsIn, request: Request, response: Response
                                               user_agent=request.headers.get("user-agent"))
     await session.commit()
     remember_settings(value)
+    # 多进程：别的进程的登录设置缓存也要换（开没开登录！），见 app/cluster/caches.py
+    from app.cluster import caches
+
+    await caches.broadcast("auth_settings")
     out = _settings_out(value)
     if token is not None and created is not None:
         _login_response(request, response, token)

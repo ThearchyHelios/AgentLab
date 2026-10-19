@@ -42,6 +42,7 @@ from app.data.xlsx_scan import Bounds, SheetScan, UnsupportedTable, WorkbookScan
 from app.db.base import SessionLocal
 from app.db.models import DataSource, ImportStaging, SourceSnapshot, TableImport, TableRecipe
 from app.main import app
+from tests.fixtures.names import letters
 
 FLOW_RECIPE = json.loads((Path(__file__).parent / "fixtures" / "recipes" / "flow_recipe.json").read_text("utf-8"))
 FLOW_FULL = Recipe.model_validate(FLOW_RECIPE).model_dump(mode="json")
@@ -294,7 +295,7 @@ async def client():
 
 
 def unique(prefix: str = "wp5c") -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+    return f"{prefix}_{letters(10)}"
 
 
 def raw_bytes() -> bytes:
