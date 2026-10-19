@@ -428,3 +428,51 @@ def test_agent_field_warnings_are_degraded_signals():
     ], OK_OUTPUT)
     assert [(s.kind, s.severity) for s in signals] == [
         ("agent_field_mismatch", rv.DEGRADED), ("agent_field_unverified", rv.DEGRADED)]
+
+
+# --------------------------------------------------------------------------
+# 报告「改过一次」的信号按最终结果定档
+# --------------------------------------------------------------------------
+
+
+def _repaired(final_ok: bool) -> list[dict]:
+    violations = [] if final_ok else [{"code": "bare_number", "message": "裸数字 12"}]
+    return [
+        ev(EventType.NODE_STARTED, node_id="write", label="写周报"),
+        ev(EventType.LOG, node_id="write", level="warn", code="report_repair", count=2, attempt=1,
+           message="报告有 2 处未通过核对（裸数字 12、裸数字 30），已要求模型重写（第 1 次）"),
+        ev(EventType.REPORT_CHECKED, node_id="write", ok=final_ok, violations=violations, repairs=1),
+    ]
+
+
+def test_a_repair_that_finally_passed_is_not_a_gap():
+    """首稿没过核对、重写一次之后通过（最后一次 report.checked ok、没有违规）：不进异常清单，复核不为它叫模型；
+    复核被别的信号叫起来时，说明里写「首稿有 N 处没过核对，重写后已全部通过」。"""
+    rows = _repaired(True)
+    assert rv.scan(rows, OK_OUTPUT) == []
+    [note] = rv.notes(rows)
+    assert note == "报告「写周报」首稿有 2 处没过核对，重写后已全部通过"
+    prompt = rv.review_prompt("上周产量", "答案", [rv.Signal("tool_error", "工具 x 调用失败", rv.BROKEN)],
+                              settled=rv.notes(rows))
+    assert "重写后已全部通过" in prompt and "不要写成缺口" in prompt
+    assert prompt.index("检测到的异常") < prompt.index("已经处理好的")
+    assert "首稿有 2 处" not in prompt.split("已经处理好的")[0], "处理好了的不在异常清单里"
+
+
+def test_a_repair_that_still_failed_stays_a_gap():
+    rows = _repaired(False)
+    [signal] = rv.scan(rows, OK_OUTPUT)
+    assert signal.kind == "report_repair" and signal.severity == rv.DEGRADED
+    assert rv.notes(rows) == []
+
+
+def test_a_rewrite_counts_by_the_final_judgement():
+    base = [ev(EventType.NODE_STARTED, node_id="write", label="写周报"),
+            ev(EventType.LOG, node_id="write", level="warn", code="report_rewrite", count=1,
+               message="裁判认为 1 句结论证据不支持（……），已退回写作模型仅修改这几句")]
+    good = [*base, ev(EventType.REPORT_CHECKED, node_id="write", ok=True, violations=[],
+                      judge={"counts": {"supported": 3, "contradicted": 0, "insufficient": 0}})]
+    bad = [*base, ev(EventType.REPORT_CHECKED, node_id="write", ok=True, violations=[],
+                     judge={"counts": {"supported": 2, "contradicted": 1, "insufficient": 0}})]
+    assert rv.scan(good, OK_OUTPUT) == [] and rv.notes(good) == ["报告「写周报」有 1 句结论裁判认为证据不支持，改写后都有了依据"]
+    assert [s.kind for s in rv.scan(bad, OK_OUTPUT)] == ["report_rewrite"] and rv.notes(bad) == []

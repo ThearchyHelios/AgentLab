@@ -791,7 +791,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs \
             and not (repairs and not _fatal(blocking)):
         repairs += 1
-        ctx.emit(EventType.LOG, level="warn", code="report_repair",
+        ctx.emit(EventType.LOG, level="warn", code="report_repair", count=len(blocking), attempt=repairs,
                  message=f"报告有 {len(blocking)} 处未通过核对（{_named(blocking)}），"
                          f"已要求模型重写（第 {repairs} 次）")
         messages = [*messages, response, HumanMessage(content=_repair_request(blocking, failed_rule))]
@@ -979,7 +979,7 @@ async def _judge_inline(ctx: NodeContext, doc: dict[str, Any], catalog: dict[str
     if judge_cfg["rewrite_once"] and bad:
         texts = judging.unit_texts(doc)
         sentences = [(texts.get(uid, ""), _rewrite_reason(outcome["verdicts"][uid])) for uid in bad]
-        ctx.emit(EventType.LOG, level="warn", code="report_rewrite",
+        ctx.emit(EventType.LOG, level="warn", code="report_rewrite", count=len(bad),
                  message=f"裁判认为 {len(bad)} 句结论证据不支持（{_named([{'text': t} for t, _ in sentences])}），"
                          "已退回写作模型仅修改这几句")
         again, raw = await draft([*messages, HumanMessage(content=_rewrite_request(sentences))])

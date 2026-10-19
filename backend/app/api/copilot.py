@@ -2804,5 +2804,7 @@ async def review_of_run(session: AsyncSession, run: Any, *, question: str, provi
             chat_model, question=question, answer=answer, signals=signals,
             # 报告撰写节点产出的答案逐段对应着证据文档：只能加说明，不能改写
             locked=bool(output and output.get("_evidence")),
+            # 已经处理好的（首稿没过、重写后已全部通过……）：不是缺口，照实告诉复核模型
+            settled=rv.notes(rows),
         )
     return done(result)
