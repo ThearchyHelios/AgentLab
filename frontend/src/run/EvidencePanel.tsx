@@ -1370,6 +1370,9 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
   // 所依据的查询对照数据目录查出了错误级的问题：值照算，结果不可靠，出具同样按缺口降档。问题和改法在查询步骤里
   const sqlFailed = step?.sql_check_failed === true || entry?.sql_check_failed === true
   const sqlReason = step?.sql_check_reason || entry?.sql_check_reason || EVIDENCE_TEXT.sqlCheckFallback
+  // 输入取自「查询区间里这张表没有数据」的列：值照算，那个 0 不代表真的是 0，出具同样按缺口降档
+  const noData = step?.no_data === true || entry?.no_data === true
+  const noDataReason = step?.no_data_reason || entry?.no_data_reason || EVIDENCE_TEXT.noDataFallback
   // 期 4：双盲复算复核过这个指标才有
   const dualCheck = dualCheckOf(step)
   // 输入追没追到原始数据：和「有出处」（确定性复算一致）分开说。卡上没有输入、老服务端没给时不说
@@ -1394,6 +1397,12 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
           <span className="chip" data-ev-sql-check-failed="" title={sqlReason}
                 style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
             {EVIDENCE_TEXT.sqlCheckFailed}
+          </span>
+        )}
+        {noData && (
+          <span className="chip" data-ev-no-data="" title={noDataReason}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>
+            {EVIDENCE_TEXT.noData}
           </span>
         )}
         {!!untraced?.length && (
@@ -1429,6 +1438,9 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
       )}
       {sqlFailed && (
         <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-sql-check-reason="">{sqlReason}</p>
+      )}
+      {noData && (
+        <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-no-data-reason="">{noDataReason}</p>
       )}
       {unshowable && (
         <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-unshowable="">
@@ -1664,6 +1676,10 @@ function UpstreamPart({ id, step, seal, linkOf }: {
           <span className="chip" title={step.sql_check_reason || EVIDENCE_TEXT.sqlCheckFallback}
                 style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>{EVIDENCE_TEXT.sqlCheckFailed}</span>
         )}
+        {step.no_data === true && (
+          <span className="chip" title={step.no_data_reason || EVIDENCE_TEXT.noDataFallback}
+                style={{ color: 'var(--st-waiting)', borderColor: 'var(--st-waiting)' }}>{EVIDENCE_TEXT.noData}</span>
+        )}
         {host.onNode && <NodeChip id={step.node_id} />}
       </div>
       <Integrity step={step} seal={seal} />
@@ -1859,6 +1875,20 @@ function QueryPart({ id, step, seal, masked, pick }: {
         <div className="mb-1.5" data-ev-sql-checks="">
           <div className="mb-0.5 text-2xs text-faint">{SQL_CHECK_TEXT.title}</div>
           <SqlCheckList checks={step.checks} />
+        </div>
+      )}
+      {Array.isArray(step.no_data) && step.no_data.length > 0 && (
+        // 查询区间里这张表没有数据的那几列（查询时现查）：这些 0 不代表真的是 0。没有问题时接口不给这个键
+        <div className="mb-1.5 text-2xs" data-ev-no-data-list="">
+          <div className="mb-0.5 text-faint">{EVIDENCE_TEXT.noDataTitle}</div>
+          <ul className="space-y-0.5">
+            {step.no_data.map((g, k) => (
+              <li key={k} className="flex items-start gap-1 leading-snug" style={{ color: 'var(--st-waiting)' }}>
+                <AlertTriangle size={10} className="mt-[2px] shrink-0" aria-hidden />
+                <span>{g.message}</span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
       {!!step.merge?.warnings.length && (

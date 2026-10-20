@@ -475,6 +475,15 @@ def incomplete_gaps(metrics: list[dict[str, Any]]) -> list[str]:
             for m in metrics if isinstance(m, dict) and m.get("incomplete")]
 
 
+def no_data_gaps(metrics: list[dict[str, Any]]) -> list[str]:
+    """契约收来的指标里，输入取自「查询区间里这张表没有数据」的列的（口径卡标了 no_data，data/coverage.py），每个一句缺口。
+
+    数回指得上口径卡、复算也一致，可那个 0 是因为这段时间表里根本没有数据，不是真的是 0：盖完整出具的章等于替「上周到访
+    0 人」作保。原因用口径卡记下的那句（查询记下的区间和表里的范围）。"""
+    return [f"指标「{m.get('name') or m.get('id')}」{m.get('no_data_reason') or '所依据的查询区间里这张表没有数据'}"
+            for m in metrics if isinstance(m, dict) and m.get("no_data")]
+
+
 def sql_check_gaps(metrics: list[dict[str, Any]], cited: dict[str, list[str]] | None = None, *,
                    label: Callable[[str, str | None], str | None] | None = None) -> list[str]:
     """sql_check_findings 的那几句缺口（见下）。"""

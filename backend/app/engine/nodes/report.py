@@ -56,6 +56,8 @@ from app.engine.evidence import (
     CLAIMS_RULE,
     ENTITY_KINDS,
     MARKER_RULES,
+    NO_DATA_MARK,
+    NO_DATA_RULE,
     SEE_AND_CODE_RULES,
     UNIT_RULE,
     StreamRenderer,
@@ -651,6 +653,9 @@ def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims
     if writer.guarded:
         # 写作者看不全证据（目录有省略、有来源的结构化结论为空）：「没有查到」这类结论没有依据
         rules = f"{rules}\n{ABSENCE_RULE}"
+    if NO_DATA_MARK in writer.text:
+        # 有指标、查询列取自「查询区间里这张表没有数据」的列（data/coverage.py）：照实写没有数据，不写成 0、持平
+        rules = f"{rules}\n{NO_DATA_RULE}"
     if claims in ("require_citation", CLAIMS_JUDGE):
         # 裁判只看写作者挂的依据：要判，就更得每句都挂上
         rules = f"{rules}\n{CLAIMS_RULE}" + (f"\n{judging.JUDGE_RULE}" if claims == CLAIMS_JUDGE else "")
