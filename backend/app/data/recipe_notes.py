@@ -696,8 +696,9 @@ def _period_column_key(col: ColumnOut) -> str | None:
 
 
 def _null_eligible(ctx: _Ctx, w: _Writers, table: str, col: ColumnOut) -> bool:
-    """这一列要不要考虑空值说明：值列；主键不会是空值；表内合计表的空值已由表说明（未能核对）交代。"""
-    value_col = col.role in ("measure", "value") and col.type in ("INTEGER", "REAL")
+    """这一列要不要考虑空值说明：值列（交叉表按文字导入的指标也是，它的占位符、空格同样存成空值）；主键不会是空值；
+    表内合计表的空值已由表说明（未能核对）交代。"""
+    value_col = col.role == "measure" or (col.role == "value" and col.type in ("INTEGER", "REAL"))
     is_total = bool(w.kept_from or w.list_totals or w.list_subtotals)
     return value_col and not is_total and col.name not in set(ctx.grains.get(table, []))
 

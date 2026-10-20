@@ -488,9 +488,9 @@ def test_closed_value_sets():
         "header", "row_label", "section_title", "total_word", "axis", "after_title", "outside_text")
     assert _literal(T.EditResult, "kind") == ("fix", "selection")
     assert _literal(T.ChangeClass, "change") == ("same", "compatible", "retire", "semantic")
-    assert T.FIX_KINDS[-1] == "declare_subtotals"                  # 期 5 加在末尾
-    assert T.FIX_KINDS[:-1] == ("remove_label", "add_label", "edit_members", "rename_title", "declare_total",
-                           "ignore_cells", "declare_placeholder", "declare_hidden", "rename_sheet")
+    assert T.FIX_KINDS[-2:] == ("declare_subtotals", "declare_text_measure")   # 期 5、文字指标依次加在末尾
+    assert T.FIX_KINDS[:-2] == ("remove_label", "add_label", "edit_members", "rename_title", "declare_total",
+                                "ignore_cells", "declare_placeholder", "declare_hidden", "rename_sheet")
     assert T.SELECTION_AS == ("list", "crosstab", "segment", "derived", "section_title", "ignore_rows",
                               "ignore_columns", "ignore_outside")
     assert T.ACCUMULATE_ACTIONS == ("replace", "first", "append", "replace_period", "restart", "rejected")

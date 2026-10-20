@@ -2528,13 +2528,34 @@ await section('数据 · 表格：按配方导入', async () => {
   check('勾选「没有小计行」：发 PUT，no_subtotals 为 true、没有配小计', noSub?.no_subtotals === true && !noSub?.subtotals,
         JSON.stringify(noSub ?? {}))
   await page.waitForTimeout(300)
+  // 指标类型：整行是文字的指标（如「高峰时段」写着「18-19」）改按时段 / 文字导入，落成文字列、去掉单位；改回数字时按标签补回单位
+  const kindSel = panel.locator('[data-field="/sheets/0/blocks/0/segments/0/text_measures/分区乙（人次）"]')
+  const kindOptions = await kindSel.locator('option').evaluateAll((os) => os.map((o) => `${o.value}:${o.textContent}`))
+  check('指标类型是下拉框：数字、时段、文字', JSON.stringify(kindOptions) === JSON.stringify([':数字', 'hour_range:时段', 'text:文字']),
+        kindOptions.join(','))
+  replies.recipe.push(echo())
+  await kindSel.selectOption('hour_range')
+  await until(async () => puts().length === 7, 4000)
+  const k1 = puts()[6]?.body?.recipe
+  check('改成「时段」：发 PUT，text_measures 写上 hour_range，这一列的单位去掉',
+        k1?.sheets?.[0]?.blocks?.[0]?.segments?.[0]?.text_measures?.['分区乙（人次）']?.parser === 'hour_range'
+        && !('分区乙' in (k1?.tables?.[0]?.units ?? {})), JSON.stringify(k1?.tables?.[0]?.units ?? {}))
+  await page.waitForTimeout(300)
+  replies.recipe.push(echo())
+  await kindSel.selectOption('')
+  await until(async () => puts().length === 8, 4000)
+  const k2 = puts()[7]?.body?.recipe
+  check('改回「数字」：发 PUT，text_measures 去掉这一项，单位按标签补回「人次」',
+        !('分区乙（人次）' in (k2?.sheets?.[0]?.blocks?.[0]?.segments?.[0]?.text_measures ?? {}))
+        && k2?.tables?.[0]?.units?.['分区乙'] === '人次', JSON.stringify(k2?.tables?.[0]?.units ?? {}))
+  await page.waitForTimeout(300)
   // 有问题的配方：一条对得上字段（单位），一条对不上（挂到面板顶部）
   replies.recipe.push(echo({ recipe_problems: [
     { path: '/tables/0/units/分区甲', code: 'unit_label_conflict', message: '表「日客流量」：列「分区甲」的单位与标签「分区甲（人次）」不一致' },
     { path: '/sheets/0/blocks/0/label_offset', code: 'schema', message: '第 1 个工作表的交叉表：标签列偏移只能是紧挨日期的左侧一列' },
   ] }))
   await panel.locator('[data-field="/tables/0/units/分区甲"]').selectOption('人')
-  await until(async () => puts().length === 7, 4000)
+  await until(async () => puts().length === 9, 4000)
   await page.waitForTimeout(300)
   const trialBtn = wizard().locator('[data-trial-run]')
   check('配方有问题时「试运行」禁用', await trialBtn.isDisabled())
@@ -2548,8 +2569,8 @@ await section('数据 · 表格：按配方导入', async () => {
   await panel.locator('[data-recipe-paste-toggle]').click()
   await panel.locator('[data-recipe-paste] textarea').fill(JSON.stringify(FLOW_RECIPE))
   await panel.locator('[data-recipe-paste] button', { hasText: '保存配方' }).click()
-  await until(async () => puts().length === 8, 4000)
-  check('「粘贴配方」发 PUT，body 就是粘贴的配方', JSON.stringify(puts()[7]?.body?.recipe) === JSON.stringify(FLOW_RECIPE))
+  await until(async () => puts().length === 10, 4000)
+  check('「粘贴配方」发 PUT，body 就是粘贴的配方', JSON.stringify(puts()[9]?.body?.recipe) === JSON.stringify(FLOW_RECIPE))
   await page.waitForTimeout(300)
   check('……问题清掉以后「试运行」可用', await trialBtn.isEnabled())
   // 连续修改：上一次 PUT 还没回来就接着改。上一次回来时，排在后面的修改不能被服务端那份盖掉，

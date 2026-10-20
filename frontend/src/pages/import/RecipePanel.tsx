@@ -130,8 +130,9 @@ export function tableColumns(recipe: Recipe | null): Map<string, RecipeColumn[]>
         for (const seg of arr(block.segments)) {
           if (!isObj(seg)) continue
           if (seg.role === 'measures') {
+            const text = isObj(seg.text_measures) ? seg.text_measures : {}
             put(seg.table, [axis, ...arr(seg.labels?.expect).map((label: string) => ({
-              name: String(seg.measures?.[label] ?? ''), type: vtype, role: 'measure', header: label,
+              name: String(seg.measures?.[label] ?? ''), type: isObj(text[label]) ? 'TEXT' : vtype, role: 'measure', header: label,
             }))])
           } else if (seg.role === 'dimension') {
             put(seg.table, [
@@ -568,6 +569,23 @@ function DeriveNames({ path, derive, onRename }: { path: string; derive: unknown
   )
 }
 
+/**
+ * 指标改按文字（text / hour_range）或改回数字（空串）。文字列不能有单位：改成文字时去掉这一列的单位，改回数字时按标签
+ * 末尾的括号补回（与加标签时一致）
+ */
+function setMeasureKind(r: Recipe, x: any, label: string, kind: string, units: string[]) {
+  const col = x.measures?.[label]
+  const table = arr(r.tables).find((t) => t?.name === x.table)
+  if (kind) {
+    x.text_measures = { ...(isObj(x.text_measures) ? x.text_measures : {}), [label]: { parser: kind } }
+    if (table && col && isObj(table.units)) delete table.units[col]
+    return
+  }
+  if (isObj(x.text_measures)) delete x.text_measures[label]
+  const [, unit] = splitUnit(label, units)
+  if (unit && table && col) table.units = { ...(isObj(table.units) ? table.units : {}), [col]: unit }
+}
+
 function SegmentEditor({ s, b, g, seg, edit, candidates, labelOptions, units }: {
   s: number; b: number; g: number; seg: any; edit: Edit
   candidates: Record<string, string[]>; labelOptions: string[]; units: string[]
@@ -596,6 +614,7 @@ function SegmentEditor({ s, b, g, seg, edit, candidates, labelOptions, units }: 
     if (x.role === 'measures' && isObj(x.measures)) {
       const col = x.measures[label]
       delete x.measures[label]
+      if (isObj(x.text_measures)) delete x.text_measures[label]
       const table = arr(r.tables).find((t) => t?.name === x.table)
       if (table && col) {
         if (isObj(table.units)) delete table.units[col]
@@ -644,7 +663,14 @@ function SegmentEditor({ s, b, g, seg, edit, candidates, labelOptions, units }: 
                              if (old) renameColumn(r, x.table, old, v)
                              else x.measures = { ...(isObj(x.measures) ? x.measures : {}), [label]: v }
                            })} />
+                <select className="field !w-20" data-field={`${base}/text_measures/${ptr(label)}`}
+                        value={String(seg.text_measures?.[label]?.parser ?? '')}
+                        aria-label={`${RECIPE_TEXT.measureKind}：${label}`} title={RECIPE_TEXT.measureKind}
+                        onChange={(e) => edit((r) => { setMeasureKind(r, at(r), label, e.target.value, units) })}>
+                  {Object.entries(RECIPE_CHOICE_LABEL.measureKind).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
                 <FieldProblems path={`${base}/measures/${ptr(label)}`} />
+                <FieldProblems path={`${base}/text_measures/${ptr(label)}`} />
               </div>
             ))}
           </div>

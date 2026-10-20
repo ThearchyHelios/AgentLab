@@ -359,6 +359,7 @@ class _Seg:
     title: str | None = None
     title_row: int | None = None
     parser: str | None = None                   # dimension：hour_range / text
+    text: dict[str, str] = field(default_factory=dict)      # measures：整行是文字的标签原文 → 解析方式
     # 以下由命名阶段填
     id: str = ""
     table: str = ""
@@ -415,6 +416,41 @@ def _sums_above(cell: GridCell | None, r: int) -> bool:
         return False
     m = re.fullmatch(r"=\s*SUM\(\s*\$?([A-Z]{1,3})\$?(\d+)\s*:\s*\$?([A-Z]{1,3})\$?(\d+)\s*\)\s*", cell.formula.upper())
     return bool(m) and m.group(1) == m.group(3) and int(m.group(4)) == r - 1
+
+
+def _text_row(grid: Grid, r: int, c1: int, c2: int, label: str) -> str | None:
+    """指标行是不是整行文字（「高峰时段」每格写着「18-19」）：是的话返回解析方式（全都能按时段解析的 hour_range，
+    否则 text），不是返回 None。轴列上除了占位符候选和空格全是文字，至少一格；有一格是数、公式、错误值、写成文字的
+    数就不是。标签末尾写着词表里的单位（「时段人数（人次）」）的是数字指标，不算。"""
+    unit = P.split_unit_suffix(label)[1]
+    if unit is not None and P.unit_known(unit):
+        return None
+    texts: list[str] = []
+    for c in range(c1, c2 + 1):
+        cell = grid.get(r, c)
+        kind = _cell_kind(cell)
+        if kind in ("blank", "ph"):
+            continue
+        if kind != "text":
+            return None
+        t = cell.value.strip()       # type: ignore[union-attr]
+        if P.looks_numeric_text(t) or P.thousands_number(t) is not None:
+            return None
+        texts.append(t)
+    if not texts:
+        return None
+    return "hour_range" if all(P.hour_range(t) is not None for t in texts) else "text"
+
+
+def _value_failure(sheet: str, r: int, label: str, why: str, cells: list[tuple[int, str]]) -> _Failure:
+    """数值区一行里同一种不合格的格合成一条（一行 30 格不再报 30 条）。给模型的那条只有坐标，没有格子里的字。"""
+    if len(cells) == 1:
+        c, shown = cells[0]
+        return _Failure(f"工作表「{sheet}」：{_a1(r, c)} 的「{shown}」{why}", f"工作表「{sheet}」：{_a1(r, c)} {why}")
+    examples = "、".join(f"{_a1(r, c)}「{shown}」" for c, shown in cells[:3])
+    where = _a1_list([(r, c) for c, _ in cells], 3)
+    return _Failure(f"工作表「{sheet}」：第 {r} 行「{label}」有 {len(cells)} 个单元格{why}（如 {examples}）",
+                    f"工作表「{sheet}」：第 {r} 行有 {len(cells)} 个单元格{why}（{where}）")
 
 
 def _analyze_crosstab(grid: Grid, axis_row: int, date_cols: list[int]) -> _Cross:
@@ -544,8 +580,13 @@ def _analyze_crosstab(grid: Grid, axis_row: int, date_cols: list[int]) -> _Cross
     # ---- 数值区：类型、占位符、空格、公式（P2-SPEC 6.1 第 9 条）
     ints = True
     for seg in x.segments:
-        for r in seg.rows:
+        for r, label in zip(seg.rows, seg.labels):
+            # 指标行整行是文字（「高峰时段」每格写着「18-19」）：按文字指标起草，不当数字报错；要人在问题里确认
+            text = _text_row(grid, r, c1, c2, label) if seg.role == "measures" else None
+            if text is not None:
+                seg.text[label] = text
             row_vals: list[int | float | None] = []
+            bad: dict[str, list[tuple[int, str]]] = {}
             for c in range(c1, c2 + 1):
                 cell = grid.get(r, c)
                 kind = _cell_kind(cell)
@@ -565,13 +606,16 @@ def _analyze_crosstab(grid: Grid, axis_row: int, date_cols: list[int]) -> _Cross
                     entry[1] += 1
                     entry[2].append((r, c))
                     x.nonnumeric[cell.value.strip()] = x.nonnumeric.get(cell.value.strip(), 0) + 1
+                elif kind == "text" and text is not None:
+                    continue
                 elif kind in ("text", "error", "other"):
                     shown = _shown(cell.value)
                     if isinstance(cell.value, str):
                         x.nonnumeric[shown] = x.nonnumeric.get(shown, 0) + 1
-                    why = "是错误值" if kind == "error" else "不是数字，也不像表示无数据的符号"
-                    fail(_Failure(f"工作表「{sheet}」：{_a1(r, c)} 的「{shown}」{why}",
-                                  f"工作表「{sheet}」：{_a1(r, c)} {why}"))
+                    bad.setdefault("是错误值" if kind == "error" else "不是数字，也不像表示无数据的符号",
+                                   []).append((c, shown))
+            for why, cells in bad.items():
+                fail(_value_failure(sheet, r, label, why, cells))
             x.values[r] = row_vals
     x.value_type = "INTEGER" if ints else "REAL"
 
@@ -1436,8 +1480,11 @@ def _prefer_prefix(period: list[tuple[int, int, str]]) -> str | None:
 
 def _segment_dict(s: _Seg) -> dict[str, Any]:
     if s.role == "measures":
-        return {"id": s.id, "role": "measures", "table": s.table, "locate": {"by": "labels"},
-                "labels": {"expect": list(s.labels)}, "measures": dict(s.columns)}
+        out = {"id": s.id, "role": "measures", "table": s.table, "locate": {"by": "labels"},
+               "labels": {"expect": list(s.labels)}, "measures": dict(s.columns)}
+        if s.text:
+            out["text_measures"] = {label: {"parser": p} for label, p in s.text.items()}
+        return out
     if s.role == "dimension":
         out: dict[str, Any] = {
             "id": s.id, "role": "dimension", "table": s.table,
@@ -2427,6 +2474,18 @@ def _unit_cards(labels: list[tuple[str, str]], sheet_id: str) -> list[Card]:
     return out
 
 
+def _label_row(grid: Grid | None, loc: _CrossLoc | None, seg_id: str, label: str) -> int | None:
+    """分段里标签是 label 的那一行（按 match_key 比）；定位不到时 None。"""
+    if grid is None or loc is None:
+        return None
+    key = P.match_key(label)
+    for r in loc.seg_rows.get(seg_id, []):
+        cell = grid.get(r, loc.label_col)
+        if cell is not None and isinstance(cell.value, str) and P.match_key(cell.value) == key:
+            return r
+    return None
+
+
 def _crosstab_cards(si: int, bi: int, sheet: Any, block: CrosstabBlock, loc: _CrossLoc | None, grid: Grid | None,
                     name: str, recipe: dict[str, Any], parsed: Recipe, sheet_facts: list[Fact],
                     relation_question: Callable[[Fact], Question], ext: Extraction | None,
@@ -2538,6 +2597,32 @@ def _crosstab_cards(si: int, bi: int, sheet: Any, block: CrosstabBlock, loc: _Cr
                               None, {"null": [], "reject": [{"op": "remove", "path": _ptr(*path)}]}))
     cards.extend(ph_cards)
     questions.extend(reversed(ph_qs))
+
+    # 6b 按文字导入的指标：要人确认。「不是」去掉这一条，这一行回到按块的数值类型导入，试运行会拒收
+    for gi, s in enumerate(block.segments):
+        if not isinstance(s, MeasuresSegment):
+            continue
+        for label, tm in s.text_measures.items():
+            r = _label_row(grid, loc, s.id, label)
+            spots: list[tuple[int, int]] = []
+            if r is not None and loc is not None and grid is not None:
+                spots = [(r, loc.label_col)] + [(r, cc) for cc in range(loc.c1, loc.c2 + 1)
+                                                if grid.get(r, cc) is not None]
+            where = f"第 {r} 行" if r is not None else f"分段「{s.id}」中"
+            how = "时段" if tm.parser == "hour_range" else "文字"
+            col = s.measures.get(label, "")
+            qid = _qid(f"q_text_measure:{s.id}:{label}", block.id, used)
+            reason = (f"这一行每格写的都是{'时段（如「18-19」）' if tm.parser == 'hour_range' else '文字'}，不是数字："
+                      f"确认后列「{col}」存成文字列"
+                      f"{'（时段存规范写法，「18–19」存成「18-19」）' if tm.parser == 'hour_range' else '（存原文）'}，"
+                      "不参与数值核对；如果它应该是数字，这份文件无法按当前配方导入")
+            cards.append(Card(f"text_measure:{s.id}:{label}", f"{where}「{label}」按{how}导入", reason,
+                              _coords(name, spots), qid))
+            path = ["sheets", si, "blocks", bi, "segments", gi, "text_measures", label]
+            questions.append(Question(qid, f"「{label}」这一行按{how}导入吗",
+                                      [{"value": "text", "label": f"是，按{how}导入", "needs_reason": False},
+                                       {"value": "reject", "label": "不是，不导入", "needs_reason": False}],
+                                      None, {"text": [], "reject": [{"op": "remove", "path": _ptr(*path)}]}))
 
     # 7 合计段
     for s in block.segments:

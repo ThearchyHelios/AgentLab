@@ -154,6 +154,14 @@ class DimSpec(_M):
     derive: dict[str, Literal["start", "end"]] = Field(default_factory=dict)
 
 
+class TextMeasure(_M):
+    """按文字导入的指标：这一行每格写的是文字（如「高峰时段」写着「18-19」），落成文字列。空格、公式、占位符照块的
+    取值规则；块的数值类型、千分位规则对它不适用。"""
+
+    #: text：存原文（去首尾空白）；hour_range：按时段解析，存规范写法（「18–19」存成「18-19」），解析不了的格是问题
+    parser: Literal["text", "hour_range"] = "text"
+
+
 class MeasuresSegment(_M):
     """每一行是一个指标：落成宽表，一个指标一列。"""
 
@@ -166,6 +174,8 @@ class MeasuresSegment(_M):
     #: derive_tables 按原文查，查不到报 measures_keys_mismatch，绝不产出空列名）。文件里标签的写法变化由
     #: 执行器按 match_key 认，与这里无关
     measures: dict[str, str]
+    #: 按文字导入的指标：标签原文（与 measures 的键逐字相同）→ 解析方式。不在这里的指标按块的数值类型导入
+    text_measures: dict[str, TextMeasure] = Field(default_factory=dict)
 
 
 class DimensionSegment(_M):
@@ -479,7 +489,7 @@ class Problem:
 #: 修复按钮的种类（P3-SPEC 3.2 ①–⑨；期 5 加 declare_subtotals：列表中间像小计的行改作小计核对）。Problem.fix、
 #: FixProposal.kind、确认项 fix:<目标键> 的 kind 都取自这里
 FIX_KINDS = ("remove_label", "add_label", "edit_members", "rename_title", "declare_total", "ignore_cells",
-             "declare_placeholder", "declare_hidden", "rename_sheet", "declare_subtotals")
+             "declare_placeholder", "declare_hidden", "rename_sheet", "declare_subtotals", "declare_text_measure")
 
 
 @dataclass
@@ -1135,7 +1145,8 @@ def derive_tables(recipe: Recipe) -> tuple[dict[str, list[ColumnOut]], list[Reci
                             problems.append(RecipeProblem(f"{path}/measures", "measures_keys_mismatch",
                                                           f"分段「{seg.id}」：" + "；".join(parts)))
                         cols = [ColumnOut(axis_name, "TEXT", role="axis")]
-                        cols += [ColumnOut(seg.measures.get(label, ""), vtype, header=label, role="measure")
+                        cols += [ColumnOut(seg.measures.get(label, ""), "TEXT" if label in seg.text_measures else vtype,
+                                           header=label, role="measure")
                                  for label in seg.labels.expect]
                         put(seg.table, cols, path)
                     elif isinstance(seg, DimensionSegment):

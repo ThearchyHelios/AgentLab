@@ -214,7 +214,8 @@ def _column_sources(recipe: Recipe) -> dict[tuple[str, str], str]:
 
 
 def _text_stores(recipe: Recipe) -> dict[tuple[str, str], tuple[str, bool]]:
-    """(表, 列表的 TEXT 列) → (实际生效的存法, 是否显式写了)。缺省时主键列 canonical、其余 raw。"""
+    """(表, 列表的 TEXT 列) → (实际生效的存法, 是否显式写了)。缺省时主键列 canonical、其余 raw。
+    交叉表按文字导入的指标也算：按时段解析的存规范写法，按文字的存原文，都是显式写的。"""
     grains = {t.name: set(t.grain) for t in recipe.tables}
     out: dict[tuple[str, str], tuple[str, bool]] = {}
     for sheet in recipe.sheets:
@@ -224,6 +225,13 @@ def _text_stores(recipe: Recipe) -> dict[tuple[str, str], tuple[str, bool]]:
                     if c.type == "TEXT":
                         eff = c.store or ("canonical" if c.name in grains.get(block.table, set()) else "raw")
                         out[(block.table, c.name)] = (eff, c.store is not None)
+                continue
+            for seg in block.segments:
+                if isinstance(seg, MeasuresSegment):
+                    for label, tm in seg.text_measures.items():
+                        if seg.measures.get(label):
+                            out[(seg.table, seg.measures[label])] = (
+                                "canonical" if tm.parser == "hour_range" else "raw", True)
     return out
 
 
@@ -516,6 +524,9 @@ def _signatures(recipe: Recipe, sheet_name: Callable[[SheetRecipe], str]) -> dic
                     if isinstance(seg, DerivedSegment):
                         keep = seg.keep_as.table if seg.keep_as else None
                         out[f"derived:{seg.id}"] = _sig(keep, sorted(match_key(x) for x in seg.labels.expect))
+                    elif isinstance(seg, MeasuresSegment):
+                        for label, tm in seg.text_measures.items():
+                            out[f"text_measure:{seg.id}:{label}"] = _sig(tm.parser, seg.measures.get(label))
             else:
                 out[f"merged_fill:{block.id}"] = _sig(block.merged_data)
                 out[f"ignored_columns:{block.id}"] = _sig(block.extra_columns, ignore_cols)
@@ -1048,6 +1059,12 @@ def _recipe_items(bag: _Bag, recipe: Recipe, ex: dict[str, Any], facts: Any, *, 
                 prefix = rows_text(seg_rows.get(seg.id)) or f"分段「{seg.id}」的合计行"
                 keep = f"，原值另存表「{seg.keep_as.table}」" if seg.keep_as else "，原值不另存"
                 bag.add(f"derived:{seg.id}", f"{prefix}改作核对{keep}")
+            elif isinstance(seg, MeasuresSegment):
+                # 文字指标：这一行不再按数字核对类型，写错成别的文字也照样入库，所以配置了就要人确认
+                for label, tm in seg.text_measures.items():
+                    how = "按时段导入，存规范写法（如 18-19）" if tm.parser == "hour_range" else "按文字原样导入"
+                    bag.add(f"text_measure:{seg.id}:{label}",
+                            f"「{label}」{how}，不当数字：表「{seg.table}」的列「{seg.measures.get(label, '')}」是文字列")
     derived_rows: dict[str, set[int]] = {}
     for d in ex.get("derived") or []:
         if isinstance(d, dict) and d.get("kind") == "column_sum":

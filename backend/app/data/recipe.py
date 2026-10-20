@@ -265,7 +265,7 @@ _FIELD_LABEL = {
     "meaning": "含义", "blank": "空格的处理", "text_number": "文本数字的处理", "formula": "公式的处理",
     "segments": "分段", "role": "分段类型", "table": "表", "locate": "定位方式", "by": "定位依据",
     "title": "分段标题", "segment": "紧跟的分段", "labels": "标签", "expect": "期望的标签",
-    "measures": "指标列名对照", "dim": "维度", "derive": "派生列", "value": "值列", "const": "常量列",
+    "measures": "指标列名对照", "text_measures": "按文字导入的指标", "dim": "维度", "derive": "派生列", "value": "值列", "const": "常量列",
     "pick": "取值", "stop_parser": "结束本段的标签", "labels_parser": "标签解析方式", "verify": "核对方式",
     "against_table": "核对的基表", "keep_as": "另存", "header_rows": "表头行数", "after_title": "表头上方的标题",
     "columns": "列", "header": "表头", "store": "存储写法", "extra_columns": "多出的列",
@@ -815,6 +815,21 @@ class _Checker:
                 if key in seen:
                     self.add(lp, "label_duplicate", f"标签「{label}」与「{seen[key]}」是同一个标签")
                 seen.setdefault(key, label)
+            if isinstance(seg, MeasuresSegment):
+                self.check_text_measures(sp, seg)
+
+    def check_text_measures(self, sp: tuple[Any, ...], seg: MeasuresSegment) -> None:
+        """文字指标的键与 measures 一样逐字对 labels.expect；标签末尾写着词表里的单位的是数字指标，不能按文字导入。"""
+        for label in seg.text_measures:
+            tp = sp + ("text_measures", label)
+            if label not in seg.labels.expect:
+                self.add(tp, "text_measure_unknown",
+                         f"按文字导入的「{label}」不在期望的标签中（必须与标签逐字相同）")
+                continue
+            unit = split_unit_suffix(label)[1]
+            if unit is not None and unit in UNITS:
+                self.add(tp, "text_measure_unit",
+                         f"标签「{label}」写着单位「{unit}」，是数字指标，不能按文字导入")
 
     @staticmethod
     def label_key(seg: Any, label: str) -> str | None:
@@ -880,13 +895,25 @@ class _Checker:
     # ---- 3. 占位符只能映射空值，不能像数 ----
 
     def check_placeholders(self) -> None:
+        """占位符不能像数；也不能含数字（origin 不是 replay 时）。「18-19」「约3000」不像一个数，却是数据本身：
+        当成占位符，整格的内容就静默存成空值，干跑照样通过。表示无数据的符号（「·」「—」「/」「无」）不含数字；
+        已提交的配方里沿用下来的（同一块、canon 相同）放行，重放也不报，免得期 3 之前存下的配方在下一期被拒。"""
+        literal = self.origin != "replay"
+        carried = self.base_placeholders() if literal else {}
         for si, sheet in enumerate(self.r.sheets):
             for bi, block in enumerate(sheet.blocks):
                 for n, ph in enumerate(block.values.placeholders):
+                    pp = ("sheets", si, "blocks", bi, "values", "placeholders", n, "text")
                     if looks_numeric_text(ph.text):
-                        self.add(("sheets", si, "blocks", bi, "values", "placeholders", n, "text"),
-                                 "placeholder_numeric",
+                        self.add(pp, "placeholder_numeric",
                                  f"占位符「{ph.text}」看起来是一个数，不能当作占位符（占位符一律存为空值）")
+                    elif (literal and any(ch.isdigit() for ch in ph.text)
+                          and canon(ph.text) not in carried.get(block.id, set())):
+                        what = ("；如果这一行写的都是文字（如时段、名称），请把这个指标的「指标类型」改为「文字」或「时段」"
+                                if isinstance(block, CrosstabBlock) else "")
+                        self.add(pp, "placeholder_digits",
+                                 f"占位符「{ph.text}」含数字：表示无数据的符号不含数字（如「·」「—」「无」），"
+                                 f"含数字的通常是数据本身，当作占位符会整格存成空值{what}")
         for si, bi, block in self.lists:
             total = block.rows.total_row
             if total is not None and any(ch.isdigit() for ch in total.pick):
@@ -896,6 +923,14 @@ class _Checker:
             if sub is not None and any(ch.isdigit() for ch in sub.pick):
                 self.add(("sheets", si, "blocks", bi, "rows", "subtotals", "pick"), "period_literal",
                          f"小计行的开头词「{sub.pick}」不能含数字（配方里不能写死年份或期次）")
+
+    def base_placeholders(self) -> dict[str, set[str]]:
+        """现行配方（base）里每个块的占位符（canon 后）：块 id → 集合。没有 base 时为空。"""
+        out: dict[str, set[str]] = {}
+        for sheet in self.base.sheets if self.base is not None else []:
+            for block in sheet.blocks:
+                out.setdefault(block.id, set()).update(canon(p.text) for p in block.values.placeholders)
+        return out
 
     # ---- 4、9、13. 单位：键是本表列名，值在词表里，与原表标签、表头里的单位一致 ----
 
@@ -915,7 +950,12 @@ class _Checker:
         for si, bi, _gi, _block, seg in self.segs:
             if isinstance(seg, MeasuresSegment):
                 for label in seg.labels.expect:
-                    if label in seg.measures:
+                    if label not in seg.measures:
+                        continue
+                    if label in seg.text_measures:
+                        # 标签写着单位的已报 text_measure_unit；这里只拦文字列上写的单位
+                        self.no_unit_on_text(seg.table, seg.measures[label])
+                    else:
                         self.unit_against(seg.table, seg.measures[label], label, "标签")
             elif isinstance(seg, DimensionSegment) and seg.locate.by == "section_title" and seg.locate.title:
                 self.unit_against(seg.table, seg.value, seg.locate.title, "分段标题")
@@ -937,6 +977,12 @@ class _Checker:
         """合计分段紧跟的那个 dimension 分段（同一块里按 id 找）；找不到或不是 dimension 段时已报 derived_after_invalid。"""
         return next((s for sj, bj, _gi, _block, s in self.segs
                      if (sj, bj) == (si, bi) and isinstance(s, DimensionSegment) and s.id == seg.locate.segment), None)
+
+    def no_unit_on_text(self, table: str, column: str) -> None:
+        i = self.declared.get(table)
+        if i is None or not column or column not in self.r.tables[i].units:
+            return
+        self.add(("tables", i, "units", column), "unit_on_text", f"列「{column}」按文字导入，不能写单位")
 
     def unit_against(self, table: str, column: str, source: str, what: str) -> None:
         i = self.declared.get(table)

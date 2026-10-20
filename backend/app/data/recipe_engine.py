@@ -67,10 +67,10 @@ from app.data import engine as _data_engine
 from app.data import tabular, xlsx_cells
 from app.data.names import canon
 from app.data.recipe_parsers import (
-    TOTAL_WORDS, AxisDate, HourRange, HourTotal, Period, classify_outside, cn_date_range, cn_year_month,
+    TOTAL_WORDS, UNITS, AxisDate, HourRange, HourTotal, Period, classify_outside, cn_date_range, cn_year_month,
     filename_period,
     hour_range, hour_range_total, is_pure_period_cell, looks_numeric_text, match_key, month_day_or_date,
-    period_residue, text_label, thousands_number,
+    period_residue, split_unit_suffix, text_label, thousands_number,
 )
 from app.data.recipe_types import (
     SUBTOTAL_KEY, AxisOut, CanonEntry, CheckResult, ColumnOut, ContextSpec, CrosstabBlock, DerivedItem,
@@ -116,7 +116,7 @@ PROBLEM_CODES: dict[str, str] = {
     "value_not_integer": "structure", "value_text_number": "structure", "value_blank": "structure",
     "value_error": "structure", "value_not_number": "structure", "value_not_date": "structure",
     "value_formula": "structure", "formula_uncached": "structure", "formula_full_calc": "structure",
-    "pk_duplicate": "structure",
+    "pk_duplicate": "structure", "value_not_text": "structure", "value_not_hour_range": "structure",
 }
 
 #: 修复按钮的种类（契约 Problem.fix，取值见 FIX_KINDS）。参数 fix_args 的形状见 P3-SPEC 3.2，由报问题的地方随问题
@@ -520,6 +520,9 @@ class _Issue:
     row: int | None = None
     #: value_not_number：能当占位符提议的文字（canon 后）→ 格数，最多收 PLACEHOLDER_TEXTS_MAX + 1 种
     texts: Counter[str] = field(default_factory=Counter)
+    #: value_not_number：measures 段里整行都是文字的指标（declare_text_measure 的参数）：
+    #: {"segment", "label"（期望标签原文）, "cell"（标签格）, "parsers"（能用的解析方式）}
+    text_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 #: 合并类问题的说明：code → (原因（{n} 是个数）, 下一步)。下一步写配方面板上的「字段」和「选项」原文
@@ -530,8 +533,13 @@ _ISSUE_TEXT: dict[str, tuple[str, str]] = {
                           "。如需按数字导入，请在配方面板的「文本写的数字」中选择「千分位写法按数字保存」"),
     "value_blank": ("{n} 个单元格为空", "。如原表确实为空，请在配方面板的「空格」中选择「存为空值」"),
     "value_error": ("{n} 个单元格是错误值", "。请在 Excel 中修正后重新上传"),
+    # 下一步按格子的情况另写（_not_number_tail）：整行是文字的提示改「指标类型」，能当占位符的才提示加占位符
     "value_not_number": ("{n} 个单元格不是数字", "。如果它表示无数据，请在配方面板中添加占位符"),
     "value_not_date": ("{n} 个单元格不是日期", "。请检查原表，或在配方面板中把这一列的「类型」改为「文字」"),
+    "value_not_text": ("{n} 个单元格不是文字",
+                       "。这个指标按文字导入：请检查原表，或在配方面板中把它的「指标类型」改为「数字」"),
+    "value_not_hour_range": ("{n} 个单元格无法按时段解析",
+                             "。这个指标按时段导入：请检查原表，或在配方面板中把它的「指标类型」改为「文字」"),
     "value_formula": ("{n} 个数据格是公式",
                       "。数据区的公式通常是没有识别出来的合计；如确为数据，请在配方面板的「公式」中选择「按保存值导入」"),
     "formula_uncached": ("{n} 个公式格没有保存计算结果", "，文件未经计算保存。请在 Excel 中打开并保存后重新上传"),
@@ -546,6 +554,21 @@ _PK_BLANK = ("主键列有 {n} 个单元格为空", "。主键不能为空，请
 _PK_PLACEHOLDER = ("主键列有 {n} 个单元格是占位符", "。占位符按空值存，主键不能为空，请检查原表")
 #: 交叉表、合计另存表的主键列是空值（占位符、blank=null 的空格、没有保存值的合计格、跳过的隐藏行）
 _PK_NULL = ("有 {n} 处为空值", "。主键不能为空：请检查原表，或在配方面板的「主键」中去掉这一列")
+
+
+def _not_number_tail(it: _Issue) -> str:
+    """value_not_number 的下一步。整行写的都是文字的指标，提示改「指标类型」；有能当占位符的文字（不含数字的短符号）
+    才提示加占位符：「18-19」这种写法当占位符会整格存成空值，干跑照样通过（静态校验 placeholder_digits 也拦）。"""
+    hint: list[str] = []
+    if it.text_rows:
+        hint.append(f"{_quoted([x['label'] for x in it.text_rows])}这一行写的都是文字：如果本来就是文字（如时段、名称），"
+                    "请在配方面板中把它的「指标类型」改为「文字」或「时段」")
+    if it.texts:
+        hint.append("如果其中有表示无数据的符号，请在配方面板中添加占位符" if hint
+                    else "如果它表示无数据，请在配方面板中添加占位符")
+    if not hint:
+        return "。数值区只能是数字或表示无数据的符号（如「·」「—」，不含数字）：请检查原表"
+    return "。" + "；".join(hint)
 
 
 class _Problems:
@@ -592,6 +615,12 @@ class _Problems:
         if sample is not None and (sample in it.texts or len(it.texts) <= PLACEHOLDER_TEXTS_MAX):
             it.texts[sample] += 1
 
+    def text_row(self, sheet: str, where: str, row: dict[str, Any]) -> None:
+        """把整行是文字的指标记到这一段的 value_not_number 上（那一行的格转换时已经各自报过）。"""
+        it = self.issues.get(("value_not_number", sheet, where + "\x00"))
+        if it is not None and all(x["label"] != row["label"] for x in it.text_rows):
+            it.text_rows.append(row)
+
     def finish(self, failed_sheets: set[str],
                args_for: Callable[[_Issue], dict[str, Any] | None] | None = None) -> list[Problem]:
         """合并类问题出成 Problem；args_for 给有修复按钮的合并类问题（outside_number、value_not_number）算 fix_args。
@@ -602,7 +631,8 @@ class _Problems:
             ex = f"（如 {'；'.join(it.examples)}）" if it.examples else f"（{_join(shown, 5)}）"
             model_ex = f"（{_join(shown, 5)}）"
             args = args_for(it) if args_for is not None and it.code in PROBLEM_FIX else None
-            self.add(it.code, f"{it.where}：{reason}{ex}{it.tail}", f"{it.where}：{reason}{model_ex}", it.cells,
+            tail = _not_number_tail(it) if it.code == "value_not_number" else it.tail
+            self.add(it.code, f"{it.where}：{reason}{ex}{tail}", f"{it.where}：{reason}{model_ex}", it.cells,
                      sheet=it.sheet, fix_args=args)
         for (code, sheet), n in self._over.items():
             where = f"工作表「{sheet}」" if sheet else "本文件"
@@ -1482,10 +1512,22 @@ class _Crosstab:
                 eng.headers[(seg.table, seg.measures.get(label, ""))] = _text(self._label(r).value)  # type: ignore[union-attr]
         # 值保留 _FAIL（已报过问题），交给 _Sink 按空值存；没找到的标签（已报 label_missing）也按 _FAIL
         values: dict[tuple[str, int], Any] = {}
+        pol = self.block.values
         for label, r in rows_by_label.items():
             excluded = self.exclude_hidden and sh.hidden_row(r)
+            text = seg.text_measures.get(label)
+            column = seg.measures.get(label, "")
             for c in self._axis_cols():
-                values[(label, c)] = None if excluded else self._value(r, c, where)
+                if excluded:
+                    values[(label, c)] = None
+                elif text is not None:
+                    values[(label, c)] = eng.convert_text(self.grid.get(r, c), text.parser, pol, sh.name, where, r, c,
+                                                          seg.table, column)
+                else:
+                    values[(label, c)] = self._value(r, c, where)
+            if text is None and not excluded and (parsers := self._text_parsers(r, label)):
+                eng.problems.text_row(sh.name, where, {"segment": seg.id, "label": label,
+                                                       "cell": sh.coord(r, self.label_c), "parsers": parsers})
         if self.dates is None:
             return
         for c in self._axis_cols():
@@ -1497,6 +1539,31 @@ class _Crosstab:
                 if r is not None:
                     cells.append((seg.measures.get(label, ""), r, c))
             sink.add(row, sheet=sh.name, at=(self.axis_row, c), cells=cells, fails=True)
+
+    def _text_parsers(self, r: int, label: str) -> list[str] | None:
+        """这一行能不能改按文字指标导入（declare_text_measure 的提议）：轴列上除了占位符和空格，全是文字（不是数字、
+        日期、公式、错误值，也不是写成文字的数），至少一格。全都能按时段解析时给两种解析方式，时段在前。标签写着
+        词表里的单位的是数字指标（静态校验 text_measure_unit 也拒），不提议。"""
+        unit = split_unit_suffix(label)[1]
+        if unit is not None and unit in UNITS:
+            return None
+        ph = self.eng._placeholders(self.block.values)
+        texts: list[str] = []
+        for c in self._axis_cols():
+            cell = self.grid.get(r, c)
+            if cell is None:
+                continue
+            if cell.formula is not None or not isinstance(cell.value, str):
+                return None
+            t = cell.value.strip()
+            if not t or canon(t) in ph:
+                continue
+            if t in tabular.EXCEL_ERRORS or thousands_number(t) is not None or looks_numeric_text(t):
+                return None
+            texts.append(t)
+        if not texts:
+            return None
+        return ["hour_range", "text"] if all(hour_range(t) is not None for t in texts) else ["text"]
 
     def _derive_values(self, derive: dict[str, str], hr: Any) -> list[Any]:
         ordered = sorted(derive.items(), key=lambda kv: (kv[1] != "start", kv[0]))
@@ -2441,6 +2508,55 @@ class _Engine:
             return v if vtype == "REAL" else int(v)
         return self._number(v, vtype, pol, sheet, where, r, c, pk)
 
+    def convert_text(self, cell: GridCell | None, parser: str, pol: Any, sheet: str, where: str, r: int, c: int,
+                     table: str, column: str) -> Any:
+        """文字指标的一格（MeasuresSegment.text_measures）→ 入库值。空格、公式、占位符照块的取值规则；text 存原文
+        （去首尾空白），hour_range 存时段的规范写法。数字、日期不是文字（不替人把 8-9 被 Excel 改成的日期认回去），
+        解析不了的时段也是问题：都按 _FAIL 返回、已记问题。"""
+        p = self.problems
+        if cell is None:
+            if pol.blank == "null":
+                return None
+            p.issue("value_blank", sheet, where, _coord(sheet, r, c))
+            return _FAIL
+        v = cell.value
+        if cell.formula is not None:
+            v = self._accept_formula(cell, pol, sheet, where, r, c)
+            if v is _FAIL:
+                return _FAIL
+        if not isinstance(v, str):
+            p.issue("value_not_text", sheet, where, _coord(sheet, r, c), f"{cell_ref(r, c)}「{_shown(v)}」")
+            return _FAIL
+        t = v.strip()
+        ph = self._placeholders(pol)
+        key = canon(t)
+        if key in ph:
+            name = ph[key]
+            self.ex.placeholders[name] = self.ex.placeholders.get(name, 0) + 1
+            return None
+        if not t:
+            if pol.blank == "null":
+                return None
+            p.issue("value_blank", sheet, where, _coord(sheet, r, c))
+            return _FAIL
+        if t in tabular.EXCEL_ERRORS:
+            p.issue("value_error", sheet, where, _coord(sheet, r, c), f"{cell_ref(r, c)}「{_shown(v)}」")
+            return _FAIL
+        if parser == "text":
+            return t
+        hr = hour_range(t)
+        if hr is None:
+            p.issue("value_not_hour_range", sheet, where, _coord(sheet, r, c), f"{cell_ref(r, c)}「{_shown(v)}」")
+            return _FAIL
+        if hr.canonical != t:
+            log = (table, column, t, hr.canonical)
+            hit = self.canon_log.get(log)
+            if hit is not None:
+                hit.count += 1
+            elif len(self.canon_log) < CANON_MAX:
+                self.canon_log[log] = CanonEntry(table, column, t, hr.canonical, 1, _coord(sheet, r, c))
+        return hr.canonical
+
     def _accept_formula(self, cell: GridCell, pol: Any, sheet: str, where: str, r: int, c: int) -> Any:
         """数据区的公式格：拒收、无缓存、打开时重算都是问题；否则按保存值导入并计数。"""
         p = self.problems
@@ -2675,7 +2791,11 @@ class _Engine:
             if it.block is None:
                 return None
             texts = list(it.texts)[:PLACEHOLDER_TEXTS_MAX]
-            return {"block": it.block, "texts": texts, "other": it.count - sum(it.texts[t] for t in texts)}
+            args = {"block": it.block, "texts": texts, "other": it.count - sum(it.texts[t] for t in texts)}
+            if it.text_rows:
+                # 只有标签原文、标签格坐标和解析方式，没有数据格的内容
+                args["text_rows"] = [dict(x) for x in it.text_rows]
+            return args
         if it.code == "outside_number" and it.row is not None:
             sh = next((x for x in self.sheets if x.name == it.sheet), None)
             if sh is None:

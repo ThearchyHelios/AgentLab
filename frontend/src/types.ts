@@ -800,10 +800,11 @@ export interface CurrentRecipe {
 // 和接口的 JSON 同名（Selection 的 as 除外：后端 dataclass 叫 as_，JSON 里是 as）
 // ---------------------------------------------------------------------------
 
-/** 修复按钮的九种（契约 FIX_KINDS） */
+/** 修复按钮的种类（契约 FIX_KINDS） */
 export type FixKind =
   | 'remove_label' | 'add_label' | 'edit_members' | 'rename_title' | 'declare_total' | 'ignore_cells'
-  | 'declare_placeholder' | 'declare_hidden' | 'rename_sheet' | (string & {})
+  | 'declare_placeholder' | 'declare_hidden' | 'rename_sheet' | 'declare_subtotals' | 'declare_text_measure'
+  | (string & {})
 
 /** 修复提议的一个封闭选项。效果由服务端算：界面只发 fix_id、value 和理由 */
 export interface FixOption {
