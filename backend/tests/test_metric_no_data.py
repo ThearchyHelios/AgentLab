@@ -183,3 +183,15 @@ async def test_the_report_prompt_carries_the_rule(plant, monkeypatch):
     await finished(graph)
     prompt = "\n".join(str(m.content) for m in seen[0])
     assert NO_DATA_RULE in prompt and "这段时间表里没有数据" in prompt
+
+
+def test_an_ungated_result_says_its_gaps_on_the_stamp():
+    """成果没配出具契约时，实例页的印章照实写这些缺口（配了契约的已经按缺口降档）。"""
+    from app.apps.resolve import ungated_notes
+
+    cards = [{"metrics": [{"id": "visitors", "name": "上周到访人数", "no_data": True}, {"id": "pv", "name": "客流PV"}]}]
+    dual = {"issuance_gaps": ["指标「销售额」无法复算：盲算已达每项最多查询次数（1 次）"]}
+    notes = ungated_notes(cards, dual)
+    assert notes[0].startswith("指标「上周到访人数」所依据的查询区间里表里没有数据") and "没有配出具契约" in notes[0]
+    assert notes[1].startswith("双盲复算有缺口：指标「销售额」无法复算")
+    assert ungated_notes([{"metrics": [{"id": "pv", "name": "客流PV"}]}], None) == []
