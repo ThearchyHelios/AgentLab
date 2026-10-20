@@ -257,3 +257,32 @@ async def test_a_live_range_is_kept_for_a_while(monkeypatch):
     await coverage.result_gaps(source, sql, payload)
     await coverage.result_gaps(source, sql, payload)
     assert sum("MIN(" in t for t in seen) == 3, "过期了就重新现查"
+
+
+async def test_a_failed_probe_is_not_retried_for_a_while(monkeypatch):
+    """现查没成功（大表全表 MIN / MAX 超时）也记几分钟：期间同一张表直接退回剖析，不再每次白等探查的时限。"""
+    from types import SimpleNamespace
+
+    seen: list[str] = []
+
+    async def probe(source, text):
+        seen.append(text)
+        return None
+
+    async def facts(table):
+        return {"at": "2026-10-01T03:00:00+00:00", "date_ranges": [{"column": "event_date", "min": "20260930",
+                                                                     "max": "20260930"}]}
+
+    monkeypatch.setattr(coverage, "_probe", probe)
+    monkeypatch.setattr(coverage, "_LIVE", {})
+    source = SimpleNamespace(name=f"plant_{uuid.uuid4().hex[:6]}", kind="sqlite", schema_cache=None, id="s-failed")
+    payload = {"columns": ["n"], "rows": [[0]], "row_count": 1, "column_types": {"n": "number"}}
+    sql = "SELECT COUNT(*) AS n FROM gate_events WHERE event_date >= '20261012'"
+    for _ in range(3):
+        [gap] = await coverage.result_gaps(source, sql, payload, facts=facts)
+        assert gap["basis"] == "profile"
+    assert sum("MIN(" in t for t in seen) == 1, "失败的现查也记着，期间不再白等"
+    monkeypatch.setattr(coverage, "LIVE_TTL_S", 0.0)
+    coverage._LIVE.clear()
+    await coverage.result_gaps(source, sql, payload, facts=facts)
+    assert sum("MIN(" in t for t in seen) == 2, "过期了就重新现查"
