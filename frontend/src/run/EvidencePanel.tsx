@@ -1361,6 +1361,8 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
   // 口径卡里 rendered 为「—」有两种：value 为 null 是缺输入，不为 null 是有值但按格式显示不出来
   const dash = rendered === NONE || entry?.rendered === NONE
   const missing = entry?.status === 'missing_input' || (value == null && (dash || !resolved))
+  // 没有值的两种：缺输入，和输入都齐、计算式自己算不出来（分母为 0，口径卡记了 undefined）
+  const undefinedValue = missing && (step?.undefined === true || entry?.undefined === true)
   const unshowable = !missing && dash && value != null
   // 拿截断的查询结果整组算出来的：值是真的算出来的，但只算到了取回的那部分，出具已按缺口降档
   const incomplete = step?.incomplete === true || entry?.incomplete === true
@@ -1416,7 +1418,12 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
       )}
       {dualCheck && <DualCheckLine check={dualCheck} formal={runClass === 'formal'} />}
       <Integrity step={step} seal={seal} />
-      {missing && <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-missing="">{EVIDENCE_TEXT.missingValue}</p>}
+      {missing && (
+        <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-missing=""
+           {...(undefinedValue ? { 'data-ev-undefined': '' } : {})}>
+          {undefinedValue ? EVIDENCE_TEXT.undefinedValue : EVIDENCE_TEXT.missingValue}
+        </p>
+      )}
       {incomplete && (
         <p className="mt-1" style={{ color: 'var(--st-waiting)' }} data-ev-incomplete-reason="">{incompleteReason}</p>
       )}

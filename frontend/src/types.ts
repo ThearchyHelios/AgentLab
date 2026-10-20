@@ -2399,6 +2399,8 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   sql_check_failed?: boolean
   /** metric：没通过的原因（人话，「所依据的查询未通过 SQL 检查（…），结果不可靠」） */
   sql_check_reason?: string
+  /** metric：没有值，不是缺输入，是输入都齐、计算式自己算不出来（分母为 0）。状态仍是 missing_input */
+  undefined?: boolean
   /** metric（期 4）：这个指标的双盲复算状态。没有双盲复算复核过这份指标集时没有这个键 */
   dual_check?: EvidenceDualCheck
   /**

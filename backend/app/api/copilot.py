@@ -207,6 +207,9 @@ NODE_REFERENCE = """\
   config: {caliber, caliber_version, metrics:[{id, name, unit, decimals, format, expression}], on_missing, assign_to}
   expression 是受限表达式（不是模板）：vars.kpi.gmv、cell(nodes.fetch, 0, 'gmv')、
   round((vars.kpi.gmv - vars.kpi.gmv_prev) / vars.kpi.gmv_prev * 100, 1)
+  **分母可能为 0**（上期为 0、这段时间没有数据）时写「… if 分母 else None」：
+  round((vars.kpi.gmv - vars.kpi.gmv_prev) / vars.kpi.gmv_prev * 100, 1) if vars.kpi.gmv_prev else None。
+  算不出来就是空值（报告里显示「—」，写作者照实说算不出来）；不要写 else 0——0 会被读成持平、0%
   format：thousands（默认，千分位）/ plain（不分组，年份编号这类）/ percent_of_ratio（值是 0.0235 这样的比率，显示成 2.35%）；
   decimals 写 -15 到 15 的整数；percent_of_ratio 的 decimals 按比率算：要显示两位百分比（2.35%）写 4，
   写 2 只剩「2%」，0.004 这样的小比率还会显示不出来、报告引用不了。on_missing 默认 fail（缺输入整张卡失败）；写 null 则缺输入的指标记为空值，交给出具契约判档

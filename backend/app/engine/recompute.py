@@ -609,7 +609,8 @@ _ANY = object()
 _CARD_PLAIN = frozenset({"kind", "caliber", "caliber_version", "artifact", "source"})
 #: 一个指标里不带值的字段（名称、单位、表达式、显示格式、状态这类）。值、渲染、输入、代入式都带着值
 _METRIC_PLAIN = frozenset({"id", "name", "unit", "expression", "decimals", "format", "status", "recompute_ok",
-                           "incomplete", "incomplete_reason", "sql_check_failed", "sql_check_reason"})
+                           "incomplete", "incomplete_reason", "sql_check_failed", "sql_check_reason", "undefined",
+                           "no_data", "no_data_reason", "no_data_sources"})
 #: 转抄的上游口径卡当时的产出读不出来（文件不在、与哈希不一致、不知道是谁写的）：转抄来的是不是遮罩值核对不了
 CARD_UNREADABLE = "转抄的口径卡结果无法读取，核对不了这个值是否取自设置了遮罩的列"
 

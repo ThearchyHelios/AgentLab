@@ -179,7 +179,8 @@ async def test_each_metric_records_its_inputs_substitution_and_rendering(engine_
     # 旧字段一个不少，text 照旧——模板 ⑧ 的叙述 prompt 靠它
     assert {"id", "name", "unit", "value", "expression"} <= set(wow)
     output = row.output["清单"]
-    assert "- wow（环比增幅）= 8.7%" in output and "- orders（订单数）= 1234单" in output
+    # 清单按卡上渲染好的字写（和报告里 [[m:]] 一样按单位、小数位、千分位）：叙述节点抄的就是报告上会出现的写法
+    assert "- wow（环比增幅）= 8.7%" in output and "- orders（订单数）= 1,234单" in output
 
 
 async def test_metric_set_artifact_is_in_the_ledger_and_node_finished(engine_up):

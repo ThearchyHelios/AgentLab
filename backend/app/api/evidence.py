@@ -992,6 +992,8 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         # 来源查询没通过 SQL 检查：面板标出来并写明原因（问题和改法在查询步骤的 checks 里）。没问题的没有这两个键
         **({"sql_check_failed": True, "sql_check_reason": source.get("sql_check_reason") or ""}
            if source.get("sql_check_failed") else {}),
+        # 输入都齐、计算式自己算不出来（分母为 0）：面板说「算不出来」，不说「缺少输入」。有值的没有这个键
+        **({"undefined": True} if source.get("undefined") and source.get("value") is None else {}),
         "node_id": entry.get("node_id"), "artifact": artifact or None, "eid": cite.get("eid"),
         "eid_ok": cite.get("eid") == entry.get("eid") == make_eid("metric", artifact or None, {"metric": metric_id}),
         "hash_ok": hash_ok and metric is not None,
@@ -1091,6 +1093,7 @@ async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Mask
                if found.get("incomplete") else {}),
             **({"sql_check_failed": True, "sql_check_reason": found.get("sql_check_reason") or ""}
                if found.get("sql_check_failed") else {}),
+            **({"undefined": True} if found.get("undefined") and found.get("value") is None else {}),
             "untraced": _untraced_steps(found, sealed, node),
         })
         if withheld := {path: _held_word(h) for path, h in held.items() if h.kind != "table"}:

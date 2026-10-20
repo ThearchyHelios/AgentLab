@@ -201,6 +201,16 @@ class Side:
     inputs: dict[str, Any] = field(default_factory=dict)
 
 
+def missing_reason(side: str, metric: dict[str, Any]) -> str | None:
+    """一边的指标没有值时的那句原因：输入都齐、计算式自己算不出来的（口径卡记了 undefined，分母为 0）说「算不出来」，
+    别的说「缺少输入」。有值的为 None。"""
+    if metric.get("status") != "missing_input":
+        return None
+    if metric.get("undefined"):
+        return f"{side}这个指标算不出来（这组输入下计算式没有值，比如分母为 0）"
+    return f"{side}这个指标缺少输入，没有值"
+
+
 def compare(base: Side, target: Side) -> dict[str, Any]:
     """对比两次运行（base 是基准，target 是这次），只读，不碰两次运行的任何东西。返回：
 
@@ -1499,8 +1509,8 @@ class _Compare:
                 out.update(classification=DATA_ONLY, reasons=[
                     DATA_FROM_UPSTREAM if self.template["same_graph"] else DATA_FROM_UPSTREAM_SCOPED])
         for side, metric in (("基准运行", bm), ("这次运行", tm)):
-            if metric.get("status") == "missing_input":
-                out["reasons"].append(f"{side}这个指标缺少输入，没有值")
+            if said := missing_reason(side, metric):
+                out["reasons"].append(said)
         if out["classification"] in _ATTRIBUTED and bp is not None and tp is not None:
             out["attribution"] = self._attribution(bp, tp, card_id)
         if any(inp.masked for plan in (bp, tp) if plan is not None for inp in plan.inputs.values()):

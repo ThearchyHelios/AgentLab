@@ -175,6 +175,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 # 值是空的就是缺输入，不论 on_missing 是哪一种：fail 模式下直接取到空值的
                 # 指标（原式就是 vars.x.y 而 y 不存在）以前也是照常产出一个 None
                 "status": "ok" if value is not None else "missing_input",
+                # 输入都齐、是计算式自己交回的空值（分母为 0 时写的 … if 分母 else None）：算不出来，不是缺输入。状态照旧是
+                # missing_input（证据面板、推演、运行对比按状态认的地方不受影响），只多这一个键；有值的指标和以前一字不差
+                **({"undefined": True} if value is None and not missing else {}),
                 # 只在不完整时出现：完整的指标和以前一字不差，老运行复核时目录也对得上
                 **incomplete,
                 # 只在来源查询没通过 SQL 检查时出现，同上
@@ -188,8 +191,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     # text 是给叙述节点 prompt 用的清单——它是叙述层唯一的数字来源
     lines = [
-        (f"- {m['id']}（{m['name']}）= {m['value']}{m['unit']}" if m["value"] is not None
-         else f"- {m['id']}（{m['name']}）= {MISSING}（缺少输入，无值）")
+        f"- {m['id']}（{m['name']}）= {_listed(m)}"
         # 不写行数：叙述节点照抄进正文就是一个没有出处的数
         + ("（不完整：基于被截断的查询结果计算）" if m.get("incomplete") else "")
         + ("（存疑：所依据的查询未通过 SQL 检查）" if m.get("sql_check_failed") else "")
@@ -441,6 +443,24 @@ def _rendered(value: Any, definition: dict[str, Any], display: dict[str, Any]) -
         # 按规则渲染不出来的值显示「—」：inf / nan、不是 0 却会显示成 0 的（小数位不够）、
         # 位数大到不像话的。值本身照旧记着，报告里引用它会被判成解析不了，原因写清楚
         return MISSING
+
+
+#: 清单里没有值的两种说法：缺输入，和输入都齐、计算式自己算不出来（分母为 0）
+LISTED_MISSING = "（缺少输入，无值）"
+LISTED_UNDEFINED = "（算不出来：这组输入下计算式没有值，比如分母为 0）"
+#: 有值、按口径卡的小数位和格式显示不出来（太小、太大、不是有限的数）：不把原值拼出来，照实说
+LISTED_UNSHOWABLE = "（有值，但按设定的小数位和格式显示不出来）"
+
+
+def _listed(metric: dict[str, Any]) -> str:
+    """清单里这个指标的值：卡上按单位、小数位、格式渲染好的字（rendered，和报告里经 [[m:]] 渲染出来的一样）。以前拼原值
+    （{value}{unit}），比率 0.0007 配 % 写成「0.0007%」，直接读清单的模型节点差 100 倍。"""
+    if metric["value"] is None:
+        return MISSING + (LISTED_UNDEFINED if metric.get("undefined") else LISTED_MISSING)
+    rendered = str(metric.get("rendered") or "")
+    if not rendered or rendered == MISSING:
+        return MISSING + LISTED_UNSHOWABLE
+    return rendered
 
 
 def _value_of(path: str, tctx: dict[str, Any]) -> Any:
