@@ -498,9 +498,10 @@ def _snapshot_hidden(content: dict[str, Any], source_masks: Mapping[str, Any]) -
 # --------------------------------------------------------------------------
 
 #: 数据源查询工具（tools/datasource.py）落的查询快照里会有的键。有别的键的（比如核查 agent 在查询时就把遮罩列换成
-#: 「已遮罩」、另记下了遮了哪些列）不知道它记着什么，照现有规则只给 id
+#: 「已遮罩」、另记下了遮了哪些列）不知道它记着什么，照现有规则只给 id。no_data 是查询区间里这张表没有数据的那几列
+#: （data/coverage.py）：只有日期和表名、列名，遮罩列上的不探查也不记
 _QUERY_KEYS = frozenset({"columns", "rows", "row_count", "truncated", "elapsed_ms", "sql", "column_types", "source",
-                         "checks", "schema_artifact", "mask_columns", "data_version"})
+                         "checks", "schema_artifact", "mask_columns", "data_version", "no_data"})
 #: 导出时只知道数据源设的遮罩、不知道是哪种库：SQL 按每种支持的库的读法各解析一遍（None 是 sqlglot 的通用读法），
 #: 至少一种读得通，读得通的每一种都要过关
 _READINGS = (None, "sqlite", "mysql", "postgres", "oracle")

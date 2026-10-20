@@ -696,6 +696,12 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
         # 快照和以前一字不差
         if checks := await _sql_checks(_checker(), sql):
             payload["checks"] = checks
+        # 结果里有整列是 0 或空的数值列时，现查查询区间里这张表有没有数据（data/coverage.py）：没有就照实写进结果和
+        # 快照（no_data，给人和模型看的 message），运行事件里记一条 query_no_data。没查出问题不加这个键，快照和以前一字不差
+        if gaps := await _coverage(source, str(payload.get("sql") or sql), payload, mask):
+            payload["no_data"] = gaps
+            await _announce(ctx, EventType.LOG, level="warn", code="query_no_data", no_data=gaps,
+                            message="；".join(g["message"] for g in gaps))
         if outside and (unchecked := _unchecked_tables(sql, source, outside)):
             payload["unchecked_tables"] = unchecked
         # 表结构快照：这次查询时数据源的结构冻结下来，报告里写的表名、字段名按它核对。事后数据源
@@ -774,6 +780,33 @@ def _unchecked_tables(sql: str, source: Any, outside: frozenset[str]) -> list[st
     cache = getattr(source, "schema_cache", None)
     return [t for t in dict.fromkeys(names)
             if name_key(str(t).rsplit(".", 1)[-1]) in outside and data_catalog.resolve_table_name(cache, str(t)) is None]
+
+
+async def _coverage(source: Any, sql: str, payload: Mapping[str, Any], mask: list[str]) -> list[dict[str, Any]]:
+    """查询区间里这张表没有数据的那几列（data/coverage.result_gaps）。只在结果里有整列是 0 或空的数值列时才查库；遮罩列
+    不探查；现查表的范围不成时退回剖析、取值观察记下的范围（上传表格的快照对不上就不用）。从不抛异常。"""
+    from app.data import coverage
+
+    if not coverage.zero_columns(payload):
+        return []
+
+    async def facts(table: str) -> Mapping[str, Any] | None:
+        from app.data.catalog_profile_jobs import last_facts
+        from app.db.base import SessionLocal
+
+        source_id = getattr(source, "id", None)
+        if not source_id:
+            return None
+        name = data_catalog.resolve_table_name(getattr(source, "schema_cache", None), table) or table
+        async with SessionLocal() as session:
+            found = (await last_facts(session, str(source_id), [name])).get(name)
+        snapshot = getattr(source, "snapshot_id", None)
+        if found and snapshot and found.get("snapshot_id") != snapshot:
+            # 上传表格：剖析时是另一版数据，范围对不上这次读的这一版
+            return None
+        return found
+
+    return await coverage.result_gaps(source, sql, payload, facts=facts, masked=mask)
 
 
 async def _sql_checks(checker: SqlChecker, sql: str) -> list[dict[str, Any]]:
