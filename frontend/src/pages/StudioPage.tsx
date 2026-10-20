@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
-  AlertTriangle, Check, ChevronDown, History, LayoutGrid, MoreHorizontal, PanelRightClose, PanelRightOpen, Plus,
+  AlertTriangle, Check, ChevronDown, History, LayoutGrid, MoreHorizontal, PanelRightClose, PanelRightOpen, Pencil, Plus,
   Redo2, RotateCw, Save, ShieldCheck, Square, Undo2, Variable, Wand2, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
@@ -13,7 +13,7 @@ import { CanvasDock, type DockTab } from '../canvas/CanvasDock'
 import { LineageLayer } from '../canvas/LineageLayer'
 import { VersionsSheet } from '../canvas/VersionsSheet'
 import { PublishDialog } from '../canvas/PublishDialog'
-import { WorkflowPicker, confirmDiscard, createWorkflow, takeDiscarded } from '../canvas/WorkflowPicker'
+import { WorkflowPicker, confirmDiscard, createWorkflow, renameWorkflow, takeDiscarded } from '../canvas/WorkflowPicker'
 import { fieldOfIssue, problemsOf, type Problem } from '../canvas/issues'
 import { STUDIO_SHORTCUTS, hintOf, studioShortcut, type StudioShortcutId } from '../canvas/shortcuts'
 import { AssistantPanel } from '../run/AssistantPanel'
@@ -527,6 +527,11 @@ export function StudioPage() {
           <span className="max-w-56 truncate font-medium @max-[1120px]:max-w-32">{workflow?.name ?? '选择工作流'}</span>
           <ChevronDown size={12} className="shrink-0 text-faint" />
         </button>
+        {/* 改名只改名字，画布上没保存的改动不受影响；内置模板不给改名（见 renameWorkflow） */}
+        {workflow && !workflow.is_template && (
+          <IconButton label={`重命名「${workflow.name}」`} title="重命名" className="-ml-1 shrink-0 text-faint hover:text-dim"
+                      onClick={() => void renameWorkflow(workflow, refresh)} icon={<Pencil size={12} />} />
+        )}
 
         {workflow && <VersionLabel workflow={workflow} />}
         {dirty && (

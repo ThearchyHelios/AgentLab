@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Check, Copy, Layers, LayoutTemplate, Plus, Search, Trash2, Workflow as WorkflowIcon } from 'lucide-react'
+import { Check, Copy, Layers, LayoutTemplate, Pencil, Plus, Search, Trash2, Workflow as WorkflowIcon } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { useCatalog } from '../store/catalog'
@@ -153,6 +153,35 @@ export async function createWorkflow(
   } catch (e) {
     toast.error(e)
     return false
+  }
+}
+
+/**
+ * 给工作流改名。只改名字：不加版本、不碰图，画布上还没保存的改动原样留着（改的正是画布上打开的这一张时，只换它的名字）。
+ * 同名、空名在这里先拦一道，服务端也拦（api/workflows._checked_name）；内置模板不给改名入口（启动时按名字补内置模板，
+ * 服务端会拒），要改就「以此模板新建」。
+ */
+export async function renameWorkflow(w: Workflow, refresh: () => Promise<void> | void): Promise<Workflow | null> {
+  const names = new Set(useCatalog.getState().workflows.filter((x) => x.id !== w.id).map((x) => x.name))
+  const raw = await promptDialog({
+    title: `重命名「${w.name}」`,
+    label: '名称',
+    initial: w.name,
+    confirmLabel: '重命名',
+    validate: (v) => (!v.trim() ? '名称不能为空' : names.has(v.trim()) ? '已存在同名工作流，请使用其他名称' : null),
+  })
+  const name = raw?.trim()
+  if (!name || name === w.name) return null
+  try {
+    const updated = await api.workflows.update(w.id, { name })
+    const open = useStudio.getState().workflow
+    if (open?.id === w.id) useStudio.setState({ workflow: { ...open, name: updated.name } })
+    void refresh()
+    toast.ok(`已重命名为「${updated.name}」`)
+    return updated
+  } catch (e) {
+    toast.error(e)
+    return null
   }
 }
 
@@ -369,6 +398,11 @@ export function WorkflowPicker({ open, onClose }: { open: boolean; onClose: () =
                             onClick={async () => { if (await createWorkflow(navigate, refresh, w)) onClose() }}>
                       <Plus size={11} /> 以此模板新建
                     </button>
+                  )}
+                  {!w.is_template && (
+                    <IconButton label={`重命名「${w.name}」`} title="重命名"
+                                className="text-faint group-hover:text-dim"
+                                onClick={() => void renameWorkflow(w, refresh)} icon={<Pencil size={11} />} />
                   )}
                   <IconButton label={`复制「${w.name}」`} title="复制"
                               className="text-faint group-hover:text-dim"

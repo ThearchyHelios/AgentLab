@@ -203,6 +203,33 @@ async def get_workflow(
     return await _workflow_out(session, workflow)
 
 
+#: 工作流名称最长多少字（workflows.name 是 String(200)）
+NAME_MAX = 200
+
+
+async def _checked_name(session: AsyncSession, workflow: Workflow, given: str) -> str:
+    """改名：去掉首尾空白，不许空、不许超长、不许和别的工作流同名。
+
+    内置模板不许改名：启动时补内置模板是按名字认的（seed.seed_defaults），改了名下次启动会再导入一份原名的。要改名就
+    「以此模板新建」，改新建的那一份。名字没变（只是首尾多了空白）的照常放行。
+    """
+    name = given.strip()
+    if not name:
+        raise HTTPException(422, "工作流名称不能为空")
+    if len(name) > NAME_MAX:
+        raise HTTPException(422, f"工作流名称最多 {NAME_MAX} 个字")
+    if name == workflow.name:
+        return name
+    from app.seed import TEMPLATES
+
+    if workflow.is_template and workflow.name in {t["name"] for t in TEMPLATES}:
+        raise HTTPException(409, "内置模板的名称由系统维护，不能修改：可以「以此模板新建」，再给新建的工作流改名")
+    taken = await session.scalar(select(Workflow.id).where(Workflow.name == name, Workflow.id != workflow.id).limit(1))
+    if taken:
+        raise HTTPException(409, f"已存在同名工作流「{name}」，请使用其他名称")
+    return name
+
+
 @router.patch("/{workflow_id}", response_model=WorkflowOut)
 async def update_workflow(
     workflow_id: str, payload: WorkflowPatch, session: AsyncSession = Depends(get_session)
@@ -212,7 +239,7 @@ async def update_workflow(
         raise HTTPException(404, _GONE)
 
     if payload.name is not None:
-        workflow.name = payload.name
+        workflow.name = await _checked_name(session, workflow, payload.name)
     if payload.description is not None:
         workflow.description = payload.description
     if payload.tags is not None:
