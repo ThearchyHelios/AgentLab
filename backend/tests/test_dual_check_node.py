@@ -271,9 +271,11 @@ async def test_two_metrics_using_one_cell_are_checked_once(monkeypatch, shop):
 
 
 async def test_hitting_a_limit_counts_as_unchecked(monkeypatch, shop):
-    """查询次数用完了还没查到要交的那一格：按无法复算计入缺口；一个指标都没核成，产出是 unchecked，不是 agreed。"""
+    """查询次数用完了还没查到要交的那一格：按无法复算计入缺口；一个指标都没核成，产出是 unchecked，不是 agreed。
+    盲算交回的理由截一段带进原因：审批卡、缺口说明上看得到它查到了什么。"""
     name, _ = shop
-    Blind(monkeypatch, name, {"销售额": ([BLIND_TOTAL, RIGHT], "gmv")})
+    Blind(monkeypatch, name, {"销售额": ([BLIND_TOTAL, RIGHT], "gmv")},
+          rationale="只查到了不含退款的合计，还没来得及按支付日核对。")
     run = await start(graph(name, RIGHT), options={"verify": {"dual_check": {"max_queries": 1}}})
     assert run.status == "succeeded", run.error
     evs = await events(run.id)
@@ -281,15 +283,16 @@ async def test_hitting_a_limit_counts_as_unchecked(monkeypatch, shop):
     out = dual_output(run, evs)
     assert out["status"] == "unchecked" and out["metrics"][0]["status"] == "unchecked"
     assert out["counts"] == {"agreed": 0, "disagreed": 0, "unchecked": 1}
-    assert out["issuance_gaps"] == ["指标「销售额」无法复算：盲算已达每项最多查询次数（1 次）"]
+    reason = "盲算已达每项最多查询次数（1 次）；盲算交回的理由：只查到了不含退款的合计，还没来得及按支付日核对。"
+    assert out["issuance_gaps"] == [f"指标「销售额」无法复算：{reason}"]
     [said] = logs(evs, "dual_check_unchecked")
-    assert said["metrics"] == [{"id": "gmv", "name": "销售额", "reason": "盲算已达每项最多查询次数（1 次）"}]
+    assert said["metrics"] == [{"id": "gmv", "name": "销售额", "reason": reason}]
     assert not logs(evs, "dual_check_agreed")
     assert not [e for e in evs if e.type == "human.requested"]
     [finished] = [e for e in evs if e.type == "node.finished" and e.node_id == "dual"]
     assert finished.data["evidence"][0]["status"] == "unchecked"
     assert run.output["_issuance"]["tier"] == "degraded"
-    assert run.output["_issuance"]["gaps"] == ["双盲复算「复核销售额」：指标「销售额」无法复算：盲算已达每项最多查询次数（1 次）"]
+    assert run.output["_issuance"]["gaps"] == [f"双盲复算「复核销售额」：指标「销售额」无法复算：{reason}"]
 
 
 async def test_an_answer_on_the_last_allowed_query_still_counts(monkeypatch, shop):
@@ -1575,3 +1578,41 @@ async def test_the_report_catalog_leaves_out_the_blind_queries(monkeypatch, shop
                      if e.type == "tool.end" and e.node_id == "dual" and e.data.get("query_artifact")]
     ledger = [entry for e in evs if e.type == "node.finished" for entry in e.data.get("evidence") or []]
     assert blind_queries and not any(entry.get("artifact") in blind_queries for entry in ledger)
+
+
+# --------------------------------------------------------------------------
+# 查询区间里这张表没有数据（data/coverage.py）：不判一致，按无法复算记
+# --------------------------------------------------------------------------
+
+#: 订单表只有 2026 年的数：2030 年那一周表里没有数据，COUNT 是 0
+EMPTY_WEEK = "BETWEEN '2030-01-07' AND '2030-01-13'"
+NO_ORDERS = f"SELECT COUNT(*) AS orders FROM orders WHERE status <> 'refunded' AND paid_date {EMPTY_WEEK}"
+ORDERS = {"id": "orders", "name": "订单数", "unit": "单", "expression": "cell(nodes.fetch, 0, 'orders')"}
+
+
+async def test_an_original_cell_without_data_is_not_checked(monkeypatch, shop):
+    """原值所在的格子落在 no_data 的列上：那个 0 不代表真的是 0，盲算查到 0 也说明不了一致。不派盲算，按无法复算记。"""
+    name, _ = shop
+    blind = Blind(monkeypatch, name, {"订单数": (NO_ORDERS, "orders")})
+    run = await start(graph(name, NO_ORDERS, metrics=[ORDERS], dual={"definitions": {"orders": "已支付订单数"}}))
+    assert run.status == "succeeded", run.error
+    evs = await events(run.id)
+    out = dual_output(run, evs)
+    [row] = out["metrics"]
+    assert row["status"] == "unchecked" and row["reason"].startswith("查询区间里这张表没有数据（输入 cell(nodes.fetch")
+    assert "2030-01-07 到 2030-01-13" in row["reason"]
+    assert "step" not in blind.calls, "原值就没有数据：不白派一次盲算"
+    assert out["counts"] == {"agreed": 0, "disagreed": 0, "unchecked": 1}
+
+
+async def test_a_blind_cell_without_data_is_not_agreed(monkeypatch, shop):
+    """盲算交回的格子落在 no_data 的列上（它查了一段表里没有数据的区间）：不判一致，按无法复算记。"""
+    name, _ = shop
+    buyers = {"id": "orders", "name": "订单数", "unit": "单", "expression": "cell(nodes.fetch, 0, 'orders')"}
+    original = f"SELECT COUNT(*) AS orders FROM orders WHERE status <> 'refunded' AND paid_date {WEEK}"
+    Blind(monkeypatch, name, {"订单数": (NO_ORDERS.replace("AS orders", "AS n"), "n")})
+    run = await start(graph(name, original, metrics=[buyers], dual={"definitions": {"orders": "已支付订单数"}}))
+    assert run.status == "succeeded", run.error
+    [row] = dual_output(run, await events(run.id))["metrics"]
+    assert row["status"] == "unchecked", row
+    assert row["reason"].startswith("查询区间里这张表没有数据（盲算查到的那一格：「n」查的是 2030-01-07 到 2030-01-13")
