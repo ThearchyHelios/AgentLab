@@ -1627,6 +1627,8 @@ export const RECIPE_TEXT = {
   derivedSegment: (id: string) => `合计段「${id}」`,
   tableName: '表名',
   columnName: '列名',
+  /** measures 段每个指标的「指标类型」：数字按块的「类型」导入；文字、时段落成文字列（执行器的报错里写的就是这个字段名） */
+  measureKind: '指标类型',
   unit: '单位',
   noUnit: '无单位',
   grain: '主键',
@@ -1909,6 +1911,7 @@ export const FIX_KIND_LABEL: Record<string, string> = {
   rename_title: '改分段标题',
   declare_total: '改作合计核对',
   declare_subtotals: '改作小计核对',
+  declare_text_measure: '按文字导入这一行',
   ignore_cells: '按文字忽略',
   declare_placeholder: '声明占位符',
   declare_hidden: '设置隐藏行处理',
@@ -2152,6 +2155,7 @@ export const RECIPE_ORIGIN_LABEL: Record<string, string> = {
 export const RECIPE_CHOICE_LABEL = {
   locateBy: { labels: '按标签', section_title: '按分段标题' } as Record<string, string>,
   dimParser: { hour_range: '时段（如 7-8）', text: '文字' } as Record<string, string>,
+  measureKind: { '': '数字', hour_range: '时段', text: '文字' } as Record<string, string>,
   valueType: { INTEGER: '整数', REAL: '小数' } as Record<string, string>,
   blankCross: { reject: '拒收', null: '存为空值（需确认）' } as Record<string, string>,
   blankList: { null: '存为空值', reject: '拒收' } as Record<string, string>,

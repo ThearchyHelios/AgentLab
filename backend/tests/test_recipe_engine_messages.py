@@ -362,6 +362,20 @@ def c_value_not_number(mp):
     return _run(_flow(_set(C11=f"约{N}")), FLOW), [f"约{N}", N]
 
 
+def _text_measure(parser: str) -> dict[str, Any]:
+    data = recipe_dict()
+    data["sheets"][0]["blocks"][0]["segments"][0]["text_measures"] = {"分区甲（人次）": {"parser": parser}}
+    return data
+
+
+def c_value_not_text(mp):
+    return _run(_flow(_set(C6=N)), _text_measure("text")), [N]
+
+
+def c_value_not_hour_range(mp):
+    return _run(_flow(_set(C6=f"约{N}", D6="18-19", E6="19-20")), _text_measure("hour_range")), [f"约{N}", N]
+
+
 def c_value_not_date(mp):
     return _run(sales_book(edit=lambda ws: ws.cell(4, 3, f"{N}日")), LIST), [f"{N}日", N]
 
@@ -438,7 +452,10 @@ NEXT_STEPS = {
     "value_text_number": "在配方面板的「文本写的数字」中选择「千分位写法按数字保存」",
     "value_blank": "在配方面板的「空格」中选择「存为空值」",
     "value_formula": "在配方面板的「公式」中选择「按保存值导入」",
-    "value_not_number": "在配方面板中添加占位符",
+    # 「约987654」含数字、不是整行文字：既不提示加占位符，也不提示改指标类型（另见 test_recipe_text_measures）
+    "value_not_number": "数值区只能是数字或表示无数据的符号",
+    "value_not_text": "在配方面板中把它的「指标类型」改为「数字」",
+    "value_not_hour_range": "在配方面板中把它的「指标类型」改为「文字」",
     "value_not_integer": "在配方面板中把「类型」改为「小数」",
     "value_not_date": "在配方面板中把这一列的「类型」改为「文字」",
     "sheet_unexpected": "在配方面板的「配方没有列出的其他工作表」中选择「记入回执，需确认」",

@@ -27,10 +27,12 @@ from pydantic import ValidationError
 from app.data.names import canon, collide_key
 from app.data.recipe import apply_patch, recipe_sha256
 from app.data.recipe_parsers import (
+    UNITS,
     candidate_words,
     looks_numeric_text,
     match_key,
     month_day_or_date,
+    split_unit_suffix,
 )
 from app.data.recipe_suggest import _measure_column
 from app.data.recipe_types import (
@@ -255,6 +257,8 @@ def _key(kind: str, target: dict[str, Any]) -> str:
         return f"rename_sheet:{t['sheet_id']}"
     if kind == "declare_subtotals":
         return f"declare_subtotals:{t['block']}"
+    if kind == "declare_text_measure":
+        return f"declare_text_measure:{t['segment']}:{t['label']}"
     raise KeyError(kind)
 
 
@@ -308,6 +312,8 @@ def _o_remove_label(recipe: dict, p: FixProposal, opt: FixOption, reason: str | 
         cols = []
         for e in removed:
             col = seg["measures"].get(e)
+            if e in (seg.get("text_measures") or {}):
+                ops.append({"op": "remove", "path": ptr(*sp, "text_measures", e)})
             if col is None:
                 continue
             cols.append(col)
@@ -968,6 +974,67 @@ def _o_declare_placeholder(recipe: dict, p: FixProposal, opt: FixOption, reason:
 
 
 # ==========================================================================
+# ⑪ 按文字导入整行是文字的指标（value_not_number 的另一个出口：「高峰时段」一行写的是「18-19」）
+# ==========================================================================
+
+_TEXT_PARSER_OPTION = {
+    "hour_range": ("按时段导入（存规范写法，如 18-19）", "以后各期这一行每格都要能按时段解析，否则拒收"),
+    "text": ("按文字原样导入", "以后各期这一行按原文存，不再要求是数字"),
+}
+
+
+def _p_declare_text_measure(recipe: dict, prob: Any, args: dict, anchor: FixAnchor) -> list[FixProposal]:
+    """执行器在 fix_args.text_rows 里给出整行都是文字的指标（标签原文、标签格、能用的解析方式）。每个指标一条提议；
+    标签写着词表里的单位的不提议（静态校验 text_measure_unit 会拒），已经按文字导入的不再提议。"""
+    out: list[FixProposal] = []
+    for row in args.get("text_rows") or []:
+        found = find_segment(recipe, row.get("segment"))
+        label = row.get("label")
+        if found is None or not isinstance(label, str):
+            continue
+        seg = found[4]
+        if (seg.get("role") != "measures" or label not in (seg.get("labels") or {}).get("expect", [])
+                or label in (seg.get("text_measures") or {}) or not seg.get("measures", {}).get(label)):
+            continue
+        unit = split_unit_suffix(label)[1]
+        if unit is not None and unit in UNITS:
+            continue
+        parsers = [p for p in row.get("parsers") or [] if p in _TEXT_PARSER_OPTION]
+        if not parsers:
+            continue
+        target = {"segment": seg["id"], "label": label}
+        col = seg["measures"][label]
+        cell = row.get("cell")
+        out.append(_proposal(
+            "declare_text_measure", _key("declare_text_measure", target), code=_get(prob, "code"),
+            title=f"「{label}」这一行写的都是文字，不是数字",
+            cells=[cell] if isinstance(cell, str) else [], target=target,
+            options=[FixOption(p, _TEXT_PARSER_OPTION[p][0],
+                               detail=f"表「{seg.get('table')}」的列「{col}」改成文字列；{_TEXT_PARSER_OPTION[p][1]}",
+                               breaking=True) for p in parsers],
+            anchor=anchor))
+    return out
+
+
+def _o_declare_text_measure(recipe: dict, p: FixProposal, opt: FixOption, reason: str | None) -> tuple[list, list[str]]:
+    found = find_segment(recipe, p.target.get("segment"))
+    label = p.target.get("label")
+    if found is None or found[4].get("role") != "measures" or label not in found[4].get("measures", {}):
+        raise _Stale
+    si, bi, gi, _block, seg = found
+    sp = ("sheets", si, "blocks", bi, "segments", gi)
+    ops: list[dict[str, Any]] = []
+    if "text_measures" not in seg:
+        ops.append({"op": "add", "path": ptr(*sp, "text_measures"), "value": {}})
+    ops.append({"op": "add", "path": ptr(*sp, "text_measures", label), "value": {"parser": opt.value}})
+    col = seg["measures"][label]
+    ti = table_index(recipe, seg.get("table"))
+    if ti is not None and col in (recipe["tables"][ti].get("units") or {}):
+        ops.append({"op": "remove", "path": ptr("tables", ti, "units", col)})
+    return ops, [f"分段「{seg['id']}」的「{label}」{opt.label}：表「{seg.get('table')}」的列「{col}」是文字列"]
+
+
+# ==========================================================================
 # ⑧ 声明隐藏行列怎么处理
 # ==========================================================================
 
@@ -1062,7 +1129,12 @@ _OPS: dict[str, Callable[[dict, FixProposal, FixOption, str | None], tuple[list,
     "remove_label": _o_remove_label, "add_label": _o_add_label, "edit_members": _o_edit_members,
     "rename_title": _o_rename_title, "declare_total": _o_declare_total, "ignore_cells": _o_ignore_cells,
     "declare_placeholder": _o_declare_placeholder, "declare_hidden": _o_declare_hidden, "rename_sheet": _o_rename_sheet,
-    "declare_subtotals": _o_declare_subtotals,
+    "declare_subtotals": _o_declare_subtotals, "declare_text_measure": _o_declare_text_measure,
+}
+#: 同一条问题的另一种出口（问题的 fix 字段只写一种，界面按 fix_ids 放按钮，所以能挂几个提议）：value_not_number 的
+#: 格子是整行文字时，除了声明占位符，还可以把这个指标改按文字导入
+_EXTRA_BUILDERS: dict[str, Callable[[dict, Any, dict, FixAnchor], list[FixProposal]]] = {
+    "value_not_number": _p_declare_text_measure,
 }
 
 
@@ -1096,7 +1168,15 @@ def propose_fixes(recipe: dict[str, Any], problems: list[dict[str, Any]], recipe
         try:
             push(builder(recipe, prob, args, FixAnchor("problem", i)))
         except (KeyError, TypeError, ValueError, IndexError, AttributeError):
-            continue    # fix_args 的形状不对（执行器的契约问题）：不出提议，不拖垮 staging_out
+            pass        # fix_args 的形状不对（执行器的契约问题）：不出提议，不拖垮 staging_out
+        extra = _EXTRA_BUILDERS.get(_get(prob, "code") or "")
+        if extra is None:
+            continue
+        try:
+            for p in extra(recipe, prob, args, FixAnchor("problem", i)):
+                push(p)
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+            continue
     fl = _facts(facts)
     for i, rp in enumerate(recipe_problems or []):
         try:
@@ -1125,6 +1205,8 @@ def _edit_title(p: FixProposal, opt: FixOption) -> str:
         return opt.label
     if p.kind == "declare_subtotals":
         return f"列表「{t.get('block')}」中间「{t.get('pick')}」开头的行{opt.label}"
+    if p.kind == "declare_text_measure":
+        return f"分段「{t.get('segment')}」的「{t.get('label')}」{opt.label}"
     return p.title
 
 
