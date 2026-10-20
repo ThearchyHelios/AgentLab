@@ -723,6 +723,11 @@ class GraphChecker:
         self.defaults = defaults
         self.checkers = checkers
         self.known = known
+        #: 工具节点写死的 SQL 查的区间里表里没有数据（data/coverage.py）：同一个节点、同一条 SQL 只查一次库
+        self._coverage: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._coverage_cache: Any = None
+        #: 这类问题已经交回模型改过一轮：之后不再挡（修正后仍在的留在检查结果里当提醒，由模型在说明里照实告诉用户）
+        self._coverage_given = False
 
     def blocking(self) -> list[dict[str, Any]] | None:
         from app.api.copilot import _blocking_issues
@@ -735,7 +740,10 @@ class GraphChecker:
         errors = self.blocking()
         refused = _refused_issues(self.applier)
         if self.known is None:
-            return [*refused, *(errors or [])]
+            # 查的区间里表里没有数据：交回模型改一轮（换有这段数据的表，或者在说明里照实告诉用户）；改过一轮仍在的不挡
+            covered = [] if self._coverage_given or errors is None else await self.coverage()
+            self._coverage_given = self._coverage_given or bool(covered)
+            return [*refused, *(errors or []), *covered]
         from app.engine.autofix import _sig
 
         if not self.applier.effective:
@@ -746,6 +754,77 @@ class GraphChecker:
         from app.api.copilot import _repair_request
 
         return _repair_request(self.applier.nodes, self.applier.edges, issues, looks=looks_text)
+
+    async def coverage(self, *, level: str = "error") -> list[dict[str, Any]]:
+        """工具节点写死的 SQL 里，查的区间和表里的范围完全不重叠的（data/coverage.sql_gaps）：搭图时没有查询结果，SQL 里
+        所有带时间谓词的表都查（按表去重、限时，不跑原 SQL，只跑算界和现查范围的两条小查询）。一条一个问题（形状同自查的
+        问题，code 是 sql_no_data）；level 给 warning 时是收尾那一步的提醒。"""
+        out: list[dict[str, Any]] = []
+        for nid, node in self.applier.nodes.items():
+            cfg = ((node or {}).get("data") or {}).get("config") or {}
+            tool, args = cfg.get("tool"), cfg.get("args")
+            sql = args.get("sql") if isinstance(args, dict) else None
+            if not isinstance(tool, str) or not tool.startswith("db_query__") or not isinstance(sql, str) \
+                    or not sql.strip() or "{{" in sql:
+                continue
+            key = (nid, sql)
+            if key not in self._coverage:
+                self._coverage[key] = await self._gaps(tool[len("db_query__"):], sql)
+            out.extend({"level": level, "node_id": nid, "edge_id": None, "field": "args.sql", "code": "sql_no_data",
+                        "message": f"{gap['message']}：这段时间表里没有数据，查出来会是 0",
+                        "for_model": f"{gap['message']}：换有这段数据的表；没有这样的表，就在 done 的 explanation 里照实"
+                                     "告诉用户这段时间表里没有数据、数据只到哪天（写具体日期）"}
+                       for gap in self._coverage[key])
+        return out
+
+    async def _gaps(self, name: str, sql: str) -> list[dict[str, Any]]:
+        from app.data import coverage
+        from app.data.engine import masked_columns
+
+        row = next((s for s in self.sources or [] if getattr(s, "name", None) == name), None)
+        if row is None or not getattr(row, "enabled", True):
+            return []
+        if self._coverage_cache is None:
+            self._coverage_cache = coverage.Cache()
+        try:
+            source = await _probe_source(row)
+        except Exception:  # noqa: BLE001 - 上传表格没有可用的版本这类：不判
+            return []
+        return await coverage.sql_gaps(source, sql, facts=_profile_facts(row), masked=masked_columns(row.options),
+                                       cache=self._coverage_cache, budget=COVERAGE_BUDGET_S)
+
+
+#: 自查时一条 SQL 的覆盖检查最多花多少秒（data/coverage.py）：搭图要等它，比查询时的 BUDGET_S 短
+COVERAGE_BUDGET_S = 8.0
+
+
+async def _probe_source(row: Any) -> Any:
+    """自查时探查用的源：上传表格换成当前版本的快照视图（table_versions.resolve_source），别的原样。"""
+    from app.data import table_versions
+    from app.db.base import SessionLocal
+
+    if (getattr(row, "origin", None) or "manual") != "upload":
+        return row
+    async with SessionLocal() as session:
+        return await table_versions.resolve_source(session, row)
+
+
+def _profile_facts(row: Any) -> Any:
+    """现查表的范围不成时退回的剖析事实（catalog_profile_jobs.last_facts）。"""
+    async def facts(table: str) -> Any:
+        from app.data import catalog as data_catalog
+        from app.data.catalog_profile_jobs import last_facts
+        from app.db.base import SessionLocal
+
+        name = data_catalog.resolve_table_name(getattr(row, "schema_cache", None), table) or table
+        async with SessionLocal() as session:
+            found = (await last_facts(session, str(row.id), [name])).get(name)
+        current = getattr(row, "current_snapshot_id", None) if (getattr(row, "origin", None) or "") == "upload" else None
+        if found and current and found.get("snapshot_id") != current:
+            return None     # 上传表格：剖析时是另一版数据
+        return found
+
+    return facts
 
 
 # ==========================================================================

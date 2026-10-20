@@ -142,11 +142,16 @@ def review_reason(review: Mapping[str, Any]) -> str:
 
 
 def retry_after_review(review: Mapping[str, Any] | None, attempt: int) -> bool:
-    """复核之后要不要带着原图重来一次：复核说换个配置重跑大概率就好（retry）、答案不可信（severity=broken）、这一轮还没
-    试满（attempt 从 0 数，attempt + 1 < MAX_ATTEMPTS）。"""
+    """复核之后要不要带着原图重来一次：复核说换个配置重跑大概率就好（retry）、答案不可信（severity=broken）或者有值得
+    重建一次的缺口（engine/review.REBUILD：查询区间里这张表没有数据，换一张有这段数据的表大概率就好）、这一轮还没试满
+    （attempt 从 0 数，attempt + 1 < MAX_ATTEMPTS）。"""
+    from app.engine.review import REBUILD
+
     if not review:
         return False
-    return bool(review.get("retry")) and review.get("severity") == "broken" and attempt + 1 < MAX_ATTEMPTS
+    rebuild = any(isinstance(s, Mapping) and s.get("kind") in REBUILD for s in review.get("signals") or [])
+    return bool(review.get("retry")) and (review.get("severity") == "broken" or rebuild) \
+        and attempt + 1 < MAX_ATTEMPTS
 
 
 def retry_instruction(question: str, reason: str, has_base: bool) -> str:

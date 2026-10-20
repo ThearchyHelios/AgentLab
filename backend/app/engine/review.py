@@ -137,11 +137,18 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 核查 agent 的输出到了上限被截断（推理模型的思考也算在额度里）：没交成结果，由节点按无法复算、未能反查记缺口。
     # 同 verify_limit，是缺口不是断裂，记成它自己的 kind：说得清是输出额度的问题，换个模型就好
     "verify_truncated": ("verify_truncated", DEGRADED),
+    # 查询区间里这张表没有数据（data/coverage.py）：查询结果整列是 0，口径卡的指标取自这些列。答案照常交付（出具契约另按
+    # 缺口降档），是缺口不是断裂；但换一张有这段数据的表再建一次大概率就好，所以能给出重来的指示（REBUILD）
+    "query_no_data": ("query_no_data", DEGRADED),
+    "metric_no_data": ("metric_no_data", DEGRADED),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。
 # 工具参数错了、步数不够、图没校验过，都属于改一下再来一遍就行的。
 RETRYABLE = {"step_limit", "tool_error", "empty_completion", "node_failed"}
+#: 是缺口（DEGRADED）、却值得重建一次的信号：查询区间里这张表没有数据——图选错了表，换一张有这段数据的表大概率就好。
+#: 答案照常交付，复核照样可以给出「按复核重来」的指示（should_retry、chat/turn.retry_after_review 都认）
+REBUILD = {"query_no_data", "metric_no_data"}
 
 #: 串行工具模式下塞给未执行调用的占位说明。它漏到用户面前当过答案，
 #: 所以复核要认得出来。从 nodes.llm 导入会绕成循环，这里按内容识别。
@@ -357,8 +364,8 @@ def worst(signals: Iterable[Signal]) -> str:
 
 
 def should_retry(signals: Iterable[Signal]) -> bool:
-    """这些信号里有没有「重跑一次大概率能好」的。"""
-    return any(s.kind in RETRYABLE and s.severity == BROKEN for s in signals)
+    """这些信号里有没有「重跑一次大概率能好」的：严重的那几类（RETRYABLE），或者值得重建一次的缺口（REBUILD）。"""
+    return any((s.kind in RETRYABLE and s.severity == BROKEN) or s.kind in REBUILD for s in signals)
 
 
 def check_numbers(original: str, revised: str) -> list[str]:

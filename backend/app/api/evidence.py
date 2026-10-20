@@ -992,6 +992,10 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         # 来源查询没通过 SQL 检查：面板标出来并写明原因（问题和改法在查询步骤的 checks 里）。没问题的没有这两个键
         **({"sql_check_failed": True, "sql_check_reason": source.get("sql_check_reason") or ""}
            if source.get("sql_check_failed") else {}),
+        # 输入都齐、计算式自己算不出来（分母为 0）：面板说「算不出来」，不说「缺少输入」。有值的没有这个键
+        **({"undefined": True} if source.get("undefined") and source.get("value") is None else {}),
+        # 输入取自「查询区间里这张表没有数据」的列（data/coverage.py）：面板标出来并写明原因。没问题的没有这两个键
+        **({"no_data": True, "no_data_reason": source.get("no_data_reason") or ""} if source.get("no_data") else {}),
         "node_id": entry.get("node_id"), "artifact": artifact or None, "eid": cite.get("eid"),
         "eid_ok": cite.get("eid") == entry.get("eid") == make_eid("metric", artifact or None, {"metric": metric_id}),
         "hash_ok": hash_ok and metric is not None,
@@ -1091,6 +1095,8 @@ async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Mask
                if found.get("incomplete") else {}),
             **({"sql_check_failed": True, "sql_check_reason": found.get("sql_check_reason") or ""}
                if found.get("sql_check_failed") else {}),
+            **({"undefined": True} if found.get("undefined") and found.get("value") is None else {}),
+            **({"no_data": True, "no_data_reason": found.get("no_data_reason") or ""} if found.get("no_data") else {}),
             "untraced": _untraced_steps(found, sealed, node),
         })
         if withheld := {path: _held_word(h) for path, h in held.items() if h.kind != "table"}:
@@ -2571,6 +2577,8 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
                 column_types=snap.get("column_types") if isinstance(snap.get("column_types"), dict) else {},
                 **({"provenance": True} if hint and snap.get("data_version") and not merged else {}),
                 **({"checks": shown.checks(checks)} if (checks := _query_checks(snap)) else {}),
+                # 查询区间里这张表没有数据的那几列（data/coverage.py，查询时记进快照）。没有就不加这个键
+                **({"no_data": gaps} if (gaps := _no_data_view(snap)) else {}),
                 **_catalog_of(snap))
     if shown.changed:
         notes.append(SQL_MASKED_NOTE)
@@ -2583,6 +2591,17 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     step["rows"] = [[MASKED if i in masked else v for i, v in enumerate(rows[r])] if isinstance(rows[r], list)
                     else rows[r] for r in index]
     return step
+
+
+#: 查询步骤上 no_data 每一条给面板的字段（data/coverage.result_gaps 的形状）
+_NO_DATA_FIELDS = ("columns", "table", "column", "window", "data_range", "basis", "basis_at", "message")
+
+
+def _no_data_view(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """快照里记的「查询区间里这张表没有数据」（no_data）：只给面板要的那几个字段，认不出的条目不给。"""
+    items = snap.get("no_data") if isinstance(snap.get("no_data"), list) else []
+    return [{k: item[k] for k in _NO_DATA_FIELDS if k in item} for item in items
+            if isinstance(item, dict) and isinstance(item.get("message"), str)]
 
 
 class _Shown:

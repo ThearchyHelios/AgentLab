@@ -207,6 +207,9 @@ NODE_REFERENCE = """\
   config: {caliber, caliber_version, metrics:[{id, name, unit, decimals, format, expression}], on_missing, assign_to}
   expression 是受限表达式（不是模板）：vars.kpi.gmv、cell(nodes.fetch, 0, 'gmv')、
   round((vars.kpi.gmv - vars.kpi.gmv_prev) / vars.kpi.gmv_prev * 100, 1)
+  **分母可能为 0**（上期为 0、这段时间没有数据）时写「… if 分母 else None」：
+  round((vars.kpi.gmv - vars.kpi.gmv_prev) / vars.kpi.gmv_prev * 100, 1) if vars.kpi.gmv_prev else None。
+  算不出来就是空值（报告里显示「—」，写作者照实说算不出来）；不要写 else 0——0 会被读成持平、0%
   format：thousands（默认，千分位）/ plain（不分组，年份编号这类）/ percent_of_ratio（值是 0.0235 这样的比率，显示成 2.35%）；
   decimals 写 -15 到 15 的整数；percent_of_ratio 的 decimals 按比率算：要显示两位百分比（2.35%）写 4，
   写 2 只剩「2%」，0.004 这样的小比率还会显示不出来、报告引用不了。on_missing 默认 fail（缺输入整张卡失败）；写 null 则缺输入的指标记为空值，交给出具契约判档
@@ -293,7 +296,9 @@ NODE_REFERENCE = """\
 6. 问题里的「今天、昨天、上周、本月、去年」这类相对日期一律按运行当天算：SQL 用数据源方言里取当天的写法（CURRENT_DATE、
    CURDATE()、date('now')、SYSDATE），agent 先调 current_time 拿到当天日期再写条件（agent 的 prompt 里写明这一点、tools 绑上
    current_time）。不要用表里最大的日期（MAX(日期)）去推「上周」「本月」：数据没更新到那段时间时，推出来的是另一段，报告还会
-   把它当成上周来写。想让报告说清数据最新到哪天，另取一列 MAX(日期) AS 数据最新日期
+   把它当成上周来写。想让报告说清数据最新到哪天，另取一列 MAX(日期) AS 数据最新日期。
+   写按周期取数的 SQL 前先看表的日期范围（look 结果里的剖析、取值观察）：只有一天的数据、或者最新日期早于要查的区间的表，
+   不能用来算这段时间（查出来全是 0）——换有历史的表；没有这样的表，就在说明里照实告诉用户这段时间没有数据
 
 模型字段（llm / agent / supervisor / report 的 config.model）：
 - **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。
@@ -950,6 +955,7 @@ async def generate(
         applier.replay_onto(prev_graph)
     async for _op in gen.repair():
         pass
+    covered = await gen.checker.coverage(level="warning") if isinstance(gen.checker, GraphChecker) else []
 
     try:
         spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
@@ -968,7 +974,7 @@ async def generate(
         explanation=applier.explanation or str((gen.asked or {}).get("question") or ""),
         issues=[i.model_dump() for i in report.issues if i.level != "info"]
         + _issue_dicts(scope_issues(out["nodes"], scope), "datasource_out_of_scope")
-        + dropped_tool_warnings(changes, payload.instruction),
+        + dropped_tool_warnings(changes, payload.instruction) + covered,
         layout=layout,
         tool_changes=changes,
     )
@@ -1809,6 +1815,9 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
         warnings = dropped_tool_warnings(changes, payload.instruction)
+        # 工具节点写死的 SQL 查的区间里表里没有数据（data/coverage.py）：自查时交回模型改过一轮，仍在的不挡运行，留在检查
+        # 结果里当提醒（模型照要求在说明里告诉用户）
+        warnings += await gen.checker.coverage(level="warning") if isinstance(gen.checker, GraphChecker) else []
         # 建完要不要跑，由模型在 done.run 里表态；问了用户的不跑：要等他回答
         autorun = applier.autorun and gen.asked is None
         if remaining:

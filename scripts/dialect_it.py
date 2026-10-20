@@ -149,6 +149,23 @@ def _ddl(t: Target) -> list[str]:
     return out
 
 
+def _snapshot(t: Target) -> list[str]:
+    """覆盖检查（data/coverage.py）的夹具：只存当天的滚动表（每天整表重灌的那种）。日期按库自己的当前日期写，避开容器
+    和本机时区不一致；daily_snapshot 的日期按文字 'YYYYMMDD' 存（部署上撞过的写法，只在 MySQL / MariaDB 上判），
+    daily_snapshot_d 按 DATE 存。"""
+    vc = "VARCHAR2" if t.oracle else "VARCHAR"
+    today_text = ("TO_CHAR(SYSDATE, 'YYYYMMDD')" if t.oracle
+                  else "REPLACE(CAST(CURRENT_DATE AS CHAR), '-', '')" if t.mysql
+                  else "REPLACE(CAST(CURRENT_DATE AS VARCHAR), '-', '')")
+    today = "TRUNC(SYSDATE)" if t.oracle else "CURRENT_DATE"
+    out = [f"CREATE TABLE daily_snapshot (event_day {vc}(8), visitor {vc}(16))",
+           f"CREATE TABLE daily_snapshot_d (event_day DATE, visitor {vc}(16))"]
+    for who in ("v1", "v2", "v3"):
+        out.append(f"INSERT INTO daily_snapshot (event_day, visitor) VALUES ({today_text}, '{who}')")
+        out.append(f"INSERT INTO daily_snapshot_d (event_day, visitor) VALUES ({today}, '{who}')")
+    return out
+
+
 def _paid(t: Target, o: dict[str, Any]) -> str:
     if o["paid_at"] is not None:
         stamp = o["paid_at"].strftime("%Y-%m-%d %H:%M:%S")
@@ -212,7 +229,7 @@ async def _setup(t: Target) -> None:
             if t.mysql:
                 # 关掉严格模式才写得进零日期（老库里常见的情形）
                 await conn.execute(text("SET SESSION sql_mode = ''"))
-            for sql in _ddl(t) + _rows(t) + _events(1, N_EVENTS_OLD):
+            for sql in _ddl(t) + _rows(t) + _events(1, N_EVENTS_OLD) + _snapshot(t):
                 await conn.exec_driver_sql(sql)
         async with engine.begin() as conn:
             for sql in _analyze(t, "events") + _analyze(t, "orders") + _analyze(t, "stores"):
@@ -421,8 +438,39 @@ async def run_target(t: Target) -> None:
         res = await data_engine.run_query(source, d.max_date_sql(tbl, paid_col))
         check(bool(res.rows) and str(res.rows[0][0])[:19].replace("T", " ") == str(EXPECT["paid_at"][1]),
               f"max_date_sql 直接跑：{res.rows}")
+        await _coverage(t, source)
     finally:
         await data_engine.engines.invalidate(source.id)
+
+
+async def _coverage(t: Target, source: Any) -> None:
+    """覆盖检查（data/coverage.py）在真库上：按运行当天现算的上周区间，表里只有当天的数据 → 判成没有数据；区间包含当天、
+    只是别的条件筛空的 → 不报。界在库里算（各方言自己的写法），表的范围现查 MIN / MAX。"""
+    from app.data import coverage
+
+    last_week = {"mysql": ("event_day >= DATE_SUB(CURRENT_DATE, INTERVAL (WEEKDAY(CURRENT_DATE) + 7) DAY) "
+                           "AND event_day < DATE_SUB(CURRENT_DATE, INTERVAL WEEKDAY(CURRENT_DATE) DAY)"),
+                 "pg": ("event_day >= date_trunc('week', CURRENT_DATE) - INTERVAL '7 days' "
+                        "AND event_day < date_trunc('week', CURRENT_DATE)"),
+                 "oracle": "event_day >= TRUNC(SYSDATE, 'IW') - 7 AND event_day < TRUNC(SYSDATE, 'IW')"}
+    recent = {"mysql": "event_day >= DATE_SUB(CURRENT_DATE, INTERVAL 1 DAY)",
+              "pg": "event_day >= CURRENT_DATE - INTERVAL '1 day'",
+              "oracle": "event_day >= TRUNC(SYSDATE) - 1"}
+    flavor = "mysql" if t.mysql else "pg" if t.pg else "oracle"
+    today_sql = "SELECT TRUNC(SYSDATE) FROM DUAL" if t.oracle else "SELECT CURRENT_DATE"
+    today = str((await data_engine.run_query(source, today_sql)).rows[0][0])[:10]
+    for table in ["daily_snapshot_d"] + (["daily_snapshot"] if t.mysql else []):
+        sql = f"SELECT COUNT(DISTINCT visitor) AS n FROM {table} WHERE {last_week[flavor]}"
+        gaps = await coverage.result_gaps(source, sql, (await data_engine.run_query(source, sql)).to_payload())
+        check(len(gaps) == 1 and gaps[0]["data_range"] == [today, today]
+              and [c.lower() for c in gaps[0]["columns"]] == ["n"],
+              f"覆盖检查：{table} 只有当天的数据，上周的区间判成没有数据：{gaps}")
+        pre = await coverage.sql_gaps(source, sql)
+        check(len(pre) == 1, f"助手自查：{table} 上周的区间判成没有数据：{pre}")
+        fine = f"SELECT COUNT(DISTINCT visitor) AS n FROM {table} WHERE visitor = 'nobody' AND {recent[flavor]}"
+        quiet = await coverage.result_gaps(source, fine, (await data_engine.run_query(source, fine)).to_payload())
+        check(quiet == [], f"覆盖检查：{table} 区间里有数据、只是别的条件筛空的不报：{quiet}")
+        check(await coverage.sql_gaps(source, fine) == [], f"助手自查：{table} 区间包含当天的不报")
 
 
 async def main() -> int:

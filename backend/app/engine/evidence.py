@@ -926,6 +926,12 @@ def build_catalog(
                 # 来源查询没通过 SQL 检查（data/sqlcheck.py 的 error 级问题）：同样只在有问题时有这两个键
                 **({"sql_check_failed": True, "sql_check_reason": metric.get("sql_check_reason") or ""}
                    if metric.get("sql_check_failed") else {}),
+                # 输入都齐、计算式自己算不出来（分母为 0）：写作目录、引用解析不了的原因说「算不出来」，不说「缺少输入」
+                **({"undefined": True} if metric.get("undefined") and metric.get("value") is None else {}),
+                # 输入取自「查询区间里这张表没有数据」的列（data/coverage.py）：写作目录里提醒写作者，证据面板标出来。
+                # 只在有问题时有这两个键
+                **({"no_data": True, "no_data_reason": metric.get("no_data_reason") or ""}
+                   if metric.get("no_data") else {}),
             }
 
     queries = retrievals = 0
@@ -1653,7 +1659,8 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
             # 换算了只会解析不了、原因说成「不是数值」。引用它本身由报告自查另记一条违规（masked_metrics）
             rendered = str(entry.get("rendered") or "")
         elif entry.get("value") is None:
-            return _unresolved(marker, alias, ev_kind, f"指标「{entry.get('name') or ref}」本次没有值（缺少输入），"
+            why = UNDEFINED_REASON if entry.get("undefined") else "缺少输入"
+            return _unresolved(marker, alias, ev_kind, f"指标「{entry.get('name') or ref}」本次没有值（{why}），"
                                "无法写入报告", rendered=MISSING)
         else:
             try:
@@ -3450,6 +3457,17 @@ SEE_AND_CODE_RULES = (
     "（「状态为 9」「类型 1」）：码值是没有出处的数字，系统会当成裸数字打回重写。"
 )
 
+#: 查询区间里这张表没有数据（查询快照的 no_data、口径卡的 no_data，data/coverage.py）：写作目录里的两种提醒、写作规则。
+#: 都带着 NO_DATA_MARK 这几个字：报告节点据此决定要不要加 NO_DATA_RULE
+NO_DATA_MARK = "这段时间表里没有数据"
+NO_DATA_METRIC_NOTE = "（这段时间表里没有数据：所依据的查询区间在表里查不到数据，这个数不要当成 0 解读，照实写没有数据）"
+NO_DATA_QUERY_NOTE = "  （注意：{message}。引用这几列时照实写这段时间表里没有数据，不要当成 0 解读）"
+NO_DATA_RULE = ("标着「这段时间表里没有数据」的指标和查询列：不要写成 0、持平或 0%，照实写这段时间表里没有数据、"
+                "数据只到哪天（写具体日期）。")
+
+#: 指标「算不出来」的那句（口径卡记了 undefined：输入都齐、计算式自己交回空值）：引用解析不了的原因、写作目录里用
+UNDEFINED_REASON = "算不出来：这组输入下计算式没有值，比如分母为 0"
+
 #: [[m:]]、[[v:]] 渲染出来自带单位（部署上撞过「覆盖 8条 条产线」：口径卡的单位是「条」，写作者照着助手的指令又写了一个）。
 #: 渲染时紧跟着的同一个单位会去掉（_tidy），这里先说给写作者听
 UNIT_RULE = ("数字标记渲染出来自带单位（[[m:…]] 是口径卡里的单位，比如「8条」「12,345人次」），后面不要再写一遍单位："
@@ -3725,6 +3743,10 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
                      "不要把取回的行数当成总数，也不要据此写合计、全部之类的结论）")
     if note := _sql_check_note(entry.get("artifact"), snaps):
         lines.append(note)
+    for gap in snapshot.get("no_data") or [] if isinstance(snapshot.get("no_data"), list) else []:
+        # 查询区间里这张表没有数据（data/coverage.py）：这几列的 0 不是真的是 0
+        if isinstance(gap, dict) and gap.get("message"):
+            lines.append(NO_DATA_QUERY_NOTE.format(message=gap["message"]))
     if not cells_allowed:
         return lines
     columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]
@@ -3838,8 +3860,13 @@ def _metric_prompt(catalog: dict[str, Any]) -> list[str]:
             if e.get("masked"):
                 # 值取自遮罩列的一格（withhold_metrics）：写作者看到的就是「已遮罩」，引用了也只会交回重写
                 lines.append(f"- [[{e['alias']}]] {e.get('name')} = {e.get('rendered')}（取自设置了遮罩的列，不要引用）")
+            elif e.get("value") is None and e.get("undefined"):
+                # 输入都齐、计算式自己算不出来（分母为 0）：照实写算不出来，不写成 0、持平
+                lines.append(f"- [[{e['alias']}]] {e.get('name')}：这次算不出来（{UNDEFINED_REASON}），不要引用；"
+                             "照实写算不出来，不要写成 0 或持平" + (NO_DATA_METRIC_NOTE if e.get("no_data") else ""))
             elif e.get("value") is None:
-                lines.append(f"- [[{e['alias']}]] {e.get('name')}：这次没有值，不要引用")
+                lines.append(f"- [[{e['alias']}]] {e.get('name')}：这次没有值，不要引用"
+                             + (NO_DATA_METRIC_NOTE if e.get("no_data") else ""))
             elif e.get("rendered") == MISSING:
                 # 有值但按口径卡的格式显示不出来（太小、太大、不是有限的数）：引用了也是解析不了
                 lines.append(f"- [[{e['alias']}]] {e.get('name')}：按口径卡的格式显示不出来，不要引用")
@@ -3850,6 +3877,8 @@ def _metric_prompt(catalog: dict[str, Any]) -> list[str]:
                 # 取数的 SQL 没通过检查（重复计算、存量跨期加总）：数是算错的可能很大，写作者引用时得交代
                 if e.get("sql_check_failed"):
                     caveat += "（所依据的查询未通过 SQL 检查，结果存疑：引用时须如实说明，不要当作确定的结论）"
+                if e.get("no_data"):
+                    caveat += NO_DATA_METRIC_NOTE
                 lines.append(f"- [[{e['alias']}]] {e.get('name')} = {e.get('rendered')}{caveat}")
     inputs = [e for e in catalog.values() if e.get("kind") == "input"]
     if inputs:

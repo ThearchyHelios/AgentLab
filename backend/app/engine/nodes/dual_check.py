@@ -69,6 +69,7 @@ from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import DataSource
 from app.data import catalog_view
+from app.data.coverage import NO_DATA_SHORT, no_data_of
 from app.engine import deadline, recompute
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError, NodeRejected
@@ -635,6 +636,10 @@ async def _query_input(item: dict[str, Any], sources: _Sources, aliases: dict[st
     hidden = await sources.hidden(artifact)
     if column.lower() in hidden:
         return {}, f"输入 {item['path']} 取自设置了遮罩的列，不能用于复算"
+    if (gap := no_data_of(snap, column)) is not None:
+        # 原值所在的那一格落在「查询区间里这张表没有数据」的列上（data/coverage.py）：那个 0 不代表真的是 0，盲算查到 0
+        # 也说明不了一致，不白派一次盲算，按无法复算记
+        return {}, f"{NO_DATA_SHORT}（输入 {item['path']}：{gap.get('message') or ''}）"
     value = cell_value(item.get("value"))
     if not _number(value):
         return {}, f"输入 {item['path']} 不是数值"
@@ -1003,6 +1008,30 @@ def _settled(found: Mapping[str, Any]) -> bool:
     return found.get("limit") == "max_queries" and found.get("value") is not None
 
 
+#: 无法复算的原因里带上盲算交回的理由时最多截多少字（理由是渲染后的正文，已经过遮罩）
+RATIONALE_CHARS = 160
+
+
+def _rationale_tail(found: Mapping[str, Any]) -> str:
+    """盲算触顶、按无法复算记时（_limit_text 那一路），它交回的理由截一段接在原因后面：审批卡、缺口说明上看得到它查到了
+    什么。没有理由的交回空串（原因照旧）。"""
+    text = " ".join(str(found.get("rationale") or "").split())
+    if not text:
+        return ""
+    return f"；盲算交回的理由：{text[:RATIONALE_CHARS]}{'…' if len(text) > RATIONALE_CHARS else ''}"
+
+
+def _no_data_cell(artifact: Any, column: Any, load: Callable[[str], Any]) -> dict[str, Any] | None:
+    """这一格所在的列「查询区间里这张表没有数据」（查询快照的 no_data，data/coverage.py）：那一条，不是为 None。"""
+    if not isinstance(artifact, str) or not artifact or not isinstance(column, str):
+        return None
+    try:
+        snapshot = load(artifact)
+    except (ValueError, OSError):
+        return None
+    return no_data_of(snapshot, column)
+
+
 def _limit_text(limit: str | None, options: _Options) -> str:
     """盲算为什么停下，接在「盲算」后面读：「盲算已达每项最多查询次数（6 次）」。"""
     if limit == "max_queries" and options.max_queries is not None:
@@ -1027,11 +1056,16 @@ def _compare(row: dict[str, Any], metric: dict[str, Any], results: dict[str, Any
             row.update(status=UNCHECKED, reason="盲算没有执行")
             return
         if found.get("limit") and not _settled(found):
-            row.update(status=UNCHECKED, reason="盲算" + _limit_text(found["limit"], options))
+            row.update(status=UNCHECKED, reason="盲算" + _limit_text(found["limit"], options) + _rationale_tail(found))
             return
         if found.get("value") is None:
             row.update(status=UNCHECKED, reason=found.get("reason") or "盲算没有交回可用的数值",
                        **{k: found[k] for k in ("cause", "run_seconds") if k in found})   # 运行时长上限将至（_blind）
+            return
+        if gap := _no_data_cell(found.get("artifact"), found.get("column"), load):
+            # 盲算交回的那一格落在「查询区间里这张表没有数据」的列上（data/coverage.py）：那个 0 不代表真的是 0，拿它和原值
+            # 比一致不一致都说明不了什么，按无法复算记
+            row.update(status=UNCHECKED, reason=f"{NO_DATA_SHORT}（盲算查到的那一格：{gap.get('message') or ''}）")
             return
         values[inp["path"]] = found["value"]
     outcome = recompute.recompute(metric, recompute.Changes(inputs=values), recompute.Sources(

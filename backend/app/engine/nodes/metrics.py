@@ -82,6 +82,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     checked: dict[str, list[QueryProblem]] = {}
     #: 指标 id → 它没通过 SQL 检查的那几条来源查询。运行日志按查询归并（_emit_sql_check_logs）
     failed_by: dict[str, list[QueryProblem]] = {}
+    #: 查询快照工件 id → 快照本身（读输入的格落在哪一列「查询区间里这张表没有数据」，_no_data_inputs）
+    snapshots: dict[str, Any] = {}
     for definition in definitions:
         metric_id = str(definition.get("id") or "").strip()
         expr = str(definition.get("expression") or "").strip()
@@ -159,6 +161,12 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                          "sql_check_sources": [{"artifact": artifact, "codes": list(dict.fromkeys(
                              code for p in found for code in p.codes))} for artifact, found in failed]}
             failed_by[metric_id] = [p for _, found in failed for p in found]
+        # 输入取自「查询区间里这张表没有数据」的列（查询快照的 no_data，data/coverage.py）：值照算，标 no_data 并写明原因，
+        # 出具契约据此降档（issuance.no_data_gaps）。按输入的快照 id + 列认：同一条查询里有数的列不受影响。转抄的指标
+        # 那张卡标了的，这一个照样标
+        no_data: dict[str, Any] = {}
+        if lacking := _no_data_inputs(inputs, carried, snapshots):
+            no_data = {"no_data": True, "no_data_reason": _no_data_reason(lacking), "no_data_sources": lacking}
         metrics.append(
             {
                 "id": metric_id,
@@ -175,10 +183,15 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 # 值是空的就是缺输入，不论 on_missing 是哪一种：fail 模式下直接取到空值的
                 # 指标（原式就是 vars.x.y 而 y 不存在）以前也是照常产出一个 None
                 "status": "ok" if value is not None else "missing_input",
+                # 输入都齐、是计算式自己交回的空值（分母为 0 时写的 … if 分母 else None）：算不出来，不是缺输入。状态照旧是
+                # missing_input（证据面板、推演、运行对比按状态认的地方不受影响），只多这一个键；有值的指标和以前一字不差
+                **({"undefined": True} if value is None and not missing else {}),
                 # 只在不完整时出现：完整的指标和以前一字不差，老运行复核时目录也对得上
                 **incomplete,
                 # 只在来源查询没通过 SQL 检查时出现，同上
                 **sql_check,
+                # 只在输入取自「查询区间里这张表没有数据」的列时出现，同上
+                **no_data,
             }
         )
 
@@ -188,11 +201,11 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     # text 是给叙述节点 prompt 用的清单——它是叙述层唯一的数字来源
     lines = [
-        (f"- {m['id']}（{m['name']}）= {m['value']}{m['unit']}" if m["value"] is not None
-         else f"- {m['id']}（{m['name']}）= {MISSING}（缺少输入，无值）")
+        f"- {m['id']}（{m['name']}）= {_listed(m)}"
         # 不写行数：叙述节点照抄进正文就是一个没有出处的数
         + ("（不完整：基于被截断的查询结果计算）" if m.get("incomplete") else "")
         + ("（存疑：所依据的查询未通过 SQL 检查）" if m.get("sql_check_failed") else "")
+        + (LISTED_NO_DATA if m.get("no_data") else "")
         for m in metrics
     ]
     for m in metrics:
@@ -202,6 +215,12 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                      reason=m["incomplete_reason"], rows=[s.get("rows") for s in m.get("truncated_sources") or []],
                      message=f"指标「{m['name']}」{m['incomplete_reason']}")
     _emit_sql_check_logs(metrics, failed_by, state, ctx)
+    if lacking := [m for m in metrics if m.get("no_data")]:
+        # 结构化字段给界面读：metrics / metric_names（受影响的指标）、reason（第一个指标的那句）、sources
+        ctx.emit(EventType.LOG, level="warn", code="metric_no_data", metric=lacking[0]["id"],
+                 metrics=[m["id"] for m in lacking], metric_names=[m["name"] for m in lacking],
+                 reason=lacking[0]["no_data_reason"],
+                 message="指标" + "".join(f"「{m['name']}」" for m in lacking) + lacking[0]["no_data_reason"])
     card = {
         "kind": "metric_set",
         "caliber": caliber,
@@ -441,6 +460,72 @@ def _rendered(value: Any, definition: dict[str, Any], display: dict[str, Any]) -
         # 按规则渲染不出来的值显示「—」：inf / nan、不是 0 却会显示成 0 的（小数位不够）、
         # 位数大到不像话的。值本身照旧记着，报告里引用它会被判成解析不了，原因写清楚
         return MISSING
+
+
+#: 清单里输入取自「查询区间里这张表没有数据」的列的指标后面那句：直接读清单的模型节点不能把 0 当成真的是 0
+LISTED_NO_DATA = "（这段时间表里没有数据：不要当成 0 解读）"
+#: 指标的 no_data_reason 打头那半句（后面接查询记下的说明）
+NO_DATA_REASON = "所依据的查询区间里这张表没有数据"
+
+
+def _no_data_inputs(inputs: list[dict[str, Any]], carried: list[dict[str, Any]],
+                    snapshots: dict[str, Any]) -> list[dict[str, Any]]:
+    """这个指标的输入里，取自「查询区间里这张表没有数据」的列的：[{artifact, column, table, window, message}]。
+
+    认两处：输入的出处带着查询快照 id 和列（cell() 取的格、按位置取的格、Agent 经 cite_fields 交来的字段），快照里的
+    no_data 记着这一列；转抄的指标那张卡标了 no_data 的（no_data_sources 照抄）。读不出来的快照不算。"""
+    from app.data.coverage import no_data_of
+
+    out: list[dict[str, Any]] = []
+    for item in inputs:
+        artifact = item.get("artifact")
+        locator = item.get("locator") if isinstance(item.get("locator"), dict) else {}
+        columns = [locator.get("column")] if locator.get("column") is not None \
+            else list((locator.get("columns") or {}).values()) if isinstance(locator.get("columns"), dict) else []
+        if not isinstance(artifact, str) or not artifact or not columns:
+            continue
+        if artifact not in snapshots:
+            try:
+                snapshots[artifact] = artifact_store.load(artifact)
+            except (ValueError, OSError):
+                snapshots[artifact] = None
+        for column in columns:
+            found = no_data_of(snapshots[artifact], column)
+            if found is None:
+                continue
+            entry = {"artifact": artifact, "column": str(column), "table": found.get("table"),
+                     "window": found.get("window"), "message": found.get("message")}
+            if entry not in out:
+                out.append(entry)
+    for metric in carried:
+        for entry in metric.get("no_data_sources") or []:
+            if isinstance(entry, dict) and entry not in out:
+                out.append(dict(entry))
+    return out
+
+
+def _no_data_reason(lacking: list[dict[str, Any]]) -> str:
+    """「所依据的查询区间里这张表没有数据：「上周到访人数」查的是 … 」：出具缺口、运行日志、证据面板、写作目录都用这句。"""
+    said = list(dict.fromkeys(str(e.get("message") or "") for e in lacking if e.get("message")))
+    return NO_DATA_REASON + (f"：{'；'.join(said[:2])}" if said else "")
+
+
+#: 清单里没有值的两种说法：缺输入，和输入都齐、计算式自己算不出来（分母为 0）
+LISTED_MISSING = "（缺少输入，无值）"
+LISTED_UNDEFINED = "（算不出来：这组输入下计算式没有值，比如分母为 0）"
+#: 有值、按口径卡的小数位和格式显示不出来（太小、太大、不是有限的数）：不把原值拼出来，照实说
+LISTED_UNSHOWABLE = "（有值，但按设定的小数位和格式显示不出来）"
+
+
+def _listed(metric: dict[str, Any]) -> str:
+    """清单里这个指标的值：卡上按单位、小数位、格式渲染好的字（rendered，和报告里经 [[m:]] 渲染出来的一样）。以前拼原值
+    （{value}{unit}），比率 0.0007 配 % 写成「0.0007%」，直接读清单的模型节点差 100 倍。"""
+    if metric["value"] is None:
+        return MISSING + (LISTED_UNDEFINED if metric.get("undefined") else LISTED_MISSING)
+    rendered = str(metric.get("rendered") or "")
+    if not rendered or rendered == MISSING:
+        return MISSING + LISTED_UNSHOWABLE
+    return rendered
 
 
 def _value_of(path: str, tctx: dict[str, Any]) -> Any:

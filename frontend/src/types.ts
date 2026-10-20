@@ -2346,6 +2346,21 @@ export interface EvidenceMerge {
 }
 
 /** 指标的一个输入追不到原始数据：出处追到哪个节点为止。认不出是哪个节点时 node_id、label 为 null */
+/** 查询区间里这张表没有数据的那几列（服务端 data/coverage.result_gaps） */
+export interface EvidenceNoData {
+  columns: string[]
+  table?: string
+  column?: string
+  /** 查的区间（按天，两头都含），没有限制的那一头为 null */
+  window?: (string | null)[]
+  /** 表里这一列的范围；表里一个值都没有时为 null */
+  data_range?: (string | null)[] | null
+  /** live 现查；profile / observed 现查不成，按剖析、取值观察 */
+  basis?: string
+  basis_at?: string
+  message: string
+}
+
 export interface EvidenceUntraced {
   path: string
   node_id: string | null
@@ -2399,6 +2414,15 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   sql_check_failed?: boolean
   /** metric：没通过的原因（人话，「所依据的查询未通过 SQL 检查（…），结果不可靠」） */
   sql_check_reason?: string
+  /** metric：没有值，不是缺输入，是输入都齐、计算式自己算不出来（分母为 0）。状态仍是 missing_input */
+  undefined?: boolean
+  /**
+   * metric：输入取自「查询区间里这张表没有数据」的列，值照算，出具按缺口降档（true）；
+   * query：这次查询里这样的几列（服务端 data/coverage.py，查询时记进快照）。没有问题时没有这个键
+   */
+  no_data?: boolean | EvidenceNoData[]
+  /** metric：没有数据的原因（人话，「所依据的查询区间里这张表没有数据：…」） */
+  no_data_reason?: string
   /** metric（期 4）：这个指标的双盲复算状态。没有双盲复算复核过这份指标集时没有这个键 */
   dual_check?: EvidenceDualCheck
   /**

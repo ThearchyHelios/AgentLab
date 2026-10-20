@@ -69,6 +69,8 @@ PROFILE_ROWS_PROMPT = {"stats": "约 {n} 行（数据库统计估算）", "count
                        "at_least": "至少 {n} 行（数到上限为止）"}
 PROFILE_RANGE_PROMPT = "{column} 从 {low} 到 {high}"
 PROFILE_HINT_PROMPT = "只供写查询参考（定时间范围、估表大小），不是查询结果，不能作为回答里的数"
+#: 日期范围最早和最晚是同一天：这张表很可能只存最新一天（每天整表重灌），拿它算上周、上月只会查出 0
+PROFILE_ONE_DAY_PROMPT = "剖析时这张表的 {column} 只有一天（{day}）的数据，可能每天整表重灌：算历史周期请换有历史的表"
 PROFILE_STALE_PROMPT = "数据剖析：剖析早于当前版本，不给"
 #: 取值观察的结论（next-round 03 B2）：最新业务日期；行数比剖析的新时用观察的
 PROFILE_LATEST_PROMPT = "最新业务日期 {column} 到 {value}（取值观察，{day}）"
@@ -241,6 +243,7 @@ def profile_lines(facts: Mapping[str, Any] | None, masked: set[str], snapshot_id
     if upload and (not snapshot_id or facts.get("snapshot_id") != snapshot_id):
         return [indent + PROFILE_STALE_PROMPT]
     parts: list[str] = []
+    one_day: list[str] = []
     estimate = facts.get("row_estimate") if isinstance(facts.get("row_estimate"), Mapping) else None
     seen_rows = observed.get("rows") if isinstance(observed.get("rows"), Mapping) else None
     if seen_rows and str(seen_rows.get("at") or "") > str(facts.get("at") or ""):
@@ -259,6 +262,8 @@ def profile_lines(facts: Mapping[str, Any] | None, masked: set[str], snapshot_id
         if not column or column.lower() in masked or found.get("min") is None or found.get("max") is None:
             continue
         parts.append(PROFILE_RANGE_PROMPT.format(column=column, low=_when(found["min"]), high=_when(found["max"])))
+        if (day := _same_day(found["min"], found["max"])) is not None:
+            one_day.append(PROFILE_ONE_DAY_PROMPT.format(column=column, day=day))
     for found in observed.get("freshness") or []:
         column = str((found or {}).get("column") or "")
         if column and column.lower() not in masked and found.get("max"):
@@ -271,7 +276,15 @@ def profile_lines(facts: Mapping[str, Any] | None, masked: set[str], snapshot_id
         # 只有取值观察、没剖析过：照实说是观察
         latest = max((str(f.get("at") or "") for f in [seen_rows or {}, *(observed.get("freshness") or [])]), default="")
         head = OBSERVE_HEAD_PROMPT.format(day=_day(latest), facts="；".join(parts))
-    return [indent + head, indent + "  " + PROFILE_HINT_PROMPT]
+    return [indent + head, *(indent + "  " + line for line in one_day), indent + "  " + PROFILE_HINT_PROMPT]
+
+
+def _same_day(low: Any, high: Any) -> str | None:
+    """日期范围的两头是同一天（DATE、DATETIME、'YYYY-MM-DD'、'YYYYMMDD' 都认，data/coverage 同一个归一）：那一天，不是为 None。"""
+    from app.data.coverage import _as_day
+
+    lo, hi = _as_day(low), _as_day(high)
+    return lo.day.isoformat() if lo is not None and hi is not None and lo.day == hi.day else None
 
 
 # ==========================================================================

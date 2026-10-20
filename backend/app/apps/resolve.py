@@ -75,6 +75,24 @@ STATUS_TEXT = {"queued": "排队中", "running": "运行中", "interrupted": "�
 REJECTED_TEXT = "被驳回"
 TIER_TEXT = {"formal": "完整出具", "degraded": "降档出具", "withheld": "不予出具"}
 NO_TIER = "未声明出具契约"
+#: 成果没配出具契约（印章上是「未声明出具契约」）时，本该降档的缺口照实写进 notes：不然实例页上看不出来
+UNGATED_NO_DATA = "指标{names}所依据的查询区间里表里没有数据，这些 0 不代表真的是 0（成果没有配出具契约，没有按缺口降档）"
+UNGATED_DUAL = "双盲复算有缺口：{gaps}（成果没有配出具契约，没有按缺口降档）"
+
+
+def ungated_notes(cards: list[dict[str, Any]], dual: dict[str, Any] | None) -> list[str]:
+    """没配出具契约的成果，印章上要照实写的缺口：口径卡里输入取自「查询区间里这张表没有数据」的列的指标（no_data），
+    双盲复算的缺口（产出的 issuance_gaps：无法复算、审核人没采用原流程……）。配了契约的这些已经按缺口降档，不另写。"""
+    notes: list[str] = []
+    names = list(dict.fromkeys(str(m.get("name") or m.get("id")) for card in cards for m in card.get("metrics") or []
+                               if isinstance(m, dict) and m.get("no_data")))
+    if names:
+        shown = "".join(f"「{n}」" for n in names[:3]) + (f"等 {len(names)} 个" if len(names) > 3 else "")
+        notes.append(UNGATED_NO_DATA.format(names=shown))
+    gaps = [str(g) for g in (dual or {}).get("issuance_gaps") or [] if g]
+    if gaps:
+        notes.append(UNGATED_DUAL.format(gaps="；".join(gaps[:2]) + ("等" if len(gaps) > 2 else "")))
+    return notes
 #: 蓝图试运行（docs/design/normal-user-apps.md N4）：印章的来源、说明，趋势只有一个点时的说明，预览里入口按钮为什么点不了
 TRIAL_FROM = "试运行"
 TRIAL_NOTE = "数据是真的，但这不是正式结果：发布之后才会按设定出数"
@@ -315,7 +333,8 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
     if run.data_versions:
         parts.append("数据版本 " + "、".join(_version_text(v) for v in run.data_versions.values() if isinstance(v, dict)))
     calibers: list[dict[str, str]] = []
-    for _, _, card in _sealed_cards(sealed):
+    cards = [card for _, _, card in _sealed_cards(sealed)]
+    for card in cards:
         item = {"name": str(card.get("caliber") or ""), "version": str(card.get("caliber_version") or "")}
         if item["name"] and item not in calibers:
             calibers.append(item)
@@ -339,6 +358,9 @@ async def stamp_of(session: AsyncSession, source: Source) -> dict[str, Any]:
         # 个人应用最近一次刷新没成功、这里给的是上一次的（_exploratory_source）
         notes.append(source.message)
     notes += [gap for entry in (run.data_versions or {}).values() if (gap := _records_gap(entry))]
+    if tier not in TIER_TEXT:
+        # 没配出具契约：双盲复算的缺口、查询区间里没有数据的指标不会降档，照实写在这里
+        notes += ungated_notes(cards, sealed.payload_of(sealed.nodes_of("dual_check")))
     if not sealed.trusted:
         notes.append("这次运行还没有封存（或封存核对不一致），数字仅供参考")
     return {

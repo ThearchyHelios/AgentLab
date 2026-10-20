@@ -1464,6 +1464,40 @@ def _caliber_inputs(card: GraphNode, spec: GraphSpec) -> list[tuple[int, GraphNo
     return out
 
 
+def _is_zero(node: Any) -> bool:
+    """常量 0（0、0.0、-0、+0）；布尔不算。"""
+    import ast
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        node = node.operand
+    return isinstance(node, ast.Constant) and type(node.value) in (int, float) and node.value == 0
+
+
+def _divides(node: Any) -> bool:
+    import ast
+
+    return any(isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Div, ast.FloorDiv, ast.Mod)) for n in ast.walk(node))
+
+
+def zero_for_undefined(expression: str) -> bool:
+    """口径卡的表达式在算不出来时给了 0：某个条件表达式（x if c else y，嵌套的也算）一边有除法、另一边是常量 0——
+    `round((a - b) / b, 4) if b else 0`、`0 if not b else a / b`。分母为 0、没有数据时给 0，报告里写成「0%」「持平」，
+    读的人当成真的没变；应给 None（显示「—」）。按语法树认，解析不了的不算（另有表达式错误的报法）。"""
+    import ast
+
+    from app.engine.expressions import ExpressionError, parse_expression
+
+    try:
+        tree, _, _ = parse_expression(expression)
+    except (ExpressionError, ValueError, TypeError):
+        return False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.IfExp) and ((_divides(n.body) and _is_zero(n.orelse))
+                                          or (_divides(n.orelse) and _is_zero(n.body))):
+            return True
+    return False
+
+
 def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
     from app.engine.governance import UPGRADE_POLICIES, UPGRADE_POLICY_LABELS
 
@@ -1488,6 +1522,13 @@ def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
         elif node.type == NodeType.METRICS:
             if cfg.get("caliber_from") not in (None, "", {}):
                 out.extend(_caliber_from_issues(node, UPGRADE_POLICIES, UPGRADE_POLICY_LABELS, spec))
+            else:
+                for i, d in enumerate(cfg.get("metrics") or []):
+                    if isinstance(d, dict) and zero_for_undefined(str(d.get("expression") or "")):
+                        add(f"指标「{d.get('name') or d.get('id') or i + 1}」在算不出来时给了 0（条件表达式的一边是除法，"
+                            "另一边是 0）：分母为 0、没有数据时应给 None（报告里显示「—」，写作者照实说算不出来），"
+                            "写成 0 会被当成持平 / 0%。请改成「… if 分母 else None」",
+                            node, f"metrics[{i}].expression", code="metrics.zero_for_undefined")
             warned: set[str] = set()
             for i, producer in _caliber_inputs(node, spec):
                 role = str(producer.config.get("evidence_role") or "compute")

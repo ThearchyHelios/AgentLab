@@ -150,7 +150,7 @@ def _apply_contract(
     from datetime import datetime, timezone
 
     from app.engine.governance import board_only
-    from app.engine.issuance import decide_tier, incomplete_gaps, sql_check_findings, trace_numbers
+    from app.engine.issuance import decide_tier, incomplete_gaps, no_data_gaps, sql_check_findings, trace_numbers
 
     nodes = state.get("nodes") or {}
     # 写了 report_from 就是引用模式：按报告文档逐段复核，不再按数值回指叙述
@@ -191,6 +191,8 @@ def _apply_contract(
         gaps.append(f"指标来源未解析：{'、'.join(unresolved[:5])}")
     # 拿截断的查询结果整组算出来的指标：数回指得上，但算的只是取回的那一截，不能完整出具
     gaps.extend(incomplete_gaps(metrics))
+    # 输入取自「查询区间里这张表没有数据」的列的指标：数回指得上、复算一致，但那个 0 不代表真的是 0，不能完整出具
+    gaps.extend(no_data_gaps(metrics))
     # 来源查询没通过 SQL 检查（error 级：重复计算、存量跨期加总）：口径卡复算得一致，算的却是错数。
     # 报告直接引用的查询要等引用核对之后才知道，缺口放在这个位置，下面一起算
     sql_at = len(gaps)
@@ -489,6 +491,8 @@ def _check_citations(
                            "counted": governed and bool(unknown)}
 
     out["queries"], out["aliases"] = _cited_queries(doc, catalog)
+    # 报告直接引用了「查询区间里这张表没有数据」的列的格（查询快照的 no_data）：这些 0 不代表真的是 0，按缺口降档
+    gaps.extend(_cited_no_data(doc, catalog))
 
     # 老前端要用的逐个数字出处，从复核通过的数字片段拼出来
     for _, unit in iter_units(doc):
@@ -852,6 +856,37 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
         "unjudged": dict(summary.get("unjudged") or {}), "limits_hit": list(summary.get("limits_hit") or []),
         "complete": bool(summary.get("complete")), "model": summary.get("model"),
     }
+
+
+def _cited_no_data(doc: dict[str, Any], catalog: dict[str, Any]) -> list[str]:
+    """报告直接引用的格里，落在「查询区间里这张表没有数据」的列上的（查询快照的 no_data，data/coverage.py）：按列一句缺口
+    「报告引用的 Q1「上周到访人数」：所依据的查询区间里这张表没有数据（…）」。读不出来的快照不算。"""
+    from app.core.artifact_store import load
+    from app.data.coverage import NO_DATA_SHORT, no_data_of
+    from app.engine.evidence import iter_units
+
+    snapshots: dict[str, Any] = {}
+    out: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for _, unit in iter_units(doc):
+        for seg in unit.get("segments") or []:
+            cite = seg.get("cite") or {}
+            if cite.get("kind") != "cell" or cite.get("status") != "resolved" or not cite.get("alias"):
+                continue
+            alias = str(cite["alias"])
+            column = str((cite.get("locator") or {}).get("column") or "")
+            artifact = (catalog.get(alias) or {}).get("artifact")
+            if not column or not isinstance(artifact, str) or (alias, column) in seen:
+                continue
+            seen.add((alias, column))
+            if artifact not in snapshots:
+                try:
+                    snapshots[artifact] = load(artifact)
+                except (ValueError, OSError):
+                    snapshots[artifact] = None
+            if (found := no_data_of(snapshots[artifact], column)) is not None:
+                out.append(f"报告引用的 {alias}「{column}」：{NO_DATA_SHORT}（{found.get('message') or ''}）")
+    return out
 
 
 def _cited_queries(doc: dict[str, Any], catalog: dict[str, Any]) -> tuple[dict[str, list[str]], dict[str, str]]:
