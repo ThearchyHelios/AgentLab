@@ -48,6 +48,10 @@ MAX_BOUNDS = 24
 MAX_SQL_CHARS = 20_000
 #: 一条 no_data 里最多列几个结果列（计数照实）
 MAX_COLUMNS = 12
+#: 现查到的表的范围在进程里记多久（秒）：同一张表一会儿内查好几次（一张图里几个取数节点、助手自查几轮）不再全表 MIN /
+#: MAX。滚动表一天才换一次数据，几分钟的旧不影响判断；查不成的、退回剖析的不记
+LIVE_TTL_S = 300.0
+_LIVE: dict[tuple[Any, ...], tuple[float, Any]] = {}
 
 #: 给人和模型看的说法
 NO_DATA_MESSAGE = "{columns}查的是 {window}，但 {table} 的 {column} {data}：这些 0 不代表这段时间真的是 0，是这段时间表里没有数据{basis}"
@@ -392,6 +396,11 @@ async def _range(source: Any, flt: _Filter, read: str | None, cache: Cache, fact
     key = (str(getattr(source, "name", "")), name_key(flt.table_name), name_key(flt.column_name))
     if key in cache.ranges:
         return cache.ranges[key]
+    live = (getattr(source, "id", None), getattr(source, "snapshot_id", None), *key)
+    held = _LIVE.get(live)
+    if held is not None and held[0] > time.monotonic():
+        cache.ranges[key] = held[1]
+        return held[1]
     table = flt.table.copy()
     table.set("alias", None)
     ident = flt.column.this.copy() if isinstance(flt.column.this, exp.Identifier) \
@@ -413,6 +422,10 @@ async def _range(source: Any, flt: _Filter, read: str | None, cache: Cache, fact
     elif facts is not None:
         out = await _fallback(flt, facts)
     cache.ranges[key] = out
+    if out is not None and out.basis == "live":
+        if len(_LIVE) > 512:
+            _LIVE.clear()
+        _LIVE[live] = (time.monotonic() + LIVE_TTL_S, out)
     return out
 
 

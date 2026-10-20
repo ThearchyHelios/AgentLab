@@ -232,3 +232,28 @@ async def test_the_weekly_report_shape_on_mysql(monkeypatch):
     # 表的范围同一张表、同一列只查一次；按运行当天现算的界一条 SELECT 算出来
     assert sum("MIN(" in t for t in seen) == 1
     assert all(t.startswith("SELECT ") for t in seen)
+
+
+async def test_a_live_range_is_kept_for_a_while(monkeypatch):
+    """现查到的范围在进程里记几分钟：一张图里几个取数节点、助手自查几轮查同一张表，不再每次全表 MIN / MAX。"""
+    from types import SimpleNamespace
+
+    seen: list[str] = []
+
+    async def probe(source, text):
+        seen.append(text)
+        return ["20200101", "20200101"], ["text", "text"]
+
+    monkeypatch.setattr(coverage, "_probe", probe)
+    monkeypatch.setattr(coverage, "_LIVE", {})
+    source = SimpleNamespace(name=f"plant_{uuid.uuid4().hex[:6]}", kind="sqlite", schema_cache=None, id="s1")
+    payload = {"columns": ["n"], "rows": [[0]], "row_count": 1, "column_types": {"n": "number"}}
+    sql = "SELECT COUNT(*) AS n FROM gate_events WHERE event_date >= '20261012'"
+    for _ in range(2):
+        assert len(await coverage.result_gaps(source, sql, payload)) == 1
+    assert sum("MIN(" in t for t in seen) == 1
+    monkeypatch.setattr(coverage, "LIVE_TTL_S", 0.0)
+    coverage._LIVE.clear()
+    await coverage.result_gaps(source, sql, payload)
+    await coverage.result_gaps(source, sql, payload)
+    assert sum("MIN(" in t for t in seen) == 3, "过期了就重新现查"
