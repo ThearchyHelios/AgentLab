@@ -199,10 +199,10 @@ LEXICONS: dict[int, Lexicon] = {1: _V1}
 
 #: 有这几类判断的分句里，因果词并进它们核（「下降主要由华东造成」：说的是记账意义上的来源）
 _SOURCE_KEYS = frozenset({"source", "source_not", "dispersed", "offset", "mix"})
-#: 结果表里不是维度的列（按维度认点名的段时跳过）
+#: 拆解结果表里不是维度的列（params.by 对不上时按「不是度量列」认维度，跳过这些）
 _MEASURE_COLUMNS = frozenset({
-    "base", "target", "delta", "pct", "share", "flag", "d_base", "d_target", "w_base", "w_target", "r_base",
-    "r_target", "mix", "rate", "total", "contrib",
+    "base", "target", "delta", "pct", "share", "flag", "n_base", "n_target", "d_base", "d_target", "w_base",
+    "w_target", "r_base", "r_target", "mix", "rate", "total", "contrib",
 })
 #: 一段的变化记在哪一列：可加拆解的 delta、比率拆解的 total（结构 + 自身）、乘积拆解的 contrib
 _DELTA_COLUMNS = ("delta", "total", "contrib")
@@ -350,13 +350,17 @@ def _named_value(value: Any) -> str | None:
 
 
 def _dims(result: Mapping[str, Any]) -> list[int]:
-    """结果表里维度列的位置：拆解按 params.by，乘积拆解是 factor 列，别的按「不是度量列」认。"""
+    """结果表里各段名字所在的列：拆解按 params.by（照输入的列名），乘积拆解是 factor 列（因子的叫法），差异检验是 a、b 两组；
+    拆解的 by 对不上表头时按「不是度量列」认。别的算子没有段。"""
     table = result.get("table") or {}
     columns = [str(c) for c in table.get("columns") or []]
-    params = result.get("params") or {}
+    if result.get("op") == "differ":
+        return [columns.index(c) for c in ("a", "b") if c in columns]
+    if result.get("op") != "decompose":
+        return []
     if result.get("mode") == "factor" and "factor" in columns:
         return [columns.index("factor")]
-    by = params.get("by")
+    by = (result.get("params") or {}).get("by")
     wanted = by if isinstance(by, list) else [by] if isinstance(by, str) else []
     picked = [columns.index(str(b)) for b in wanted if str(b) in columns]
     return picked or [i for i, c in enumerate(columns) if c not in _MEASURE_COLUMNS]
@@ -435,6 +439,18 @@ def _segment_change(result: Mapping[str, Any], name: str) -> tuple[Decimal | Non
         if share_col is not None and (s := _decimal(row[share_col] if share_col < len(row) else None)) is not None:
             share = s if share is None else share + s
     return total, share
+
+
+def _both_ways(result: Mapping[str, Any]) -> bool:
+    """结果表里各段的变化有涨有跌。"""
+    table = result.get("table") or {}
+    columns = [str(c) for c in table.get("columns") or []]
+    col = next((columns.index(c) for c in _DELTA_COLUMNS if c in columns), None)
+    if col is None:
+        return False
+    signs = {d > 0 for row in table.get("rows") or [] if isinstance(row, list) and col < len(row)
+             and (d := _decimal(row[col])) is not None and d != 0}
+    return signs == {True, False}
 
 
 def _caveats(result: Mapping[str, Any]) -> set[str]:
@@ -526,8 +542,10 @@ def _check(lex: Lexicon, hit: Hit, result: Mapping[str, Any], names: str) -> _Mi
     if key == "dispersed":
         return None if code == "dispersed" else _verdict_miss(result)
     if key == "offset":
-        return None if "offset" in _caveats(result) else _Miss(
-            "没有记下此消彼长（各段的变化方向大多一致）", "这份结论没有记下各段此消彼长")
+        # 抵消记在 offset 里；判定为基本持平的，判定语本身就说了此消彼长（不一定再接 offset），各段有涨有跌就算
+        if "offset" in _caveats(result) or (code == "flat" and _both_ways(result)):
+            return None
+        return _Miss("没有记下此消彼长（各段的变化方向大多一致）", "这份结论没有记下各段此消彼长")
     if key == "mix":
         if result.get("mode") != "ratio":
             return _Miss("是按维度的可加拆解，说明不了结构变化：结构变化要挂比率拆解",
