@@ -395,10 +395,13 @@ def _count(word: str) -> int | None:
     return (_CN_DIGITS.get(tens, 0) if tens else 1) * 10 + (_CN_DIGITS.get(ones, 0) if ones else 0)
 
 
-def scan(text: str, *, version: int | None = None) -> list[Hit]:
+def scan(text: str, *, version: int | None = None, bare: bool = False) -> list[Hit]:
     """一句话里的判断词（text 是写作者自己写的字，别的片段已经涂成 \\x00）。同一处有几种读法时取最靠前、最长的：
     「超出正常范围」是异常不是正常，「没有明显的上升或下降趋势」是无趋势不是趋势。不核的写法（_counts）连同和它重叠的
-    读法一起跳过。"""
+    读法一起跳过。
+
+    bare=True 只按词认、不看上下文：构成、建议计划、业务状态、「相当」的比法、「未见异常」的主语这些只对整句话成立的
+    规矩都不用——认叫法（度量的叫法、因子名）里夹带的判断词时用它，叫法是一个名字，不是一句话。"""
     lex = lexicon(version)
     found: list[tuple[int, int, int, Claim]] = []
     for order, claim in enumerate(lex.claims):
@@ -413,7 +416,7 @@ def scan(text: str, *, version: int | None = None) -> list[Hit]:
             continue
         taken = end
         left, right = _clause(text, start, end)
-        if not _counts(lex, claim, text, start, end, left, right):
+        if not bare and not _counts(lex, claim, text, start, end, left, right):
             continue
         before = text[left:start]
         key, negated = claim.key, False
@@ -423,7 +426,8 @@ def scan(text: str, *, version: int | None = None) -> list[Hit]:
                 continue
             key = claim.flip
         word = text[start:end]
-        if key == "normal" and (claim.subject or (negated and "异" in word)) and not lex.subject.search(text[:right]):
+        if not bare and key == "normal" and (claim.subject or (negated and "异" in word)) \
+                and not lex.subject.search(text[:right]):
             continue            # 「未见异常」「没有出现异动」：主语不是指标、波动的（运行平稳、系统正常）不核
         direction = _direction(lex, word, text[end:right], text[left:right])
         run = claim.run and not negated
@@ -848,7 +852,7 @@ def _cause(sentence: Sentence, hit: Hit, left: int, right: int) -> str:
     return names[left + by[-1]:hit.start] if by else names[left:hit.start]
 
 
-#: 原因只是指代（「以上是下降的主要原因」「原因如下：」后面的列表各自核）：这一句不核
+#: 原因只是指代（「以上是下降的主要原因」「下降的主要原因：」，列出原因的那几句各自核）：这一句不核
 _POINTER = re.compile(r"(?:这|那|此|其|以上|上述|前述|如下|以下|下列)(?:些|个|几个|几点|两点|方面|原因|因素)?")
 _FILLING = re.compile(r"[\x00\s\W_]|的|都|也|就|主要|正是|便是|即")
 

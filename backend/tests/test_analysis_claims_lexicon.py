@@ -143,3 +143,12 @@ def test_the_sample_table_is_not_shorter_than_the_review():
 def test_runs_carry_the_number_of_periods_they_claim(text, count):
     [run] = [h for h in ac.scan(text) if h.run]
     assert run.count == count
+
+
+@pytest.mark.parametrize("label, claims", [("主要来自华东的销售额", ["source"]), ("集中在线上的订单", ["source"]),
+                                           ("建议持续降低的退款率", ["trend"]), ("部分订单异常", ["anomaly"]),
+                                           ("销售额", [])])
+def test_bare_scanning_finds_judgement_words_in_a_name(label, claims):
+    """认叫法里夹带的判断词（bare=True）只按词认：叫法是一个名字不是一句话，构成、建议计划、业务状态这些整句话的规矩不用。"""
+    assert [h.claim for h in ac.scan(label, bare=True)] == claims
+    assert ac.scan(label) == []
