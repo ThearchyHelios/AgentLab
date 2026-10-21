@@ -32,8 +32,9 @@ from app.eval.gold import Context
 from tests import eval_samples as es
 from tests.fixtures.acceptance import retail_trends
 
-TZ = "Asia/Shanghai"
 SUITE = json.loads((Path(__file__).parent / "fixtures" / "eval" / "analysis_suite.json").read_text(encoding="utf-8"))
+#: 题集的时区：题目里的期次（{{ schedule.* }}）按它算，生成库的「今天」也按它取，不看本机时区
+TZ = SUITE["suite"]["timezone"]
 #: 题集里的第 1 题（上周销售额下降主要来自华东）和第 3 题（订单数的常规波动）
 REGION = next(c for c in SUITE["cases"] if c["seq"] == 1)
 ORDERS = next(c for c in SUITE["cases"] if c["seq"] == 3)
@@ -53,7 +54,7 @@ async def engine_up(monkeypatch):
 
 @pytest.fixture
 async def source(tmp_path, scratch_source):
-    path = retail_trends.build(tmp_path / "trends.db", date.today())
+    path = retail_trends.build(tmp_path / "trends.db", now().date())
     sid = await scratch_source(retail_trends.SOURCE_NAME, path, schema=True)
     return {"id": sid, "name": retail_trends.SOURCE_NAME, "path": path}
 
