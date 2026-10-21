@@ -127,6 +127,29 @@ async def test_a_rounded_headline_closes_within_its_written_precision():
         assert (result["verdict"]["code"] != "unclosed") is closes, written
 
 
+async def test_a_headline_rounded_by_the_database_to_a_whole_number_closes_within_half_a_unit():
+    # SQLite 的 ROUND() 交回浮点 2120.0：取到了个位，最短写法里的「.0」不是一位小数的书写精度
+    rows = [["华东", "2026-W41", "1120.2"], ["华东", "2026-W42", "700"], ["华北", "2026-W41", "1000.2"],
+            ["华北", "2026-W42", "600"]]
+    for written, closes in ((2120.0, True), (2121.0, False), (2120.5, False)):
+        head = snap("Q1", "SELECT ROUND(SUM(amount)) AS gmv FROM orders", ["gmv_base", "gmv"], [[written, 1300.0]])
+        result = await additive(rows, snaps=[weekly(rows), head], headline=["Q1.r0.gmv_base", "Q1.r0.gmv"])
+        assert (result["verdict"]["code"] != "unclosed") is closes, written
+
+
+async def test_a_drill_closes_against_the_exact_value_of_the_parent_segment():
+    top = await additive()                                             # 华东 820 → 700
+    near = snap("Q4", "SELECT province, week, SUM(amount) AS gmv FROM orders WHERE region = '华东' GROUP BY 1, 2",
+                ["province", "week", "gmv"],
+                [["沪", "2026-W41", "500.4"], ["沪", "2026-W42", "410"], ["苏", "2026-W41", 320],
+                 ["苏", "2026-W42", "290.3"]])
+    params = {"query": "Q4", "by": ["province"], "period": "week", "base": "2026-W41", "target": "2026-W42",
+              "measure": "gmv", "parent": {"of": "A3", "key": ["华东"]}}
+    off = await analyze("decompose", "additive", snaps=[near], parents={"A3": top}, **params)
+    # 上一层那一段是算出来的精确值，不是取整过的总数：820.4 对 820、700.3 对 700 都不闭合
+    assert off["verdict"]["code"] == "unclosed" and off["values"]["gap"] == "-0.4"
+
+
 async def test_drilling_down_checks_closure_against_the_parent_segment():
     top = await additive()
     province = snap("Q4", "SELECT province, week, SUM(amount) AS gmv FROM orders WHERE region = '华东' GROUP BY 1, 2",

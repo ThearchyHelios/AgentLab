@@ -345,7 +345,7 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
             gaps[side] = heads[side][0] - total
         if parent_row is not None:
             expect = to_fraction(parent_row.get(side))
-            if expect is None or not closes(total, expect, parent_row.get(side)):
+            if expect is None or not closes(total, expect, None, exact=True):
                 gaps.setdefault(side, (expect or Fraction(0)) - total)
     closed = not gaps
     deltas = {x.key: x.target - x.base for x in segs}
@@ -547,7 +547,7 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
                 "d_target": sum((x.target[1] for x in live), Fraction(0))}
         for col, total in sums.items():
             expect = to_fraction(parent_row.get(col))
-            if expect is None or not closes(total, expect, parent_row.get(col)):
+            if expect is None or not closes(total, expect, None, exact=True):
                 gaps.setdefault("base" if col.endswith("base") else "target", (expect or Fraction(0)) - total)
     closed = not gaps
     mix_total = sum((e[4] for e in effects), Fraction(0))

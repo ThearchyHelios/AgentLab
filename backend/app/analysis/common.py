@@ -107,8 +107,11 @@ def need(raw: Mapping[str, Any], key: str, what: str) -> Any:
 
 
 def written_places(raw: Any) -> int:
-    """快照里一格写到第几位小数（headline 是取整过的，按它的书写精度容差）：数字文本按字面，浮点按最短写法，整数为 0。"""
+    """快照里一格写到第几位小数（headline 是取整过的，按它的书写精度容差）：数字文本按字面，浮点按最短写法，整数为 0。是整数
+    的浮点（SQLite 的 ROUND() 交回 2120.0）是取到个位的，也为 0——最短写法里的「.0」不是书写精度。"""
     if isinstance(raw, bool) or raw is None:
+        return 0
+    if isinstance(raw, float) and raw.is_integer():
         return 0
     text = repr(raw) if isinstance(raw, float) else str(raw).strip()
     if "e" in text.lower():
@@ -116,13 +119,14 @@ def written_places(raw: Any) -> int:
     return len(text.split(".", 1)[1]) if "." in text else 0
 
 
-def closes(total: Fraction, cell: Fraction, raw: Any) -> bool:
+def closes(total: Fraction, cell: Fraction, raw: Any, *, exact: bool = False) -> bool:
     """各段之和（或合起来的比率）和总数那一格对得上：十进制逐位相等；总数取整过的，差在它书写精度的半个末位以内也算；浮点
-    算出来的差在最后几位的也算（相对误差 1e-9 以内，同 engine/compare._equal）。"""
+    算出来的差在最后几位的也算（相对误差 1e-9 以内，同 engine/compare._equal）。exact：对的是上一层那一段算出来的精确值
+    （下钻），没有取整，只容浮点的最后几位。"""
     if total == cell:
         return True
     gap = abs(total - cell)
-    if gap <= Fraction(1, 2) / Fraction(10) ** written_places(raw):
+    if not exact and gap <= Fraction(1, 2) / Fraction(10) ** written_places(raw):
         return True
     scale = max(abs(total), abs(cell))
     return scale != 0 and gap <= scale * Fraction(1, 10 ** 9)
