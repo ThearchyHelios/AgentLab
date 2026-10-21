@@ -539,7 +539,7 @@ class _Skipped(Exception):
 
 async def _check_comparable(pair: tuple[str, str], inputs: list[dict[str, Any]], ctx: NodeContext,
                             comparing: _Comparing, snapshots: dict[str, Any]) -> dict[str, Any]:
-    import app.analysis as analysis_ops   # 按模块取 run：测试、合并前的替身都只换模块上的这一个函数
+    import app.analysis as analysis_ops   # 按模块取 run：测试换替身时只换模块上的这一个函数
 
     from app.analysis.contract import VERDICTS
     from app.data.sql_semantics import normalize_sql
@@ -573,10 +573,9 @@ async def _check_comparable(pair: tuple[str, str], inputs: list[dict[str, Any]],
         refs[artifact] = producer if producer and producer not in refs.values() else f"{producer or 'query'}·{role}"
     snaps = {}
     for artifact in order:
-        content = snapshots[artifact]
-        snap = input_snapshot(content, ref=refs[artifact], artifact=artifact, node_id=refs[artifact].split("·")[0])
-        snap["masked"] = await masked_of(content, artifact)
-        snaps[refs[artifact]] = snap
+        snaps[refs[artifact]] = input_snapshot(snapshots[artifact], ref=refs[artifact], artifact=artifact,
+                                               node_id=refs[artifact].split("·")[0],
+                                               masked=await masked_of(snapshots[artifact], artifact))
     settings = await settings_of(run_snapshot(ctx.run))
     context = await context_of(list(snaps.values()), tool_ctx=tool_context(ctx.run, ctx.node.id, ctx.emit))
     request = {"op": "comparable", "mode": None,
@@ -586,8 +585,9 @@ async def _check_comparable(pair: tuple[str, str], inputs: list[dict[str, Any]],
     if result.get("status") != "ok" or verdict not in VERDICTS["comparable"]:
         raise _Skipped(str(result.get("reason") or "检查没有给出判定"))
     artifact = await store(result, run_id=ctx.run.run_id, node_id=ctx.node.id)
-    return {"artifact": artifact, "verdict": verdict, "phrase": str(result.get("phrase") or ""),
-            "reasons": comparability_reasons(result)}
+    # 原因的拆法只有算子那一处（analysis.comparable_reasons，按检查表的说明拆）
+    return {"artifact": artifact, "verdict": result["verdict"]["code"], "phrase": result["phrase"],
+            "reasons": analysis_ops.comparable_reasons(result)}
 
 
 async def _dialect_of(source: str, comparing: _Comparing) -> str | None:
@@ -623,24 +623,6 @@ def _period_order(a: tuple[str, ...], b: tuple[str, ...]) -> tuple[int, int]:
         if len(left) == len(right) and re.fullmatch(r"[\dW\-/Qq]+", left) and re.fullmatch(r"[\dW\-/Qq]+", right):
             return (0, 1) if left < right else (1, 0)
     return 1, 0
-
-
-def comparability_reasons(result: dict[str, Any]) -> list[str]:
-    """可比性结论里 fail、warn 的原因，一句一个（contract.MetricComparability.reasons）。结果表里有 status 一列和一列说明
-    （reason / text / detail / message）的照表取；没有的按判定语「两期不可比：原因；原因」拆。可比的没有原因。"""
-    table = result.get("table") or {}
-    columns = [str(c) for c in table.get("columns") or []]
-    text_col = next((c for c in ("reason", "text", "detail", "message") if c in columns), None)
-    if "status" in columns and text_col is not None:
-        si, ti = columns.index("status"), columns.index(text_col)
-        found = [str(row[ti]) for row in table.get("rows") or []
-                 if isinstance(row, list) and len(row) > max(si, ti) and row[si] in ("fail", "warn") and row[ti]]
-        if found:
-            return found
-    phrase = str(result.get("phrase") or "")
-    if (result.get("verdict") or {}).get("code") == "comparable" or "：" not in phrase:
-        return []
-    return [part.strip() for part in phrase.split("：", 1)[1].split("；") if part.strip()]
 
 
 #: 清单里输入取自「查询区间里这张表没有数据」的列的指标后面那句：直接读清单的模型节点不能把 0 当成真的是 0

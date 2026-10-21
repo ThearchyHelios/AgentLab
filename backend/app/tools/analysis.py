@@ -10,8 +10,9 @@
   那一步按 checkpoint 里的结果照样放一遍，编号还是同一套。
 - **阈值**：发起时的快照（run.options["analysis"]，engine/launch.py）← 分析卡上写的覆盖；没有快照的现读设置。agent 改不了：
   分析工具的参数里没有阈值（契约 D4）。
-- **运行期依赖**（contract.Context）：运行当天（服务端时区）、现查表的日期范围（W1-a 的 make_prober，没有这个模块时不给）、
-  数据目录（按运行的目录视图读，和 db_schema 给模型看的同一份）、剖析事实。
+- **运行期依赖**（contract.Context）：运行当天（服务端时区）、现查表的日期范围（analysis.make_prober，按这次运行固定的数据
+  版本解析数据源）、数据目录（按运行的目录视图读，和 db_schema 给模型看的同一份）、剖析事实（analysis.probe.profile_facts，
+  和查询工具的覆盖检查同一个取法）。
 - **遮罩列**：数据源设的遮罩列、查询当时记下的、按 SQL 认出改了名字的（和证据面板、运行对比同一个函数，api/evidence 的
   _mask_sets 的 hidden，宁可多遮），加上遮罩运行里查询时就整列遮掉的。算子不拿它们当维度、度量。
 - **结论**：整份落成内容寻址的工件（contract.ARTIFACT_KIND），台账记 contract.ledger_entry；交回 agent 的是一段短的
@@ -64,9 +65,10 @@ def call_error_text(error: CallError) -> str:
 class AnalysisScope:
     """一次节点执行里分析工具读的容器（agent 节点、协作成员的一次执行各一个）。
 
-    queries：编号 Qn → 输入快照（contract.InputSnapshot，masked 留空，用到时由 prepare 补）。results：编号 An → 整份
-    结论；artifacts：An → 结论的工件 id。snapshot：发起时的分析设置快照（没有为 None，现读设置）。mask_cache：快照工件 →
-    遮罩列；source_cache：数据源和表 → 目录、剖析事实（一次节点执行里各读一次，只在工具执行时用，不影响编号）。"""
+    queries：编号 Qn → 输入快照（contract.InputSnapshot；记台账时先放交回模型的那份 payload，分析前 prepare 换成工件库里
+    那份完整快照，补上遮罩列）。results：编号 An → 整份结论；artifacts：An → 结论的工件 id。snapshot：发起时的分析设置快照
+    （没有为 None，现读设置）。mask_cache：快照工件 → 遮罩列；source_cache：数据源和表 → 目录、查询用的源；probe_cache：
+    数据源名 → coverage.Cache（一次节点执行里各读、各查一次，只在工具执行时用，不影响编号）。"""
 
     node_id: str
     snapshot: dict[str, Any] | None = None
@@ -75,6 +77,9 @@ class AnalysisScope:
     artifacts: dict[str, str] = field(default_factory=dict)
     mask_cache: dict[str, list[str]] = field(default_factory=dict)
     source_cache: dict[str, Any] = field(default_factory=dict)
+    probe_cache: dict[str, Any] = field(default_factory=dict)
+    #: 已经换成工件库里那份完整快照的编号（prepare 每份只取回一次）
+    prepared: set[str] = field(default_factory=set)
 
     def add_query(self, alias: str, snapshot: InputSnapshot) -> None:
         self.queries[alias] = snapshot
@@ -130,25 +135,18 @@ async def settings_of(snapshot: Mapping[str, Any] | None,
 # --------------------------------------------------------------------------
 
 
-def input_snapshot(content: Mapping[str, Any], *, ref: str, artifact: str, node_id: str) -> InputSnapshot:
-    """一份查询快照（数据源查询工具交回的、工件库里的）→ 算子的一份输入（masked 留空，prepare 时补）。列的类型对齐成和
-    columns 同序的列表（快照里记的是 {列: 类型}，没记的为 None）；行一律写成和 columns 同序的列表。"""
-    columns = [str(c) for c in content.get("columns") or []]
-    types = content.get("column_types")
-    rows: list[list[Any]] = []
-    for row in content.get("rows") or []:
-        if isinstance(row, (list, tuple)):
-            rows.append(list(row))
-        elif isinstance(row, Mapping):
-            rows.append([row.get(c) for c in columns])
-        else:
-            rows.append([row])
-    return {
-        "ref": ref, "artifact": artifact, "node_id": node_id, "source": str(content.get("source") or ""),
-        "sql": str(content.get("sql") or ""), "columns": columns,
-        "column_types": [types.get(c) if isinstance(types, Mapping) else None for c in columns],
-        "rows": rows, "truncated": bool(content.get("truncated")), "masked": [],
-    }
+def input_snapshot(content: Mapping[str, Any], *, ref: str, artifact: str, node_id: str,
+                   masked: Iterable[str] = ()) -> InputSnapshot:
+    """一份查询快照 → 算子的一份输入：查询工具的 payload（工件库里那份）原样——列、行、类型、SQL、数据源，连同 SQL 检查结果
+    （checks）、「查询区间里这张表没有数据」（no_data）、查询当时记下的遮罩（mask_columns、masked_at_query），可比性检查按
+    它们判数据问题——再加上出处（ref、artifact、node_id）和不能当维度、度量的列（masked，见 masked_of）。合并查询在 SQLite
+    里执行，方言写明；数据源的方言算子按探查器认（prober.dialect）。"""
+    from app.engine.merge_query import MERGE_SOURCE
+
+    out: dict[str, Any] = {**content, "ref": ref, "artifact": artifact, "node_id": node_id, "masked": list(masked)}
+    if content.get("source") == MERGE_SOURCE and not content.get("dialect"):
+        out["dialect"] = "sqlite"
+    return out  # type: ignore[return-value]
 
 
 async def masked_of(content: Mapping[str, Any] | None, artifact: str | None) -> list[str]:
@@ -171,23 +169,28 @@ async def masked_of(content: Mapping[str, Any] | None, artifact: str | None) -> 
 
 
 async def prepare(scope: AnalysisScope) -> None:
-    """补上容器里每份输入快照的遮罩列（每份工件只认一次）。快照取不回来、和哈希对不上的照实报错：查询明明交回过，
-    分析读不到它的快照，不是 agent 写错了参数。"""
+    """分析前把容器里的每份输入换成工件库里那份完整的查询快照（取回时复验哈希），补上遮罩列（每份工件只认一次）。快照
+    取不回来、和哈希对不上的照实报错：查询明明交回过，分析读不到它的快照，不是 agent 写错了参数。"""
     import asyncio
 
     from app.core import artifact_store
 
-    for alias, snapshot in scope.queries.items():
-        artifact = snapshot.get("artifact") or ""
+    for alias, snapshot in list(scope.queries.items()):
+        if alias in scope.prepared:
+            continue
+        artifact = str(snapshot.get("artifact") or "")
+        try:
+            content = await asyncio.to_thread(artifact_store.load, artifact)
+        except ValueError as e:
+            raise RuntimeError(f"{alias} 的查询快照与哈希不一致，疑似被修改，不能分析") from e
+        if not isinstance(content, Mapping):
+            raise RuntimeError(f"{alias} 的查询快照已不存在，不能分析")
         if artifact not in scope.mask_cache:
-            try:
-                content = await asyncio.to_thread(artifact_store.load, artifact)
-            except ValueError as e:
-                raise RuntimeError(f"{alias} 的查询快照与哈希不一致，疑似被修改，不能分析") from e
-            if content is None:
-                raise RuntimeError(f"{alias} 的查询快照已不存在，不能分析")
             scope.mask_cache[artifact] = await masked_of(content, artifact)
-        snapshot["masked"] = list(scope.mask_cache[artifact])
+        scope.queries[alias] = input_snapshot(content, ref=alias, artifact=artifact,
+                                              node_id=str(snapshot.get("node_id") or scope.node_id),
+                                              masked=scope.mask_cache[artifact])
+        scope.prepared.add(alias)
 
 
 # --------------------------------------------------------------------------
@@ -214,21 +217,26 @@ def _tables_of(snapshots: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
 
 
 async def context_of(snapshots: Iterable[Mapping[str, Any]], *, tool_ctx: Any,
-                     cache: dict[str, Any] | None = None) -> contract.Context:
-    """算子要的运行期依赖（contract.Context）。
+                     cache: dict[str, Any] | None = None,
+                     probe_cache: dict[str, Any] | None = None) -> contract.Context:
+    """算子要的运行期依赖（contract.Context）。每次分析调用一份（探查器有总时限，一次调用建一个）。
 
     - today：运行当天，服务端时区（算子据此判本期完不完整）
     - catalogs：数据源名 → {表名: 这张表的目录（app/data/catalog 的 notes）}，按运行的目录视图读（tool_ctx.catalog_view，
       和 db_schema 给模型看的、冻结进表结构快照的同一份），只给快照的 SQL 里用到的表
-    - facts：数据源名 → {表名: 剖析事实（catalog_profile_jobs.last_facts）}；上传表格的剖析不是这次查的那一版的不给
-    - probe：现查一列的实际范围（W1-a 的 make_prober，按这次运行固定的数据版本解析数据源；没有这个模块时为 None）
+    - facts：数据源名 → 取剖析事实的函数（analysis.probe.profile_facts：上传表格的剖析不是这次查的那一版的不给）
+    - probe：analysis.make_prober(数据源名 → 查询用的源)：按这次运行固定的数据版本解析数据源（上传表格查的是固定的那一版），
+      遮罩列按数据源设的不探，探不成由算子退回剖析事实；一个源都解析不出来时为 None
 
-    tool_ctx 是查询用的那个 ToolContext（固定的数据版本、目录视图都从它取）。cache 是调用方的缓存（同一个节点里分析
-    好几次，目录、剖析事实读一次）。读不到的源当没有：目录、剖析是附加说明，不能挡住分析。"""
+    tool_ctx 是查询用的那个 ToolContext（固定的数据版本、目录视图都从它取）。cache 是调用方的缓存（同一个节点里分析好几次，
+    目录、数据源读一次）；probe_cache 是数据源名 → coverage.Cache（同一张表的范围一个节点里只查一次）。读不到的源当没有：
+    目录、剖析、探查都是附加的，不能挡住分析。"""
+    from app.analysis.probe import profile_facts
+
     cache = cache if cache is not None else {}
     catalogs: dict[str, Any] = {}
     facts: dict[str, Any] = {}
-    found: dict[str, Any] = {}
+    sources: dict[str, Any] = {}
     for name, tables in _tables_of(snapshots).items():
         key = f"{name}\n" + "\n".join(sorted(tables))
         if key not in cache:
@@ -236,17 +244,16 @@ async def context_of(snapshots: Iterable[Mapping[str, Any]], *, tool_ctx: Any,
         entry = cache[key]
         if entry is None:
             continue
-        found[name] = entry["source"]
-        catalogs[name], facts[name] = entry["catalog"], entry["facts"]
-    return {"today": date.today(), "probe": _prober(found, facts), "catalogs": catalogs, "facts": facts}
+        sources[name] = entry["source"]
+        catalogs[name] = entry["catalog"]
+        facts[name] = profile_facts(entry["source"])
+    return {"today": date.today(), "probe": _prober(sources, probe_cache), "catalogs": catalogs, "facts": facts}
 
 
 async def _source_context(name: str, tables: set[str], tool_ctx: Any) -> dict[str, Any] | None:
-    """一个数据源这几张表的目录、剖析事实，和查询用的那个源（探查用）。读不到为 None。"""
+    """一个数据源这几张表的目录，和查询用的那个源（探查、剖析事实都按它）。读不到为 None。"""
     from app.data import catalog as data_catalog
     from app.data import catalog_view
-    from app.data.catalog_profile_jobs import last_facts
-    from app.db.base import SessionLocal
     from app.tools.datasource import resolved_source
 
     try:
@@ -255,61 +262,24 @@ async def _source_context(name: str, tables: set[str], tool_ctx: Any) -> dict[st
             return None
         row, source = resolved
         entries = await catalog_view.read(catalog_view.CatalogView.parse(getattr(tool_ctx, "catalog_view", None)), row)
-        names = {data_catalog.resolve_table_name(getattr(source, "schema_cache", None), t) or t for t in tables}
-        async with SessionLocal() as session:
-            profiled = await last_facts(session, str(row.id), sorted(names)) if names else {}
-    except Exception:  # noqa: BLE001 - 目录、剖析读不到当没有（目录视图指定的快照不在了另由查询工具照实报）
-        logger.warning("分析读取数据源 %s 的目录、剖析事实失败，这次不附", name, exc_info=True)
+    except Exception:  # noqa: BLE001 - 目录读不到当没有（目录视图指定的快照不在了另由查询工具照实报）
+        logger.warning("分析读取数据源 %s 的目录失败，这次不附", name, exc_info=True)
         return None
-    snapshot = getattr(source, "snapshot_id", None)
-    return {
-        "source": source,
-        "catalog": {t: dict(entries[t].notes or {}) for t in sorted(names) if t in entries},
-        # 上传表格：剖析时是另一版数据，范围对不上这次读的这一版（同 tools/datasource 的 _coverage）
-        "facts": {t: f for t, f in profiled.items() if not (snapshot and f.get("snapshot_id") != snapshot)},
-    }
+    names = {data_catalog.resolve_table_name(getattr(source, "schema_cache", None), t) or t for t in tables}
+    return {"source": source, "catalog": {t: dict(entries[t].notes or {}) for t in sorted(names) if t in entries}}
 
 
-def _probe_factory() -> Any:
-    """W1-a 的 app.analysis.probe.make_prober；还没有这个模块时为 None（算子只用剖析事实，核对不了的写「核对不了」）。"""
-    try:
-        from app.analysis.probe import make_prober  # type: ignore[import-not-found]
-    except ModuleNotFoundError as e:
-        if e.name not in ("app.analysis.probe", "app.analysis"):
-            raise
+def _prober(sources: Mapping[str, Any], probe_cache: dict[str, Any] | None) -> contract.Prober | None:
+    """这次分析调用的探查器（analysis.make_prober）。遮罩列、剖析事实按缺省（数据源设的遮罩列；profile_facts 现读）；
+    coverage.Cache 按数据源名放在调用方给的 probe_cache 里，同一个节点里的几次分析共用。"""
+    if not sources:
         return None
-    return make_prober
-
-
-def _prober(sources: Mapping[str, Any], facts: Mapping[str, Any]) -> contract.Prober | None:
-    """按数据源名分派的探查（contract.Prober）。每个源第一次被问到时才建它自己的探查：
-
-        make_prober(查询用的源, masked=遮罩列, cache=coverage.Cache(), facts=按表取剖析事实的协程函数)
-
-    签名以 W1-a 的交付为准（合并时由编排者对齐这一处）。遮罩列上的不探（data/coverage 的规矩），探查失败由它自己退回
-    剖析事实。"""
-    make = _probe_factory()
-    if make is None or not sources:
-        return None
+    from app import analysis
     from app.data import coverage
-    from app.data.engine import masked_columns
 
-    built: dict[str, Any] = {}
-
-    async def probe(source: str, table: str, column: str) -> contract.Probe | None:
-        if source not in built:
-            obj = sources.get(source)
-            known = (facts.get(source) or {}) if isinstance(facts, Mapping) else {}
-
-            async def by_table(name: str, known: Mapping[str, Any] = known) -> Mapping[str, Any] | None:
-                return known.get(name)
-
-            built[source] = None if obj is None else make(
-                obj, masked=masked_columns(getattr(obj, "options", None)), cache=coverage.Cache(), facts=by_table)
-        found = built[source]
-        return await found(source, table, column) if found is not None else None
-
-    return probe
+    shared = probe_cache if probe_cache is not None else {}
+    return analysis.make_prober(dict(sources), cache={name: shared.setdefault(name, coverage.Cache())
+                                                      for name in sources})
 
 
 def tool_context(run_ctx: Any, node_id: str, emit: Any = None) -> Any:

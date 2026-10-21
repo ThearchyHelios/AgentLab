@@ -63,7 +63,7 @@ async def run_analysis(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 inputs[node_id] = await _load_input(state, ctx, node_id, queries)
     context = await context_of(list(inputs.values()), tool_ctx=tool_context(ctx.run, ctx.node.id, ctx.emit))
 
-    import app.analysis as analysis_ops   # 按模块取 run：测试、合并前的替身都只换模块上的这一个函数
+    import app.analysis as analysis_ops   # 按模块取 run：测试换替身时只换模块上的这一个函数
 
     exec_no = next_exec(state, ctx.node.id)
     done: dict[str, AnalysisResult] = {}
@@ -158,9 +158,8 @@ async def _load_input(state: GraphState, ctx: NodeContext, node_id: str,
         raise NodeError(ctx.node.id, f"{who}的查询快照与哈希不一致，疑似被修改，不能分析") from None
     if not isinstance(content, dict):
         raise NodeError(ctx.node.id, f"{who}的查询快照已不存在，无法分析。请重新运行它")
-    snapshot = input_snapshot(content, ref=node_id, artifact=artifact, node_id=node_id)
-    snapshot["masked"] = await masked_of(content, artifact)
-    return snapshot
+    return input_snapshot(content, ref=node_id, artifact=artifact, node_id=node_id,
+                          masked=await masked_of(content, artifact))
 
 
 __all__ = ["REFUSED_CODE", "card_view", "run_analysis"]

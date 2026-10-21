@@ -158,6 +158,9 @@ def test_a_well_formed_card_validates():
      "输入里"),
     ([{**WOW, "params": {**WOW["params"], "bogus": 1}}], "items[0].params.bogus", "analysis.params_invalid",
      "没有「bogus」"),
+    # 运行当天、目录事实、下钻层数由系统填（算子自己记），分析项里写了不收
+    ([{**WOW, "params": {**WOW["params"], "today": "2026-10-21"}}], "items[0].params.today",
+     "analysis.params_invalid", "没有「today」"),
     ([{**WHERE, "params": {**WHERE["params"], "headline": {"base": "weekly.gmv", "target": "weekly.r1.gmv"}}}],
      "items[0].params.headline.base", "analysis.params_invalid", "节点 id.r行号.列名"),
     ([{**WHERE, "params": {**WHERE["params"], "headline": "weekly.r0.gmv"}}], "items[0].params.headline",

@@ -1,9 +1,12 @@
 """口径卡的可比性挂钩（docs/design/analysis-round/00-总方案.md §3.4 第 3 条）：一个指标的输入落在两份不同的查询快照上、
 两份 SQL 同形只差字面量（本周对上周）时，口径卡执行时自动做一次可比性检查，结论落成工件、记在指标的 comparability 上。
 
-- 同形只差日期 → 有 comparability，早的那期是基期（和表达式里谁先写无关）；同一对快照只查一次
+- 同形只差日期 → 有 comparability，早的那期是基期（和表达式里谁先写无关）；同一对快照只查一次；原因按算子的
+  analysis.comparable_reasons 拆
 - SQL 结构不同（退款额 / 销售额）、两次是同一条 SQL → 不查、不记日志
-- 算子出错、算不了、还没有算子（第 1 波的 run 抛 NotImplementedError）→ 不挡口径卡，记一条 metric_comparability_skipped
+- 算子出错、算不了、算子没有实现（NotImplementedError）→ 不挡口径卡，记一条 metric_comparability_skipped
+
+这里的算子是替身（tests/fixtures/analysis_ops.FakeOps）；真算子跑一遍的见 tests/test_analysis_e2e.py。
 """
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ from app.core import artifact_store
 from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent
-from app.engine.nodes.metrics import COMPARABILITY_SKIPPED, comparability_reasons
+from app.engine.nodes.metrics import COMPARABILITY_SKIPPED
 from app.engine.runner import run_manager
 from tests.fixtures.analysis_ops import FakeOps
 
@@ -118,12 +121,23 @@ async def test_two_periods_of_the_same_query_get_a_comparability_check(monkeypat
     assert not [log for log in logs if log.get("code") == COMPARABILITY_SKIPPED]
 
 
+#: 可比性结论的检查表（照算子的 comparable.table_of：检查项、结果、基期、本期、说明）
+CHECKS = {"columns": ["check", "status", "base", "target", "note"], "labels": {},
+          "rows": [["同口径", "通过", None, None, None], ["窗口长度", "通过", "7 天", "7 天", None],
+                   ["整期", "不通过", None, None, "本期数据只到 2026-10-15，还差 3 天"],
+                   ["星期构成", "提醒", None, None, "两段的周末天数不同：2 天对 1 天"]]}
+
+
 async def test_an_incomparable_pair_lists_its_reasons(monkeypatch):
-    FakeOps(monkeypatch, verdicts=["incomparable"])
+    import app.analysis as analysis_ops
+
+    FakeOps(monkeypatch, verdicts=["incomparable"], table=CHECKS)
     _, card, _ = await run_card(graph([{"id": "wow", "name": "销售额环比", "expression": WOW}]))
     found = by_id(card)["wow"]["comparability"]
-    assert found["verdict"] == "incomparable" and found["phrase"] == "两期不可比：本期只有 3 天数据"
-    assert found["reasons"] == ["本期只有 3 天数据"]
+    stored = artifact_store.load(found["artifact"])
+    assert found == {"artifact": found["artifact"], "verdict": "incomparable", "phrase": stored["phrase"],
+                     "reasons": analysis_ops.comparable_reasons(stored)}
+    assert found["reasons"] == ["本期数据只到 2026-10-15，还差 3 天", "两段的周末天数不同：2 天对 1 天"]
 
 
 async def test_different_structures_and_the_same_query_are_not_checked(monkeypatch):
@@ -136,8 +150,9 @@ async def test_different_structures_and_the_same_query_are_not_checked(monkeypat
     assert not [log for log in [*logs, *logs2] if log.get("code") == COMPARABILITY_SKIPPED]
 
 
-async def test_without_the_operator_the_card_still_runs():
-    """第 1 波的 app.analysis.run 还抛 NotImplementedError：口径卡照常算，照实记一条没做成。"""
+async def test_an_operator_that_is_not_there_does_not_block_the_card(monkeypatch):
+    """算子没有实现（合并前的骨架抛 NotImplementedError）：口径卡照常算，照实记一条没做成。"""
+    FakeOps(monkeypatch, errors=[NotImplementedError("analysis.run 还没有实现")])
     _, card, logs = await run_card(graph([{"id": "wow", "name": "销售额环比", "expression": WOW, "decimals": 4}]))
     wow = by_id(card)["wow"]
     assert "comparability" not in wow and wow["value"] == pytest.approx((450 + 300 - 900) / 900, abs=1e-4)
@@ -157,12 +172,3 @@ async def test_failures_do_not_block_the_card(monkeypatch, ops_kw):
     assert "comparability" not in by_id(card)["wow"]
     [log] = [log for log in logs if log.get("code") == COMPARABILITY_SKIPPED]
     assert log["reason"]
-
-
-def test_reasons_come_from_the_check_table_when_there_is_one():
-    result = {"verdict": {"code": "conditional"}, "phrase": "两期有条件可比：两段的周末天数不同",
-              "table": {"columns": ["check", "status", "reason"], "labels": {},
-                        "rows": [["同口径", "pass", None], ["窗口长度", "warn", "窗口长度不同：7 天对 6 天"],
-                                 ["星期构成", "warn", "两段的周末天数不同：2 天对 1 天"], ["整期", "unknown", "核对不了"]]}}
-    assert comparability_reasons(result) == ["窗口长度不同：7 天对 6 天", "两段的周末天数不同：2 天对 1 天"]
-    assert comparability_reasons({"verdict": {"code": "comparable"}, "phrase": "两期可比"}) == []

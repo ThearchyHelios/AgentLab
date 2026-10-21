@@ -42,9 +42,6 @@ NO_SCOPE = ("分析工具只能由 Agent 在本节点查过数之后调用：它
             "模板里要固定做的分析，请改用「分析卡」节点")
 #: 交回 agent 的说法：本节点还没有成功的查询
 NO_QUERIES = "本节点还没有成功的查询可以分析：先用数据库查询工具查出要分析的数，再按交回的编号（Q1、Q2……）调用分析工具"
-#: 这个节点的分析次数用完
-MAX_CALLS = ("这个节点已经做了 {done} 次分析，达到「{label}」的上限（{limit} 次），不能再分析了。"
-             "请基于已有的分析结论给出结论，没查清的照实说")
 
 _QUERY = "要分析的查询结果：本节点交回过的编号，如 Q3（和「【证据 Q3】」同一个）"
 _LABEL = "度量的叫法，系统写判定语时用（如「销售额」）；不要写数字、百分号和单位，留空就用列名"
@@ -118,20 +115,20 @@ class DifferArgs(BaseModel):
         description="rate：比率（转化率、退款率），给分子、分母两列；mean：均值，给每组的均值、标准差、样本数三列，"
                     "或合计、平方和、样本数三列；rows：逐行的值，算子自己算均值和方差（结果不能截断）")
     query: str = Field(description=_QUERY)
-    by: list[str] | None = Field(default=None, description="分组列的列名")
-    reference: str | None = Field(default=None, description="对照组：分组列里的一个值；留空和整体比")
+    by: list[str] | None = Field(default=None, description="按组比时：分组列的列名（一列）")
     pairs: list[list[str]] | None = Field(default=None, description="只比这几对：每对写两个组在分组列里的值")
-    period: str | None = Field(default=None, description="按期次比同一组的两期时：期次列")
+    reference: str | None = Field(default=None, description="对照组：分组列里的一个值，其余各组各和它比")
+    period: str | None = Field(default=None, description="按期次比同一组的两期时：期次列（SQL 里先筛好那一组）")
     base: str | None = Field(default=None, description="按期次比时：基期")
     target: str | None = Field(default=None, description="按期次比时：本期")
     numerator: str | None = Field(default=None, description="分子列：成功数（rate 用，如退款单数）")
     denominator: str | None = Field(default=None, description="分母列：试验数（rate 用，如订单数）")
-    mean: str | None = Field(default=None, description="每组的均值列（mean 用）")
-    std: str | None = Field(default=None, description="每组的标准差列（mean 用）")
-    sum: str | None = Field(default=None, description="每组的合计列（mean 用，没有标准差时和平方和一起给）")
-    sum_sq: str | None = Field(default=None, description="每组的平方和列（mean 用）")
+    mean: str | None = Field(default=None, description="每组的均值列（mean 用，和标准差、样本数一起给）")
+    sd: str | None = Field(default=None, description="每组的标准差列（mean 用）")
+    sum: str | None = Field(default=None, description="每组的合计列（mean 用，没有标准差时和平方和、样本数一起给）")
+    sumsq: str | None = Field(default=None, description="每组的平方和列（mean 用）")
     n: str | None = Field(default=None, description="每组的样本数列（mean 用）")
-    measure: str | None = Field(default=None, description="逐行的值列（rows 用）")
+    value: str | None = Field(default=None, description="逐行的值列（rows 用）")
     label: str | None = Field(default=None, description=_LABEL)
     hypothesis: str | None = Field(default=None, description=_HYPOTHESIS)
 
@@ -143,7 +140,8 @@ class ComparableArgs(BaseModel):
     period: str | None = Field(default=None, description="同一份查询时：期次列")
     base: str | None = Field(default=None, description="同一份查询时：基期")
     target: str | None = Field(default=None, description="同一份查询时：本期")
-    label: str | None = Field(default=None, description=_LABEL)
+    measure: str | None = Field(default=None, description="度量列：按它找时间条件、认它是不是可累加的量；只有一列数值列时可以不写")
+    grain: Literal["day", "week", "month", "quarter"] | None = Field(default=None, description=_GRAIN)
     hypothesis: str | None = Field(default=None, description=_HYPOTHESIS)
 
 
@@ -179,10 +177,10 @@ async def run_tool(op: str, ctx: ToolContext, args: BaseModel) -> dict[str, Any]
     """一次 agent 分析：读本节点的查询容器、按设置快照取阈值、调算子、结论落成工件。交回 {analysis_artifact, result}：
     记台账、编号 An、给模型看的那一段由节点在记台账时做（engine/nodes/llm.py 的 _record_call），重放时照样做一遍。
 
-    调用写错（含这个节点的分析次数用完）抛 contract.CallError，节点作为工具错误交回模型、不记台账。"""
-    import app.analysis as analysis_ops   # 按模块取 run：测试、合并前的替身都只换模块上的这一个函数
+    调用写错（含这个节点的分析次数用完，analysis.exhausted）抛 contract.CallError，节点作为工具错误交回模型、不记台账。
+    结论原样存成工件、一个字段都不加：下钻时算子按上一层结论的内容哈希认 parent 的工件。"""
+    import app.analysis as analysis_ops   # 按模块取 run：测试换替身时只换模块上的这一个函数
 
-    from app.analysis.contract import LABELS
     from app.tools.analysis import context_of, prepare, scope_of, settings_of, store
 
     scope = scope_of(ctx.extra)
@@ -192,11 +190,11 @@ async def run_tool(op: str, ctx: ToolContext, args: BaseModel) -> dict[str, Any]
         raise CallError("no_queries", NO_QUERIES)
     settings = await settings_of(scope.snapshot)
     if len(scope.results) >= settings["max_calls"]:
-        raise CallError("max_calls", MAX_CALLS.format(done=len(scope.results), label=LABELS["max_calls"],
-                                                      limit=settings["max_calls"]))
+        raise analysis_ops.exhausted(settings)          # 次数用完的说法只有算子那一处
     request = request_of(op, args)
     await prepare(scope)
-    context = await context_of(list(scope.queries.values()), tool_ctx=ctx, cache=scope.source_cache)
+    context = await context_of(list(scope.queries.values()), tool_ctx=ctx, cache=scope.source_cache,
+                               probe_cache=scope.probe_cache)
     result = await analysis_ops.run(request, scope.resolve, settings=settings, context=context, parents=scope.parent)
     artifact = await store(result, run_id=ctx.run_id, node_id=scope.node_id)
     return {"analysis_artifact": artifact, "result": result}
@@ -242,7 +240,7 @@ async def analysis_trend(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
     name=contract.TOOL_NAMES["differ"],
     category=CATEGORY,
     description="差异检验：判断两组（或同一组的两期）的差异站得住，还是可能只是样本波动。比率给分子、分母两列（rate），"
-                "均值给均值、标准差、样本数（mean），也可以给逐行的值（rows）；样本小时照实标出。",
+                "均值给均值、标准差、样本数或合计、平方和、样本数（mean），也可以给逐行的值（rows）；样本小时照实标出。",
     args_schema=DifferArgs,
     guide=METHOD_GUIDE,
 )

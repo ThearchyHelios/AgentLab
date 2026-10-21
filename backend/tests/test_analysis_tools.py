@@ -23,7 +23,7 @@ from app.db.base import SessionLocal
 from app.db.models import Artifact, DataSource, Run, RunEvent
 from app.engine.runner import run_manager
 from app.tools.analysis import CALL_ERROR_HEAD, REFUSED_CODE
-from app.tools.builtin.analysis import ANALYSIS_METHOD_PROMPT, ARGS, MAX_CALLS, METHOD_GUIDE, NO_SCOPE
+from app.tools.builtin.analysis import ANALYSIS_METHOD_PROMPT, ARGS, METHOD_GUIDE, NO_SCOPE
 from tests.fixtures.analysis_ops import FakeOps
 
 TOOL = "db_query__shop"
@@ -173,8 +173,11 @@ def test_the_five_tools_take_no_thresholds_and_share_one_method():
     assert {"mode", "by", "period", "base", "target", "measure", "numerator", "denominator", "product", "factors",
             "headline", "parent", "label", "hypothesis"} <= set(ARGS["decompose"].model_fields)
     assert {"basis", "grain", "lag"} <= set(ARGS["baseline"].model_fields)
-    assert {"reference", "pairs", "mode"} <= set(ARGS["differ"].model_fields)
-    assert {"base_query", "target_query"} <= set(ARGS["comparable"].model_fields)
+    # 参数名以算子为准（app/analysis 各算子文件头）：差异检验的均值是 mean / sd / n 或 sum / sumsq / n，逐行是 value
+    assert {"reference", "pairs", "mode", "mean", "sd", "sum", "sumsq", "n", "value"} <= set(ARGS["differ"].model_fields)
+    assert {"base_query", "target_query", "measure", "grain"} <= set(ARGS["comparable"].model_fields)
+    # 运行当天、目录事实、下钻层数由系统填，哪个工具的参数里都没有
+    assert not any({"today", "catalog", "depth"} & set(model.model_fields) for model in ARGS.values())
 
 
 def test_unknown_parameters_and_thresholds_are_rejected_like_any_tool():
@@ -209,6 +212,22 @@ async def test_calling_it_outside_an_agent_says_where_it_belongs():
     with pytest.raises(CallError) as found:
         await call_tool(DECOMPOSE, DECOMPOSE_ARGS, ToolContext(data_versions=Versions.CURRENT))
     assert found.value.message == NO_SCOPE
+
+
+def test_input_snapshots_carry_the_payload_as_is():
+    """交给算子的一份输入：查询工具的 payload 原样（SQL 检查结果、「查询区间里这张表没有数据」、查询当时记下的遮罩，可比性
+    检查按它们判数据问题），加上出处和遮罩列；合并查询写明方言（在 SQLite 里执行）。"""
+    from app.engine.merge_query import MERGE_SOURCE
+    from app.tools.analysis import input_snapshot
+
+    content = {"columns": ["region", "gmv"], "rows": [["华东", 1]], "sql": "SELECT …", "source": "shop",
+               "column_types": {"region": "text", "gmv": "number"}, "truncated": False,
+               "checks": [{"level": "error", "code": "fanout_sum"}], "no_data": [{"columns": ["gmv"]}],
+               "mask_columns": ["phone"], "masked_at_query": ["tel"]}
+    snap = input_snapshot(content, ref="Q1", artifact="a" * 64, node_id="bot", masked=["tel", "phone"])
+    assert snap == {**content, "ref": "Q1", "artifact": "a" * 64, "node_id": "bot", "masked": ["tel", "phone"]}
+    merged = input_snapshot({**content, "source": MERGE_SOURCE}, ref="m", artifact="b" * 64, node_id="m")
+    assert merged["dialect"] == "sqlite" and merged["masked"] == []
 
 
 # --------------------------------------------------------------------------
@@ -265,11 +284,15 @@ async def test_an_analysis_reads_this_nodes_query_and_is_recorded(monkeypatch, s
     assert snap["ref"] == "Q1" and snap["artifact"] == query_artifact and snap["node_id"] == "bot"
     assert snap["source"] == "shop" and snap["sql"] == SQL and snap["truncated"] is False
     assert snap["columns"] == ["region", "week", "gmv"] and snap["rows"][0] == ["华东", "2026-W41", 820.0]
-    assert snap["column_types"] == ["text", "text", "number"] and snap["masked"] == []
+    # 查询工具的 payload 原样（工件库里那份），加上出处和遮罩列
+    assert snap["column_types"] == {"region": "text", "week": "text", "gmv": "number"} and snap["masked"] == []
+    assert snap["row_count"] == 6 and snap == {**artifact_store.load(query_artifact), "ref": "Q1",
+                                               "artifact": query_artifact, "node_id": "bot", "masked": []}
     # 阈值：没有发起时的快照，现读设置（没存过就是缺省）
     assert call["settings"] == contract.DEFAULTS
     assert set(call["context"]) == {"today", "probe", "catalogs", "facts"}
-    assert call["context"]["probe"] is None, "还没有 W1-a 的 make_prober 时不给探查"
+    # 探查器按这次运行固定的数据版本解析数据源（analysis.make_prober），剖析事实是按表取的函数（probe.profile_facts）
+    assert call["context"]["probe"].dialect("shop") == "sqlite" and callable(call["context"]["facts"]["shop"])
 
     # 结论落成工件，tool.end 带着它；台账记一条 kind analysis（带 call_id），在那次查询之后
     analysis_artifact = ends[1]["analysis_artifact"]
@@ -353,7 +376,9 @@ async def test_the_number_of_analyses_per_node_is_capped(monkeypatch, shop):
     await run_graph(agent_graph(), options={contract.SETTINGS_KEY: {"max_calls": 1}})
     assert len(ops.calls) == 1
     capped = tool_messages(script)[2]
-    assert capped == CALL_ERROR_HEAD + MAX_CALLS.format(done=1, label=contract.LABELS["max_calls"], limit=1)
+    import app.analysis as analysis_ops
+
+    assert capped == CALL_ERROR_HEAD + analysis_ops.exhausted({"max_calls": 1}).message
     # 阈值来自发起时的快照
     assert ops.calls[0]["settings"]["max_calls"] == 1
 
