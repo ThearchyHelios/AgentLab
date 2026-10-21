@@ -10,6 +10,7 @@ import type {
   EvalTrigger, EvalUpgradePolicy, EvalVerdict,
 } from '../typesEval'
 import { formatCost, formatNumber } from './format'
+import { ANALYSIS_MODE_LABEL, ANALYSIS_OP_LABEL } from './termsAnalysis'
 
 /** 比率写成百分数：0.756 → 「75.6%」；没有分母（null）写「—」 */
 export function pct(rate: number | null | undefined, digits = 1): string {
@@ -310,16 +311,13 @@ export const EVAL_TEXT = {
     refused: (reason: string) => `算不了：${reason}（这一项不能评分）`,
   },
   /**
-   * 分析期望（贡献、判定）的叫法。分析方法、模式的叫法和服务端契约（app/analysis/contract 的 OP_LABELS、MODE_LABELS）一字
-   * 不差（tests/test_frontend_eval_unions.py 逐个对照）；判定类是评测自己的（app/eval/judgements.JUDGEMENTS）
+   * 分析期望（贡献、判定）的叫法。分析方法、模式的叫法只有 lib/termsAnalysis 一份（照服务端契约 app/analysis/contract 的
+   * OP_LABELS、MODE_LABELS 一字不差，tests/test_frontend_eval_unions.py 与 check-studio 逐个对照），这里引用它，不另抄；
+   * 判定类是评测自己的（app/eval/judgements.JUDGEMENTS）
    */
   analysis: {
-    op: {
-      decompose: '变化拆解', baseline: '波动基线', trend: '趋势判断', differ: '差异检验', comparable: '可比性检查',
-    } as Record<EvalAnalysisOp, string>,
-    mode: {
-      additive: '可加', ratio: '比率', factor: '乘积', rate: '比率', mean: '均值', rows: '逐行明细',
-    } as Record<EvalAnalysisMode, string>,
+    op: ANALYSIS_OP_LABEL as Record<EvalAnalysisOp, string>,
+    mode: ANALYSIS_MODE_LABEL as Record<EvalAnalysisMode, string>,
     judgement: {
       source: '主要来源', dispersed: '分散，没有主要来源', flat: '基本持平', mix: '主要来自结构变化', rate: '主要来自各段自身的变化',
       mixed: '几方面都有影响', normal: '常规波动', anomaly: '超出常规波动', rising: '上升趋势', falling: '下降趋势',

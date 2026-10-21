@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TYPES_EVAL = ROOT / "frontend" / "src" / "typesEval.ts"
 TERMS_EVAL = ROOT / "frontend" / "src" / "lib" / "termsEval.ts"
+#: 分析方法、模式的叫法只有这一份（termsEval 引用它，不另抄）
+TERMS_ANALYSIS = ROOT / "frontend" / "src" / "lib" / "termsAnalysis.ts"
 
 _COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 
@@ -111,16 +113,28 @@ def test_signal_bands_follow_the_server():
     assert set(_labels("signals.band")) == {c["band"] for c in [*SIGNAL_CRITERIA["e1"], *SIGNAL_CRITERIA["e3"]]}
 
 
+def _analysis_table(name: str) -> list[tuple[str, str]]:
+    """lib/termsAnalysis.ts 里一张叫法表（export const NAME … = { … }）的 (键, 叫法)，按写的顺序。"""
+    text = _source(TERMS_ANALYSIS)
+    found = re.search(rf"export const {name}\b[^=]*= \{{(.*?)\n\}}", text, re.S)
+    assert found is not None, f"termsAnalysis.ts 里没有 export const {name}"
+    return re.findall(r"(\w+): '([^']*)'", found.group(1))
+
+
 def test_analysis_expectations_follow_the_server():
     """分析期望：判定类和服务端 app/eval/judgements 一致；分析方法、模式的叫法和契约（app/analysis/contract 的 OP_LABELS、
-    MODE_LABELS）一字不差——界面上的「变化拆解（可加）」和服务端拼的、证据面板写的是同一种说法。"""
+    MODE_LABELS）一字不差——界面上的「变化拆解（可加）」和服务端拼的、证据面板写的是同一种说法。叫法只有 lib/termsAnalysis
+    一份：评测页（EVAL_TEXT.analysis.op / mode）引用它，不另抄一份。"""
     from app.analysis.contract import MODE_LABELS, MODES, OP_LABELS, OPS
     from app.eval.judgements import JUDGEMENTS
 
     assert _union("EvalJudgement") == list(JUDGEMENTS)
     assert _labels("analysis.judgement") == list(JUDGEMENTS)
     assert _union("EvalAnalysisOp") == list(OPS)
-    assert _pairs("analysis.op") == list(OP_LABELS.items())
+    assert _analysis_table("ANALYSIS_OP_LABEL") == list(OP_LABELS.items())
     assert _union("EvalAnalysisMode") == list(MODE_LABELS)
-    assert _pairs("analysis.mode") == list(MODE_LABELS.items())
+    assert _analysis_table("ANALYSIS_MODE_LABEL") == list(MODE_LABELS.items())
     assert {m for modes in MODES.values() for m in modes} == set(MODE_LABELS)
+    terms = _source(TERMS_EVAL)
+    assert re.search(r"\n\s*op: ANALYSIS_OP_LABEL\b", terms) and re.search(r"\n\s*mode: ANALYSIS_MODE_LABEL\b", terms), \
+        "评测页的分析方法、模式叫法要引用 lib/termsAnalysis 的那一份"
