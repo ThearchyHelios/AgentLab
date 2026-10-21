@@ -11,9 +11,11 @@
 - 百分点：比率的变化（2.1% 到 2.5% 是上升 0.4 个百分点）。
 
 **label 消毒**（§7.3）：判定语里的度量叫法、因子名、维度叫法是 agent 或数据给的。agent 给的 label（以及目录里的叫法、
-当叫法用的列名）去掉数字、百分号、单位符号、引用标记，不超过 20 字，消毒后为空就退回下一个来源：不然模型可以把
-「销售额（同比 +30%）」塞进 label，借系统渲染绕过裸数字检测。去数字按出具校验抽数字的同一个函数（engine/issuance 的
-extract_numbers：阿拉伯数字、中文数字、带万 / 亿 / 成 / 倍的写法），再去掉剩下的数字字符。维度值是数据，照原样。
+当叫法用的列名）去掉数字、百分号、单位符号、引用标记，截到第一个分句标点之前，不超过 20 字；里面有说法表的判断词的整个
+不要；消毒后为空就退回下一个来源：不然模型可以把「销售额（同比 +30%）」「销售额，主要来自华东」塞进 label，借系统渲染绕过
+裸数字检测和说法核对（判定语不受说法核对）。去数字按出具校验抽数字的同一个函数（engine/issuance 的 extract_numbers：阿拉伯
+数字、中文数字、带万 / 亿 / 成 / 倍的写法），再去掉剩下的数字字符。消毒反复做到不再变化：消过的再消一遍不变，复算拿记下的
+叫法再消，判定语逐字相同。维度值是数据，照原样。
 
 **附带说明**：判定语后面用「；」接，最多两条（按 PHRASE_ORDER 的先后），其余只在证据面板。度量类型没标、以各段之和为
 总数这类方法上的交代不进判定语。
@@ -168,13 +170,63 @@ _DIGITS = re.compile(r"[0-9０-９]")
 _SYMBOLS = re.compile(r"[%％‰‱¥￥$＄€£₩℃°+＋\-−–±×÷=＝<>＜＞~～^*]")
 _EMPTY_BRACKETS = re.compile(r"[（(【\[]\s*[)）】\]]")
 _EDGE_PUNCT = "，,、：:；;。.！!？? 　"
+#: 分句的标点：叫法截到第一个之前（「销售额，主要来自华东」只留「销售额」）
+_CLAUSE = re.compile(r"[，。；：！？、,.;:!?]")
+#: 截出来以后还没配上对的左括号（「销售额（含税，元）」截成「销售额（含税」）连同后面的都不要
+_OPENERS = {"（": "）", "(": ")", "【": "】"}
 
 
 def clean_label(text: Any) -> str:
-    """消毒（见文件头）：去引用标记、数字（出具校验认的数字写法连同后缀，再加剩下的数字字符）、百分号和单位符号、空括号，
-    压掉多余空白，不超过 LABEL_MAX 字。可能消成空串。"""
+    """消毒（见文件头）：去引用标记、数字（出具校验认的数字写法连同后缀，再加剩下的数字字符）、百分号和单位符号、空括号、
+    多余空白，反复做到不再变化（去掉一处可能拼出新的一处：「销售额[ [v:Q1.r0.gmv] ]」去完数字成了「销售额[[v:Q.r.gmv]]」），
+    再去掉剩下的方括号，截到第一个分句标点之前、去掉没配上对的左括号，不超过 LABEL_MAX 字；整个过程再做到不再变化，所以
+    消过的再消一遍不变。消完的叫法里有说法表的判断词（engine/analysis_claims.scan 认得出的）就整个不要。可能消成空串。"""
     if not isinstance(text, str):
         return ""
+    out = text
+    for _ in range(len(text) + 2):
+        again = _shorten(_settle(out))
+        if again == out:
+            break
+        out = again
+    return "" if out and _judges(out) else out
+
+
+def _settle(text: str) -> str:
+    """去引用标记、数字、符号、空括号，做到不再变化（每一遍只会变短或只换空白，一定停得下来）。"""
+    out = text
+    for _ in range(len(text) + 2):
+        again = _scrub(out)
+        if again == out:
+            break
+        out = again
+    return out
+
+
+def _shorten(text: str) -> str:
+    """去掉剩下的方括号，截到第一个分句标点之前，去掉没配上对的左括号连同后面的，不超过 LABEL_MAX 字。"""
+    out = _CLAUSE.split(text.replace("[", "").replace("]", ""), maxsplit=1)[0]
+    open_at: list[tuple[int, str]] = []
+    for i, ch in enumerate(out):
+        if ch in _OPENERS:
+            open_at.append((i, _OPENERS[ch]))
+        elif open_at and ch == open_at[-1][1]:
+            open_at.pop()
+    if open_at:
+        out = out[:open_at[0][0]]
+    out = re.sub(r"\s+", " ", out).strip(_EDGE_PUNCT)
+    return out[:LABEL_MAX].strip(_EDGE_PUNCT)
+
+
+def _judges(text: str) -> bool:
+    """叫法里有没有说法表的判断词（「主要来自」「历史新高」……）。说法核对在 engine 里，在这里导入免得循环导入。"""
+    from app.engine.analysis_claims import scan
+
+    return bool(scan(text))
+
+
+def _scrub(text: str) -> str:
+    """一遍：去引用标记、数字、符号，收拾去掉以后留下的空白、标点、空括号。"""
     from app.engine.issuance import extract_numbers
 
     raw = _MARKER.sub("", text)
@@ -193,8 +245,7 @@ def clean_label(text: Any) -> str:
     out = re.sub(r"([，,、：:；;])[，,、：:；;]+", r"\1", out)
     while _EMPTY_BRACKETS.search(out):
         out = _EMPTY_BRACKETS.sub("", out)
-    out = re.sub(r"\s+", " ", out).strip(_EDGE_PUNCT)
-    return out[:LABEL_MAX].strip(_EDGE_PUNCT)
+    return re.sub(r"\s+", " ", out).strip(_EDGE_PUNCT)
 
 
 def pick_label(*candidates: Any, fallback: str = "这一列") -> str:

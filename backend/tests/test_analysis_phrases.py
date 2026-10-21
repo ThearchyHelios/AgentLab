@@ -60,6 +60,28 @@ def test_labels_are_scrubbed_of_numbers_units_and_markers():
     assert ph.pick_label("2026", None, "2026") == "这一列"
 
 
+def test_scrubbing_a_scrubbed_label_changes_nothing():
+    # 去掉一处可能拼出新的一处：去完数字的「销售额[[v:Q.r.gmv]]」又是一个引用标记，要接着去
+    assert ph.clean_label("销售额[ [v:Q1.r0.gmv] ]") == "销售额"
+    assert ph.clean_label("[ [see:A1] ]销售额") == "销售额" and ph.clean_label("销售额[1[v:x]2]") == "销售额"
+    for text in ("销售额[ [v:Q1.r0.gmv] ]", "销售额 [ [ a:A1 ] ]", "销售额（ ）（3）", "销售额（同比 +30%，3.5万）",
+                 "近三成客户的退款率", "【线上】销售额", "退款率 (%)", "销售额（", "  ，销售额。", "一[二]三",
+                 "销售额" * 30, "[[a:A1]]主要来自[[v:Q1.r0.region]]"):
+        once = ph.clean_label(text)
+        assert ph.clean_label(once) == once, text
+
+
+def test_labels_stop_at_the_first_clause_and_judgments_fall_back():
+    assert ph.clean_label("销售额，主要来自华东") == "销售额"
+    assert ph.clean_label("订单数; 销售额") == "订单数" and ph.clean_label("订单数、销售额") == "订单数"
+    assert ph.clean_label("销售额（含税，元）") == "销售额"               # 截完没配上对的括号也不要
+    # 判定语不受说法核对：叫法里有判断词的整个不要，退回下一个来源（目录叫法、当叫法用的列名同样处理）
+    assert ph.clean_label("销售额主要来自华东") == "" and ph.clean_label("历史新高的销售额") == ""
+    assert ph.pick_label("销售额主要来自华东", "实收金额", "gmv") == "实收金额"
+    assert ph.pick_label(None, "历史新高的销售额", "gmv") == "gmv"
+    assert ph.pick_label(None, None, "主要来自华东") == "这一列"
+
+
 def test_numbers_stuffed_into_a_label_never_reach_the_phrase():
     label = ph.pick_label("销售额（同比 +30%，3.5万）", "销售额", "gmv")
     phrase = ph.decompose_driver(label, ph.change(-194, 2220), "华东", "-120", Fraction(6186, 10000))

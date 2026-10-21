@@ -448,3 +448,16 @@ async def test_dimension_columns_keep_the_type_recorded_at_query_time():
     factor_result = await factor([["W41", "1000", 100, "10"], ["W42", "1320", 120, "11"]])
     assert factor_result["table"]["column_types"] == {"factor": "text", "base": "number", "target": "number",
                                                        "pct": "number", "contrib": "number", "share": "number"}
+
+
+
+async def test_a_label_cannot_carry_a_judgment_into_the_phrase():
+    cut = await additive(label="销售额，主要来自华南")
+    assert cut["params"]["label"] == "销售额" and cut["phrase"].startswith("销售额下降 194")
+    assert "华南" not in cut["phrase"]
+    judged = await additive(label="主要来自华南的销售额")
+    assert "label" not in judged["params"]                       # 消成空了，退回目录里的叫法
+    assert judged["phrase"].startswith("销售额下降 194") and "华南" not in judged["phrase"]
+    # 消过一遍会变的叫法：复算拿记下的叫法再消，判定语逐字相同（analyze 核对复算逐字段相同）
+    marked = await additive(label="销售额[ [v:Q1.r0.gmv] ]")
+    assert marked["params"]["label"] == "销售额" and marked["phrase"].startswith("销售额下降 194")
