@@ -91,11 +91,15 @@ ENTITY_SYNTAXES = frozenset({1, 2})
 #:   「没有第 N 行」重新解析得了，会被当成文档被改过（render_mismatch）。另外标识列（编码、编号、分组键，见
 #:   cell_format.plain_columns）的数不分千位：编码 1203 不写成「1,203」。真有格子因此改了写法的文档记 cell_display: 3，
 #:   引用上记 plain: true（离线核对页解析不了 SQL，照它渲染）
+#: - 4：引用分析结论的结果表一格、具名的数时没写换算的，按结论给这一列 / 这个数记的格式渲染（占比、变化率按百分数，
+#:   比率的变化按百分点：0.62 显示成 62.0%，不再照原样写 0.618556701），实际用的换算记在引用上（conv，导出页和可验证报告
+#:   照它渲染）。3 版及以前组装的文档里的引用照当年原样显示，复核按记下的版本，不因此判对不上
 #: 新组装的文档里真有格子因为显示规则改了写法时才记 cell_display（参与内容哈希），记的是渲染得出这些格子的最低一版
-#: （只有日期时间被改写的记 2：标识列没有因此改写法的，3 版的整表截行不改格子的写法），没有的文档和以前一字不差。复核必须按
-#: 文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过（render_mismatch）
-CELL_DISPLAY = 3
-CELL_DISPLAYS = frozenset({1, 2, 3})
+#: （只有日期时间被改写的记 2：标识列没有因此改写法的，3 版的整表截行不改格子的写法，引用分析结论时本来就有换算的记 1）；没有的
+#: 文档和以前一字不差。复核必须按文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过
+#: （render_mismatch）
+CELL_DISPLAY = 4
+CELL_DISPLAYS = frozenset({1, 2, 3, 4})
 _ISO_DATETIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)$")
 
 
@@ -148,7 +152,7 @@ class Citation(TypedDict, total=False):
     status: Literal["resolved", "unresolved", "mismatch"]
     reason: str               # unresolved 时为什么
     unknown: bool             # 实体：本次运行哪里都没有这个名字（可疑实体，不是写法错了）
-    conv: str                 # 换算：万 / 亿 / pct / int / .N
+    conv: str                 # 换算：万 / 亿 / pct / pp / int / .N（没写换算、按分析结论记的格式渲染的也照记，导出、可验证报告照它渲染）
     value: Any
     rendered: str
     source: dict[str, Any]    # 引文：原文所在的检索快照、文档、片段
@@ -573,6 +577,11 @@ MISSING = "—"
 
 _CONV_SCALE = {"万": Decimal(10) ** 4, "亿": Decimal(10) ** 8}
 _CONV_PLACES = re.compile(r"^\.([0-6])$")
+#: 比率的变化按百分点写（0.012 →「+1.2 个百分点」，-0.003 →「-0.3 个百分点」）：分析结论的结果表、具名的数里的换算，
+#: 算子记成 pp（analysis.contract.CONV_POINTS）。正数带「+」（和 pct 一样），不是 0 的值写出来成了 0.0 的多给小数位
+#: （最多 4 位），不写假的 0
+_CONV_POINTS = "pp"
+_POINTS_SUFFIX = " 个百分点"
 #: 小数位最多写到多少。负数是取整到十位、百位……（round(x, -2) 的意思）
 MAX_PLACES = 100
 #: 整数部分最多多少位。浮点数到头也就 309 位，再大的整数按规则一位位写出来没有意义
@@ -648,7 +657,7 @@ def render_number(
     - decimals：固定小数位；不写就按值本来的样子（整数不带小数点）
     - 单位直接接在数字后面：45,678.5元、8.7%
     - conv 是报告里写的换算：万 / 亿（保留两位、去尾零，单位接在后面：4.57万元）、
-      pct（比率 ×100 加 %）、int（取整）、.N（N 位小数）
+      pct（比率 ×100 加 %）、pp（比率的变化 ×100 写成「+1.2 个百分点」）、int（取整）、.N（N 位小数）
 
     值是 None 显示「—」。文本值原样（压成一行），不能换算。
 
@@ -696,13 +705,30 @@ def _render_numeric(d: Decimal, *, unit: str, decimals: int | None, fmt: str, co
             raise RenderError("该指标本身是百分数（单位为 %），不能再换算为 pct")
         places = max(decimals - 2, 0) if decimals is not None else 1
         return _digits(_ctx(d).multiply(d, 100), places, group=group, zero=rounded) + "%"
+    if conv == _CONV_POINTS:
+        # 比率的变化按百分点写：一位小数、正数带「+」（0 不带）；不是 0 的值写出来成了 0.0 的多给小数位（最多 4 位），
+        # 不写假的 0。说法照 phrases.points / ratio_change 里已有的百分点写法，只是表格里的数没有「上升 / 下降」可依，
+        # 正负靠符号
+        if "%" in unit or "％" in unit:
+            raise RenderError("该指标本身是百分数（单位为 %），不能再换算为 pp")
+        points = _ctx(d).multiply(d, 100)
+        if points.is_zero():
+            return _digits(points, 1, group=group) + _POINTS_SUFFIX
+        zero = f"{shown} 按 |pp 显示为 0，精度不够：请去掉换算，或改用 |.N 多保留几位小数"
+        for places in range(1, 5):
+            exp = -(places)
+            if points.quantize(Decimal(1).scaleb(exp), context=_ctx(points, places)).is_zero():
+                continue
+            out = _digits(points, places, group=group, zero=zero)
+            return ("+" + out if not out.startswith("-") else out) + _POINTS_SUFFIX
+        raise RenderError(zero)
 
     if conv == "int":
         places: int | None = 0
     elif conv and (m := _CONV_PLACES.match(conv)):
         places = int(m.group(1))
     elif conv:
-        raise RenderError(f"无法识别的换算 |{conv}，只支持 万 / 亿 / pct / int / .N（N 为 0–6）")
+        raise RenderError(f"无法识别的换算 |{conv}，只支持 万 / 亿 / pct / pp / int / .N（N 为 0–6）")
     else:
         rounded = (f"{shown} 按口径卡的小数位（{decimals}）显示为 0，精度不够：请在口径卡中增加小数位"
                    if decimals is not None else
@@ -1464,8 +1490,8 @@ class _Snapshots:
 
     def table(self, alias: str, entry: dict[str, Any]) -> tuple[Any, str | None]:
         """按单元格、整表取的那张表：(表, 取不到的原因)。查询结果是查询快照本身；分析结论是它的结果表（形状同查询快照：
-        columns 是稳定的列 id，另带 labels 给人看的列名，整表的表头写它）。结果表另记了列类型（column_types）的照着渲染，
-        没记的按值认（同老快照）。"""
+        columns 是稳定的列 id，另带 labels 给人看的列名，整表的表头写它）。结果表另记了列类型（column_types）、各列的换算
+        （formats，占比、变化率这类以比率存的列）的照着渲染，没记的按值认（同老快照）。"""
         if entry.get("kind") != LEDGER_KIND:
             return self.get(alias, entry.get("artifact"))
         result, why = self.analysis(alias, entry)
@@ -1476,9 +1502,11 @@ class _Snapshots:
             return None, f"{alias} 没有结果表" + ("（这次分析没有做成）" if result.get("status") == "refused" else "")
         labels = table.get("labels")
         types = table.get("column_types")
+        formats = table.get("formats")
         return {"columns": [str(c) for c in table.get("columns") or []], "rows": table["rows"],
                 "labels": {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
-                **({"column_types": types} if isinstance(types, dict) else {})}, None
+                **({"column_types": types} if isinstance(types, dict) else {}),
+                **({"formats": {str(k): str(v) for k, v in formats.items()}} if isinstance(formats, dict) else {})}, None
 
     def hits(self, alias: str, artifact: Any) -> tuple[list[Any], str | None]:
         """检索快照里的命中：(命中列表, 取不到的原因)。"""
@@ -1565,6 +1593,19 @@ def _noun(entry: dict[str, Any] | None) -> str:
     return "结果表" if (entry or {}).get("kind") == LEDGER_KIND else "查询结果"
 
 
+def _column_conv(snapshot: Any, column: str, display: int = CELL_DISPLAY) -> str | None:
+    """分析结论的结果表给这一列记的换算（ResultTable.formats：占比、变化率的列记 pct，比率的变化记 pp）。查询快照没有这一项，
+    一切照原样（None）。按分析结论记的格式显示是 4 版起的显示规则：老文档（3 版及以前）里的引用照当年原样显示，复核不因此
+    判对不上。"""
+    if display < 4:
+        return None
+    formats = snapshot.get("formats") if isinstance(snapshot, dict) else None
+    if not isinstance(formats, dict):
+        return None
+    found = formats.get(column)
+    return found if isinstance(found, str) and found else None
+
+
 def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
                   cells_allowed: bool) -> dict[str, Any]:
     ref = marker.get("ref") or ""
@@ -1592,7 +1633,14 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
         raw, column = locate_cell(snapshot, parsed["row"], parsed["column"])
         kind = column_kind(snapshot, column)
         shown = snaps.shown(raw)
+        # 分析结论的结果表记了这一列的换算（占比、变化率这类以比率存的列；4 版显示规则起）、写作者没写换算的，按它渲染；
+        # 写作者自己写了换算的照他的。实际用的换算记进引用（导出页、可验证报告照它渲染）
+        conv = conv or _column_conv(snapshot, column, snaps.display)
         rendered = render_cell(shown, conv, kind=kind)
+        if conv and not marker.get("conv") and rendered != render_cell(shown, None, kind=kind):
+            # 按分析结论记的格式渲染、真改了写法（4 版起）：文档的 cell_display 记成 4，引用上记 conv，
+            # 导出页和可验证报告照引用上的换算渲染
+            snaps.needed = max(snaps.needed, 4)
         plain = column in snaps.plain(entry.get("artifact"), snapshot) \
             and render_cell(shown, conv, kind=kind, plain=True) != rendered
         if plain:
@@ -1836,6 +1884,7 @@ def _resolve_analysis(marker: dict[str, Any], catalog: dict[str, Any], snaps: _S
                       cells_allowed: bool) -> dict[str, Any]:
     """[[a:A3]] → 判定语：分析结论里系统按模板渲染好的那一整句（判定是平台的算子算的，写作者只引用，00-总方案 D5）。
     [[a:A3.top_share|pct]] → 具名标量：结论 values 里的一项（数一律十进制字符串），按单元格的规则渲染，换算同 [[m:]]。
+    没写换算、结论给这个数记了格式（value_formats）的按它渲染（0.62 显示成 62.0%，不是 0.62），实际用的换算记进引用。
 
     判定语是一个片段（种类 analysis），里面的数和字都是系统写的：组装、复核都按带引用的片段整段涂白，不算裸数字。受管级别的
     正式出具、契约没开「单元格引用」时，Agent 现场做的分析解析不了（ANALYSIS_CELLS_REASON），分析卡做的照常解析。"""
@@ -1875,6 +1924,13 @@ def _resolve_analysis(marker: dict[str, Any], catalog: dict[str, Any], snaps: _S
         return _unresolved(marker, alias, LEDGER_KIND, _Reason(
             f"{alias} 中没有名为「{key}」的数", f"{alias} 里没有「{key}」，能引用的数：{names}（写成 [[{MARKER_KIND}:{alias}.键]]）"))
     raw = values[key]
+    # 结论里给这个数记了换算（value_formats：占比、变化率这类以比率存的数；4 版显示规则起）而写作者没写换算的，按它渲染；
+    # 写作者自己写了换算的照他的。实际用的换算记进引用（导出页、可验证报告照它渲染）
+    named = result.get("value_formats") if isinstance(result.get("value_formats"), dict) else {}
+    if snaps.display >= 4 and not conv and isinstance(named.get(key), str) and named.get(key):
+        conv = named[key]
+        # 按分析结论记的格式渲染了（4 版起）：文档记成 4，引用上记 conv（写了换算才真有换算，写法一定和以前不同）
+        snaps.needed = max(snaps.needed, 4)
     try:
         rendered = render_cell(raw, conv)
     except RenderError as e:
@@ -4028,7 +4084,8 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
 ANALYSIS_PROMPT = (
     "分析结论（系统按平台的方法算好的判定。判定语、具名的数、结果表都只能用引用标记写，系统照结论渲染、逐字核对）：\n"
     "写法：判定语单独写 [[a:A1]]，系统换成整句判定；具名的数写 [[a:A1.键]]，换算同指标，比重、变化率这类比率写成 "
-    "[[a:A1.top_share|pct]] 显示成百分数；结果表的一格写 [[v:A1.r0.列]]（行号从 0 数），要列出多行多列，单独一行写 "
+    "[[a:A1.top_share|pct]] 显示成百分数；比重、变化率不写换算也按百分数显示，比率的变化按百分点（[[v:A1.r0.mix]] 显示成「1.2 "
+    "个百分点」）；结果表的一格写 [[v:A1.r0.列]]（行号从 0 数），要列出多行多列，单独一行写 "
     "[[table:A1 cols=列a,列b rows=0-4]]；拿它当结论的依据，句末写 [[see:A1]]。"
     "「主要来自」「超出常规波动」「呈上升趋势」这类判断已经写在判定语里：引用判定语，不要自己改写判定；"
     "算不了的照实写算不了的原因。下面没有的编号、键、列不要编造。"
@@ -4101,10 +4158,13 @@ def _analysis_prompt(entry: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
     if see_only:
         return lines
     values = result.get("values") if isinstance(result.get("values"), dict) else {}
+    named = result.get("value_formats") if isinstance(result.get("value_formats"), dict) else {}
     shown = []
     for key, raw in list(values.items())[:_PROMPT_VALUES]:
         try:
-            shown.append(f"{key}={render_cell(raw)}")
+            # 具名的数按结论记的格式写（占比、变化率是百分数）：写作者在这里看到的就是引用之后显示的字
+            conv = named.get(key) if isinstance(named.get(key), str) and named.get(key) else None
+            shown.append(f"{key}={render_cell(raw, conv)}")
         except RenderError:
             shown.append(f"{key}={MISSING}")
     if shown:
@@ -4127,12 +4187,15 @@ def _analysis_prompt(entry: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
     top = top if isinstance(top, int) and not isinstance(top, bool) and top > 0 else _TOP_K
     lines.append(f"  结果表（共 {len(rows)} 段）：列 {named}")
     plain = snaps.plain(entry.get("artifact"), snapshot)
+    formats = snapshot.get("formats") if isinstance(snapshot.get("formats"), dict) else {}
     for r in range(min(top, len(rows))):
         cells = []
         for c in columns:
             try:
                 raw, _ = locate_cell(snapshot, r, c)
-                cells.append(f"{c}={render_cell(snaps.shown(raw), kind=column_kind(snapshot, c), plain=c in plain)}")
+                conv = formats.get(c) if isinstance(formats.get(c), str) and formats.get(c) else None
+                cells.append(f"{c}={render_cell(snaps.shown(raw), conv, kind=column_kind(snapshot, c),
+                                                plain=c in plain)}")
             except (CellError, RenderError):
                 cells.append(f"{c}={MISSING}")
         lines.append(f"  r{r}：" + "，".join(cells))
