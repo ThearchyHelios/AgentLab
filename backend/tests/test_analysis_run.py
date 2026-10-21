@@ -247,3 +247,15 @@ async def test_structural_call_errors_still_fail_even_when_data_errors_are_refus
         with pytest.raises(CallError) as e:
             await analyze("decompose", "additive", snaps=REFUSALS, refuse_data_errors=True, check=False, **params)
         assert e.value.code not in analysis.DATA_ERRORS and e.value.reason is None
+
+
+@pytest.mark.parametrize("op,mode,params", [CALLS[0], *CALLS[2:]])
+async def test_the_fake_results_for_tests_have_each_operators_shape(op, mode, params):
+    from app.analysis.testing import fake_result
+
+    real = await _run(op, mode, params)
+    fake = fake_result(op, mode, real["verdict"]["code"])
+    assert fake["method"] == real["method"] and fake["table"]["columns"] == real["table"]["columns"]
+    assert set(fake["table"]["labels"]) == set(fake["table"]["columns"])
+    assert set(fake["values"]) <= set(real["values"]) and {i["role"] for i in fake["inputs"]} == \
+        {i["role"] for i in real["inputs"]}
