@@ -96,8 +96,6 @@ _SHOWN_EVENTS = frozenset({EventType.RUN_STARTED, EventType.REPORT_CHECKED, Even
 _CITED_KINDS = {"metric": "metric_set", "query": "query", LEDGER_KIND: ARTIFACT_KIND}
 #: 下钻的上一层结论最多跟几层（同分析设置里下钻层数的上限）
 _PARENT_DEPTH = 6
-#: 分析卡里一项做完的事件（core/events.EventType.ANALYSIS_END）：带着那一项的判定、判定语和结论工件（analysis_artifact）
-_ANALYSIS_END = "analysis.end"
 
 #: 没挂在工作流上的运行（画布、问数据当场搭的）：老数据叫「临时图」，新的叫「未保存的工作流」，也可能是空的。
 #: 和前端 lib/terms.ts 的 runName 同一个规则
@@ -1230,8 +1228,8 @@ def _shows_content(etype: str, node_id: str | None, data: Any, node_types: Mappi
         # 分析工具：预览里是结论的前一截（判定语、具名的数、结果表），和结论本身同一个认法
         found = data.get("analysis_artifact") if isinstance(data, dict) else None
         return isinstance(found, str) and bool(found) and _result_shown(found, store)
-    if etype == _ANALYSIS_END:
-        # 分析卡的一项：带着判定、判定语，结论随文件附带得了（输入没碰遮罩列）才带
+    if etype == EventType.ANALYSIS_END:
+        # 分析卡里一项做完的事件：带着判定、判定语和结论工件（analysis_artifact），结论随文件附带得了（输入没碰遮罩列）才带
         found = data.get("analysis_artifact") if isinstance(data, dict) else None
         return isinstance(found, str) and bool(found) and _result_shown(found, store)
     return False
