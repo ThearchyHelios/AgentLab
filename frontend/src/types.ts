@@ -4601,7 +4601,6 @@ export interface RunCompareQuery {
   problem?: string
 }
 
-/** GET /runs/{id}/compare?base=。任一未封存或封存核对不一致 409；不是同一工作流、是同一次运行 422 */
 /** 运行对比里分析卡的一边（analysis.end 那一项）：没有这一项为 null */
 export interface RunCompareAnalysisSide {
   status?: string | null
@@ -4626,6 +4625,7 @@ export interface RunCompareAnalysis {
   change: 'same' | 'verdict' | 'phrase' | 'added' | 'removed' | string
 }
 
+/** GET /runs/{id}/compare?base=。任一未封存或封存核对不一致 409；不是同一工作流、是同一次运行 422 */
 export interface RunComparison {
   target: RunCompareRef
   base: RunCompareRef
