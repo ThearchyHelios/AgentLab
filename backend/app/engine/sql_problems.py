@@ -8,7 +8,9 @@
 - 写作目录里提醒写作者（engine/evidence.catalog_prompt）。
 
 合并查询在内存 SQLite 上执行，不对照数据目录，它的快照没有自己的 checks，但记着 inputs：顺着往下找，问题记在
-出问题的那条源查询上。几个指标、几处引用出自同一条查询时，问题只算一次（problems_by_query 按快照 id 归并）。
+出问题的那条源查询上。分析结论（app/analysis 的工件）同样记着 inputs（它用到的查询快照）：报告引用了一份分析结论，
+它的输入查询上的问题照样算——写作目录随 A 条目提醒，出具契约按引用的查询降档。几个指标、几处引用出自同一条查询时，
+问题只算一次（problems_by_query 按快照 id 归并）。
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.analysis.contract import is_result
 from app.core import artifact_store
 
 #: 合并查询快照的 source（engine/merge_query.MERGE_SOURCE）。这里写死同一个字面量，免得为一个常量引入执行器
@@ -57,9 +60,10 @@ def _load(artifact: str, loader: Callable[[str], Any] | None) -> Any:
 
 def query_problems(artifact: Any, *, loader: Callable[[str], Any] | None = None,
                    _seen: set[str] | None = None, _node: str | None = None, _depth: int = 0) -> list[QueryProblem]:
-    """这份查询快照（或合并快照的各个输入）里有 error 级 SQL 检查的那几条查询，一条一个 QueryProblem。
+    """这份查询快照（或合并快照、分析结论的各个输入）里有 error 级 SQL 检查的那几条查询，一条一个 QueryProblem。
 
-    读不出来的快照、没有问题的快照都不出现。自引用、成环的坏快照不会卡死。
+    读不出来的快照、没有问题的快照都不出现。自引用、成环的坏快照不会卡死。分析结论的输入没记节点（node_id 为 None），
+    调用方按证据台账补（node_of）；下钻的上一层结论（role parent）也是输入，顺着它再往下找。
     """
     if not isinstance(artifact, str) or not artifact or _depth > _MAX_DEPTH:
         return []
@@ -75,7 +79,7 @@ def query_problems(artifact: Any, *, loader: Callable[[str], Any] | None = None,
     errors = [c for c in checks if isinstance(c, dict) and c.get("level") == "error"] if isinstance(checks, list) else []
     if errors:
         out.append(QueryProblem(artifact, _node, errors))
-    inputs = snapshot.get("inputs") if snapshot.get("source") == MERGE_SOURCE else None
+    inputs = snapshot.get("inputs") if snapshot.get("source") == MERGE_SOURCE or is_result(snapshot) else None
     for entry in inputs if isinstance(inputs, list) else []:
         if isinstance(entry, dict) and isinstance(entry.get("artifact"), str):
             node = entry.get("node_id") if isinstance(entry.get("node_id"), str) else None

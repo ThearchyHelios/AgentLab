@@ -44,6 +44,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from sqlalchemy import select
 
+from app.analysis.contract import CATALOG_PREFIX, LEDGER_KIND, catalog_result, is_result, method_label
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
 from app.core.errors import describe_exception, not_configured
@@ -159,6 +160,15 @@ JUDGE_RULES = f"""判定（verdict）五选一：
 6. 判 insufficient 时 missing 写缺的是什么，越短越好，比如「SQL」「字段清单」「取数的查询」；其余判定 missing 写空字符串。
 7. used 写你实际用到的证据编号（摘录里【】中的那个，比如 m:gmv、Q1），没用到就写空数组。
 8. 每句都要给判定，unit 照抄句子前面方括号里的编号。"""
+
+#: 摘录里有分析结论（【A1】）时接在裁判规则后面的一条。只在这时才加：没有分析结论的报告，裁判看到的规则一字不差，
+#: 已判过的句子照旧复用（复用键里只有摘录，没有规则）
+ANALYSIS_JUDGE_PROMPT = (
+    "9. 【A1】这类分析结论的判定、判定标准和关键数是系统按平台的方法算出来的，不要质疑也不要复算；只判断句子的说法和"
+    "判定是否一致：「主要来自」「集中在」「超出常规波动」「呈上升趋势」「差异站得住」这类判断要和判定对得上，句子点名的段"
+    "要在判定里，方向要一致；判定写着算不了的，不能支持任何判断。分析结论只说明变化来自哪里，说明不了原因：句子写了"
+    "原因、证据里又没有原因的，判 partial 或 insufficient。"
+)
 
 #: 报告节点 claims 为 judge 时拼在写作规则后面：写作者要知道还有一道按证据的核对
 JUDGE_RULE = ("这份报告的结论句还会由另一个模型逐句核对：它只看你挂的依据，判断这句话站不站得住。"
@@ -299,8 +309,8 @@ def _candidate(unit: dict[str, Any], priority: int, order: int, text: str, secti
             rows.append((alias, int(locator["row"])))
             if kind == "cell" and locator.get("column") not in (None, ""):
                 cols.append((alias, str(locator["column"])))
-        elif kind in ("query", "retrieval"):
-            whole.append(alias)
+        elif kind in ("query", "retrieval", LEDGER_KIND):
+            whole.append(alias)                 # 分析结论：判定语、具名标量、依据 [[see:A1]] 都整份摘
         elif kind == "quote" and isinstance(locator.get("hit"), int):
             hits.append((alias, int(locator["hit"])))
     return Candidate(unit=str(unit.get("id")), priority=priority, order=order, text=text, section=section,
@@ -565,6 +575,10 @@ def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: d
         if metric.get("expression"):
             lines.append(f"原式：{_clean(str(metric['expression']))}")
         lines.extend(_metric_inputs(metric, fetch, catalog, masked, mask))
+        comparability = metric.get("comparability")
+        if isinstance(comparability, dict) and str(comparability.get("phrase") or "").strip():
+            # 跨两份同形查询算的环比、同比：口径卡执行时自动做的可比性检查（判定语是系统写的，原样给）
+            lines.append(f"两期可比性（系统检查）：{_clean(str(comparability['phrase']))}")
     return "\n".join(lines)
 
 
@@ -664,6 +678,102 @@ def _retrieval_excerpt(alias: str, entry: dict[str, Any], picked: list[int], who
     return "\n".join(lines)
 
 
+def _analysis_alias(alias: Any) -> bool:
+    """写作目录里分析结论的编号（A1、A2……）。"""
+    return isinstance(alias, str) and alias.startswith(CATALOG_PREFIX) and alias[len(CATALOG_PREFIX):].isdigit()
+
+
+#: 分析结论的摘录最多列几个具名的数
+ANALYSIS_VALUES = 16
+
+
+def _analysis_excerpt(alias: str, entry: dict[str, Any], rows: set[int], fetch: _Fetch,
+                      masked: dict[str, Any] | None, catalog: dict[str, Any], mask: Any = None) -> str | None:
+    """一条分析结论的摘录：方法、判定语、判定标准、关键数（具名标量）、附带说明、结果表（被引用的行先给，再从头补满
+    EXCERPT_ROWS 行，最多 EXCERPT_COLS 列，表头写给人看的列名）、输入取自哪几次查询、用了哪几列，以及那几次查询的 SQL
+    （截到 SQL_CHARS，最多 ENTITY_QUERIES 次）。判定是系统算的，裁判只判句子的说法和判定是否一致（ANALYSIS_JUDGE_PROMPT）。
+
+    结论按工件取（经 fetch：按需裁判时只认封存范围内的工件，取不到、哈希不符的不给这段摘录）；目录条目带着整份结论的
+    直接用。agent 写的假设不给：它不是结论。mask 同 _query_excerpt（核查 agent 的摘录才给）：SQL 先遮再截，结果表里的文字、
+    判定语按值换，数照原样。"""
+    result = catalog_result(entry)
+    if result is None:
+        content = fetch(entry.get("artifact"))
+        result = content if is_result(content) else None
+    if result is None:
+        return None
+    scrub = mask.text if mask is not None else (lambda t: t)
+    lines = [f"【{alias}】分析结论（{method_label(result.get('op'), result.get('mode'))}，方法 {result.get('method') or '—'}）"]
+    if result.get("status") == "refused":
+        lines.append(f"判定：算不了（{_clean(str(result.get('reason') or '没有写原因'))}）")
+    else:
+        lines.append(f"判定：{scrub(_clean(str(result.get('phrase') or ''))) or '—'}")
+        if criterion := _clean(str(result.get("criterion") or "")):
+            lines.append(f"判定标准：{criterion}")
+    values = result.get("values") if isinstance(result.get("values"), dict) else {}
+    if values:
+        shown = []
+        for key, raw in list(values.items())[:ANALYSIS_VALUES]:
+            try:
+                text = render_cell(raw)
+            except RenderError:
+                text = MISSING
+            shown.append(f"{key}={text if isinstance(raw, (int, float)) else scrub(text)}")
+        more = f" | …另有 {len(values) - ANALYSIS_VALUES} 个" if len(values) > ANALYSIS_VALUES else ""
+        lines.append("关键数：" + " | ".join(shown) + more)
+    caveats = [_clean(str(c.get("text") or "")) for c in result.get("caveats") or [] if isinstance(c, dict)]
+    if caveats := [c for c in caveats if c]:
+        lines.append("附带说明：" + "；".join(scrub(c) for c in caveats))
+    table = result.get("table") if isinstance(result.get("table"), dict) else None
+    if table is not None and isinstance(table.get("rows"), list) and table["rows"]:
+        columns = [str(c) for c in table.get("columns") or []][:EXCERPT_COLS]
+        labels = table.get("labels") if isinstance(table.get("labels"), dict) else {}
+        total = len(table["rows"])
+        picked = sorted(r for r in rows if 0 <= r < total)[:EXCERPT_ROWS]
+        picked += [r for r in range(total) if r not in picked][:EXCERPT_ROWS - len(picked)]
+        lines.append(f"结果表（共 {total} 行）列：" + " | ".join(_clean(str(labels.get(c) or c)) for c in columns))
+        for r in sorted(picked):
+            cells = []
+            for c in columns:
+                try:
+                    raw, _ = locate_cell(table, r, c)
+                    text = render_cell(raw)
+                    cells.append(text if isinstance(raw, (int, float)) else scrub(text))
+                except (CellError, RenderError):
+                    cells.append(MISSING)
+            lines.append(f"r{r}：" + " | ".join(cells))
+    sqls: list[str] = []
+    seen: set[str] = set()
+    for item in result.get("inputs") or []:
+        if not isinstance(item, dict) or not item.get("artifact") or item.get("role") == "parent":
+            continue
+        artifact = str(item["artifact"])
+        if artifact in seen:
+            continue
+        seen.add(artifact)
+        query = _query_alias(catalog, artifact)
+        snap = fetch(artifact)
+        snap = snap if isinstance(snap, dict) else {}
+        source = (catalog.get(query) or {}).get("source") if query else None
+        hidden, names = _derived(snap, _source_hidden(source or snap.get("source"), catalog, fetch, masked)
+                                 | _mask_names(snap.get("mask_columns")), fetch, mask)
+        used = [str(c) for c in item.get("columns") or [] if str(c).lower() not in hidden]
+        label = f"查询 {query}" if query else "一次查询（不在这份报告的证据目录中）"
+        lines.append(f"输入：取自{label}" + (f"，用到 {'、'.join(used)} 列" if used else ""))
+        sql = _clean(str(snap.get("sql") or ""))
+        if sql and mask is not None:
+            sql = mask.sql(sql, snap, names)
+        if sql and len(sqls) < ENTITY_QUERIES:
+            sqls.append(_sql_line(f"查询 {query} 的 SQL" if query else "这次查询的 SQL", sql))
+    parents = [str(i.get("artifact")) for i in result.get("inputs") or []
+               if isinstance(i, dict) and i.get("role") == "parent"]
+    for artifact in parents:
+        found = next((a for a, e in catalog.items() if isinstance(e, dict) and e.get("kind") == LEDGER_KIND
+                      and e.get("artifact") == artifact), None)
+        lines.append(f"下钻自：{found or '一条分析结论（不在这份报告的证据目录中）'}")
+    return "\n".join(lines + sqls)
+
+
 def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _Fetch,
              masked: dict[str, Any] | None, catalog: dict[str, Any], *, provenance_on: bool = False,
              mask: Any = None) -> str | None:
@@ -683,6 +793,9 @@ def _excerpt(alias: str, entry: dict[str, Any], cands: list[Candidate], fetch: _
     if kind == "retrieval":
         picked = [h for c in cands for a, h in c.hits if a == alias]
         return _retrieval_excerpt(alias, entry, picked, any(alias in c.whole for c in cands), fetch, mask)
+    if kind == LEDGER_KIND:
+        rows = {r for c in cands for a, r in c.rows if a == alias}
+        return _analysis_excerpt(alias, entry, rows, fetch, masked, catalog, mask)
     if kind == "table":
         head = f"【{alias}】表 {entry.get('name')}" + (f"（数据源 {entry['source']}）" if entry.get("source") else "")
         return "\n".join([head, *_table_lines(entry, catalog, fetch, masked),
@@ -754,8 +867,10 @@ class JudgeRequest:
         aliases = list(dict.fromkeys(a for c in units for a in c.aliases if a in self.excerpts))
         evidence = "\n\n".join(self.excerpts[a] for a in aliases) or "（这些句子都没有挂依据）"
         ordered = sorted(units, key=lambda c: c.order)
+        # 摘录里有分析结论时另加一条（ANALYSIS_JUDGE_PROMPT）；没有的和以前一字不差
+        rules = f"{JUDGE_RULES}\n{ANALYSIS_JUDGE_PROMPT}" if any(_analysis_alias(a) for a in aliases) else JUDGE_RULES
         return [
-            SystemMessage(content=f"{JUDGE_ROLE}\n\n{JUDGE_RULES}"),
+            SystemMessage(content=f"{JUDGE_ROLE}\n\n{rules}"),
             HumanMessage(content=(
                 f"证据摘录（【】里是编号，判定时 used 写它）：\n{evidence}\n\n"
                 "要判断的句子（每句都要给判定）：\n" + "\n".join(self.unit_line(c) for c in ordered) + "\n\n"
