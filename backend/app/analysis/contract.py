@@ -85,16 +85,18 @@ VERDICTS: dict[str, tuple[str, ...]] = {
 }
 #: 算不了的原因（细案 01 §8.2）。算不了也记成结论：写作者可以照实写「历史只有 5 周，判断不了是否异常」。最后两种是分析卡
 #: 里随数据变化的调用错误记成的（analysis.run 的 refuse_data_errors，见 app/analysis 的 DATA_ERRORS）：parent_refused 上一层
-#: 没做成；input_unavailable 这次的数据里没有要用的那一项（下钻的段、期次、总数那一格、要比的组……，reason 写是哪一项、哪个值）
+#: 没做成；input_unavailable 这次的数据里没有要用的那一项（下钻的段、期次、总数那一格、要比的组……，reason 写是哪一项、哪个值）。
+#: untestable：差异检验一对都拿不到 p 值（两组各 1 个样本、样本量为 0……）
 REASONS: tuple[str, ...] = (
     "truncated", "too_few_segments", "history_short", "partial_target", "target_gap", "series_gap",
     "period_unreadable", "zero_base", "non_positive", "incomparable_sides", "parent_refused", "input_unavailable",
+    "untestable",
 )
 #: 附带说明的种类（caveats[].code）
 CAVEATS: tuple[str, ...] = (
     "offset", "simpson", "small_denominator", "record_high", "record_low", "weekday_effect",
     "multiple_comparisons", "outlier_sensitive", "small_sample", "measure_unlabeled", "null_values",
-    "headline_basis", "comparability", "partial_periods",
+    "headline_basis", "comparability", "partial_periods", "untested",
 )
 
 # --------------------------------------------------------------------------

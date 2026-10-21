@@ -32,8 +32,8 @@ from app.analysis.contract import OP_LABELS
 from app.analysis.numbers import fixed, to_fraction
 
 #: 附带说明进判定语的先后；不在这里的（measure_unlabeled、headline_basis、partial_periods）只在证据面板
-PHRASE_ORDER = ("comparability", "simpson", "offset", "outlier_sensitive", "small_sample", "record_high", "record_low",
-                "multiple_comparisons", "weekday_effect", "small_denominator", "null_values")
+PHRASE_ORDER = ("comparability", "untested", "simpson", "offset", "outlier_sensitive", "small_sample", "record_high",
+                "record_low", "multiple_comparisons", "weekday_effect", "small_denominator", "null_values")
 #: 判定语里最多接几条附带说明
 PHRASE_CAVEATS = 2
 #: 消毒后的叫法最多几个字
@@ -343,6 +343,12 @@ def multiple_text(pairs: int) -> str:
     return f"比了 {pairs} 对，已按次数校正"
 
 
+def untested_pairs_text(count: int, reasons: Sequence[str]) -> str:
+    """差异检验里拿不到 p 值的那几对（不算进比了几对）：另有 1 对算不了（华北的样本量为 0）。"""
+    shown = list(dict.fromkeys(reasons))
+    return f"另有 {count} 对算不了（{'，'.join(shown[:3])}{'等' if len(shown) > 3 else ''}）"
+
+
 def outlier_text(largest: bool, now_differs: bool) -> str:
     which = "最大" if largest else "最小"
     return f"去掉{which}的一笔后，差异{'变得站得住' if now_differs else '不再站得住'}"
@@ -567,6 +573,7 @@ __all__ = [
     "decompose_flat", "decompose_unclosed", "differ_pair", "differ_phrase", "dims_text", "factor_both",
     "factor_driver", "key_text", "multiple_text", "names", "no_evidence_phrase", "null_periods_text",
     "null_segments_text", "number", "offset_text", "outlier_text", "partial_periods_text", "pct", "pick_label",
+    "untested_pairs_text",
     "points", "ratio_both",
     "ratio_change", "ratio_mix", "ratio_rate", "ratio_value", "record_text", "refused", "say", "share_words",
     "simpson_text", "small_denominator_text", "small_sample_mean_text", "small_sample_rate_text", "threshold_pct",
