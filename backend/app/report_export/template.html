@@ -97,6 +97,13 @@ h1 { margin: 2px 0 0; font-size: 24px; line-height: 1.35; }
 .chipbtn { font: inherit; font-size: 12px; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer;
   text-align: left; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
 .hit { background: var(--mark); }
+.scope { margin-top: 16px; padding: 14px 18px; border: 1px dashed var(--border); border-radius: 10px; background: var(--panel); }
+.scope h3 { margin: 0 0 4px; font-size: 16px; }
+.scope > .muted { margin: 0 0 8px; font-size: 12px; }
+.scope-list { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 0; font-size: 14px; }
+.scope-list dt { color: var(--faint); }
+.scope-list dd { margin: 0; min-width: 0; }
+.scope-list ul { margin: 0; padding-left: 1.2em; }
 .foot { margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 12px; color: var(--faint); }
 .foot p { margin: 4px 0; }
 @media print {
@@ -115,7 +122,7 @@ h1 { margin: 2px 0 0; font-size: 24px; line-height: 1.35; }
   body { font-size: 14px; }
   .page { padding: 20px 16px 56px; }
   h1 { font-size: 20px; }
-  .meta { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .meta, .scope-list { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .meta dt { margin-top: 6px; }
   .doc { padding: 12px; }
 }
