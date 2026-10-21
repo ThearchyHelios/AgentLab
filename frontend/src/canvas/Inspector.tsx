@@ -15,7 +15,15 @@ import { formatShortcut } from '../lib/keys'
 import { INPUT_FIELD_TEXT, JUDGE_FIELD_LABEL, JUDGE_ON_UNSUPPORTED_HINT, JUDGE_ON_UNSUPPORTED_LABEL, JUDGE_SETTING_TEXT, MERGE_TEXT, CATALOG_UI_TEXT, NODE_TYPE_LABEL, PROVIDER_REF_TEXT, SUBGRAPH_UPGRADE_HELP, judgeByModelText, upgradeNewerText } from '../lib/terms'
 import { TemplateText } from './TemplateText'
 import { MERGE_ALIAS, isQueryNode, mergeAlias } from './mergeInputs'
-import type { NodeType, Provider, ValidationIssue, WorkflowVersion } from '../types'
+import {
+  ITEM_ID, TWO_QUERY_SKIP, allowsHeadline, allowsParent, allowsTwoQueries, itemsOf, nextItemId, paramSpecs, paramText,
+  paramValue, withMode, withOp, type ParamSpec,
+} from './analysisItems'
+import {
+  ANALYSIS_MODES, ANALYSIS_MODE_LABEL, ANALYSIS_OPS, ANALYSIS_OP_LABEL, ANALYSIS_SETTING_KEYS, ANALYSIS_SETTING_LABEL,
+  ANALYSIS_TEXT, isAnalysisOp, settingRangeText, settingValueProblem, type AnalysisSettingKey,
+} from '../lib/termsAnalysis'
+import type { AnalysisItem, NodeType, Provider, ValidationIssue, WorkflowVersion } from '../types'
 
 /** 检查器里一条落到字段上的问题 */
 type FieldIssue = ValidationIssue & { at: FieldRef | null }
@@ -151,6 +159,34 @@ function NodeRefsInput({ nodeId, type, value, onChange }: {
   )
 }
 
+/** 上游能当查询输入的节点（选了数据库查询工具的「调用工具」节点、合并查询）：合并查询、分析卡共用 */
+function useUpstreamQueries(nodeId: string): { value: string; label: string; hint?: string }[] {
+  const nodes = useStudio((s) => s.nodes)
+  const edges = useStudio((s) => s.edges)
+  return useMemo(() => {
+    const parents = new Map<string, string[]>()
+    for (const e of edges) parents.set(e.target, [...(parents.get(e.target) ?? []), e.source])
+    const seen = new Set<string>()
+    const stack = [...(parents.get(nodeId) ?? [])]
+    while (stack.length) {
+      const id = stack.pop()!
+      if (seen.has(id) || id === nodeId) continue
+      seen.add(id)
+      stack.push(...(parents.get(id) ?? []))
+    }
+    return nodes
+      .filter((n) => seen.has(n.id) && isQueryNode(n))
+      .map((n) => {
+        const label = String(n.data?.label || n.id)
+        const tool = String((n.data?.config as Record<string, any> | undefined)?.tool ?? '')
+        return {
+          value: n.id, label: label === n.id ? label : `${label}（${n.id}）`,
+          hint: n.data?.nodeType === 'merge' ? NODE_TYPE_LABEL.merge : tool,
+        }
+      })
+  }, [nodes, edges, nodeId])
+}
+
 interface MergeRow { alias: string; node: string }
 
 /** config.inputs（{别名: 节点 id}）→ 行。对象的键顺序就是行的顺序 */
@@ -178,28 +214,7 @@ function MergeInputList({ nodeId, value, issues, onChange }: {
   const nodes = useStudio((s) => s.nodes)
   const edges = useStudio((s) => s.edges)
   const uid = useId()
-  const options = useMemo(() => {
-    const parents = new Map<string, string[]>()
-    for (const e of edges) parents.set(e.target, [...(parents.get(e.target) ?? []), e.source])
-    const seen = new Set<string>()
-    const stack = [...(parents.get(nodeId) ?? [])]
-    while (stack.length) {
-      const id = stack.pop()!
-      if (seen.has(id) || id === nodeId) continue
-      seen.add(id)
-      stack.push(...(parents.get(id) ?? []))
-    }
-    return nodes
-      .filter((n) => seen.has(n.id) && isQueryNode(n))
-      .map((n) => {
-        const label = String(n.data?.label || n.id)
-        const tool = String((n.data?.config as Record<string, any> | undefined)?.tool ?? '')
-        return {
-          value: n.id, label: label === n.id ? label : `${label}（${n.id}）`,
-          hint: n.data?.nodeType === 'merge' ? NODE_TYPE_LABEL.merge : tool,
-        }
-      })
-  }, [nodes, edges, nodeId])
+  const options = useUpstreamQueries(nodeId)
 
   const external = useMemo(() => mergeRowsOf(value), [value])
   const [rows, setRows] = useState<MergeRow[]>(external)
@@ -291,6 +306,319 @@ function MergeInputList({ nodeId, value, issues, onChange }: {
         <Plus size={11} /> {MERGE_TEXT.addInput}
       </button>
       {!options.length && <div className="mt-1.5 text-2xs leading-snug text-faint">{MERGE_TEXT.noUpstream}</div>}
+    </div>
+  )
+}
+
+const AT = ANALYSIS_TEXT.node
+
+/** 选一个上游查询节点。已经选了、后来删掉或挪到下游的节点照样列出来并说明，好让人看见并改掉 */
+function QueryPick({ id, value, options, onChange }: {
+  id: string; value: string; options: { value: string; label: string }[]; onChange: (v: string) => void
+}) {
+  const known = options.some((o) => o.value === value)
+  return (
+    <select id={id} className="field text-xs" value={value} onChange={(e) => onChange(e.target.value)}>
+      <option value="" disabled>{AT.pickFrom}</option>
+      {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+      {value && !known && <option value={value} disabled>{AT.missingNode(value)}</option>}
+    </select>
+  )
+}
+
+/**
+ * 分析卡的分析项（engine/schema.analysis_issues 的配置）：每一项一个标识、一种分析方法（有模式的再选模式）、要分析的上游
+ * 查询节点（或基期、本期两份查询），再按方法摆参数格（analysisItems.paramSpecs）；可加、比率的变化拆解另有总数核对、下钻。
+ * 阈值不在这里写（统一写在阈值覆盖里）。服务端按 items[i].<键> 报的问题落在那一格下面，定位按 [data-item] [data-sub] 落进来
+ */
+function AnalysisItemList({ nodeId, value, issues, onChange }: {
+  nodeId: string; value: any; issues: FieldIssue[]; onChange: (v: any) => void
+}) {
+  const uid = useId()
+  const options = useUpstreamQueries(nodeId)
+  const items = itemsOf(value)
+  const commit = (next: AnalysisItem[]) => onChange(next)
+  const update = (i: number, next: AnalysisItem) => commit(items.map((it, j) => (j === i ? next : it)))
+  const setParam = (i: number, key: string, v: unknown) => {
+    const params = { ...(items[i].params ?? {}) }
+    if (v === undefined) delete params[key]
+    else params[key] = v
+    update(i, { ...items[i], params })
+  }
+  const add = () => commit([...items, { id: nextItemId(items), params: {} }])
+  return (
+    <div>
+      {items.map((item, i) => {
+        const own = issues.filter((x) => x.at?.index === i)
+        const at = (sub: string) => own.filter((x) => x.at?.sub === sub || x.at?.sub?.startsWith(`${sub}.`))
+        const lines = (sub: string) => at(sub).map((x, k) => <IssueLine key={k} issue={x} />)
+        const op = isAnalysisOp(item.op) ? item.op : null
+        const modes = op ? ANALYSIS_MODES[op] : undefined
+        const params = (item.params && typeof item.params === 'object' ? item.params : {}) as Record<string, any>
+        const two = !!op && allowsTwoQueries(op) && ('base_query' in params || 'target_query' in params)
+        const id = String(item.id ?? '')
+        const dup = !!id && items.some((other, j) => j !== i && String(other.id ?? '') === id)
+        const local = !id || !ITEM_ID.test(id) ? AT.idInvalid : dup ? AT.idDuplicate(id) : ''
+        const tone = own.some((x) => x.level === 'error') || local ? 'error' : own.length ? 'warning' : undefined
+        const before = items.slice(0, i).filter((it) => it.op === 'decompose' && it.id)
+        const parent = params.parent && typeof params.parent === 'object' ? params.parent as { of?: string; key?: unknown } : null
+        const field = (spec: ParamSpec) => {
+          const fid = `${uid}-${i}-p-${spec.key}`
+          const label = AT.param[spec.key] ?? spec.key
+          const text = paramText(spec.kind, params[spec.key])
+          const set = (t: string) => setParam(i, spec.key, paramValue(spec.kind, t))
+          let control
+          if (spec.kind === 'basis' || spec.kind === 'grain') {
+            const opts = spec.kind === 'basis' ? AT.basis : AT.grain
+            control = (
+              <select id={fid} className="field text-xs" value={text} onChange={(e) => set(e.target.value)}>
+                {Object.entries(opts).filter(([k]) => !(spec.kind === 'basis' && k === 'change')).map(([k, v]) => (
+                  <option key={k} value={k}>{v}</option>
+                ))}
+                {text && !(text in opts) && <option value={text} disabled>{text}</option>}
+              </select>
+            )
+          } else if (spec.kind === 'pairs') {
+            control = <textarea id={fid} className="field mono text-xs" rows={2} value={text} spellCheck={false}
+                                placeholder="华东、华南" onChange={(e) => set(e.target.value)} />
+          } else if (spec.kind === 'value') {
+            // 期次、对照组、叫法可以按运行输入写 {{ }}（执行时先渲染再分析）
+            control = <TemplateText id={fid} multiline={false} nodeId={nodeId} className="text-xs" value={text}
+                                    placeholder={AT.paramPlaceholder[spec.key]} onChange={set} />
+          } else {
+            control = <input id={fid} className="field mono text-xs" value={text} spellCheck={false}
+                             inputMode={spec.kind === 'int' ? 'numeric' : undefined}
+                             placeholder={AT.paramPlaceholder[spec.key]} onChange={(e) => set(e.target.value)} />
+          }
+          const hint = spec.kind === 'columns' ? AT.listHint : spec.kind === 'pairs' ? AT.pairsHint : AT.paramHint[spec.key]
+          return (
+            <div key={spec.key} className="min-w-0">
+              <Sub label={label} htmlFor={fid} sub={`params.${spec.key}`}>
+                {control}
+                {hint && <div className="mt-0.5 text-2xs leading-snug text-faint">{hint}</div>}
+              </Sub>
+              {lines(`params.${spec.key}`)}
+            </div>
+          )
+        }
+        const specs = op ? paramSpecs(op, item.mode).filter((p) => !(two && TWO_QUERY_SKIP.has(p.key))) : []
+        const headline = params.headline && typeof params.headline === 'object' ? params.headline as Record<string, string> : null
+        const setHeadline = (side: 'base' | 'target', t: string) => {
+          const next = { base: headline?.base ?? '', target: headline?.target ?? '', [side]: t.trim() }
+          setParam(i, 'headline', next.base || next.target ? next : undefined)
+        }
+        const toggleTwo = (on: boolean) => {
+          const next = { ...params }
+          if (on) {
+            next.base_query = item.from ?? ''
+            next.target_query = ''
+            for (const k of TWO_QUERY_SKIP) delete next[k]
+            update(i, { ...item, from: undefined, params: next })
+          } else {
+            const from = typeof next.base_query === 'string' ? next.base_query : ''
+            delete next.base_query
+            delete next.target_query
+            update(i, { ...item, from, params: next })
+          }
+        }
+        // 落在某一格下面的问题在那一格下面说，其余的（格式不对、多写了这种分析没有的参数……）放在这一项的最后
+        const placed = ['id', 'op', 'mode', 'hypothesis', ...(two ? ['params.base_query', 'params.target_query'] : ['from']),
+          ...specs.map((p) => `params.${p.key}`),
+          ...(op && allowsHeadline(op, item.mode) ? ['params.headline'] : []),
+          ...(op && allowsParent(op, item.mode) && (before.length > 0 || parent) ? ['params.parent'] : [])]
+        const rest = own.filter((x) => !placed.some((sub) => x.at?.sub === sub || x.at?.sub?.startsWith(`${sub}.`)))
+        return (
+          <Row key={i} item={i} removeLabel={AT.removeItem(id)} tone={tone}
+               onRemove={() => commit(items.filter((_, j) => j !== i))}>
+            <div className="flex gap-1.5" data-analysis-item={id || i}>
+              <Sub label={AT.id} htmlFor={`${uid}-${i}-id`} className="w-20 shrink-0" sub="id">
+                <input id={`${uid}-${i}-id`} className="field mono text-xs" value={id} spellCheck={false}
+                       aria-invalid={!!local || undefined}
+                       onChange={(e) => update(i, { ...item, id: e.target.value.trim() })} />
+              </Sub>
+              <Sub label={AT.op} htmlFor={`${uid}-${i}-op`} className="min-w-0 flex-1" sub="op">
+                <select id={`${uid}-${i}-op`} className="field text-xs" value={item.op ?? ''}
+                        onChange={(e) => update(i, withOp(item, e.target.value))}>
+                  <option value="" disabled>{AT.pickOp}</option>
+                  {ANALYSIS_OPS.map((o) => <option key={o} value={o}>{ANALYSIS_OP_LABEL[o]}</option>)}
+                  {!!item.op && !op && <option value={item.op} disabled>{AT.unknownOp(item.op)}</option>}
+                </select>
+              </Sub>
+              {modes && (
+                <Sub label={AT.mode} htmlFor={`${uid}-${i}-mode`} className="w-[5.5rem] shrink-0" sub="mode">
+                  <select id={`${uid}-${i}-mode`} className="field text-xs" value={item.mode ?? ''}
+                          onChange={(e) => update(i, withMode(item, e.target.value))}>
+                    <option value="" disabled>{AT.pickMode}</option>
+                    {modes.map((m) => <option key={m} value={m}>{ANALYSIS_MODE_LABEL[m]}</option>)}
+                    {!!item.mode && !modes.includes(item.mode) && <option value={item.mode} disabled>{AT.unknownMode(item.mode)}</option>}
+                  </select>
+                </Sub>
+              )}
+            </div>
+            {local && !at('id').length && (
+              <div className="flex items-start gap-1 text-2xs leading-snug" style={{ color: 'var(--err)' }}>
+                <XCircle size={11} className="mt-px shrink-0" aria-hidden />
+                <span className="min-w-0 [overflow-wrap:anywhere]">{local}</span>
+              </div>
+            )}
+            {lines('id')}
+            {lines('op')}
+            {lines('mode')}
+            {id && ITEM_ID.test(id) && (
+              <div className="mono truncate text-2xs text-faint" title={AT.idHint(nodeId, id)}>{AT.idHint(nodeId, id)}</div>
+            )}
+            {two ? (
+              <div className="grid grid-cols-2 gap-1.5">
+                <div className="min-w-0">
+                  <Sub label={AT.baseQuery} htmlFor={`${uid}-${i}-bq`} sub="params.base_query">
+                    <QueryPick id={`${uid}-${i}-bq`} value={String(params.base_query ?? '')} options={options}
+                               onChange={(v) => setParam(i, 'base_query', v)} />
+                  </Sub>
+                  {lines('params.base_query')}
+                </div>
+                <div className="min-w-0">
+                  <Sub label={AT.targetQuery} htmlFor={`${uid}-${i}-tq`} sub="params.target_query">
+                    <QueryPick id={`${uid}-${i}-tq`} value={String(params.target_query ?? '')} options={options}
+                               onChange={(v) => setParam(i, 'target_query', v)} />
+                  </Sub>
+                  {lines('params.target_query')}
+                </div>
+              </div>
+            ) : (
+              <div>
+                <Sub label={AT.from} htmlFor={`${uid}-${i}-from`} sub="from">
+                  <QueryPick id={`${uid}-${i}-from`} value={String(item.from ?? '')} options={options}
+                             onChange={(v) => update(i, { ...item, from: v })} />
+                </Sub>
+                {lines('from')}
+              </div>
+            )}
+            {op && allowsTwoQueries(op) && (
+              <label className="flex items-center gap-1.5 text-2xs text-dim">
+                <input type="checkbox" checked={two} onChange={(e) => toggleTwo(e.target.checked)} data-analysis-two="" />
+                {AT.twoQueries}
+              </label>
+            )}
+            {!options.length && <div className="text-2xs leading-snug text-faint">{AT.noUpstream}</div>}
+            {specs.length > 0 && (
+              <div className="grid grid-cols-2 gap-1.5" data-analysis-params="">
+                {specs.map(field)}
+              </div>
+            )}
+            {op && allowsHeadline(op, item.mode) && (
+              <div data-sub="params.headline">
+                <div className="mb-0.5 text-2xs text-faint">{AT.headline}</div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {(['base', 'target'] as const).map((side) => (
+                    <Sub key={side} label={side === 'base' ? AT.headlineBase : AT.headlineTarget}
+                         htmlFor={`${uid}-${i}-h-${side}`} sub={`params.headline.${side}`}>
+                      <input id={`${uid}-${i}-h-${side}`} className="field mono text-xs" spellCheck={false}
+                             value={headline?.[side] ?? ''} placeholder={side === 'base' ? 'weekly.r0.gmv' : 'weekly.r1.gmv'}
+                             onChange={(e) => setHeadline(side, e.target.value)} />
+                    </Sub>
+                  ))}
+                </div>
+                <div className="mt-0.5 text-2xs leading-snug text-faint">{AT.headlineHint}。{AT.cellHint}</div>
+                {lines('params.headline')}
+              </div>
+            )}
+            {op && allowsParent(op, item.mode) && (before.length > 0 || parent) && (
+              <div data-sub="params.parent">
+                <div className="grid grid-cols-2 gap-1.5">
+                  <Sub label={AT.parentOf} htmlFor={`${uid}-${i}-po`}>
+                    <select id={`${uid}-${i}-po`} className="field text-xs" value={parent?.of ?? ''}
+                            onChange={(e) => setParam(i, 'parent', e.target.value
+                              ? { of: e.target.value, key: Array.isArray(parent?.key) ? parent!.key : [] } : undefined)}>
+                      <option value="">{AT.noParent}</option>
+                      {before.map((it) => <option key={String(it.id)} value={String(it.id)}>{String(it.id)}</option>)}
+                      {parent?.of && !before.some((it) => it.id === parent.of) && <option value={parent.of} disabled>{parent.of}</option>}
+                    </select>
+                  </Sub>
+                  {parent && (
+                    <Sub label={AT.parentKey} htmlFor={`${uid}-${i}-pk`}>
+                      <input id={`${uid}-${i}-pk`} className="field mono text-xs" spellCheck={false} placeholder="华东"
+                             value={paramText('columns', parent.key)}
+                             onChange={(e) => setParam(i, 'parent', { of: parent.of, key: paramValue('columns', e.target.value) ?? [] })} />
+                    </Sub>
+                  )}
+                </div>
+                <div className="mt-0.5 text-2xs leading-snug text-faint">{AT.parentHint}</div>
+                {lines('params.parent')}
+              </div>
+            )}
+            <div>
+              <Sub label={AT.hypothesis} htmlFor={`${uid}-${i}-hyp`} sub="hypothesis">
+                <input id={`${uid}-${i}-hyp`} className="field text-xs" value={item.hypothesis ?? ''}
+                       placeholder={AT.hypothesisPlaceholder}
+                       onChange={(e) => update(i, { ...item, hypothesis: e.target.value || undefined })} />
+              </Sub>
+              <div className="mt-0.5 text-2xs leading-snug text-faint">{AT.hypothesisHint}</div>
+              {lines('hypothesis')}
+            </div>
+            {rest.map((x, k) => <IssueLine key={k} issue={x} />)}
+          </Row>
+        )
+      })}
+      <button type="button" className="btn btn-sm w-full justify-center" onClick={add} data-analysis-add="">
+        <Plus size={11} /> {AT.addItem}
+      </button>
+    </div>
+  )
+}
+
+/**
+ * 分析卡的阈值覆盖：只列写了的几项，「添加阈值覆盖」从没写的里面选。键和叫法同设置里的分析一组（contract.LABELS），范围先在
+ * 这里按 contract.RANGES 说，两两之间的大小（「明显超出」要大于「超出常规波动」……）由服务端核、问题落在这一栏下面。
+ * 全部删掉写回 undefined：没覆盖就不留一个空对象
+ */
+function AnalysisOverrides({ value, issues, onChange }: { value: any; issues: FieldIssue[]; onChange: (v: any) => void }) {
+  const uid = useId()
+  const current: Record<string, unknown> = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  // 正在填的字先记在本地：「0.」这种还不是数的字写回去会被转成别的
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const keys = Object.keys(current)
+  const free = ANALYSIS_SETTING_KEYS.filter((k) => !(k in current))
+  const write = (next: Record<string, unknown>) => onChange(Object.keys(next).length ? next : undefined)
+  const set = (key: string, text: string) => {
+    setDrafts((d) => ({ ...d, [key]: text }))
+    const t = text.trim()
+    write({ ...current, [key]: t !== '' && Number.isFinite(Number(t)) ? Number(t) : t })
+  }
+  const remove = (key: string) => {
+    const next = { ...current }
+    delete next[key]
+    setDrafts((d) => { const c = { ...d }; delete c[key]; return c })
+    write(next)
+  }
+  return (
+    <div data-analysis-overrides="">
+      {keys.map((key, i) => {
+        const known = (ANALYSIS_SETTING_KEYS as readonly string[]).includes(key)
+        const label = known ? ANALYSIS_SETTING_LABEL[key as AnalysisSettingKey] : key
+        const text = drafts[key] ?? (current[key] == null ? '' : String(current[key]))
+        const problem = known ? settingValueProblem(key as AnalysisSettingKey, text) : null
+        const fid = `${uid}-${i}`
+        return (
+          <Row key={key} removeLabel={AT.removeOverride(label)} tone={problem ? 'error' : undefined} onRemove={() => remove(key)}>
+            <Sub label={label} htmlFor={fid} sub={key}>
+              <input id={fid} className="field tnum text-xs" inputMode="decimal" value={text} aria-invalid={!!problem || undefined}
+                     data-analysis-override={key} onChange={(e) => set(key, e.target.value)} />
+            </Sub>
+            <div className="text-2xs leading-snug" style={{ color: problem ? 'var(--err)' : 'var(--text-faint)' }}>
+              {problem ?? (known ? settingRangeText(key as AnalysisSettingKey) : '')}
+            </div>
+          </Row>
+        )
+      })}
+      {!keys.length && <div className="mb-1.5 text-2xs text-faint">{AT.noOverrides}</div>}
+      {issues.map((x, k) => <IssueLine key={k} issue={x} />)}
+      {free.length > 0 ? (
+        <select className="field text-xs" value="" aria-label={AT.addOverride} data-analysis-add-override=""
+                onChange={(e) => { if (e.target.value) set(e.target.value, '') }}>
+          <option value="">{AT.addOverride}</option>
+          {free.map((k) => <option key={k} value={k}>{ANALYSIS_SETTING_LABEL[k]}</option>)}
+        </select>
+      ) : <div className="text-2xs text-faint">{AT.allOverridden}</div>}
     </div>
   )
 }
@@ -789,6 +1117,12 @@ function FieldInput({ field, id, nodeId, syntax, value, config, invalid, describ
 
     case 'mergeInputs':
       return <MergeInputList nodeId={nodeId} value={value} issues={issues} onChange={onChange} />
+
+    case 'analysisItems':
+      return <AnalysisItemList nodeId={nodeId} value={value} issues={issues} onChange={onChange} />
+
+    case 'analysisOverrides':
+      return <AnalysisOverrides value={value} issues={issues} onChange={onChange} />
 
     case 'caliberFrom':
       return <CaliberFromPicker id={id} value={value} invalid={invalid} describedBy={describedBy} />

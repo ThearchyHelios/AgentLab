@@ -189,6 +189,7 @@ export const NODE_TYPE_LABEL: Record<NodeType, string> = {
   human: '人工审批',
   validate: '结构校验',
   metrics: '口径卡',
+  analysis: '分析卡',
   report: '报告撰写',
   dual_check: '双盲复算',
   challenge: '反方审稿',
@@ -1164,6 +1165,7 @@ export const EVIDENCE_KIND_LABEL: Record<string, string> = {
   entity: '表或字段',
   column: '字段',
   quote: '引文',
+  analysis: '分析结论',
 }
 
 /**

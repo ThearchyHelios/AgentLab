@@ -82,6 +82,7 @@
   --nt-human: #ce91e6;
   --nt-validate: #ebb1fd;
   --nt-metrics: #cbaddb;
+  --nt-analysis: #c09dd9;
   --nt-report: #a9b0ec;
   --nt-dual_check: #a98ee0;
   --nt-challenge: #dcb7ef;
@@ -151,6 +152,7 @@
   --nt-human: #6f3d81;
   --nt-validate: #885398;
   --nt-metrics: #6e557b;
+  --nt-analysis: #674a82;
   --nt-report: #4f5694;
   --nt-dual_check: #5a4a91;
   --nt-challenge: #7d4c8f;
@@ -214,6 +216,7 @@
     --nt-human: #6f3d81;
     --nt-validate: #885398;
     --nt-metrics: #6e557b;
+    --nt-analysis: #674a82;
     --nt-report: #4f5694;
     --nt-dual_check: #5a4a91;
     --nt-challenge: #7d4c8f;
@@ -428,6 +431,7 @@
 .nt-transform  { --nt: var(--nt-transform); }
 .nt-subgraph   { --nt: var(--nt-subgraph); }
 .nt-metrics    { --nt: var(--nt-metrics); }
+.nt-analysis   { --nt: var(--nt-analysis); }
 .nt-report     { --nt: var(--nt-report); }
 .nt-dual_check { --nt: var(--nt-dual_check); }
 .nt-challenge  { --nt: var(--nt-challenge); }

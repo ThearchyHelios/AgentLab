@@ -1,11 +1,12 @@
 import type { ReactNode } from 'react'
 import {
-  Bot, Braces, Brain, CheckCircle2, Code2, Combine, Database, FileInput, FileOutput, FileText,
+  Bot, Braces, Brain, ChartColumnStacked, CheckCircle2, Code2, Combine, Database, FileInput, FileOutput, FileText,
   Gauge, GitBranch, GitCompareArrows, Hand, Repeat, Search, ShieldAlert, Shuffle, Users, Wrench,
 } from 'lucide-react'
 import {
   APPROVAL_POLICY_LABEL, CHALLENGE_TEXT, DUAL_CHECK_TEXT, MERGE_TEXT, NODE_TYPE_LABEL, REJECTED_TEXT, UPGRADE_POLICY_LABEL,
 } from '../lib/terms'
+import { ANALYSIS_FIELD_LABEL, ANALYSIS_OPTION_LABEL, ANALYSIS_TEXT } from '../lib/termsAnalysis'
 import type { NodeType } from '../types'
 import { dualCheckFields, dualCheckSummary } from './DualCheckFields'
 import { HUMAN_PROCESS_FIELDS, TOOL_WRITE_FIELDS } from './humanFields'
@@ -15,6 +16,7 @@ export type FieldType =
   | 'text' | 'textarea' | 'prompt' | 'code' | 'number' | 'select' | 'switch'
   | 'json' | 'model' | 'tools' | 'skills' | 'collection'
   | 'ioFields' | 'cases' | 'agents' | 'metricsList' | 'nodeRefs' | 'caliberFrom' | 'judge' | 'mergeInputs'
+  | 'analysisItems' | 'analysisOverrides'
 
 /**
  * 这个字段里写的是什么语法。
@@ -654,6 +656,29 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
           + '反引号中无从核对的名称标为「疑似不存在的名称」',
         unknownLabel: (v) => `${v}：无法识别的值，请从上方选项中选择`,
       },
+      {
+        // 后端认 off / check / strict（schema.ANALYSIS_CLAIMS_VALUES），没写按 check：缺省放第一项，没写时下拉正好落在它上面。
+        // 选项以 engine/labels.py 的短说法开头
+        key: 'analysis_claims', label: ANALYSIS_FIELD_LABEL.analysis_claims, type: 'select',
+        options: [
+          { value: 'check', label: `${ANALYSIS_OPTION_LABEL.analysis_claims.check}（默认）：仍有的在报告中标注，不影响出具档位` },
+          { value: 'strict', label: `${ANALYSIS_OPTION_LABEL.analysis_claims.strict}：按最多重写次数重写，出具随之降档` },
+          { value: 'off', label: ANALYSIS_OPTION_LABEL.analysis_claims.off },
+        ],
+        help: '「主要来自」「超出常规波动」「持续上升」这类判断要挂对应的分析结论且判定对得上；「由于」「导致」这类原因要有'
+          + '知识库原话或运行输入作依据，否则写成待核实的推测。受管级别发布须选择「重写后仍有的计入缺口」',
+        unknownLabel: (v) => `${v}：无法识别的值，请从上方选项中选择`,
+      },
+      {
+        // 后端认 auto / off（schema.ANALYSIS_SCOPE_VALUES），没写按 auto
+        key: 'analysis_scope', label: ANALYSIS_FIELD_LABEL.analysis_scope, type: 'select', advanced: true,
+        options: [
+          { value: 'auto', label: `${ANALYSIS_OPTION_LABEL.analysis_scope.auto}（默认）` },
+          { value: 'off', label: ANALYSIS_OPTION_LABEL.analysis_scope.off },
+        ],
+        help: '报告末尾由系统写一段：现象、拆过、排除、没拆、检验，写作者改不了，随报告封存',
+        unknownLabel: (v) => `${v}：无法识别的值，请从上方选项中选择`,
+      },
       ...MODEL_FIELDS,
       { key: 'system', label: '系统提示', type: 'textarea', advanced: true, placeholder: '你是…' },
       ...COMMON_TAIL,
@@ -697,6 +722,20 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
       caliber: '', caliber_version: 'v1',
       metrics: [{ id: 'total', name: '', unit: '', expression: '' }],
     },
+  },
+  analysis: {
+    type: 'analysis', label: NODE_TYPE_LABEL.analysis, category: '把关', icon: ChartColumnStacked,
+    description: ANALYSIS_TEXT.node.description,
+    hasTarget: true, sources: [{ id: 'out', label: '' }],
+    // 配置的键照服务端 engine/schema.analysis_issues：items（每项 id、op、mode、from、params、hypothesis）、overrides（阈值覆盖，
+    // 键和范围同设置里的分析一组）。产出 nodes.<卡>.results.<项> = {status, verdict, direction, values, phrase, artifact}
+    fields: [
+      { key: 'items', label: ANALYSIS_FIELD_LABEL.items, type: 'analysisItems', help: ANALYSIS_TEXT.node.itemsHint },
+      { key: 'overrides', label: ANALYSIS_FIELD_LABEL.overrides, type: 'analysisOverrides', help: ANALYSIS_TEXT.node.overridesHint },
+      ...COMMON_TAIL,
+    ],
+    // 带一项空的：拖进画布就看得到一项要填什么（同口径卡带一个空指标）
+    defaults: { items: [{ id: 'a1', params: {} }] },
   },
   dual_check: {
     type: 'dual_check', label: NODE_TYPE_LABEL.dual_check, category: '把关', icon: GitCompareArrows,

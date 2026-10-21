@@ -1,7 +1,7 @@
 export type NodeType =
   | 'input' | 'output' | 'llm' | 'agent' | 'supervisor' | 'tool' | 'code' | 'merge'
   | 'branch' | 'loop' | 'subgraph' | 'memory' | 'retrieve' | 'transform'
-  | 'human' | 'validate' | 'metrics' | 'report' | 'dual_check' | 'challenge'
+  | 'human' | 'validate' | 'metrics' | 'analysis' | 'report' | 'dual_check' | 'challenge'
 
 export interface GraphNode {
   id: string
@@ -1771,9 +1771,9 @@ export interface EvidenceCitation {
   ref?: string
   /** 目录里的别名，如 m:gmv、i:week、Q1 */
   alias?: string
-  /** 引文：hit 是检索快照里第几条命中，start / end 是引文在那条原文里的码点位置 */
+  /** 引文：hit 是检索快照里第几条命中，start / end 是引文在那条原文里的码点位置；分析结论的具名的数：key（[[a:A1.top_share]]） */
   locator?: { metric?: string; field?: string; row?: number; column?: string; table?: string
-              hit?: number; start?: number; end?: number }
+              hit?: number; start?: number; end?: number; key?: string }
   eid?: string
   /** metric / input / cell / table / column / quote / query */
   kind?: string
@@ -2008,8 +2008,15 @@ export interface EvidenceBlock {
 }
 
 export interface EvidenceViolation {
-  /** uncited_number / unresolved_ref / render_mismatch / eid_mismatch / … */
+  /**
+   * uncited_number / unresolved_ref / render_mismatch / eid_mismatch / …；分析能力一轮的说法违规：analysis_claim_uncited
+   * （判断词未挂分析结论）、analysis_claim_mismatch（判断与分析结论不符）、causal_unsupported（因果说法没有依据）
+   */
   code: string
+  /** 说法违规：判断词的类（source、anomaly、causal……）、要挂的算子、所挂的分析结论编号 */
+  claim?: string
+  op?: string
+  analyses?: string[]
   message?: string
   span?: [number, number]
   text?: string
@@ -2021,6 +2028,8 @@ export interface EvidenceViolation {
 }
 
 export interface EvidenceStats {
+  /** 说法违规几处（只有记了分析说法核对的文档有） */
+  analysis_claims?: number
   units?: number
   segments?: number
   claims?: number
@@ -2062,6 +2071,10 @@ export interface EvidenceDocData {
   violations?: EvidenceViolation[]
   /** 四期：写作时结论句策略是 judge 才有 */
   judge?: EvidenceJudgeSummary
+  /** 分析能力一轮：报告节点核分析说法时记下的处置（check / strict）和说法表版本；老文档没有 */
+  analysis_claims?: { mode?: string; lexicon?: number }
+  /** 系统写的「分析范围」：这次有分析结论、报告节点没关掉时才有 */
+  analysis_scope?: AnalysisScope
 }
 
 /**
@@ -2371,6 +2384,207 @@ export interface EvidenceUntraced {
   type: string | null
 }
 
+// ---------------------------------------------------------------------------
+// 分析能力一轮（docs/design/analysis-round）：分析结论在证据里的样子。形状照服务端 api/evidence.py 的 _analysis_chain、
+// _comparability_view，报告文档的 analysis_scope（analysis.contract.ScopeBlock），出具声明的 analysis_claims / comparability /
+// untraced（engine/nodes/io.py）。判定语、判定标准、原因、附带说明、代入式、闭合核对的数都是服务端写好的字，界面照原样显示
+// ---------------------------------------------------------------------------
+
+/** 分析结论的判定：判定码、点名的段（一段一个列表，多维时几个值；乘积拆解是因子名）、方向 */
+export interface AnalysisVerdict {
+  code?: string
+  subjects?: (string | number | null)[][]
+  direction?: 'up' | 'down' | null
+}
+
+/** 附带说明：一种说法，服务端渲染好的一句 */
+export interface AnalysisCaveat { code?: string; text?: string }
+
+/** 可比性检查现查的一条：一列的实际范围（table、column、min、max），或按运行当天现算的界（expr、value） */
+export interface AnalysisProbe {
+  source?: string
+  table?: string
+  column?: string
+  min?: string | null
+  max?: string | null
+  basis?: 'live' | 'profile' | 'observed' | string
+  at?: string
+  expr?: string
+  value?: string | null
+}
+
+/**
+ * 出处链里分析结论的六步（step 依次是 analysis、analysis_method、analysis_calc、analysis_input（每份输入一步）、
+ * analysis_recompute、analysis_seal）共用的形状：每一步只带自己那几项
+ */
+export interface EvidenceAnalysisStep {
+  step: string
+  alias?: string
+  // ---- analysis：判定 ----
+  op?: string
+  mode?: string | null
+  /** 「变化拆解（可加）」：服务端 contract.method_label */
+  method_label?: string
+  /** card 分析卡、agent Agent 现场做的、metric 口径卡执行时自动做的可比性检查 */
+  origin?: 'card' | 'agent' | 'metric' | string
+  item?: string
+  call_id?: string
+  node_id?: string | null
+  label?: string | null
+  artifact?: string | null
+  eid?: string
+  eid_ok?: boolean
+  /** 这一处引用的是结论的哪一项：判定语、具名的数（key）、结果表的一格（row、column） */
+  cited?: { what?: 'phrase' | 'value' | 'cell' | string; key?: string; row?: number; column?: string; raw?: unknown; conv?: string }
+  rendered?: string
+  render_ok?: boolean
+  hash_ok?: boolean | null
+  status?: string
+  reason_code?: string | null
+  reason?: string | null
+  phrase?: string
+  criterion?: string
+  verdict?: AnalysisVerdict | null
+  caveats?: AnalysisCaveat[]
+  hypothesis?: string
+  hypothesis_note?: string
+  note?: string
+  // ---- analysis_method：方法、参数、实际用的阈值、现查结果 ----
+  method?: string
+  params?: Record<string, unknown>
+  settings?: { key: string; label?: string; value: unknown }[]
+  probes?: AnalysisProbe[]
+  // ---- analysis_calc：具名的数、代入式、结果表 ----
+  values?: { key: string; raw?: unknown; rendered?: string; cited?: boolean }[]
+  formulas?: { label?: string; text?: string }[]
+  table?: {
+    columns: string[]
+    labels?: Record<string, string>
+    total_rows?: number
+    row_index?: number[]
+    rows: unknown[][]
+    masked?: string[]
+    highlight?: { cells?: [number, string][] }
+    window_truncated?: boolean
+  }
+  // ---- analysis_input：一份输入 ----
+  /** 这一步是哪份结论的输入 */
+  of?: string
+  ref?: string
+  role?: string
+  role_label?: string
+  columns?: string[]
+  rows?: 'all' | number[]
+  row?: number
+  column?: string
+  value?: string | null
+  /** 输入落到报告目录的哪个 Q */
+  query?: string | null
+  sealed?: boolean
+  /** headline 那一格和结论里总数的闭合核对：mode 可加对各段之和，比率对各段分子之和 ÷ 分母之和 */
+  closure?: { mode?: string; total_key?: string; total?: string; headline?: string; closed?: boolean }
+  // ---- analysis_recompute：复算（服务端算好的那一句） ----
+  text?: string
+  // ---- analysis_seal：封存 ----
+  ledger?: boolean
+  /** metric_set：口径卡指标上的可比性结论，记在指标集里、随卡封存 */
+  via?: string
+}
+
+/** 指标步骤上的两期可比性（api/evidence._comparability_view）：判定、判定语、原因，连同那份可比性结论的出处链 */
+export interface EvidenceComparability {
+  verdict?: 'comparable' | 'conditional' | 'incomparable' | string
+  phrase?: string
+  reasons?: string[]
+  artifact?: string | null
+  hash_ok?: boolean | null
+  sealed?: boolean
+  method?: string
+  criterion?: string
+  caveats?: AnalysisCaveat[]
+  probes?: AnalysisProbe[]
+  /** 判定 → 方法 → 计算 → 输入 → 复算 → 封存（两份输入快照的查询步骤指标链里已经有了，不再给） */
+  steps?: EvidenceAnalysisStep[]
+}
+
+/** 报告文档里系统写的「分析范围」的一条（contract.ScopeItem） */
+export interface AnalysisScopeItem {
+  alias?: string
+  op?: string
+  mode?: string | null
+  /** 拆解的维度（给人看的叫法） */
+  dims?: string[]
+  verdict?: string | null
+  phrase?: string
+  /** 下钻：上一层的编号 */
+  parent?: string | null
+  reason?: string | null
+}
+
+/** 报告文档的 analysis_scope（contract.ScopeBlock）：不进正文、不过裸数字和说法核对，随文档封存 */
+export interface AnalysisScope {
+  phenomena?: AnalysisScopeItem[]
+  decomposed?: AnalysisScopeItem[]
+  excluded?: AnalysisScopeItem[]
+  refused?: AnalysisScopeItem[]
+  /** 候选维度里没拆过的叫法；null 是候选维度核对不了（看 note） */
+  not_decomposed?: string[] | null
+  note?: string | null
+  /** 这次做了几次差异检验 */
+  tests?: number
+  /** 检验校正过没有：只做了一次为 true，不止一次为 false，没做为 null */
+  corrected?: boolean | null
+}
+
+/** 出具声明的 analysis_claims：处置、几处、记没记缺口、按种类的计数、前几处（同报告文档的说法违规） */
+export interface IssuanceAnalysisClaims {
+  mode?: 'check' | 'strict' | string
+  count?: number
+  counts?: Record<string, number>
+  counted?: boolean
+  violations?: EvidenceViolation[]
+}
+
+/** 出具声明的 comparability：两期有条件可比、不可比的指标，一条一个 */
+export interface IssuanceComparability {
+  metric?: string
+  name?: string
+  verdict?: string
+  phrase?: string
+  reasons?: string[]
+  artifact?: string
+}
+
+/** 出具声明的 untraced：报告引用的指标里输入追不到原始数据的，counted 是记了缺口（受管级别的正式运行） */
+export interface IssuanceUntraced {
+  metrics?: { metric?: string; name?: string; stops?: { path?: string; node_id?: string | null; label?: string | null; type?: string | null }[] }[]
+  counted?: boolean
+}
+
+/** Agent 分析工具 tool.end 的 analysis（服务端 tools/analysis.event_view）：preview 只是结论的前一截，判定语从这里读 */
+export interface AnalysisEventView {
+  /** 这份结论在本节点的编号（「【分析 An】」那个）；不记台账的执行没有 */
+  alias?: string | null
+  op?: string
+  mode?: string | null
+  status?: 'ok' | 'refused' | string
+  verdict?: string | null
+  direction?: string | null
+  phrase?: string
+  reason_code?: string | null
+}
+
+/** 分析卡的一项（节点配置 items[i]，engine/schema.analysis_issues 校验） */
+export interface AnalysisItem {
+  id?: string
+  op?: string
+  mode?: string | null
+  /** 要分析的上游查询节点（调用数据库查询工具的「调用工具」节点，或「合并查询」）；两份查询时写在 params 的 base_query、target_query */
+  from?: string
+  params?: Record<string, any>
+  hypothesis?: string
+}
+
 export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   step: string
   /**
@@ -2477,6 +2691,10 @@ export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {
   merge?: EvidenceMerge
   /** 这一步是哪次合并查询的输入（合并结果在目录里的编号）：排在那个合并步骤后面，高亮的是追到的格 */
   merged_into?: string
+  /** query：这一步是哪份分析结论的输入（结论在目录里的编号 A…）：接在那份结论的输入后面 */
+  input_of?: string
+  /** metric：跨两份同形查询算的环比、同比，口径卡执行时自动做的可比性检查。没做过检查的指标没有这个键 */
+  comparability?: EvidenceComparability
   // ---- entity：表或字段（三期）----
   /** entity：table / column */
   kind?: string
@@ -4371,12 +4589,38 @@ export interface RunCompareQuery {
 }
 
 /** GET /runs/{id}/compare?base=。任一未封存或封存核对不一致 409；不是同一工作流、是同一次运行 422 */
+/** 运行对比里分析卡的一边（analysis.end 那一项）：没有这一项为 null */
+export interface RunCompareAnalysisSide {
+  status?: string | null
+  verdict?: string | null
+  direction?: string | null
+  phrase?: string
+  artifact?: string | null
+}
+
+/**
+ * 运行对比里分析卡的一项（engine/compare._analyses）：两次运行的分析卡按节点和项的标识对齐。change：same 判定和判定语都一样、
+ * verdict 状态或判定变了、phrase 判定一样而判定语里的数变了、added / removed 只在一边有
+ */
+export interface RunCompareAnalysis {
+  node_id: string
+  title?: string
+  item: string
+  op?: string | null
+  mode?: string | null
+  base: RunCompareAnalysisSide | null
+  target: RunCompareAnalysisSide | null
+  change: 'same' | 'verdict' | 'phrase' | 'added' | 'removed' | string
+}
+
 export interface RunComparison {
   target: RunCompareRef
   base: RunCompareRef
   summary: RunCompareSummary
   template: RunCompareTemplate
   metrics: RunCompareMetric[]
+  /** 分析卡按项对齐（分析能力一轮）；老服务端没有 */
+  analyses?: RunCompareAnalysis[]
   queries: RunCompareQuery[]
   notes: string[]
 }
@@ -4504,6 +4748,12 @@ export interface DualCheckConfig {
   /** null 或不写：跟随设置 */
   enabled?: boolean | null
 }
+
+/**
+ * 设置里的 analysis 一组（GET /settings 给的是补齐缺省之后的完整一组）：判定用的阈值、Agent 每次执行最多分析几次、最多下钻
+ * 几层、列出前几段。键、叫法、范围见 lib/termsAnalysis（照服务端 analysis/contract.py）
+ */
+export type AnalysisSettings = Record<string, number>
 
 /** 设置里的 verify 一组（GET /settings 给的是补齐默认之后的完整一组；上限为 null 表示不限） */
 export interface VerifySettings {
