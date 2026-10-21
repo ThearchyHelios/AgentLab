@@ -33,7 +33,7 @@ def weekly(**contract_overrides) -> dict:
             {"id": "gmv", "name": "销售额", "unit": "元", "expression": "cell(nodes.fetch, 0, 'gmv')"},
             {"id": "orders", "name": "订单数", "unit": "单", "expression": "cell(nodes.fetch, 0, 'orders')"}]),
         node("write", "report", "报告撰写", instructions="写周报",
-             numbers="strict", on_violation="fail", claims="require_citation"),
+             numbers="strict", on_violation="fail", claims="require_citation", analysis_claims="strict"),
         node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
              contract={k: v for k, v in contract.items() if v is not None}),
     ]
@@ -72,7 +72,8 @@ def add_card(graph: dict, nid: str = "card2") -> dict:
 
 def add_report(graph: dict, nid: str = "write2") -> dict:
     graph["nodes"].insert(4, node(nid, "report", "第二份报告", instructions="写月报",
-                                  numbers="strict", on_violation="fail", claims="require_citation"))
+                                  numbers="strict", on_violation="fail", claims="require_citation",
+                                  analysis_claims="strict"))
     graph["edges"] += [{"source": "card", "target": nid}, {"source": nid, "target": "done"}]
     return graph
 

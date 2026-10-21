@@ -806,6 +806,13 @@ CLAIMS_VALUES = (*REPORT_CLAIMS, CLAIMS_JUDGE)
 JUDGE_KEYS = ("provider", "model", "max_claims", "max_cost_usd", "timeout_s", "rewrite_once", "on_unsupported")
 #: 证据相矛盾时正式运行怎么判档：degrade 降档（默认）/ withhold 不予出具。探索运行只标注
 JUDGE_ON_UNSUPPORTED = ("degrade", "withhold")
+#: 报告撰写节点的分析说法核对（analysis_claims，docs/design/analysis-round/00-总方案.md §3.5、engine/analysis_claims）：
+#: off 不核；check（缺省，问数据也是它）判断词没挂对分析结论的句子交回写作者重写一次、仍有的标出，不影响出具档位；
+#: strict 按最多重写次数重写，仍有的计入出具缺口（受管级别要求它，门禁 G3）
+ANALYSIS_CLAIMS_VALUES = ("off", "check", "strict")
+ANALYSIS_CLAIMS_DEFAULT = "check"
+#: 报告文档里系统写的「分析范围」（analysis_scope，engine/analysis_scope）：auto（缺省）这次有分析结论时写；off 不写
+ANALYSIS_SCOPE_VALUES = ("auto", "off")
 
 #: 「没有指定模型」那条提示的编号。节点（或全图默认）点名了接入、而那个接入本身不存在或已停用时，它和接入那条问题
 #: 互相矛盾（一条说照常执行、一条说会失败），接口层读了接入表以后按编号去掉它（provider_refs.quiet_unset_model）
@@ -827,6 +834,24 @@ def claims_problem(value: Any) -> str | None:
         return None
     allowed = [f"「{option_label('claims', v)}」" for v in CLAIMS_VALUES]
     return (f"「{field_label('claims')}」只能选{'、'.join(allowed[:-1])}或{allowed[-1]}，当前为「{value}」")
+
+
+def _choice_problem(key: str, value: Any, allowed: tuple[str, ...]) -> str | None:
+    """一个只能在几个取值里选的报告节点配置写错了的说法（没写的不算错，按缺省）。"""
+    if value in (None, "") or (isinstance(value, str) and value in allowed):
+        return None
+    names = [f"「{option_label(key, v)}」" for v in allowed]
+    return f"「{field_label(key)}」只能选{'、'.join(names[:-1])}或{names[-1]}，当前为「{value}」"
+
+
+def analysis_claims_problem(value: Any) -> str | None:
+    """analysis_claims 的取值有什么问题，没问题返回 None。校验和报告撰写节点执行时报的是同一句话。"""
+    return _choice_problem("analysis_claims", value, ANALYSIS_CLAIMS_VALUES)
+
+
+def analysis_scope_problem(value: Any) -> str | None:
+    """analysis_scope 的取值有什么问题，没问题返回 None。"""
+    return _choice_problem("analysis_scope", value, ANALYSIS_SCOPE_VALUES)
 
 
 def _positive(value: Any, *, integer: bool = False) -> bool:
@@ -887,6 +912,11 @@ def _check_report_claims(node: GraphNode, spec: GraphSpec, result: ValidationRes
     value = effective("claims")
     if problem := claims_problem(value):
         result.add(problem, node_id=node.id, field="claims", code="report.claims_invalid")
+    # 分析说法核对、分析范围：写错了执行时报告节点照样报这一句
+    if problem := analysis_claims_problem(effective("analysis_claims")):
+        result.add(problem, node_id=node.id, field="analysis_claims", code="report.analysis_claims_invalid")
+    if problem := analysis_scope_problem(effective("analysis_scope")):
+        result.add(problem, node_id=node.id, field="analysis_scope", code="report.analysis_scope_invalid")
     if value != CLAIMS_JUDGE:
         return
     judge = effective("judge")

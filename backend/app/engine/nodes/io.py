@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from app.analysis.contract import LEDGER_KIND
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError
 from app.engine.expressions import ExpressionError, eval_expression
@@ -236,6 +237,15 @@ def _apply_contract(
         )
         unmatched = trace.unmatched if trace else []
 
+    # 口径卡指标上的可比性（口径卡跨两份同形查询算环比、同比时自动查的）：报告引用了的（引用模式按文档，别的按数字回指上
+    # 的指标）、契约必需的指标两期不可比，记缺口降档；有条件可比的写进出具声明作标注
+    required = {str(r) for r in contract.get("required") or []}
+    matched_ids = {str(h.get("metric")) for h in (trace.matched if trace else []) if h.get("metric")}
+    compared_gaps, comparability = _comparability(
+        [*(cited.get("cited_metrics") or []),
+         *(m for m in metrics if str(m.get("id")) in required | (set() if citations else matched_ids))])
+    gaps.extend(compared_gaps)
+
     # 同一条查询算出几个指标、报告又引用了它的格，只记一句（按出问题的那条查询归并，列出受影响的引用）
     titles = {n.id: n.title for n in ctx.run.spec.nodes}
     aliases: dict[str, str] = cited.get("aliases") or {}
@@ -271,8 +281,9 @@ def _apply_contract(
         if isinstance(payload, dict) and payload.get("exhausted"):
             gaps.append(f"协作团队「{titles.get(node_id, node_id)}」用完 {payload.get('rounds', '?')} "
                         "轮仍未完成，交付的是成员最后的回复")
-    # 上游节点自己报上来的缺口（双盲复算比不上、反方审稿的反驳没回应……）：只会降档，不会升档
-    gaps.extend(_upstream_issuance_gaps(state, ctx))
+    # 上游节点自己报上来的缺口（双盲复算比不上、反方审稿的反驳没回应……）：只会降档，不会升档。报告节点报的分析说法那一条，
+    # 引用模式下出口自己复核过、记了自己的缺口的不再重复收
+    gaps.extend(_upstream_issuance_gaps(state, ctx, skip=cited.get("analysis_skip")))
 
     tier = decide_tier(
         missing_required=missing_required,
@@ -290,7 +301,7 @@ def _apply_contract(
         return _declare_citations(tier, cited, calibers=calibers, metrics=metrics, gaps=gaps,
                                   missing_required=missing_required, missing_expected=missing_expected,
                                   report_from=str(report_from), declared_at=datetime.now(timezone.utc),
-                                  ctx=ctx, sql_checks=sql_checks)
+                                  ctx=ctx, sql_checks=sql_checks, comparability=comparability)
 
     # 逐个数字的出处。以前只有一个计数，界面标不出「这个数来自哪个指标」
     matched = [
@@ -311,6 +322,8 @@ def _apply_contract(
         "gaps": gaps,
         "declared_at": datetime.now(timezone.utc).isoformat(),
         **({"sql_checks": sql_checks} if sql_checks else {}),
+        # 指标的可比性（有条件可比的标注、不可比的同时在缺口里）：只在有的时候带这个键
+        **({"comparability": comparability} if comparability else {}),
     }
     ctx.emit(
         EventType.ISSUANCE,
@@ -343,8 +356,9 @@ def _shown_text(fields: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _untraced_gaps(metrics: list[dict[str, Any]], ctx: NodeContext) -> list[str]:
-    """指标出具的缺口：输入没追到原始数据的指标，每个一句，说清停在哪个节点（engine/lineage 的认法）。"""
+def _untraced(metrics: list[dict[str, Any]], ctx: NodeContext) -> list[dict[str, Any]]:
+    """输入没追到原始数据的指标（engine/lineage 的认法）：[{metric, name, stops: [{path, node_id}], gap}]。gap 是缺口那一句，
+    说清停在哪个节点。metrics 可以是契约收来的全部指标（指标出具），也可以只是报告引用的那几个（引用模式，D15）。"""
     from app.engine.lineage import untraced
 
     titles = {n.id: n.title for n in ctx.run.spec.nodes}
@@ -357,11 +371,45 @@ def _untraced_gaps(metrics: list[dict[str, Any]], ctx: NodeContext) -> list[str]
         where = "、".join(dict.fromkeys(
             f"{s.get('path')}（停在「{titles.get(at, at or '未知来源')}」）"
             for s in stops[:3] for at in [str(s.get('node_id') or '').split('/', 1)[0]]))
-        out.append(f"指标「{m.get('name') or m.get('id')}」的输入没追到原始数据：{where}")
+        out.append({"metric": m.get("id"), "name": m.get("name") or m.get("id"),
+                    "stops": [{"path": s.get("path"), "node_id": s.get("node_id")} for s in stops[:3]],
+                    "gap": f"指标「{m.get('name') or m.get('id')}」的输入没追到原始数据：{where}"})
     return out
 
 
-def _upstream_issuance_gaps(state: GraphState, ctx: NodeContext) -> list[str]:
+def _untraced_gaps(metrics: list[dict[str, Any]], ctx: NodeContext) -> list[str]:
+    """指标出具的缺口：输入没追到原始数据的指标，每个一句（_untraced）。"""
+    return [u["gap"] for u in _untraced(metrics, ctx)]
+
+
+def _comparability(metrics: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    """口径卡指标上的可比性（contract.MetricComparability，口径卡跨两份同形查询算环比、同比时自动做的检查）：
+    (缺口, 出具声明里的那一项)。metrics 是要看的指标（报告引用了的、契约必需的，调用方挑好）：两期不可比的记缺口（降档，
+    同 sql_check_failed），有条件可比的只标注。没有可比性记录的指标不在里面；同一条指标只看一次。"""
+    gaps: list[str] = []
+    declared: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for m in metrics:
+        mid = str(m.get("id") or "") if isinstance(m, dict) else ""
+        found = m.get("comparability") if mid else None
+        if not isinstance(found, dict) or id(m) in seen:
+            continue
+        seen.add(id(m))
+        verdict = found.get("verdict")
+        if verdict not in ("conditional", "incomparable"):
+            continue
+        name = m.get("name") or mid
+        phrase = str(found.get("phrase") or "").strip()
+        declared.append({"metric": mid, "name": name, "verdict": verdict, "phrase": phrase,
+                         "reasons": [str(r) for r in found.get("reasons") or [] if r],
+                         **({"artifact": found["artifact"]} if found.get("artifact") else {})})
+        if verdict == "incomparable":
+            gaps.append(f"指标「{name}」{phrase or '两期不可比'}")
+    return gaps, declared
+
+
+def _upstream_issuance_gaps(state: GraphState, ctx: NodeContext,
+                            skip: dict[str, set[str]] | None = None) -> list[str]:
     """上游节点产出里的 issuance_gaps（字符串列表），每条前面加上是哪个节点说的。
 
     这是给「把关类」节点留的通用口子：节点觉得这次的结论不该完整出具（双盲复算两路对不上、
@@ -372,6 +420,9 @@ def _upstream_issuance_gaps(state: GraphState, ctx: NodeContext) -> list[str]:
 
     只认这个成果节点的上游：另一条支路上的节点管不到这份成果。不是字符串、空白的条目跳过——
     这个键谁都能写（数据整形的 JSON 模板也行），写坏了只当没写，不能让出具崩掉。
+
+    skip：{节点 id: 不再收的那几条}。引用模式的出口自己复核过报告文档的分析说法、记了自己的缺口时，报告节点报上来的同一件事
+    不再重复收一条（_analysis_claims）。
     """
     from app.engine.labels import type_label
 
@@ -388,7 +439,9 @@ def _upstream_issuance_gaps(state: GraphState, ctx: NodeContext) -> list[str]:
             continue
         kind = type_label(node.type)
         prefix = f"{kind}：" if node.title == kind else f"{kind}「{node.title}」："
-        out.extend(prefix + gap.strip() for gap in reported if isinstance(gap, str) and gap.strip())
+        dropped = (skip or {}).get(node.id) or set()
+        out.extend(prefix + gap.strip() for gap in reported
+                   if isinstance(gap, str) and gap.strip() and gap not in dropped)
     return out
 
 
@@ -418,12 +471,14 @@ def _check_citations(
     governed：受管级别的正式运行。可疑实体（名字哪里都找不到）只在这时按缺口降档，别处只标注。
     """
     from app.core.artifact_store import load
+    from app.engine import analysis_claims as said
     from app.engine.evidence import iter_units, ledger_enabled, resolve_ref, verify_doc
     from app.engine.nodes.report import report_catalog, report_entities
 
     out: dict[str, Any] = {"matched": [], "unmatched": [], "unresolved": [], "gaps": [],
                            "doc_artifact": None, "stats": None, "claims_policy": None, "uncited": None,
-                           "unsupported": None, "claims": None, "entities": None, "queries": {}, "aliases": {}}
+                           "unsupported": None, "claims": None, "entities": None, "queries": {}, "aliases": {},
+                           "analysis": None, "analysis_skip": {}, "cited_metrics": [], "untraced": None}
     gaps = out["gaps"]
     spec = ctx.run.spec
     node = spec.node_map().get(report_from)
@@ -458,7 +513,11 @@ def _check_citations(
     broken: list[str] = []
     flagged: set[str] = set()
     suspicious: dict[str, list[dict[str, Any]]] = {"unknown_entity": [], "unverified_entity": []}
+    said_found: list[dict[str, Any]] = []       # 分析说法的违规（只有记了核对这一项的文档才有，_analysis_claims）
     for v in checked["violations"]:
+        if v["code"] in said.CODES:
+            said_found.append(v)
+            continue
         where = {k: v[k] for k in ("segment", "unit") if v.get(k)}
         if v.get("span"):
             where.update(start=v["span"][0], end=v["span"][1])
@@ -510,8 +569,12 @@ def _check_citations(
                 if label:
                     hit["caliber"] = label
             elif cite["kind"] == "cell":
-                # 查询单元格：Q1.r0.gmv（全局编号，和 doc.catalog 一致）
+                # 查询单元格：Q1.r0.gmv（全局编号，和 doc.catalog 一致）；分析结论结果表的一格同一种写法（A3.r0.share）
                 hit["cell"] = f"{cite['alias']}.r{cite['locator']['row']}.{cite['locator']['column']}"
+            elif cite["kind"] == LEDGER_KIND:
+                # 分析结论的具名标量（[[a:A3.top_share]]）：A3.top_share
+                key = (cite.get("locator") or {}).get("key")
+                hit["analysis"] = f"{cite['alias']}.{key}" if key else str(cite["alias"])
             else:
                 hit["input"] = cite["locator"].get("field")
             out["matched"].append({**hit, "segment": seg["id"], "unit": unit["id"], "start": start, "end": end,
@@ -519,6 +582,16 @@ def _check_citations(
 
     _claims(out, contract, payload, evidence_on=ledger_enabled(ctx.run), governed=governed,
             uncited=checked.get("uncited") or [], doc=doc, title=node.title)
+    _analysis_claims(out, doc, payload, said_found, title=node.title, node_id=str(report_from))
+
+    # 报告引用的指标（[[m:]] 片段和句末依据里的 m:）：可比性按它们看（_apply_contract）；输入追不到原始数据的，受管级别的
+    # 正式运行记缺口（降档，和证据面板「追不到原始数据」的说法一致：代码节点自称取数也不能完整出具），其余写进出具声明
+    out["cited_metrics"] = _cited_metrics(doc, catalog, state)
+    if stray := _untraced(out["cited_metrics"], ctx):
+        if governed:
+            gaps.extend(u["gap"] for u in stray)
+        out["untraced"] = {"metrics": [{k: u[k] for k in ("metric", "name", "stops")} for u in stray[:_LISTED]],
+                           "counted": governed}
 
     mine = next((r for r in reports if r["node"].id == report_from), None)
     edited = mine["edited"] if mine else []
@@ -858,6 +931,70 @@ def _claims(out: dict[str, Any], contract: dict[str, Any], payload: dict[str, An
     }
 
 
+#: 报告节点 analysis_claims 的三种处置，从松到严
+_ANALYSIS_ORDER = ("off", "check", "strict")
+
+
+def _analysis_claims(out: dict[str, Any], doc: dict[str, Any], payload: Any, found: list[dict[str, Any]], *,
+                     title: str, node_id: str) -> None:
+    """分析说法核对的出口独立复核（00-总方案 §3.5、D9）：found 是 verify_doc 这次重新核出的说法违规（只有文档记了
+    analysis_claims 那一项才核，老文档复核结果不变）。
+
+    处置取报告文档记下的和报告节点产出里写的更严的那个：strict 有违规就记一条缺口（降档），报告节点报上来的同一条
+    （产出的 analysis_gap）不再重复收；check 只写进出具声明作标注、不影响档位。要求 strict、文档里却没有核对记录的
+    （不该发生），照实记一条缺口：出口替不了报告节点去核。结果放进 out["analysis"]（出具声明的 analysis_claims），
+    strict 和有违规时才有。"""
+    from app.engine import analysis_claims as said
+
+    found_mode = said.recorded(doc)
+    written = payload.get("analysis_claims") if isinstance(payload, dict) else None
+    modes = [m for m in (found_mode[0] if found_mode else None, written) if m in _ANALYSIS_ORDER]
+    mode = max(modes, key=_ANALYSIS_ORDER.index) if modes else None
+    if mode in (None, "off"):
+        return
+    if found_mode is None:
+        if mode == "strict":
+            out["gaps"].append(f"报告「{title}」要求严格核对分析说法，但文档中没有分析说法的核对记录，分析说法未核对")
+        return
+    counted = mode == "strict"
+    if found and counted:
+        out["gaps"].append(f"报告「{title}」有 {len(found)} 处分析说法未通过核对（{said.summary(found)}）："
+                           "判断要挂对应的分析结论并照判定写，原因要有知识库原话或运行输入作依据")
+        if isinstance(payload, dict) and isinstance(payload.get("analysis_gap"), str):
+            out["analysis_skip"] = {node_id: {payload["analysis_gap"]}}
+    if found or counted:
+        keep = ("code", "text", "claim", "op", "analyses", "unit", "segment", "span", "message", "context")
+        out["analysis"] = {"mode": mode, "count": len(found), "counts": said.counts(found), "counted": counted,
+                           "violations": [{k: v[k] for k in keep if v.get(k) not in (None, "", [])}
+                                          for v in found[:_LISTED]]}
+
+
+def _cited_metrics(doc: dict[str, Any], catalog: dict[str, Any], state: GraphState) -> list[dict[str, Any]]:
+    """报告引用了的指标（[[m:]] 片段和句末 [[see:m:…]]）：口径卡产出里的那一条（带 inputs、comparability），按引用的先后、
+    同一张卡的同一个指标只算一次。目录里认不出、卡的产出里找不到的跳过。"""
+    from app.engine.evidence import iter_units
+
+    nodes = state.get("nodes") or {}
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for _, unit in iter_units(doc):
+        cites = [s.get("cite") for s in unit.get("segments") or [] if s.get("ref") and not s.get("auto")]
+        for cite in [*cites, *(unit.get("see") or [])]:
+            if not isinstance(cite, dict) or cite.get("kind") != "metric" or cite.get("status") != "resolved":
+                continue
+            entry = catalog.get(cite.get("alias")) or {}
+            card, mid = str(entry.get("node_id") or ""), str((entry.get("locator") or {}).get("metric") or "")
+            if entry.get("kind") != "metric" or not card or not mid or (card, mid) in seen:
+                continue
+            seen.add((card, mid))
+            payload = nodes.get(card)
+            metric = next((m for m in (payload.get("metrics") or []) if isinstance(m, dict) and str(m.get("id")) == mid),
+                          None) if isinstance(payload, dict) else None
+            if metric is not None:
+                out.append(metric)
+    return out
+
+
 def _cited_no_data(doc: dict[str, Any], catalog: dict[str, Any]) -> list[str]:
     """报告直接引用的格里，落在「查询区间里这张表没有数据」的列上的（查询快照的 no_data，data/coverage.py）：按列一句缺口
     「报告引用的 Q1「上周到访人数」：所依据的查询区间里这张表没有数据（…）」。读不出来的快照不算。"""
@@ -895,37 +1032,51 @@ def _cited_queries(doc: dict[str, Any], catalog: dict[str, Any]) -> tuple[dict[s
     单元格（[[v:Q1.r0.gmv]]，[[table:]] 展开后也是一格一格的引用）按查询数：一格写「Q1 第 1 行「gmv」」，
     几格写「Q1 的 3 格」；只拿它当依据（[[see:Q1]]）的写「Q1（结论依据）」。出具契约据此判这些查询有没有通过
     SQL 检查（issuance.sql_check_gaps）。
+
+    分析结论按它的工件记（sql_problems.query_problems 顺着结论的输入找到查询）：结果表的格同上（A3 第 1 行「share」）；
+    判定语、具名标量写「A3（判定语）」「A3「top_share」」，当依据（[[see:A3]]）的写「A3（结论依据）」——引用了一份分析
+    结论，它的输入查询上的问题照样计入缺口。
     """
     from app.engine.evidence import iter_units
 
     cells: dict[str, list[tuple[Any, Any]]] = {}
+    said: dict[str, list[str]] = {}         # 分析结论的判定语、具名标量：{A 编号: [键或 None…]}
     support: list[str] = []
     for _, unit in iter_units(doc):
         for seg in unit.get("segments") or []:
             cite = seg.get("cite") or {}
-            if cite.get("kind") == "cell" and cite.get("status") == "resolved" and cite.get("alias"):
+            if cite.get("status") != "resolved" or not cite.get("alias"):
+                continue
+            if cite.get("kind") == "cell":
                 loc = cite.get("locator") or {}
                 cells.setdefault(str(cite["alias"]), [])
                 if (loc.get("row"), loc.get("column")) not in cells[str(cite["alias"])]:
                     cells[str(cite["alias"])].append((loc.get("row"), loc.get("column")))
+            elif cite.get("kind") == LEDGER_KIND:
+                keys = said.setdefault(str(cite["alias"]), [])
+                key = (cite.get("locator") or {}).get("key")
+                if key not in keys:
+                    keys.append(key)
         for cite in unit.get("see") or []:
             alias = str((cite or {}).get("alias") or "")
-            if (catalog.get(alias) or {}).get("kind") == "query" and alias not in support:
+            if (catalog.get(alias) or {}).get("kind") in ("query", LEDGER_KIND) and alias not in support:
                 support.append(alias)
     queries: dict[str, list[str]] = {}
     # 目录里全部查询的编号：合并查询的输入没被直接引用，缺口里也要写得出它是 Q 几
     aliases = {str(e["artifact"]): str(e["alias"]) for e in catalog.values()
                if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact") and e.get("alias")}
-    for alias in [*cells, *(a for a in support if a not in cells)]:
+    for alias in dict.fromkeys([*cells, *said, *support]):
         artifact = (catalog.get(alias) or {}).get("artifact")
         if not isinstance(artifact, str) or not artifact:
             continue
         hit = cells.get(alias) or []
+        refs = []
         if len(hit) == 1 and isinstance(hit[0][0], int):
-            ref = f"{alias} 第 {hit[0][0] + 1} 行「{hit[0][1]}」"
-        else:
-            ref = f"{alias} 的 {len(hit)} 格" if hit else f"{alias}（结论依据）"
-        queries.setdefault(artifact, []).append(ref)
+            refs.append(f"{alias} 第 {hit[0][0] + 1} 行「{hit[0][1]}」")
+        elif hit:
+            refs.append(f"{alias} 的 {len(hit)} 格")
+        refs.extend(f"{alias}「{key}」" if key else f"{alias}（判定语）" for key in said.get(alias) or [])
+        queries.setdefault(artifact, []).extend(refs or [f"{alias}（结论依据）"])
     return queries, aliases
 
 
@@ -933,6 +1084,7 @@ def _declare_citations(
     tier: str, cited: dict[str, Any], *, calibers: list[dict[str, str]], metrics: list[dict[str, Any]],
     gaps: list[str], missing_required: list[str], missing_expected: list[str], report_from: str,
     declared_at: Any, ctx: NodeContext, sql_checks: list[dict[str, Any]] | None = None,
+    comparability: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """引用模式的 _issuance。旧字段一个不少（老前端照常显示），另加 mode、report、unresolved。"""
     # 节点 id 和报告文档、report.checked 事件上记的同一个（这次运行里的，子工作流里的带前缀）
@@ -957,6 +1109,10 @@ def _declare_citations(
         **({"entities": cited["entities"]} if cited.get("entities") else {}),
         # 没通过 SQL 检查的查询（结构化）：报告页据此在显眼处说明降档原因。没有就不加这个键
         **({"sql_checks": sql_checks} if sql_checks else {}),
+        # 分析说法核对（strict，或者有违规时）、指标的可比性、报告引用的指标里追不到原始数据的：同样只在有的时候带
+        **({"analysis_claims": cited["analysis"]} if cited.get("analysis") else {}),
+        **({"comparability": comparability} if comparability else {}),
+        **({"untraced": cited["untraced"]} if cited.get("untraced") else {}),
     }
     entities = cited.get("entities")
     ctx.emit(
@@ -983,6 +1139,9 @@ def _declare_citations(
         **({"entities": {"unknown": (cited["stats"] or {}).get("unknown_entities", len(entities["unknown"])),
                          "unverified": (cited["stats"] or {}).get("unverified_entities", len(entities["unverified"])),
                          "counted": entities["counted"]}} if entities else {}),
+        # 分析说法：处置、几处、记没记缺口（名单只在出具声明里）
+        **({"analysis_claims": {k: cited["analysis"][k] for k in ("mode", "count", "counted")}}
+           if cited.get("analysis") else {}),
     )
     return issuance
 

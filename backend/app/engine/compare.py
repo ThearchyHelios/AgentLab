@@ -134,7 +134,8 @@ _CFG_KEYS: dict[str, frozenset[str]] = {
     "retrieve": frozenset({"query", "collection", "limit", "alpha", "rerank", "min_score", "assign_to"}),
     "metrics": frozenset({"metrics", "caliber", "caliber_version", "on_missing", "assign_to"}),
     "report": _MODEL_KEYS | {"numbers", "claims", "judge", "entities", "max_repairs", "system", "instructions",
-                             "on_violation", "evidence_from", "metrics_from", "emit_message", "assign_to"},
+                             "on_violation", "evidence_from", "metrics_from", "emit_message", "assign_to",
+                             "analysis_claims", "analysis_scope"},
 }
 #: 只在调模型时才读的（_calls_model）：条件分支让模型分类、结构校验让模型修复（默认开着）、知识检索用模型重排
 _CFG_KEYS_IF: dict[str, frozenset[str]] = {

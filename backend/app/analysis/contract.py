@@ -397,6 +397,8 @@ class ScopeBlock(TypedDict, total=False):
     not_decomposed: list[str] | None  # 候选维度里没拆过的叫法；None = 候选维度核对不了
     note: str | None                  # 核对不了时的一句说明
     tests: int                        # 这次做了几次差异检验
+    corrected: bool | None            # 检验校正过没有：只做了一次为 True（一次里比了多对的已按次数校正），不止一次为
+                                      # False（几次之间没有校正），没做为 None
 
 
 #: 复算核对时不比的字段：hypothesis 是 agent 写的话，不是算出来的

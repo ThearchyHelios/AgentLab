@@ -149,8 +149,9 @@ def weekly(*, report=None, contract=None) -> dict:
         node("start", "input", fields=[{"name": "week", "default": "2026-W37"}]),
         node("fetch", "transform", mode="expression", expression="{'gmv': 45678.5}", assign_to="kpi"),
         node("caliber", "metrics", caliber="周报口径", caliber_version="v2", metrics=METRICS),
+        # 这里测的是裁判：写作者那句「增长主要来自新客首单」没有分析结论可挂，分析说法核对关掉，免得多重写一次
         node("write", "report", instructions="写周报", **{"claims": "judge", "judge": {"max_cost_usd": 0.05},
-                                                           **(report or {})}),
+                                                           "analysis_claims": "off", **(report or {})}),
         node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
              contract={"report_from": "write", "metrics_from": ["caliber"], "required": ["gmv"], "strict": True,
                        **(contract or {})}),

@@ -57,7 +57,7 @@ def weekly(source: str, sql: str) -> dict:
         node("card", "metrics", "周报口径卡", caliber="周报口径", metrics=[
             {"id": "gmv", "name": "订单金额", "unit": "元", "expression": "cell(nodes.fetch, 0, 'gmv')"}]),
         node("write", "report", "报告撰写", instructions="写周报",
-             numbers="strict", on_violation="fail", claims="require_citation"),
+             numbers="strict", on_violation="fail", claims="require_citation", analysis_claims="strict"),
         node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}],
              contract={"report_from": "write", "metrics_from": ["card"], "required": ["gmv"], "strict": True}),
     ]

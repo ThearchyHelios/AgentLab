@@ -58,7 +58,9 @@ def weekly(*, gate=False, **report):
         node("fetch", "transform", mode="expression", expression="{'gmv': 45678.5}", assign_to="kpi"),
         node("caliber", "metrics", caliber="周报口径", caliber_version="v2", metrics=METRICS),
         *([node("gate", "human", mode="approve", title="确认口径")] if gate else []),
-        node("write", "report", instructions="写周报", **report),
+        # 这里测的是裁判：写作者那句「增长主要来自新客首单」没有分析结论可挂，分析说法核对关掉，免得多重写一次
+        # （说法核对见 test_report_analysis_claims.py）
+        node("write", "report", instructions="写周报", **{"analysis_claims": "off", **report}),
         node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
     ]
     ids = [n["id"] for n in nodes]

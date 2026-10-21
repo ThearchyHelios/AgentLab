@@ -18,6 +18,7 @@ from app.engine.schema import (
     ValidationResult,
     _ancestors,
     _caliber_inputs,
+    analysis_claims_problem,
     claims_problem,
     contract_needs_metrics,
     judge_problems,
@@ -324,7 +325,8 @@ def _lint_contract(
 #
 # G1 带契约的出口核对报告撰写节点的文档，成果字段的文字只能来自报告撰写节点
 # G2 模型写的文字不绕过报告撰写节点直接流进出口（从图上追）
-# G3 报告撰写节点写明 numbers: strict、on_violation: fail、claims: require_citation（或 judge，带上预算）
+# G3 报告撰写节点写明 numbers: strict、on_violation: fail、claims: require_citation（或 judge，带上预算）、
+#    analysis_claims: strict（分析能力一轮加的：判断词没挂对分析结论的句子重写后仍有的计入缺口）
 # G4 口径卡的输入不来自计算角色的沙箱代码
 # G5 给口径卡供数的 agent 配 output_schema 并开 cite_fields（模型调用节点不能给口径卡供数）
 #
@@ -332,13 +334,18 @@ def _lint_contract(
 # 下次发布才按这些规则查。受管级别挡住发布，已发布级别只给警告。
 # --------------------------------------------------------------------------
 
-#: 报告撰写节点在受管级别里要写明的三项：(配置键, 要求的值, 为什么)。给人看的时候键和值都换成
-#: labels 里的界面叫法
+#: 报告撰写节点在受管级别里要写明的几项：(配置键, 要求的值, 为什么)。给人看的时候键和值都换成
+#: labels 里的界面叫法。自动修复、一键升级、按口径出具起草的报告节点都照这一份写（autofix、upgrade、ledger/certify）。
+#: analysis_claims 没写时运行时是 check（只标注、不影响档位），受管级别要写明 strict；已经发布的版本照常运行，下次发布才按
+#: 这一条查（和别的 G 规则一样只在发布、发布前检查时起作用）
 REPORT_POLICY = (
     ("numbers", "strict", "没有出处的数字判为违规"),
     ("on_violation", "fail", "重写后仍有违规时节点失败，不带着问题出具"),
     ("claims", "require_citation", "未附依据的结论句计入缺口，出具按档位降档"),
+    ("analysis_claims", "strict", "判断词没挂对分析结论、原因没有依据的句子重写后仍有的计入缺口，出具按档位降档"),
 )
+#: 取值写错了由 validate 报（report.claims_invalid、report.analysis_claims_invalid），G3 不重复
+_POLICY_PROBLEMS = {"claims": claims_problem, "analysis_claims": analysis_claims_problem}
 #: 除了 REPORT_POLICY 里写的那个值，还认的更严的写法。claims: judge 在挂引用之外再请另一个模型按证据逐句
 #: 裁判，不支持的按 on_unsupported 判档——比 require_citation 严，但要写预算（见 judge_budget_missing）
 REPORT_POLICY_ALSO: dict[str, tuple[str, ...]] = {"claims": (CLAIMS_JUDGE,)}
@@ -669,8 +676,8 @@ def _lint_evidence(spec: GraphSpec, flag: Callable[..., None], *, strict: bool) 
         loose = []
         for key, want, why in REPORT_POLICY:
             value = _effective(spec, node, key)
-            if key == "claims" and claims_problem(value):
-                continue        # 写了不认识的值，validate 的 report.claims_invalid 报
+            if key in _POLICY_PROBLEMS and _POLICY_PROBLEMS[key](value):
+                continue        # 写了不认识的值，validate 的 report.claims_invalid / analysis_claims_invalid 报
             also = REPORT_POLICY_ALSO.get(key, ())
             if value != want and value not in also:
                 now = "当前未设置" if value in (None, "") else f"当前为「{option_label(key, value)}」"
