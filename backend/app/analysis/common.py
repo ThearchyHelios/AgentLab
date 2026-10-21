@@ -106,6 +106,14 @@ def need(raw: Mapping[str, Any], key: str, what: str) -> Any:
     return value
 
 
+def reserved_check(column: str, reserved: Sequence[str], what: str) -> None:
+    """结果表的列 id 是输入的维度列（期次列）加上固定的几列：重名了列 id 就重复，引用结果表的格、下钻按的维度数都会认错。
+    遇到这些名字（不分大小写）是调用错误，让 agent 在 SQL 里换个别名。"""
+    if column.lower() in {r.lower() for r in reserved}:
+        raise CallError("reserved_column", f"{what}「{column}」和结果表的列重名（结果表要用 {'、'.join(reserved)} 这几个名字）："
+                                           f"在 SQL 里给它换个别名再分析，比如 AS {column}_name")
+
+
 def written_places(raw: Any) -> int:
     """快照里一格写到第几位小数（headline 是取整过的，按它的书写精度容差）：数字文本按字面，浮点按最短写法，整数为 0。是整数
     的浮点（SQLite 的 ROUND() 交回 2120.0）是取到个位的，也为 0——最短写法里的「.0」不是书写精度。"""
@@ -152,4 +160,4 @@ def sign_word(value: Fraction | float | int) -> str | None:
 
 
 __all__ = ["DERIVED_PARAMS", "Env", "build", "closes", "column_label", "column_types", "label_for", "need", "refuse",
-           "sign_word", "today_param", "written_places"]
+           "reserved_check", "sign_word", "today_param", "written_places"]

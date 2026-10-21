@@ -26,8 +26,8 @@ from typing import Any
 
 from app.analysis import comparable as cmp
 from app.analysis import phrases as ph
-from app.analysis.common import (Env, build, closes, column_label, column_types, label_for, need, refuse, sign_word,
-                                 today_param)
+from app.analysis.common import (Env, build, closes, column_label, column_types, label_for, need, refuse,
+                                 reserved_check, sign_word, today_param)
 from app.analysis.contract import CallError
 from app.analysis.inputs import Snap, as_list, hashable, same_value
 from app.analysis.numbers import canon, to_fraction
@@ -81,9 +81,10 @@ def _key_strings(key: Sequence[Any]) -> list[str]:
     return [ph.key_text([k]) for k in key]
 
 
-def _sides(raw: Mapping[str, Any], env: Env, roles: Sequence[tuple[str, str]], *, by_needed: bool = True
-           ) -> tuple[dict[str, Any], Snap, Snap, dict[str, str], list[str]]:
-    """一份或两份快照：(规范化的参数, 基期快照, 本期快照, {角色: 列名}, 维度列)。roles 是 [(参数名, 角色的叫法)]。"""
+def _sides(raw: Mapping[str, Any], env: Env, roles: Sequence[tuple[str, str]], *, by_needed: bool = True,
+           reserved: Sequence[str] = ()) -> tuple[dict[str, Any], Snap, Snap, dict[str, str], list[str]]:
+    """一份或两份快照：(规范化的参数, 基期快照, 本期快照, {角色: 列名}, 维度列)。roles 是 [(参数名, 角色的叫法)]；reserved 是
+    结果表固定的列名，维度列不能叫这些。"""
     params: dict[str, Any] = {}
     two = raw.get("base_query") is not None or raw.get("target_query") is not None
     if two:
@@ -105,6 +106,8 @@ def _sides(raw: Mapping[str, Any], env: Env, roles: Sequence[tuple[str, str]], *
         if two:
             for c in by:
                 base.column(c, "维度列")
+        for c in by:
+            reserved_check(c, reserved, "维度列")
         params["by"] = by
     cols: dict[str, str] = {}
     for key, what in roles:
@@ -284,7 +287,7 @@ def _share_rank(segments: Sequence[Any], share: Any) -> list[Any]:
 
 def additive(raw: Mapping[str, Any], env: Env) -> Any:
     used = list(USED["additive"])
-    params, bs, ts, cols, by = _sides(raw, env, [("measure", "度量列")])
+    params, bs, ts, cols, by = _sides(raw, env, [("measure", "度量列")], reserved=_FIXED_ADDITIVE)
     measure = cols["measure"]
     label = label_for(env, raw.get("label"), ts, measure)
     if raw.get("label") is not None:
@@ -444,7 +447,8 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
 
 def ratio(raw: Mapping[str, Any], env: Env) -> Any:
     used = list(USED["ratio"])
-    params, bs, ts, cols, by = _sides(raw, env, [("numerator", "分子列"), ("denominator", "分母列")])
+    params, bs, ts, cols, by = _sides(raw, env, [("numerator", "分子列"), ("denominator", "分母列")],
+                                      reserved=_FIXED_RATIO)
     num, den = cols["numerator"], cols["denominator"]
     num_label, den_label = column_label(env, ts, num), column_label(env, ts, den)
     label = ph.pick_label(raw.get("label"), ph.say(num_label, "与", den_label, "之比"))

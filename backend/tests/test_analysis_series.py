@@ -319,3 +319,11 @@ async def test_a_falling_trend_whose_last_weeks_rise_says_but():
     falling = await trend(weeks([200, 196, 190, 188, 181, 176, 170, 165, 160, 162, 165, 168]))
     assert falling["verdict"]["code"] == "falling" and falling["values"]["run_direction"] == "up"
     assert falling["phrase"].endswith("，但最近已连续 3 周上升")
+
+
+async def test_a_period_column_named_like_a_result_column_is_a_call_error():
+    rows = [[r[0], r[1]] for r in weeks(NOISE + [101])]
+    named = snap("Q1", "SELECT DATE(order_date, 'weekday 0', '-6 days') AS value, COUNT(*) AS orders FROM orders "
+                       "GROUP BY 1", ["value", "orders"], rows)
+    error = await call_error("baseline", snaps=[named], query="Q1", period="value", measure="orders")
+    assert error.code == "reserved_column" and "期次列「value」和结果表的列重名" in error.message

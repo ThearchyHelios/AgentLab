@@ -9,6 +9,7 @@ from fractions import Fraction
 
 import pytest
 
+from app.analysis import DATA_ERRORS
 from app.analysis.decompose import lmdi, ratio_effects
 from tests.analysis_samples import analyze, call_error, fixed_prober, notes, snap
 
@@ -487,3 +488,19 @@ async def test_a_label_cannot_carry_a_judgment_into_the_phrase():
     # 消过一遍会变的叫法：复算拿记下的叫法再消，判定语逐字相同（analyze 核对复算逐字段相同）
     marked = await additive(label="销售额[ [v:Q1.r0.gmv] ]")
     assert marked["params"]["label"] == "销售额" and marked["phrase"].startswith("销售额下降 194")
+
+
+async def test_a_dimension_named_like_a_result_column_is_a_call_error():
+    rows = [["线上", "2026-W41", 820], ["线上", "2026-W42", 700], ["线下", "2026-W41", 600], ["线下", "2026-W42", 560]]
+    flagged = snap("Q2", "SELECT channel AS flag, week, SUM(amount) AS gmv FROM orders GROUP BY 1, 2",
+                   ["flag", "week", "gmv"], rows)
+    error = await call_error("decompose", "additive", snaps=[flagged], query="Q2", by=["flag"], period="week",
+                             base="2026-W41", target="2026-W42", measure="gmv")
+    assert error.code == "reserved_column" and "在 SQL 里给它换个别名" in error.message and "AS flag_name" in error.message
+    assert error.code not in DATA_ERRORS                               # 结构性的：分析卡里照旧让卡失败
+    ratio_rows = [["线上", "W41", 50, 1000], ["线上", "W42", 80, 1000], ["线下", "W41", 20, 1000], ["线下", "W42", 26, 1000]]
+    mixed = snap("Q1", "SELECT channel AS Mix, week, SUM(refund_flag) AS refunds, COUNT(*) AS orders FROM orders "
+                       "GROUP BY 1, 2", ["Mix", "week", "refunds", "orders"], ratio_rows)
+    error = await call_error("decompose", "ratio", snaps=[mixed], query="Q1", by="Mix", period="week", base="W41",
+                             target="W42", numerator="refunds", denominator="orders")
+    assert error.code == "reserved_column" and "「Mix」" in error.message

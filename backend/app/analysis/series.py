@@ -31,7 +31,8 @@ from app.analysis import comparable as cmp
 from app.analysis import periods as pd
 from app.analysis import phrases as ph
 from app.analysis import stats
-from app.analysis.common import Env, build, column_label, column_types, label_for, need, refuse, sign_word, today_param
+from app.analysis.common import (Env, build, column_label, column_types, label_for, need, refuse, reserved_check,
+                                 sign_word, today_param)
 from app.analysis.contract import CallError
 from app.analysis.inputs import Snap, same_value
 from app.analysis.numbers import canon, to_fraction
@@ -45,6 +46,8 @@ USED: dict[str, tuple[str, ...]] = {
     "baseline": ("k_warn", "k_alert", "min_history", "max_history"),
     "trend": ("trend_min_points", "trend_alpha", "max_history"),
 }
+#: 结果表在期次列之外固定的几列（期次列不能叫这些）
+FIXED: dict[str, tuple[str, ...]] = {"baseline": ("value", "change", "role"), "trend": ("value", "change")}
 
 
 def refusal_basis(op: str, settings: Mapping[str, Any]) -> tuple[list[str], str]:
@@ -83,6 +86,7 @@ def _load(raw: Mapping[str, Any], env: Env, used: list[str]) -> Series | Any:
     """读出一条序列；算不了时直接交回 refused 的结论。"""
     snap = env.inputs.snap(need(raw, "query", "查询编号"), "查询编号")
     period = snap.column(need(raw, "period", "期次列"), "期次列")
+    reserved_check(period, FIXED[env.op], "期次列")
     measure = snap.column(need(raw, "measure", "度量列"), "度量列")
     grain = raw.get("grain")
     if grain is not None and grain not in (*pd.GRAINS, "seq"):
@@ -369,4 +373,4 @@ def _tail_gap(series: Series, ordinal: int) -> str:
     return "再往前缺期"
 
 
-__all__ = ["MAD_SCALE", "USED", "baseline", "refusal_basis", "run_length", "trend", "unreadable_text"]
+__all__ = ["FIXED", "MAD_SCALE", "USED", "baseline", "refusal_basis", "run_length", "trend", "unreadable_text"]
