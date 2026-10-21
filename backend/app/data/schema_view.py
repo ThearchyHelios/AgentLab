@@ -6,7 +6,7 @@
 
 **遮罩规矩。** 遮罩列（data/engine.py 的 masked_columns，按列名设在整个数据源上）只给列名和类型：它的注释、目录里
 这一列的各项（含码值、带具体取值的说明）都不给。和表助手（data/catalog_assistant.py）是同一条规矩。代价是运行时
-agent 看到的目录少了遮罩列那部分（README 写明）。
+agent 看到的目录少了遮罩列那部分（docs/zh-CN/data-catalog.md 写明）。
 
 **剖析事实**（next-round 遗留 e）：剖析记下的行数估算和依据、各日期列的范围（catalog_profile_jobs.last_facts）在表详情里
 成一节（profile_lines），后面跟一句固定提示「只供写查询参考……不能作为回答里的数」——剖析数字是会过期的观测，叙述层无算术靠

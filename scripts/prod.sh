@@ -18,7 +18,7 @@ usage() {
 
 默认只在 frontend/dist 不存在、或者比前端源码旧的时候才构建。
 数据目录照后端配置：默认是仓库下的 data/，用环境变量 AGENTLAB_DATA_DIR 改。
-应用库是 SQLite（缺省）时只能单进程；换成 PostgreSQL 之后可以多进程（README.zh-CN.md「多进程」）。
+应用库是 SQLite（缺省）时只能单进程；换成 PostgreSQL 之后可以多进程（docs/zh-CN/postgresql-and-scaling.md「多进程」）。
 USAGE
 }
 
