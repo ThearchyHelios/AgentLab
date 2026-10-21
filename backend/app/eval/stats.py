@@ -22,23 +22,13 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-#: 95% 区间的 z
-Z95 = 1.959963984540054
+#: Wilson 区间和 95% 区间的 z 在分析的统计里（总方案 D13：分析和评测共用一套纯 Python 的统计），这里引用、行为不变
+from app.analysis.stats import Z95, wilson
+
 #: 问数据页等复核最多这么久（毫秒，同 answer.REVIEW_PAGE_WAIT_S）
 REVIEW_PAGE_WAIT_MS = 25_000
 TIERS = ("formal", "degraded", "withheld", "explore")
 TIMING_KEYS = ("build_ms", "run_wall_ms", "run_active_ms", "review_ms", "total_ms")
-
-
-def wilson(passed: int, n: int, z: float = Z95) -> tuple[float, float] | None:
-    """Wilson 区间（缺省 95%）。n 为 0 时没有区间。"""
-    if n <= 0:
-        return None
-    p = passed / n
-    denom = 1 + z * z / n
-    centre = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4)
 
 
 def mcnemar_exact(only_a: int, only_b: int) -> float:
