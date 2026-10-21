@@ -333,10 +333,8 @@ async def test_headline_inputs_show_the_closure(client):
     assert next(s for s in body["chain"] if s["step"] == "analysis_recompute")["status"] == "same"
 
 
-async def test_a_ratio_headline_closes_against_the_overall_ratio(client):
-    """比率拆解给了整体比率的两格（headline）：闭合核对对着结论里的整体比率，即各段分子之和 ÷ 分母之和（r_base_total、
-    r_target_total），角色写「基期整体比率」「本期整体比率」，closure.mode 写明是比率（导出页照它说「各段分子之和 ÷ 分母
-    之和」，不说「各段之和」）。以前只认可加拆解的总数键，比率拆解的 headline 不显示闭合核对。"""
+async def ratio_run() -> dict[str, Any]:
+    """一次封存的运行：按渠道拆退款率（比率拆解），给了整体比率的两格（headline，0.035 → 0.053），报告引用判定语。"""
     rates = {"columns": ["channel", "week", "refunds", "orders"],
              "column_types": {"channel": "text", "week": "text", "refunds": "number", "orders": "number"},
              "rows": [["线上", "W41", 50, 1000], ["线上", "W42", 80, 1000], ["线下", "W41", 20, 1000],
@@ -352,7 +350,14 @@ async def test_a_ratio_headline_closes_against_the_overall_ratio(client):
                             query="Q2", by=["channel"], period="week", base="W41", target="W42", numerator="refunds",
                             denominator="orders", label="退款率", headline={"base": "Q5.r0.rate", "target": "Q5.r1.rate"})
     assert result["status"] == "ok" and result["verdict"]["code"] != "unclosed"
-    made = await sealed_run("[[a:A1]]。", result=result, queries=[rates, head])
+    return await sealed_run("[[a:A1]]。", result=result, queries=[rates, head])
+
+
+async def test_a_ratio_headline_closes_against_the_overall_ratio(client):
+    """比率拆解给了整体比率的两格（headline）：闭合核对对着结论里的整体比率，即各段分子之和 ÷ 分母之和（r_base_total、
+    r_target_total），角色写「基期整体比率」「本期整体比率」，closure.mode 写明是比率（导出页照它说「各段分子之和 ÷ 分母
+    之和」，不说「各段之和」）。以前只认可加拆解的总数键，比率拆解的 headline 不显示闭合核对。"""
+    made = await ratio_run()
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
     inputs = {s["role"]: s for s in body["chain"] if s["step"] == "analysis_input"}
     assert inputs["headline_base"]["closure"] == {"mode": "ratio", "total_key": "r_base_total", "total": "0.035",
