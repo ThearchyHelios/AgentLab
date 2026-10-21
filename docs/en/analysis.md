@@ -143,6 +143,7 @@ The built-in template 11, Anomaly Analysis (Traceable), is built this way: fetch
 ```
 
 - The Analysis Conclusions section of the writing catalog lists each conclusion's number, verdict phrase, named values, the top 10 segments of its result table, and caveats or the reason it couldn't be done.
+- The system shows shares and change rates in analysis conclusions as percentages (`[[a:A1.top_share]]` and `[[v:A1.r0.share]]` render as 62.0%), and changes in rates in percentage points (1.2 percentage points); writers cite them as usual and do not add a conversion. A conversion the writer does write is kept.
 - Conclusions from analysis cards can always be cited. In formal issuance at the governed level, analyses an agent ran on the spot with analysis tools follow the same rule as the cells it queried: they can be cited only when the issuance contract turns on Cell Citations (they can still serve as the basis at the end of a sentence).
 - The measure name in a verdict phrase comes from the agent or the template; the system first strips digits, percent signs, units, and citation markers from it and cuts it to 20 characters, so text written by the system never smuggles in numbers written by the model.
 
