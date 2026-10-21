@@ -7,6 +7,9 @@
 //   - 加题四种方式：写 SQL 定期望（选数据源、写 SQL、预览、点选格、试算、保存）、遮罩列拒收的原话落在 SQL 下面、选口径（不能复用
 //     的照列、写原因、选不了）、从问数据运行认定（选运行、选查询、选取哪一列）、期望反问（不带期望答案）；交上去的请求体逐项核对，
 //     数值期望不许人填（请求体里不出现 value 这类键）；
+//   - 分析期望（贡献、判定）：预览之后选做哪种分析、模式、按哪几列，试算写出服务端算的判定和判定语，请求体只有分析方法和参数
+//     （不带来源、方向、判定）；编辑配了几个期望的题，另外的期望照旧保留；结果页逐题写期望和答案的判定、点开写判定语和引用了
+//     哪一份结论或正文那一句，总览按期望的种类分开写；
 //   - 口径升版待处置：顶部提示、处置三选一（叫法由服务端给，没有缺省）；启用开关、导出；
 //   - 发起评测：估算和发起是同一份请求体，评一次 / A/B 对照 / 目录贡献对照（预设）各自的请求体；估算的项数、花费、今天已花照服务端写；
 //     上一次的调用金额估不出时估算写「估不出花费」、估出一部分的写「至少约」，总览的每题平均不写成 $0；
@@ -178,6 +181,42 @@ const RESULTS = [
     question: CASE_ASK.question, cost: { cost_usd: 0.008, unpriced_calls: 0 } },
 ]
 const EVAL_OLD = { ...EVAL_DONE, id: 'ev-old', created_at: iso(NOW - 48 * H), summary: { ...SUMMARY, accuracy: RATE(1, 3), baseline: undefined } }
+// 分析期望：贡献（变化拆解）、判定（波动基线……）。判定语、判定类都是服务端算好交来的，界面照原样写
+const PHRASE_EAST = '销售额下降 194（-8.7%），主要来自华东（-120，占 61.9%）'
+const PREVIEW_WEEKS = { status: 'ok', reason: null, code: null, columns: ['地区', '周', 'gmv'],
+  rows: [['华东', '2026-10-05', 820], ['华东', '2026-10-12', 700], ['华南', '2026-10-05', 700], ['华南', '2026-10-12', 626]], row_count: 4,
+  truncated: false, shown: 4, run_id: 'run-preview-3', rendered: { sql: 'SELECT region AS 地区, week AS 周, SUM(amount) AS gmv FROM orders GROUP BY 地区, 周' } }
+const TRIAL_ANALYSIS = { status: 'ok', as_of: iso(NOW), reason: null, code: null, run_ids: ['run-trial-2'], rendered: {},
+  sets: [{ run_id: 'run-trial-2', snapshot: 'snap-2', version: null, values: { e1: { kind: 'contribution', status: 'ok', op: 'decompose',
+    mode: 'additive', method: '变化拆解（可加）', judgement: 'source', subjects: ['华东'], direction: 'down', phrase: PHRASE_EAST } } }] }
+const CASE_AN = { ...CASE_SQL, id: 'case-an', suite_id: 'suite-b', seq: 1, question: '上周销售额为什么下降？', version: 1,
+  expectations: [{ id: 'source', kind: 'contribution', required: true, op: 'decompose', mode: 'additive',
+    params: { by: ['地区'], period: '周', measure: 'gmv' }, top_n: 1 },
+  { id: 'gmv', kind: 'scalar', column: 'gmv', row: 0, required: false, label: '华东上上周的销售额' }] }
+const WANT_EAST = { judgement: 'source', subjects: ['华东'], direction: 'down', phrase: PHRASE_EAST, method: '变化拆解（可加）', status: 'ok' }
+const RESULTS_AN = [
+  { ...RESULTS[0], id: 'r-a1', eval_run_id: 'ev-an', case_id: 'case-an', case_seq: 1, question: '上周销售额为什么下降？', question_template: null, verdict: 'pass',
+    traced: true, scores: [{ id: 'source', kind: 'contribution', required: true, outcome: 'traced', want: WANT_EAST,
+      found: { judgement: 'source', subjects: ['华东', '华北'], direction: 'down', alias: 'A1', status: 'ok',
+        phrase: '销售额下降 194（-8.7%），集中在华东、华北（合计占 82.5%）', method: '变化拆解（可加）' } }] },
+  { ...RESULTS[0], id: 'r-a2', seq: 2, eval_run_id: 'ev-an', case_id: 'case-a2', case_seq: 2, question: '上周订单数下降算不算异常？', question_template: null,
+    verdict: 'pass', traced: false, scores: [{ id: 'band', kind: 'verdict', required: true, outcome: 'untraced',
+      want: { judgement: 'normal', phrase: '订单数本期变化 -0.7%，在过去 23 周的常规波动范围内（-8.7% 至 +9.3%）', method: '波动基线', status: 'ok' },
+      found: { judgement: 'normal', text: '订单数的下降在常规波动范围内' } }] },
+  { ...RESULTS[0], id: 'r-a3', seq: 3, eval_run_id: 'ev-an', case_id: 'case-a3', case_seq: 3, question: '上周取消的订单是不是突然变多了？', question_template: null,
+    verdict: 'fail', traced: false, error: '正文写的「取消单数没有异常」和期望对不上', scores: [{ id: 'spike', kind: 'verdict', required: true,
+      outcome: 'wrong', reason: '正文写的「取消单数没有异常」和期望对不上：判定是「取消单数本期变化 +250.0%，明显超出过去 23 周的常规波动范围」',
+      want: { judgement: 'anomaly', direction: 'up', phrase: '取消单数本期变化 +250.0%，明显超出过去 23 周的常规波动范围（-21.4% 至 +30.1%）',
+        method: '波动基线', status: 'ok' }, found: { judgement: 'normal', text: '取消单数没有异常' } }] },
+  { ...RESULTS[0], id: 'r-a4', seq: 4, eval_run_id: 'ev-an', case_id: 'case-a4', case_seq: 4, question: '这周和上周比卖得怎么样？', question_template: null,
+    verdict: 'ungradable', traced: false, error: '期望算不了：期次列「周」里没有本期「2026-10-19」', scores: [{ id: 'comparable', kind: 'verdict',
+      required: true, outcome: 'ungradable', reason: '期望算不了：期次列「周」里没有本期「2026-10-19」',
+      want: { status: 'refused', reason: '期次列「周」里没有本期「2026-10-19」', method: '可比性检查' } }] },
+]
+const EVAL_AN = { ...EVAL_DONE, id: 'ev-an', counts: { total: 4, done: 4, passed: 2, failed: 1, ungradable: 1 },
+  summary: { ...SUMMARY, items: 4, done: 4, cases: 4, verdicts: { pass: 2, fail: 1, ungradable: 1, skipped: 0 }, accuracy: RATE(2, 3),
+    traced_accuracy: RATE(1, 3), outcomes: { traced: 1, untraced: 1, wrong: 1, ungradable: 1 },
+    outcomes_by_kind: { contribution: { traced: 1 }, verdict: { untraced: 1, wrong: 1, ungradable: 1 } } } }
 const COMPARE = {
   base: EVAL_OLD, cleaned: false,
   fingerprint_diff: [{ key: 'writer_model', label: '写作模型', before: 'model-a', after: 'model-b' }, { key: 'schemas', label: '表结构' }],
@@ -356,7 +395,9 @@ function reply(state, method, path, url, body) {
     const rest = m[2] ?? ''
     if (!ev) return { status: 404, json: { detail: '评测不存在', code: 'eval_evaluation_not_found' } }
     if (method === 'GET' && !rest) return { json: ev }
-    if (method === 'GET' && rest === '/results') return { json: { evaluation_id: ev.id, cleaned: false, results: ev.id === 'ev-new' ? RESULTS.slice(0, 1) : RESULTS } }
+    if (method === 'GET' && rest === '/results') {
+      return { json: { evaluation_id: ev.id, cleaned: false, results: ev.id === 'ev-new' ? RESULTS.slice(0, 1) : ev.id === 'ev-an' ? RESULTS_AN : RESULTS } }
+    }
     if (method === 'GET' && rest === '/compare') {
       state.compareBases = [...(state.compareBases ?? []), url.searchParams.get('base')]
       return { json: COMPARE }
@@ -385,7 +426,7 @@ function reply(state, method, path, url, body) {
   }
   m = path.match(/^\/evals\/evaluations\/([^/]+)\/results\/([^/]+)$/)
   if (method === 'GET' && m) {
-    const r = RESULTS.find((x) => x.id === m[2])
+    const r = [...RESULTS, ...RESULTS_AN].find((x) => x.id === m[2])
     return r ? { json: { ...r, details: { turn: { attempts: 1, reason: null, reply: null }, answer: { text: `答案原文：上周销售额 ${r.scores[0]?.got ?? ''} 元` } } } }
       : { status: 404, json: { detail: '这一题的结果不存在' } }
   }
@@ -486,7 +527,8 @@ async function open(path, { state = freshState(), width = 1280, height = 900 } =
 const writes = (state, re) => state.writes.filter((w) => re.test(w.key))
 const lastWrite = (state, re) => writes(state, re).at(-1)
 const text = (page, sel) => page.locator(sel).first().innerText()
-const hasHumanValue = (exps) => (exps ?? []).some((e) => ['value', 'values', 'expected', 'answer', 'rows', 'number'].some((k) => k in e))
+const hasHumanValue = (exps) => (exps ?? []).some((e) => ['value', 'values', 'expected', 'answer', 'rows', 'number', 'segment',
+  'subjects', 'direction', 'verdict', 'judgement'].some((k) => k in e))
 
 // ---------------------------------------------------------------- 导航与权限
 
@@ -691,6 +733,110 @@ await section('加题：选口径、从运行认定、期望反问', async () =>
   check('工作流题：固定已发布的 v3、按入口字段填输入模板，期望照样由 SQL 算', wf?.kind === 'workflow' && wf.workflow_id === 'wf-week'
     && wf.workflow_version === 3 && wf.input_template?.week === '{{ schedule.last_week_start }}' && wf.gold?.kind === 'sql',
     JSON.stringify(wf))
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+await section('分析期望：加题选做哪种分析、试算写判定，编辑保留另外的期望', async () => {
+  const state = freshState({ override: (method, path, body) => {
+    if (method === 'POST' && path === '/evals/suites/suite-b/cases/preview' && String(body?.sql).includes('周')) {
+      state.writes.push({ key: `${method} ${path}`, body })
+      return { json: PREVIEW_WEEKS }
+    }
+    if (method === 'POST' && path === '/evals/suites/suite-b/cases/trial' && body?.expectations?.[0]?.kind === 'contribution') {
+      state.writes.push({ key: `${method} ${path}`, body })
+      return { json: { trial: TRIAL_ANALYSIS } }
+    }
+    return null
+  } })
+  const { page, errors } = await open('/evals/suites/suite-b', { state })
+  await page.locator('[data-eval-add-case]').click()
+  await page.locator('[data-eval-case-editor="sql"]').waitFor()
+  await page.locator('[data-eval-case-question]').fill('上周销售额为什么下降？')
+  await page.locator('[data-eval-case-source]').selectOption('ds-shop')
+  await page.locator('[data-eval-case-sql]').fill('SELECT region AS 地区, week AS 周, SUM(amount) AS gmv FROM orders GROUP BY 地区, 周')
+  await page.locator('[data-eval-case-preview]').click()
+  await page.locator('[data-eval-analysis]').waitFor()
+  check('预览之后能定分析期望：贡献、判定两种', await page.locator('[data-eval-analysis-kind]').count() === 2)
+  await page.locator('[data-eval-analysis-kind="contribution"]').click()
+  check('贡献：模式三种（可加、比率、乘积，叫法同契约）', (await page.locator('[data-eval-analysis-mode] option').allInnerTexts()).join('、')
+    === '变化拆解（可加）、变化拆解（比率）、变化拆解（乘积）', (await page.locator('[data-eval-analysis-mode] option').allInnerTexts()).join('、'))
+  await page.locator('[data-eval-analysis-param-col="地区"]').check()
+  await page.locator('select[data-eval-analysis-param="period"]').selectOption('周')
+  await page.locator('select[data-eval-analysis-param="measure"]').selectOption('gmv')
+  check('期望的种类写做哪种分析、按哪几列：贡献：变化拆解（可加） · 按地区 · gmv',
+    (await text(page, '[data-eval-case-main-text]')) === '贡献：变化拆解（可加） · 按地区 · gmv', await text(page, '[data-eval-case-main-text]'))
+  await page.locator('[data-eval-case-trial]').click()
+  await page.locator('[data-eval-trial="ok"]').waitFor()
+  const trialText = await text(page, '[data-eval-trial="ok"]')
+  check('试算写服务端算的判定和判定语：主要来源：华东（下降）', trialText.includes('主要来源：华东（下降）') && trialText.includes(PHRASE_EAST), trialText)
+  const trialBody = lastWrite(state, /cases\/trial$/)?.body
+  check('试算交上去的只有分析方法、模式、参数和前几段（不带来源、方向、判定）', JSON.stringify(trialBody?.expectations?.[0])
+    === JSON.stringify({ kind: 'contribution', op: 'decompose', mode: 'additive', params: { by: ['地区'], period: '周', measure: 'gmv' },
+      top_n: 1, required: true }) && !hasHumanValue(trialBody?.expectations), JSON.stringify(trialBody?.expectations))
+  await shot(page, 'case-analysis')
+  await page.locator('[data-eval-analysis-kind="verdict"]').click()
+  await page.locator('[data-eval-analysis-op]').selectOption('differ')
+  check('判定选差异检验：要选模式（比率、均值、逐行明细）', await page.locator('[data-eval-analysis-mode] option').count() === 3)
+  await page.locator('[data-eval-analysis-op]').selectOption('baseline')
+  check('换回波动基线：没有模式', await page.locator('[data-eval-analysis-mode]').count() === 0)
+  await page.locator('select[data-eval-analysis-param="period"]').selectOption('周')
+  await page.locator('select[data-eval-analysis-param="measure"]').selectOption('gmv')
+  await page.locator('[data-eval-case-save]').click()
+  await until(() => lastWrite(state, /^POST \/evals\/suites\/suite-b\/cases$/))
+  const saved = lastWrite(state, /^POST \/evals\/suites\/suite-b\/cases$/)?.body
+  check('保存判定期望：分析方法和参数，期望答案的来源是那条 SQL', JSON.stringify(saved?.expectations?.[0])
+    === JSON.stringify({ kind: 'verdict', op: 'baseline', params: { period: '周', measure: 'gmv' }, required: true })
+    && saved?.gold?.kind === 'sql' && !hasHumanValue(saved?.expectations), JSON.stringify(saved))
+
+  // 编辑一道配了两个期望的题（贡献 + 一个数）：编辑框改的是贡献那一个，另外那个照旧带上
+  state.cases['suite-b'] = [clone(CASE_AN)]
+  await page.goto(`${WEB}/evals/suites/suite-b`, { waitUntil: 'networkidle' })
+  const row = page.locator('[data-eval-case="case-an"]')
+  await row.waitFor()
+  check('题目表写分析期望：贡献：变化拆解（可加） · 按地区 · gmv', (await row.innerText()).includes('贡献：变化拆解（可加） · 按地区 · gmv'),
+    await row.innerText())
+  await row.locator('[data-eval-case-edit]').click()
+  await page.locator('[data-eval-case-others="1"]').waitFor()
+  check('编辑：另外的期望列出来、写明照旧保留', (await text(page, '[data-eval-case-others]')).includes('华东上上周的销售额'))
+  await page.locator('[data-eval-case-question]').fill('上周销售额为什么下降了？')
+  await page.locator('[data-eval-case-save]').click()
+  await until(() => lastWrite(state, /cases\/case-an$/))
+  const patched = lastWrite(state, /cases\/case-an$/)?.body
+  check('保存：两个期望都在，贡献的参数没动', patched?.expectations?.length === 2 && patched.expectations[0].kind === 'contribution'
+    && JSON.stringify(patched.expectations[0].params) === JSON.stringify(CASE_AN.expectations[0].params)
+    && patched.expectations[1].id === 'gmv', JSON.stringify(patched?.expectations))
+  check('没有页面报错', !errors.length, errors.join(' ｜ '))
+})
+
+await section('分析期望：逐题写期望和答案的判定，总览按期望的种类分开', async () => {
+  const state = freshState()
+  state.evaluations['ev-an'] = clone(EVAL_AN)
+  const { page, errors } = await open('/evals/runs/ev-an', { state })
+  await page.locator('[data-eval-overview]').waitFor()
+  check('总览：按期望的种类分开写结论', (await text(page, '[data-eval-outcomes-kind="contribution"]')) === '贡献：对且可追溯 1'
+    && (await text(page, '[data-eval-outcomes-kind="verdict"]')) === '判定：对但没引用 1 · 错 1 · 不能评分 1',
+  await text(page, '[data-eval-outcomes-by-kind]'))
+  await page.getByRole('tab', { name: '逐题' }).click()
+  await page.locator('[data-eval-results="4"]').waitFor()
+  await shot(page, 'run-results-analysis')
+  const cell = (id) => text(page, `[data-eval-result="${id}"] [data-eval-score-judgement]`)
+  check('贡献：期望「主要来源：华东（下降）」→ 答案引用的结论集中在华东、华北', (await cell('r-a1'))
+    === '主要来源：华东（下降） → 主要来源：华东、华北（下降）', await cell('r-a1'))
+  check('判定：常规波动 → 正文说的常规波动（对但没引用）', (await cell('r-a2')) === '常规波动 → 常规波动'
+    && (await page.locator('[data-eval-result="r-a2"]').innerText()).includes('对但没引用'))
+  check('说成相反：超出常规波动（上升）→ 常规波动，错', (await cell('r-a3')) === '超出常规波动（上升） → 常规波动'
+    && (await page.locator('[data-eval-result="r-a3"]').innerText()).includes('不通过'))
+  check('期望算不了：照实写原因、不能评分', (await cell('r-a4')).includes('没有做成：期次列「周」里没有本期')
+    && (await page.locator('[data-eval-result="r-a4"]').innerText()).includes('不能评分'))
+  await page.locator('[data-eval-result="r-a1"] [data-eval-result-toggle]').click()
+  const detail = page.locator('[data-eval-result-detail="r-a1"] [data-eval-analysis-detail]')
+  await detail.waitFor()
+  const d1 = await detail.innerText()
+  check('点开：期望的判定和判定语、答案引用了哪一份结论和它的判定语', d1.includes('期望的判定：主要来源：华东（下降） · 变化拆解（可加）')
+    && d1.includes(PHRASE_EAST) && d1.includes('引用了 A1') && d1.includes('集中在华东、华北'), d1)
+  await page.locator('[data-eval-result="r-a3"] [data-eval-result-toggle]').click()
+  const d3 = await text(page, '[data-eval-result-detail="r-a3"]')
+  check('点开说反了的那题：写正文那一句和对不上的原因', d3.includes('正文写的「取消单数没有异常」') && d3.includes('明显超出过去 23 周'), d3)
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
 })
 

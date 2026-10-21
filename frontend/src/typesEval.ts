@@ -88,10 +88,23 @@ export interface EvalSuiteDetail extends EvalSuite {
 // ---------------------------------------------------------------------------
 
 export type EvalCaseKind = 'ask' | 'workflow'
-export type EvalExpectationKind = 'scalar' | 'table' | 'set' | 'none' | 'ask' | 'text'
+export type EvalExpectationKind = 'scalar' | 'table' | 'set' | 'none' | 'ask' | 'text' | 'contribution' | 'verdict'
+
+/** 分析期望用的分析方法（服务端 app/analysis/contract.OPS）：贡献恒为 decompose，判定是另外四种 */
+export type EvalAnalysisOp = 'decompose' | 'baseline' | 'trend' | 'differ' | 'comparable'
+/** 分析方法的模式（contract.MODES）：变化拆解 additive / ratio / factor，差异检验 rate / mean / rows */
+export type EvalAnalysisMode = 'additive' | 'ratio' | 'factor' | 'rate' | 'mean' | 'rows'
+/**
+ * 判定类（服务端 app/eval/judgements.JUDGEMENTS）：期望和答案里的分析结论都按它比。贡献：source 主要来源、dispersed 分散、
+ * flat 基本持平、mix 结构变化为主、rate 各段自身的变化为主、mixed 两方面都有影响；判定：normal 常规波动、anomaly 超出常规波动、
+ * rising / falling / no_trend、differs 差异站得住、no_evidence 不足以下结论、comparable / incomparable
+ */
+export type EvalJudgement = 'source' | 'dispersed' | 'flat' | 'mix' | 'rate' | 'mixed' | 'normal' | 'anomaly' | 'rising'
+  | 'falling' | 'no_trend' | 'differs' | 'no_evidence' | 'comparable' | 'incomparable'
 
 /**
- * 一个期望。数值期望不许人填（评测-D4）：只写从期望答案的结果里取哪一格、哪一列、整张表，值由 SQL / 口径算出来
+ * 一个期望。数值期望不许人填（评测-D4）：只写从期望答案的结果里取哪一格、哪一列、整张表，值由 SQL / 口径算出来；分析期望
+ * （贡献、判定）只写做哪种分析、参数，来源、方向、判定由平台的分析方法在期望 SQL 的结果上算
  */
 export interface EvalExpectation {
   id?: string
@@ -112,10 +125,15 @@ export interface EvalExpectation {
   keys?: string[]
   /** table：比哪几列（缺省全部） */
   columns?: string[]
+  /** table、set：前几行；contribution：期望点名主要来源的前几段（缺省 1） */
   top_n?: number
   ordered?: boolean
   /** text：文字要点（由裁判判，单列，不计入准确率） */
   points?: string[]
+  /** contribution、verdict：分析方法、模式、参数（同分析工具的参数名：by、period、base、target、measure……） */
+  op?: EvalAnalysisOp
+  mode?: EvalAnalysisMode
+  params?: Record<string, unknown>
 }
 
 export type EvalGoldKind = 'sql' | 'caliber' | 'from_run'
@@ -233,6 +251,21 @@ export interface EvalGoldSet {
 
 export interface EvalGoldValue {
   kind: EvalExpectationKind
+  /** contribution、verdict：分析做成了（ok）还是算不了（refused，这一项不能评分，原因在 reason） */
+  status?: 'ok' | 'refused'
+  op?: EvalAnalysisOp
+  mode?: EvalAnalysisMode | null
+  /** 「变化拆解（可加）」：服务端按契约的叫法拼好 */
+  method?: string
+  judgement?: EvalJudgement | null
+  /** 主要来源点名的段（按 top_n 取前几段）、差异检验比的两组 */
+  subjects?: string[]
+  direction?: 'up' | 'down' | null
+  /** 判定语（系统渲染，照原样显示） */
+  phrase?: string
+  criterion?: string
+  reason?: string | null
+  reason_code?: string | null
   value?: unknown
   column?: string
   row?: number
@@ -444,6 +477,8 @@ export interface EvalSummary {
   accuracy?: EvalRate
   traced_accuracy?: EvalRate
   outcomes?: Partial<Record<EvalOutcome, number>>
+  /** 各期望的结论按期望的种类分开（必需的、文字要点除外） */
+  outcomes_by_kind?: Partial<Record<EvalExpectationKind, Partial<Record<EvalOutcome, number>>>>
   text?: Partial<Record<EvalTextOutcome, number>>
   paths?: Partial<Record<EvalPath, number>>
   tiers?: Partial<Record<'formal' | 'degraded' | 'withheld' | 'explore', number>>
@@ -504,6 +539,21 @@ export interface EvalRunDetail extends EvalRun {
   actions?: { stop: boolean; retry: boolean; rescore: boolean; pin: boolean; unpin: boolean; open: number; cleaned: boolean }
 }
 
+/** 分析期望的评分里期望、答案各一份（judgements.view）：叫法在 termsEval，判定语照原样显示 */
+export interface EvalJudgementView {
+  judgement?: EvalJudgement
+  subjects?: string[]
+  direction?: 'up' | 'down'
+  phrase?: string
+  method?: string
+  /** 答案引用的分析结论编号（A1） */
+  alias?: string
+  status?: 'ok' | 'refused'
+  /** 正文里说出这个判断的那一句 */
+  text?: string
+  reason?: string
+}
+
 export type EvalVerdict = 'pass' | 'fail' | 'ungradable' | 'skipped'
 export type EvalOutcome = 'traced' | 'untraced' | 'wrong' | 'scale' | 'ungradable'
 export type EvalTextOutcome = 'covered' | 'partial' | 'missing' | 'unjudged'
@@ -528,6 +578,9 @@ export interface EvalScore {
   items?: number
   missing?: unknown[]
   points?: number
+  /** contribution、verdict：期望的判定、答案里对上的（或对不上的）那一份 */
+  want?: EvalJudgementView
+  found?: EvalJudgementView
 }
 
 /** 逐题的 E1：答案的查询和期望的取数等价与否、差在哪个方面 */

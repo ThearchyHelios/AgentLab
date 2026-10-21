@@ -27,8 +27,8 @@ def _union(name: str) -> list[str]:
     return re.findall(r"'([^']+)'", found.group(1))
 
 
-def _labels(path: str) -> list[str]:
-    """EVAL_TEXT 里某一张叫法表（a.b 这样的路径）的键，按写的顺序。只认一行写完、或几行写完的对象字面量。"""
+def _pairs(path: str) -> list[tuple[str, str]]:
+    """EVAL_TEXT 里某一张叫法表（a.b 这样的路径）的 (键, 叫法)，按写的顺序。只认一行写完、或几行写完的对象字面量。"""
     text = _source(TERMS_EVAL)
     *parents, leaf = path.split(".")
     start = 0
@@ -38,7 +38,12 @@ def _labels(path: str) -> list[str]:
         start += hit.end()
     hit = re.search(rf"\n\s*{leaf}: \{{(.*?)\}}( as Record<[^>]+>)?,", text[start:], re.S)
     assert hit is not None, f"EVAL_TEXT 里没有 {path}"
-    return re.findall(r"(\w+): '", hit.group(1))
+    return re.findall(r"(\w+): '([^']*)'", hit.group(1))
+
+
+def _labels(path: str) -> list[str]:
+    """EVAL_TEXT 里某一张叫法表的键，按写的顺序。"""
+    return [key for key, _ in _pairs(path)]
 
 
 def test_statuses_triggers_and_kinds():
@@ -93,3 +98,18 @@ def test_signal_bands_follow_the_server():
     assert _union("EvalE1Band") == [c["band"] for c in SIGNAL_CRITERIA["e1"]]
     assert _union("EvalE3Band") == [c["band"] for c in SIGNAL_CRITERIA["e3"]]
     assert set(_labels("signals.band")) == {c["band"] for c in [*SIGNAL_CRITERIA["e1"], *SIGNAL_CRITERIA["e3"]]}
+
+
+def test_analysis_expectations_follow_the_server():
+    """分析期望：判定类和服务端 app/eval/judgements 一致；分析方法、模式的叫法和契约（app/analysis/contract 的 OP_LABELS、
+    MODE_LABELS）一字不差——界面上的「变化拆解（可加）」和服务端拼的、证据面板写的是同一种说法。"""
+    from app.analysis.contract import MODE_LABELS, MODES, OP_LABELS, OPS
+    from app.eval.judgements import JUDGEMENTS
+
+    assert _union("EvalJudgement") == list(JUDGEMENTS)
+    assert _labels("analysis.judgement") == list(JUDGEMENTS)
+    assert _union("EvalAnalysisOp") == list(OPS)
+    assert _pairs("analysis.op") == list(OP_LABELS.items())
+    assert _union("EvalAnalysisMode") == list(MODE_LABELS)
+    assert _pairs("analysis.mode") == list(MODE_LABELS.items())
+    assert {m for modes in MODES.values() for m in modes} == set(MODE_LABELS)
