@@ -135,3 +135,11 @@ def test_a_sentence_is_reported_without_conclusions_exactly_when_it_carries_a_ju
 
 def test_the_sample_table_is_not_shorter_than_the_review():
     assert len(SAMPLES) >= 70 and len({t for t, _ in SAMPLES}) == len(SAMPLES)
+
+
+@pytest.mark.parametrize("text, count", [("已连续三周下降。", 3), ("线上销售额持续增长，已连续 5 周上升。", 5),
+                                         ("线上销售额十二连涨。", 12), ("连续两个月下滑。", 2), ("连续多周上升。", None),
+                                         ("订单量三连降。", 3), ("连续１０周上升。", 10)])
+def test_runs_carry_the_number_of_periods_they_claim(text, count):
+    [run] = [h for h in ac.scan(text) if h.run]
+    assert run.count == count

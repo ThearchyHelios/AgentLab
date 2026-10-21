@@ -256,6 +256,29 @@ def test_trends_check_the_direction_and_runs_check_the_length():
     assert codes(said("线上销售额持续上升。", "A1", results={"A1": flat})) == [ac.MISMATCH]
 
 
+def test_runs_follow_the_run_direction_and_the_number_of_periods_they_claim():
+    """「连续 N 期上升」按趋势结论记的末尾连续同向核（run_direction、run_length）：方向一致、期数不少于 N（没写 N 的至少
+    3 期），不看整体的趋势判定——判定语在方向相反时写「但最近已连续 N 期上升」。"""
+    rising = fake_result("trend", None, "rising", direction="up", values={"run_length": "4", "run_direction": "up"})
+    assert said("线上销售额已连续 4 周上升。", "A1", results={"A1": rising}) == []
+    [miss] = said("线上销售额持续增长，已连续 5 周上升。", "A1", results={"A1": rising})
+    assert miss["code"] == ac.MISMATCH and miss["claim"] == "trend" and "只有 4 期，不够说连续 5 期" in miss["message"]
+    # 整体下降、最近连续上升：「连续上升」对得上，「持续上升」对不上
+    turned = fake_result("trend", None, "falling", direction="down", values={"run_length": "4", "run_direction": "up"})
+    assert said("订单数最近已连续四周上升。", "A1", results={"A1": turned}) == []
+    assert codes(said("订单数已连续三周下降。", "A1", results={"A1": turned})) == [ac.MISMATCH]
+    assert codes(said("订单数持续上升。", "A1", results={"A1": turned})) == [ac.MISMATCH]
+    # 没有明显趋势、末尾连续下降：也能说连续
+    flat = fake_result("trend", None, "no_trend", direction=None, values={"run_length": "3", "run_direction": "down"})
+    assert said("订单数三连降。", "A1", results={"A1": flat}) == []
+    assert codes(said("订单数四连降。", "A1", results={"A1": flat})) == [ac.MISMATCH]
+    assert codes(said("订单数三连涨。", "A1", results={"A1": flat})) == [ac.MISMATCH]
+    # 没记 run_direction 的老结论按整体的趋势方向
+    old = fake_result("trend", None, "rising", direction="up", values={"run_length": "3"})
+    assert said("订单数连续上升。", "A1", results={"A1": old}) == []
+    assert codes(said("订单数连续下降。", "A1", results={"A1": old})) == [ac.MISMATCH]
+
+
 def test_differences_check_the_verdict_and_the_order_of_the_two_groups():
     differs = fake_result("differ", "rate", "differs", subjects=[["西南"], ["华东"]], direction="up")
     assert said("西南的退款率显著高于华东。", "A1", results={"A1": differs}) == []

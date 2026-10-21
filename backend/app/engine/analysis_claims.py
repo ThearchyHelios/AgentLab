@@ -34,7 +34,9 @@
    依据，或者写成推测（可能、或许、推测、待核实、不排除、疑似）。句子没挂拆解、同一分句里有来源判断的，原因不是拆解
    的段时另报（目录里有拆解可比的时候），认不出时并进来源那一处（它报没挂拆解）。原因说的是数据本身（「由于数据只到
    10 月 16 日」「样本少」）、只是指代（「以上是下降的主要原因」，列出原因的那几句各自核）的不算
-6. **不扫的地方**：知识库原话（[[q:]] 片段）、系统渲染的判定语（[[a:]] 片段）、别的引用渲染出来的字、标题、代码块、
+6. **连续**：「连续 N 期上升」「三连降」按趋势结论记的末尾连续同向（run_direction、run_length）核：方向一致、期数不少于
+   N（没写 N 的至少 3 期），不看整体的趋势判定（判定语在方向相反时写「但最近已连续 N 期上升」）
+7. **不扫的地方**：知识库原话（[[q:]] 片段）、系统渲染的判定语（[[a:]] 片段）、别的引用渲染出来的字、标题、代码块、
    表格（表头和正文的格都不扫：一格是一个值不是一句话，状态列的「异常」、说明列的「主要来自线上」不是判断；裁判的预筛
    judge.claim_priority 也不送表格的格）；分析范围是文档的结构化字段（analysis_scope），本来就不在正文里
 
@@ -109,7 +111,7 @@ class Claim:
     flip: str | None = None
     mode: str | None = None
     negative: bool = False
-    #: 「连续…上升」「三连降」：另要末尾连续同向至少 3 期
+    #: 「连续…上升」「三连降」：按末尾连续同向的期数核（_run_miss）
     run: bool = False
     #: 这句话到这个分句为止要说了变化（Lexicon.change）才核：来源、集中、分散、主导、拉动带动
     gated: bool = False
@@ -312,7 +314,7 @@ def lexicon(version: int | None = None) -> Lexicon:
 @dataclass(frozen=True)
 class Hit:
     """句子里的一处判断词：类（否定翻过之后的）、在句子里的起止、原文、方向（up / down / None）。side 是点名的段、原因在
-    判断词的哪一边（Claim.side，否定翻过来的为 None）。"""
+    判断词的哪一边（Claim.side，否定翻过来的为 None），count 是「连续 N 期」「三连降」写明的期数（没写为 None）。"""
 
     claim: str
     start: int
@@ -322,6 +324,7 @@ class Hit:
     negated: bool = False
     run: bool = False
     side: str | None = None
+    count: int | None = None
 
 
 def _clause(text: str, start: int, end: int) -> tuple[int, int]:
@@ -371,6 +374,27 @@ def _counts(lex: Lexicon, claim: Claim, text: str, start: int, end: int, left: i
     return claim.bars is None or not claim.bars.search(text[left:right])
 
 
+#: 「连续 N 期」「N 连降」里的期数：阿拉伯数字（全角也认）或一到九十九的中文数字
+_COUNT = re.compile(r"[0-9０-９]+|[一二三四五六七八九十两]+")
+_CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _count(word: str) -> int | None:
+    """判断词里写明的期数：「连续三周」3、「连续 12 周」12、「十二连涨」12；「连续多周」「连续下滑」None。"""
+    m = _COUNT.search(word)
+    if m is None:
+        return None
+    raw = unicodedata.normalize("NFKC", m.group(0))
+    if raw.isdigit():
+        return int(raw)
+    if "十" not in raw:
+        return _CN_DIGITS.get(raw) if len(raw) == 1 else None
+    tens, _, ones = raw.partition("十")
+    if len(tens) > 1 or len(ones) > 1:
+        return None
+    return (_CN_DIGITS.get(tens, 0) if tens else 1) * 10 + (_CN_DIGITS.get(ones, 0) if ones else 0)
+
+
 def scan(text: str, *, version: int | None = None) -> list[Hit]:
     """一句话里的判断词（text 是写作者自己写的字，别的片段已经涂成 \\x00）。同一处有几种读法时取最靠前、最长的：
     「超出正常范围」是异常不是正常，「没有明显的上升或下降趋势」是无趋势不是趋势。不核的写法（_counts）连同和它重叠的
@@ -402,8 +426,9 @@ def scan(text: str, *, version: int | None = None) -> list[Hit]:
         if key == "normal" and (claim.subject or (negated and "异" in word)) and not lex.subject.search(text[:right]):
             continue            # 「未见异常」「没有出现异动」：主语不是指标、波动的（运行平稳、系统正常）不核
         direction = _direction(lex, word, text[end:right], text[left:right])
-        hits.append(Hit(claim=key, start=start, end=end, word=word, direction=direction, negated=negated,
-                        run=claim.run and not negated, side=None if negated else claim.side))
+        run = claim.run and not negated
+        hits.append(Hit(claim=key, start=start, end=end, word=word, direction=direction, negated=negated, run=run,
+                        side=None if negated else claim.side, count=_count(word) if run else None))
     return hits
 
 
@@ -687,21 +712,11 @@ def _check(lex: Lexicon, hit: Hit, result: Mapping[str, Any], names: str, *, spa
     if key == "normal":
         return None if code == "within_band" else _verdict_miss(result)
     if key == "trend":
+        if hit.run:
+            return _run_miss(hit, result)
         if code not in ("rising", "falling"):
             return _verdict_miss(result)
-        if miss := _direction_miss(hit, "up" if code == "rising" else "down"):
-            return miss
-        if hit.run:
-            run = _value(result, "run_length")
-            if run is None or run < 3:
-                shown = "没有" if run is None else f"只有 {run} 期"
-                return _Miss(f"末尾连续同向的期数{shown}，不够说「连续」（至少 3 期）",
-                             f"末尾连续同向的期数{shown}，不够说「连续」")
-            ran = _run_direction((result.get("values") or {}).get("run_direction"))
-            if ran and hit.direction and ran != hit.direction:
-                return _Miss(f"末尾连续{_dir_word(ran)}，不是连续{_dir_word(hit.direction)}",
-                             f"末尾连续{_dir_word(ran)}，与「{hit.word}」的方向相反")
-        return None
+        return _direction_miss(hit, "up" if code == "rising" else "down")
     if key == "no_trend":
         return None if code == "no_trend" else _verdict_miss(result)
     if key == "differ":
@@ -721,6 +736,27 @@ def _check(lex: Lexicon, hit: Hit, result: Mapping[str, Any], names: str, *, spa
         return None
     if key == "no_diff":
         return None if code == "no_evidence" else _verdict_miss(result)
+    return None
+
+
+def _run_miss(hit: Hit, result: Mapping[str, Any]) -> _Miss | None:
+    """「连续 N 期上升」「三连降」：按趋势结论记的末尾连续同向核（values 的 run_direction、run_length），不看整体的趋势
+    判定——判定语在方向相反时写「但最近已连续 N 期上升」。期数不少于句子写的 N（没写的至少 3 期），方向一致。没记
+    run_direction 的老结论按整体的趋势方向。"""
+    values = result.get("values") or {}
+    run = _value(result, "run_length")
+    need = hit.count if hit.count is not None and hit.count >= 2 else 3
+    if run is None or run < need:
+        shown = "没有记下" if run is None else f"只有 {run} 期"
+        return _Miss(f"末尾连续同向的期数{shown}，不够说连续 {need} 期", f"末尾连续同向的期数{shown}，不够说连续 {need} 期")
+    ran = _run_direction(values.get("run_direction"))
+    if ran is None and "run_direction" not in values:
+        ran = {"rising": "up", "falling": "down"}.get(str(_verdict(result).get("code")))
+    if hit.direction and ran != hit.direction:
+        if ran is None:
+            return _Miss("没有记下末尾连续变化的方向", "这份结论没有记下末尾连续变化的方向")
+        return _Miss(f"末尾连续{_dir_word(ran)}，不是连续{_dir_word(hit.direction)}",
+                     f"末尾连续{_dir_word(ran)}，与「{hit.word.replace(chr(0), '')}」的方向相反")
     return None
 
 
