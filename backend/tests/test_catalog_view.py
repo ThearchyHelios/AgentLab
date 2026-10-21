@@ -258,7 +258,7 @@ def test_of_run_reads_the_run_options():
 
 #: 给模型、给自查读目录的模块（四处消费 + 它们的帮手）。要读目录一律经 data/catalog_view.py
 CONSUMERS = ("tools/datasource.py", "look/tables.py", "data/sqlcheck.py", "engine/nodes/dual_check.py",
-             "engine/verify_agent.py", "api/copilot_context.py")
+             "engine/verify_agent.py", "api/copilot_context.py", "tools/analysis.py")
 FORBIDDEN = re.compile(r"\bread_catalogs?\s*\(|\bread_entry\s*\(|\bCatalogNote\b")
 
 

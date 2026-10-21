@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.errors import GraphRecursionError
 from langgraph.func import task
 
+from app.analysis.contract import CallError
 from app.core.config import settings
 from app.core.errors import describe_exception, raw_detail
 from app.core.events import EventType
@@ -32,12 +33,24 @@ from app.providers import catalog
 from app.providers.factory import ModelSpec, bind_tools_safely, get_chat_model
 from app.engine.sql_problems import event_checks
 from app.data import catalog_view
+from app.tools.analysis import (
+    REFUSED_CODE as ANALYSIS_REFUSED,
+    SCOPE_KEY as ANALYSIS_SCOPE_KEY,
+    AnalysisScope,
+    call_error_text,
+    input_snapshot,
+    is_analysis_tool,
+    payload_of,
+    reply_text,
+    run_snapshot,
+)
 from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_scope_fixed, run_versions
 from app.tools.registry import (
     ToolArgsError,
     ToolContext,
     args_model_of,
     build_tools,
+    guides_text,
     prepare_args,
 )
 from app.tools.trust import ask_gate, call_policy
@@ -302,6 +315,10 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     async def _member(name: str, instruction: str, progress: str,
                       tally: dict[str, Any]) -> dict[str, Any]:
         cfg = agent_map[name]
+        # 绑了分析工具的成员：这一次执行自己的分析容器（同 Agent 节点）。查询结果照 Agent 的写法编成「【证据 Qn】」，分析结论
+        # 编成「【分析 An】」；协作节点不记证据台账，这些编号只给成员自己接着分析、下钻用
+        scope = (AnalysisScope(node_id=ctx.node.id, snapshot=run_snapshot(ctx.run))
+                 if any(is_analysis_tool(t) for t in cfg.get("tools", []) or []) else None)
         async with SessionLocal() as session:
             model, model_id = await get_chat_model(
                 session,
@@ -325,13 +342,17 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 catalog_view=catalog_view.of_run(ctx.run),
                 # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
                 emit=ctx.emit,
+                extra={ANALYSIS_SCOPE_KEY: scope} if scope is not None else {},
             )
             tools = await build_tools(cfg.get("tools", []) or [], tool_ctx, session=session)
 
         bound = bind_tools_safely(model, tools, parallel=False)
         tool_map = {t.name: t for t in tools}
+        # 绑定的工具带的方法说明（分析方法）接在成员的 system 后面，同一份只注入一次（同 Agent 节点的 _build_messages）
+        guide = guides_text(tools)
+        system = cfg.get("system") or f"你是 {name}。"
         messages: list[Any] = [
-            SystemMessage(content=cfg.get("system") or f"你是 {name}。"),
+            SystemMessage(content=f"{system}\n\n{guide}" if guide else system),
             HumanMessage(content=f"团队目标：{goal}\n\n已有进展：\n{progress or '(无)'}\n\n你的任务：{instruction}"),
         ]
         calls: list[dict[str, Any]] = []
@@ -426,16 +447,29 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                         except ToolTimeout as e:
                             content = str(e)
                             failure = {"error": content, "timed_out": True}
+                        except CallError as e:
+                            # 分析调用写错了：不记结论，原话交回成员照着改（同 Agent 节点）
+                            content = call_error_text(e)
+                            failure = {"error": content[:300], "call_error": e.code}
                         except Exception as e:  # noqa: BLE001
                             content = f"工具失败：{describe_exception(e)}"
                             failure = {"error": content, "detail": raw_detail(e)}
                 # 查库的 SQL 检查结果单独带上：preview 截到前 1500 个字符，checks 通常在截掉的那段里
                 checks = event_checks(content) if not failure and tname.startswith(QUERY_PREFIX) else []
+                analysis = payload_of(content) if scope is not None and not failure and is_analysis_tool(tname) else None
                 ctx.emit(EventType.TOOL_ERROR if failure else EventType.TOOL_END, tool=tname,
                          agent=name, call_id=cid, preview=content[:1500],
                          duration_ms=int((time.perf_counter() - started) * 1000), **failure,
-                         **({"checks": checks} if checks else {}))
+                         **({"checks": checks} if checks else {}),
+                         **({"analysis_artifact": analysis["artifact"]} if analysis else {}))
+                if analysis is not None and analysis["result"].get("status") == "refused":
+                    ctx.emit(EventType.LOG, level="warn", code=ANALYSIS_REFUSED, agent=name, call_id=cid, tool=tname,
+                             reason_code=analysis["result"].get("reason_code"),
+                             reason=analysis["result"].get("reason"),
+                             message=f"{name} 的 {tname} 没有做成：{analysis['result'].get('reason') or '原因未知'}")
                 calls.append({"tool": tname, "args": targs, "result": content[:2000]})
+                if scope is not None and not failure and tname in tool_map:
+                    content = await _numbered(scope, tname, content, analysis, ctx.run.run_id, ctx.node.id)
                 messages.append(ToolMessage(content=content, tool_call_id=cid))
 
         # 步数用完了：最后一步一定是要了工具的，模型从没拿到过"说结论"的那一轮。
@@ -609,6 +643,25 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if var_name:
         updates["vars"] = {var_name: final_text}
     return updates
+
+
+async def _numbered(scope: AnalysisScope, tool: str, content: str, analysis: dict[str, Any] | None, run_id: str,
+                   node_id: str) -> str:
+    """绑了分析工具的协作成员：一次成功的工具调用交回成员的内容。数据源查询（平台执行的，端点读取另核工件是这次运行落下
+    的）编号「【证据 Qn】」并放进分析容器；分析结论编号「【分析 An】」、换成给模型看的那一段。别的工具原样。"""
+    from app.capabilities.registry import is_platform_query, snapshot_owned
+    from app.engine.evidence import query_entry_fields
+
+    if analysis is not None:
+        return reply_text(scope.add_result(analysis["result"], analysis["artifact"]), analysis["result"])
+    if not is_platform_query(tool):
+        return content
+    fields = query_entry_fields(content)
+    if fields is None or not await snapshot_owned(fields["artifact"], run_id, tool):
+        return content
+    alias = f"Q{len(scope.queries) + 1}"
+    scope.add_query(alias, input_snapshot(json.loads(content), ref=alias, artifact=fields["artifact"], node_id=node_id))
+    return f"【证据 {alias}】\n{content}"
 
 
 # --------------------------------------------------------------------------

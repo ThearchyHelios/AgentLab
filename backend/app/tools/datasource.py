@@ -374,6 +374,26 @@ def _pinned_under_name(pins: dict[str, Any], name: str) -> bool:
     return any(isinstance(entry, dict) and entry.get("name") == name for entry in pins.values())
 
 
+async def resolved_source(name: str, ctx: ToolContext) -> tuple[DataSource, Any] | None:
+    """按名字找启用着的数据源，按这次运行固定的版本解析成查询用的那个源（_resolve，同 build_datasource_tools）：(数据源的行,
+    查询用的源)。找不到、固定的版本没了返回 None。
+
+    分析（app/tools/analysis.py）读目录、剖析事实、现查表的日期范围时用：查的要和这次运行的查询是同一版数据。用自己的短
+    会话，不提交（行上已经读出来的属性会话关了照样能读）。"""
+    from app.db.base import SessionLocal
+
+    async with SessionLocal() as session:
+        row = (await session.execute(select(DataSource).where(
+            DataSource.name == name, DataSource.enabled.is_(True)))).scalar_one_or_none()
+        if row is None:
+            return None
+        try:
+            source, _ = await _resolve(session, row, ctx)
+        except table_versions.SnapshotMissing:
+            return None
+        return row, source
+
+
 async def _resolve(session: AsyncSession, row: DataSource, ctx: ToolContext) -> tuple[Any, bool]:
     """查询该用的源，以及它的版本是不是这次运行固定的。
 

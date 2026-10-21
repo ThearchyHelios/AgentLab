@@ -561,6 +561,13 @@ def _check_dual_check(node: GraphNode, spec: GraphSpec, result: ValidationResult
                 "definitions", "dual_check.definitions_invalid")
 
 
+def _analysis_tools() -> frozenset[str]:
+    """五个分析工具的名字（contract.TOOL_NAMES）。"""
+    from app.analysis.contract import TOOL_NAMES
+
+    return frozenset(TOOL_NAMES.values())
+
+
 def _produces_query(node: GraphNode) -> bool:
     """这个节点的产出是一份存成快照的查询结果：调用数据库查询工具的「调用工具」节点，或另一个合并查询。"""
     if node.type == NodeType.MERGE:
@@ -938,6 +945,10 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         elif node.type == NodeType.TOOL:
             if not cfg.get("tool"):
                 result.add("「调用工具」节点还没有选择工具", node_id=node.id, field="tool")
+            elif str(cfg.get("tool")).strip() in _analysis_tools():
+                # 分析工具读的是同一个 Agent 查过的结果（【证据 Qn】），调用工具节点里没有这份容器，运行到这里一定失败
+                result.add("「调用工具」节点不能调用分析工具：分析工具分析的是同一个 Agent 查过的结果。模板里要固定做的分析，"
+                           "请改用「分析卡」节点", node_id=node.id, field="tool", code="analysis.tool_node")
             # 写入动作的确认派给谁（应用平台 §3.8）：写法同人工节点
             from app.engine.lint_process import assignee_problem
 

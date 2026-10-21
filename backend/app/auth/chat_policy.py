@@ -4,13 +4,14 @@
 start_run 先查来源和运行类别）。图本身再按这里收窄，理由是同一条：对 user 角色来说遮罩就是边界（A7 第 6 条），它能
 碰的只有「读数据、整理、撰写」这一类，不能执行代码、不能调外部系统、不能写任何东西：
 
-- 节点只许：输入、模型、Agent、报告、输出、知识库检索、数据整形、条件分支、口径卡、合并查询、调用工具。代码、协作、
+- 节点只许：输入、模型、Agent、报告、输出、知识库检索、数据整形、条件分支、口径卡、合并查询、分析卡、调用工具。代码、协作、
   子工作流、循环、人工审批、记忆写入、校验、双盲复算、反方审稿一律不许——后几种不是危险，而是问数据用不到，多放一种
   就多一处要单独核对遮罩的地方；
 - 工具（Agent 绑的、调用工具节点调的同一份白名单，engine/launch.tool_bindings 一并列出）只许数据源工具（db_query__ /
   db_schema__，查询结果按 MASK_RESULTS_OPTION 在工具边界遮）和只读的内置工具（计算、当前时间、JSON 取值、知识库检索、
-  记忆读取）。自定义工具、MCP、文件、网页、HTTP、代码执行、平台的写入能力（records_append 这类）一律不许；模板拼出来的
-  工具名（{{ vars.tool }}）发起时不知道是谁，也不许。调用工具节点放行的理由：它和 Agent 调同一个查询工具等价——同一个
+  记忆读取、分析）。分析工具不查库，只读本节点查过、在工具边界遮过的结果，遮罩列不当维度、度量（app/tools/analysis.py）；
+  分析卡读上游查询节点的快照，同一套遮罩。自定义工具、MCP、文件、网页、HTTP、代码执行、平台的写入能力（records_append
+  这类）一律不许；模板拼出来的工具名（{{ vars.tool }}）发起时不知道是谁，也不许。调用工具节点放行的理由：它和 Agent 调同一个查询工具等价——同一个
   ToolContext 带着遮罩、只读两个开关（engine/nodes/tools.py 的 _tool_ctx），参数由人写死反而比模型挑的更好核对；
   周期看板、异常处置这些模板的取数节点就是它（个人应用和问数据同一份白名单，blueprints/personal.policy_problem）；
 - 数据源查询一律只读：可写源上的写语句由守卫拒掉，不交给审批（api/runs.py、个人应用刷新、个人蓝图试运行给运行打上
@@ -28,11 +29,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.analysis.contract import TOOL_NAMES
+
 #: 问数据运行里 user 角色能用的节点类型（engine/schema.py 的 NodeType 取值）
 CHAT_NODE_TYPES = frozenset({"input", "llm", "agent", "report", "output", "retrieve", "transform", "branch",
-                             "metrics", "merge", "tool"})
-#: Agent 能绑的只读内置工具（tools/builtin/）
-CHAT_BUILTIN_TOOLS = frozenset({"calculator", "current_time", "json_query", "kb_search", "memory_recall"})
+                             "metrics", "merge", "analysis", "tool"})
+#: Agent 能绑的只读内置工具（tools/builtin/）：五个分析工具也在内（contract.TOOL_NAMES，不查库）
+CHAT_BUILTIN_TOOLS = frozenset({"calculator", "current_time", "json_query", "kb_search", "memory_recall",
+                                *TOOL_NAMES.values()})
 #: 运行时改记忆范围、知识库的配置键（engine/nodes 的 ctx.cfg("memory_scope") / ctx.cfg("collection")，图级 defaults 同样生效）
 SCOPE_KEYS = ("memory_scope", "collection")
 SCOPE_REFUSED = "没有权限：使用者在问数据中不能指定记忆范围和知识库，使用的是管理员设好的默认值"
@@ -90,7 +94,7 @@ def chat_graph_problem(graph: Any, *, where: str = "问数据") -> str | None:
             return f"没有权限：{who}的工具名由模板拼成，发起前无法确定是哪个工具，使用者在{where}中不能这样绑定工具"
         if not _tool_allowed(name):
             return (f"没有权限：{who}绑定了工具「{name}」。使用者在{where}中只能使用数据源查询和只读的内置工具"
-                    "（计算、当前时间、JSON 取值、知识库检索、记忆读取）")
+                    "（计算、当前时间、JSON 取值、知识库检索、记忆读取、分析）")
     return None
 
 

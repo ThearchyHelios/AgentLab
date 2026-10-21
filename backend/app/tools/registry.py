@@ -55,6 +55,17 @@ class ToolContext:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ToolGuide:
+    """绑了这个工具时一并交给模型的方法说明（写进 system，engine/nodes/llm.py 的 _build_messages、协作成员同样）。
+
+    几个工具共用一份说明时写同一个 id：同一份只注入一次（guides_of 按 id 去重）。说明随代码升版，不是 Skill——Skill 是库里
+    用户可改、可停用的行，种子只在同名不存在时插入（seed.py），平台的方法要跟着代码走（分析方法，D12）。"""
+
+    id: str
+    text: str
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -72,6 +83,8 @@ class ToolSpec:
     # 能力登记里的效果，写了就照它登记（平台内置的写入能力记 write：只能放在调用工具节点里，经动作流程执行，
     # capabilities/platform.py）。不写的按 dangerous / writes_state 推
     effect: str | None = None
+    # 绑了它时一并交给模型的方法说明（ToolGuide）。建工具时放进工具的 metadata["guide"]，节点按 guides_of 去重注入
+    guide: ToolGuide | None = None
 
     def json_schema(self) -> dict[str, Any]:
         return self.args_schema.model_json_schema()
@@ -90,6 +103,7 @@ def register(
     needs_context: bool = True,
     writes_state: bool = False,
     effect: str | None = None,
+    guide: ToolGuide | None = None,
 ) -> Callable[[ToolFunc], ToolFunc]:
     def deco(func: ToolFunc) -> ToolFunc:
         _REGISTRY[name] = ToolSpec(
@@ -102,6 +116,7 @@ def register(
             needs_context=needs_context,
             writes_state=writes_state,
             effect=effect,
+            guide=guide,
         )
         return func
 
@@ -159,7 +174,24 @@ def build_tool(spec: ToolSpec, ctx: ToolContext) -> BaseTool:
         coroutine=_run,
         # 只给异步实现；同步路径直接报错，避免在事件循环里被阻塞调用
         func=None,
+        # 方法说明跟着工具走：节点按绑定的工具取（guides_of），没有说明的工具 metadata 和以前一样是空的
+        **({"metadata": {"guide": spec.guide}} if spec.guide is not None else {}),
     )
+
+
+def guides_of(tools: Any) -> list[ToolGuide]:
+    """这批工具带的方法说明，按 id 去重、按第一次出现的先后。没有说明的工具不算。"""
+    out: dict[str, ToolGuide] = {}
+    for tool in tools or []:
+        guide = ((getattr(tool, "metadata", None) or {}) if tool is not None else {}).get("guide")
+        if isinstance(guide, ToolGuide) and guide.id not in out:
+            out[guide.id] = guide
+    return list(out.values())
+
+
+def guides_text(tools: Any) -> str:
+    """注入 system 的那一段：每份说明一段，空行隔开。没有说明为空串。"""
+    return "\n\n".join(g.text.strip() for g in guides_of(tools) if g.text.strip())
 
 
 async def build_tools(
