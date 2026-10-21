@@ -100,6 +100,7 @@ def verdicts(bundle: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_the_analysis_and_its_input_travel_with_the_file_and_verify():
+    """Agent 现场做的结论（台账条目带 call_id）：那一句「在验证什么」标成「Agent 写的假设」。"""
     bundle, files, a = bundle_of()
     analysis_item = item(bundle, a)
     assert analysis_item["kind"] == ARTIFACT_KIND and "b64" in analysis_item and analysis_item["node_id"] == "an"

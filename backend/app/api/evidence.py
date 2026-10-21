@@ -1015,8 +1015,12 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
 # 分析结论的出处链
 # --------------------------------------------------------------------------
 
-#: Agent 写的假设（hypothesis）旁边那句：它不是结论，只在证据面板显示（细案 01 §7.3）
-HYPOTHESIS_NOTE = "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+#: 「在验证什么」（hypothesis）旁边那句：它不是结论，只在证据面板显示（细案 01 §7.3）。谁写的照实说：Agent 现场做的
+#: （台账条目带 call_id）写「Agent 写的假设」，分析卡做的（带 item）是模板作者写的，写「分析卡上写的『在验证什么』」
+HYPOTHESIS_LABEL = "Agent 写的假设"
+HYPOTHESIS_NOTE = f"{HYPOTHESIS_LABEL}：说明这次在验证什么，不是分析结论，也不进报告正文"
+CARD_HYPOTHESIS_LABEL = "分析卡上写的『在验证什么』"
+CARD_HYPOTHESIS_NOTE = f"{CARD_HYPOTHESIS_LABEL}：模板作者写的那一句，不是分析结论，也不进报告正文"
 UNSEALED_ANALYSIS = "这份分析结论不属于封存范围内的任何事件（封存前的台账里没有它），不能作为证据展示"
 TAMPERED_ANALYSIS = "分析结论与哈希不一致，疑似被修改，不展示其中的判定和数"
 MISSING_ANALYSIS = "无法读取分析结论"
@@ -1104,7 +1108,8 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
     """分析结论的出处链（00-总方案 §3.3）：判定 → 方法 → 计算 → 输入 → 复算 → 封存。
 
     - 判定（analysis）：判定语、判定标准、判定码和点名的段、附带说明、算不了的原因，这一处引用的是哪一项（判定语、具名标量、
-      结果表的一格）；Agent 写的假设另列，标成「Agent 写的假设」（HYPOTHESIS_NOTE）
+      结果表的一格）；「在验证什么」另列，谁写的照实标：Agent 现场做的写「Agent 写的假设」
+      （HYPOTHESIS_NOTE），分析卡做的写「分析卡上写的『在验证什么』」（CARD_HYPOTHESIS_NOTE，模板作者写的）
     - 方法（analysis_method）：方法与版本、规范化后的参数、实际用的阈值（只列这个算子用到的）、现查的表范围（probes）
     - 计算（analysis_calc）：结果表（前 table_top_k 段，加上被引用的那一行附近）、具名的数、关键数的代入式
       （evidence.analysis_formulas）
@@ -1154,7 +1159,11 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
         phrase=result.get("phrase"), criterion=result.get("criterion"), verdict=verdict,
         caveats=[{k: c.get(k) for k in ("code", "text")} for c in result.get("caveats") or [] if isinstance(c, dict)])
     if isinstance(result.get("hypothesis"), str) and result["hypothesis"].strip():
-        judged.update(hypothesis=result["hypothesis"], hypothesis_note=HYPOTHESIS_NOTE)
+        # 谁写的照实说：分析卡（台账条目带 item）是模板作者写的，Agent 工具（带 call_id）是现场写的
+        card = judged["origin"] == "card"
+        judged.update(hypothesis=result["hypothesis"],
+                      hypothesis_label=CARD_HYPOTHESIS_LABEL if card else HYPOTHESIS_LABEL,
+                      hypothesis_note=CARD_HYPOTHESIS_NOTE if card else HYPOTHESIS_NOTE)
     settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
     method = {
         "step": "analysis_method", "alias": alias, "method": result.get("method"),

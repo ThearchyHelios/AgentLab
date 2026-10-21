@@ -673,7 +673,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -1326,7 +1327,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -1984,7 +1986,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -3280,7 +3283,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -3871,7 +3875,8 @@
       "verdict": null,
       "caveats": [],
       "hypothesis": "这周的下降算不算异常",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -4075,7 +4080,8 @@
       },
       "caveats": [],
       "hypothesis": "两周能不能直接比",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -5189,7 +5195,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "分析卡上写的『在验证什么』：模板作者写的那一句，不是分析结论，也不进报告正文",
+      "hypothesis_label": "分析卡上写的『在验证什么』"
      },
      {
       "step": "analysis_method",
@@ -6082,7 +6089,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "分析卡上写的『在验证什么』：模板作者写的那一句，不是分析结论，也不进报告正文",
+      "hypothesis_label": "分析卡上写的『在验证什么』"
      },
      {
       "step": "analysis_method",
@@ -6740,7 +6748,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "分析卡上写的『在验证什么』：模板作者写的那一句，不是分析结论，也不进报告正文",
+      "hypothesis_label": "分析卡上写的『在验证什么』"
      },
      {
       "step": "analysis_method",
@@ -7924,7 +7933,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "分析卡上写的『在验证什么』：模板作者写的那一句，不是分析结论，也不进报告正文",
+      "hypothesis_label": "分析卡上写的『在验证什么』"
      },
      {
       "step": "analysis_method",

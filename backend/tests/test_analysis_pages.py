@@ -147,7 +147,8 @@ async def test_the_export_page_opens_the_analysis_steps_and_the_scope_numbers():
                                "analysis_recompute", "analysis_seal"]
     assert opened["title"].startswith("判定「销售额下降")
     body = opened["body"]
-    for text in ("判定标准一段占总变化的一半以上算主要来源", "Agent 写的假设华东拖累", "实际用的阈值", "「主要来源」的占比",
+    # 分析卡做的结论（台账条目带 item）：那一句是模板作者写的，照实写「分析卡上写的『在验证什么』」，不标成 Agent 写的假设
+    for text in ("判定标准一段占总变化的一半以上算主要来源", "分析卡上写的『在验证什么』华东拖累", "实际用的阈值", "「主要来源」的占比",
                  "华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷ （-194） = 61.9%", "结果表（列出 4 行，共 4 行）",
                  "复算一致：按封存的输入重新计算，结论逐项相同", "封存范围内的台账记过这份分析结论",
                  "按运行当天现算的界 date('now', '-7 days') = 2026-10-14（现查 · 2026-10-21T09:00:00）",
@@ -186,6 +187,8 @@ async def test_the_bundle_page_shows_the_analysis_detail_and_the_scope():
     # 方法写服务端带来的叫法和 id（和导出页同一个写法），不只写 id
     assert "判定语销售额下降 194（-8.7%）" in phrase and "方法与版本变化拆解（可加） · decompose.additive@1" in phrase
     assert "输入数据 · Q1" in phrase                       # 输入的角色写叫法，不写 data
+    # 这份结论是分析卡做的（台账条目带 item）：那一句「在验证什么」写「分析卡上写的『在验证什么』」，不标成 Agent 写的假设
+    assert "分析卡上写的『在验证什么』" in phrase and "Agent 写的假设" not in phrase
     assert "复算一致：按封存的输入重新计算，结论逐项相同（导出时服务端按封存的输入复算的结论；本页只核哈希" in phrase
     value = next(text for text in out["opened"].values() if "具名的数「top_share」" in text)
     assert "引用的值0.618556701031" in value and "正文显示61.9%（与按显示规则渲染的结果一致）" in value

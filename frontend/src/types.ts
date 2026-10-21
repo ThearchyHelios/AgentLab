@@ -2448,6 +2448,8 @@ export interface EvidenceAnalysisStep {
   verdict?: AnalysisVerdict | null
   caveats?: AnalysisCaveat[]
   hypothesis?: string
+  /** 「在验证什么」那一行的说法：谁写的照实说，服务端按台账条目给（Agent 写的假设 / 分析卡上写的『在验证什么』） */
+  hypothesis_label?: string
   hypothesis_note?: string
   note?: string
   // ---- analysis_method：方法、参数、实际用的阈值、现查结果 ----

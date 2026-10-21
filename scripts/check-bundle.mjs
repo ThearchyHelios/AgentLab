@@ -927,8 +927,9 @@ await section('样本页：各种形状', async () => {
     check('analysis：点开判定语：判定语、判定标准、方法与版本（服务端带的叫法）', detail.includes('判定语')
       && detail.includes('一段占总变化的一半以上算主要来源') && detail.includes('变化拆解（可加） · decompose.additive@1'),
       detail.replace(/\s+/g, ' ').slice(0, 300))
+    // 这三份分析都是 Agent 现场做的（台账条目带 call_id）：那一句照旧标「Agent 写的假设」
     check('analysis：……附带说明、Agent 写的假设', detail.includes('附带说明') && detail.includes('Agent 写的假设')
-      && detail.includes('下降是不是集中在某个地区'), detail.replace(/\s+/g, ' ').slice(0, 400))
+      && !detail.includes('分析卡上写的『在验证什么』') && detail.includes('下降是不是集中在某个地区'), detail.replace(/\s+/g, ' ').slice(0, 400))
     check('analysis：……输入（角色、编号、各自的核对状态）', ['基期总数 · Q1', '本期总数 · Q1', '数据 · Q2'].every((t) => detail.includes(t)),
       detail.replace(/\s+/g, ' ').slice(0, 500))
     check('analysis：……复算写导出时服务端复算的结论、本页不重算统计', detail.includes('复算一致：按封存的输入重新计算，结论逐项相同')

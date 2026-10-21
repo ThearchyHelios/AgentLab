@@ -461,7 +461,8 @@
       }, v == null ? NONE : textOf(v))))))))
   }
 
-  /** 分析结论 · 判定：判定语、判定标准、判定码和点名的段、附带说明、算不了的原因、这一处引用的是哪一项、谁做的、Agent 写的假设 */
+  /** 分析结论 · 判定：判定语、判定标准、判定码和点名的段、附带说明、算不了的原因、这一处引用的是哪一项、谁做的、
+   *  「在验证什么」（谁写的照实标：Agent 写的假设 / 分析卡上写的『在验证什么』） */
   function analysisPart(step) {
     const body = []
     const verdict = isObj(step.verdict) ? step.verdict : null
@@ -484,7 +485,9 @@
         h('ul', { style: 'margin:4px 0 0;padding-left:1.2em;font-size:13px' }, step.caveats.map((c) => h('li', {}, String(c.text || '')))))
     }
     if (step.hypothesis) {
-      body.push(h('p', { class: 'sub' }, T.dHypothesis), h('p', { style: 'margin:4px 0 0;font-size:13px' }, String(step.hypothesis)))
+      // 「在验证什么」：谁写的服务端照实给（Agent 写的假设 / 分析卡上写的『在验证什么』），这里照原样显示
+      body.push(h('p', { class: 'sub' }, String(step.hypothesis_label || T.dHypothesis)),
+        h('p', { style: 'margin:4px 0 0;font-size:13px' }, String(step.hypothesis)))
       if (step.hypothesis_note) body.push(muted(step.hypothesis_note))
     }
     if (step.note) body.push(waiting(step.note))

@@ -259,7 +259,7 @@
     dCell: '快照里的值', dShown: '正文显示', dShownSame: '与按显示规则渲染的结果一致', dExpected: '按显示规则应为',
     dArtifact: '所在工件', dReport: '所在报告',
     dPhrase: '判定语', dCriterion: '判定标准', dMethod: '方法与版本', dAnalysis: '分析结论里的值', dRecheck: '复算',
-    dAnalysisInputs: '输入', dHypothesis: 'Agent 写的假设', dCaveats: '附带说明',
+    dAnalysisInputs: '输入', dHypothesis: 'Agent 写的假设', dCardHypothesis: '分析卡上写的『在验证什么』', dCaveats: '附带说明',
     recheckBy: '导出时服务端按封存的输入复算的结论；本页只核哈希，不在浏览器里重算统计',
     recheckNone: '导出时没有复算（结论未随文件附带）',
     analysisInput: (role, alias) => `${role}${alias ? ` · ${alias}` : ''}`,
@@ -1212,7 +1212,7 @@
   async function verify(data, digest, shownSeal) {
     const out = {
       events: [], manifest: [], artifacts: [], chain: [], numbers: [], docs: [], meta: [], checked: new Map(), order: [],
-      arts: new Map(), queryAliases: new Map(),
+      arts: new Map(), queryAliases: new Map(), analysisEntries: new Map(),
     }
     const events = Array.isArray(data.events) ? data.events.filter(isObj) : []
     const meta = data.meta
@@ -1372,6 +1372,15 @@
     // 工件 → 报告目录里它的编号（Q1、M1……）：数字详情里口径卡的输入据此写出「查询 Q1 · 第 N 行 · 列」
     for (const [id, refs] of byDoc) {
       if (refs.length && !out.queryAliases.has(id)) out.queryAliases.set(id, refs[0].alias)
+    }
+    // 工件 → 报告目录里这条分析结论的条目（item、call_id）：谁做的那一行、「在验证什么」的说法照它认
+    out.analysisEntries = new Map()
+    for (const [id, refs] of byDoc) {
+      for (const ref of refs) {
+        const doc = trusted.get(ref.report)
+        const entry = own(isObj(doc) ? doc.catalog : null, ref.alias)
+        if (isObj(entry) && entry.kind === 'analysis' && !out.analysisEntries.has(id)) out.analysisEntries.set(id, entry)
+      }
     }
     out.arts = arts
     out.chained = chained
@@ -2032,12 +2041,17 @@
     return parts
   }
 
-  /** 数字详情里分析结论一节：判定语、判定标准、方法与版本、附带说明、Agent 写的假设、输入（各自的核对状态）、导出时服务端
-   *  的复算结论。结论没随文件附带（遮罩、文件不在）时只写复算一句 */
+  /** 数字详情里分析结论一节：判定语、判定标准、方法与版本、附带说明、「在验证什么」（谁写的照实标：Agent 写的假设 /
+   *  分析卡上写的『在验证什么』，照报告目录里这条结论的条目认）、输入（各自的核对状态）、导出时服务端的复算结论。
+   *  结论没随文件附带（遮罩、文件不在）时只写复算一句 */
   function analysisBlock(number) {
     const result = isObj(number.analysis) ? number.analysis : null
     const art = view.out.artifacts.find((a) => a.a.id === number.artifact)
     const recheck = art && isObj(art.a.recheck) ? art.a.recheck : null
+    // 谁做的：报告目录里这条结论的条目（带 item 的是分析卡做的，带 call_id 的是 Agent 现场做的）。「在验证什么」的说法照它认，
+    // 不把模板作者写的那一句标成 Agent 写的假设
+    const entry = view.out.analysisEntries.get(number.artifact)
+    const card = isObj(entry) ? !!entry.item && !entry.call_id : false
     const parts = []
     if (result) {
       parts.push(kv([
@@ -2048,7 +2062,7 @@
       const caveats = (Array.isArray(result.caveats) ? result.caveats : []).filter(isObj).map((c) => String(c.text || ''))
       if (caveats.length) parts.push(h('p', { class: 'sub' }, T.dCaveats), h('ul', { class: 'items' }, caveats.map((c) => h('li', {}, c))))
       if (typeof result.hypothesis === 'string' && result.hypothesis.trim()) {
-        parts.push(h('p', { class: 'sub' }, T.dHypothesis), h('p', {}, result.hypothesis))
+        parts.push(h('p', { class: 'sub' }, card ? T.dCardHypothesis : T.dHypothesis), h('p', {}, result.hypothesis))
       }
       const inputs = (Array.isArray(result.inputs) ? result.inputs : []).filter((i) => isObj(i) && typeof i.artifact === 'string')
       if (inputs.length) {

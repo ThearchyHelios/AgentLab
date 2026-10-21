@@ -5,7 +5,8 @@
 真的 recompute：按 sha256 取回封存的输入快照、下钻的上一层结论，逐字段比。只有要它出错、升版的几处用 monkeypatch。
 
 - 证据图：A1 条目带算子、判定；「派生自」的边 A1 → Q1
-- 片段接口：判定 → 方法 → 计算 → 输入（接查询步骤）→ 复算 → 封存；Agent 写的假设标出来；复算不了照实写，不让接口出错
+- 片段接口：判定 → 方法 → 计算 → 输入（接查询步骤）→ 复算 → 封存；「在验证什么」谁写的照实标（Agent 写的假设 / 分析卡上
+  写的『在验证什么』）；复算不了照实写，不让接口出错
 - 审计：分析判定、分析结论的叫法；分析说法核对的违规单列一行
 - 报告导出：数据块里有分析结论那几步；文档带「分析范围」的，正文后面渲染、编号点得开
 - 指标步骤带可比性：口径卡指标上的可比性结论（不进台账）照卡上记的 sha256 取回，点得开（判定 → … → 复算 → 封存）
@@ -135,7 +136,9 @@ async def test_the_phrase_opens_judgment_method_calculation_inputs_recompute_and
     assert judged["verdict"] == {"code": "driver", "subjects": [["华东"]], "direction": "down"}
     assert judged["cited"] == {"what": "phrase"} and judged["render_ok"] is True and judged["eid_ok"] is True
     assert judged["origin"] == "card" and judged["item"] == "drop" and judged["label"] == "分析"
-    assert judged["hypothesis"] == "华东拖累" and judged["hypothesis_note"].startswith("Agent 写的假设")
+    # 分析卡做的：模板作者写的「在验证什么」，不标成 Agent 写的假设
+    assert judged["hypothesis"] == "华东拖累" and judged["hypothesis_label"] == "分析卡上写的『在验证什么』"
+    assert judged["hypothesis_note"].startswith("分析卡上写的『在验证什么』")
     assert {c["code"] for c in judged["caveats"]} == {"measure_unlabeled", "headline_basis", "comparability"}
     assert method["method"] == "decompose.additive@1" and method["method_label"] == "变化拆解（可加）"
     assert {s["key"]: s["label"] for s in method["settings"]}["main_share"] == "「主要来源」的占比"
@@ -307,9 +310,12 @@ def test_suspicious_name_hints_do_not_read_the_analysis_results(monkeypatch):
 
 
 async def test_agent_analyses_are_marked_as_such(client):
+    """Agent 现场做的：谁做的写 Agent，「在验证什么」照旧标「Agent 写的假设」（分析卡上那一句是模板作者写的，另说）"""
     made = await sealed_run(TEXT, item=None, call_id="call-9")
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
-    assert body["chain"][0]["origin"] == "agent" and body["chain"][0]["call_id"] == "call-9"
+    judged = body["chain"][0]
+    assert judged["origin"] == "agent" and judged["call_id"] == "call-9"
+    assert judged["hypothesis_label"] == "Agent 写的假设" and judged["hypothesis_note"].startswith("Agent 写的假设")
 
 
 async def test_headline_inputs_show_the_closure(client):

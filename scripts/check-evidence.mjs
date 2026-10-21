@@ -645,6 +645,10 @@ await section('analysis', '分析结论：判定语、具名的数、结果表�
   await p.locator('[data-ev-analysis="A2"]').waitFor({ timeout: 8000 })
   check('分析卡的结论：谁做的写「分析卡（模板定好的分析）」', (await p.locator('[data-ev-analysis-origin]').getAttribute('data-ev-analysis-origin')) === 'card'
     && (await p.locator('[data-ev-analysis="A2"]').innerText()).includes('分析卡（模板定好的分析）'))
+  // 「在验证什么」那一句是模板作者写的：照实写「分析卡上写的『在验证什么』」，不标成 Agent 写的假设
+  const cardBody = await p.locator('[data-ev-analysis="A2"]').innerText()
+  check('……「在验证什么」写「分析卡上写的『在验证什么』」，不说 Agent 写的假设', cardBody.includes('分析卡上写的『在验证什么』')
+    && !cardBody.includes('Agent 写的假设'), cardBody.slice(-160))
   await card.locator('[data-seg="s6"]').click()
   await p.locator('[data-ev-analysis="A1"]').waitFor({ timeout: 8000 })
   check('算不了的结论：标「这次分析没有做成」、写算不了的原因', await p.locator('[data-ev-analysis-refused]').count() === 1

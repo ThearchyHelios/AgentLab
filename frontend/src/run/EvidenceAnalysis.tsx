@@ -135,7 +135,7 @@ function JudgedPart({ step, recompute, seal, overall }: {
               {step.caveats.map((c, i) => <li key={`${c.code ?? ''}-${i}`}>{c.text}</li>)}
             </ul>
           )] : null,
-          step.hypothesis ? [E.hypothesis, (
+          step.hypothesis ? [step.hypothesis_label || E.hypothesis, (
             <span key="h" data-ev-analysis-hypothesis="">
               {step.hypothesis}
               {step.hypothesis_note && <span className="mt-0.5 block text-2xs text-faint">{step.hypothesis_note}</span>}
