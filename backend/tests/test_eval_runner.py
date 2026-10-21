@@ -33,7 +33,12 @@ async def _clear_ledger() -> None:
 
 
 @pytest.fixture(autouse=True)
-async def engine_up():
+async def engine_up(monkeypatch):
+    # 同一个测试进程里别的测试建的数据源可能超过评测拍目录快照的上限（app/eval/snapshots.MAX_SOURCES），评测会按
+    # 设计报「数据源超过 20 个」——这里的评测不测这个上限，分到哪个进程都要照常跑
+    from app.eval import snapshots
+
+    monkeypatch.setattr(snapshots, "MAX_SOURCES", 10_000)
     await run_manager.setup()
     await _clear_ledger()
     yield
@@ -47,6 +52,16 @@ async def engine_up():
 async def client():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
+
+
+async def _until(cond, what: str, *, timeout: float = 30.0) -> None:
+    """等到 cond() 为真；等不到就让测试失败、说清在等什么，不让整次测试卡死（作答运行在排队之前就失败时，排队永远等不到）。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not await cond():
+        if loop.time() > deadline:
+            raise AssertionError(f"等了 {timeout:g} 秒还没等到：{what}")
+        await asyncio.sleep(0.02)
 
 
 def ask_cases(n: int) -> list[dict]:
@@ -327,12 +342,13 @@ async def test_time_queued_for_a_run_slot_does_not_count_against_the_case_limit(
     monkeypatch.setattr(runner.EvalExecution, "_prepare", prepare)
     held = asyncio.create_task(blocker())
     try:
-        while not (await slots.snapshot())["classes"]["system"]["running"]:
-            await asyncio.sleep(0.02)
+        async def blocking() -> bool:
+            return bool((await slots.snapshot())["classes"]["system"]["running"])
+
+        await _until(blocking, "占名额的那一段拿到名额")
         suite_id = await es.make_suite("none", cases=ask_cases(1))
         [run] = await start(suite_id)
-        while not await slots.waiting("eval-answer-in-queue"):
-            await asyncio.sleep(0.02)
+        await _until(lambda: slots.waiting("eval-answer-in-queue"), "作答运行排队等名额")
         await asyncio.sleep(2.0)
         gate.set()
         await es.wait_eval(run.id)
