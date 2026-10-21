@@ -1008,7 +1008,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     LEDGER_GROUP: ledger_values(None),
     # 评测：预算的全站缺省（题集上可以改）、保留几次明细、结论裁判的缺省开关
     EVAL_GROUP: eval_values(None),
-    # 分析：判定用的阈值、一次运行最多分析几次、最多下钻几层（app/analysis/contract.py）
+    # 分析：判定用的阈值、Agent 每次执行最多分析几次、最多下钻几层（app/analysis/contract.py）
     ANALYSIS_GROUP: analysis_values(None),
     # 邮件服务（SMTP）：通知渠道的邮件格式用它发信。缺省关
     MAIL_GROUP: _mail_public(None),

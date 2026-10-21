@@ -152,4 +152,4 @@ async def test_ledger_entries_name_the_real_input_snapshots():
 
 def test_the_call_limit_error_is_spoken_with_the_limit():
     error = analysis.exhausted({"max_calls": 5})
-    assert error.code == "max_calls" and error.message == "这次运行的分析次数已经用完（最多 5 次）：用已有的分析结论写，不再新做分析"
+    assert error.code == "max_calls" and error.message == "这个 Agent 这次执行最多做 5 次分析，已经用完：用已有的分析结论写，不再新做分析"
