@@ -1724,7 +1724,7 @@ function useSchemaColumns(sourceId: string | undefined, active: boolean) {
 
 /**
  * 遮罩的列：列名一个个加成标签，可以从已探查的结构里挑，也可以直接输。
- * 用户拍板写明遮罩的边界，口径同 README「哪些角色看得到原值」：对开了登录的使用者是边界；对搭建者、管理员，以及未开启
+ * 用户拍板写明遮罩的边界，口径同 README.zh-CN.md「哪些角色看得到原值」：对开了登录的使用者是边界；对搭建者、管理员，以及未开启
  * 登录时的所有人，只减少暴露（MASK_BOUNDARY_TEXT）
  */
 function MaskColumnsInput({ id, sourceId, synced, value, onChange }: {

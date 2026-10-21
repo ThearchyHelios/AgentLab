@@ -208,7 +208,7 @@ def _naive(moment: Any) -> Any:
 def _message(peers: list[dict[str, Any]], *, beating: set[str] | None = None) -> str:
     listed = "；".join(_describe(p, beating) for p in peers)
     return (f"库里还有 {len(peers)} 个版本不同的 AgentLab 进程活着：{listed}。本进程是代码 {code_version()}、库结构 "
-            f"{schema_version()}。不支持新旧版本同时运行：先停掉这些进程再启动新版本（升级步骤见 README「多进程」的「升级」）")
+            f"{schema_version()}。不支持新旧版本同时运行：先停掉这些进程再启动新版本（升级步骤见 README.zh-CN.md「多进程」的「升级」）")
 
 
 def check_rows(rows: list[Any], now: Any) -> None:

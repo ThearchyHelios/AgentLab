@@ -1,3 +1,5 @@
+[English](README.md) | 简体中文
+
 # AgentLab
 
 **可视化 Agent 编排实验台**——在画布上定义工作流，运行时逐节点观察执行过程，

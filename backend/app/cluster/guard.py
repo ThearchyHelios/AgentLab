@@ -22,7 +22,7 @@ LOCK_FILE = ".agentlab.lock"
 
 SINGLE_PROCESS = ("应用库是 SQLite 时只支持单进程：数据目录 {dir} 已经被另一个 AgentLab 进程使用（{hint}）。"
                   "SQLite 不能多进程部署——不要给 uvicorn 加 --workers、不要让两个服务指着同一个数据目录；"
-                  "要多进程，把应用库换成 PostgreSQL（AGENTLAB_DATABASE_URL，见 README「用 PostgreSQL」「多进程」）")
+                  "要多进程，把应用库换成 PostgreSQL（AGENTLAB_DATABASE_URL，见 README.zh-CN.md「用 PostgreSQL」「多进程」）")
 
 
 class SingleProcessOnly(RuntimeError):
