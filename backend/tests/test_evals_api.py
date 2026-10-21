@@ -431,9 +431,11 @@ async def test_the_retail_sample_suite_trials_on_the_retail_database(client, tmp
         # 陷阱确实埋着：按下单日、含退款算出来的都不一样
         assert paid not in (by_order_date, with_refunds)
         refunds = await trial(2)
-        assert (refunds["refund_orders"]["value"], refunds["refund_amount"]["value"]) == one(
-            f"SELECT COUNT(*), ROUND(SUM(amount), 2) FROM orders WHERE status = 'refunded' AND paid_date BETWEEN "
-            f"'{start}' AND '{end}'")
+        # 金额两边都按两位小数比：SQLite 的 ROUND(SUM(amount), 2) 出来的是浮点（6448.19 存成 6448.1900000000005），
+        # 和试算交回的金额逐字比会随数据变而挂
+        orders, amount = one(f"SELECT COUNT(*), ROUND(SUM(amount), 2) FROM orders WHERE status = 'refunded' "
+                             f"AND paid_date BETWEEN '{start}' AND '{end}'")
+        assert (refunds["refund_orders"]["value"], round(refunds["refund_amount"]["value"], 2)) == (orders, amount)
         assert refunds["refund_orders"]["value"] > 0
         cancelled = await trial(3)
         assert cancelled["cancelled"]["value"] == one(
