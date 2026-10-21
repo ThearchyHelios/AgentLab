@@ -230,6 +230,30 @@ def test_input_snapshots_carry_the_payload_as_is():
     assert merged["dialect"] == "sqlite" and merged["masked"] == []
 
 
+async def test_each_query_is_parsed_once_per_node_for_its_tables(monkeypatch):
+    """agent 每次分析都按本节点全部查询认表（目录、剖析、探查都按表给，tools/analysis.context_of）：同一条 SQL 一个节点里只
+    解析一次（AnalysisScope.tables_cache）。以前每次调用都把本节点的查询从头解析一遍。"""
+    from app.engine import evidence
+    from app.tools.analysis import AnalysisScope, SCOPE_KEY, input_snapshot
+    from app.tools.builtin.analysis import DecomposeArgs, run_tool
+    from app.tools.registry import ToolContext
+
+    FakeOps(monkeypatch)
+    parsed: list[str] = []
+    real = evidence.sql_tables
+    monkeypatch.setattr(evidence, "sql_tables", lambda sql: parsed.append(sql) or real(sql))
+    scope = AnalysisScope(node_id="bot", snapshot={})
+    for alias, sql in (("Q1", SQL), ("Q2", MASKED_SQL)):
+        content = {"columns": ["region", "week", "gmv"], "rows": [["华东", "2026-W41", 820.0]], "sql": sql,
+                   "source": "nowhere", "truncated": False}
+        artifact = await artifact_store.put_json(content, kind="query_snapshot")
+        scope.add_query(alias, input_snapshot(content, ref=alias, artifact=artifact, node_id="bot"))
+    ctx = ToolContext(run_id="r", node_id="bot", extra={SCOPE_KEY: scope})
+    for _ in range(3):
+        await run_tool("decompose", ctx, DecomposeArgs(**DECOMPOSE_ARGS))
+    assert parsed == [SQL, MASKED_SQL] and scope.tables_cache[SQL] == ("orders",)
+
+
 # --------------------------------------------------------------------------
 # 方法说明：绑了分析工具的 Agent 注入一次，模型调用节点、没绑的 Agent 不注入
 # --------------------------------------------------------------------------

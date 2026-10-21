@@ -67,8 +67,9 @@ class AnalysisScope:
 
     queries：编号 Qn → 输入快照（contract.InputSnapshot；记台账时先放交回模型的那份 payload，分析前 prepare 换成工件库里
     那份完整快照，补上遮罩列）。results：编号 An → 整份结论；artifacts：An → 结论的工件 id。snapshot：发起时的分析设置快照
-    （没有为 None，现读设置）。mask_cache：快照工件 → 遮罩列；source_cache：数据源和表 → 目录、查询用的源；probe_cache：
-    数据源名 → coverage.Cache（一次节点执行里各读、各查一次，只在工具执行时用，不影响编号）。"""
+    （没有为 None，现读设置）。mask_cache：快照工件 → 遮罩列；source_cache：数据源和表 → 目录、查询用的源；tables_cache：
+    SQL → 它用到的表（每次分析调用都要按本节点全部查询认表，同一条 SQL 只解析一次）；probe_cache：数据源名 →
+    coverage.Cache（一次节点执行里各读、各查一次，只在工具执行时用，不影响编号）。"""
 
     node_id: str
     snapshot: dict[str, Any] | None = None
@@ -77,6 +78,7 @@ class AnalysisScope:
     artifacts: dict[str, str] = field(default_factory=dict)
     mask_cache: dict[str, list[str]] = field(default_factory=dict)
     source_cache: dict[str, Any] = field(default_factory=dict)
+    tables_cache: dict[str, tuple[str, ...]] = field(default_factory=dict)
     probe_cache: dict[str, Any] = field(default_factory=dict)
     #: 已经换成工件库里那份完整快照的编号（prepare 每份只取回一次）
     prepared: set[str] = field(default_factory=set)
@@ -198,27 +200,33 @@ async def prepare(scope: AnalysisScope) -> None:
 # --------------------------------------------------------------------------
 
 
-def _tables_of(snapshots: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
-    """数据源名 → 这几份快照的 SQL 里用到的表（evidence.sql_tables，去掉 schema 前缀前的写法）。合并查询不是数据源。"""
+def _tables_of(snapshots: Iterable[Mapping[str, Any]],
+               memo: dict[str, tuple[str, ...]] | None = None) -> dict[str, set[str]]:
+    """数据源名 → 这几份快照的 SQL 里用到的表（evidence.sql_tables，去掉 schema 前缀前的写法）。合并查询不是数据源。
+    memo 是 SQL → 表的缓存（调用方的，同一个节点里分析好几次，每条 SQL 只解析一次）。"""
     from app.engine.evidence import sql_tables
     from app.engine.merge_query import MERGE_SOURCE
 
+    memo = memo if memo is not None else {}
     out: dict[str, set[str]] = {}
     for snap in snapshots:
         name = str(snap.get("source") or "")
         if not name or name == MERGE_SOURCE:
             continue
-        try:
-            tables = sql_tables(str(snap.get("sql") or ""))
-        except Exception:  # noqa: BLE001 - 认不出表就只是少给一点目录
-            tables = []
-        out.setdefault(name, set()).update(str(t) for t in tables)
+        sql = str(snap.get("sql") or "")
+        if sql not in memo:
+            try:
+                memo[sql] = tuple(str(t) for t in sql_tables(sql))
+            except Exception:  # noqa: BLE001 - 认不出表就只是少给一点目录
+                memo[sql] = ()
+        out.setdefault(name, set()).update(memo[sql])
     return out
 
 
 async def context_of(snapshots: Iterable[Mapping[str, Any]], *, tool_ctx: Any,
                      cache: dict[str, Any] | None = None,
-                     probe_cache: dict[str, Any] | None = None) -> contract.Context:
+                     probe_cache: dict[str, Any] | None = None,
+                     tables_cache: dict[str, tuple[str, ...]] | None = None) -> contract.Context:
     """算子要的运行期依赖（contract.Context）。每次分析调用一份（探查器有总时限，一次调用建一个）。
 
     - today：运行当天，服务端时区（算子据此判本期完不完整）
@@ -229,15 +237,16 @@ async def context_of(snapshots: Iterable[Mapping[str, Any]], *, tool_ctx: Any,
       遮罩列按数据源设的不探，探不成由算子退回剖析事实；一个源都解析不出来时为 None
 
     tool_ctx 是查询用的那个 ToolContext（固定的数据版本、目录视图都从它取）。cache 是调用方的缓存（同一个节点里分析好几次，
-    目录、数据源读一次）；probe_cache 是数据源名 → coverage.Cache（同一张表的范围一个节点里只查一次）。读不到的源当没有：
-    目录、剖析、探查都是附加的，不能挡住分析。"""
+    目录、数据源读一次）；tables_cache 是 SQL → 用到的表（同一条 SQL 一个节点里只解析一次：agent 每次分析都按本节点全部
+    查询认表）；probe_cache 是数据源名 → coverage.Cache（同一张表的范围一个节点里只查一次）。读不到的源当没有：目录、剖析、
+    探查都是附加的，不能挡住分析。"""
     from app.analysis.probe import profile_facts
 
     cache = cache if cache is not None else {}
     catalogs: dict[str, Any] = {}
     facts: dict[str, Any] = {}
     sources: dict[str, Any] = {}
-    for name, tables in _tables_of(snapshots).items():
+    for name, tables in _tables_of(snapshots, tables_cache).items():
         key = f"{name}\n" + "\n".join(sorted(tables))
         if key not in cache:
             cache[key] = await _source_context(name, tables, tool_ctx)
