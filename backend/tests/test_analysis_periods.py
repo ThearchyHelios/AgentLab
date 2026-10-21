@@ -128,3 +128,15 @@ def test_unreadable_values_are_named():
     assert pd.unreadable(["2026-W40", "上周", "2026-W41", None]) == ("shape", ["上周", None])
     assert pd.unreadable(["2026-W40", "2026-W41", "2026-10-12"]) == ("mixed", ["2026-10-12"])
     assert pd.unreadable(["2026-10", "2026-11"], "week") == ("grain", ["2026-10", "2026-11"])
+
+
+def test_a_plain_date_column_is_a_day_even_when_two_values_are_a_week_apart():
+    plain = "SELECT region, order_date AS day, SUM(amount) AS gmv FROM orders GROUP BY 1, 2"
+    starts = ("SELECT region, date(order_date, '-6 days', 'weekday 1') AS week, SUM(amount) AS gmv FROM orders "
+              "GROUP BY 1, 2")
+    assert pd.plain_day(plain, "day", "sqlite") and pd.plain_day(plain.replace("order_date AS", "DATE(order_date) AS"),
+                                                                  "day", "sqlite")
+    assert not pd.plain_day(starts, "week", "sqlite")
+    assert pd.parse_compared(["2026-10-13", "2026-10-20"], plain, "day", "sqlite")[1] == "day"
+    assert pd.parse_compared(["2026-10-12", "2026-10-19"], starts, "week", "sqlite")[1] == "week"
+    assert pd.parse_compared(["2026-09-01", "2026-10-01"], plain, "day", "sqlite")[1] == "month"

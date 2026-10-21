@@ -568,7 +568,8 @@ def comparable(raw: Mapping[str, Any], env: Any) -> Any:
                                                     "里有的期次值",
                                 reason=f"期次列「{period}」里没有{what}「{ph.key_text([params[side]])}」")
         env.inputs.use(target, "data", [period, *([measure] if measure else [])], rows["base"] + rows["target"])
-        parsed = pd.parse(values, grain, weeks=pd.week_scheme(target.sql, period, target.dialect))
+        parsed = pd.parse(values, grain, weeks=pd.week_scheme(target.sql, period, target.dialect)) if grain \
+            else pd.parse_compared(values, target.sql, period, target.dialect)
         if parsed is None:
             item_b = item_t = pd.Period(None, 0, None, None)
             grain = "seq"

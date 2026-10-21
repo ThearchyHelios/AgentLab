@@ -136,7 +136,7 @@ async def test_the_phrase_opens_judgment_method_calculation_inputs_recompute_and
     assert judged["cited"] == {"what": "phrase"} and judged["render_ok"] is True and judged["eid_ok"] is True
     assert judged["origin"] == "card" and judged["item"] == "drop" and judged["label"] == "分析"
     assert judged["hypothesis"] == "华东拖累" and judged["hypothesis_note"].startswith("Agent 写的假设")
-    assert {c["code"] for c in judged["caveats"]} == {"measure_unlabeled", "headline_basis"}
+    assert {c["code"] for c in judged["caveats"]} == {"measure_unlabeled", "headline_basis", "comparability"}
     assert method["method"] == "decompose.additive@1" and method["method_label"] == "变化拆解（可加）"
     assert {s["key"]: s["label"] for s in method["settings"]}["main_share"] == "「主要来源」的占比"
     assert {s["key"] for s in method["settings"]} >= {"main_share", "concentration", "table_top_k"}

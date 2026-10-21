@@ -271,6 +271,35 @@ def week_scheme(sql: str, column: str, dialect: str | None) -> str | None:
         return None
 
 
+@lru_cache(maxsize=256)
+def plain_day(sql: str, column: str, dialect: str | None) -> bool:
+    """期次列是不是直接取的一个日期列（原样、date(列)、DATE(列)、CAST(列 AS DATE)），没有按周、按月换算过。"""
+    from sqlglot import exp
+
+    from app.engine import cell_format as cf
+
+    try:
+        value = _period_expr(sql, column, dialect)
+    except Exception:  # noqa: BLE001
+        return False
+    if isinstance(value, (exp.Date, exp.TsOrDsToDate)):
+        extra = [v for k, v in value.args.items() if k != "this" and v not in (None, [], False)]
+        value = cf._unwrap(value.this) if not extra else None
+    return isinstance(value, exp.Column) and not isinstance(value.this, exp.Star)
+
+
+def parse_compared(values: Sequence[Any], sql: str, column: str,
+                   dialect: str | None) -> tuple[list[Period], str] | None:
+    """按期次分组的一份快照里比的两期（变化拆解、可比性检查没给粒度时；快照里往往只有这两期）：同 parse，周号按 SQL 认算法，
+    粒度按值推断；但值都是日期、推断成按周、期次列又是直接取的日期列（plain_day）时按天认——两期正好隔 7 天，光看值分不出
+    是两天还是两周，期次列没按周换算过就是那一天。"""
+    parsed = parse(values, weeks=week_scheme(sql, column, dialect))
+    if parsed is not None and parsed[1] == "week" and all(_shape(v) == "date" for v in values) \
+            and plain_day(sql, column, dialect):
+        return parse(values, "day")
+    return parsed
+
+
 def _period_expr(sql: str, column: str, dialect: str | None) -> Any:
     """结果列 column 的写法（sqlglot 节点）：最外层 SELECT 里那一项；是从 CTE、子查询里原样取出的一列时往里找。"""
     from sqlglot import exp
@@ -497,4 +526,4 @@ def weekend_days(start: date, end: date) -> int:
 
 
 __all__ = ["COUNT_WORD", "DEFAULT_LAG", "GRAINS", "PER_WORD", "WEEK_SCHEMES", "Period", "calendar_unit", "parse",
-           "short_days", "unreadable", "week_scheme", "week_span", "weekend_days"]
+           "parse_compared", "plain_day", "short_days", "unreadable", "week_scheme", "week_span", "weekend_days"]
