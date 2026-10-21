@@ -1006,11 +1006,16 @@ _OP_SETTINGS: dict[str, tuple[str, ...]] = {
     "differ": ("differ_alpha", "min_n", "min_expected"),
     "comparable": (),
 }
-#: 输入的角色（analysis.contract.AnalysisInput.role）给人看的叫法
+#: 输入的角色（analysis.contract.AnalysisInput.role）给人看的叫法；比率拆解的 headline 是整体比率，不是总数
 _INPUT_ROLES = {"data": "数据", "base": "基期", "target": "本期", "headline_base": "基期总数",
                 "headline_target": "本期总数", "parent": "上一层拆解"}
-#: 闭合核对：headline 的那一格对着结论里的哪个总数（细案 01 §2.1）
-_HEADLINE_TOTALS = {"headline_base": "base_total", "headline_target": "target_total"}
+_RATIO_ROLES = {"headline_base": "基期整体比率", "headline_target": "本期整体比率"}
+#: 闭合核对：headline 的那一格对着结论里的哪个数（细案 01 §2.1、§2.2）。可加拆解对各段之和（base_total / target_total），
+#: 比率拆解对整体比率，即各段分子之和 ÷ 分母之和（r_base_total / r_target_total）
+_HEADLINE_TOTALS = {
+    "additive": {"headline_base": "base_total", "headline_target": "target_total"},
+    "ratio": {"headline_base": "r_base_total", "headline_target": "r_target_total"},
+}
 #: 计算一步最多给结果表的几行（前 table_top_k 段，加上被引用的那一行前后各 WINDOW 行）
 MAX_ANALYSIS_ROWS = MAX_WINDOW_ROWS
 
@@ -1181,11 +1186,15 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
                            sealed: _Sealed, masks: _Masks, *, queries: bool = True
                            ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """输入：每份一步（analysis_input），再给每份输入快照一个查询步骤（_query_steps，高亮用到的列；整份用到的给前
-    MAX_WINDOW_ROWS 行；queries 为假时不给）。headline 的那一格另核对和结论里的总数闭不闭合（照实写判定是不是
-    unclosed，不在这里重算容差）；下钻的上一层落到报告目录的哪个 A。"""
+    MAX_WINDOW_ROWS 行；queries 为假时不给）。headline 的那一格另核对和结论里的数闭不闭合（_HEADLINE_TOTALS：可加拆解是
+    各段之和，比率拆解是整体比率；closure.mode 写明是哪一种，照实写判定是不是 unclosed，不在这里重算容差）；下钻的上一层
+    落到报告目录的哪个 A。"""
     values = result.get("values") if isinstance(result.get("values"), dict) else {}
     verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else {}
     unclosed = verdict.get("code") == "unclosed"
+    mode = str(result.get("mode") or "")
+    totals = _HEADLINE_TOTALS.get(mode, {}) if result.get("op") == "decompose" else {}
+    roles = {**_INPUT_ROLES, **(_RATIO_ROLES if mode == "ratio" else {})}
     steps: list[dict[str, Any]] = []
     cells: dict[str, list[tuple[Any, Any]]] = {}
     for item in result.get("inputs") or []:
@@ -1195,7 +1204,7 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
         role = str(item.get("role") or "")
         step: dict[str, Any] = {
             "step": "analysis_input", "of": alias, "ref": item.get("ref"), "role": role,
-            "role_label": _INPUT_ROLES.get(role, role or "输入"), "artifact": artifact or None,
+            "role_label": roles.get(role, role or "输入"), "artifact": artifact or None,
             **{k: item[k] for k in ("columns", "rows", "row", "column", "value") if k in item},
         }
         if role == "parent":
@@ -1208,10 +1217,9 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
         query = sealed.queries.get(artifact)
         step.update(query=_catalog_alias_of(catalog, artifact), node_id=(query or {}).get("node_id"),
                     sealed=sealed.trusted and query is not None)
-        if role in _HEADLINE_TOTALS and _HEADLINE_TOTALS[role] in values:
-            total = values[_HEADLINE_TOTALS[role]]
+        if role in totals and totals[role] in values:
             with contextlib.suppress(RenderError):
-                step["closure"] = {"total_key": _HEADLINE_TOTALS[role], "total": render_cell(total),
+                step["closure"] = {"mode": mode, "total_key": totals[role], "total": render_cell(values[totals[role]]),
                                    "headline": render_cell(item.get("value")), "closed": not unclosed}
         steps.append(step)
         if artifact and query is not None:
