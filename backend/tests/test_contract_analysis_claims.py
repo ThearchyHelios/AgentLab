@@ -299,3 +299,74 @@ async def test_a_metric_read_from_a_query_cell_is_traced(client, monkeypatch, sh
                                           "expression": "cell(nodes.fetch, 0, 'gmv')"}])
     issuance = await governed(client, graph)
     assert "untraced" not in issuance and not any("没追到原始数据" in g for g in issuance["gaps"])
+
+
+# --------------------------------------------------------------------------
+# 引用了分析结论：输入查询的 SQL 检查问题计入缺口，具名标量记进逐个数字的出处
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def analyses(monkeypatch):
+    """写作目录里多几条分析结论：{A 编号: 结论工件 id}。台账里的分析结论由入口（分析卡、Agent 的分析工具）记，这里直接
+    补进目录：报告节点和出口复核按同一个 report_catalog 建目录，一处补上。"""
+    from app.core import artifact_store
+    from app.engine.evidence import make_eid
+    from app.engine.nodes import report as report_mod
+
+    added: dict[str, str] = {}
+    original = report_mod.report_catalog
+
+    def catalog(state, spec, node):
+        out = original(state, spec, node)
+        for alias, artifact in added.items():
+            out[alias] = {"alias": alias, "kind": "analysis", "artifact": artifact, "item": "drop",
+                          "eid": make_eid("analysis", artifact, {}), "locator": {},
+                          "result": artifact_store.load(artifact)}
+        return out
+
+    monkeypatch.setattr(report_mod, "report_catalog", catalog)
+    return added
+
+
+async def stored_driver(*, checks=None) -> str:
+    """一份「销售额下降主要来自华东」的拆解结论，输入是一份（可能带着 SQL 检查问题的）查询快照，都存进工件库。"""
+    from app.analysis.testing import fake_result
+    from app.core import artifact_store
+
+    query = await artifact_store.put_json({"source": "shop", "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders",
+                                           "columns": ["region", "week", "gmv"], "rows": [["华东", "W41", 820]],
+                                           "truncated": False, **({"checks": checks} if checks else {})},
+                                          kind="query_snapshot")
+    result = fake_result(inputs=[{"ref": "Q2", "artifact": query, "role": "data",
+                                  "columns": ["region", "week", "gmv"], "rows": "all"}])
+    return await artifact_store.put_json(result, kind="analysis_result")
+
+
+FANOUT = {"code": "fanout_sum", "level": "error", "message": "一对多关联后求和，订单金额被重复计算。改法：先汇总再关联"}
+
+
+@pytest.mark.parametrize("text", [
+    "[[a:A1]]。[[see:m:gmv]]",
+    "本周销售额 [[m:gmv]]，下降主要来自华东。[[see:m:gmv,A1]]",
+    "华东占变化的 [[a:A1.top_share|pct]]。[[see:m:gmv]]",
+])
+async def test_an_analysis_built_on_a_failing_query_degrades_like_the_query_itself(monkeypatch, analyses, text):
+    analyses["A1"] = await stored_driver(checks=[FANOUT])
+    writes(monkeypatch, text)
+    issuance = await issued(weekly())
+    assert issuance["tier"] == "degraded"
+    [gap] = [g for g in issuance["gaps"] if "SQL 检查" in g]
+    assert "一对多关联后求和" in gap and "A1" in gap
+    analyses["A1"] = await stored_driver()
+    clean = await issued(weekly())
+    assert clean["tier"] == "formal" and not any("SQL 检查" in g for g in clean["gaps"])
+
+
+async def test_a_named_scalar_is_listed_as_an_analysis_number(monkeypatch, analyses):
+    analyses["A1"] = await stored_driver()
+    writes(monkeypatch, "华东占变化的 [[a:A1.top_share|pct]]，下降主要来自华东。[[see:m:gmv,A1]]")
+    issuance = await issued(weekly())
+    [hit] = [m for m in issuance["matched"] if m.get("analysis")]
+    assert hit["analysis"] == "A1.top_share" and hit["token"] == "61.9%" and "input" not in hit
+    assert "analysis_claims" not in issuance, "判断词挂对了：check 下没有可标注的"

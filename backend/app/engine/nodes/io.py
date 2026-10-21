@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from app.analysis.contract import LEDGER_KIND
 from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError
 from app.engine.expressions import ExpressionError, eval_expression
@@ -568,8 +569,12 @@ def _check_citations(
                 if label:
                     hit["caliber"] = label
             elif cite["kind"] == "cell":
-                # 查询单元格：Q1.r0.gmv（全局编号，和 doc.catalog 一致）
+                # 查询单元格：Q1.r0.gmv（全局编号，和 doc.catalog 一致）；分析结论结果表的一格同一种写法（A3.r0.share）
                 hit["cell"] = f"{cite['alias']}.r{cite['locator']['row']}.{cite['locator']['column']}"
+            elif cite["kind"] == LEDGER_KIND:
+                # 分析结论的具名标量（[[a:A3.top_share]]）：A3.top_share
+                key = (cite.get("locator") or {}).get("key")
+                hit["analysis"] = f"{cite['alias']}.{key}" if key else str(cite["alias"])
             else:
                 hit["input"] = cite["locator"].get("field")
             out["matched"].append({**hit, "segment": seg["id"], "unit": unit["id"], "start": start, "end": end,
@@ -1027,37 +1032,51 @@ def _cited_queries(doc: dict[str, Any], catalog: dict[str, Any]) -> tuple[dict[s
     单元格（[[v:Q1.r0.gmv]]，[[table:]] 展开后也是一格一格的引用）按查询数：一格写「Q1 第 1 行「gmv」」，
     几格写「Q1 的 3 格」；只拿它当依据（[[see:Q1]]）的写「Q1（结论依据）」。出具契约据此判这些查询有没有通过
     SQL 检查（issuance.sql_check_gaps）。
+
+    分析结论按它的工件记（sql_problems.query_problems 顺着结论的输入找到查询）：结果表的格同上（A3 第 1 行「share」）；
+    判定语、具名标量写「A3（判定语）」「A3「top_share」」，当依据（[[see:A3]]）的写「A3（结论依据）」——引用了一份分析
+    结论，它的输入查询上的问题照样计入缺口。
     """
     from app.engine.evidence import iter_units
 
     cells: dict[str, list[tuple[Any, Any]]] = {}
+    said: dict[str, list[str]] = {}         # 分析结论的判定语、具名标量：{A 编号: [键或 None…]}
     support: list[str] = []
     for _, unit in iter_units(doc):
         for seg in unit.get("segments") or []:
             cite = seg.get("cite") or {}
-            if cite.get("kind") == "cell" and cite.get("status") == "resolved" and cite.get("alias"):
+            if cite.get("status") != "resolved" or not cite.get("alias"):
+                continue
+            if cite.get("kind") == "cell":
                 loc = cite.get("locator") or {}
                 cells.setdefault(str(cite["alias"]), [])
                 if (loc.get("row"), loc.get("column")) not in cells[str(cite["alias"])]:
                     cells[str(cite["alias"])].append((loc.get("row"), loc.get("column")))
+            elif cite.get("kind") == LEDGER_KIND:
+                keys = said.setdefault(str(cite["alias"]), [])
+                key = (cite.get("locator") or {}).get("key")
+                if key not in keys:
+                    keys.append(key)
         for cite in unit.get("see") or []:
             alias = str((cite or {}).get("alias") or "")
-            if (catalog.get(alias) or {}).get("kind") == "query" and alias not in support:
+            if (catalog.get(alias) or {}).get("kind") in ("query", LEDGER_KIND) and alias not in support:
                 support.append(alias)
     queries: dict[str, list[str]] = {}
     # 目录里全部查询的编号：合并查询的输入没被直接引用，缺口里也要写得出它是 Q 几
     aliases = {str(e["artifact"]): str(e["alias"]) for e in catalog.values()
                if isinstance(e, dict) and e.get("kind") == "query" and e.get("artifact") and e.get("alias")}
-    for alias in [*cells, *(a for a in support if a not in cells)]:
+    for alias in dict.fromkeys([*cells, *said, *support]):
         artifact = (catalog.get(alias) or {}).get("artifact")
         if not isinstance(artifact, str) or not artifact:
             continue
         hit = cells.get(alias) or []
+        refs = []
         if len(hit) == 1 and isinstance(hit[0][0], int):
-            ref = f"{alias} 第 {hit[0][0] + 1} 行「{hit[0][1]}」"
-        else:
-            ref = f"{alias} 的 {len(hit)} 格" if hit else f"{alias}（结论依据）"
-        queries.setdefault(artifact, []).append(ref)
+            refs.append(f"{alias} 第 {hit[0][0] + 1} 行「{hit[0][1]}」")
+        elif hit:
+            refs.append(f"{alias} 的 {len(hit)} 格")
+        refs.extend(f"{alias}「{key}」" if key else f"{alias}（判定语）" for key in said.get(alias) or [])
+        queries.setdefault(artifact, []).extend(refs or [f"{alias}（结论依据）"])
     return queries, aliases
 
 
