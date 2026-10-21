@@ -126,7 +126,7 @@ def _shape(value: Any) -> str | None:
     text = value.strip()
     if (m := _MONTH.match(text)) and 1 <= int(m.group(2)) <= 12 and 1900 <= int(m.group(1)) <= 2200:
         return "month"
-    if _WEEK.match(text):
+    if (m := _WEEK.match(text)) and int(m.group(2)) <= 53:
         return "week"
     if _QUARTER.match(text):
         return "quarter"
@@ -161,17 +161,18 @@ def _first_weekday(start: date, weekday: int) -> date:
 
 def week_span(scheme: str, year: int, week: int) -> tuple[date, date] | None:
     """按周号算法，year 年第 week 周覆盖的第一天和最后一天（含）。这种算法里没有这一周（ISO 只有 52 周的年份写了第 53 周、
-    1 月 1 日就是周一的年份写了第 0 周……）为 None。"""
-    if scheme == "iso":
-        try:
-            start = date.fromisocalendar(year, week, 1)
-        except ValueError:
-            return None
-        return start, start + timedelta(days=6)
+    1 月 1 日就是周一的年份写了第 0 周……）、日子超出日期能表示的范围的为 None。"""
     try:
-        jan1, dec31 = date(year, 1, 1), date(year, 12, 31)
-    except ValueError:
+        return _week_span(scheme, year, week)
+    except (OverflowError, ValueError):
         return None
+
+
+def _week_span(scheme: str, year: int, week: int) -> tuple[date, date] | None:
+    if scheme == "iso":
+        start = date.fromisocalendar(year, week, 1)
+        return start, start + timedelta(days=6)
+    jan1, dec31 = date(year, 1, 1), date(year, 12, 31)
     if scheme == "jan1":
         if not 1 <= week <= 53:
             return None

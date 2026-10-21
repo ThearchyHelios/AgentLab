@@ -140,3 +140,10 @@ def test_a_plain_date_column_is_a_day_even_when_two_values_are_a_week_apart():
     assert pd.parse_compared(["2026-10-13", "2026-10-20"], plain, "day", "sqlite")[1] == "day"
     assert pd.parse_compared(["2026-10-12", "2026-10-19"], starts, "week", "sqlite")[1] == "week"
     assert pd.parse_compared(["2026-09-01", "2026-10-01"], plain, "day", "sqlite")[1] == "month"
+
+
+
+def test_week_numbers_out_of_any_algorithm_are_unreadable():
+    assert pd.parse(["2026-W41", "2026-W99"]) is None
+    assert pd.unreadable(["2026-W41", "2026-W99"]) == ("shape", ["2026-W99"])
+    assert pd.week_span("sunday_year", 9999, 53) is None and pd.week_span("iso", 0, 1) is None
