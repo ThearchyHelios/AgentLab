@@ -33,7 +33,7 @@ from app.analysis import phrases as ph
 from app.analysis import stats
 from app.analysis.common import (Env, build, column_label, column_types, label_for, need, refuse, reserved_check,
                                  sign_word, today_param)
-from app.analysis.contract import CallError
+from app.analysis.contract import CONV_PCT, CallError
 from app.analysis.inputs import Snap, same_value
 from app.analysis.numbers import canon, to_fraction
 
@@ -258,8 +258,13 @@ def baseline(raw: Mapping[str, Any], env: Env) -> Any:
               "z": canon(z) if z is not None else None, "rank": str(stats.rank_desc(x, hv)), "n_history": str(n),
               "hist_min": canon(min(hv)), "hist_max": canon(max(hv))}
     verdict = {"code": code, "subjects": [], "direction": sign_word(x - m)}
+    # 按变化率比时，本期的变化率、中位数、常规波动范围、历史最小最大都是变化率，按百分数显示；按值本身比时照原样
+    change = ("change",) if basis == "change" else ()
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion,
-                 phrase=ph.with_caveats(main, caveats, skip=("comparability",)), caveats=caveats)
+                 phrase=ph.with_caveats(main, caveats, skip=("comparability",)), caveats=caveats,
+                 formats={c: CONV_PCT for c in change},
+                 named={k: CONV_PCT for k in ("x", "median", "band_lo", "band_hi", "hist_min", "hist_max")
+                        if basis == "change"})
 
 
 def _compare_gap(series: Series, ordinal: int, lag: int, unit: str) -> str:
@@ -360,7 +365,9 @@ def trend(raw: Mapping[str, Any], env: Env) -> Any:
     verdict = {"code": code, "subjects": [], "direction": "up" if code == "rising" else "down" if code == "falling"
                else None}
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion,
-                 phrase=ph.with_caveats(main, caveats, skip=("comparability",)), caveats=caveats)
+                 phrase=ph.with_caveats(main, caveats, skip=("comparability",)), caveats=caveats,
+                 # 相对斜率是比率（每期变百分之几），按百分数显示；斜率本身、p 值、各期之比照原样
+                 named={"rel_slope": CONV_PCT})
 
 
 def _tail_gap(series: Series, ordinal: int) -> str:

@@ -64,13 +64,18 @@ def today_param(env: Env) -> str:
 def build(env: Env, params: dict[str, Any], used: Sequence[str], *, status: str = "ok",
           reason_code: str | None = None, reason: str | None = None, table: Mapping[str, Any] | None = None,
           values: Mapping[str, Any] | None = None, verdict: Mapping[str, Any] | None = None, criterion: str,
-          phrase: str, caveats: Sequence[Mapping[str, str]] = ()) -> AnalysisResult:
-    """组装一份结论：形状严格按 contract.AnalysisResult，params 补上查过的目录事实。"""
+          phrase: str, caveats: Sequence[Mapping[str, str]] = (),
+          formats: Mapping[str, str] | None = None, named: Mapping[str, str] | None = None) -> AnalysisResult:
+    """组装一份结论：形状严格按 contract.AnalysisResult，params 补上查过的目录事实。formats 是结果表各列的换算（占比、
+    变化率的列记 pct，比率的变化记 pp），named 是具名的数的换算（value_formats）：都只留记了的，为空时整项不写。"""
     record = env.facts.record()
     out_params = {k: v for k, v in params.items() if v is not None}
     if record:
         out_params["catalog"] = record
-    return {
+    out_table = dict(table) if table is not None else None
+    if out_table is not None and (table_formats := column_formats(formats or {})):
+        out_table["formats"] = table_formats
+    out: AnalysisResult = {
         "op": env.op,
         "mode": env.mode,
         "method": METHODS[(env.op, env.mode)],
@@ -81,7 +86,7 @@ def build(env: Env, params: dict[str, Any], used: Sequence[str], *, status: str 
         "status": status,  # type: ignore[typeddict-item]
         "reason_code": reason_code,
         "reason": reason,
-        "table": dict(table) if table is not None else None,  # type: ignore[typeddict-item]
+        "table": out_table,  # type: ignore[typeddict-item]
         "values": dict(values or {}),
         "verdict": dict(verdict) if verdict is not None else None,  # type: ignore[typeddict-item]
         "criterion": criterion,
@@ -89,6 +94,9 @@ def build(env: Env, params: dict[str, Any], used: Sequence[str], *, status: str 
         "caveats": [dict(c) for c in caveats],  # type: ignore[misc]
         "hypothesis": env.hypothesis,
     }
+    if named_formats := value_formats(named or {}):
+        out["value_formats"] = named_formats
+    return out
 
 
 def refuse(env: Env, params: dict[str, Any], used: Sequence[str], code: str, reason: str, *,
@@ -155,9 +163,19 @@ def column_types(columns: Sequence[str], *, dims: Mapping[str, str | None] | Non
     return out
 
 
+def column_formats(formats: Mapping[str, str]) -> dict[str, str]:
+    """结果表的 formats（ResultTable.formats）：列 id → 换算。只留记了换算的列，都为空时整项不写（结论和以前一字不差）。"""
+    return {str(k): v for k, v in formats.items() if v}
+
+
+def value_formats(values: Mapping[str, Any]) -> dict[str, str]:
+    """结论的 value_formats（AnalysisResult.value_formats）：键 → 换算。只留记了换算的数，都为空时整项不写。"""
+    return {str(k): v for k, v in values.items() if v}
+
+
 def sign_word(value: Fraction | float | int) -> str | None:
     return "up" if value > 0 else "down" if value < 0 else None
 
 
-__all__ = ["DERIVED_PARAMS", "Env", "build", "closes", "column_label", "column_types", "label_for", "need", "refuse",
-           "reserved_check", "sign_word", "today_param", "written_places"]
+__all__ = ["DERIVED_PARAMS", "Env", "build", "closes", "column_formats", "column_label", "column_types", "label_for",
+           "need", "refuse", "reserved_check", "sign_word", "today_param", "value_formats", "written_places"]
