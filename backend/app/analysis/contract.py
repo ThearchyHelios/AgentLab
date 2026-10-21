@@ -314,6 +314,54 @@ def ledger_entry(result: AnalysisResult, *, node_id: str, exec_no: int, artifact
     return entry
 
 
+# --------------------------------------------------------------------------
+# 跨包的约定：写作目录里的分析条目、口径卡指标上的可比性、报告文档里系统写的「分析范围」
+# --------------------------------------------------------------------------
+
+
+def catalog_result(entry: Mapping[str, Any] | None) -> AnalysisResult | None:
+    """写作目录（engine/evidence.build_catalog）里一条分析条目的结论。约定：编号 A{n} 的条目 kind 为 LEDGER_KIND，
+    result 是从工件取回的整份结论（证据接入负责装上，说法核对、分析范围只经这个函数读）。"""
+    if not entry or entry.get("kind") != LEDGER_KIND:
+        return None
+    result = entry.get("result")
+    return result if isinstance(result, dict) else None
+
+
+class MetricComparability(TypedDict, total=False):
+    """口径卡指标上的可比性（00-总方案 §3.4 第 3 条）：指标的表达式用到两份同形、只差字面量的查询快照时，口径卡执行时
+    自动做一次可比性检查，记在指标条目的 comparability 字段。写作目录照实提醒，带契约的出口按 verdict 记缺口或标注。"""
+
+    artifact: str             # 那份可比性结论的工件 sha256
+    verdict: str              # comparable / conditional / incomparable
+    phrase: str
+    reasons: list[str]        # fail、warn 的原因，一句一个
+
+
+class ScopeItem(TypedDict, total=False):
+    alias: str                # 写作目录编号 A{n}
+    op: str
+    mode: str | None
+    dims: list[str]           # 拆解的维度（给人看的叫法）
+    verdict: str | None
+    phrase: str
+    parent: str | None        # 下钻：上一层的编号
+    reason: str | None        # 算不了的原因
+
+
+class ScopeBlock(TypedDict, total=False):
+    """报告文档的 analysis_scope 字段：系统写的「分析范围」（00-总方案 §3.6）。结构化数据随文档封存，不进正文、不过
+    裸数字和说法核对（不是模型写的）；网页、导出、可验证报告各自按它渲染，编号点得开。"""
+
+    phenomena: list[ScopeItem]        # 可比性、基线、趋势
+    decomposed: list[ScopeItem]       # 拆过的（按下钻链的先后）
+    excluded: list[ScopeItem]         # 判定为分散、差异不足以下结论的
+    refused: list[ScopeItem]          # 算不了的
+    not_decomposed: list[str] | None  # 候选维度里没拆过的叫法；None = 候选维度核对不了
+    note: str | None                  # 核对不了时的一句说明
+    tests: int                        # 这次做了几次差异检验
+
+
 #: 复算核对时不比的字段：hypothesis 是 agent 写的话，不是算出来的
 NOT_RECOMPUTED = frozenset({"hypothesis"})
 
@@ -327,6 +375,7 @@ def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
 __all__ = [
     "ARTIFACT_KIND", "CATALOG_PREFIX", "CAVEATS", "DEFAULTS", "LABELS", "LEDGER_KIND", "MARKER_KIND", "METHODS", "MODES",
     "NODE_TYPE", "NOT_RECOMPUTED", "OPS", "RANGES", "REASONS", "SETTINGS_KEY", "TOOL_NAMES", "VERDICTS",
-    "AnalysisInput", "AnalysisRequest", "AnalysisResult", "CallError", "Caveat", "Context", "InputSnapshot", "Probe",
-    "Prober", "ResultTable", "Verdict", "effective_settings", "ledger_entry", "same", "settings_problem",
+    "AnalysisInput", "AnalysisRequest", "AnalysisResult", "CallError", "Caveat", "Context", "InputSnapshot",
+    "MetricComparability", "Probe", "Prober", "ResultTable", "ScopeBlock", "ScopeItem", "Verdict", "catalog_result",
+    "effective_settings", "ledger_entry", "same", "settings_problem",
 ]

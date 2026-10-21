@@ -49,3 +49,11 @@ def test_every_op_has_a_method_and_a_tool_name():
         modes = c.MODES.get(op, (None,))
         assert all((op, m) in c.METHODS for m in modes), op
         assert c.TOOL_NAMES[op] == f"analysis_{op}"
+
+
+def test_catalog_entries_hand_over_the_whole_result_only_for_analysis():
+    result = fake_result()
+    assert c.catalog_result({"kind": "analysis", "result": result}) is result
+    assert c.catalog_result({"kind": "query", "result": result}) is None
+    assert c.catalog_result({"kind": "analysis"}) is None
+    assert c.catalog_result(None) is None
