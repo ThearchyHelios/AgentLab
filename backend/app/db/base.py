@@ -308,13 +308,13 @@ def check_pgbouncer() -> None:
     if not settings.database_direct_url:
         raise RuntimeError("AGENTLAB_DB_PGBOUNCER=1（应用库地址是 PgBouncer 的事务模式）时要另给 AGENTLAB_DATABASE_DIRECT_URL："
                            "进程间通知（LISTEN）、跨进程的锁（会话级咨询锁）、断点库要直连 PostgreSQL（或 PgBouncer 的会话模式）。"
-                           "见 README「多进程」里的「直连与 PgBouncer」")
+                           "见 README.zh-CN.md「多进程」里的「直连与 PgBouncer」")
     if _endpoint(settings.database_direct_url) == _endpoint(settings.database_url):
         from app.db.urls import describe
 
         raise RuntimeError(f"AGENTLAB_DATABASE_DIRECT_URL 和 AGENTLAB_DATABASE_URL 指着同一个地址（{describe(settings.database_url)}）："
                            "AGENTLAB_DB_PGBOUNCER=1 说应用库地址是 PgBouncer 的事务模式，直连地址要绕过它、直接连 PostgreSQL"
-                           "（或者 PgBouncer 的会话模式那个端口）。见 README「多进程」里的「直连与 PgBouncer」")
+                           "（或者 PgBouncer 的会话模式那个端口）。见 README.zh-CN.md「多进程」里的「直连与 PgBouncer」")
 
 
 def _endpoint(url: str) -> tuple[str, int]:

@@ -1,589 +1,852 @@
+English | [简体中文](README.zh-CN.md)
+
 # AgentLab
 
-**可视化 Agent 编排实验台**——在画布上定义工作流，运行时逐节点观察执行过程，
-并对产出施加可验证的约束。
+**A visual agent-orchestration workbench**: define workflows on a canvas, watch execution node by node at run time, and
+put verifiable constraints on what comes out.
 
-面向通用场景的**受限动态编排**：模板定义骨架，agent 只在被授权的关节处自由。
-所有算术下沉到受控指标集，叙述层无权创造数字——报告里的数字由系统照快照填值，
-每一个都点得开出处；正式运行钉死在不可变版本上，每一次执行的完整证据落进内容寻址的工件库。
+**Constrained dynamic orchestration** for general-purpose scenarios: templates define the skeleton, and agents are free
+only at the joints they are authorized for. All arithmetic sinks into a controlled metric set, and the narrative layer
+has no right to create numbers — the system fills in the numbers in a report from snapshots, and every one of them opens
+to its provenance. Formal runs are pinned to immutable versions, and the complete evidence of every execution lands in a
+content-addressed artifact store.
 
-![运行中的画布](docs/images/canvas-running.png)
+![Canvas during a run](docs/images/canvas-running.png)
 
-<sub>研究助手模板用 Mock 执行中：跑完的节点打勾，执行中的节点显示耗时和流式输出；
-底部航迹是实时时间轴，右栏是同一份事件流驱动的运行步骤。</sub>
-
----
-
-## 目录
-
-- [快速开始](#快速开始) · [生产部署](#生产部署) · [核心能力](#核心能力) · [受限动态编排](#受限动态编排模板定骨架agent-填关节)
-- [可点击证据](#可点击证据报告里的每个数都点得开出处) · [评测与口径账本](#回归评测与口径账本) · [应用](#应用已发布版本的使用面) · [身份与权限](#身份与权限) · [能力登记与端点](#能力登记与端点)
-- [数据目录](#数据目录让助手和-agent-看懂业务数据) · [工作流形态](#工作流形态) · [节点类型](#节点类型) · [架构](#架构)
-- [关键设计决策](#关键设计决策) · [运行环境](#运行环境) · [用 PostgreSQL](#用-postgresql) · [常见问题](#常见问题) · [开发与验证](#开发与验证)
+<sub>The Research Assistant (「研究助手」) template running on Mock: finished nodes get a check mark, and running nodes show
+elapsed time and streaming output. The track along the bottom (「航迹」) is a live timeline; the right column shows the run
+steps, driven by the same event stream.</sub>
 
 ---
 
-## 快速开始
+## Contents
 
-环境要求：conda（[miniforge](https://conda-forge.org/miniforge/) 即可）、Node 20+、pnpm。
-**无需 Docker**——代码沙箱基于操作系统自带的隔离原语，可选升级至 microVM。
+- [Quick Start](#quick-start) · [Production Deployment](#production-deployment) · [Core Capabilities](#core-capabilities) · [Constrained Dynamic Orchestration](#constrained-dynamic-orchestration-templates-fix-the-skeleton-agents-fill-the-joints)
+- [Clickable Evidence](#clickable-evidence-every-number-in-a-report-opens-to-its-provenance) · [Evaluation and Caliber Ledger](#regression-evaluation-and-the-caliber-ledger) · [Apps](#apps-the-usage-surface-of-published-versions) · [Identity and Permissions](#identity-and-permissions) · [Capability Registry and Endpoints](#capability-registry-and-endpoints)
+- [Data Catalog](#data-catalog-helping-copilot-and-agents-understand-business-data) · [Workflow Shapes](#workflow-shapes) · [Node Types](#node-types) · [Architecture](#architecture)
+- [Key Design Decisions](#key-design-decisions) · [Runtime Environment](#runtime-environment) · [Using PostgreSQL](#using-postgresql) · [FAQ](#faq) · [Development and Verification](#development-and-verification)
+
+---
+
+## Quick Start
+
+Requirements: conda ([miniforge](https://conda-forge.org/miniforge/) is enough), Node 20+, pnpm.
+**No Docker needed** — the code sandbox is built on isolation primitives that ship with the operating system, with an
+optional upgrade to microVM.
 
 ```bash
-conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装依赖
-./scripts/dev.sh                      # 之后：一条命令启动前后端
+conda env create -f environment.yml   # first time: create the agentlab environment and install dependencies
+./scripts/dev.sh                      # after that: one command starts the frontend and backend
 ```
 
-`dev.sh` 自动定位 `agentlab` conda 环境；环境不存在时依 `environment.yml` 创建。
-如需使用其他环境名，设置 `AGENTLAB_CONDA_ENV`。
-后端依赖的版本以 `backend/requirements.lock` 为准，装到的是测试跑过的那一套，
-不是当天的最新版（见[依赖与锁文件](#依赖与锁文件)）。
+`dev.sh` finds the `agentlab` conda environment automatically and creates it from `environment.yml` when it doesn't
+exist. To use a different environment name, set `AGENTLAB_CONDA_ENV`. Backend dependency versions follow
+`backend/requirements.lock`: you get exactly the set the tests ran against, not whatever happens to be newest that day
+(see [Dependencies and the Lock File](#dependencies-and-the-lock-file)).
 
-服务启动于 http://localhost:5273 。
+The service starts at http://localhost:5273 .
 
-要让同一网络里的手机、别的电脑打开，用 `./scripts/dev.sh --host`：前端监听所有网卡，启动时打印局域网地址；
-后端仍只听 127.0.0.1，页面里的 `/api` 由前端开发服务器在本机转发。**默认不开登录**：同一网络里打得开页面的人
-都能用全部功能——跑工作流、花你配的模型额度、读数据源、执行沙箱代码，审批和发起记的是各自填的署名、未经核实。
-只在信得过的网络里这样用；多人使用请开登录，见[身份与权限](#身份与权限)。
-应用库要用 PostgreSQL 时加 `--postgres`（本机 docker 起一个开发用的库，见[用 PostgreSQL](#用-postgresql)）。
-认不出的参数直接报错，`./scripts/dev.sh --help` 看用法。
+To open it from phones or other computers on the same network, use `./scripts/dev.sh --host`: the frontend listens on
+all network interfaces and prints the LAN address at startup; the backend still listens only on 127.0.0.1, and the
+frontend dev server forwards the page's `/api` on the local machine. **Login is off by default**: anyone on the same
+network who can open the page can use every feature — run workflows, spend the model quota you configured, read data
+sources, and execute sandbox code — and approvals and run starts record whatever name each person typed in, unverified.
+Only use it this way on a network you trust; for multiple users, turn on login (see
+[Identity and Permissions](#identity-and-permissions)). To use PostgreSQL for the app database, add `--postgres` (it
+starts a development database in local docker; see [Using PostgreSQL](#using-postgresql)). Unrecognized arguments fail
+with an error; run `./scripts/dev.sh --help` for usage.
 
-**无需配置 API Key 即可完整体验。** 内置 Mock provider 产出流式回复、工具调用与
-符合 schema 的结构化数据，编排链路（画布高亮、审批中断、沙箱执行）会完整走一遍。
-接入真实模型请在「设置 → 模型接入」配置。启动时若环境变量中存在
-`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY`，将自动导入为 provider。
-Mock 不会写引用标记：探索运行里报告撰写节点照样跑完，但里面的数字全标成「无证据」，
-要看到逐段可点的出处得接真实模型。
+**You can try everything without configuring an API key.** The built-in Mock provider produces streaming replies, tool
+calls, and schema-conforming structured data, so the whole orchestration path (canvas highlighting, approval interrupts,
+sandbox execution) runs end to end. To connect a real model, configure it under Settings → Model Access (「设置 → 模型接入」).
+If `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` is present in the environment at startup, it is
+imported as a provider automatically. Mock doesn't write citation markers: in an exploratory run the report-writer node
+still runs to completion, but every number in it is marked "No evidence" (「无证据」); to see provenance that is clickable
+segment by segment, connect a real model.
 
-内置 9 个模板，从「最小问答」到「可追溯周报」，既可直接运行，
-也是各类节点用法的可执行文档。
-
----
-
-## 生产部署
-
-**不用 Docker：** `./scripts/prod.sh` 构建前端并由后端一并托管页面，缺省一个进程（`--workers` 起多个，要 PostgreSQL）、不热重载，启动于
-http://127.0.0.1:8000 。前端产物不存在或比源码旧时才重新构建，`--build` / `--no-build` 强制构建或跳过。
-`--port`（或 `AGENTLAB_PORT`）改端口；`--host` 监听所有网卡，默认同样**不开登录**，多人使用请开登录
-（[身份与权限](#身份与权限)）。
-数据目录默认为仓库下的 `data/`，`AGENTLAB_DATA_DIR` 可改。应用库默认是数据目录里的 SQLite，**只支持单进程**：同一个数据目录
-已经有一个服务在用时，第二个进程拒绝启动、照实报错（不要给 uvicorn 加 `--workers`，`--workers` 大于 1 时 `prod.sh` 先拦下）。
-换成 PostgreSQL（[用 PostgreSQL](#用-postgresql)）之后可以多进程：`./scripts/prod.sh --workers 4`，规矩见[多进程](#多进程)。
-按期累积的数据源每个历史版本是一份完整副本，磁盘占用随期数和被引用的版本数增长。除当前版本和被运行引用的
-版本外，每个数据源再保留最近启用过的 3 个版本，其余的会被回收、无法再启用。
-
-**Docker 离线包：** `./scripts/package-docker.sh` 构建 Linux 镜像（默认取本机架构，目标机不同时用
-`--platform linux/arm64` 或 `linux/amd64`），连同一键部署脚本、配置模板和部署说明打成
-`release/agentlab-<版本>-linux-<arch>.tar`。拷到只装了 Docker Engine 的离线机器上，解包、按需修改
-`agentlab.env`、运行 `./deploy.sh` 即可，不需要 docker compose。安装、升级、备份、沙箱权限与常见问题见
-[deploy/README.md](deploy/README.md)。应用库可以用包里带的 PostgreSQL：新部署 `./deploy.sh install --postgres`（旁边再起一个
-PostgreSQL 容器，端口不对外，密码自动生成在数据目录里），已经在用 SQLite 的 `./deploy.sh migrate-to-postgres`（停服务、备份、
-导入、核对，哪一步出错都退回 SQLite）；`upgrade` 前自动备份库，表结构和默认数据启动时自动补齐。三种放法见 deploy/README.md
-「用 PostgreSQL」。
-
-镜像里默认带 microVM 的运行时和沙箱镜像（约 150 MB，`--no-microvm` 可不带）。目标机有 KVM 时，deploy.sh
-先用临时容器试启动一台 microVM，起得来就把 `/dev/kvm` 交给容器，代码在 microVM 里执行，部署时不用联网。
-没有 KVM（Mac、Windows 上的 Docker Desktop，多数云主机）时，默认权限下代码沙箱退回本地子进程，隔离边界只有容器本身。
-
-
-**从旧版本升级（应用平台）**：升级后第一次启动会自动做几件事，都幂等：
-
-- 存量的待审批补建成待办；自定义工具的请求头、MCP 的环境变量里的明文加密一遍；能力登记同步一遍。
-- 记级别之前发布过、有正式运行凭据的老版本补记为「已发布」。子工作流、口径卡固定的版本须已发布且未退役，没有凭据
-  的老版本被固定着时，正式运行会被拒绝，按提示改为固定一个已发布的版本。
-- 指向本机或内网的 http MCP 服务，自动登记一个开了内网访问的端点（`mcp-<服务名>`）并绑定，写审计。之后新建的内网
-  MCP 要管理员先在「工具 → 端点」登记。
-- `/api/copilot/generate` 改图时只出改动操作，不再是整张新图；每次运行多一条 `run.origin` 事件（在封存范围内）。
-
-**从旧版本升级（2026-10 下一轮第 1 波）**：有几处行为变化会影响现有部署：
-
-- 人工驳回（审批、动作确认、填写、代码和工具审批、双盲复算）的运行记为「已取消 · 被驳回」，不再算失败：通知走「实例
-  结束」，定时任务推「未出具（被驳回）」，不能继续运行。配了失败重试或「出错时继续」的关卡，驳回不再重问、也不接着往下走。
-  已封存的老运行不改写。
-- 开了登录时，应用入口和待办表单里的选人控件按候选池核对（缺省是能用这个应用的人），池外的名字回 422（`principal`）。
-- 页面默认只能被本站嵌入（`frame-ancestors 'self'`，另加 `X-Frame-Options`）。已经用 iframe 嵌 AgentLab 的门户，
-  在 `AGENTLAB_FRAME_ANCESTORS` 里写上门户的地址。
-- 「对外访问地址」只剩一个设置（「设置 → 通用」；`AGENTLAB_PUBLIC_URL` 优先，写错了启动就报错）。设置里填了地址的部署，
-  OIDC 回调改按这个地址拼，和身份提供方登记的不一致时要去改登记。开了登录时 `/docs`、`/openapi.json` 要搭建者登录。
-- 探查结构时列类型改存各数据库的完整写法（`VARCHAR2(20 CHAR)`、`ENUM('a','b')`）：升级后每个数据源点一次「探查结构」。
-  新运行的表结构快照哈希会变，旧运行不受影响。MySQL / MariaDB 上文字列的剖析说明多一句排序规则，ENUM 列补上数据里没出现的
-  取值，日期列写明排除了几个无效日期，所以升级后第一次重新剖析，这些表的目录各升一次版本。剖析设置的「抽样键值数」改叫
-  「核对键值数」（`DISTINCT … LIMIT` 取的不是随机样本）。
-
-**从旧版本升级（2026-10 下一轮第 2 波）**：
-
-- 探查结构改成后台任务（和同一个数据源的起草、剖析排队）。升级后每个数据源点一次「探查结构」，建立对象索引；老的表结构
-  在探查读完之前原样保留。超过 500 张表、又没设探查范围的库，第一次探查会被拒绝并说出命中了多少张，要先在「探查范围」里
-  设规则或调高上限（最多 2,000）。正式探查不再接受 `?schema=` 临时换 schema（一个数据源一个 schema），预览照旧可以。
-- 运行时的 `db_schema__` 不传表名时只列前 50 张，并说清另有多少张；可以用 `keyword` 检索，点名探查范围外的表会当场读结构、
-  加进范围（每次运行最多 8 张，留痕）。
-- 探索运行封存后会在后台比对已发布的口径，追加一条封存后事件 `ledger.matched`：时间线、可验证报告的「封存后追加」里
-  多出这一条，不在封存范围内。启动时补比最近 7 天的运行，跟着 `AGENTLAB_SCHEDULER` 开关。
-- 报告导出和可验证报告下载各记一条审计 `report.exported`。问数据发起的运行带上所在对话和轮次（`origin_ref`），
-  「在画布里打开」建的工作流记下来自哪一轮。
-
-**从旧版本升级（2026-10 下一轮第 3 波）**：
-
-- 探查结构时每张表记一个结构版本，和上一次读到的结构比：加删列、改类型、改可空、改注释、主键 / 唯一约束 / 外键的增删
-  记进数据源的变化记录（疑似改名只说「可能是改名」，不下结论）。升级后第一次探查每张表只建基线、不出变化。从发布版本发起
-  的正式运行，这一版引用的表结构在发布之后变了时，运行里多一条「表结构变化」提醒（`schema.drift`，在封存范围内）。
-- 剖析多了取值观察：行数、码值分布（包括人工确认过的码值列）、最新业务日期、最近 35 天每天的行数，和同一口径的历史比出
-  新码值、比例剧变、断档、缺天、量跌、行数大起大落。只在剖析范围是「取值观察」或定时维护时做。标了「已列全」的码值表出现目录
-  里没有的取值时，系统撤销「已列全」（目录升一版），这是机器唯一会写进目录的事；新取值的含义仍要人填。遮罩列不观察。
-- 数据源可以设定时维护（探查 → 剖析需要的表 → 取值观察，可多选），就是一条目标为数据源的定时任务，缺省没有。定时任务的
-  目标也可以是评测题集。这两种目标不收 Webhook（回 422），通知走「设置 → 通知」的渠道订阅。
-- 变化记录、评测、口径出具与对账这一波只有接口（`/api/datasources/{id}/changes`、`/api/evals/…`、
-  `/api/ledger/answers/{run_id}/…`），界面随下一波上线。
-- 问数据的答案整题等价于一份已发布的受管口径时（SQL 被证明等价、版本受管、图里没有人工节点和写入），系统按口径自动发起
-  一次正式运行，来源记为「按口径正式出具」。「设置」的 `ledger` 一组可以关掉自动出具（`auto_issue`），自动和一键合计每天最多
-  20 次。画布试跑、个人应用刷新这类不是问数据的答案不自动出具。
-- 应用视图、趋势、分享链接、视图数据接口取「最近一次封存」时，只认定时任务、应用入口、按需视图、画布或版本页上的「正式运行」、
-  入站钩子和访问密钥发起的正式运行；按口径出具、补算出来的运行不会顶替看板上的数。
-- 开了登录时，使用者能读原始运行记录、事件和实时流的，只剩自己的问数据运行；别的运行（包括替他发起的口径对账）经应用页
-  和证据接口读，展示的 SQL 里写着的遮罩值换成「已遮罩」。
-- 通知多了邮件：管理员在「设置 → 通知 → 邮件服务」配 SMTP（口令加密存），之后可以建邮件格式的渠道。邮件只确认交给了邮件
-  服务器，退信不追踪。每天的待办汇总按 `notify.digest_at`（缺省 09:00，服务端时区）发给订阅了它的个人渠道；访问密钥到期前
-  7 天、1 天各提醒一次。关登录时这两项都不发。
-- 分享链接（只读、不用登录的视图页）缺省关，见[分享链接](#分享链接)。
-
-**从旧版本升级（2026-10 下一轮第 4 波）**：
-
-- 导航多了「评测」（搭建者以上可见，⌥0，排在「设置」前面），见[回归评测与口径账本](#回归评测与口径账本)。
-- 受管口径发布新版本后，系统在后台反查用过旧版的答案，按参数分组在同一份数据上重算两版之差（来源「口径召回」的探索运行，
-  差值在召回卡里算）。只有数真变了才给答案的主人开「召回」待办、推 `ledger.recall`；没变的在原答案上记「已按 vN 核对，
-  不影响」。每次发布最多重算 `ledger.recall_limit` 组（缺省 50，0 表示只列不算），超出的在版本历史里「接着算」。发布后自动
-  那一批和启动时接着做跟着 `AGENTLAB_SCHEDULER` 开关。
-- 审阅改了数据目录里影响数字的那几项（有效记录条件、去重、业务日期、关联、业务主键、度量类型），或者表结构删了表、删了列、
-  改了列类型时，用过它的答案标「依据有变」；按新目录新出现错误级问题的才开待办。
-- 被驳回的那一步，`node.failed` 事件多带 `reason: "rejected"`（和 `run.cancelled` 同一个字段），画布、航迹、时间线、问数据
-  过程都画「被驳回」，不再画成失败。读事件的外部系统按 `reason` 区分；老运行不变。
-- 问数据每一轮的建图用量改成读完模型的流再记：以前流末尾才报的输出 token 没记上，这一轮的花费会比以前多一些，多的是原来漏掉的。
-- 可订阅的通知事件多了「数据源有变化要处理」（全局渠道）和「口径升版，答案的数变了」（全局渠道、答案主人的个人渠道），
-  消息里都不放数字。
-- 最终验收后的修正：口径标签逐个数判（见[回归评测与口径账本](#回归评测与口径账本)），比对算法升到第 4 版，老的比对记录
-  照常可读、不会自动重算；评测评分规则升到第 2 版，老评测可以在评测详情里按新规则重评（只读封存、不调模型）。助手只给了
-  思考、一个操作都没给时，问数据和评测都自动重来一次。被取消、超时的模型调用也记一次调用（标「未完成」）。
-- 数据目录页起草、剖析的进度挪到一条后台任务条（探查、起草、剖析按服务端的排队顺序列），页头只留入口。数据源卡片上可以设
-  「定时维护」。链到某个数据源卡片的地址统一是 `/data/databases#source-<id>`。
-
-**从旧版本升级（2026-10 编排完善第 1 波）**：
-
-- 问数据的一整轮（建图、发起运行、复核、按复核重来、落库）改在服务端的后台任务里跑，页面只负责看：掉线、刷新、关掉再打开
-  都按序号接着看，停止走接口（`/api/chat/turns`）。服务重启时还在建图的那一轮标中断、可重试；已经发起运行的接着等它、照常
-  复核收尾。同一段对话同时只跑一轮（停在审批上等人的不算）。使用者（user 角色）的问数据现在也会被复核；继续运行照旧只给
-  搭建者以上。问数据和评测用同一个驱动（`chat/drive.py`）。
-- 子工作流里的每一步现在进同一个运行的事件流：时间线、记录页会多出「子工作流 › 那一步」，封存也包含子工作流查过的数。
-  子工作流出口的字段带着出处回到父图，父图的口径卡、报告能一路追到子工作流里的那一格（最多 3 层）；子工作流里追不到原始
-  数据的，父图照样降档。子工作流里的报告按带前缀的节点 id 记，父图只认自己的报告。
-- 审批、补充输入、编辑稿件、动作确认、代码和工具审批、双盲裁决可以多接一个「驳回」出口：驳回（含超时驳回）后这一步正常
-  结束、沿出口往下走，动作确认走出口时什么都不发出去，实例页和通知写「被驳回，转到 X」；运行照路径结束，`run.finished`
-  带 `rejected_via`。不接这个出口时行为不变（记「已取消 · 被驳回」）。发布检查拦下走不到结束的驳回路径。
-- 定时任务可以选「事件触发」：上传表格出了新一期、上游工作流的正式运行成功结束、数据源有「要处理」的变化。事件在发生处
-  记下，调度循环去抖后发起（每一期各自去抖），下游的输入模板用 `{{ event.* }}` 取事件内容；保存时检查串联不成环、运行时
-  限 5 层；途经驳回的、应用补算的缺省不认（可以勾选）。跟着 `AGENTLAB_SCHEDULER` 开关：关着时事件留着不派发。
-
-**从旧版本升级（2026-10 编排完善第 2 波）**：
-
-- 缺省仍是数据目录里的 SQLite、单进程，不改配置的部署升级后行为不变；启动时自动补上这一波的新列和索引（运行事件的
-  `(run_id, seq)` 改成唯一索引，存量库里要是已有重号，记一条日志、这一次不建，不影响启动）。数据目录里会多一个
-  `.agentlab-data` 标记文件，`deploy.sh` 靠它（或 `agentlab.db`、`.secret_key`）认数据目录，别删。
-- 应用库可以换成 PostgreSQL：设 `AGENTLAB_DATABASE_URL`，执行断点一起进去；现有数据用 `python -m app.db copy-to-postgres`
-  导入（要先停服务，断点一起搬）。Docker 部署可以让 `deploy.sh` 在旁边起一个内置的 PostgreSQL（新部署 `install --postgres`，
-  已经在用 SQLite 的 `migrate-to-postgres`，失败就原样退回 SQLite）；开发时 `./scripts/dev.sh --postgres`。内置和外接只能选
-  一种。见[用 PostgreSQL](#用-postgresql)。
-- 用 PostgreSQL 时可以起多个工作进程（`AGENTLAB_WORKERS`）：运行、问数据一轮、后台任务在库里认领，进程没了别的进程接手或
-  照实标中断，停止跨进程生效，调度只由一个进程当班，实时事件跨进程推送。SQLite 只支持单进程：第二个进程拒绝启动。升级要先
-  停掉全部工作进程（`deploy.sh upgrade` 就是这样做的）：库里还有活着的、版本不同的进程时，新版本拒绝启动。见[多进程](#多进程)。
-- 运行按类别排队：交互（问数据、画布试跑）、应用、定时、系统（评测、召回、对账、补算、出具）。全站上限照旧是
-  `AGENTLAB_MAX_CONCURRENT_RUNS`，其中缺省留四分之一给交互，别的类别空闲时可以借用其余的，「设置 → 运行并发」可调。满载时
-  评测、召回会比以前慢，换来问数据总有名额；评测每题的时限不算排队的时间。
-- `deploy.sh upgrade` 升级前自动备份：SQLite 拷到数据目录的 `backups/sqlite/`，内置 PostgreSQL 用 `pg_dump` 存到
-  `backups/postgres/`，各留最近 5 份（`BACKUP_KEEP`），只有属主能读。`restart` 缺省只重启服务，`restart --postgres` 连库一起。
-- bubblewrap 沙箱不再继承后端的环境变量：代码节点里读不到模型的 API Key、数据库地址这类变量了。代码要用的值请显式传进去。
-- 子工作流放在循环里多次执行时，每次的步骤接着编号，写外部系统的幂等键改用父运行里的全局 id：以前循环第二轮的写入会拿到
-  第一轮的回执、不发送，现在照常发；升级前停在子工作流里的运行恢复时仍认旧的键，已经生效的不重发。
-- 问数据的心跳不再落库，结束超过 14 天的轮次清掉事件日志（那一轮的问答、答案照旧在对话里）；服务重启后接手一轮时按账号现在的
-  角色重新核对，停用或没了权限的照实标中断。
-- 多行查询没有 `ORDER BY` 时，引用其中一格不再算「来自口径」，召回、对账里照实标「行序不定」（E1 统计会跟着变）；全部指标
-  都行序不定的召回结论写「核对不了」并开待办，不再写「没变」。对账要人选对照指标时，按逐个数核对过的那几列预选。
-- 待办、通知、Webhook 里驳回的去向照实写（「被驳回，转到 X」「这一路到此为止」），子工作流里的写「子工作流 › x」；子工作流
-  里一步失败时自动复核只报一条。用户看得到的列表遇到同名、同时间的并列时按 id 排，两种库顺序一致。
+The 9 built-in templates, from Minimal Q&A (「最小问答」) to Traceable Weekly Report (「可追溯周报」), can be run as they are and
+also serve as executable documentation of how each kind of node is used.
 
 ---
 
-## 核心能力
+## Production Deployment
 
-| 领域 | 能力 |
+**Without Docker:** `./scripts/prod.sh` builds the frontend and has the backend serve the pages as well. By default it
+runs one process (`--workers` starts more, which requires PostgreSQL), without hot reload, at http://127.0.0.1:8000 . It
+rebuilds the frontend only when the build output is missing or older than the source; `--build` / `--no-build` forces or
+skips the build. `--port` (or `AGENTLAB_PORT`) changes the port; `--host` listens on all network interfaces, and login
+is likewise **off by default** — for multiple users, turn on login
+([Identity and Permissions](#identity-and-permissions)). The data directory defaults to `data/` under the repository;
+`AGENTLAB_DATA_DIR` changes it. The app database defaults to SQLite in the data directory, which
+**supports a single process only**: when a service is already using the same data directory, a second process refuses to
+start and says so plainly (don't add `--workers` to uvicorn; `prod.sh` stops you first when `--workers` is greater than
+1). After switching to PostgreSQL ([Using PostgreSQL](#using-postgresql)) you can run multiple processes:
+`./scripts/prod.sh --workers 4`; for the rules, see [Multiple Processes](#multiple-processes). For data sources that
+accumulate by period, every historical version is a full copy, so disk usage grows with the number of periods and of
+referenced versions. Besides the current version and versions referenced by runs, each data source keeps the 3 most
+recently activated versions; the rest are reclaimed and can no longer be activated.
+
+**Docker offline bundle:** `./scripts/package-docker.sh` builds a Linux image (the local architecture by default; use
+`--platform linux/arm64` or `linux/amd64` when the target machine differs) and packs it, together with a one-step deploy
+script, a configuration template, and deployment notes, into `release/agentlab-<版本>-linux-<arch>.tar` (`<版本>` is the
+version). Copy it to an offline machine that has only Docker Engine, unpack it, edit `agentlab.env` as needed, and run
+`./deploy.sh`; docker compose isn't needed. For installation, upgrades, backups, sandbox permissions, and common
+problems, see [deploy/README.md](deploy/README.md). The app database can use the PostgreSQL shipped in the bundle: for a
+new deployment, `./deploy.sh install --postgres` (starts a PostgreSQL container alongside, with no externally exposed
+port and a password generated automatically in the data directory); for a deployment already on SQLite,
+`./deploy.sh migrate-to-postgres` (stops the service, backs up, imports, verifies, and falls back to SQLite if any step
+fails). The database is backed up automatically before `upgrade`, and the schema and default data are filled in
+automatically at startup. For the three ways to place the database, see "Using PostgreSQL" (「用 PostgreSQL」) in
+deploy/README.md.
+
+By default the image includes the microVM runtime and sandbox image (about 150 MB; `--no-microvm` leaves them out). When
+the target machine has KVM, deploy.sh first tries to boot a microVM in a temporary container; if it boots, deploy.sh
+hands `/dev/kvm` to the container and code executes inside a microVM, with no network access needed during deployment.
+Without KVM (Docker Desktop on Mac or Windows, most cloud hosts), under default permissions the code sandbox falls back
+to a local subprocess, and the only isolation boundary is the container itself.
+
+
+**Upgrading from an older version (app platform)**: the first startup after the upgrade does several things
+automatically, all idempotent:
+
+- Existing pending approvals get tasks created for them; plaintext in custom tools' request headers and in MCP
+  environment variables gets encrypted; the capability registry is synced once.
+- Old versions that were published before levels were recorded and that have formal-run credentials are retroactively
+  marked Published (「已发布」). Versions pinned by subworkflows and caliber cards must be published and not retired; when an
+  old version without credentials is pinned, formal runs are refused — follow the prompt and pin a published version
+  instead.
+- HTTP MCP services that point at the local machine or the internal network automatically get an endpoint registered
+  with internal network access enabled (`mcp-<服务名>`, named after the service) and are bound to it, with an audit entry.
+  After that, a newly created internal-network MCP must first be registered by an admin under Tools → Endpoints
+  (「工具 → 端点」).
+- When `/api/copilot/generate` edits a graph, it outputs only the change operations instead of a whole new graph; every
+  run gets an extra `run.origin` event (inside the sealed scope).
+
+**Upgrading from an older version (2026-10 next round, wave 1)**: several behavior changes affect existing deployments:
+
+- Runs rejected by a human (approvals, action confirmations, form filling, code and tool approvals, double-blind
+  recomputation) are recorded as "Cancelled · Rejected" (「已取消 · 被驳回」) and no longer count as failures: notifications go
+  out as "Instance finished" (「实例结束」), schedules push "Not issued (rejected)" (「未出具（被驳回）」), and the run can't be
+  continued. For gates configured with retry on failure or Continue on error (「出错时继续」), a rejection no longer asks again
+  and doesn't carry on downstream either. Old runs that are already sealed aren't rewritten.
+- With login on, the people pickers in app entry forms and task forms are checked against a candidate pool (by default,
+  the people who can use the app); a name outside the pool gets a 422 (`principal`).
+- By default, pages can only be embedded by the same site (`frame-ancestors 'self'`, plus `X-Frame-Options`). Portals
+  that already embed AgentLab in an iframe need to add the portal's address to `AGENTLAB_FRAME_ANCESTORS`.
+- The public URL (「对外访问地址」) is now a single setting (Settings → General, 「设置 → 通用」; `AGENTLAB_PUBLIC_URL` takes
+  precedence, and a malformed value fails at startup). For deployments that filled in the address in Settings, the OIDC
+  callback is now built from this address; if it differs from what's registered with the identity provider, update the
+  registration. With login on, `/docs` and `/openapi.json` require a builder login.
+- Schema introspection now stores column types in each database's full notation (`VARCHAR2(20 CHAR)`, `ENUM('a','b')`):
+  after upgrading, click Introspect Schema (「探查结构」) once for each data source. Schema snapshot hashes of new runs will
+  change; old runs are unaffected. On MySQL / MariaDB, profiling notes for text columns gain a sentence about the
+  collation, ENUM columns gain the values that don't appear in the data, and date columns state how many invalid dates
+  were excluded, so the first re-profiling after the upgrade bumps the catalog of each of these tables up one version.
+  The profiling setting "Sampled key count" (「抽样键值数」) is renamed "Checked key count" (「核对键值数」) (`DISTINCT … LIMIT`
+  doesn't take a random sample).
+
+**Upgrading from an older version (2026-10 next round, wave 2)**:
+
+- Schema introspection becomes a background job (queued with drafting and profiling for the same data source). After
+  upgrading, click Introspect Schema (「探查结构」) once for each data source to build the object index; the old schema stays
+  as it is until introspection finishes reading. For a database with more than 500 tables and no introspection scope,
+  the first introspection is refused and says how many tables matched; first set rules under Introspection Scope
+  (「探查范围」) or raise the limit (at most 2,000). Formal introspection no longer accepts `?schema=` for switching schemas
+  temporarily (one schema per data source); previews still can.
+- At run time, `db_schema__` without a table name lists only the first 50 tables and says how many more there are; you
+  can search with `keyword`, and naming a table outside the introspection scope reads its schema on the spot and adds it
+  to the scope (at most 8 tables per run, with an audit trail).
+- After an exploratory run is sealed, it's matched against published calibers in the background, and a post-seal event
+  `ledger.matched` is appended: it shows up in the timeline and in the verifiable report's Appended after sealing
+  (「封存后追加」) section, outside the sealed scope. At startup, runs from the last 7 days are matched retroactively; this
+  follows the `AGENTLAB_SCHEDULER` switch.
+- Report exports and verifiable report downloads each record an audit entry `report.exported`. Runs started from Ask
+  Data (「问数据」) carry their conversation and turn (`origin_ref`), and workflows created with Open in Canvas (「在画布里打开」)
+  record which turn they came from.
+
+**Upgrading from an older version (2026-10 next round, wave 3)**:
+
+- Schema introspection records a schema version for every table and compares it with the schema read last time: added or
+  dropped columns, type changes, nullability changes, comment changes, and added or removed primary keys / unique
+  constraints / foreign keys go into the data source's change log (a suspected rename is only reported as "possibly a
+  rename" (「可能是改名」), with no conclusion drawn). The first introspection after upgrading only builds a baseline for each
+  table and reports no changes. For a formal run started from a published version, if the schema that version references
+  has changed since publishing, the run gets an extra "Schema change" (「表结构变化」) reminder (`schema.drift`, inside the
+  sealed scope).
+- Profiling gains value observation: row counts, code-value distributions (including code-value columns confirmed by a
+  human), the latest business date, and daily row counts over the last 35 days, compared with history on the same basis
+  to find new code values, sharp shifts in proportions, gaps, missing days, volume drops, and large swings in row
+  counts. It runs only when the profiling scope is Value Observation (「取值观察」) or during scheduled maintenance. When a
+  code table marked "Complete" (「已列全」) shows a value that isn't in the catalog, the system revokes "Complete" (the
+  catalog goes up one version); this is the only thing the machine ever writes into the catalog, and the meaning of the
+  new value still has to be filled in by a person. Masked columns aren't observed.
+- Data sources can have scheduled maintenance (introspection → profile the tables that need it → value observation, with
+  multiple choices allowed). It's simply a schedule whose target is the data source, and there's none by default. A
+  schedule's target can also be an evaluation test suite. These two target types don't accept webhooks (they return
+  422); notifications go through channel subscriptions under Settings → Notifications (「设置 → 通知」).
+- In this wave, the change log, evaluation, and caliber issuance and reconciliation are API-only
+  (`/api/datasources/{id}/changes`, `/api/evals/…`, `/api/ledger/answers/{run_id}/…`); the UI ships with the next wave.
+- When an Ask Data answer as a whole is equivalent to a published governed caliber (the SQL is proven equivalent, the
+  version is governed, and the graph has no human nodes and no writes), the system automatically starts a formal run by
+  that caliber, with the origin recorded as "Formal issuance by caliber" (「按口径正式出具」). The `ledger` group in Settings
+  (「设置」) can turn off automatic issuance (`auto_issue`); automatic and one-click issuance together are capped at 20 per
+  day. Things that aren't Ask Data answers, such as canvas trial runs and personal app refreshes, aren't issued
+  automatically.
+- When app views, trends, share links, and the view data API take "the latest sealed run" (「最近一次封存」), they count only
+  formal runs started by schedules, app entries, on-demand views, the Formal Run (「正式运行」) button on the canvas or
+  version page, inbound hooks, and access keys; runs from issuance by caliber or from backfills never replace the
+  numbers on a dashboard.
+- With login on, the only raw run records, events, and live streams a user can read are those of their own Ask Data
+  runs; other runs (including caliber reconciliations started on their behalf) are read through app pages and the
+  evidence API, and masked values written in the displayed SQL are replaced with "Masked" (「已遮罩」).
+- Notifications gain email: an admin configures SMTP under Settings → Notifications → Mail Service (「设置 → 通知 → 邮件服务」)
+  (the password is stored encrypted), after which email channels can be created. Email only confirms handoff to the mail
+  server; bounces aren't tracked. A daily task digest is sent at `notify.digest_at` (default 09:00, server time zone) to
+  the personal channels subscribed to it; access keys get a reminder 7 days and again 1 day before they expire. Neither
+  is sent when login is off.
+- Share links (read-only view pages that need no login) are off by default; see [Share Links](#share-links).
+
+**Upgrading from an older version (2026-10 next round, wave 4)**:
+
+- The navigation gains Evaluations (「评测」) (visible to builders and above, ⌥0, placed before Settings (「设置」)); see
+  [Regression Evaluation and the Caliber Ledger](#regression-evaluation-and-the-caliber-ledger).
+- After a new version of a governed caliber is published, the system looks up, in the background, the answers that used
+  the old version, groups them by parameters, and recomputes the difference between the two versions on the same data
+  (exploratory runs with the origin "Caliber recall" (「口径召回」); the difference is computed in a recall card). Only when a
+  number really changed does the system open a Recall (「召回」) task for the answer's owner and push `ledger.recall`;
+  unchanged answers are annotated "Checked against vN, not affected" (「已按 vN 核对，不影响」). Each publish recomputes at most
+  `ledger.recall_limit` groups (default 50; 0 means list without computing), and the rest can be continued with Continue
+  (「接着算」) in the version history. The automatic batch after publishing and the continuation at startup follow the
+  `AGENTLAB_SCHEDULER` switch.
+- When a review changes the data catalog items that affect numbers (valid-record condition, deduplication, business
+  date, relationships, business key, measure type), or the schema drops a table, drops a column, or changes a column
+  type, the answers that used it are marked "Basis changed" (「依据有变」); a task is opened only for answers that newly have
+  error-level issues under the new catalog.
+- For the step that was rejected, the `node.failed` event additionally carries `reason: "rejected"` (the same field as
+  on `run.cancelled`), and the canvas, track, timeline, and Ask Data process all show "Rejected" (「被驳回」) instead of
+  drawing a failure. External systems that read events can tell them apart by `reason`; old runs are unchanged.
+- The graph-building usage of each Ask Data turn is now recorded after the model stream has been read to the end: output
+  tokens reported only at the end of the stream used to go unrecorded, so a turn will cost somewhat more than before —
+  the difference is what used to be missed.
+- Subscribable notification events gain "Data source has changes to handle" (「数据源有变化要处理」) (global channels) and "Caliber
+  version bumped, answer numbers changed" (「口径升版，答案的数变了」) (global channels and the answer owner's personal channels);
+  neither message includes numbers.
+- Fixes after final acceptance: caliber labels are judged number by number (see
+  [Regression Evaluation and the Caliber Ledger](#regression-evaluation-and-the-caliber-ledger)), and the matching
+  algorithm moves to version 4; old matching records remain readable and aren't recomputed automatically. Evaluation
+  scoring rules move to version 2, and old evaluations can be re-scored under the new rules from the evaluation details
+  (reading only the sealed records, without calling models). When Copilot (「助手」) returns only thinking and no operations
+  at all, both Ask Data and evaluation automatically try again once. Cancelled and timed-out model calls are also
+  recorded as a call (marked "Incomplete" (「未完成」)).
+- Drafting and profiling progress on the data catalog page moves to a background job bar (introspection, drafting, and
+  profiling are listed in the server's queue order), and the page header keeps only the entry points. Scheduled
+  Maintenance (「定时维护」) can be set on the data source card. Links to a particular data source card are now uniformly
+  `/data/databases#source-<id>`.
+
+**Upgrading from an older version (2026-10 orchestration improvements, wave 1)**:
+
+- A whole Ask Data turn (building the graph, starting the run, review, retrying per the review, persisting) now runs in
+  a server-side background job, and the page only watches: after a disconnect, a refresh, or closing and reopening, it
+  picks up where it left off by sequence number, and stopping goes through the API (`/api/chat/turns`). On a service
+  restart, a turn still building its graph is marked interrupted and can be retried; a turn that has already started its
+  run keeps waiting for it, then reviews and wraps up as usual. A conversation runs only one turn at a time (a turn
+  waiting for a person at an approval doesn't count). Ask Data for users (the user role) is now reviewed too; continuing
+  a run is still limited to builders and above. Ask Data and evaluation share the same driver (`chat/drive.py`).
+- Every step inside a subworkflow now goes into the same run's event stream: the timeline and the Records page (「记录」)
+  show extra entries like "Subworkflow › that step" (「子工作流 › 那一步」), and the seal also covers the numbers the subworkflow
+  queried. Fields at the subworkflow's exit return to the parent graph carrying their provenance, so the parent graph's
+  caliber cards and reports can trace all the way to the cell inside the subworkflow (at most 3 levels); when something
+  inside the subworkflow can't be traced back to raw data, the parent graph is downgraded just the same. Reports inside
+  a subworkflow are recorded under prefixed node ids, and the parent graph recognizes only its own reports.
+- Approvals, supplementary input, draft editing, action confirmations, code and tool approvals, and double-blind
+  adjudication can take an extra Reject (「驳回」) exit: after a rejection (including rejection on timeout), the step ends
+  normally and execution continues along that exit. When an action confirmation takes the exit, nothing is sent out. The
+  instance page and notifications say "Rejected, routed to X" (「被驳回，转到 X」); the run ends along its path, and
+  `run.finished` carries `rejected_via`. Without this exit, behavior is unchanged (recorded as "Cancelled · Rejected"
+  (「已取消 · 被驳回」)). The pre-publish check blocks reject paths that can never reach the end.
+- Schedules can choose Event trigger (「事件触发」): a new period of an uploaded spreadsheet arrives, a formal run of an
+  upstream workflow finishes successfully, or a data source has changes marked Action needed (「要处理」). Events are
+  recorded where they happen, and the scheduler loop starts runs after debouncing (each period is debounced separately);
+  downstream input templates read the event content with `{{ event.* }}`. Saving checks that chains don't form a cycle,
+  and at run time chains are limited to 5 levels; runs that passed through a rejection, or that come from app backfills,
+  are ignored by default (you can tick a box to accept them). It follows the `AGENTLAB_SCHEDULER` switch: when the
+  switch is off, events are kept but not dispatched.
+
+**Upgrading from an older version (2026-10 orchestration improvements, wave 2)**:
+
+- The default is still SQLite in the data directory with a single process, so deployments that don't change their
+  configuration behave the same after upgrading; at startup the new columns and indexes of this wave are added
+  automatically (run events' `(run_id, seq)` becomes a unique index; if an existing database already has duplicate
+  numbers, a log line is written and the index isn't built this time, without affecting startup). The data directory
+  gains a `.agentlab-data` marker file, which `deploy.sh` uses (or else `agentlab.db` or `.secret_key`) to recognize the
+  data directory — don't delete it.
+- The app database can be switched to PostgreSQL: set `AGENTLAB_DATABASE_URL`, and the execution checkpoints go there
+  too; import existing data with `python -m app.db copy-to-postgres` (stop the service first; the checkpoints move
+  along). Docker deployments can have `deploy.sh` start a built-in PostgreSQL alongside (`install --postgres` for a new
+  deployment, `migrate-to-postgres` for one already on SQLite, which falls back to SQLite unchanged on failure); for
+  development, use `./scripts/dev.sh --postgres`. Built-in and external are mutually exclusive. See
+  [Using PostgreSQL](#using-postgresql).
+- With PostgreSQL you can run multiple worker processes (`AGENTLAB_WORKERS`): runs, Ask Data turns, and background jobs
+  are claimed in the database; when a process dies, another process takes over or honestly marks the work interrupted;
+  stopping works across processes; only one process is on duty as the scheduler; and live events are pushed across
+  processes. SQLite supports a single process only: a second process refuses to start. Upgrading requires stopping all
+  worker processes first (`deploy.sh upgrade` does exactly this): while the database still has live processes of a
+  different version, the new version refuses to start. See [Multiple Processes](#multiple-processes).
+- Runs queue by class: interactive (Ask Data, canvas trial runs), app, scheduled, and system (evaluation, recall,
+  reconciliation, backfill, issuance). The site-wide limit is still `AGENTLAB_MAX_CONCURRENT_RUNS`; by default a quarter
+  of it is reserved for interactive runs, the other classes can borrow the rest while it's idle, and this is adjustable
+  under Settings → Run Concurrency (「设置 → 运行并发」). Under full load, evaluation and recall will be slower than before, in
+  exchange for Ask Data always having a slot; an evaluation question's time limit doesn't include time spent queuing.
+- `deploy.sh upgrade` backs up automatically before upgrading: SQLite is copied to `backups/sqlite/` in the data
+  directory, and the built-in PostgreSQL is saved with `pg_dump` to `backups/postgres/`; each keeps the latest 5 copies
+  (`BACKUP_KEEP`), readable only by the owner. `restart` restarts only the service by default; `restart --postgres`
+  restarts the database too.
+- The bubblewrap sandbox no longer inherits the backend's environment variables: code nodes can no longer read variables
+  such as model API keys or database addresses. Pass any values the code needs explicitly.
+- When a subworkflow runs several times inside a loop, the steps of each execution continue the numbering, and
+  idempotency keys for writes to external systems now use the global id within the parent run: previously, a write in
+  the loop's second iteration would get the first iteration's receipt and not be sent; now it's sent as normal. Runs
+  paused inside a subworkflow before the upgrade still use the old keys when resumed, and writes that already took
+  effect aren't resent.
+- Ask Data heartbeats are no longer persisted, and event logs are purged for turns that ended more than 14 days ago (the
+  turn's Q&A and its answer stay in the conversation as before). When a turn is taken over after a service restart, it's
+  re-checked against the account's current role, and turns of accounts that were disabled or lost permission are
+  honestly marked interrupted.
+- When a multi-row query has no `ORDER BY`, citing one of its cells no longer counts as "from a caliber" (「来自口径」);
+  recall and reconciliation honestly mark it "Row order undefined" (「行序不定」) (the E1 statistic changes accordingly). A
+  recall whose metrics all have undefined row order concludes "Cannot verify" (「核对不了」) and opens a task, instead of
+  saying "Unchanged" (「没变」). When reconciliation needs a person to choose the metrics to compare, the columns that were
+  verified number by number are preselected.
+- Tasks, notifications, and webhooks state plainly where a rejection went ("Rejected, routed to X" (「被驳回，转到 X」), "This
+  path ends here" (「这一路到此为止」)), and inside a subworkflow they say "Subworkflow › x" (「子工作流 › x」); when a step fails
+  inside a subworkflow, automatic review reports it only once. User-visible lists break ties between entries with the
+  same name and time by id, so both kinds of database give the same order.
+
+---
+
+## Core Capabilities
+
+| Area | Capability |
 |---|---|
-| **可视化编排** | 18 种节点拖拽连线；运行时节点实时高亮、边上光点流动画、卡片内直接呈现流式 token；底部航迹把各节点的起止和并行度排在一条时间轴上，实时和回放共用；多 agent 节点在卡片里展开协作矩阵（谁在跑、几个人并行、省下多少） |
-| **对话式取数** | 「问数据」页：自然语言提问，系统自行接入数据源、生成工作流、执行并给出结论；答案里有数字时经报告撰写节点输出、逐段点得开；对话持久化、可分享链接 |
-| **多模型接入** | Anthropic / OpenAI / 任意 OpenAI 兼容服务（DeepSeek、Kimi、通义、智谱、硅基流动、Ollama 等）+ Mock |
-| **工具链** | 15 个内置工具 + 自定义工具（HTTP 模板 / 沙箱 Python）+ MCP server 接入；MCP 与自定义工具默认每次等审批，可逐个改成门控模型把关或始终允许 |
-| **能力登记与端点** | 所有可调用的工具登记在一处，逐项治理读写效果、审批、字段语义、遮罩；外部系统按测试 / 生产两个环境登记成端点，只有登记的端点能连内网，认证头加密；端点读回的表格和查询快照一样能作证（[详见](#能力登记与端点)） |
-| **Agent 护栏** | 同样的调用不重复执行、连续拿不到新信息就收尾、令牌与金额预算、上下文接近窗口先压缩再收尾；步数只留兜底（默认 100） |
-| **代码沙箱** | 双档隔离：系统沙箱（Seatbelt / bubblewrap，冷启动约 25ms）或 microVM（独立 Linux 内核，内存限额真实生效） |
-| **人工介入** | 执行暂停并落盘，人工批准 / 驳回 / 改稿后从断点继续；驳回可以接一个「驳回」出口、沿它往下走；进程重启不丢状态；可派给岗位、发起人或按表达式算出的人，会签（任一人 / 全体同意，一票否决 / 至少 m 人），设时限，超时提醒、升级或驳回，永远不会自动批准；驳回是人的决定，运行记为「被驳回」，不算失败、不重试 |
-| **断点续跑** | 失败的运行可从失败节点继续，已完成的节点不重复执行；探索运行允许修改节点配置（拓扑必须一致），正式运行固定在发布的版本上、不能改配置后继续；继续运行不改发起人 |
-| **知识库** | 向量 + BM25 混合检索、倒排索引、可选模型重排；PDF / Word / PowerPoint / HTML / Markdown 解析；向量模型可接本地端点 |
-| **表格入库** | Excel / CSV 上传后转为可用 SQL 查询的表，自动生成 `db_query__<name>` 工具——数字由 SQL 计算得出，而非模型读取；复杂报表按取数配方导入（CSV 同样可以），每月一份的明细能按期累积成一张表，夹在明细中间的小计核对后不进数据 |
-| **数据目录** | 给数据源的每张表记下粒度、业务主键、业务日期、有效记录条件，每个字段的含义、单位、度量类型和码值，以及表与表的关联；由外键、命名推断、数据剖析和模型起草，逐项确认后生效；表详情里可以和助手对话完善一张表，审阅队列按影响排好先审哪些，目录能导出、导入到别的实例；助手建图、agent 查结构、SQL 检查都读它；结构变化、取值变化记进变化记录逐条处理，数据源可设定时维护（[详见](#结构变化取值变化与定时维护)） |
-| **SQL 检查** | 按数据目录检查一对多关联后重复计算、存量跨时间相加、比率被相加等七类问题；助手自查时交回修正，受管模板发布时挡住，运行时标在查询结果上、契约指标降档 |
-| **跨库合并** | 合并查询节点：各库先聚合到同一个键，再在库外按键合并；截断的输入拒收，证据一路追到两边的原始查询 |
-| **长期记忆** | 跨运行的记忆读写与自动去重；Copilot 建图时主动记录应当记住的事实 |
-| **Skill 管理** | 将方法论抽象为可复用单元，挂载到节点上注入 system prompt |
-| **自然语言编排** | 助手：一句话生成或改写整张图，自动排版；system 里每个数据源只给一行概览，要看表结构、能力参数、工作流版本时由助手自己「查看」，一次给齐字段、目录和连接条件；交付前按运行时同一套规则自查，查出会运行失败的问题先交回去改，改不好就不自动运行（[详见](#助手按需查看)） |
-| **结构化成果** | JSON Schema 校验，不合格时将错误回传模型自动返工 |
-| **产出复核** | 运行结束后规则扫描事件流，发现异常才调用模型复核；复核可重组答案但**不得引入原答案中不存在的数字** |
-| **追踪与成本** | 全量事件落库可回放；逐节点耗时、token 用量、按目录价折算的成本；问数据每一轮的花费含助手建图、挑表和复核 |
-| **回归评测** | 题集与期望答案（写 SQL、选口径、从问数据运行认定，数值不许人填）；后台跑一轮和用户拿到的同一套问数据（建图、运行、复核），逐题评分，准确率带区间，按角色记用量与成本；对比、A/B、「目录贡献」对照；定时评测，退步推通知（[详见](#回归评测与口径账本)） |
-| **口径账本** | 问数据答案里的数逐个标口径（等价已证明 / 助手选用 / 相关口径 / 这次的推理）；等价于受管口径的自动按口径正式出具，相关口径一键对账、三个数都点得开；反复出现的问题进认证队列、固化成口径草稿；口径升版后召回重算，数变了才通知（[详见](#回归评测与口径账本)） |
-| **三档出具** | 口径卡（受控指标集）+ 出具契约：叙述中每个数字回指指标集，或由报告撰写节点按引用逐段核对，formal / degraded / withheld 三档判定 |
-| **可点击证据** | 报告撰写节点只写引用标记，数字和表格由系统照快照填值；数字、表名字段名、知识库原话都点得开，一路指到查询结果里的那一格；结论句可要求挂依据或交给另一个模型裁判；证据清单可导出，报告导出为自包含 HTML（数字点得开口径与出处），另有封存哈希核对件「可验证报告」 |
-| **发布前检查** | 受管级别加证据门禁 G1–G5；问题给出一键修复 / 选项 / 交给 Copilot 三类修法，一律先预览、不许降低要求；老工作流一键升级为可追溯结构 |
-| **正式 / 探索分级** | 正式运行只从已发布、未退役的不可变版本发起（按图哈希固定），子工作流、口径卡固定的版本同样须已发布且未退役；画布试跑自动标记为探索性；每次运行记下来源（问数据、画布、定时任务、应用入口、外部系统……），进封存范围 |
-| **应用** | 已发布工作流的使用面：从版本确定性派生出入口表单、视图、待办和动作，助手只润色布局和文案；视图只读封存的运行，每个数点得开出处，印章写明截至何时、哪版口径、出具档位；待办箱、实例进度、写外部系统的确认与对账（[详见](#应用已发布版本的使用面)） |
-| **身份与权限** | 默认不开登录；可开本地账号或通用 OIDC 单点登录，管理员 / 搭建者 / 使用者三种角色加应用级授权，管理操作留审计；开登录后使用者看到的数据一律遮罩（[详见](#身份与权限)） |
+| **Visual orchestration** | 18 node types, drag and connect; at run time nodes highlight live, dots of light flow along the edges, and streaming tokens appear right inside the card; the track along the bottom (「航迹」) lays out every node's start and end and the degree of parallelism on one timeline, shared by live view and replay; multi-agent nodes expand a collaboration matrix inside the card (who is running, how many in parallel, how much time is saved) |
+| **Conversational data access** | The Ask Data (「问数据」) page: ask in natural language, and the system, on its own, connects to data sources, generates a workflow, runs it, and gives a conclusion; when the answer contains numbers, it goes out through a report-writer node and can be clicked open segment by segment; conversations persist and can be shared by link |
+| **Multi-model access** | Anthropic / OpenAI / any OpenAI-compatible service (DeepSeek, Kimi, Tongyi, Zhipu, SiliconFlow, Ollama, etc.) + Mock |
+| **Toolchain** | 15 built-in tools + custom tools (HTTP template / sandboxed Python) + MCP server integration; MCP and custom tools wait for approval on every call by default, and each can be switched to review by a gating model or to always allow |
+| **Capability registry and endpoints** | Every callable tool is registered in one place and governed item by item: read/write effect, approval, field semantics, masking; external systems are registered as endpoints with test / production environments, only registered endpoints can reach the internal network, and auth headers are encrypted; tables read back from endpoints can serve as evidence just like query snapshots ([details](#capability-registry-and-endpoints)) |
+| **Agent guardrails** | The same call isn't executed twice, the agent wraps up when consecutive steps bring no new information, token and spending budgets, and context is compressed before wrapping up as it nears the window; the step count is kept only as a backstop (default 100) |
+| **Code sandbox** | Two isolation tiers: an OS sandbox (Seatbelt / bubblewrap, cold start about 25ms) or a microVM (its own Linux kernel, with memory limits that really take effect) |
+| **Human-in-the-loop** | Execution pauses and is persisted to disk, then continues from the checkpoint after a person approves / rejects / edits the draft; a rejection can take a Reject (「驳回」) exit and continue along it; process restarts lose no state; the human step can be assigned to a position, the initiator, or people computed by an expression, with joint sign-off (any one / all must agree, single veto / at least m people), time limits, and reminders, escalation, or rejection on timeout — never approved automatically; a rejection is a human decision, so the run is recorded as "Rejected" (「被驳回」), not as a failure, and isn't retried |
+| **Resume from checkpoint** | A failed run can continue from the failed node without re-executing completed nodes; exploratory runs may modify node configuration (the topology must stay the same), while formal runs are pinned to the published version and can't be continued after a configuration change; continuing a run doesn't change its initiator |
+| **Knowledge base** | Hybrid vector + BM25 retrieval, inverted index, optional model reranking; parses PDF / Word / PowerPoint / HTML / Markdown; the embedding model can use a local endpoint |
+| **Spreadsheet ingestion** | Excel / CSV uploads become tables you can query with SQL, with an automatically generated `db_query__<name>` tool — numbers are computed by SQL rather than read by the model; complex reports are imported with an extraction recipe (CSV works too), monthly detail files can accumulate by period into one table, and subtotals sandwiched between detail rows are checked and kept out of the data |
+| **Data catalog** | For each table of a data source, records the grain, business key, business date, and valid-record condition, each field's meaning, unit, measure type, and code values, and the relationships between tables; drafted from foreign keys, naming inference, data profiling, and the model, taking effect after item-by-item confirmation; in the table details you can chat with Copilot (「助手」) to refine a table, the review queue orders what to review first by impact, and the catalog can be exported and imported into another instance; Copilot's graph building, agents' schema lookups, and SQL checks all read it; schema changes and value changes go into a change log to be handled one by one, and data sources can have scheduled maintenance ([details](#schema-changes-value-changes-and-scheduled-maintenance)) |
+| **SQL checks** | Using the data catalog, checks seven kinds of problems, such as double counting after one-to-many joins, summing stocks across time, and adding up ratios; they're returned for correction during Copilot's self-check, block publishing of governed templates, are flagged on query results at run time, and downgrade contract metrics |
+| **Cross-database merge** | The merge query node: each database first aggregates to the same key, then the results are merged by key outside the databases; truncated inputs are rejected, and evidence traces all the way back to the raw queries on both sides |
+| **Long-term memory** | Memory read/write across runs with automatic deduplication; Copilot proactively records facts worth remembering while it builds graphs |
+| **Skill management** | Abstracts methodology into reusable units that mount on nodes and are injected into the system prompt |
+| **Natural-language orchestration** | Copilot: generate or rewrite a whole graph from one sentence, with automatic layout; the system prompt gives each data source only a one-line overview, and when Copilot needs table schemas, capability parameters, or workflow versions it "looks" (「查看」) for itself, getting fields, catalog, and join conditions all at once; before delivering, it self-checks with the same rules as the runtime, hands back any problem that would make the run fail, to be fixed first, and doesn't run automatically if they can't be fixed ([details](#copilot-looks-on-demand)) |
+| **Structured output** | JSON Schema validation; when output doesn't conform, the errors go back to the model for automatic rework |
+| **Output review** | After a run ends, rules scan the event stream, and a model review is called only when an anomaly is found; the review may restructure the answer but **must not introduce numbers that aren't in the original answer** |
+| **Tracing and cost** | All events are persisted and replayable; per-node duration, token usage, and cost at list prices; the cost of each Ask Data turn includes Copilot's graph building, table selection, and review |
+| **Regression evaluation** | Test suites with expected answers (written as SQL, picked from a caliber, or identified from an Ask Data run; numeric values may not be typed in by hand); runs, in the background, the same Ask Data pipeline that users get (graph building, run, review), scores question by question, reports accuracy with intervals, and records usage and cost by role; comparisons, A/B, and a Catalog contribution (「目录贡献」) contrast; scheduled evaluations push a notification when they regress ([details](#regression-evaluation-and-the-caliber-ledger)) |
+| **Caliber ledger** | Each number in an Ask Data answer gets a caliber label (proven equivalent (「等价已证明」) / chosen by Copilot (「助手选用」) / related caliber (「相关口径」) / this run's reasoning (「这次的推理」)); answers equivalent to a governed caliber are formally issued by that caliber automatically, and related calibers can be reconciled with one click, with all three numbers clickable; recurring questions go into a certification queue and are codified into caliber drafts; after a caliber version bump, recall recomputes and notifies only when numbers changed ([details](#regression-evaluation-and-the-caliber-ledger)) |
+| **Three-tier issuance** | Caliber card (controlled metric set) + issuance contract: every number in the narrative traces back to the metric set, or the report-writer node checks it by citation, segment by segment, for a formal / degraded / withheld verdict |
+| **Clickable evidence** | The report-writer node writes only citation markers, and the system fills in numbers and tables from snapshots; numbers, table and field names, and verbatim knowledge-base quotes are all clickable, pointing all the way to the exact cell in the query result; claim sentences can be required to carry a basis, or be handed to another model acting as judge; the evidence list can be exported, reports export as self-contained HTML (numbers open to their caliber and provenance), and there's also a seal-hash verification document, the "verifiable report" (「可验证报告」) |
+| **Pre-publish check** | The governed level adds evidence gates G1–G5; problems come with three kinds of fixes — one-click fix / options / hand over to Copilot — always previewed first and never allowed to lower requirements; old workflows upgrade to a traceable structure with one click |
+| **Formal / exploratory tiers** | Formal runs start only from published, non-retired immutable versions (pinned by graph hash), and versions pinned by subworkflows and caliber cards must likewise be published and not retired; canvas trial runs are automatically marked exploratory; every run records its origin (Ask Data, canvas, schedule, app entry, external system…), which is inside the sealed scope |
+| **Apps** | The usage surface of published workflows: entry forms, views, tasks, and actions derived deterministically from the version, with Copilot only polishing layout and copy; views read only sealed runs, every number opens to its provenance, and a stamp states the as-of time, the caliber version, and the issuance tier; inbox, instance progress, and confirmation and reconciliation for writes to external systems ([details](#apps-the-usage-surface-of-published-versions)) |
+| **Identity and permissions** | Login is off by default; local accounts or generic OIDC single sign-on can be turned on, with three roles — admin / builder / user — plus app-level grants, and administrative operations are audited; with login on, the data that users (the user role) see is always masked ([details](#identity-and-permissions)) |
 
 ---
 
-## 受限动态编排：模板定骨架，agent 填关节
+## Constrained Dynamic Orchestration: Templates Fix the Skeleton, Agents Fill the Joints
 
-大多数实际任务的步骤是已知的（写周报、核对数据、审批后发布）。让模型每次现场重新规划，
-既是在重复发明已知答案，也使结果不可复现——而不可复现即不可验收。
+The steps of most real tasks are known (writing a weekly report, checking data, publishing after approval). Having the
+model re-plan on the spot every time reinvents answers that are already known, and it also makes results unreproducible
+— and what can't be reproduced can't be accepted.
 
-AgentLab 的引擎是**编译式**的：运行时模型无法修改图结构，其自由被结构性地限制在
-agent 节点内部与 branch 决策之中。在此基础上划分三层：
+AgentLab's engine is **compiled**: at run time the model can't modify the graph structure, and its freedom is
+structurally confined to the inside of agent nodes and to branch decisions. On top of this, there are three layers:
 
 ```mermaid
 flowchart LR
-    T["<b>模板层</b> · 骨架固定<br/><br/>已发布的不可变版本<br/>WorkflowVersion + 图哈希<br/>governed 级须过治理 lint"]
-    J["<b>关节层</b> · 有边界的自由<br/><br/>agent 工具白名单<br/>branch 语义分类<br/>缺数据时降档"]
-    E["<b>探索层</b> · 不进正式归档<br/><br/>画布试跑 / 临时图 / 追问<br/>跑通的路径提取为草稿"]
-    T ==>|约束| J
-    E -.人工审核后发布.-> T
+    T["<b>Template layer</b> · fixed skeleton<br/><br/>Published immutable versions<br/>WorkflowVersion + graph hash<br/>governed level must pass the governance lint"]
+    J["<b>Joint layer</b> · bounded freedom<br/><br/>Agent tool allowlist<br/>Semantic classification for branch<br/>Downgrade when data is missing"]
+    E["<b>Exploration layer</b> · kept out of formal archives<br/><br/>Canvas trial runs / ad-hoc graphs / follow-up questions<br/>Paths that work are extracted as drafts"]
+    T ==>|constrains| J
+    E -.published after human review.-> T
 ```
 
-- **模板层**　正式运行只认已发布的不可变版本。发布后修改画布不影响已发布版本。
-  governed 级发布须通过治理 lint：禁用 supervisor（全动态归属探索层）、方法卡必须钉版本、
-  agent 不得关闭全部审批、output 必须配置出具契约，另有证据门禁 G1–G5
-  （见[受管门禁与发布前修复](#受管门禁与发布前修复)）。
-- **关节层**　授权范围内的自由。工具白名单衰减报表（`/api/governance/tool-usage`）
-  将「已授权但从未使用」的工具显性化，为收缩权限提供依据。
-- **探索层**　结果自动标记为探索性，不进正式归档。跑通的路径经「提取模板」沉淀为草稿
-  （仅保留实际执行的节点，剪除未走的分支），人工审核后发布。探索问题聚类提示哪些追问
-  应当固化为模板中的一节。
+- **Template layer** — Formal runs accept only published immutable versions. Editing the canvas after publishing doesn't
+  affect the published version. Publishing at the governed level must pass the governance lint: supervisor is disabled
+  (fully dynamic behavior belongs to the exploration layer), method cards must pin a version, agents may not turn off
+  all approvals, and output must have an issuance contract; there are also evidence gates G1–G5 (see
+  [Governed Gates and Pre-Publish Fixes](#governed-gates-and-pre-publish-fixes)).
+- **Joint layer** — Freedom within the authorized scope. The tool allowlist decay report (`/api/governance/tool-usage`)
+  makes tools that are "authorized but never used" visible, giving grounds for narrowing permissions.
+- **Exploration layer** — Results are automatically marked exploratory and kept out of formal archives. Paths that work
+  are distilled into drafts with Extract Template (「提取模板」) (keeping only the nodes that actually executed and pruning
+  the branches not taken), then published after human review. Exploration question clustering suggests which follow-up
+  questions should be codified as a section of a template.
 
-### 出具链路
+### The Issuance Chain
 
-模板⑧是最小示范：叙述由模型调用节点写，出口按数值回指。模板⑨把叙述换成报告撰写节点，
-数字按引用填值（见[可点击证据](#可点击证据报告里的每个数都点得开出处)）。两者的设计前提都是
-**派生边界收死**：所有算术发生在口径卡节点内，叙述层只能引用。
+Template ⑧ is the minimal demonstration: an LLM call node writes the narrative, and the exit traces the numbers back by
+value. Template ⑨ swaps the narrative for a report-writer node, which fills in numbers by citation (see
+[Clickable Evidence](#clickable-evidence-every-number-in-a-report-opens-to-its-provenance)). Both rest on the same
+design premise, **a derivation boundary that is closed off tight**: all arithmetic happens inside the caliber card node,
+and the narrative layer can only cite.
 
 ```mermaid
 flowchart LR
-    A["取数<br/><i>固定步骤</i>"] --> B["口径卡<br/><i>受控指标集</i>"]
-    B --> C["叙述<br/><i>LLM</i>"]
-    C --> D["出具契约<br/><i>数字回指校验</i>"]
+    A["Fetch data<br/><i>fixed steps</i>"] --> B["Caliber card<br/><i>controlled metric set</i>"]
+    B --> C["Narrative<br/><i>LLM</i>"]
+    C --> D["Issuance contract<br/><i>number trace-back check</i>"]
     D --> E1["formal"]
     D --> E2["degraded"]
     D --> E3["withheld"]
-    A -.快照.-> S[("工件库<br/>sha256 寻址")]
-    B -.口径名 + 版本.-> S
+    A -.snapshot.-> S[("Artifact store<br/>sha256-addressed")]
+    B -.caliber name + version.-> S
 ```
 
-![出具链路模板](docs/images/graph-issuance.png)
+![Issuance chain template](docs/images/graph-issuance.png)
 
-校验器从叙述中抽取全部数字逐个回指指标集，支持千分位、百分数与比率互转、千/万/亿后缀、
-按书写精度的舍入容差；日期、枚举序号、引用标记不参与回指。三档判定与缺数据声明随成果印出。
+The validator extracts every number from the narrative and traces each one back to the metric set. It supports thousands
+separators, conversion between percentages and ratios, the 千/万/亿 suffixes (thousand / ten thousand / hundred million),
+and a rounding tolerance based on the precision as written; dates, enumeration ordinals, and citation markers don't take
+part in trace-back. The three-tier verdict and the missing-data declaration are printed along with the output.
 
-中文数字同样回指——否则换一种写法就绕过去了（"增长三成、客户两千五百家"以前能盖 formal 章）。
-成、倍、百分之、分之、一半按比例回指，"两千余"按区间 [2000, 3000] 回指；"一个问题""十分重要"
-"从三个方面看""三季度""几十家"这类虚指、序数、季度名、结构性列举不算结论数字。
+Chinese numerals are traced back too — otherwise writing a number a different way would get around the check
+("增长三成、客户两千五百家", "grew 30%, 2,500 customers", used to earn a formal stamp). 成, 倍, 百分之, 分之, and 一半 (tenths, times,
+percent, fractions, half) are traced back as ratios, and "两千余" ("two thousand-odd") is traced back as the interval
+[2000, 3000]; vague references, ordinals, quarter names, and structural enumerations such as "一个问题" ("one issue"),
+"十分重要" ("very important"), "从三个方面看" ("from three angles"), "三季度" ("the third quarter"), and "几十家" ("dozens of
+companies") don't count as conclusion numbers.
 
-实测记录：Opus 5 撰写的正文数字全部回指成功，但结尾「（约 100 字）」中的 `100` 被判定为
-集合外数字并触发降档。处置方式是修改 prompt 而非扩大白名单——这正是校验器应有的行为。
+From actual testing: every number in body text written by Opus 5 traced back successfully, but the `100` in the closing
+「（约 100 字）」 ("(about 100 characters)") was judged a number outside the set and triggered a downgrade. The fix was to
+change the prompt rather than widen the allowlist — exactly how the validator should behave.
 
-**口径升版是被迫处置事件。** 钉住的方法卡出现新版本时，正式运行将被拒绝启动，
-直至模板显式声明升版策略：`recompute`（回算历史）/ `dual`（双印）/ `incomparable`
-（标注不可比）。此处无默认值——口径变更最容易静默翻车的形态是「数字看起来都对，
-只是与上周不可比」。
+**A caliber version bump is an event that forces a decision.** When a pinned method card gets a new version, formal runs
+refuse to start until the template explicitly declares a version-bump policy: `recompute` (recompute history) / `dual`
+(print both) / `incomparable` (mark as not comparable). There's no default here — the form in which a caliber change
+most easily goes wrong silently is "the numbers all look right; they just aren't comparable with last week's".
 
-每次运行的完整证据存于内容寻址的工件库（`data/artifacts/`，sha256 即地址，取回时复验哈希）；
-运行终态的事件清单哈希记录在 Run 上（封存到 `run.finished` 为止），事后修改流水将无法对齐。
-运行详情页一键核对，接口是 `GET /api/runs/{id}/verify`；封存之后追加的事件不在核对范围内。
+The complete evidence of every run is stored in the content-addressed artifact store (`data/artifacts/`; the sha256 is
+the address, and the hash is re-verified on retrieval); the hash of the event manifest at the run's final state is
+recorded on the Run (sealed up to `run.finished`), so any later edit to the log will no longer line up. Verify with one
+click on the run details page; the API is `GET /api/runs/{id}/verify`. Events appended after sealing are outside the
+verification scope.
 
 ---
 
-## 可点击证据：报告里的每个数都点得开出处
+## Clickable Evidence: Every Number in a Report Opens to Its Provenance
 
-按数值回指只能在出口回头猜出处，同值的指标一多就猜错。可点击证据把核对挪到写的那一刻，
-出处直接写进报告的数据结构里。
+Tracing back by value can only guess the provenance afterwards, at the exit, and once many metrics share the same value
+it guesses wrong. Clickable evidence moves the check to the moment of writing, and the provenance is written directly
+into the report's data structure.
 
-![证据面板](docs/images/evidence-panel.png)
+![Evidence panel](docs/images/evidence-panel.png)
 
-<sub>记录页的「证据」页签：点开「环比 8.7%」，右栏从口径卡的原式、代入式一路指到两次查询里被引用的那一格，
-末尾是封存核对；左下是证据清单。Mock 写不出带引用的报告，这次运行用前端测试夹具
-（`frontend/src/run/__tests__/evidence-query.json`，示例数据）伪造，列表里其余几条是 Mock 真跑的。</sub>
+<sub>The Evidence (「证据」) tab on the Records page (「记录」): clicking 「环比 8.7%」 (period-over-period 8.7%) makes the right
+column point from the caliber card's original formula and substituted formula all the way to the cited cell in each of
+the two queries, ending with the seal verification; bottom left is the evidence list. Mock can't write a report with
+citations, so this run was faked with a frontend test fixture (`frontend/src/run/__tests__/evidence-query.json`, sample
+data); the other entries in the list are real Mock runs.</sub>
 
-**引用即渲染。** 报告撰写节点（`report`）里模型只写引用标记，数值由系统照快照填进去：
+**Citation is rendering.** In the report-writer node (`report`), the model writes only citation markers, and the system
+fills in the values from snapshots:
 
 ```
-[[m:gmv]]  [[m:gmv|万]]                    口径卡指标；换算显示也由系统完成
-[[i:week]]                                 运行输入
-[[v:Q1.r0.gmv]]                            查询快照里的一格，取回时复验哈希
-[[table:Q1 cols=region,amount rows=0-4]]   系统照快照生成整张表，每一格都点得开
-[[t:orders]]  [[c:orders.week]]            表名、字段名；写在反引号里的名字同样核对
-[[q:K1|原话]]                              知识库原话，须在那次检索命中的片段里逐字出现
-[[see:m:gmv,Q1]]                           结论句的依据，挂在句末，不渲染
+[[m:gmv]]  [[m:gmv|万]]                    caliber card metric; display conversion (here 万, units of 10,000) is also done by the system
+[[i:week]]                                 run input
+[[v:Q1.r0.gmv]]                            one cell of a query snapshot; the hash is re-verified on retrieval
+[[table:Q1 cols=region,amount rows=0-4]]   the system builds the whole table from the snapshot; every cell is clickable
+[[t:orders]]  [[c:orders.week]]            table name, field name; names written in backticks are checked too
+[[q:K1|原话]]                              verbatim knowledge-base quote (原话 = the quoted words); must appear word for word in the chunks hit by that retrieval
+[[see:m:gmv,Q1]]                           basis of a claim sentence; attached at the end of the sentence, not rendered
 ```
 
-流式输出里看到的就是最终数字。裸数字、解析不了的引用当场判违规、交回去重写（`max_repairs`，默认 1 次），
-仍不过关时按 `on_violation` 让节点失败（正式运行默认）或把违规标在报告里（探索运行默认）。
-出具契约写了 `report_from` 就按引用核对：取回报告文档时复验哈希、独立重算一遍，全部带引用才判完整出具。
-纯指标看板（契约只写 `metrics_from`，上游没有报告撰写节点、成果里也没有模型写的话）按**指标出具**：没有叙述可核，核的是指标本身——必需指标齐不齐、每个指标的输入是否追到原始数据（查询快照的格、运行输入）、成果字段里的数是否都回指到指标；受管级要求每个指标都静态地追到原始数据。
+What you see in the streaming output is the final number. Bare numbers and citations that can't be parsed are judged
+violations on the spot and sent back for rewriting (`max_repairs`, default 1); if it still doesn't pass, `on_violation`
+either fails the node (the default for formal runs) or marks the violations in the report (the default for exploratory
+runs). When the issuance contract specifies `report_from`, verification goes by citation: the hash is re-verified when
+the report document is retrieved, everything is recomputed independently once, and only when every number carries a
+citation is it judged a formal (complete) issuance. A pure metrics dashboard (the contract specifies only
+`metrics_from`, there's no report-writer node upstream, and the output contains no model-written text) uses
+**metric issuance**: there's no narrative to check, so the metrics themselves are checked — whether all required metrics
+are present, whether each metric's inputs trace back to raw data (cells of query snapshots, run inputs), and whether the
+numbers in output fields all trace back to metrics; the governed level requires every metric to trace back to raw data
+statically.
 
-**取数链路。** agent、工具节点、代码节点、知识检索取数时都记进证据台账，报告目录按台账编出 Q1… / K1…。
-口径卡表达式可以写 `cell(nodes.pull, 0, 'gmv')`，出处精确到单元格。agent 开 `cite_fields`（配合 `output_schema`）
-后，每个字段标出取自哪次查询的哪一格，再到快照里核对：对不上以快照为准并告警，查不到的记为空值，不兜底成 0。
-代码节点分 `evidence_role`：`source` 是取数，`compute`（默认）是计算——沙箱算出来的数不能被报告直接引用，
-要进口径卡。数据源可设 `mask_columns` 遮罩列（只减少暴露，不是安全边界）。
+**The data retrieval chain.** When agents, tool nodes, code nodes, and knowledge retrieval fetch data, it's all recorded
+in the evidence ledger, and the report's source list is numbered Q1… / K1… from the ledger. A caliber card expression
+can be written as `cell(nodes.pull, 0, 'gmv')`, making the provenance precise to the cell. When an agent turns on
+`cite_fields` (together with `output_schema`), each field marks which cell of which query it came from, and that's then
+checked against the snapshot: on a mismatch the snapshot wins and a warning is raised, and anything not found is
+recorded as null rather than defaulted to 0. Code nodes have an `evidence_role`: `source` means data retrieval and
+`compute` (the default) means computation — numbers computed in the sandbox can't be cited directly by a report; they
+have to go into a caliber card. Data sources can set masked columns with `mask_columns` (this only reduces exposure; it
+isn't a security boundary).
 
-**点开看到什么。** 数字：指标的原式、代入式和复算结果，输入与快照是否一致，查询的 SQL、被引用的行加前后
-各 2 行、高亮到格，最后是封存状态；只认封存范围内的事件交回过的工件。上传表格的单元格可以追到原表格子
-（推断的来源）。表名、字段名：出现在哪次查询、类型、
-所属的表。表结构快照、SQL、结果列里都没有的名字标成可疑实体（「可能是编造的名字」，附最接近的 3 个）；
-快照被截断、核对不了的只说核对不了，不冤枉成编造。
+**What you see when you click.** For a number: the metric's original formula, substituted formula, and recomputed
+result; whether the inputs match the snapshot; the query's SQL; the cited row plus 2 rows before and after, highlighted
+down to the cell; and finally the seal status. Only artifacts returned by events inside the sealed scope are accepted.
+Cells of uploaded spreadsheets can be traced to the cell in the original sheet (an inferred source). For table and field
+names: which query they appear in, the type, and the table they belong to. Names that appear nowhere in the schema
+snapshot, the SQL, or the result columns are marked as suspicious entities ("May be a fabricated name" (「可能是编造的名字」),
+with the 3 closest matches); when a snapshot was truncated and can't be checked, it only says it can't be checked,
+without wrongly calling the name fabricated.
 
-**结论句。** 报告节点的 `claims`：`off`（默认）不管；`require_citation` 要求结论句挂依据，没挂的计入缺口；
-`judge` 再请另一个模型按证据逐句判为支持 / 部分支持 / 不支持 / 不是结论，只标注、不改写正文，裁判模型和
-写作模型相同时给警告。正式运行在节点内判，判定随报告一起封存，不支持的按 `on_unsupported` 降档或不予出具；
-探索运行点开哪句判哪句，判定作为封存之后追加的事件记下，封存核对照样一致。每份报告的句数、金额、时长，
-每次点击的金额，每天的总金额都有上限（默认 40 句、$0.05、30 秒，每次点击 $0.01，每天 $2），每一项都能设成不限。
+**Claim sentences.** The report node's `claims`: `off` (default) does nothing; `require_citation` requires claim
+sentences to carry a basis, and those without one count as gaps; `judge` additionally asks another model to rule on each
+sentence against the evidence as supported (「支持」) / partially supported (「部分支持」) / unsupported (「不支持」) / not a claim
+(「不是结论」) — it only annotates and never rewrites the body, and it warns when the judge model is the same as the writing
+model. In formal runs the judging happens inside the node, and the verdicts are sealed together with the report; when
+claims are unsupported, the issuance is downgraded or withheld per `on_unsupported`. In exploratory runs, whichever
+sentence you click is the one that gets judged, and the verdict is recorded as an event appended after sealing, so seal
+verification still matches. There are caps on the sentences, spending, and duration per report, the spending per click,
+and the total spending per day (defaults: 40 sentences, $0.05, 30 seconds; $0.01 per click; $2 per day), and each one
+can be set to unlimited.
 
-**审计与旧运行。** `GET /api/runs/{id}/evidence/audit` 按无证据 / 可疑实体 / 有出处 / 旧运行猜测分组，
-可导出 JSON 和 CSV。没有契约的旧答案按数值和已封存的查询单元格、口径卡值比对，每个数最多 3 个候选，
-默认折叠，写明「猜测的来源，不能当证据」。老工作流可以一键升级为可追溯结构：模型调用写的报告换成报告撰写节点，
-问数据的 input → agent → output 中间插一个报告撰写，配了 `output_schema` 的 agent 打开 `cite_fields`；
-沙箱代码喂口径卡的只建议标成 `source`，不替人改。升级只给预览，人确认后才保存。
+**Audit and old runs.** `GET /api/runs/{id}/evidence/audit` groups entries by no evidence / suspicious entity / has
+provenance / old-run guess, and can export JSON and CSV. Old answers without a contract are matched by value against
+sealed query cells and caliber card values, with at most 3 candidates per number, collapsed by default and labeled
+"Guessed source, not evidence" (「猜测的来源，不能当证据」). Old workflows can be upgraded to a traceable structure with one click:
+reports written by LLM calls are replaced with report-writer nodes, the input → agent → output of Ask Data (「问数据」) gets
+a report writer inserted in the middle, and agents with `output_schema` get `cite_fields` turned on; for sandbox code
+feeding a caliber card, it only suggests marking it `source` and doesn't change it on anyone's behalf. The upgrade only
+shows a preview; it saves only after a person confirms.
 
-**导出两份。** 问数据答案和运行详情成果上的「导出」把报告导出成一个自包含的 HTML 文件
-（`GET /api/runs/{id}/report.html`）：正文由服务端渲染，不执行脚本也读得到（邮件附件预览常常不执行脚本）；
-执行脚本后每个数字、无证据的数字、可疑的表名字段名都点得开——面板是网页上证据面板同一个拼法的
-出处链（口径、来源、计算方式、SQL、被引用的行），封存状态逐项标明；遮罩列照网页上的规矩写「已遮罩」。
-没封存的运行照常导出（和网页上读报告一个道理）。记录页「凭证详情」里的「导出可验证报告」
-（`GET /api/runs/{id}/bundle.html`）是另一份：封存核对件，收件人不连服务、在浏览器里重算哈希，核对每个
-数字、文档和运行记录没被改过；数字的出处面板同样带口径、原式、代入式、输入和复算，口径卡输入指向的
-查询快照也随文件附带、引用链认得这条引用。要证明没被改过用可验证报告，要让人读报告、查数字的来历用报告导出。
+**Two kinds of export.** Export (「导出」) on an Ask Data answer or on a run's output in run details exports the report as
+one self-contained HTML file (`GET /api/runs/{id}/report.html`): the body is rendered on the server, so it's readable
+without running scripts (email attachment previews often don't run scripts); with scripts running, every number, every
+number without evidence, and every suspicious table or field name is clickable — the panel is the same provenance chain
+the evidence panel assembles on the web page (caliber, source, calculation, SQL, cited rows), with the seal status
+marked item by item, and masked columns say "Masked" (「已遮罩」) under the same rules as the web page. Unsealed runs export
+as usual (for the same reason you can read their reports on the web). Export Verifiable Report (「导出可验证报告」) under
+Provenance Details (「凭证详情」) on the Records page (`GET /api/runs/{id}/bundle.html`) is a different file: a seal
+verification document. The recipient, without connecting to the service, recomputes the hashes in the browser and checks
+that no number, document, or run record has been altered; the provenance panel for a number likewise includes the
+caliber, original formula, substituted formula, inputs, and recomputation, and the query snapshots that caliber card
+inputs point to come attached to the file, so the citation chain recognizes those citations. To prove nothing was
+altered, use the verifiable report; to let people read the report and look up where the numbers came from, use the
+report export.
 
-### 受管门禁与发布前修复
+### Governed Gates and Pre-Publish Fixes
 
-受管级别在治理 lint 之外加了证据门禁，只看图和配置，让「每个数都点得开」在结构上成立：
+On top of the governance lint, the governed level adds evidence gates. They look only at the graph and its
+configuration, and make "every number is clickable" hold structurally:
 
-- **G1** 带契约的出口，成果字段的文字只能来自报告撰写节点
-- **G2** 模型写的文字不绕过报告撰写节点直接流进出口
-- **G3** 报告撰写节点写明 `numbers: strict`、`on_violation: fail`、`claims: require_citation`（或 `judge` 并写预算）
-- **G4** 口径卡的输入不来自计算角色的沙箱代码
-- **G5** 给口径卡供数的 agent 配 `output_schema` 并开 `cite_fields`
+- **G1** At an exit with a contract, the text in output fields may come only from report-writer nodes
+- **G2** Model-written text doesn't bypass the report-writer node to flow straight into the exit
+- **G3** The report-writer node states `numbers: strict`, `on_violation: fail`, and `claims: require_citation` (or
+  `judge` with a budget)
+- **G4** Caliber card inputs don't come from sandbox code in the compute role
+- **G5** Agents that feed a caliber card have `output_schema` configured and `cite_fields` turned on
 
-受管级别下是错误、挡住发布；已发布级别只给警告；已经发布的版本照常运行，下次发布时按新规则检查。
+At the governed level these are errors that block publishing; at the published level they're only warnings; versions
+already published keep running as usual, and the next publish is checked against the new rules.
 
-发布弹窗打开就先跑一遍发布前检查（`POST /api/workflows/{id}/publish-check`，和真正发布同一套口径），
-问题面板里平时也看得到。修复（`/autofix`）分三类：答案唯一的一键修复；要人拿主意的给选项、不替人选；
-结构性的交给 Copilot。一律先预览，不自动保存、不自动发布。删节点、删契约、放宽审批、关掉 strict、改级别
-这类降低要求的改动一律拒绝，Copilot 的方案也要过这一关；应用后重跑检查，错误必须变少、不能冒出新的。
-一键升级（`POST /api/copilot/upgrade-evidence`）过的也是这道检查。
+Opening the publish dialog first runs the pre-publish check (`POST /api/workflows/{id}/publish-check`, with the same
+criteria as actual publishing), and the results are visible in the issues panel at other times too. Fixes (`/autofix`)
+come in three kinds: a one-click fix when there's only one right answer; options when a person has to decide, without
+choosing on their behalf; and structural ones handed over to Copilot (「助手」). All are previewed first, and nothing is
+saved or published automatically. Changes that lower requirements — deleting nodes, deleting contracts, relaxing
+approvals, turning off strict, changing the level — are always refused, and Copilot's proposals have to pass this check
+too; after a fix is applied the check reruns, and the errors must decrease, with no new ones appearing. The one-click
+upgrade (`POST /api/copilot/upgrade-evidence`) goes through the same check.
 
 ---
 
-## 回归评测与口径账本
+## Regression Evaluation and the Caliber Ledger
 
-**评测**（导航「评测」，搭建者以上）是换模型、改提示词、改目录之后的一把尺：
+**Evaluation** (the Evaluations (「评测」) navigation item, builders and above) is a yardstick for after you switch models,
+change prompts, or change the catalog:
 
-- **题集**：每道题是一个问题加期望答案。期望可以是一条 SQL（选格或列，每次评测重算，不冻结数值；查到遮罩列的拒收）、一份
-  已发布口径的指标、或从某次问数据运行里认定的查询；也可以期望「没有数据」或期望反问。数值不许人填，文字要点由裁判判、单列，
-  不计入准确率。口径升版后，用到它的题顶部提示，每道题三选一：改为固定新版本、新旧两版各算一份期望、或旧题归档另建新题，处置之前评测时跳过。题集能导入导出。
-- **发起**：选变体（助手模型、写作模型、裁判开关、目录用当前 / 快照 / 只用已核实的 / 关、重复几次），先给预估花费；「目录
-  贡献」预设一次跑「当前 vs 关」。评测在后台跑，每题怎么走和用户在问数据里拿到的一样，停在审批的不代批、照实记；并发、每题
-  时限、单次和每日金额都有上限（「设置 → 偏好设置 → 评测」），评测的花费单独一本账。能停、能只重试没做完的；服务重启标中断，
-  不自己续跑。
-- **结果**：总览（准确率与可追溯准确率带 Wilson 区间、路径和出具档位的分布、按角色的用量与成本、耗时分位），逐题表（结论、
-  期望和答案里的数、SQL 差在哪、看了几次表、花费，点开去运行），和上一次或基线比（逐题转移与归因），A/B 配对表（精确 McNemar，
-  只展示不卡门）。评测运行不进使用统计。
-- **定时**：定时任务的目标可以选题集；有一道题从通过变成不通过就推「定时评测有退步」，消息只有题集名、通过数、退步题数和链接。
+- **Test suites**: each item is a question plus an expected answer. The expectation can be a SQL statement (selecting a
+  cell or a column; recomputed on every evaluation instead of freezing the value; rejected if it queries masked
+  columns), a metric of a published caliber, or a query identified from an Ask Data (「问数据」) run; you can also expect "No
+  data" (「没有数据」) or expect a clarifying question back. Numeric values may not be typed in by hand; text key points are
+  judged by the judge, listed separately, and not counted toward accuracy. After a caliber version bump, questions that
+  use it show a notice at the top, and each question takes one of three options: switch to pinning the new version,
+  compute one expectation for each of the old and new versions, or archive the old question and create a new one; until
+  handled, the question is skipped in evaluations. Test suites can be imported and exported.
+- **Starting an evaluation**: choose variants (Copilot (「助手」) model, writing model, judge on/off, catalog set to current
+  / snapshot / verified only / off, how many repetitions), and see an estimated cost first; the Catalog contribution
+  (「目录贡献」) preset runs "current vs. off" in one go. Evaluations run in the background, and each question goes exactly
+  the way a user's question would in Ask Data; questions that stop at an approval aren't approved on anyone's behalf and
+  are recorded as they are. Concurrency, per-question time limits, and per-evaluation and daily spending all have caps
+  (Settings → Preferences → Evaluation, 「设置 → 偏好设置 → 评测」), and evaluation spending is tallied separately. An evaluation
+  can be stopped, and you can retry only the unfinished questions; a service restart marks it interrupted, and it
+  doesn't resume by itself.
+- **Results**: an overview (accuracy and traceable accuracy with Wilson intervals, the distribution of paths and
+  issuance tiers, usage and cost by role, duration percentiles), a per-question table (verdict, the numbers in the
+  expectation and in the answer, where the SQL differs, how many times tables were looked at, cost; click through to the
+  run), a comparison with the previous evaluation or a baseline (per-question transitions and attribution), and an A/B
+  paired table (exact McNemar; display only, not a gate). Evaluation runs are excluded from usage statistics.
+- **Scheduled**: a schedule's target can be a test suite; if any question goes from pass to fail, it pushes "Scheduled
+  evaluation regressed" (「定时评测有退步」), and the message contains only the test suite name, the pass count, the number of
+  regressed questions, and a link.
 
-**口径账本**把问数据的答案和已发布的口径对上：
+The **caliber ledger** matches Ask Data answers against published calibers:
 
-- **逐个数标口径**：探索运行封存后在后台和已发布的口径比对。SQL 被证明等价的标「等价已证明」，助手选用口径拼出来的标「助手
-  选用」，用到同一张表却不等价的标「相关口径」并写差在哪，都不沾边的写「这次的推理」。证据面板的出处链最上面多一步「口径」，
-  问数据每一轮底下有一行摘要；比对还没出结果时写「正在比对口径」并按退避重取。逐个数判：报告引用了一条查询的几列
-  （销售额、订单数、首末日）时，每个数按它那一列单独和口径的指标列比，多查的列不影响这个数；只在去掉别的列不会改变这个数
-  时才这样比（有 DISTINCT、按别的列排序后截断、多出来的分组列这些情况照旧整条比）。整题要每个来自数据的数都被证明来自
-  同一份口径，才自动出具。口径的取数 SQL 里最好不要取整（`ROUND(SUM(x), 2)`）、不要套 `COALESCE(…, 0)`：取整、给默认值
-  交给口径卡的小数位和展示，不然问数据里没取整的写法永远认不成等价（差在哪会照实写出来）。
-- **出具与对账**：整题等价于一份受管口径时自动按口径发起一次正式运行（可关，每天有上限）；助手选用的给一键出具。相关口径点
-  「看差多少」发起一次只读的对账运行，这次的数、口径的数和差值各自点得开出处；对账的说明有没有用可以反馈。使用者能对账；按口径
-  正式出具只限他有权使用的应用固定着的口径版本。
-- **沉淀**：同一类问题反复出现（同一形状的查询 ≥3 次、来自 ≥2 段对话，或问题聚成一类，或答案被反复导出、做成应用）的进工作流
-  选择里的「可沉淀的问题」，可以固化成口径草稿（引用的查询变成取数节点，跨轮变化的字面量自动成为参数），审过再发布。
-- **召回**：受管口径发布新版本后，反查用过旧版的问数回答、正式运行、固定它的应用和导出，按参数分组在同一份数据上重算两版之差，
-  数变了才开「召回」待办（旧值、新值、差值和原答案当时的值都点得开，可以按新版重新出具），没变的只记账。发布弹窗先预告规模。
-- **统计**：等价命中、对账、问题重复度、召回四项（E1–E4）由 `GET /api/ledger/stats` 现算，评测页的「口径命中与重复度」页签
-  画趋势。
+- **A caliber label for each number**: after an exploratory run is sealed, it's matched against published calibers in
+  the background. Numbers whose SQL is proven equivalent are labeled "Proven equivalent" (「等价已证明」); those Copilot
+  assembled from a caliber it chose are labeled "Chosen by Copilot" (「助手选用」); those that use the same table but aren't
+  equivalent are labeled "Related caliber" (「相关口径」), with a note on where they differ; and those unrelated to any
+  caliber say "This run's reasoning" (「这次的推理」). The evidence panel's provenance chain gains a Caliber (「口径」) step at the
+  top, and every Ask Data turn gets a one-line summary underneath; while matching has no result yet, it says "Matching
+  calibers" (「正在比对口径」) and refetches with backoff. Judging is number by number: when a report cites several columns of
+  one query (sales, order count, first and last day), each number is compared on its own column against the caliber's
+  metric column, and extra queried columns don't affect that number; this per-column comparison is used only when
+  removing the other columns wouldn't change the number (cases with DISTINCT, truncation after sorting by another
+  column, or extra grouping columns are still compared as a whole query). A question is issued automatically only when
+  every number in it that comes from data is proven to come from the same caliber. In a caliber's data-fetch SQL, it's
+  best not to round (`ROUND(SUM(x), 2)`) or wrap things in `COALESCE(…, 0)`: leave rounding and defaults to the caliber
+  card's decimal places and display, or Ask Data queries written without rounding will never be recognized as equivalent
+  (where they differ is stated plainly).
+- **Issuance and reconciliation**: when a question as a whole is equivalent to a governed caliber, a formal run by that
+  caliber starts automatically (this can be turned off, and there's a daily cap); answers labeled "Chosen by Copilot"
+  get one-click issuance. For a related caliber, clicking See the difference (「看差多少」) starts a read-only reconciliation
+  run, where this run's number, the caliber's number, and the difference each open to their provenance; you can give
+  feedback on whether the reconciliation's explanation was useful. Users can reconcile; formal issuance by caliber is
+  limited to caliber versions pinned by apps they're allowed to use.
+- **Distill**: question types that keep recurring (a query of the same shape ≥3 times from ≥2 conversations, or
+  questions clustering into one group, or answers repeatedly exported or made into apps) go into Distillable questions
+  (「可沉淀的问题」) in the workflow picker, and can be codified into a caliber draft (cited queries become data-fetch nodes,
+  and literals that vary across turns automatically become parameters), to be published after review.
+- **Recall**: after a new version of a governed caliber is published, the system looks up the Ask Data answers, formal
+  runs, apps pinning it, and exports that used the old version, groups them by parameters, and recomputes the difference
+  between the two versions on the same data; only when a number changed does it open a Recall (「召回」) task (the old
+  value, the new value, the difference, and the original answer's value at the time are all clickable, and it can be
+  reissued under the new version), while unchanged ones are only recorded in the ledger. The publish dialog previews the
+  scale beforehand.
+- **Statistics**: four measures — equivalence hits, reconciliation, question repetition, and recall (E1–E4) — are
+  computed live by `GET /api/ledger/stats`, and the Caliber hits & repetition (「口径命中与重复度」) tab on the evaluation page
+  plots the trends.
 
-## 应用：已发布版本的使用面
+## Apps: The Usage Surface of Published Versions
 
-工作流发布出去之后，看数的人、办事的人在「应用」里用它。应用不是新引擎，也不是嵌进来的低代码平台：每个数都来自
-固定版本封存的正式运行，每次发起都是固定版本的正式运行。界面层不放逻辑——绑定只取已有的值，可见条件只能比较、
-做布尔运算、取值和 `in`，没有算术，求值都在服务端，不可见的组件和遮罩值不出服务端。
+Once a workflow is published, the people who read the numbers and the people who get work done use it in Apps (「应用」). An
+app isn't a new engine, nor an embedded low-code platform: every number comes from a sealed formal run of the pinned
+version, and every start is a formal run of the pinned version. The interface layer holds no logic — bindings only take
+existing values, visibility conditions can only compare, do boolean operations, take values, and use `in`, with no
+arithmetic; all evaluation happens on the server, and invisible components and masked values never leave the server.
 
-**怎么生成一个应用**
+**How to create an app**
 
-1. 在画布上发布工作流，在发布成功的提示里点「做成应用」；或者在问数据的回答上点「做成应用」：先把这次运行提取成
-   工作流（只保留实际执行的步骤），在画布上发布，再从发布成功的提示进来。
-2. 系统按这一版确定性地派生出应用草稿，不调模型：入口字段生成表单，口径卡生成指标块，报告生成报告块，取数节点生成
-   表格，人工节点生成待办（岗位留空等人绑定），写外部系统的调用工具节点生成动作确认和动作状态。视图优先绑定已有的
-   定时任务。
-3. 在应用编辑里调整：页面树和属性面板、按草稿预览（不发起运行）、检查。右侧助手只能润色布局、文案和控件，改不了
-   固定的版本、入口映射和表单的数据约束。
-4. 绑定岗位到人或组（流程类应用必须）、授权、入站钩子、通知订阅，然后发布。固定的工作流版本比上一版应用新时，
-   发布时要为它选一种处置：按新口径重算、两版并列、前后不可比。
+1. Publish the workflow on the canvas and click Make App (「做成应用」) in the publish-success notice; or click Make App on an
+   Ask Data (「问数据」) answer: this first extracts the run into a workflow (keeping only the steps that actually executed),
+   which you publish on the canvas, and then you come in from the publish-success notice.
+2. The system derives an app draft from this version deterministically, without calling a model: entry fields become
+   forms, caliber cards become metric blocks, reports become report blocks, data-fetch nodes become tables, human nodes
+   become tasks (with positions left empty for someone to bind), and Call Tool (「调用工具」) nodes that write to external
+   systems become action confirmations and action status. Views prefer to bind to existing schedules.
+3. Adjust it in the app editor: the page tree and properties panel, a preview based on the draft (no run is started),
+   and checks. The Copilot (「助手」) on the right can only polish layout, copy, and controls; it can't change the pinned
+   version, the entry mappings, or the forms' data constraints.
+4. Bind positions to people or groups (required for process apps), set grants, inbound hooks, and notification
+   subscriptions, then publish. When the pinned workflow version is newer than the one in the previous app version,
+   publishing requires choosing a disposition for it: Recompute with the new caliber (「按新口径重算」), Both versions side by
+   side (「两版并列」), or Before and after not comparable (「前后不可比」).
 
-**能做哪几类应用**
+**What kinds of apps you can build**
 
-| 类型 | 用到的能力 |
+| Type | Capabilities used |
 |---|---|
-| 数据看板 | 视图读定时任务最近一次封存的正式运行：印章、指标块、多期趋势（按升版处置画）、表格、折线 / 柱状图、报告 |
-| 参数化报表 | 入口表单发起一次正式运行，在实例页看结果；或者页面上的参数表单按需运行并缓存 |
-| 审批流程 | 待办派给岗位 / 发起人 / 表达式算出的人，任一人 / 全体 / 至少 m 人，时限与升级，待办箱、「我发起的」 |
-| 写回外部系统 | 调用工具节点写登记的端点，确认卡是遮罩后的预览和内容哈希，结果未知转人工核实 |
-| 外部系统触发 / 回调 | 签名的入站钩子：发起实例，或者回调「等外部系统」的那一步 |
-| 混合 | 看板上发起处置流程，最后写回系统 |
+| Data dashboard | Views read a schedule's latest sealed formal run: stamp, metric blocks, multi-period trends (drawn according to the version-bump disposition), tables, line / bar charts, reports |
+| Parameterized report | An entry form starts a formal run, and you see the result on the instance page; or a parameter form on the page runs on demand and caches the result |
+| Approval process | Tasks assigned to a position / the initiator / people computed by an expression, with any one / all / at least m people, time limits and escalation, an inbox, and Started by Me (「我发起的」) |
+| Write back to external systems | Call Tool nodes write to registered endpoints, the confirmation card shows a masked preview and a content hash, and unknown results go to a person for verification |
+| External system trigger / callback | Signed inbound hooks: start an instance, or call back the Wait for External System (「等外部系统」) step |
+| Hybrid | Start a handling process from a dashboard, and finally write back to the system |
 
-**视图与印章**　每个视图带印章：截至何时（含统计期、数据版本）、哪一版口径（工作流名 vN · 哈希前 8 位，加口径卡的
-口径名和版本）、哪一档出具、数据从哪来（定时任务「…」第 n 次 / 按需运行 / 本实例）。定时任务已改跑新版本、应用还
-固定在旧版本时照实写明。按需视图默认点「刷新」才运行，同一组参数在进程里只运行一份，查活库的必须设时效，每个应用
-每天有上限（设置项 `apps.on_demand_daily_limit`，默认 200）。
+**Views and stamps** — Every view carries a stamp: as of when (including the reporting period and data version), which
+caliber version (workflow name vN · first 8 characters of the hash, plus the caliber card's caliber name and version),
+which issuance tier, and where the data came from (schedule "…" run n / on-demand run / this instance). When the
+schedule has already moved on to a new version while the app is still pinned to the old one, the stamp says so plainly.
+By default, on-demand views run only when you click Refresh (「刷新」); a given set of parameters runs only once at a time
+within a process; views that query a live database must set a freshness period; and each app has a daily cap (the
+setting `apps.on_demand_daily_limit`, default 200).
 
-**流程与待办**　一次中断对应一条审批（给引擎）和一条待办（给人），所有人的决定经待办服务汇总、凑齐才恢复一次运行。
-图里只写岗位名，岗位绑定到人或组在应用里做。没有应用的运行（画布、定时任务）派给任何人，行为和以前一样；老接口
-`/api/approvals/{id}/decide`、`/api/runs/{id}/resume` 照旧可用。时限由调度循环每 15 秒检查一次——调度关着
-（`AGENTLAB_SCHEDULER=0`）时不提醒、不升级、不自动核实。
+**Processes and tasks** — Each interrupt corresponds to one approval (for the engine) and one task (for people);
+everyone's decisions are aggregated by the task service, and the run resumes once, only when they're all in. The graph
+names only positions; binding positions to people or groups is done in the app. Runs without an app (canvas, schedules)
+are assigned to anyone, behaving as before; the old APIs `/api/approvals/{id}/decide` and `/api/runs/{id}/resume` still
+work. The scheduler loop checks time limits every 15 seconds — when the scheduler is off (`AGENTLAB_SCHEDULER=0`), there
+are no reminders, no escalations, and no automatic verification.
 
-**写外部系统**　写入能力只能放在「调用工具」节点里。先写生效记录再发送，同一次执行发第 n 次的幂等键是
-`{action_key}:{n}`；确认卡显示遮罩后的预览和内容哈希，确认之后上游变了就拒发。结果未知时运行挂起、不封存：登记了
-查询能力的自动按幂等键核实，没有的开核实待办（已生效并填外部单号 / 未生效重新发送 / 未生效放弃），结果未知永远
-不会自动重发。正式运行写生产环境；探索运行写测试环境，没有测试环境时演练、不发请求。有生效记录的运行不能删除。
+**Writing to external systems** — Write capabilities can only be placed in Call Tool (「调用工具」) nodes. An effect record is
+written first and then the request is sent; within one execution, the idempotency key for the n-th send is
+`{action_key}:{n}`. The confirmation card shows a masked preview and a content hash, and if anything upstream changes
+after confirmation, sending is refused. When the result is unknown, the run is suspended and not sealed: if a query
+capability is registered, the result is verified automatically by idempotency key; if not, a verification task is opened
+(took effect, fill in the external order number / didn't take effect, send again / didn't take effect, give up). A write
+whose result is unknown is never resent automatically. Formal runs write to the production environment; exploratory runs
+write to the test environment, or do a dry run without sending any request when there's no test environment. Runs with
+effect records can't be deleted.
 
-**入站钩子**　在 spec 里按名字声明（发起实例 / 回调待办），在应用编辑里生成密钥（只显示一次）。外部系统向
-`/api/hooks/{钩子 id}` 发签名请求：`X-AgentLab-Timestamp`、`X-AgentLab-Signature: sha256=HMAC-SHA256(密钥, "时间戳." + 请求体)`，
-时间窗 5 分钟，`Idempotency-Key` 必填。钩子做什么以应用当前发布版的声明为准，没发布或停用的拒收。
+**Inbound hooks** — Declared by name in the spec (start an instance / call back a task), with a secret generated in the
+app editor (shown only once). The external system sends a signed request to `/api/hooks/{钩子 id}` (the hook id):
+`X-AgentLab-Timestamp` and `X-AgentLab-Signature: sha256=HMAC-SHA256(密钥, "时间戳." + 请求体)` (密钥 = the secret, 时间戳 = the
+timestamp, 请求体 = the request body), with a 5-minute time window and a required `Idempotency-Key`. What a hook does
+follows the declaration in the app's currently published version; requests to hooks that aren't published or have been
+disabled are rejected.
 
-**按新口径补算**　固定版本升版、处置选了「按新口径重算」时，管理者可以点「按新口径补算历史」：取旧版本在同一来源上
-最近几期的输入，用新版本逐个发起正式运行（来源记为按新口径补算），同一输入算过的跳过。有外部副作用的工作流（流程、
-人工节点、写外部系统）不补算。
+**Backfill with the new caliber** — When the pinned version is bumped and the chosen disposition is Recompute with the
+new caliber (「按新口径重算」), a manager can click Backfill history with the new caliber (「按新口径补算历史」): it takes the old
+version's inputs from the most recent few periods on the same origin and starts a formal run with the new version for
+each (the origin is recorded as backfill with the new caliber), skipping inputs that have already been computed.
+Workflows with external side effects (processes, human nodes, writes to external systems) aren't backfilled.
 
-**升级安全**　流程实例可能一等几天，中间升级是常态。停在人工节点、停在写入节点开头等确认的实例，升级后都能继续；
-写入结果未知的核实后继续、不会重发；停在 Agent 半路审批的实例升级后无法继续，所以发布时 `process.wait_mid_agent`
-会提醒，应用按流程引用时直接拦下。
+**Upgrade safety** — Process instances may wait for days, so upgrading in the meantime is normal. Instances paused at a
+human node, or at the start of a write node waiting for confirmation, can all continue after an upgrade; writes with
+unknown results continue after verification and aren't resent. Instances paused at an approval in the middle of an Agent
+can't continue after an upgrade, so `process.wait_mid_agent` warns at publish time, and an app that references the
+workflow as a process is blocked outright.
 
-**填报登记与附件**　填报登记的每次提交是平台托管的记录表里的一行（`data/records/`，一个表版本一个 SQLite 文件，
-只许追加）：写入只经「调用工具」节点的平台能力 `records_append`，同一次提交只落一行；更正是追加一行并指向原行，原行
-不改，更正的那一行仍记原提交人（他照样看得见），动手更正的人记进动作记录和审计。看板用 `db_query__<记录表>` 查，
-一次运行只看得到开始时已有的记录；使用者逐行只看得到自己提交的（「记录列表」组件），正式运行的汇总是全量的。
-表单只加可选字段时同一版本加列，改类型、删字段、加必填字段出新版本，旧记录照原样保留：看板查新一版时，
-旧版本只读并进同一张 `records`（旧版本没有的字段、类型改得对不上的字段为空），各版本都按运行
-开始时的记录固定；新一版发布之前已经发起、还在半路的实例照常写完旧版本，之后发起的只写新一版。记录表的写入全站一个接一个
-（多进程时是库里的锁），面向人工填报的频率，不适合每秒多次的高频写入。表单里的附件先上传（`data/files/`，按内容哈希存、只读）、提交时绑到
-这次运行，读得到那次运行或那一行记录的人才能下载；上传后 24 小时没提交的自动清理。
+**Form submissions and attachments** — Each form submission is one row in a record table managed by the platform
+(`data/records/`; one SQLite file per table version, append-only): writes go only through the platform capability
+`records_append` of a Call Tool node, and one submission lands as exactly one row; a correction appends a new row that
+points at the original row, leaving the original unchanged, and the correcting row still records the original submitter
+(who can still see it), while the person who made the correction is recorded in the action record and the audit log.
+Dashboards query with `db_query__<记录表>` (the record table's name), and a run sees only the records that existed when it
+started; users see, row by row, only what they submitted themselves (the Record List (「记录列表」) component), while
+summaries in formal runs cover everything. When a form only adds optional fields, columns are added within the same
+version; changing a type, deleting a field, or adding a required field produces a new version, and old records are kept
+as they are: when a dashboard queries the new version, old versions are read-only and are merged into the same `records`
+table (fields the old version lacks, or whose type changed incompatibly, are null), and every version is fixed to the
+records as of the run's start; instances started before the new version was published and still in progress finish
+writing to the old version, and those started afterwards write only to the new one. Writes to record tables are
+serialized site-wide (a lock in the database when running multiple processes), sized for the pace of manual data entry
+and not suited to high-frequency writes many times per second. Attachments in forms are uploaded first (`data/files/`,
+stored by content hash, read-only) and bound to the run on submission, and only people who can read that run or that
+record row can download them; uploads not submitted within 24 hours are cleaned up automatically.
 
-**验收用的假外部系统**：`python scripts/fake-erp.py --port 8765`，可以切换「正常 / 写成功后超时 / 500 / 4xx」，接口见
-脚本开头。
+**A fake external system for acceptance testing**: `python scripts/fake-erp.py --port 8765`, which can switch between
+"normal / time out after a successful write / 500 / 4xx"; its API is described at the top of the script.
 
-### 分享链接
+### Share Links
 
-要给没有账号的人看一个看板时，用分享链接：管理员先在「设置 → 偏好设置」的「应用」一节打开「允许建分享链接」（缺省关），
-再由能管理这个应用的人在应用编辑的「岗位与授权」里建。
+To show a dashboard to people who don't have an account, use a share link: an admin first turns on Allow creating share
+links (「允许建分享链接」, off by default) in the Apps (「应用」) section of Settings → Preferences (「设置 → 偏好设置」), and then someone
+who can manage the app creates one under Positions & Grants (「岗位与授权」) in the app editor.
 
-- **看什么**：只看定时出数的视图（最近一次封存的正式运行）。可选「始终最新」或「固定这一期」（建分享时的那一期）；按需视图、实例、
-  入口表单不显示，也不会因为有人打开而发起运行。流程组件、报告正文换成说明块，正文和出处在「下载报告」里。
-- **链接**：`/s#<key>`，key 在 `#` 后面，不进服务器日志、不随 Referer 带出去；库里只存哈希。到期必填，最长 90 天，可撤销；
-  撤销、到期、应用不再发布时打开回 410 并写明原因。管理员关掉开关后，已有的分享链接也一并打不开。
-- **嵌入**：分享页允许被哪些站点嵌由 `AGENTLAB_EMBED_ORIGINS` 定；建分享时没勾「允许嵌入到别的站点」的那一条，在 iframe 里不显示内容。
-  同站的门户（同一个可注册域名下）要嵌整站时用 `AGENTLAB_FRAME_ANCESTORS`，登录照常；跨站的门户嵌整站不支持（浏览器不把会话
-  cookie 带进跨站的 iframe），请用分享链接。
-- **留痕**：建、撤销写审计，打开只计次数；访问密钥调不了分享接口。
+- **What it shows**: only views fed by schedules (the latest sealed formal run). Choose Always latest (「始终最新」) or Pin
+  this period (「固定这一期」, the period that was current when the share was created); on-demand views, instances, and entry
+  forms aren't shown, and someone opening the link never starts a run. Process components and report bodies are replaced
+  with explanation blocks; the body and provenance are in Download report (「下载报告」).
+- **Link**: `/s#<key>` — the key comes after `#`, so it never enters server logs and isn't sent out in the Referer
+  header; the database stores only its hash. An expiry is required, at most 90 days, and links can be revoked; when a
+  link is revoked or expired, or the app is no longer published, opening it returns 410 with the reason stated. Once an
+  admin turns the switch off, existing share links stop opening too.
+- **Embedding**: which sites may embed share pages is set by `AGENTLAB_EMBED_ORIGINS`; a share created without ticking
+  Allow embedding in other sites (「允许嵌入到别的站点」) shows no content inside an iframe. A same-site portal (under the same
+  registrable domain) that wants to embed the whole site uses `AGENTLAB_FRAME_ANCESTORS`, with login working as usual;
+  embedding the whole site in a cross-site portal isn't supported (browsers don't send the session cookie into a
+  cross-site iframe) — use share links instead.
+- **Audit trail**: creating and revoking are written to the audit log, and opens are only counted; access keys can't
+  call the share API.
 
-## 身份与权限
+## Identity and Permissions
 
-三种登录方式，环境变量 `AGENTLAB_AUTH_MODE`（`off` / `local` / `oidc`）优先于「设置 → 身份」：
+There are three login modes, and the environment variable `AGENTLAB_AUTH_MODE` (`off` / `local` / `oidc`) takes
+precedence over Settings → Identity (「设置 → 身份」):
 
-- **off**（默认）：即以前的行为。`X-Actor` 自报署名，所有人等同管理员，应用首页上写明这一点。
-- **local**：用户名 + 密码（`hashlib.scrypt`）。从未开启切过来时，必须在同一次保存里建出第一个管理员；环境变量
-  直接指定 `local` 的新部署，在登录页建第一个管理员（只在还没有管理员时可用）。
-- **oidc**：通用 OIDC，授权码 + PKCE；飞书、企业微信这类非标准协议暂不支持。要配身份提供方地址、客户端标识和密钥，
-  至少配一个管理员映射（管理员用户名或管理员组）。每次登录按映射重算角色，`groups` 声明同步成只读的组。回调地址是
-  `<对外地址>/api/auth/oidc/callback`，在反向代理后面时设 `AGENTLAB_PUBLIC_URL`。
+- **off** (default): the previous behavior. `X-Actor` carries a self-reported name, everyone is equivalent to an admin,
+  and the app home page says so.
+- **local**: username + password (`hashlib.scrypt`). When switching to it from a deployment where login was never on,
+  the first admin must be created in the same save; for a new deployment whose environment variable specifies `local`
+  directly, the first admin is created on the login page (available only while there's no admin yet).
+- **oidc**: generic OIDC, authorization code + PKCE; non-standard protocols such as Feishu and WeCom aren't supported
+  for now. Configure the identity provider's address, the client ID and secret, and at least one admin mapping (an admin
+  username or admin group). Roles are recomputed from the mapping at every login, and the `groups` claim is synced into
+  read-only groups. The callback URL is `<对外地址>/api/auth/oidc/callback` (`<对外地址>` is the public URL); behind a reverse
+  proxy, set `AGENTLAB_PUBLIC_URL`.
 
-会话放在 HttpOnly、SameSite=Lax 的 cookie 里，库里只存 token 的哈希；闲置 12 小时、最长 7 天过期
-（`AGENTLAB_AUTH_SESSION_IDLE_HOURS`、`AGENTLAB_AUTH_SESSION_MAX_DAYS`），是否带 Secure 按请求是不是 https 决定
-（`AGENTLAB_AUTH_COOKIE_SECURE` 可强制）。开了登录后，非 GET 请求必须带 `X-AgentLab-Request` 头；带了 `Origin`
-的，必须是本站或 `AGENTLAB_CORS_ORIGINS` 里的地址。登录连续失败后等待时间逐次增加。
+Sessions live in an HttpOnly, SameSite=Lax cookie, and the database stores only the token's hash; they expire after 12
+hours idle or after 7 days at most (`AGENTLAB_AUTH_SESSION_IDLE_HOURS`, `AGENTLAB_AUTH_SESSION_MAX_DAYS`), and whether
+the cookie carries Secure depends on whether the request is https (`AGENTLAB_AUTH_COOKIE_SECURE` can force it). With
+login on, non-GET requests must carry the `X-AgentLab-Request` header, and requests with an `Origin` must come from this
+site or from an address in `AGENTLAB_CORS_ORIGINS`. After consecutive failed logins, the wait time grows each time.
 
-忘了密码、单点登录配错时，在服务器上执行：
+If you forget the password or misconfigure single sign-on, run this on the server:
 
 ```bash
-cd backend && python -m app.auth reset-admin --username admin   # 不给 --password 时随机生成并打印一次
+cd backend && python -m app.auth reset-admin --username admin   # without --password, a random one is generated and printed once
 ```
 
-**角色**：管理员 ⊇ 搭建者 ⊇ 使用者。应用另有三档授权：使用、查看全部实例、管理（授给使用者的「管理」按「查看全部
-实例」算）。搭建者绑定岗位、授权时从只读的人员名录（`GET /api/directory`：用户名、显示名、是否停用、组名）里选，
-名录里没有的、停用了的名字不让添加；单点登录的人和组第一次登录后才进名录，没进名录的要确认后才添加。开了登录后，
-发布、发起、数据导入的确认一律记登录的人，界面上不再有署名框。
+**Roles**: admin ⊇ builder ⊇ user. Apps additionally have three grant levels: Use (「使用」), View all instances (「查看全部实例」),
+and Manage (「管理」) (Manage granted to a user counts as View all instances). When builders bind positions and grant
+access, they choose from a read-only people directory (`GET /api/directory`: username, display name, whether disabled,
+group names), and names not in the directory or disabled can't be added; single-sign-on people and groups enter the
+directory only after their first login, and those not yet in it can be added only after confirmation. With login on,
+confirmations of publishing, starting runs, and data imports are always recorded as the logged-in person, and the
+interface no longer has a name field.
 
-| 能做的事 | 管理员 | 搭建者 | 使用者 |
+| What you can do | Admin | Builder | User |
 |---|---|---|---|
-| 问数据、助手 | ✓ | ✓ | 默认不能，管理员可在「设置 → 身份」开启 |
-| 编排、探索运行、以已发布级发布、数据源、数据目录、定时任务、知识库、自定义工具 | ✓ | ✓ | ✗ |
-| 以受管级发布、把受管工作流降为已发布、版本退役 | ✓ | ✗ | ✗ |
-| 记录页、运行的实时推送 | ✓（别人的个人应用除外） | ✓（别人的个人应用除外） | 只限自己的问数据运行 |
-| MCP 的 stdio、端点和凭据、能力治理、模型接入 | ✓ | 只读 | ✗ |
-| 应用：使用 / 查看全部实例 / 搭建发布 | ✓ | 能用能看；管理要创建者或有管理授权 | 按授权使用、查看 |
-| 共享蓝图：读、改、试运行、出发布单 | ✓ | 自己建的、自己管理的应用出自的 | ✗ |
-| 建个人应用、刷新、提交审核 | ✓ | ✓ | 默认不能，管理员可在「设置 → 应用」开启 |
-| 别人的个人应用：名称、拥有者、创建和更新时间，归档 | ✓ | ✗ | ✗ |
-| 别人的个人应用：页面、刷新和试运行的运行、证据、附件、蓝图 | ✗ | ✗ | ✗ |
-| 处理派给自己的待办、核实动作 | ✓ | ✓ | ✓ |
-| 用户、组、登录方式、审计 | ✓ | ✗ | ✗ |
+| Ask Data (「问数据」), Copilot (「助手」) | ✓ | ✓ | Not by default; an admin can enable it in Settings → Identity (「设置 → 身份」) |
+| Orchestration, exploratory runs, publishing at the published level, data sources, data catalog, schedules, knowledge base, custom tools | ✓ | ✓ | ✗ |
+| Publishing at the governed level, demoting a governed workflow to published, retiring versions | ✓ | ✗ | ✗ |
+| Records page (「记录」), live run streaming | ✓ (except other people's personal apps) | ✓ (except other people's personal apps) | Only their own Ask Data runs |
+| MCP stdio, endpoints and credentials, capability governance, model access | ✓ | Read-only | ✗ |
+| Apps: use / view all instances / build and publish | ✓ | Can use and view; managing requires being the creator or having a Manage grant | Use and view per grants |
+| Shared blueprints: read, edit, trial run, create publish plans | ✓ | Ones they created, and ones that come from apps they manage | ✗ |
+| Create personal apps, refresh, submit for review | ✓ | ✓ | Not by default; an admin can enable it in Settings → Apps (「设置 → 应用」) |
+| Other people's personal apps: name, owner, created and updated times, archiving | ✓ | ✗ | ✗ |
+| Other people's personal apps: pages, refresh and trial-run runs, evidence, attachments, blueprints | ✗ | ✗ | ✗ |
+| Handle tasks assigned to oneself, verify actions | ✓ | ✓ | ✓ |
+| Users, groups, login modes, audit | ✓ | ✗ | ✗ |
 
-**使用者的问数据**（管理员开启后）只能发起探索运行：图里只许输入、模型调用、Agent、报告撰写、成果、知识检索、
-数据整形、条件分支、口径卡、合并查询、调用工具；Agent 和调用工具节点都只能用数据源查询和只读的内置工具；查询结果在
-工具边界先遮、数据源一律只读（调用工具节点和 Agent 走同一道），能力治理里改成写入的工具也不执行；记忆范围固定为
-自己的。对话按建立人隔离。
+**Ask Data for users** (once an admin enables it) can only start exploratory runs: the graph may contain only input, LLM
+call, Agent, report writer, output, knowledge retrieval, data shaping, conditional branch, caliber card, merge query,
+and Call Tool (「调用工具」); Agent and Call Tool nodes can only use data source queries and read-only built-in tools; query
+results are masked at the tool boundary first, and data sources are always read-only (Call Tool nodes and Agents go
+through the same gate), and tools changed to write in capability governance aren't executed either; the memory scope is
+fixed to their own. Conversations are isolated by the person who created them.
 
-**个人应用**：在蓝图上「存成我的应用」，只给拥有者自己看；使用者要管理员在「设置 → 应用」里开启。图和使用者的问数据
-同一份白名单，周期看板、异常处置（只看清单）这些模板的取数节点就是查数据源的调用工具节点；每次刷新是一次探索运行，
-查询结果在工具边界先遮、数据源一律只读，和按需视图共用每人每天的次数上限。刷新和个人蓝图的试运行只有拥有者读得到：
-管理员、搭建者也看不到这些运行、证据、工件和附件，运行列表里不列。管理员在应用列表里只看得到名称、拥有者、创建和
-更新时间，可以归档，看不到页面和蓝图。个人应用没有入口表单，刷新不带附件；要随表单交附件的，请提交审核，由搭建者
-做成正式应用。
+**Personal apps**: Save as My App (「存成我的应用」) on a blueprint makes an app that only its owner sees; for users, an admin
+has to enable this in Settings → Apps (「设置 → 应用」). The graph uses the same allowlist as Ask Data for users, and the
+data-fetch nodes of templates such as Periodic Dashboard (「周期看板」) and Exception Handling (list only) (「异常处置（只看清单）」) are
+simply Call Tool nodes that query data sources; every refresh is an exploratory run, query results are masked at the
+tool boundary first, data sources are always read-only, and refreshes share a per-person daily cap with on-demand views.
+Only the owner can read refreshes and trial runs of personal blueprints: admins and builders can't see these runs,
+evidence, artifacts, or attachments either, and they aren't listed in run lists. In the app list, admins see only the
+name, owner, and created and updated times, and can archive, but can't see pages or blueprints. Personal apps have no
+entry form, and refreshes carry no attachments; if attachments need to be submitted along with a form, submit it for
+review so that a builder can turn it into a regular app.
 
-**哪些角色看得到原值**：数据源设置的遮罩列，对开了登录的使用者是边界——查询快照按派生遮罩处理后才给，工具快照的
-原文、运行事件里的结果预览一律不给，工件按白名单给。对搭建者、管理员，以及未开启登录时的所有人，遮罩只减少暴露，
-完整快照仍能按工件 id 取到。管理类操作（登录方式、用户和角色、组、端点、能力治理、应用发布、版本退役）写进审计。
+**Which roles can see raw values**: the masked columns set on a data source are a boundary for users when login is on —
+query snapshots are given only after derived masking is applied, raw tool snapshots and result previews in run events
+are never given, and artifacts are given per an allowlist. For builders, admins, and everyone when login is off, masking
+only reduces exposure, and full snapshots can still be fetched by artifact id. Administrative operations (login modes,
+users and roles, groups, endpoints, capability governance, app publishing, version retirement) are written to the audit
+log.
 
-### 访问密钥
+### Access Keys
 
-外部系统（门户、OA、BI）用访问密钥调接口，只在开了登录时生效：
+External systems (portals, OA, BI) call the API with access keys, which take effect only when login is on:
 
-- **谁能持有**：服务账号（管理员在「设置 → 访问密钥」建，`svc-` 开头，没有口令、不能登录、不能被派待办）；个人访问密钥
-  要管理员打开开关（缺省关），本人在同一页建。密钥只在建、轮换时显示一次，库里只存哈希；到期必填（最长 365 天，缺省 90 天），
-  轮换时旧钥 24 小时后到期，撤销立刻失效，拥有者停用后一并失效。
-- **能做什么**：一律按使用者的权限算——只看得到授权给拥有者（或所在组、所有人）的应用，看到的数据一律遮罩，管理员的密钥也
-  一样。权限按接口白名单给（读应用和视图、发起入口、刷新视图、读待办、回复待办、读报告；新建时缺省只勾读的），白名单外的
-  接口一律 403。发起入口、刷新视图必须带 `Idempotency-Key`，外部系统超时重发不会多发起一个。回复待办只给个人密钥，只限审批、
-  补充输入、编辑稿件。每把密钥每分钟 120 次。
-- **留痕**：建、撤销、轮换、开关都写审计；每次请求记一条（保留 90 天）；用密钥发起的运行在 `run.origin` 里记是哪把密钥。
-- **视图数据**：`GET /api/apps/{app_id}/views/{view_id}/data` 给印章、清单哈希和口径卡指标的原值（遮罩的为 `null`），可以拿
-  清单哈希去对照可验证报告。完整的接口清单和错误码在「设置 → 访问密钥 → 接口说明」。
+- **Who can hold one**: service accounts (created by an admin under Settings → Access Keys (「设置 → 访问密钥」), starting with
+  `svc-`, with no password, unable to log in, and unable to be assigned tasks); personal access keys require an admin to
+  turn on a switch (off by default), after which people create their own on the same page. A key is shown only once,
+  when it's created or rotated, and the database stores only its hash; an expiry is required (at most 365 days, default
+  90 days). On rotation the old key expires after 24 hours, revocation takes effect immediately, and keys stop working
+  once their owner is disabled.
+- **What it can do**: always evaluated with the user role's permissions — it sees only apps granted to the owner (or to
+  their groups, or to everyone), and the data it sees is always masked, even for an admin's key. Permissions are granted
+  per an API allowlist (read apps and views, start entries, refresh views, read tasks, reply to tasks, read reports; a
+  new key has only the read permissions ticked by default), and APIs outside the allowlist always return 403. Starting
+  entries and refreshing views require an `Idempotency-Key`, so an external system retrying after a timeout won't start
+  an extra one. Replying to tasks is only for personal keys, and only for approvals, supplementary input, and draft
+  editing. Each key is limited to 120 requests per minute.
+- **Audit trail**: creating, revoking, rotating, and toggling are all written to the audit log; every request is logged
+  (kept for 90 days); runs started with a key record which key in `run.origin`.
+- **View data**: `GET /api/apps/{app_id}/views/{view_id}/data` returns the stamp, the manifest hash, and the raw values
+  of the caliber card metrics (masked ones are `null`), and you can check the manifest hash against the verifiable
+  report. The full API list and error codes are under Settings → Access Keys → API Reference (「设置 → 访问密钥 → 接口说明」).
 
 ```bash
 curl -H "Authorization: Bearer agl_…" https://agentlab.example/api/auth/me
@@ -592,186 +855,251 @@ curl -H "Authorization: Bearer agl_…" -H "Idempotency-Key: order-20261016-001"
      https://agentlab.example/api/apps/<app_id>/entries/<entry_id>
 ```
 
-## 能力登记与端点
+## Capability Registry and Endpoints
 
-「工具 → 能力」把内置工具、数据源、自定义工具、MCP 工具登记在一处，名字就是图里的工具名。启动时和各对象增删改时
-自动同步，来源删掉的标为「缺失」，不删除。管理员可以逐项治理：效果（只读 / 写入 / 视参数而定）、审批（跟随信任
-设置 / 总要确认 / 免审批）、是否允许无人值守写入、返回的表格位置、字段语义（形状和数据目录的「项」相同，推断的项
-进「待审阅」）、遮罩字段、凭据模式、查询能力。每改一次版本号加一，正式运行在发起时固定下来，发布时记下版本，
-之后有变化只提醒。
+Tools → Capabilities (「工具 → 能力」) registers built-in tools, data sources, custom tools, and MCP tools in one place, and
+each name is the tool name used in graphs. It syncs automatically at startup and whenever an object is created, updated,
+or deleted; when the source is deleted, the entry is marked "Missing" (「缺失」) rather than deleted. Admins can govern each
+entry: effect (read-only / write / depends on arguments), approval (follow trust settings / always confirm / no
+approval), whether unattended writes are allowed, where the returned table is located, field semantics (shaped like the
+data catalog's "items", with inferred items going to Pending review (「待审阅」)), masked fields, credential mode, and query
+capability. Every change increments the version number; a formal run pins it when started, publishing records the
+version, and later changes only trigger a reminder.
 
-- **正式运行免审批**：声明为只读、审批设为免审批的能力，在正式运行里直接执行，带 MCP、自定义工具的 Agent 不再停在
-  半路等审批。可写数据源上的写语句不会因为一句声明而免审批。
-- **写入能力只能放在「调用工具」节点里**：Agent、多 Agent 协作的工具清单里有写入能力时，发布检查各级都报错，运行时
-  也拒绝。工具页的试运行、工具库执行碰到写入能力一律演练：不发送，交回将要发送的方法、地址、请求头名和请求体。
-  试运行没保存的草稿时，请求按草稿的配置拼，读写按已保存的治理和草稿的方法里更严的一个认。试运行和端点的测试连接按 HTTP 状态说成败：2xx 才算成功，能连上但回 404、401 的照实写状态码。查询能力只能选同一
-  端点上、绑定这个端点的只读能力。
-- **登记的端点**：管理员按测试、生产两个环境登记外部系统的地址和认证头。只有登记过、开了「允许访问内网」的端点能连
-  内网。绑定端点的 HTTP 工具只填方法、路径模板、查询参数和请求体，路径参数逐段编码代入，模型拿不到任意地址，不跟随
-  跳转。正式运行走生产环境；探索运行里写入走测试环境（没有就演练），读取走生产环境。凭据模式选「服务凭据 + 身份
-  断言」时，请求另带 `X-AgentLab-Assertion`（EdDSA JWT，5 分钟有效，`aud` 是端点名，`sub` 是运行发起人，确认动作
-  的人在 `act` 里），公钥在 `/api/auth/jwks`。
-- **端点读取可以作证**：给只读的绑定端点工具声明了表格（行的位置、各列的位置）后，结果落成和查询快照形状相同的
-  端点快照：报告里照样编号 Q1…、单元格点得开出处，运行对比照样比（比的是请求），遮罩按列名。Python 工具和 MCP
-  不在此列。
+- **No approval in formal runs**: capabilities declared read-only with approval set to no approval execute directly in
+  formal runs, so Agents with MCP or custom tools no longer stop halfway to wait for approval. Write statements on a
+  writable data source don't skip approval just because of a declaration.
+- **Write capabilities can only be placed in Call Tool (「调用工具」) nodes**: when the tool list of an Agent or of a
+  multi-agent collaboration includes a write capability, the pre-publish check reports an error at every level, and the
+  runtime refuses it too. Trial runs on the Tools page and executions from the tool library always do a dry run when
+  they hit a write capability: nothing is sent, and the method, URL, header names, and body that would have been sent
+  are returned. When trial-running an unsaved draft, the request is assembled from the draft's configuration, and read
+  vs. write is decided by whichever is stricter of the saved governance and the draft's method. Trial runs and endpoint
+  test connections report success or failure by HTTP status: only 2xx counts as success, and when the connection works
+  but returns 404 or 401, the status code is reported as it is. A query capability can only be a read-only capability on
+  the same endpoint and bound to that endpoint.
+- **Registered endpoints**: admins register external systems' addresses and auth headers for two environments, test and
+  production. Only endpoints that are registered and have Allow internal network access (「允许访问内网」) turned on can reach
+  the internal network. HTTP tools bound to an endpoint fill in only the method, path template, query parameters, and
+  body; path parameters are encoded segment by segment when substituted, the model can't get at arbitrary addresses, and
+  redirects aren't followed. Formal runs go to the production environment; in exploratory runs, writes go to the test
+  environment (a dry run if there isn't one), and reads go to production. When the credential mode is Service credential +
+  identity assertion (「服务凭据 + 身份断言」), requests additionally carry `X-AgentLab-Assertion` (an EdDSA JWT valid for 5
+  minutes; `aud` is the endpoint name, `sub` is the run's initiator, and the person who confirmed the action is in
+  `act`); the public key is at `/api/auth/jwks`.
+- **Endpoint reads can serve as evidence**: once a read-only, endpoint-bound tool declares a table (where the rows are
+  and where each column is), its results land as endpoint snapshots shaped like query snapshots: reports number them Q1…
+  as usual, cells open to their provenance, run comparison compares them as usual (it compares the requests), and
+  masking goes by column name. Python tools and MCP aren't included.
 
-## 数据目录：让助手和 agent 看懂业务数据
+## Data Catalog: Helping Copilot and Agents Understand Business Data
 
-表名和字段名说不清业务：一行代表一张门票还是一次检票，`visitor_count` 能不能按天相加，两张表按哪一列连、
-连上之后会不会一对多。助手（Copilot）建图、agent 写 SQL 时只能猜，猜错了查询照样能跑，数却是错的。
-数据目录把这些事实记下来，交给三处读：
+Table and field names don't explain the business: does a row stand for a ticket or for one ticket check, can
+`visitor_count` be summed by day, which column joins two tables, and will the join turn one-to-many? When Copilot (「助手」)
+builds graphs and agents write SQL, they can only guess, and when the guess is wrong the query still runs, but the
+numbers are wrong. The data catalog records these facts and hands them to three readers:
 
-- **助手建图**：system 里每个库一行概览（表数、几张有目录、有没有遮罩），不列表名、不列字段。助手要看表时自己
-  「查看」，服务端一次给齐（见[助手按需查看](#助手按需查看)）。
-- **运行时查结构**：`db_schema` 返回表结构时附上目录。**遮罩列只给列名和类型**：它的注释、目录里这一列的中文名、
-  码值和说明都不交给模型。助手查看、`db_schema`、`/api/datasources/{id}/schema?table=` 是同一份说法
-  （`data/schema_view.py`）；代价是运行时 agent 看到的目录少了遮罩列那部分。
-- **SQL 检查**：按目录检查七类问题——一对多关联后重复计算、存量跨时间相加、比率被相加或平均、漏了有效记录条件、
-  码值不存在、没用约定的业务日期、关联条件对不上已知关系。助手自查时交回修正，受管模板发布时挡住，运行时标在
-  查询快照上，契约指标的来源查询有错误时出具降档。解析不了的写法一律跳过：宁可漏报，不误报。
+- **Copilot graph building**: the system prompt has a one-line overview per database (number of tables, how many have
+  catalog entries, whether there's masking), listing neither table names nor fields. When Copilot needs to see a table
+  it "looks" (「查看」) for itself, and the server provides everything at once (see
+  [Copilot Looks On Demand](#copilot-looks-on-demand)).
+- **Schema lookups at run time**: `db_schema` attaches the catalog when it returns a table's schema.
+  **Masked columns get only their name and type**: their comment, and the catalog's Chinese name, code values, and
+  description for that column, are not given to the model. Copilot's looks, `db_schema`, and
+  `/api/datasources/{id}/schema?table=` share one description (`data/schema_view.py`); the cost is that the catalog
+  agents see at run time lacks the masked-column part.
+- **SQL checks**: seven kinds of problems are checked against the catalog — double counting after a one-to-many join,
+  summing stocks across time, adding or averaging ratios, a missing valid-record condition, nonexistent code values, not
+  using the agreed business date, and join conditions that don't match known relationships. They're sent back for
+  correction during Copilot's self-check, block publishing of governed templates, are flagged on query snapshots at run
+  time, and downgrade the issuance when the source query of a contract metric has errors. Syntax that can't be parsed is
+  always skipped: better to miss a problem than to raise a false alarm.
 
-目录里每一项都带来源和状态。来源是数据库注释、外键、命名推断、数据剖析、模型起草或人工；状态是推断、已验证、
-已确认或已驳回。推断的项只作提示，已验证、已确认的才进入错误级检查；驳回的项保留编号，不会被下一次起草或
-推断带回来。
+Every catalog item carries a source and a status. The source is a database comment, a foreign key, naming inference,
+data profiling, model drafting, or a person; the status is inferred, verified, confirmed, or rejected. Inferred items
+are only hints, and only verified and confirmed items feed error-level checks; rejected items keep their ids and won't
+be brought back by the next drafting or inference.
 
-| 环节 | 做法 |
+| Stage | How it works |
 |---|---|
-| 起草 | 探查时读外键和唯一约束；按 `xxx_id`、`xxxId` 推断关联，表名带业务前缀的也认；可选让模型起草中文名、粒度、表类型、业务主键、业务日期和每列的含义、单位、度量类型。导入表格的源已有系统按核对结果生成的说明，目录不重复、不改写它 |
-| 模型起草 | 作为后台任务逐表进行，每张表记下状态和原因，写完一张就并入目录，宽表每写完一段就并入；关掉对话框不停，可以停止、只重试失败的表，清单上标出上次起草失败或只完成一部分的表。停止、服务重启时已经写进目录的段保留；服务重启时没跑完的任务标成中断，不会自己续跑，点重试重新起草这些表（已写进的不会丢）。不设总时长上限，靠止损和手动停止：最近 10 次调用有 7 次没写出来时后面的段不再拆小，同一张表接连 3 段都没写出来就跳过它剩下的段。保留模型的思考，输出额度 32768（服务方不收时退回 8192）；每次调用最多 40 列，宽表先起草表级的项、再把列均分成几段起草，按表的先后排队，不插到窄表前面；额度用完或超时就拆小再问（超时的两半同时问，拆到每段 10 列仍接连超时就不再拆），累计两次后新开始的段减半（最低 10 列），每段连同它分开、拆小的各块最多调用 8 次，进度上看得到段被分成了几块，缺的表和列只补问缺的，被截断的回复先留下已经写完整的部分；最近 6 次调用有 4 次没写出来时提醒换模型。没写出来的原因写清是第几段、哪几列，「已拆小重试」只跟在真拆过的段后面。同步起草和后台任务互斥。重新起草时模型这次留空或没通过校验的项不删以前起草的；模型拿不准、留空的列（目录里还没有中文名和含义的）逐表记下，可以补充起草要求后重起草。库注释就是表名、列名本身或者是标识符写法的，不记进目录（不当中文名，也不当说明、含义）。数据源上存的「起草要求」和这次的补充说明一起交给模型，帮它理解业务、统一用词，不能推翻「只记数据事实」的规矩，交回的内容照样逐项校验。用哪个模型在「设置 → 偏好设置」的「起草模型」里选，空着跟随助手的模型；按配方导入表格的 AI 起草也用它 |
-| 防错事实的提议 | 模型起草时另提议「有效记录条件」（一段 SQL 条件）和「去重规则」，各带依据；开了剖析的源把目录里的码值一起交给模型（遮罩列不给）。条件按数据源方言用 sqlglot 解析，只能引用这张表的列，不能有子查询、聚合、窗口函数，只允许几个常用函数，不过就不收（逐表说明里写原因）；开了剖析的源上经只读守卫数出排除比例，排除 0% 或 100% 的不收，收下的在说明里写「剖析核对：排除 x% 的行」。这些都记为推断，SQL 检查的错误级规则只认人确认过的，提议在审阅队列里排在前面 |
-| 审阅队列 | 只列推断的项，按「表被运行用到的次数 × 这一项多影响数字 × 来源」排序：有效记录条件、去重规则、业务日期、关联关系最前，业务主键、度量类型次之，中文名、含义、单位靠后，每项写明排在这里的理由；按类别和表筛选，多选批量确认、驳回或撤销审阅（逐表乐观锁，冲突逐条标出）；看得到一张表被哪些运行用过，以及常用表、全部和影响数字的项各确认了多少 |
-| 表助手 | 表详情页里和助手对话完善这一张表：它看得到表结构、目录现状（每项的来源和状态）、关联关系、剖析结果、起草要求和上次起草留空的列（遮罩列只给列名），按你的指示成批提出修改，每项带改前、改后和依据（照目录的校验：公式不收、列名要在表结构里），拿不准的会反过来问你；只在开了剖析的源上经只读守卫跑查询核实（每次请求最多 5 条，结果先遮）。提案攒在「待保存的修改」里，确认后一次保存（一次最多 200 项），记为人工确认，每项的依据另存为这一项「确认时的依据」（和备注分开，表详情里看得到；撤销审阅回到推断时去掉）。对话不存服务端，只改目录、不碰业务库 |
-| 导出与导入 | 导出成一个 JSON 文件（全部表的目录、各项状态和起草要求），在另一个实例或数据源上导入：先预览哪些表、列对得上，每一项会新增、更新还是保留，冲突和跳过的逐条列出；人确认、驳回过的项照带，目标里已经确认过而值不同的保留目标、记成冲突，文件里推断的项只填空缺，表结构里没有的列跳过并写原因；有起草或剖析在进行时不能导入。起草要求只在目标没有时写入 |
-| 数据剖析 | 默认关闭，按数据源开启。作为后台任务逐表进行：每张表看得到检查项进度、查询数、用时和正在核对哪一项，关掉对话框不停，可以停止、只重试没做完的表；服务重启时没跑完的任务标成中断，不会自己续跑。预算按表算（缺省每张表最多 40 条查询、60 秒），一张表用完只停它自己，下一张照样满额；整次不设上限，靠止损和手动停止：连续 3 条查询失败，或最近 10 条有 7 条超时就停，不给业务库加压。查询一条一条发、只读、经过守卫，大表用统计信息估算行数，遮罩的列不取样；发过的每条查询都留痕（取值换成「?」，抽到的键值不进 AgentLab 的库）。抽样核实推断出的关联，补上覆盖率和基数，站得住的升为已验证；状态列给出码值候选，含义等人填写。缺省剖析「需要剖析的表」：从没剖析过、上次没做完，或之后又出现了待核实关联、新的码值或日期列的；同一个数据源上起草和剖析排队串行，范围在开始剖析时按当时的目录定，所以起草完接着点剖析就行。表清单有「剖析」一列，表详情有上次剖析的结果 |
-| 对话里纠正 | 用户说「status=9 表示作废」，助手给出一条目录修改提案，列出改前、改后和理由，人确认后才保存，理由记为这一项的「确认时的依据」；公式不收，留给口径卡 |
-| 版本与提醒 | 目录随表结构快照冻结进证据，每次运行用的是哪一版查得到。发布时记下模板引用的表的目录版本，正式运行时目录有变化就提醒；agent 运行时才写 SQL 的，按「可能涉及」单独提醒。只提醒，不拦运行 |
+| Drafting | During introspection, reads foreign keys and unique constraints; infers relationships from `xxx_id` and `xxxId`, including when table names carry a business prefix; optionally lets the model draft the Chinese name, grain, table kind, business key, business date, and each column's meaning, unit, and measure type. For sources from imported spreadsheets, the system already generates notes from the verification results, and the catalog neither duplicates nor rewrites them |
+| Model drafting | Runs as a background job, table by table; each table records its status and reason and is merged into the catalog as soon as it's written, and wide tables are merged after each segment; closing the dialog doesn't stop it, you can stop it or retry only the failed tables, and the list marks tables whose last drafting failed or only partly completed. On stop or service restart, segments already written into the catalog are kept; on service restart, unfinished jobs are marked interrupted and don't resume by themselves — click Retry (「重试」) to redraft those tables (what was already written isn't lost). There's no overall time limit; it relies on stop-loss rules and manual stopping: when 7 of the last 10 calls produced nothing, later segments are no longer split smaller, and when 3 consecutive segments of the same table produced nothing, the rest of that table's segments are skipped. The model's thinking is kept, with an output budget of 32768 (falling back to 8192 when the provider won't accept it); each call covers at most 40 columns, and for wide tables the table-level items are drafted first, then the columns are split evenly into several segments, queued in table order without jumping ahead of narrow tables; when the budget runs out or a call times out, the segment is split smaller and asked again (both halves of a timed-out segment are asked at the same time, and once it's down to 10 columns per segment and still timing out repeatedly, it's not split any further); after two such occurrences in total, newly started segments are halved (minimum 10 columns); each segment, together with the pieces it was divided or split into, gets at most 8 calls, and progress shows how many pieces a segment was divided into; for missing tables and columns, only the missing ones are asked again, and from a truncated reply the fully written part is kept first; when 4 of the last 6 calls produced nothing, it suggests switching models. When something wasn't produced, the reason states which segment and which columns, and "Split and retried" (「已拆小重试」) appears only after segments that really were split. Synchronous drafting and background jobs are mutually exclusive. When redrafting, items the model left empty this time, or that failed validation, don't delete what was drafted before; columns the model was unsure about and left empty (ones the catalog doesn't have a Chinese name and meaning for yet) are recorded per table, and you can add drafting instructions and redraft. Database comments that are just the table or column name itself, or that are written in identifier style, aren't recorded in the catalog (neither as the Chinese name nor as a description or meaning). The drafting instructions (「起草要求」) stored on the data source are given to the model together with this run's additional notes, to help it understand the business and keep terms consistent; they can't override the "record only data facts" rule, and what comes back is still validated item by item. Choose the model under Drafting model (「起草模型」) in Settings → Preferences (「设置 → 偏好设置」); left empty, it follows Copilot's model. AI drafting for recipe-based spreadsheet import uses it too |
+| Proposals for error-preventing facts | While drafting, the model also proposes a valid-record condition (「有效记录条件」, a SQL condition) and a dedup rule (「去重规则」), each with its basis; for sources with profiling on, the catalog's code values are given to the model as well (not for masked columns). Conditions are parsed with sqlglot in the data source's dialect; they may reference only this table's columns, may not contain subqueries, aggregates, or window functions, and may use only a few common functions — anything else isn't accepted (with the reason in the per-table notes); on sources with profiling on, the share of rows excluded is counted through the read-only guard, conditions that exclude 0% or 100% aren't accepted, and accepted ones get "Profiling check: excludes x% of rows" (「剖析核对：排除 x% 的行」) in the notes. These are all recorded as inferred; error-level SQL check rules accept only ones a person has confirmed, and the proposals are ranked at the front of the review queue |
+| Review queue | Lists only inferred items, ordered by "how many times runs used the table × how much the item affects numbers × source": valid-record conditions, dedup rules, business dates, and relationships come first, business keys and measure types next, and Chinese names, meanings, and units last, with each item stating why it's ranked there; filter by category and table, and multi-select to confirm, reject, or undo review in bulk (optimistic locking per table, with conflicts flagged one by one); you can see which runs used a table, and how many items have been confirmed for frequently used tables, for all tables, and for the items that affect numbers |
+| Table Copilot (「表助手」) | Chat with Copilot on the table details page to refine this one table: it can see the schema, the current state of the catalog (each item's source and status), relationships, profiling results, drafting instructions, and the columns left empty in the last drafting (masked columns: name only); it proposes changes in batches following your instructions, each with before, after, and basis (validated like the catalog: formulas aren't accepted, and column names must exist in the schema), and asks you back when it isn't sure; only on sources with profiling on does it run queries through the read-only guard to verify (at most 5 per request, with results masked first). Proposals accumulate in Pending changes (「待保存的修改」) and are saved in one go after confirmation (at most 200 items at a time), recorded as confirmed by a person, with each item's basis saved separately as that item's Basis at confirmation (「确认时的依据」) (kept apart from notes and visible in the table details; removed when undoing review returns the item to inferred). Conversations aren't stored on the server, and it changes only the catalog, never the business database |
+| Export and import | Exports one JSON file (the catalog of all tables, each item's status, and drafting instructions) to import into another instance or data source: first preview which tables and columns match, and whether each item will be added, updated, or kept, with conflicts and skips listed one by one; items a person confirmed or rejected are carried over as they are, where the target already has a confirmed item with a different value, the target's is kept and recorded as a conflict, inferred items in the file only fill gaps, and columns not in the schema are skipped with the reason stated; import isn't possible while drafting or profiling is in progress. Drafting instructions are written only when the target has none |
+| Data profiling | Off by default, enabled per data source. Runs as a background job, table by table: for each table you can see check progress, query count, elapsed time, and which item is being checked; closing the dialog doesn't stop it, and you can stop it or retry only the unfinished tables; on service restart, unfinished jobs are marked interrupted and don't resume by themselves. The budget is per table (by default at most 40 queries and 60 seconds per table), and when one table uses up its budget only that table stops, while the next one gets a full budget; there's no cap for the job as a whole, which relies on stop-loss rules and manual stopping: it stops after 3 consecutive failed queries, or when 7 of the last 10 queries time out, so as not to put load on the business database. Queries are sent one at a time, read-only, through the guard; large tables use statistics to estimate row counts, and masked columns aren't sampled; every query sent leaves an audit trail (with values replaced by "?", and the sampled key values never enter AgentLab's database). Sampling verifies inferred relationships, filling in coverage and cardinality, and the ones that hold up are promoted to verified; status columns get code-value candidates, with meanings left for a person to fill in. By default it profiles "tables that need profiling" (「需要剖析的表」): those never profiled, not finished last time, or that have since gained relationships awaiting verification or new code-value or date columns; on the same data source, drafting and profiling queue up serially, and the scope is set from the catalog as it stands when profiling starts, so you can simply click profile right after drafting finishes. The table list has a Profiling (「剖析」) column, and the table details show the last profiling result |
+| Corrections in conversation | When a user says "status=9 means voided" (「status=9 表示作废」), Copilot produces a catalog change proposal listing before, after, and the reason; it's saved only after a person confirms, and the reason is recorded as the item's Basis at confirmation (「确认时的依据」); formulas aren't accepted and are left to caliber cards |
+| Versions and reminders | The catalog is frozen into the evidence along with the schema snapshot, so you can look up which version every run used. Publishing records the catalog versions of the tables a template references, and a formal run gives a reminder when the catalog has changed; where an agent writes SQL only at run time, there's a separate reminder for "possibly involved" (「可能涉及」). It only reminds and never blocks the run |
 
-目录只记数据事实，不记计算公式：「在园人数是存量，不能跨天相加」进目录，「环比 =（本月 − 上月）÷ 上月」进口径卡。
-这也是不另做一层指标编译式语义层的原因——口径已经由口径卡和版本固定在管，再造一层就会出现两份口径。
+The catalog records only data facts, not calculation formulas: "the number of visitors in the park is a stock and can't
+be summed across days" (「在园人数是存量，不能跨天相加」) goes into the catalog, while "period-over-period = (this month − last month) ÷
+last month" (「环比 =（本月 − 上月）÷ 上月」) goes into a caliber card. This is also why there's no separate metric-compiling
+semantic layer — calibers are already pinned and governed by caliber cards and versions, and building another layer
+would produce two sets of calibers.
 
-跨库的问题不做联邦查询：各库先聚合到同一个键，再用**合并查询**节点在库外按键合并（内存 SQLite，同一套只读守卫）。
-被截断的输入拒收，键类型不一致、合并后行数变多都会提醒，报告里的数能一路追到两边的原始查询。
-
----
-
-### 大库：探查范围与按需加入
-
-几千张表的库不必全部读进来。探查先建一份全库的对象索引（每种数据库一条字典查询：名字、类型、注释、估算行数），再按
-「探查范围」的规则（通配、排除优先，缺省最多 500 张、上限 2,000）读范围内的表；有数据目录的表、已发布模板写死 SQL 用到的
-表一律在范围内。助手查看和运行时的 `db_schema__` 先按需求检索（BM25，遮罩列只用列名），点名范围外的表会当场只读地读结构、
-加进范围并留痕。「表已不在」只在真删除时说，范围外、读不到结构、索引里从来没有，各自分开说。剖析得到的行数和日期范围也
-交给助手和 agent，附一句「只供写查询参考，不能作为回答里的数」，遮罩按当时的设置重滤。
-
-### 结构变化、取值变化与定时维护
-
-探查时每张表记一个结构版本，和上一次比出结构变化（加删列、改类型、改可空、改注释、键和外键的增删；疑似改名只说「可能」）；
-剖析的取值观察（行数、码值分布、最新业务日期、最近 35 天每天的行数）和同一口径的历史比，比出取值变化（新码值、比例剧变、
-断档、缺天、量跌、行数大起大落），大表照实写口径（整表、窗口、块采样、前 N 行），口径不同不比。两种变化记在同一份变化记录里：
-
-- **在哪看**：数据目录的「变化」视图按要处理 / 提醒 / 说明分组，数据源卡片上的角标是要处理的条数，表详情里有「结构与取值
-  变化」一节。每条写影响面：说到这些列的目录项和它们的状态、写死了这一列的已发布模板、哪条 SQL 现在会报列不存在。
-- **怎么处理**：清理目录项、加入码值、重新起草、重新剖析、知道了、误报（必须写理由），动作都落到目录已有的写入上，记下目录
-  版本或建的任务。机器自己只做一件事：数据证明码值表不再列全时撤销「已列全」。
-- **定时维护**：数据源卡片上的「定时维护」，选步骤（探查结构、剖析需要的表、取值观察）和低峰时段，存成一条目标为这个数据源
-  的定时任务，缺省没有。和起草、剖析在同一个数据源上排队，没执行的步骤照实记原因。
-- **通知**：「数据源有变化要处理」只给源名、条数和链接，不放表名、列名和取值。
-
-### 助手按需查看
-
-以前每一轮开始前，服务端按库的大小把表结构塞进助手的 system：说一句「你好」也要先挑表，再带着上万字的表结构去
-生成。现在要不要看由助手自己定：
-
-- **默认只给概览**：每个数据源一行；画布和问数据另列能力登记里的能力，问数据只列只读的。闲聊、改提示词只调一次模型。
-- **查看**：助手输出一行 `{"op":"look","need":…,"targets":[{"kind":"table","source":…,"name":…}]}`，服务端读到就停止
-  这次输出，查看完把结果作为下一条消息交回，助手接着写，已经落地的操作不重复。能看三类对象：表；能力（名字、参数、
-  返回字段、读写、要不要确认，不给地址和凭据）；工作流版本（只列已发布且未退役的）。点名的直接取；只给需求时候选
-  不超过 12 张就全给，否则按需求挑（关思考、20 秒时限），沿关联补上两跳以内的中间表，一次最多 16 张、12,000 字。
-  挑不出、挑出来是空的照实说，把目录交回去让助手点名。每轮最多查看 3 次，自查修正另给 1 次。
-- **系统代为查看**：发布前修复、升级证据按要修的 SQL 点名查看用到的表；应用润色先查看应用固定的工作流版本。
-- **留痕**：每次查看发一条 look 事件（看了哪些、怎么来的、没找到的、目录版本、用时），存进这一轮的 `meta.looks`，
-  下一轮写「上一轮查看过：…」，追问时直接点名看。
-- **先问再做**：必须先问清才能动手时，助手输出 `{"op":"ask","question":…}`，这一轮就此结束，已经落地的改动照常交付、
-  不自动运行。
-- **一个生成过程**：起草 → 查看 → 接着写 → 自查修正只有一份（`api/copilot_gen.py`），画布、问数据、`/generate`、
-  发布前修复、升级证据、应用润色共用。
-
-## 工作流形态
-
-**人工介入与分支**——执行在 `human` 节点暂停并落盘，人工决策后沿对应出口继续：
-
-![人工审批流程](docs/images/graph-human.png)
-
-**多 Agent 协作**——调度者按进展将任务分派给多个专家，属探索层能力，governed 级发布禁用：
-
-![多 Agent 协作](docs/images/graph-supervisor.png)
-
-节点间通过模板语法传递数据：
-
-```
-{{ input.question }}        入口输入
-{{ vars.answer }}           某节点 assign_to 写入的变量
-{{ nodes.n1.text }}         指定节点的输出
-{{ vars.items | json }}     过滤器：json / compact / upper / length / first …
-```
-
-**条件和表达式不是模板。** 分支条件、while 循环条件、整形表达式、口径卡指标、跳过条件
-这几处是直接求值的表达式，变量直接写：`vars.gate != 'ok'`、`len(vars.items) > 0`。
-多套了 `{{ }}` 意思没有歧义，照 `vars.gate` 理解、只给一条提示；真写错的在校验阶段就拦下，
-不会等跑到那一步才炸——`| length` 这类过滤器（改写 `len(x)`）、`{'a', 'b'}` 集合（改用列表）、
-不认识的函数、把 `==` 写成 `=`、引号里的 `{{ }}`（它不会被渲染，条件永远不成立）。
-校验、Copilot 自查和运行时用的是同一个解析器，不会出现"校验说能跑、跑起来报错"。
-
-**代码节点的结果要 print 出来。** `assign_to` 拿到的是 stdout：脚本最后一行写个裸表达式
-不会输出（那是 notebook 的行为），变量会是空的。要交给下游一个对象就
-`print(json.dumps(结果))`，stdout 是 JSON 时会自动解析成对象。设了 `assign_to` 却找不到
-任何输出的 Python 代码，校验会直接拦下。
-
-连线即并行：单个节点连出多条边构成 fan-out，多条边汇入同一节点时自动等待汇聚——
-汇合节点等图里其余待执行的任务都跑完再执行一次，支路一长一短也不会被触发两遍；
-分支之后的二选一汇合不会去等没走的那条。代价是它也会等图里与它无关、恰好还在跑的支路。
-
-自动排版按拓扑分层：并行的支路落在同一列，层内按中位数启发式排序以减少交叉，
-分支节点的出口按 yes/no 的声明顺序自上而下，循环的回边不参与分层（否则循环体会
-被压到循环节点左边）。层与层之间按"穿过这条走廊的连线在竖直方向最多重叠几条"
-预留走廊宽度，前端 `canvas/routing.ts` 据此给每条线分配独立的竖直车道——扇出、
-汇聚的线因此不会叠在同一段上，跨层的长边则从没有节点的空档绕过去。
+Cross-database questions don't use federated queries: each database first aggregates to the same key, then the
+**merge query** node merges by key outside the databases (in-memory SQLite, with the same read-only guard). Truncated
+inputs are rejected, mismatched key types and row counts that grow after the merge both trigger warnings, and the
+numbers in the report trace all the way back to the raw queries on both sides.
 
 ---
 
-## 节点类型
+### Large Databases: Introspection Scope and On-Demand Inclusion
 
-| 分类 | 节点 | 说明 |
+A database with thousands of tables doesn't have to be read in full. Introspection first builds an object index of the
+whole database (one dictionary query per database type: name, type, comment, estimated row count), and then reads the
+tables in scope according to the Introspection Scope (「探查范围」) rules (wildcards, with exclusions taking precedence; by
+default at most 500 tables, with an upper limit of 2,000); tables with data catalog entries and tables used by SQL
+hard-coded in published templates are always in scope. Copilot's looks and the runtime `db_schema__` first search by the
+need (BM25; masked columns by name only), and naming a table outside the scope reads its schema on the spot, read-only,
+and adds it to the scope with an audit trail. "Table no longer exists" (「表已不在」) is said only when a table really was
+dropped; out of scope, schema unreadable, and never in the index are each reported separately. Row counts and date
+ranges from profiling are also given to Copilot and agents, with the note "for reference when writing queries only; not
+to be used as numbers in an answer" (「只供写查询参考，不能作为回答里的数」), and masking is re-filtered according to the settings at that
+moment.
+
+### Schema Changes, Value Changes, and Scheduled Maintenance
+
+Introspection records a schema version for every table and compares it with the previous one to find schema changes
+(added or dropped columns, type changes, nullability changes, comment changes, added or removed keys and foreign keys; a
+suspected rename is only reported as "possibly" (「可能」)). Profiling's value observation (row counts, code-value
+distributions, the latest business date, daily row counts over the last 35 days) is compared with history taken on the
+same basis to find value changes (new code values, sharp shifts in proportions, gaps, missing days, volume drops, large
+swings in row counts); for large tables it states the basis as it is (whole table, window, block sampling, first N
+rows), and observations on different bases aren't compared. Both kinds of change go into the same change log:
+
+- **Where to look**: the data catalog's Changes (「变化」) view groups entries into Action needed / Reminder / Note
+  (「要处理 / 提醒 / 说明」), the badge on a data source card is the number of entries that need action, and the table details
+  have a Schema & value changes (「结构与取值变化」) section. Each entry states its impact: the catalog items that mention these
+  columns and their status, the published templates that hard-code the column, and which SQL will now fail because the
+  column doesn't exist.
+- **How to handle them**: Clean up catalog items (「清理目录项」), Add code values (「加入码值」), Redraft (「重新起草」), Re-profile
+  (「重新剖析」), Got it (「知道了」), or False positive (「误报」; a reason is required); every action goes through the catalog's
+  existing write paths and records the catalog version or the job it created. The machine does only one thing by itself:
+  when the data proves a code table is no longer complete, it revokes "Complete" (「已列全」).
+- **Scheduled maintenance**: Scheduled Maintenance (「定时维护」) on the data source card — choose the steps (introspect the
+  schema, profile the tables that need it, value observation) and an off-peak time window, and it's saved as a schedule
+  whose target is that data source; there's none by default. It queues with drafting and profiling on the same data
+  source, and steps that didn't run record the reason as it is.
+- **Notifications**: "Data source has changes to handle" (「数据源有变化要处理」) gives only the source name, the count, and a
+  link, without table names, column names, or values.
+
+### Copilot Looks On Demand
+
+Previously, before every turn began, the server stuffed table schemas into Copilot's system prompt according to the
+database's size: even saying "hello" (「你好」) meant selecting tables first and then generating with more than ten thousand
+characters of schema attached. Now Copilot decides for itself whether to look:
+
+- **Only an overview by default**: one line per data source; the canvas and Ask Data (「问数据」) additionally list
+  capabilities from the capability registry, with Ask Data listing only read-only ones. Small talk or a prompt edit
+  calls the model only once.
+- **Look**: Copilot outputs one line, `{"op":"look","need":…,"targets":[{"kind":"table","source":…,"name":…}]}`; as soon
+  as the server reads it, it stops that output, performs the look, and returns the result as the next message, and
+  Copilot carries on writing without repeating operations already applied. Three kinds of objects can be looked at:
+  tables; capabilities (name, parameters, returned fields, read/write, whether confirmation is required — no addresses
+  or credentials); and workflow versions (only published, non-retired ones are listed). Named targets are fetched
+  directly; when only a need is given, all candidates are returned if there are no more than 12 tables, otherwise tables
+  are selected by the need (thinking off, 20-second time limit), adding intermediate tables within two hops along
+  relationships, up to 16 tables and 12,000 characters at a time. When nothing can be selected, or the selection comes
+  out empty, it says so plainly and hands the table list back for Copilot to name the tables. At most 3 looks per turn,
+  plus 1 more for self-check fixes.
+- **Looks done by the system**: pre-publish fixes and the evidence upgrade look up, by name, the tables used by the SQL
+  that needs fixing; app polishing first looks at the workflow version the app pins.
+- **Audit trail**: every look emits a look event (what was looked at, how it was arrived at, what wasn't found, the
+  catalog version, elapsed time), which is stored in the turn's `meta.looks`; the next turn says "Looked at in the
+  previous turn: …" (「上一轮查看过：…」), and follow-up questions look things up by name directly.
+- **Ask before acting**: when it must clarify before it can act, Copilot outputs `{"op":"ask","question":…}` and the
+  turn ends there; changes already applied are delivered as usual but not run automatically.
+- **One generation process**: draft → look → keep writing → self-check fixes exists in only one place
+  (`api/copilot_gen.py`), shared by the canvas, Ask Data, `/generate`, pre-publish fixes, the evidence upgrade, and app
+  polishing.
+
+## Workflow Shapes
+
+**Human-in-the-loop and branching** — execution pauses at a `human` node and is persisted to disk, and after the person
+decides, it continues along the corresponding exit:
+
+![Human approval flow](docs/images/graph-human.png)
+
+**Multi-agent collaboration** — a supervisor assigns tasks to multiple specialists as the work progresses; this is an
+exploration-layer capability and is disabled for governed-level publishing:
+
+![Multi-agent collaboration](docs/images/graph-supervisor.png)
+
+Nodes pass data to each other with template syntax:
+
+```
+{{ input.question }}        entry input
+{{ vars.answer }}           variable written by some node's assign_to
+{{ nodes.n1.text }}         output of the given node
+{{ vars.items | json }}     filters: json / compact / upper / length / first …
+```
+
+**Conditions and expressions are not templates.** Branch conditions, while-loop conditions, shaping expressions, caliber
+card metrics, and skip conditions are expressions that are evaluated directly, so write variables bare:
+`vars.gate != 'ok'`, `len(vars.items) > 0`. An extra `{{ }}` wrapper leaves no ambiguity about the meaning, so it's read
+as `vars.gate` with just a hint; real mistakes are blocked at validation instead of blowing up when that step is reached
+— filters such as `| length` (write `len(x)` instead), `{'a', 'b'}` sets (use a list instead), unknown functions,
+writing `==` as `=`, and `{{ }}` inside quotes (it won't be rendered, so the condition never holds). Validation, the
+self-check by Copilot (「助手」), and the runtime use the same parser, so "validation says it runs, but it errors when run"
+can't happen.
+
+**Code node results have to be printed.** `assign_to` receives stdout: a bare expression on the script's last line
+produces no output (echoing it is notebook behavior), so the variable will be empty. To hand an object downstream, use
+`print(json.dumps(结果))` (结果 = the result); when stdout is JSON it's parsed into an object automatically. Validation
+blocks Python code that sets `assign_to` but has no output anywhere.
+
+Edges mean parallelism: several edges out of one node form a fan-out, and when several edges flow into the same node it
+automatically waits for them to converge — the join node waits until every other pending task in the graph has finished
+and then runs once, so it isn't triggered twice when one branch is long and the other short; a join after an either-or
+branch doesn't wait for the path that wasn't taken. The cost is that it also waits for branches that have nothing to do
+with it but happen to still be running.
+
+Automatic layout layers the graph topologically: parallel branches land in the same column, nodes within a layer are
+ordered with a median heuristic to reduce crossings, a branch node's exits run top to bottom in their declared yes/no
+order, and loop back edges don't take part in layering (otherwise the loop body would be pushed to the left of the loop
+node). Between layers, corridor width is reserved according to "the maximum number of edges through this corridor that
+overlap vertically", and the frontend's `canvas/routing.ts` uses that to give each edge its own vertical lane — so
+fan-out and converging edges don't stack on the same segment, and long edges that span layers route around through gaps
+where there are no nodes.
+
+---
+
+## Node Types
+
+| Category | Nodes | Description |
 |---|---|---|
-| 起止 | `input` `output` | 声明输入字段 / 收集结构化成果 |
-| 模型 | `llm` `agent` `supervisor` `report` | 单次调用 / 带工具循环 / 多 agent 协作 / 报告撰写（只写引用标记，数字由系统填） |
-| 执行 | `tool` `code` `merge` | 直接调用工具 / 沙箱内执行代码 / 合并几次查询的结果（跨库按键对齐） |
-| 控制 | `branch` `loop` `subgraph` | 条件或语义分支 / 遍历与条件循环 / 嵌套工作流 |
-| 上下文 | `memory` `retrieve` `transform` | 长期记忆读写 / 知识检索 / 数据整形 |
-| 把关 | `human` `validate` `metrics` | 人工介入（可派给岗位、会签、设时限与超时处理、表单可由上游 Agent 拟定）/ Schema 校验与自动返工 / 口径卡 |
+| Start/end | `input` `output` | Declare input fields / collect structured output |
+| Model | `llm` `agent` `supervisor` `report` | Single call / loop with tools / multi-agent collaboration / report writer (writes only citation markers; the system fills in the numbers) |
+| Execution | `tool` `code` `merge` | Call a tool directly / execute code in the sandbox / merge the results of several queries (aligned by key across databases) |
+| Control | `branch` `loop` `subgraph` | Conditional or semantic branch / iteration and conditional loop / nested workflow |
+| Context | `memory` `retrieve` `transform` | Long-term memory read/write / knowledge retrieval / data shaping |
+| Gatekeeping | `human` `validate` `metrics` | Human-in-the-loop (can be assigned to a position, joint sign-off, time limits and timeout handling, forms can be drafted by an upstream Agent) / Schema validation and automatic rework / caliber card |
 
 ---
 
-## 架构
+## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph FE["前端 · React 19 + React Flow + Zustand"]
-        F1["画布编辑"]
-        F2["问数据"]
-        F3["运行追踪 · 证据面板"]
-        F4["decode.ts<br/><i>事件 → 人类可读的唯一翻译层</i>"]
+    subgraph FE["Frontend · React 19 + React Flow + Zustand"]
+        F1["Canvas editing"]
+        F2["Ask Data"]
+        F3["Run tracing · Evidence panel"]
+        F4["decode.ts<br/><i>the single events → human-readable translation layer</i>"]
     end
-    subgraph BE["后端 · FastAPI + LangGraph"]
-        B1["engine<br/>编译 · 调度 · 中断恢复 · 出具与证据"]
-        B2["providers<br/>多模型接入与成本估算"]
-        B3["tools<br/>注册表 · MCP · 数据源"]
-        B4["memory<br/>记忆 · 知识库 · 混合检索"]
+    subgraph BE["Backend · FastAPI + LangGraph"]
+        B1["engine<br/>compile · schedule · interrupt and resume · issuance and evidence"]
+        B2["providers<br/>multi-model access and cost estimation"]
+        B3["tools<br/>registry · MCP · data sources"]
+        B4["memory<br/>memory · knowledge base · hybrid retrieval"]
         B5["sandbox<br/>microVM / Seatbelt / bubblewrap"]
     end
-    subgraph ST["存储"]
-        S1[("agentlab.db 或 PostgreSQL<br/>业务数据")]
-        S2[("checkpoints.db 或同一个 PostgreSQL<br/>执行断点")]
-        S3[("artifacts/<br/>内容寻址工件库")]
+    subgraph ST["Storage"]
+        S1[("agentlab.db or PostgreSQL<br/>application data")]
+        S2[("checkpoints.db or the same PostgreSQL<br/>execution checkpoints")]
+        S3[("artifacts/<br/>content-addressed artifact store")]
     end
     FE <-->|REST + WebSocket| BE
     B1 --> S1 & S2 & S3
@@ -779,585 +1107,785 @@ flowchart TB
 
 ```
 backend/                  FastAPI + LangGraph
-  app/engine/             画布 JSON → StateGraph 的编译与执行
-    schema.py             图定义与静态校验
-    compiler.py           编译：节点包装、事件、重试、条件路由
-    runner.py             执行调度、事件总线、中断与恢复
-    issuance.py           出具契约：数字回指与三档判定
-    evidence.py           可点击证据：证据台账、引用标记、报告文档的切块与核对（纯函数）
-    judge.py              结论句裁判：预筛、成本上限、判定写回
-    governance.py         发布门禁：受管 lint 与证据门禁 G1–G5
-    autofix.py            发布前自动修复；upgrade.py 一键升级为可追溯结构
-    guards.py             agent 护栏：重复调用、预算、上下文压缩
-    review.py             产出复核：事件流规则扫描 + 模型复核
-    expressions.py        模板插值 + AST 白名单表达式求值
-    nodes/                各类节点的执行器（report.py 是报告撰写）
-  app/data/               数据源接入：连接、SQL 守卫、结构探查、表格导入
-  app/providers/          多模型接入与成本估算
-  app/sandbox/            microVM / Seatbelt / bubblewrap / 裸子进程四后端
-  app/tools/              工具注册表、内置工具、MCP、自定义工具
-  app/memory/             记忆、知识库、倒排索引、混合检索、文档解析
-  app/api/                REST + WebSocket（证据接口在 evidence.py）
+  app/engine/             compiles and executes canvas JSON → StateGraph
+    schema.py             graph definition and static validation
+    compiler.py           compilation: node wrapping, events, retries, conditional routing
+    runner.py             execution scheduling, event bus, interrupts and resumption
+    issuance.py           issuance contract: number trace-back and the three-tier verdict
+    evidence.py           clickable evidence: evidence ledger, citation markers, chunking and verifying report documents (pure functions)
+    judge.py              claim-sentence judge: prefiltering, cost cap, writing verdicts back
+    governance.py         publishing gates: governed lint and evidence gates G1–G5
+    autofix.py            automatic pre-publish fixes; upgrade.py does the one-click upgrade to a traceable structure
+    guards.py             agent guardrails: repeated calls, budgets, context compression
+    review.py             output review: event-stream rule scan + model review
+    expressions.py        template interpolation + AST-allowlist expression evaluation
+    nodes/                executors for each node type (report.py is the report writer)
+  app/data/               data source access: connections, SQL guard, schema introspection, spreadsheet import
+  app/providers/          multi-model access and cost estimation
+  app/sandbox/            four backends: microVM / Seatbelt / bubblewrap / bare subprocess
+  app/tools/              tool registry, built-in tools, MCP, custom tools
+  app/memory/             memory, knowledge base, inverted index, hybrid retrieval, document parsing
+  app/api/                REST + WebSocket (the evidence API is in evidence.py)
 frontend/                 React 19 + React Flow + Zustand
-  src/canvas/nodeDefs.ts  节点元数据——属性面板、节点库、连接桩均由其驱动
-  src/canvas/routing.ts   连线走线：端口错开、走廊车道、长边绕行
-  src/run/decode.ts       事件流 → 人类可读步骤的唯一翻译层
-  src/run/EvidenceDoc.tsx 报告逐段渲染：数字、名字、原话都是可点的片段；EvidencePanel.tsx 是出处链
-  src/store/studio.ts     画布状态 + 事件流到高亮的映射
-environment.yml           conda 环境定义
-scripts/dev.sh            一键启动
-scripts/check-all.mjs     前端检查的总入口：分道并行跑全部 check-*.mjs，汇总成一张表
+  src/canvas/nodeDefs.ts  node metadata — drives the properties panel, the node library, and the connection handles
+  src/canvas/routing.ts   edge routing: staggered ports, corridor lanes, detours for long edges
+  src/run/decode.ts       the single translation layer from the event stream to human-readable steps
+  src/run/EvidenceDoc.tsx renders the report segment by segment: numbers, names, and quotes are all clickable fragments; EvidencePanel.tsx is the provenance chain
+  src/store/studio.ts     canvas state + mapping from the event stream to highlights
+environment.yml           conda environment definition
+scripts/dev.sh            one-command startup
+scripts/check-all.mjs     main entry for the frontend checks: runs every check-*.mjs in parallel lanes and summarizes them in one table
 ```
 
 ---
 
-## 关键设计决策
+## Key Design Decisions
 
-### 选用 LangGraph
+### Why LangGraph
 
-可视化编排的难点不在绘制节点与连线，而在暂停、恢复与回放。LangGraph 的 checkpointer 与
-`interrupt()` 将这几件事做在了底层：人工介入是一次中断加一次 `Command(resume=...)`，
-进程重启后仍可从断点继续；`aget_state_history()` 直接给出每一步的状态快照。
+The hard part of visual orchestration isn't drawing nodes and edges; it's pausing, resuming, and replaying. LangGraph's
+checkpointer and `interrupt()` handle these at the lowest level: human intervention is one interrupt plus one
+`Command(resume=...)`, and after a process restart execution can still continue from the checkpoint;
+`aget_state_history()` gives a state snapshot of every step directly.
 
-由此派生的第二项收益：**agent 内部的工具审批不重复计费**。`interrupt()` 会使整个节点重放，
-朴素实现将重复执行此前的模型调用。agent 节点内的模型调用与工具执行均包裹在 LangGraph 的
-`@task` 中，结果进入 checkpoint，重放时直接读取缓存。
+A second benefit follows from this: **tool approvals inside an agent aren't billed twice**. `interrupt()` causes the
+whole node to replay, so a naive implementation would re-execute the model calls made before it. Model calls and tool
+executions inside agent nodes are all wrapped in LangGraph's `@task`, so their results go into the checkpoint and a
+replay reads them straight from the cache.
 
-### 事件流是唯一的可视化数据源
+### The Event Stream Is the Only Data Source for Visualization
 
-节点通过 `get_stream_writer()` 发出事件，runner 转换为 `RunEvent` 落库并广播。
-画布高亮、token 流、工具卡片、时间线全部由同一份事件驱动——刷新页面或中途接入
-均可获得完整过程（WebSocket 先补历史再接实时）。
+Nodes emit events through `get_stream_writer()`, and the runner converts them into `RunEvent`s, persists them, and
+broadcasts them. Canvas highlighting, the token stream, tool cards, and the timeline are all driven by the same events —
+refreshing the page or joining midway still gets the complete process (the WebSocket backfills history first, then
+switches to live).
 
-前端侧对应地只有一个翻译层 `run/decode.ts`：画布右栏、问数据页、运行详情页共用它。
-分设多套的后果是同一次运行在三个页面讲出三个版本，而使用者无从判断哪个为真。
+Correspondingly, the frontend has only one translation layer, `run/decode.ts`, which the canvas's right column, the Ask
+Data page (「问数据」), and the run details page all share. Having several separate ones would mean the same run tells three
+different versions of the story on three pages, and users would have no way to tell which one is true.
 
-### 画布上的动效是"正在发生的事"，不是装饰
+### Canvas Motion Means "Something Is Happening", Not Decoration
 
-画布上每一个会动的东西都对应一件真实事件：边框上转一圈光弧 = 这个节点正在跑，
-扫描线扫过 = 正在产出，绿色扫一遍 = 刚跑完，抖动 = 刚失败，琥珀呼吸 = 在等人，
-边上的光点 = 数据正从这边流向那边。跑一张十几个节点的图，一眼要能看出"谁在动"——
-纯装饰的动效做不到这件事，只会让画布变吵。
+Everything that moves on the canvas corresponds to a real event: an arc of light circling the border = this node is
+running; a scan line sweeping across = it's producing output; a green sweep = it just finished; a shake = it just
+failed; amber breathing = it's waiting for a person; dots of light on an edge = data is flowing from this side to that
+side. When running a graph with a dozen or more nodes, you need to see "who's moving" at a glance — purely decorative
+motion can't do that; it only makes the canvas noisy.
 
-多 agent 节点会**在卡片里展开协作矩阵**：花名册固定不重排，被派出去的人亮起来并
-显示当前任务，条形长度按"这一轮里最慢的那个人"归一化——三个人并排三条长短不一的
-条，墙钟为什么等于最长那条而不是三条之和，不用解释就看懂了；页脚给出并行一共省下
-多少。分支节点跑完会点亮命中的那个出口、压暗其余，实际走过的边留在画布上，就是
-这一次的执行路径。
+Multi-agent nodes **expand a collaboration matrix inside the card**: the roster is fixed and never reordered, members
+who have been dispatched light up and show their current task, and bar lengths are normalized to "the slowest member in
+this round" — with three members side by side as three bars of different lengths, why the wall-clock time equals the
+longest bar rather than the sum of all three is obvious without any explanation; the footer shows how much parallelism
+saved in total. When a branch node finishes, it lights up the exit that was taken and dims the rest, and the edges
+actually traversed stay on the canvas: that's this run's execution path.
 
-矩阵和右栏泳道读的是**同一份** `reduceTeam`（`run/decode.ts`），两处不会给出不同的
-并行度。系统里关掉动效时（`prefers-reduced-motion`）光效整体不绘制而不是停住——
-停在最后一帧的光弧和堆在起点的光点看着像渲染坏了；静态下"谁在跑"由实心圆点和
-"进行中"三个字承担。
+The matrix and the swim lanes in the right column read **the same** `reduceTeam` (`run/decode.ts`), so the two never
+show different degrees of parallelism. When motion is turned off at the system level (`prefers-reduced-motion`), the
+light effects aren't drawn at all rather than being frozen — an arc of light stuck on its last frame and dots of light
+piled up at the starting point look like broken rendering; in the static state, "who's running" is carried by a solid
+dot and the words "In progress" (「进行中」).
 
-### agent 的护栏取代固定步数
+### Agent Guardrails Replace a Fixed Step Count
 
-以前 agent 节点一律「最多 12 步」。固定步数想挡的是四件事，每件都有更贴切的挡法（`engine/guards.py`）：
+Agent nodes used to be capped at "at most 12 steps" across the board. A fixed step count is meant to guard against four
+things, and each of them has a guard that fits better (`engine/guards.py`):
 
-- **循环不收敛**：同一个工具、同样的参数第二次不再执行，把上次的结果交还给它；连续 3 步拿不到新信息就收尾
-- **花费越滚越大**：每个节点记令牌预算（默认 200 万）和金额预算（默认不限），都可以在设置里改成不限
-- **上下文会满**：用到窗口的 60% 先压缩早期的工具结果，到 85% 就收尾
-- **真正失控**：步数只留兜底，默认 100，设置里可改，`AGENTLAB_MAX_AGENT_STEPS` 封顶
+- **Loops that don't converge**: the same tool with the same arguments isn't executed a second time, and the previous
+  result is handed back to it instead; after 3 consecutive steps that bring no new information, it wraps up
+- **Spending that keeps snowballing**: each node tracks a token budget (default 2 million) and a spending budget
+  (unlimited by default), and both can be set to unlimited in Settings (「设置」)
+- **Context filling up**: at 60% of the window, early tool results are compressed first, and at 85% it wraps up
+- **Genuinely runaway agents**: the step count is kept only as a backstop, default 100, adjustable in Settings and
+  capped by `AGENTLAB_MAX_AGENT_STEPS`
 
-临近任何一个上限先提醒模型一次。上限在运行发起时快照，恢复和接着跑沿用同一份——审批恢复时节点整个重放，
-上限一变，循环停的位置就和 checkpoint 对不上。下游结构化校验失败时，报错写明是上游哪个 agent 提前收了尾。
+When it nears any of these limits, the model is reminded once first. The limits are snapshotted when the run starts, and
+resuming and continuing use the same snapshot — when resuming after an approval the node replays in full, and if the
+limits changed, the point where the loop stops would no longer line up with the checkpoint. When downstream structured
+validation fails, the error states which upstream agent wrapped up early.
 
-### 沙箱：双档隔离，以及必须声明的缺口
+### Sandbox: Two Isolation Tiers, and the Gap That Must Be Declared
 
-轻量档使用操作系统自带的访问控制：macOS 的 Seatbelt（`sandbox-exec`）、Linux 的 bubblewrap，
-冷启动约 25ms，无需额外安装。重量档为 microVM（libkrun + Hypervisor.framework），
-启动带独立内核的虚拟机。
+The lightweight tier uses access control built into the operating system: Seatbelt (`sandbox-exec`) on macOS and
+bubblewrap on Linux, with a cold start of about 25ms and nothing extra to install. The heavyweight tier is microVM
+(libkrun + Hypervisor.framework), which boots a virtual machine with its own kernel.
 
-两档共同保证三项约束：**默认断网**、**家目录不可读**、**仅工作区可写**。Seatbelt 侧策略
-由内核强制且对子进程继承——沙箱内 `subprocess` 启动的 `cat` 读取家目录同样返回
-`Operation not permitted`；解释器刻意使用 `sys.base_prefix` 下的干净 Python 而非项目环境，
-因此沙箱代码无法 import FastAPI、SQLAlchemy 及任何凭据处理相关模块。
+Both tiers guarantee three constraints: **network off by default**, **home directory unreadable**, and
+**only the workspace writable**. On the Seatbelt side, the policy is enforced by the kernel and inherited by child
+processes — a `cat` started with `subprocess` inside the sandbox likewise gets `Operation not permitted` when it reads
+the home directory; the interpreter deliberately uses the clean Python under `sys.base_prefix` rather than the project
+environment, so sandboxed code can't import FastAPI, SQLAlchemy, or any module related to credential handling.
 
-**Seatbelt 的局限**：它提供访问控制而非虚拟化。进程表共享（可见宿主机进程列表）；
-代码以当前用户身份运行（不似容器会降权至 nobody）；**macOS 不强制 `RLIMIT_AS`，
-内存用量无法限制**（实测设定 256MB 仍可分配 900MB）。CPU 时间、单文件大小、
-墙钟超时三项有效。
+**Seatbelt's limitations**: it provides access control, not virtualization. The process table is shared (the host's
+process list is visible); code runs as the current user (unlike a container, it doesn't drop privileges to nobody);
+**macOS doesn't enforce `RLIMIT_AS`, so memory usage can't be limited** (in testing, with 256MB set, 900MB could still
+be allocated). The CPU time, single-file size, and wall-clock timeout limits do work.
 
-**microVM 补齐的正是内存这一项。** 本机实测：宿主为 Darwin 27.0.0，VM 内为 Linux 6.12.99
-（libkrunfw 编译），PID 1 为 `init.krun`，`/Users` 在 VM 内不存在，`free` 仅显示 512MB。
-申请 900MB 将被内核 OOM killer 终止而 VM 存活——`RLIMIT_AS` 在 macOS 上形同虚设的问题
-在此不是被修复，而是结构上不存在。两台 VM 之间亦互不可见。
+**What microVM fills in is exactly this memory gap.** Tested on this machine: the host is Darwin 27.0.0, the VM runs
+Linux 6.12.99 (built by libkrunfw), PID 1 is `init.krun`, `/Users` doesn't exist inside the VM, and `free` shows only
+512MB. Requesting 900MB gets the process killed by the kernel's OOM killer while the VM survives — the problem of
+`RLIMIT_AS` being toothless on macOS isn't fixed here; it structurally doesn't exist. Two VMs can't see each other
+either.
 
-代价：运行时约 50MB，OCI 镜像**首次拉取实测 54.5 秒**；缓存后热启动 0.19 秒、
-VM 内执行 7–30ms。成本集中在首次而非每次——因此 auto 模式在镜像未缓存时优先使用 Seatbelt，
-避免一分钟的等待（显式指定 strict 不受此限）。
+The cost: the runtime is about 50MB, and the OCI image's **first pull measured 54.5 seconds**; once cached, a warm start
+takes 0.19 seconds and execution inside the VM takes 7–30ms. The cost is concentrated in the first time rather than
+every time — so while the image isn't cached, auto mode prefers Seatbelt to avoid a one-minute wait (explicitly
+specifying strict isn't subject to this).
 
-> **网络隔离不完整，此项须置于前列。**
-> `network=false` 时 HTTP/HTTPS 与域名解析均被切断，但 **UDP/53 无法拦截**——实测手写
-> DNS 包仍可获得真实响应。`default_egress=DENY`、`Rule.deny_dns()`、显式 deny UDP、
-> `max_connections=0` 均已尝试，UDP 通道始终无法封堵（`deny_dns` 生成的规则仅作用于宿主，
-> DNS 出口在 microsandbox 的网络栈中硬编码放行）。
-> 即 **DNS 隧道外泄通道始终开放**。该隔离足以防范「代码意外联网安装依赖」，
-> 不足以防范「恶意代码窃取数据」。设置页据此将网络一项标注为「部分生效」的黄色而非绿色——
-> 拦截了一半却显示为全绿，比显示为全红更危险。真正的外泄防护须在网络层实施。
+> **Network isolation is incomplete, and this has to be stated up front.**
+> With `network=false`, HTTP/HTTPS and DNS resolution are both cut off, but **UDP/53 can't be blocked** — in testing,
+> hand-crafted DNS packets still got real responses. `default_egress=DENY`, `Rule.deny_dns()`, explicitly denying UDP,
+> and `max_connections=0` have all been tried, and the UDP channel could never be closed (the rules `deny_dns` generates
+> apply only to the host, and DNS egress is hard-coded as allowed in microsandbox's network stack).
+> That is, **the DNS-tunnel exfiltration channel is always open**. This isolation is enough to guard against "code
+> accidentally going online to install dependencies", but not enough to guard against "malicious code stealing data".
+> Accordingly, the settings page marks the network item yellow, as "Partially effective" (「部分生效」), rather than green —
+> showing all green when only half is blocked is more dangerous than showing all red. Real exfiltration protection has
+> to be implemented at the network layer.
 
-### 检索为何是混合的
+### Why Retrieval Is Hybrid
 
-默认 embedding 为本地特征哈希：不联网、不下载模型、零配置可用，但语义泛化能力弱。
-BM25 补齐精确关键词匹配。两者各自归一化后加权，权重在界面上可调，命中结果分别显示
-语义分与关键词分。
+The default embedding is local feature hashing: no network, no model download, usable with zero configuration, but weak
+at semantic generalization. BM25 fills in exact keyword matching. Each is normalized and then weighted, the weights are
+adjustable in the UI, and hits show the semantic score and the keyword score separately.
 
-实测（24 文档 / 16 问题评测集，hit@1）：
+Measured results (an evaluation set of 24 documents / 16 questions, hit@1):
 
-| 配置 | hit@1 | 字面类 | 语义类 |
+| Configuration | hit@1 | Literal | Semantic |
 |---|---|---|---|
-| 纯关键词（alpha=0） | 88% | 100% | 75% |
-| 纯向量（本地哈希，alpha=1） | 81% | 88% | 75% |
-| 混合 + Qwen3-Embedding-4B | 94% | 100% | 88% |
-| 上述配置叠加模型重排 | 100% | — | — |
+| Keyword only (alpha=0) | 88% | 100% | 75% |
+| Vector only (local hashing, alpha=1) | 81% | 88% | 75% |
+| Hybrid + Qwen3-Embedding-4B | 94% | 100% | 88% |
+| The above plus model reranking | 100% | — | — |
 
-值得注意的一项：纯向量（81%）低于纯关键词（88%），混合才达到 94%。专有名词依靠 BM25、
-同义改写依靠向量，两者各担一半——混合检索在该语料上是必要的，而非装饰。
-样本量为 16 题，单题即 6 个百分点，结论的方向可信而精度不可过度解读。
+One result worth noting: vector only (81%) is lower than keyword only (88%), and only hybrid reaches 94%. Proper nouns
+rely on BM25 and paraphrases rely on vectors, each carrying half the load — on this corpus hybrid retrieval is
+necessary, not decoration. The sample is 16 questions, so a single question is worth 6 percentage points: the direction
+of the conclusion can be trusted, but its precision shouldn't be over-read.
 
-向量模型可接任意 OpenAI 兼容端点（LM Studio、Ollama、vLLM、TEI）。维度通过实际探测获得
-而非按模型名推断——本地部署的模型维度各异（bge-m3 为 1024、Qwen3-Embedding-4B 为 2560），
-推断错误的后果不是偏差，而是全部存量向量被判定为与当前 embedder 不匹配，检索整体退回关键词。
+The embedding model can use any OpenAI-compatible endpoint (LM Studio, Ollama, vLLM, TEI). The dimension is obtained by
+actually probing rather than inferred from the model name — locally deployed models vary in dimension (1024 for bge-m3,
+2560 for Qwen3-Embedding-4B), and the consequence of a wrong guess isn't a small error: every stored vector would be
+judged incompatible with the current embedder, and retrieval would fall back to keywords entirely.
 
-### 表格数据必须成为表
+### Spreadsheet Data Must Become Tables
 
-Excel / CSV 若传入知识库，只能被切块检索，数字即成为模型从片段中「读取」的结果。
-而本项目的基础约定是「所有算术下沉到 SQL 或口径卡」——产出复核层能拦截凭空出现的数字，
-无法拦截「从一堆片段中读错了一格」。
+If Excel / CSV went into the knowledge base, they could only be chunked and retrieved, and the numbers would become
+whatever the model "reads" out of fragments. This project's basic convention, though, is "all arithmetic sinks into SQL
+or caliber cards" — the output review layer can catch numbers that appear out of nowhere, but not "one cell misread from
+a pile of fragments".
 
-因此表格上传后落为 SQLite 文件并注册为 `kind=sqlite` 的数据源，自动生成
-`db_query__<name>` 工具。列类型逐列推断（INTEGER / REAL / TEXT），空单元格存为 NULL——
-整数列若落为 TEXT，`ORDER BY` 将退化为字典序（`'10' < '9'`），且不产生任何报错。
+So after upload, a spreadsheet is stored as a SQLite file and registered as a data source of `kind=sqlite`, with a
+`db_query__<name>` tool generated automatically. Column types are inferred column by column (INTEGER / REAL / TEXT), and
+empty cells are stored as NULL — if an integer column were stored as TEXT, `ORDER BY` would degrade to lexicographic
+order (`'10' < '9'`) without producing any error.
 
-### 安全边界
+### Security Boundaries
 
-- 分支条件使用 AST 白名单求值器而非 `eval`
-- HTTP 工具解析域名后逐 IP 检查，拦截内网、回环与云元数据地址，且不跟随重定向（逐跳重新校验）
-  本机代理开 fake-ip 时，解析结果是 198.18 段的假地址：配置 fake-ip 网段后，这类结果改向公共 DNS（DoH）
-  核实真实地址再判断，核实不了按拦截处理
-- 文件工具路径 `resolve()` 后必须仍位于工作区内
-- SQL 守卫采用白名单动词判定 + 正文扫描 + 多语句拦截 + 结果集上限；`DROP` / `TRUNCATE` / `GRANT` 等
-  在可写数据源上亦一律拒绝。以查询开头却会写的语句（`WITH … DELETE`、`SELECT … INTO`、
-  `EXPLAIN ANALYZE`、`PRAGMA … =`、`set_config()` 等）按写操作处理
-- 只读数据源在**连接层**也只读，不只靠守卫猜：SQLite 以 `mode=ro` 打开，PostgreSQL / MySQL
-  会话事务只读。**Oracle 没有会话级只读开关**，只剩守卫一道——只读数据源请配只读账号
-- 人工审批只认明确的批准（`true` / 同意 / approve），看不懂的回复一律按拒绝处理。
-  危不危险逐次判定：同一个 `db_query__<源>`，查询直接执行，可写源上的写操作要先确认，
-  确认后才提交。协作团队的成员停不下来等人，需要确认的调用不执行，会告诉成员换一种做法
-- MCP 与自定义工具平台看不出它做什么，默认每次调用都等审批（三档：`ask` / `gated` / `always`）。工具页可逐个改成「始终允许 · 门控把关」
-  （每次调用先由门控模型审一遍参数，拿不准、出错、超时都交还给人）或「始终允许」；审批卡上的
-  「始终允许」等于前者。档位在发起运行时快照，恢复和接着跑沿用同一份；正式运行不看档位，一律等审批
-- API Key 经 Fernet 加密落库，仅向前端返回掩码；端点的认证头、自定义工具的请求头、MCP 的环境变量与请求头同样加密、只回掩码
-- 内网只对登记的端点开放（管理员开「允许访问内网」），元数据地址和高危端口照样拦；模型给出的地址照旧做完整的 SSRF 检查
-- 开了登录：会话 cookie 在库里只存 token 的哈希；非 GET 请求核对来源标记头和 Origin；使用者只能读有授权的运行，看到的查询结果一律遮罩
-- 写外部系统必须经「调用工具」节点：先留生效记录再发送，确认卡上的内容哈希在发送前重算比对；结果未知永不自动重发
-- 安全响应头：`nosniff`、`Referrer-Policy`，以及 `frame-ancestors`（缺省 `'self'`，`AGENTLAB_FRAME_ANCESTORS` 列出允许
-  嵌整站的同站门户；只有 `'self'` 时另加 `X-Frame-Options: SAMEORIGIN`）。严格的 `script-src` 目前只发
-  `Content-Security-Policy-Report-Only`，观察一个版本没有误报再强制。HSTS 交给反向代理
-- 集成方要用的接口（应用、待办、工件、角色拒绝）的错误一律带机读码（`code`），`detail` 是给人看的原话，可以改
-- 评测、口径对账、口径召回是系统代为发起的运行：证据照常可查，但不进使用统计（探索问题聚类、工具白名单、目录使用
-  次数），记录页默认不列并写明有几次没列出
+- Branch conditions use an AST-allowlist evaluator rather than `eval`
+- HTTP tools resolve the domain and then check every IP, blocking internal, loopback, and cloud metadata addresses, and
+  they don't follow redirects (each hop is validated again). When a local proxy has fake-ip on, resolution returns fake
+  addresses in the 198.18 range: once the fake-ip range is configured, such results are verified against public DNS
+  (DoH) to find the real address before deciding, and anything that can't be verified is treated as blocked
+- File tool paths must still be inside the workspace after `resolve()`
+- The SQL guard uses allowlisted verb checks + body scanning + multi-statement blocking + a result-set cap; `DROP` /
+  `TRUNCATE` / `GRANT` and the like are always refused, even on writable data sources. Statements that begin as queries
+  but write (`WITH … DELETE`, `SELECT … INTO`, `EXPLAIN ANALYZE`, `PRAGMA … =`, `set_config()`, etc.) are treated as
+  writes
+- Read-only data sources are also read-only **at the connection layer**, not just by the guard's guesswork: SQLite is
+  opened with `mode=ro`, and PostgreSQL / MySQL sessions use read-only transactions.
+  **Oracle has no session-level read-only switch**, which leaves only the guard — configure a read-only account for
+  read-only data sources
+- Human approval accepts only an explicit approval (`true` / 同意 ("agree") / approve), and any reply it can't understand
+  is treated as a rejection. Whether something is dangerous is judged call by call: for the same `db_query__<源>` (the
+  source name), queries execute directly, while writes on a writable source need confirmation first and are committed
+  only after confirmation. Members of a collaboration team can't stop to wait for a person, so calls that need
+  confirmation aren't executed, and the member is told to try another approach
+- The platform can't tell what MCP and custom tools do, so by default every call waits for approval (three levels: `ask`
+  / `gated` / `always`). On the Tools page (「工具」), each one can be changed to Always allow · gated (「始终允许 · 门控把关」)
+  (every call first has its arguments reviewed by a gating model, and anything uncertain, erroring, or timing out goes
+  back to a person) or to Always allow (「始终允许」); Always allow on an approval card equals the former. The level is
+  snapshotted when the run starts, and resuming and continuing use the same snapshot; formal runs ignore the level and
+  always wait for approval
+- API keys are encrypted with Fernet before being stored, and only masked values are returned to the frontend; endpoint
+  auth headers, custom tool request headers, and MCP environment variables and request headers are likewise encrypted,
+  with only masked values returned
+- The internal network is open only to registered endpoints (an admin turns on Allow internal network access
+  (「允许访问内网」)), and metadata addresses and high-risk ports are still blocked; addresses given by the model still get the
+  full SSRF check
+- With login on: for session cookies, the database stores only the token's hash; non-GET requests are checked for the
+  source-marker header and Origin; users can read only runs they're authorized for, and the query results they see are
+  always masked
+- Writes to external systems must go through a Call Tool (「调用工具」) node: the effect record is written before sending, and
+  the content hash on the confirmation card is recomputed and compared before sending; a write whose result is unknown
+  is never resent automatically
+- Security response headers: `nosniff`, `Referrer-Policy`, and `frame-ancestors` (default `'self'`;
+  `AGENTLAB_FRAME_ANCESTORS` lists the same-site portals allowed to embed the whole site, and when it's only `'self'`,
+  `X-Frame-Options: SAMEORIGIN` is added too). A strict `script-src` is currently sent only as
+  `Content-Security-Policy-Report-Only`, to be enforced after one version goes by with no false positives. HSTS is left
+  to the reverse proxy
+- Errors from the APIs integrators use (apps, tasks, artifacts, role denials) always carry a machine-readable code
+  (`code`), while `detail` is human-readable wording and may change
+- Evaluations, caliber reconciliations, and caliber recalls are runs the system starts on someone's behalf: their
+  evidence can be inspected as usual, but they're excluded from usage statistics (exploration question clustering, tool
+  allowlists, catalog usage counts), and the Records page (「记录」) doesn't list them by default, stating how many were
+  left out
 
 ---
 
-## 运行环境
+## Runtime Environment
 
-### 沙箱后端选择
+### Sandbox Backend Selection
 
-设置页「运行环境」列出全部候选及其可用性，并标注当前选中项。安装 microVM 依赖、镜像已缓存，
-Linux 上还要拿得到 `/dev/kvm` 时，auto 选择 `microvm`；否则 macOS 使用 `seatbelt`、Linux 上安装 `bwrap`
-（`apt install bubblewrap`）后使用 `bubblewrap`。装了 `bwrap` 还要能真正创建命名空间才算可用：
-启动后首次选择时实际起一次 `bwrap` 探测，Docker 默认权限、Ubuntu 24.04 的 AppArmor 限制下会失败并跳过，
-「选择原因」写明。均不可用时降级至 `local`——**该路径不含任何访问控制**，界面明确标红。可通过 `AGENTLAB_SANDBOX_BACKEND` 强制指定，
-亦可在代码节点上单独选择隔离档位（strict = microVM，fast = 系统沙箱）。
+The Runtime Environment (「运行环境」) settings page lists every candidate and its availability, and marks the one currently
+selected. When the microVM dependencies are installed and the image is cached — and, on Linux, `/dev/kvm` is also
+accessible — auto selects `microvm`; otherwise macOS uses `seatbelt`, and Linux uses `bubblewrap` once `bwrap` is
+installed (`apt install bubblewrap`). An installed `bwrap` counts as available only if it can actually create
+namespaces: on the first selection after startup it really launches `bwrap` once as a probe; under Docker's default
+permissions or Ubuntu 24.04's AppArmor restrictions the probe fails and `bubblewrap` is skipped, with the Selection
+reason (「选择原因」) saying so. When none is available, it degrades to `local` — **this path has no access control at all**,
+and the UI clearly marks it in red. You can force a choice with `AGENTLAB_SANDBOX_BACKEND`, or choose the isolation tier
+on an individual code node (strict = microVM, fast = OS sandbox).
 
-### 启用 microVM
+### Enabling microVM
 
-三项准备，**均为一次性**——日常启动仍只需 `./scripts/dev.sh`：
+Three preparations, **all one-time** — day-to-day startup still needs only `./scripts/dev.sh`:
 
-1. Python 包：使用 `environment.yml` 创建环境时已包含（含 `[microvm]` extra）
-2. 运行时（约 50MB，落于 `~/.microsandbox`）：每台机器一次
-3. OCI 镜像（实测约 55 秒）：每个镜像一次
+1. Python package: already included when the environment is created from `environment.yml` (including the `[microvm]`
+   extra)
+2. Runtime (about 50MB, placed in `~/.microsandbox`): once per machine
+3. OCI image (measured at about 55 seconds): once per image
 
-第 2、3 项手动执行，装完用 `doctor` 检查本机的虚拟化条件，再重启 `dev.sh`：
+Items 2 and 3 are done by hand; after installing, check this machine's virtualization support with `doctor`, then
+restart `dev.sh`:
 
 ```bash
 conda run -n agentlab python -c "exec('import asyncio, microsandbox as m\nasync def main():\n    await m.install()\nasyncio.run(main())')"
-conda run -n agentlab microsandbox pull python:3.12-slim   # 默认镜像，换了 AGENTLAB_MICROVM_IMAGE 就拉那个
+conda run -n agentlab microsandbox pull python:3.12-slim   # the default image; if you changed AGENTLAB_MICROVM_IMAGE, pull that one
 conda run -n agentlab microsandbox doctor
 ```
 
-镜像要先拉：auto 只选镜像已经缓存的 microVM（免得第一次跑代码卡一分钟），没缓存就跳过它，而镜像又只在
-microVM 里跑代码时才会拉——不手动拉，auto 永远选不到它。后端选定沙箱后整个进程都沿用，装好之后要重启 `dev.sh`
-才会重新选。不想等也可以显式指定 `AGENTLAB_SANDBOX_BACKEND=microvm`，第一次跑代码时再拉镜像。
+The image has to be pulled first: auto only selects microVM when its image is already cached (so the first code run
+doesn't hang for a minute) and skips it otherwise, while the image is only pulled when code runs inside a microVM — if
+you don't pull it by hand, auto will never select it. Once the backend has selected a sandbox, the whole process keeps
+using it, so after installing you have to restart `dev.sh` for it to select again. If you don't want to wait, you can
+also explicitly set `AGENTLAB_SANDBOX_BACKEND=microvm`, and the image is pulled the first time code runs.
 
-拉镜像报 `registry error: error sending request for url (https://index.docker.io/...)` 是连不上 Docker Hub。
-msb 认 `HTTPS_PROXY` / `ALL_PROXY`，给它指一个代理：`HTTPS_PROXY=http://<代理地址>:<端口> microsandbox pull python:3.12-slim`；
-或者从能连上的镜像源拉（写完整名字，如 `<镜像源>/library/python:3.12-slim`），再把 `AGENTLAB_MICROVM_IMAGE`
-设成同一个名字，让 AgentLab 用的正是拉下来的那一份。
+If pulling the image fails with `registry error: error sending request for url (https://index.docker.io/...)`, Docker
+Hub can't be reached. msb honors `HTTPS_PROXY` / `ALL_PROXY`, so point it at a proxy:
+`HTTPS_PROXY=http://<代理地址>:<端口> microsandbox pull python:3.12-slim` (proxy address and port); or pull from a mirror you
+can reach (write the full name, such as `<镜像源>/library/python:3.12-slim`, where `<镜像源>` is the mirror), then set
+`AGENTLAB_MICROVM_IMAGE` to the same name so AgentLab uses exactly the copy you pulled.
 
-`install` 要在正在跑的事件循环里调用：写成 `asyncio.run(m.install())` 会先在循环外调用它，报
-`RuntimeError: no running event loop`，所以包了一层 `async def`。Linux 要有 `/dev/kvm`，当前用户还得有权限——
-doctor 报「/dev/kvm is not accessible by your user」时：
+`install` has to be called inside a running event loop: writing `asyncio.run(m.install())` would call it outside the
+loop first and fail with `RuntimeError: no running event loop`, hence the extra `async def` wrapper. Linux needs
+`/dev/kvm`, and the current user also needs permission for it — when doctor reports "/dev/kvm is not accessible by your
+user":
 
 ```bash
-sudo usermod -aG kvm $USER               # 永久生效，重新登录后才算数
-sudo setfacl -m u:$USER:rw /dev/kvm      # 当前会话立即可用
+sudo usermod -aG kvm $USER               # permanent; takes effect only after you log in again
+sudo setfacl -m u:$USER:rw /dev/kvm      # usable immediately in the current session
 ```
 
-也可以直接 `microsandbox doctor --fix`。改完再跑一次 doctor，应当全是 ✓。doctor 全绿不等于第 2 项装好了：
-它只查 wheel 里自带的 msb 和 libkrunfw，AgentLab 用 `microsandbox.is_installed()` 判断，看的是 `~/.microsandbox`，
-所以上面那条安装命令照样要跑。
+You can also just run `microsandbox doctor --fix`. Run doctor again afterwards, and everything should be ✓. All green in
+doctor doesn't mean item 2 is installed: doctor only checks the msb and libkrunfw bundled in the wheel, whereas AgentLab
+decides with `microsandbox.is_installed()`, which looks at `~/.microsandbox` — so you still have to run the install
+command above.
 
-三项均落于磁盘，重启机器或重开终端无需重来。设置页「运行环境」中 `microvm` 条目的
-`warm` 为 true 即表示三项齐备，auto 将自动升级至 `microvm`。镜像可通过
-`AGENTLAB_MICROVM_IMAGE` 更换，闲置 VM 回收时间由 `AGENTLAB_MICROVM_IDLE_SECONDS` 控制。
+All three live on disk, so restarting the machine or reopening the terminal doesn't mean redoing them. When the
+`microvm` entry on the Runtime Environment (「运行环境」) settings page shows `warm` as true, all three are in place, and auto
+will upgrade to `microvm` automatically. The image can be changed with `AGENTLAB_MICROVM_IMAGE`, and how long idle VMs
+are kept before being reclaimed is controlled by `AGENTLAB_MICROVM_IDLE_SECONDS`.
 
-### 可选依赖
+### Optional Dependencies
 
-`environment.yml` 默认已经全部装上。单独补装时带上锁文件，版本才和测过的一致：
+`environment.yml` installs all of them by default. When installing extras separately, pass the lock file so the versions
+match what was tested:
 
 ```bash
-pip install -e 'backend[docs]' -c backend/requirements.lock     # PDF / Word / PowerPoint / Excel 解析
-pip install -e 'backend[db]' -c backend/requirements.lock       # MySQL / PostgreSQL / Oracle 驱动
-pip install -e 'backend[microvm]' -c backend/requirements.lock  # microVM 沙箱
-pip install -e 'backend[postgres]' -c backend/requirements.lock # 应用库用 PostgreSQL（asyncpg、psycopg 3、官方断点库）
+pip install -e 'backend[docs]' -c backend/requirements.lock     # PDF / Word / PowerPoint / Excel parsing
+pip install -e 'backend[db]' -c backend/requirements.lock       # MySQL / PostgreSQL / Oracle drivers
+pip install -e 'backend[microvm]' -c backend/requirements.lock  # microVM sandbox
+pip install -e 'backend[postgres]' -c backend/requirements.lock # PostgreSQL for the app database (asyncpg, psycopg 3, the official checkpoint library)
 pip install -e 'backend[dev]' -c backend/requirements.lock      # pytest
 ```
 
-### 依赖与锁文件
+### Dependencies and the Lock File
 
-`backend/pyproject.toml` 写版本范围，`backend/requirements.lock` 写精确版本：后端全部
-依赖（含间接依赖、全部 extras）锁在测试跑过的那一套上，跨平台通用。`environment.yml`
-装包时以它为约束，所以换一台机器装到的也是同一套。
+`backend/pyproject.toml` specifies version ranges and `backend/requirements.lock` specifies exact versions: all backend
+dependencies (including transitive dependencies and all extras) are locked to the set the tests ran against, and the
+lock works across platforms. `environment.yml` uses it as a constraint when installing packages, so another machine gets
+the same set too.
 
-LangGraph / LangChain 一族在 `pyproject.toml` 里只放行到下一个小版本：引擎直接依赖
-它们的断点格式、interrupt / resume 和流式事件，这些在小版本里也改过行为。断点格式本身在
-`langgraph-checkpoint` 里（langgraph 只要求它 <5，所以单独卡住）；SQLite、PostgreSQL 两个断点库
-（`langgraph-checkpoint-sqlite`、`langgraph-checkpoint-postgres`）都按它读写，`copy-to-postgres` 搬断点也靠两边是同一版格式。
-`langgraph-checkpoint-postgres` 3.1.3 起要 `langgraph-checkpoint` 4.3，锁在 3.1.2，升级时三个一起动。aiosqlite
-与 SQLAlchemy 同理——`db/base.py` 给 aiosqlite 打了补丁，连接池断开连接时会走到它；应用库换成 PostgreSQL 之后
-补丁照样打着：上传表格、手工登记的 SQLite 数据源还走 aiosqlite。
+The LangGraph / LangChain family is allowed only up to the next minor version in `pyproject.toml`: the engine depends
+directly on their checkpoint format, interrupt / resume, and streaming events, and these have changed behavior even in
+minor releases. The checkpoint format itself lives in `langgraph-checkpoint` (langgraph only requires it to be <5, so
+it's pinned separately); both checkpoint libraries, for SQLite and for PostgreSQL (`langgraph-checkpoint-sqlite`,
+`langgraph-checkpoint-postgres`), read and write according to it, and `copy-to-postgres` can move checkpoints only
+because both sides use the same version of the format. From 3.1.3 on, `langgraph-checkpoint-postgres` requires
+`langgraph-checkpoint` 4.3, so it's locked at 3.1.2, and the three have to be upgraded together. The same goes for
+aiosqlite and SQLAlchemy — `db/base.py` patches aiosqlite, and the connection pool runs into that patch when it closes
+connections; after the app database moves to PostgreSQL the patch stays in place, because uploaded spreadsheets and
+manually registered SQLite data sources still go through aiosqlite.
 
-`[postgres]` 里是应用库用 PostgreSQL 时要的：SQLAlchemy 这边走 asyncpg（和 `[db]` 里连业务库的是同一个包），
-断点库走官方的 `langgraph-checkpoint-postgres`，它只认 psycopg 3 和 `psycopg-pool`。psycopg 带 `[binary]`：
-wheel 里自带 libpq，镜像和本机都不用另装 PostgreSQL 客户端。
+`[postgres]` holds what the app database needs on PostgreSQL: on the SQLAlchemy side it goes through asyncpg (the same
+package `[db]` uses to connect to business databases), and the checkpoint library is the official
+`langgraph-checkpoint-postgres`, which only works with psycopg 3 and `psycopg-pool`. psycopg comes with `[binary]`:
+libpq is bundled in the wheel, so neither the image nor the local machine needs a separately installed PostgreSQL
+client.
 
-升级依赖要主动做，改完跑一遍测试再提交：
+Upgrading dependencies is something you do deliberately; after changing them, run the tests once before committing:
 
 ```bash
-./scripts/lock-deps.sh --upgrade-package langgraph   # 升一个包（连带它必须跟着动的）
-./scripts/lock-deps.sh --upgrade                     # 全部升到 pyproject 允许的最新
-./scripts/lock-deps.sh                               # 只加了新依赖：补上它，已锁的不动
-pip install -e 'backend[microvm,dev,db,docs,postgres]' -c backend/requirements.lock   # 装到当前环境
+./scripts/lock-deps.sh --upgrade-package langgraph   # upgrade one package (plus whatever has to move with it)
+./scripts/lock-deps.sh --upgrade                     # upgrade everything to the latest that pyproject allows
+./scripts/lock-deps.sh                               # only added a new dependency: add it and leave the locked ones alone
+pip install -e 'backend[microvm,dev,db,docs,postgres]' -c backend/requirements.lock   # install into the current environment
 ```
 
-重新生成锁文件需要 [uv](https://docs.astral.sh/uv/)；装依赖本身只用 pip。
+Regenerating the lock file requires [uv](https://docs.astral.sh/uv/); installing the dependencies themselves uses only
+pip.
 
-### 数据位置
+### Data Location
 
-全部位于 `data/`：`agentlab.db` 业务数据、`checkpoints.db` 执行断点、
-`artifacts/` 工件库、`workspace/` 沙箱文件、`uploads/` 上传文件、`records/` 填报登记的记录表、`files/` 表单附件、
-`.secret_key` 加密密钥。
-删除 `data/` 即恢复出厂设置。应用库用 PostgreSQL 时（下一节）不再用 `agentlab.db`、`checkpoints.db`，业务数据和断点
-都在 PostgreSQL 里；别的照旧在 `data/`，数据目录照样要有、要备份。
+Everything lives in `data/`: `agentlab.db` for application data, `checkpoints.db` for execution checkpoints,
+`artifacts/` for the artifact store, `workspace/` for sandbox files, `uploads/` for uploaded files, `records/` for the
+form-submission record tables, `files/` for form attachments, and `.secret_key` for the encryption key. Deleting `data/`
+restores factory settings. When the app database uses PostgreSQL (next section), `agentlab.db` and `checkpoints.db` are
+no longer used, and the application data and checkpoints are both in PostgreSQL; everything else stays in `data/` as
+before, so you still need the data directory and still need to back it up.
 
-### 用 PostgreSQL
+### Using PostgreSQL
 
-缺省的应用库是数据目录里的 SQLite：单机单进程，什么都不用装。换成 PostgreSQL 之后才能多进程（[多进程](#多进程)）。要把应用库（工作流、运行、事件、审批、待办、数据目录、
-评测……）和执行断点放进 PostgreSQL，设一项：
+The default app database is SQLite in the data directory: one machine, one process, nothing to install. Running multiple
+processes is possible only after switching to PostgreSQL ([Multiple Processes](#multiple-processes)). To put the app
+database (workflows, runs, events, approvals, tasks, data catalog, evaluations…) and the execution checkpoints in
+PostgreSQL, set one variable:
 
 ```bash
-AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agentlab   # postgresql:// 也认
+AGENTLAB_DATABASE_URL=postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agentlab   # postgresql:// is accepted too
 ```
 
-- 要 `[postgres]` 额外依赖（`environment.yml`、Docker 镜像都已带上）；库要先建好（`CREATE DATABASE agentlab`），
-  表由服务启动时建，老版本建的库启动时补列补索引，同 SQLite。启动日志第一句写用的是哪种库、哪台主机哪个库（不写密码）。
-- 没装 `[postgres]` 就设了这一项，启动时直接报要装什么（`pip install -e 'backend[postgres]' -c backend/requirements.lock`）。
-- SSL：地址后加 `?sslmode=require`（或 `verify-ca`、`verify-full`；asyncpg 的写法 `?ssl=require` 也认），启动时换成 asyncpg
-  认的参数。证书文件不写在地址里（asyncpg 不收 `sslrootcert` 这类参数，写了启动就报错），设环境变量 `PGSSLROOTCERT`、
-  `PGSSLCERT`、`PGSSLKEY`——应用库的 asyncpg 和断点库的 libpq 都认。地址里别的 libpq 参数（`application_name`、
-  `connect_timeout` 之类）asyncpg 也不收，同样启动时报出来。
-- 断点（LangGraph 的 checkpoints、checkpoint_blobs、checkpoint_writes、checkpoint_migrations 四张表，不和应用的表重名）
-  缺省放在同一个库；要放别处设 `AGENTLAB_CHECKPOINT_URL=postgresql://…`（这一项是 libpq 的写法，`sslrootcert` 等可以直接写）。
-- 连接池：每个进程常驻 `AGENTLAB_DB_POOL_SIZE`（缺省 10）条、高峰再多开 `AGENTLAB_DB_MAX_OVERFLOW`（缺省 20）条，取连接前探活，
-  30 分钟换一次；断点库另有一个小池子。前面有 PgBouncer 时照下面「直连与 PgBouncer」的三种部署写（事务模式要开
-  `AGENTLAB_DB_PGBOUNCER=1` 并另给直连地址）。
-- 连接数的账：每个进程最多 `AGENTLAB_DB_POOL_SIZE + AGENTLAB_DB_MAX_OVERFLOW`（缺省 10 + 20 = 30）条应用库连接，断点库的池子
-  最多 `min(AGENTLAB_MAX_CONCURRENT_RUNS, 20)` 条（至少 4，缺省 20），合起来一个进程最多 50 条；导入命令另占几条。PostgreSQL
-  缺省 `max_connections=100`，还要留几条给 `psql`、备份和超级用户（`superuser_reserved_connections` 缺省 3）：一个进程够用，
-  起几个进程就是几倍——要么把 `max_connections` 调大（约「进程数 × 50 + 20」），要么调小两边的池子（比如 POOL_SIZE=5、
-  MAX_OVERFLOW=10、MAX_CONCURRENT_RUNS=10，一个进程最多 25 条），要么前面放 PgBouncer。
-- 和 SQLite 上的行为一致：字符串列不限长（SQLite 本来就不查长度，模型里写的长度只是示意）、文本按字节比大小和排序
-  （列上带 COLLATE "C"，同 SQLite，不看建库时选的区域设置）、整数列是 BIGINT、JSON 列存原文（PostgreSQL 的 json，不是 JSONB：
-  JSONB 会重排对象里的键）、时间存不带时区的 UTC、排序时可空列的 NULL 照 SQLite 的位置（升序在前、降序在后；只管直接按列
-  排的，按聚合、coalesce 之类的表达式排的不管，列表都另带了 id 之类的决胜键，并列时两种库排出来一样）、按 JSON 里的键筛选
-  按 JSON 的类型比（true 不等于 1）。两处 SQLite 照存而 PostgreSQL 不收的值会被换掉：JSON 里的 NaN / Infinity 写成 null，
-  文本（JSON 里的、普通文本列里的）中的 NUL 字符去掉。
-- 不分大小写的搜索（运行列表按名字、对象索引按注释）：文本列是 COLLATE "C"，列上的 ILIKE 只认 ASCII 的大小写，所以按建库时的
-  区域设置折大小写——建库用 `en_US.UTF-8`、`C.UTF-8` 这类区域，É/é、全角Ａ/ａ 都认；用纯 `C` 区域建的库只认 ASCII。
-- `AGENTLAB_DATA_DIR` 照旧要设：工件、上传表格的版本库、原件、附件、记录表、沙箱工作区、`.secret_key` 都还是文件。
-- 启动时库还连不上（和库的容器一起起、库还在初始化）：按退避重试（1、2、4、5、5… 秒），每次打一条「应用库还没就绪」，最多等
-  `AGENTLAB_DB_STARTUP_TIMEOUT`（缺省 90）秒再报错退出；密码不对、库不存在这种等也没用的（SQLSTATE 28、3D、42 类）立刻报错。
-  建表、补列补索引在库里的咨询锁里做，默认数据在跨进程的锁里补，几个工作进程同时起各只做一次。
+- It needs the `[postgres]` extra (already included in `environment.yml` and in the Docker image); the database has to
+  be created first (`CREATE DATABASE agentlab`), and the tables are created when the service starts; for a database
+  created by an older version, missing columns and indexes are added at startup, the same as with SQLite. The first line
+  of the startup log states which kind of database is in use, and which host and which database (without the password).
+- If you set this without having installed `[postgres]`, startup fails right away and says what to install
+  (`pip install -e 'backend[postgres]' -c backend/requirements.lock`).
+- SSL: append `?sslmode=require` to the URL (or `verify-ca`, `verify-full`; asyncpg's own `?ssl=require` is accepted
+  too), which is converted at startup into the parameter asyncpg understands. Certificate files don't go in the URL
+  (asyncpg doesn't accept parameters like `sslrootcert`, and startup fails if you include them); set the environment
+  variables `PGSSLROOTCERT`, `PGSSLCERT`, and `PGSSLKEY` instead — both the app database's asyncpg and the checkpoint
+  library's libpq honor them. asyncpg doesn't accept other libpq parameters in the URL either (`application_name`,
+  `connect_timeout`, and the like), and these are likewise reported at startup.
+- Checkpoints (LangGraph's four tables checkpoints, checkpoint_blobs, checkpoint_writes, and checkpoint_migrations,
+  whose names don't clash with the app's tables) go into the same database by default; to put them elsewhere, set
+  `AGENTLAB_CHECKPOINT_URL=postgresql://…` (this one uses libpq syntax, so `sslrootcert` and the like can be written in
+  it directly).
+- Connection pool: each process keeps `AGENTLAB_DB_POOL_SIZE` (default 10) connections open and opens up to
+  `AGENTLAB_DB_MAX_OVERFLOW` (default 20) more at peak, checks liveness before handing out a connection, and replaces
+  each connection every 30 minutes; the checkpoint library has a separate small pool. With PgBouncer in front, follow
+  the three deployments in "Direct connections and PgBouncer" below (transaction mode requires turning on
+  `AGENTLAB_DB_PGBOUNCER=1` and giving a separate direct-connection URL).
+- Counting connections: each process uses at most `AGENTLAB_DB_POOL_SIZE + AGENTLAB_DB_MAX_OVERFLOW` (default 10 + 20 = 30)
+  app database connections, and the checkpoint library's pool at most `min(AGENTLAB_MAX_CONCURRENT_RUNS, 20)` (at least
+  4, default 20), for a total of at most 50 per process; the import command takes a few more. PostgreSQL defaults to
+  `max_connections=100`, and you also have to leave a few for `psql`, backups, and superusers
+  (`superuser_reserved_connections` defaults to 3): one process fits, but N processes need N times as many — either
+  raise `max_connections` (roughly "number of processes × 50 + 20"), shrink both pools (for example POOL_SIZE=5,
+  MAX_OVERFLOW=10, MAX_CONCURRENT_RUNS=10, for at most 25 per process), or put PgBouncer in front.
+- Behavior matches SQLite: string columns have no length limit (SQLite never checks length anyway; lengths written in
+  the ORM models are only indicative); text is compared and sorted by bytes (columns carry COLLATE "C", as in SQLite,
+  regardless of the locale chosen when the database was created); integer columns are BIGINT; JSON columns store the raw
+  text (PostgreSQL json, not JSONB: JSONB reorders the keys of objects); times are stored as UTC without a time zone;
+  when sorting, NULLs in nullable columns take SQLite's positions (first in ascending order, last in descending; this
+  covers only sorting directly by a column, not by expressions such as aggregates or coalesce — lists all carry an extra
+  tie-breaker such as id, so ties sort the same on both databases); and filtering by a key inside JSON compares by JSON
+  type (true doesn't equal 1). Two kinds of values that SQLite stores but PostgreSQL rejects are replaced: NaN /
+  Infinity in JSON are written as null, and NUL characters in text (inside JSON or in ordinary text columns) are
+  removed.
+- Case-insensitive search (the run list by name, the object index by comment): text columns are COLLATE "C", and ILIKE
+  on such a column only handles ASCII case, so case folding follows the locale chosen when the database was created —
+  with a locale such as `en_US.UTF-8` or `C.UTF-8`, É/é and fullwidth Ａ/ａ both match; a database created with the plain
+  `C` locale handles only ASCII.
+- You still have to set `AGENTLAB_DATA_DIR`: artifacts, uploaded spreadsheets' version databases, originals,
+  attachments, record tables, sandbox workspaces, and `.secret_key` are all still files.
+- When the database can't be reached yet at startup (started together with the database's container while the database
+  is still initializing): it retries with backoff (1, 2, 4, 5, 5… seconds), logging "App database not ready yet"
+  (「应用库还没就绪」) each time, and waits at most `AGENTLAB_DB_STARTUP_TIMEOUT` (default 90) seconds before exiting with an
+  error; errors that waiting won't fix, such as a wrong password or a database that doesn't exist (SQLSTATE classes 28,
+  3D, 42), fail immediately. Creating tables and adding columns and indexes happen under an advisory lock in the
+  database, and default data is filled in under a cross-process lock, so when several worker processes start at the same
+  time, each of these is done only once.
 
-**和库一起起。** 部署：离线包的 `./deploy.sh install --postgres` 带一个内置 PostgreSQL，`migrate-to-postgres` 把 SQLite 的部署切过去
-（[deploy/README.md](deploy/README.md)「用 PostgreSQL」）。开发：`./scripts/dev.sh --postgres` 起（已经有就复用）一个本地的
-`postgres:16` 容器 `agentlab-dev-postgres`，只开在 `127.0.0.1:55432`，数据在 docker 数据卷 `agentlab-dev-pgdata`，密码第一次
-自动生成在 `data/.postgres-dev/`（后端按 `PGPASSFILE` 读），后端照它设 `AGENTLAB_DATABASE_URL`；Ctrl-C 只停前后端，库的容器
-留着下次复用。容器名、端口、数据卷、镜像用 `AGENTLAB_DEV_PG_CONTAINER`、`AGENTLAB_DEV_PG_PORT`、`AGENTLAB_DEV_PG_VOLUME`、
-`AGENTLAB_DEV_PG_IMAGE` 改（环境变量，或写在 `.env` 里，环境变量优先；`.env.example` 列着应用库、连接池、PgBouncer、多进程和这几项）。不加 `--postgres` 和原来一样：SQLite，不用 docker。
+**Starting together with the database.** Deployment: the offline bundle's `./deploy.sh install --postgres` comes with a
+built-in PostgreSQL, and `migrate-to-postgres` switches an SQLite deployment over (see "Using PostgreSQL"
+(「用 PostgreSQL」) in [deploy/README.md](deploy/README.md)). Development: `./scripts/dev.sh --postgres` starts (or reuses,
+if it already exists) a local `postgres:16` container, `agentlab-dev-postgres`, exposed only on `127.0.0.1:55432`, with
+its data in the docker volume `agentlab-dev-pgdata`; the password is generated automatically the first time in
+`data/.postgres-dev/` (the backend reads it via `PGPASSFILE`), and the backend's `AGENTLAB_DATABASE_URL` is set to point
+at that container; Ctrl-C stops only the frontend and backend, and the database container is kept for reuse next time.
+Change the container name, port, volume, and image with `AGENTLAB_DEV_PG_CONTAINER`, `AGENTLAB_DEV_PG_PORT`,
+`AGENTLAB_DEV_PG_VOLUME`, and `AGENTLAB_DEV_PG_IMAGE` (as environment variables or in `.env`, with environment variables
+taking precedence; `.env.example` lists the app database, connection pool, PgBouncer, and multi-process settings, plus
+these). Without `--postgres`, everything is as before: SQLite, no docker.
 
-**从 SQLite 搬过来。** `python -m app.db copy-to-postgres` 把数据目录里的 `agentlab.db` 和 `checkpoints.db` 导进 PostgreSQL，
-停在审批上的、中断了的运行导过去之后照样能接着跑：
+**Moving over from SQLite.** `python -m app.db copy-to-postgres` imports `agentlab.db` and `checkpoints.db` from the
+data directory into PostgreSQL, and runs paused at an approval or interrupted can still continue after the import:
 
 ```bash
-# 1. 停服务（导入会检查：来源旁边还留着 agentlab.db-wal / checkpoints.db-wal，或者目标库上已经有服务连着，就拒绝）
-# 2. 备份数据目录（停着服务拷一份）
-# 3. 只核对：数来源有多少、目标上已有多少，什么都不写
+# 1. Stop the service (the import checks for this: if agentlab.db-wal / checkpoints.db-wal is still next to the source, or a service is already connected to the target database, it refuses)
+# 2. Back up the data directory (copy it while the service is stopped)
+# 3. Verify only: count what the source has and what the target already has, writing nothing
 cd backend && python -m app.db copy-to-postgres ../data postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agentlab --dry-run
-# 4. 导入：建表、按外键先后逐表分批插入，结束时逐表按主键核对、断点按条数核对，有没导进去的退出码非零
+# 4. Import: create the tables and insert table by table in batches in foreign-key order; at the end, verify each table by primary key and the checkpoints by count; the exit code is non-zero if anything wasn't imported
 cd backend && python -m app.db copy-to-postgres ../data postgresql+asyncpg://agentlab:<密码>@127.0.0.1:5432/agentlab
-# 5. 设 AGENTLAB_DATABASE_URL（AGENTLAB_DATA_DIR 还指着原来的数据目录），起服务
+# 5. Set AGENTLAB_DATABASE_URL (with AGENTLAB_DATA_DIR still pointing at the original data directory) and start the service
 ```
 
-- 目标地址不给就用 `AGENTLAB_DATABASE_URL`；`--checkpoint-url` 把断点导到另一个库；`--work-dir` 放快照（要留出和两个库一样大的
-  空间，缺省系统临时目录）。读的是 SQLite 备份接口拷出的一份快照，在快照上先补到当前的表结构，来源的内容不改。
-- 重跑是幂等的：目标上已有同一主键（或撞了别的唯一约束）的行一律不动，只补上还没有的，不重复、也不覆盖——所以导入之后又在
-  SQLite 上改过的行，重跑不会带过去；要整份重来就清空目标库再导。断点同理，已有的不重写。
-- 能查到的只有上面两样：服务连着别的数据目录、另一台机器上的服务连着目标库，查不出来，要自己保证。服务正常停下时会关掉
-  所有连接、-wal 随之消失；还在的是上次强杀留下的，确认服务已停后加 `--assume-stopped`。
-- 老库里 SQLite 存得下、PostgreSQL 不收的会先在快照上处理、在报告里照实列出：老版本补列时没带缺省值、留着 NULL 的 NOT NULL 列
-  填成模型的缺省值（启动时的迁移在 SQLite 上也这么填，两边存的一样）；**孤儿行**——外键指向已经不在的行（SQLite 当时没强制
-  外键留下的）——外键是 SET NULL 的置空，别的（CASCADE、不可空）不导入，按表列出条数，不算核对失败（父行被删时它们本来就该
-  跟着删）。自增主键的序列接在 SQLite 用过的最大号后面（删过的号不复用）。
-- 导完 `agentlab.db` 留在数据目录里也没关系（可以当回退用）：它照样算 AgentLab 自己的文件，不能登记成数据源。
+- Without a target URL, `AGENTLAB_DATABASE_URL` is used; `--checkpoint-url` imports the checkpoints into a different
+  database; `--work-dir` holds the snapshot (leave as much space as the two databases take up; defaults to the system
+  temp directory). It reads a snapshot copied out through SQLite's backup API, first brings the snapshot up to the
+  current schema, and never changes the source's contents.
+- Rerunning is idempotent: rows the target already has with the same primary key (or that collide with another unique
+  constraint) are left untouched, and only the missing ones are added, with no duplicates and no overwrites — so rows
+  changed on SQLite after the import won't be carried over by a rerun; to redo everything, empty the target database and
+  import again. Checkpoints work the same way: existing ones aren't rewritten.
+- Only the two things above can be checked: a service connected to a different data directory, or a service on another
+  machine connected to the target database, can't be detected, and you have to make sure of that yourself. When the
+  service stops normally it closes all its connections and the -wal files go away with them; any still present were left
+  by a previous force-kill — after confirming the service is stopped, add `--assume-stopped`.
+- Data in old databases that SQLite can store but PostgreSQL won't accept is handled on the snapshot first and listed
+  plainly in the report: NOT NULL columns left holding NULL because an old version added the column without a default
+  are filled with the ORM model's default (the startup migration fills them the same way on SQLite, so both sides store
+  the same thing); **orphan rows** — rows whose foreign key points at a row that no longer exists (left over because
+  SQLite didn't enforce foreign keys at the time) — have their foreign key set to null where it is SET NULL, and
+  otherwise (CASCADE, non-nullable) aren't imported; their counts are listed per table, and they don't count as
+  verification failures (they should have been deleted along with their parent rows anyway). Auto-increment primary key
+  sequences continue after the largest number SQLite has used (deleted numbers aren't reused).
+- Leaving `agentlab.db` in the data directory after the import is fine (it can serve as a fallback): it still counts as
+  AgentLab's own file and can't be registered as a data source.
 
-**备份。** PostgreSQL 用 `pg_dump`（应用表和断点在同一个库里就一次带上），数据目录照旧整份拷。两样最好在停服务时一起做；
-不停服务的话先 dump 库、再拷数据目录：工件、原件按内容寻址、只增不改，库里引用到的文件拷数据目录时都在。例外是填报的记录表
-`records/*.db`：SQLite 文件、原地追加写，开着服务直接拷可能拷到写了一半的——要么停服务拷，要么一个个用 SQLite 的备份接口拷
-（`sqlite3 data/records/x.v1.db ".backup /备份目录/x.v1.db"`）。
+**Backups.** Use `pg_dump` for PostgreSQL (if the app tables and the checkpoints are in the same database, one dump
+covers both), and copy the whole data directory as before. Ideally, do both together while the service is stopped; if
+you don't stop the service, dump the database first and then copy the data directory: artifacts and originals are
+content-addressed and append-only, so every file the database references is there when you copy the data directory. The
+exception is the form-submission record tables `records/*.db`: they're SQLite files appended in place, so copying them
+directly while the service is running may capture a half-written file — either copy them with the service stopped, or
+copy them one by one with SQLite's backup API (`sqlite3 data/records/x.v1.db ".backup /备份目录/x.v1.db"`, where `/备份目录/` is
+your backup directory).
 
-**多台机器**见下一节[多进程](#多进程)。
+For **multiple machines**, see the next section, [Multiple Processes](#multiple-processes).
 
-**测试。** `scripts/test-postgres.sh` 用本机 docker 已有的 `postgres:16` 镜像起一个临时容器（只绑 127.0.0.1 的随机端口，跑完删掉），
-在上面跑后端全量；参数原样交给 pytest。只对 SQLite 成立的测试标了 `sqlite_only`，在 PostgreSQL 上跳过。
+**Tests.** `scripts/test-postgres.sh` starts a temporary container from the `postgres:16` image already present in local
+docker (bound only to a random port on 127.0.0.1 and deleted afterwards) and runs the full backend suite against it;
+arguments are passed to pytest as they are. Tests that hold only on SQLite are marked `sqlite_only` and skipped on
+PostgreSQL.
 
-问数据每一轮的事件日志（`agentlab.db` 的 `chat_turn_events`：助手的操作、阶段、运行、复核、终局，供页面先回放再接实时）只为
-进行中的轮次服务：已结束（成功、失败、取消、中断）超过 14 天的轮次由调度循环每小时清一次、整轮删除；重开已结束的一轮读的是
-对话里那一行（答案、图、复核、用量、几次尝试），不受影响。助手等模型时的心跳只在实时流上发、不落库。
+The event log of each Ask Data (「问数据」) turn (`chat_turn_events` in `agentlab.db`: the operations of Copilot (「助手」),
+phases, runs, reviews, and final outcome, which the page replays first before switching to live) only serves turns in
+progress: turns that ended (succeeded, failed, cancelled, interrupted) more than 14 days ago are cleaned up by the
+scheduler loop once an hour and deleted as whole turns; reopening an ended turn reads that turn's row in the
+conversation (answer, graph, review, usage, number of attempts), which isn't affected. Copilot's heartbeats while it
+waits for the model are sent only on the live stream and never persisted.
 
-### 多进程
+### Multiple Processes
 
-应用库是 PostgreSQL 时可以起几个工作进程，指着同一个库、同一个数据目录：
+When the app database is PostgreSQL, you can start several worker processes that point at the same database and the same
+data directory:
 
 ```bash
-AGENTLAB_DATABASE_URL=postgresql+asyncpg://… ./scripts/prod.sh --workers 4      # 一台机器、uvicorn 起 4 个进程共用一个端口
-AGENTLAB_WORKERS=4 …                                                             # Docker：agentlab.env 里加这一行（deploy/README.md）
+AGENTLAB_DATABASE_URL=postgresql+asyncpg://… ./scripts/prod.sh --workers 4      # one machine: uvicorn starts 4 processes sharing one port
+AGENTLAB_WORKERS=4 …                                                             # Docker: add this line to agentlab.env (deploy/README.md)
 ```
 
-几个容器、几台机器各起一份也行（前面挂一个负载均衡，WebSocket、SSE 不需要粘性会话）。**SQLite 只支持单进程**：数据目录上有一把
-文件锁，第二个进程拒绝启动、照实报错；`AGENTLAB_WORKERS` 大于 1 而应用库是 SQLite 时同样拒绝。
+Starting one copy each in several containers or on several machines also works (put a load balancer in front; WebSocket
+and SSE don't need sticky sessions). **SQLite supports a single process only**: there's a file lock on the data
+directory, so a second process refuses to start and says so plainly; it likewise refuses when `AGENTLAB_WORKERS` is
+greater than 1 while the app database is SQLite.
 
-| 配置 | 缺省 | 说的是什么 |
+| Setting | Default | What it means |
 | --- | --- | --- |
-| `AGENTLAB_WORKERS` | 1 | 起几个工作进程（`prod.sh`、Docker 的入口按它给 uvicorn `--workers`） |
-| `AGENTLAB_WORKER_HEARTBEAT_S` | 5 | 每个进程隔多久续一次租约、取一次发给自己的请求（停止之类） |
-| `AGENTLAB_WORKER_LEASE_S` | 30 | 租约多长（至少是心跳的 3 倍）：进程没了（强杀、断电）多久之后别的进程接手 |
-| `AGENTLAB_SCHEDULER_TICK_S` | 15 | 调度循环一拍的间隔 |
+| `AGENTLAB_WORKERS` | 1 | How many worker processes to start (`prod.sh` and the Docker entrypoint pass it to uvicorn as `--workers`) |
+| `AGENTLAB_WORKER_HEARTBEAT_S` | 5 | How often each process renews its lease and picks up the requests sent to it (such as stops) |
+| `AGENTLAB_WORKER_LEASE_S` | 30 | How long a lease lasts (at least 3 times the heartbeat): how long after a process dies (force-killed, power loss) another process takes over |
+| `AGENTLAB_SCHEDULER_TICK_S` | 15 | Interval between ticks of the scheduler loop |
 
-连接数照上一节「连接数的账」按进程数乘，另外每个进程多一条专门收发进程间通知（LISTEN / NOTIFY）的连接，不占连接池；跨进程的锁
-（会话级咨询锁）持锁期间占一条。
+Multiply the connection count from "Counting connections" in the previous section by the number of processes; in
+addition, each process has one extra connection dedicated to sending and receiving inter-process notifications (LISTEN /
+NOTIFY), which doesn't come out of the connection pool, and a cross-process lock (a session-level advisory lock)
+occupies one connection while it's held.
 
-**直连与 PgBouncer。** 有几样连接依赖会话状态：收发进程间通知的那一条（LISTEN）、跨进程的锁（会话级咨询锁，取锁和放锁要在同一条
-会话上）、断点库（预备语句，建表时取会话锁）。普通查询走 `AGENTLAB_DATABASE_URL`；设了 `AGENTLAB_DATABASE_DIRECT_URL`（写法同它）
-时，上面这几样走直连地址（断点库缺省也走它，`AGENTLAB_CHECKPOINT_URL` 另给的除外）；不设就全用同一个地址。三种部署：
+**Direct connections and PgBouncer.** A few kinds of connections depend on session state: the one that sends and
+receives inter-process notifications (LISTEN), cross-process locks (session-level advisory locks, which must be acquired
+and released on the same session), and the checkpoint library (prepared statements, plus a session lock when creating
+tables). Ordinary queries go through `AGENTLAB_DATABASE_URL`; when `AGENTLAB_DATABASE_DIRECT_URL` is set (with the same
+syntax), the connections above go through the direct-connection URL (the checkpoint library uses it by default too,
+unless `AGENTLAB_CHECKPOINT_URL` is given separately); when it isn't set, everything uses the same URL. Three
+deployments:
 
-| 部署 | 怎么设 |
+| Deployment | How to configure |
 | --- | --- |
-| 直连 PostgreSQL | 只设 `AGENTLAB_DATABASE_URL`。最简单，多进程建议这样 |
-| PgBouncer 会话模式（`pool_mode=session`） | `AGENTLAB_DATABASE_URL` 指 PgBouncer 就行：会话模式下一个客户端连接独占一条服务端连接，会话状态都在 |
-| PgBouncer 事务模式（`pool_mode=transaction`） | `AGENTLAB_DATABASE_URL` 指 PgBouncer，另设 `AGENTLAB_DB_PGBOUNCER=1` 和 `AGENTLAB_DATABASE_DIRECT_URL`（直连 PostgreSQL，或指 PgBouncer 的会话模式那个库）。没给直连地址时拒绝启动 |
+| Direct PostgreSQL | Set only `AGENTLAB_DATABASE_URL`. The simplest, and the recommended setup for multiple processes |
+| PgBouncer session mode (`pool_mode=session`) | Just point `AGENTLAB_DATABASE_URL` at PgBouncer: in session mode each client connection has a server connection to itself, so all the session state is there |
+| PgBouncer transaction mode (`pool_mode=transaction`) | Point `AGENTLAB_DATABASE_URL` at PgBouncer, and also set `AGENTLAB_DB_PGBOUNCER=1` and `AGENTLAB_DATABASE_DIRECT_URL` (direct to PostgreSQL, or to PgBouncer's session-mode database). Startup is refused when no direct URL is given |
 
-`AGENTLAB_DB_PGBOUNCER=1` 做的事（只对普通地址）：不用客户端的连接池（交给 PgBouncer）；关掉 SQLAlchemy 和 asyncpg 的预备语句缓存
-（事务模式下下一条语句可能落在另一条服务端连接上，缓存着的预备语句在那边不存在）；asyncpg 每条语句仍先预备再执行（SQLAlchemy 的
-asyncpg 方言一律这样做，同一个事务里、在同一条服务端连接上），名字用随机的，不和别的客户端留下的撞名——PgBouncer 那边要配
-`server_reset_query = DISCARD ALL` 加 `server_reset_query_always = 1` 收掉留下的预备语句，或用 1.21 以上开 `max_prepared_statements`。
-事务级的咨询锁（发名额、同源队、建表时用）在事务模式下照常成立：取锁、放锁在同一个事务里。这几条照 SQLAlchemy、asyncpg、psycopg
-的文档和代码核过，没有在真的 PgBouncer 上跑过（本机没有它的镜像）。
+What `AGENTLAB_DB_PGBOUNCER=1` does (only for the ordinary URL): it doesn't use the client-side connection pool (leaving
+that to PgBouncer); it turns off SQLAlchemy's and asyncpg's prepared statement caches (in transaction mode the next
+statement may land on a different server connection, where the cached prepared statement doesn't exist); asyncpg still
+prepares each statement before executing it (SQLAlchemy's asyncpg dialect always does this, within the same transaction
+and on the same server connection), using random names so they don't collide with ones left behind by other clients — on
+the PgBouncer side, configure `server_reset_query = DISCARD ALL` plus `server_reset_query_always = 1` to clean up
+leftover prepared statements, or use 1.21 or later with `max_prepared_statements` turned on. Transaction-level advisory
+locks (used when handing out slots, for same-source queues, and when creating tables) still hold in transaction mode:
+the lock is acquired and released within the same transaction. These points were checked against the documentation and
+code of SQLAlchemy, asyncpg, and psycopg, but haven't been run against a real PgBouncer (there's no image for it on this
+machine).
 
-**认领和租约。** 每个进程在库里登记一行（主机、pid、启动时的随机串），隔一拍心跳续租约。运行、问数据的一轮、后台任务（探查、起草、
-剖析、评测、影子起草）、处理中的文档、执行中的发布单都记着认领它的进程；租约按进程算，进程没了它认领的行一起到期。平稳关停的进程
-交班、删掉自己的登记，别的进程马上接手；强杀的等租约过期。启动时的整理只碰属主不在了的行，绝不碰别的活进程的。接手的规矩：
+**Claims and leases.** Each process registers a row in the database (host, pid, a random string generated at startup)
+and renews its lease on every heartbeat tick. Runs, Ask Data turns, background jobs (introspection, drafting, profiling,
+evaluation, shadow drafting), documents being processed, and publish plans being executed all record the process that
+claimed them; leases are per process, so when a process dies, all the rows it claimed expire together. A process that
+shuts down gracefully hands over and deletes its own registration, and other processes take over immediately; for a
+force-killed one, they wait for its lease to expire. The cleanup at startup only touches rows whose owner is gone, and
+never those of other live processes. The takeover rules:
 
-| 什么 | 属主不在了之后 |
+| What | After the owner is gone |
 | --- | --- |
-| 在跑的运行 | 标中断（可从断点继续运行），补一条「服务上次未正常关闭」——不自动重跑有副作用的步骤，人点「继续运行」 |
-| 排队的运行 | 标失败（从没开始执行，没有断点，「恢复」只会伪造一份结果），补一条失败原因 |
-| 停在审批上的运行 | 不属于任何进程：谁收到决定谁接着跑，同一个决定只会被一个进程执行（审批和运行都是带条件的更新） |
-| 问数据的一轮 | 还在建图的标中断（可「重试本轮」）；已经发起运行的，接手的进程接着等这次运行、照常复核收尾 |
-| 起草、剖析、探查、评测、影子起草 | 标中断（没做完的表、题记停止），界面上点「重试」接着做 |
-| 处理中的文档、执行中的发布单 | 文档标失败（请重新上传）；发布单改成停下、停在没做完的那一步，可以接着做 |
-| 待审批、结果未知的写入 | 缺了待办的补建；结果未知、还没安排核实的补上核实（所属运行还在别的活进程里执行的不碰） |
+| Running runs | Marked interrupted (can be continued from the checkpoint), with an added note "The service did not shut down cleanly last time" (「服务上次未正常关闭」) — steps with side effects aren't rerun automatically; a person clicks Continue Run (「继续运行」) |
+| Queued runs | Marked failed (they never started executing and have no checkpoint, so "resuming" could only fabricate a result), with a failure reason added |
+| Runs paused at an approval | Belong to no process: whoever receives the decision carries on, and the same decision is executed by only one process (approvals and runs are both updated conditionally) |
+| Ask Data turns | Ones still building the graph are marked interrupted (Retry This Turn (「重试本轮」) is available); for ones that have already started a run, the process that takes over keeps waiting for that run, then reviews and wraps up as usual |
+| Drafting, profiling, introspection, evaluation, shadow drafting | Marked interrupted (unfinished tables and questions are recorded as stopped); click Retry (「重试」) in the UI to carry on |
+| Documents being processed, publish plans being executed | Documents are marked failed (please upload again); publish plans are changed to stopped, halted at the step that didn't finish, and can be continued |
+| Pending approvals, writes with unknown results | Missing tasks are created; for unknown results with no verification scheduled yet, verification is added (ones whose run is still executing in another live process are left alone) |
 
-**停止。** 运行、问数据的一轮、后台任务在别的进程上跑时，「停止」写一条给属主的请求（PostgreSQL 上 NOTIFY 叫醒它，最迟一拍心跳），
-属主照本进程的规矩停、收尾（`run.cancelled` 带上是谁停的），界面上和单进程时一样；属主不在了的按上表接手。
+**Stopping.** When a run, an Ask Data turn, or a background job is running in another process, Stop (「停止」) writes a
+request for the owner (on PostgreSQL, NOTIFY wakes it up, within one heartbeat tick at the latest), and the owner stops
+and wraps up under its own process's rules (`run.cancelled` records who stopped it), so in the UI it looks the same as
+with a single process; if the owner is gone, takeover follows the table above.
 
-**运行并发。** 每段执行（发起、审批之后接着跑、继续运行）开始前要一个名额，按来源分四类，几个进程合起来算：交互（问数据、画布
-试运行、手动发起的正式运行、蓝图试运行、个人应用刷新）、应用（应用入口、按需视图、钩子、接口）、定时（定时任务、事件触发）、系统
-（评测、口径召回、对账、补算、按口径正式出具）。全站上限取 `AGENTLAB_MAX_CONCURRENT_RUNS`（缺省 20），其中一部分是**给交互的留底**
-（缺省全站上限的 1/4、至少 1、至多全站上限减 1）：应用、定时、系统三类合起来永远用不到留底，有人问数据、试运行时总有名额；留底以外的
-它们可以**借用**——三类各自的上限缺省就是「全站上限 − 留底」，没人问数据时评测也能开满，设置里可以调小。交互自己的上限缺省等于全站
-上限。等名额时按优先级（缺省交互 40 > 应用 30 > 定时 20 > 系统 10，同级先来先得），已经在执行的不打断。在「设置 → 偏好设置 → 运行
-并发」里改（管理员），改了最迟几秒各进程按新的发。单进程时也照这套发名额。
+**Run concurrency.** Each execution segment (a start, carrying on after an approval, continuing a run) needs a slot
+before it begins. Slots are divided by origin into four classes and counted across all processes together: interactive
+(Ask Data, canvas trial runs, formal runs started by hand, blueprint trial runs, personal app refreshes), app (app
+entries, on-demand views, hooks, the API), scheduled (schedules, event triggers), and system (evaluation, caliber
+recall, reconciliation, backfill, formal issuance by caliber). The site-wide limit is `AGENTLAB_MAX_CONCURRENT_RUNS`
+(default 20), and part of it is **a reserve for interactive runs** (by default 1/4 of the site-wide limit, at least 1
+and at most the site-wide limit minus 1): the app, scheduled, and system classes combined can never use the reserve, so
+there's always a slot when someone uses Ask Data or does a trial run; outside the reserve they can **borrow** — each of
+the three classes' limits defaults to "site-wide limit − reserve", so evaluations can use all of those slots when nobody
+is using Ask Data, and you can lower that in Settings. The interactive class's own limit defaults to the site-wide
+limit. While waiting for a slot, priority decides (by default interactive 40 > app 30 > scheduled 20 > system 10, first
+come, first served within the same level), and what's already executing isn't interrupted. Change these under Settings →
+Preferences → Run Concurrency (「设置 → 偏好设置 → 运行并发」) (admins); after a change, every process hands out slots by the new
+values within a few seconds at most. A single process hands out slots the same way.
 
-**调度当班。** 只有一个进程当班（库里的一份租约）：定时认领、事件派发、Webhook 投递、流程的时限和核实、每天的汇总、各类周期清理、
-口径比对的补比和自动召回的续发、接手不在了的进程留下的行，都只在当班的进程里做；其余进程待命，当班的没了待命的接班（平稳关停的马上
-交班）。切换的那一会儿重复不了：定时认领是条件更新、触发和投递记录有唯一约束。访问密钥的请求记录攒在各进程自己的内存里，各自隔一拍
-心跳写库。
+**Scheduler leader.** Only one process is on duty (a single lease in the database): claiming schedules, dispatching
+events, delivering webhooks, business-process time limits and verification, the daily digest, all kinds of periodic
+cleanup, retroactive caliber matching and continuing automatic recalls, and taking over rows left by processes that are
+gone all happen only in the process on duty; the other processes stand by, and when the one on duty is gone, a standby
+takes over (a graceful shutdown hands over immediately). Nothing can run twice during the switchover: schedule claims
+are conditional updates, and trigger and delivery records have unique constraints. Access key request logs accumulate in
+each process's own memory, and each process writes them to the database at its heartbeat tick.
 
-**实时流。** 运行事件、问数据一轮的事件都先落库。页面的 WebSocket / SSE 连到的进程不在执行它时，从库里按 seq 追：执行的进程每提交
-一批事件发一个 NOTIFY（只带运行 / 轮次的 id 和 seq），别的进程收到就回库里读；NOTIFY 丢了也有兜底（运行隔 2 秒、问数据隔一拍心跳回库里
-看一次）。不落库的那两样——正文 token、思考增量，问数据助手的保活心跳——只转给有人在看的进程（攒一小段放进 NOTIFY 里）。回放、重连、
-心跳的说法不变；序号由执行它的进程发，别的进程往执行中的运行里记事件交给它记，停着的运行追加时按库里的最后一条接号（条件更新防撞号）。
+**Live streams.** Run events and Ask Data turn events are all persisted first. When the process a page's WebSocket / SSE
+is connected to isn't the one executing it, it follows along from the database by seq: the executing process sends a
+NOTIFY (carrying only the run / turn id and seq) for every batch of events it commits, and other processes read from the
+database when they receive it; there's a fallback if a NOTIFY is lost (run streams recheck the database every 2 seconds,
+Ask Data streams every heartbeat tick). The two things that aren't persisted — body tokens and thinking deltas, and the
+Ask Data Copilot's keep-alive heartbeats — are forwarded only to processes where someone is watching (a short batch is
+packed into a NOTIFY). Replay, reconnection, and heartbeat semantics are unchanged; sequence numbers are assigned by the
+executing process, other processes hand events for an executing run over to it to record, and appends to a paused run
+continue numbering from the last row in the database (conditional updates prevent number collisions).
 
-**进程里的账和缓存。** 要全站一致的都进了库：每日花费账（裁判、核查、评测）先占住那一行再读写；访问密钥每分钟限流、登录失败的退避
-记在库里；按需探查、加入范围、上传表格的版本存储、记录表的写入、按需视图的单飞和每日上限、个人应用刷新、出具、召回、补算、定时发起
-用跨进程的锁（PostgreSQL 的咨询锁）；同源队（起草、剖析、探查一个接一个）记在库里。登录设置、对外访问地址、向量模型、能力登记的治理
-快照、数据源的连接池、应用页面的缓存仍在各进程内存里，改的那个进程马上刷新，别的进程收到通知（或最迟一拍心跳）跟着重读。纯性能的缓存
-留在进程里、过期无害：问数据的向量、取值猜测、表结构快照、取数快照的遮罩集合、OIDC 的元数据、DoH 解析、xlsx 的列扫描、口径比对的
-SQL 形状。各进程各自的并发闸门（口径比对、自动对比、起草的模型调用、上传解析）按进程算，进程多了总量跟着多。
+**In-process accounting and caches.** Everything that must be consistent site-wide is in the database: the daily
+spending accounts (judge, verification, evaluation) lock their row first before reading and writing; per-minute rate
+limiting for access keys and the backoff after failed logins are recorded in the database; on-demand introspection,
+adding tables to the scope, version storage for uploaded spreadsheets, record table writes, single-flight and daily caps
+for on-demand views, personal app refreshes, issuance, recall, backfill, and scheduled starts use cross-process locks
+(PostgreSQL advisory locks); same-source queues (drafting, profiling, introspection, one after another) are recorded in
+the database. Login settings, the public URL, the embedding model, the capability registry's governance snapshot, data
+source connection pools, and app page caches still live in each process's memory; the process that makes a change
+refreshes immediately, and the others reload once they receive a notification (or within one heartbeat tick at the
+latest). Pure performance caches stay in the process, where staleness is harmless: Ask Data vectors, value guesses,
+schema snapshots, the masking sets of data-fetch snapshots, OIDC metadata, DoH resolutions, xlsx column scans, and the
+SQL shapes used in caliber matching. Each process's own concurrency gates (caliber matching, automatic comparison,
+drafting model calls, upload parsing) count per process, so the total grows with the number of processes.
 
-**多台机器。** 几台机器要用同一份数据目录：放在共享存储（NFS 之类）上，每台挂在**同一个绝对路径**（库里记着上传表格各版本库文件的
-绝对路径），各台机器的时钟仍要对时（NTP）：租约按库的时钟算，机器之间差多少都不影响谁算活着，但「停了两个租约时长」这类判断看的是各机器按本机时钟写下的时间。库服务器自己的时钟往前跳超过一个租约时（少见），所有进程续租时都会发现自己的租约已经过期、一起隔离：执行到一半的运行标成中断，在运行详情里点「继续运行」从断点接着执行；后台任务按「属主不在了」的规矩处理；各进程自动换身份重新登记，之后发起的照常。往回跳时不隔离，只是真没了的进程要多等跳回去的那么久才被接手。本机墙钟跳了（NTP 一步校时、手动改时间）不会隔离：判续没续晚看的是计入休眠的单调钟，对不上时以库里的租约为准。文件都是先写临时文件再改名，读的一方看不到写了一半的；写上传版本库、记录表
-在库里的锁下一个接一个。但要说实话：数据目录里还有 SQLite 文件——上传表格的各版本库（发布后只读）、填报的记录表（`records/*.db`，
-原地追加写）、沙箱里代码自己建的库——SQLite 文件放在网络文件系统上，读写一致性靠文件锁，而 NFS 上的文件锁不可靠：一台机器在追加时
-另一台读，可能读到不一致的页。所以多台机器时，记录表写得多的部署建议用一台机器多进程，或者把数据目录放在支持可靠文件锁的存储上。
-沙箱会话（microVM）在各进程自己手上，不跨进程共享。
+**Multiple machines.** Several machines need to share one data directory: put it on shared storage (NFS or the like),
+mounted on every machine at **the same absolute path** (the database records the absolute paths of uploaded
+spreadsheets' version database files), and the machines' clocks still need to be synchronized (NTP): leases go by the
+database's clock, so however far apart the machines' clocks are doesn't affect who counts as alive, but judgments such
+as "stopped for two lease durations" look at times each machine wrote using its own local clock. When the database
+server's own clock jumps forward by more than one lease (rare), every process finds its lease already expired when it
+renews, and they all fence themselves off together: runs halfway through execution are marked interrupted, and clicking
+Continue Run (「继续运行」) in run details continues from the checkpoint; background jobs are handled under the "owner is
+gone" rules; and each process automatically re-registers with a new identity, after which new starts proceed as usual. A
+backward jump causes no fencing; it's just that a process that really is gone takes that much longer to be taken over. A
+jump in the local wall clock (an NTP step correction, a manual time change) causes no fencing: whether a renewal was
+late is judged by a monotonic clock that counts sleep time, and when the two disagree, the lease in the database wins.
+Files are always written to a temporary file first and then renamed, so readers never see a half-written file; writes to
+uploaded spreadsheets' version databases and to record tables go one after another under a lock in the database. But to
+be honest: the data directory still contains SQLite files — the version databases of uploaded spreadsheets (read-only
+after publishing), the form-submission record tables (`records/*.db`, appended in place), and databases created by code
+inside the sandbox — and for SQLite files on a network file system, read/write consistency relies on file locks, which
+aren't reliable on NFS: if one machine reads while another is appending, it may read inconsistent pages. So with
+multiple machines, deployments that write a lot to record tables are better off running multiple processes on one
+machine, or putting the data directory on storage with reliable file locking. Sandbox sessions (microVM) belong to each
+process and aren't shared across processes.
 
-**升级。** 不支持新旧版本的进程同时连着一个库，代码里拦着：每个进程登记时带上代码版本（包版本、构建号或 git 提交、源码指纹——源码加上依赖锁文件，只升了依赖也算版本不同）和
-库结构版本，库里还有活着的、版本不同的进程时，新版本的进程在补列之前就拒绝启动，报错里列出全部这样的进程、各是什么版本、心跳还在不在走；同版本的照常
-加入。升级步骤：
+**Upgrades.** Processes of an old and a new version connected to one database at the same time aren't supported, and the
+code blocks it: each process registers with its code version (package version, build number or git commit, and a source
+fingerprint — the source plus the dependency lock file, so upgrading only a dependency also counts as a different
+version) and its schema version; while the database still has live processes of a different version, a new-version
+process refuses to start before adding columns, and the error lists every such process, the version of each, and whether
+its heartbeat is still going; processes of the same version join as usual. Upgrade steps:
 
-1. 停掉全部旧版本的进程（平稳关停的马上删掉自己的登记；强杀的等它的租约过期，新进程启动时会等）；
-2. 备份（`pg_dump` 加数据目录，见上一节）；
-3. 起新版本：第一个进程补列补索引，之后的照常加入。
+1. Stop all old-version processes (a graceful shutdown deletes its own registration immediately; for a force-killed one,
+   its lease has to expire, and the new process waits for that at startup);
+2. Back up (`pg_dump` plus the data directory; see the previous section);
+3. Start the new version: the first process adds the columns and indexes, and the ones after it join as usual.
 
-只停了一部分就起新版本，新版本起不来，旧版本照常跑，不会两边各按各的写同一批行。
+If you start the new version after stopping only some of them, the new version won't start and the old version keeps
+running as usual, so the two never each write the same rows by their own rules.
 
-**测试。** `scripts/test-multiprocess.sh` 用本机 docker 的 `postgres:16` 起临时库，在上面起两个工作进程，用演示模型跑端到端
-（`backend/tests/test_multiprocess_e2e.py`，缺省跳过，`AGENTLAB_MULTIPROCESS_E2E=1` 时跑）：运行由任一进程认领、另一个进程上的
-流收得到实时事件、同一个决定只执行一次、跨进程停止、定时只触发一次、评测和问数据并发时优先级生效、每日花费上限不越过、强杀一个进程
-之后被接手或照实标中断。检查脚本的 `--stacks`（隔离的副本服务）只支持 SQLite。
+**Tests.** `scripts/test-multiprocess.sh` starts a temporary database from `postgres:16` in local docker, starts two
+worker processes on it, and runs end to end with the demo model (`backend/tests/test_multiprocess_e2e.py`, skipped by
+default and run when `AGENTLAB_MULTIPROCESS_E2E=1`): a run is claimed by either process, a stream on the other process
+receives the live events, the same decision is executed only once, stopping works across processes, a schedule fires
+only once, priorities take effect when evaluation and Ask Data run concurrently, the daily spending cap isn't exceeded,
+and after one process is force-killed its work is taken over or honestly marked interrupted. The check scripts'
+`--stacks` (isolated replica services) supports SQLite only.
 
 ---
 
-## 常见问题
+## FAQ
 
-**模型返回空内容。** Claude 4.6 之后的模型默认启用 thinking，`max_tokens` 过小会出现
-「思考耗尽额度，正文为空」。将节点的 max_tokens 调大，或将思考模式设为关闭。
-时间线中会给出相应提示。
+**The model returns empty content.** Models after Claude 4.6 enable thinking by default, and with too small a
+`max_tokens` you get "Thinking used up the budget; the body is empty" (「思考耗尽额度，正文为空」). Increase the node's max_tokens,
+or turn thinking mode off. The timeline shows a corresponding hint.
 
-**中转网关返回 401。** 部分网关仅接受 `Authorization: Bearer`，且额外携带 `x-api-key`
-即会拒绝。在 provider 设置中勾选「用 Authorization: Bearer 认证」。
+**A relay gateway returns 401.** Some gateways accept only `Authorization: Bearer`, and reject a request that also
+carries `x-api-key`. In the provider settings, tick Authenticate with Authorization: Bearer
+(「用 Authorization: Bearer 认证」).
 
-**数据源结构探查失败。** 探查失败与「尚未探查」是两种状态：前者点击按钮无法解决，
-需先处理超时或更换 schema。数据源卡片会显示失败原因与该服务器上的可选库列表。
-agent 侧同样会收到实情，并被告知可直接查询 `information_schema` 自行确认表结构。
+**Data source schema introspection fails.** Introspection failure and "Not yet introspected" (「尚未探查」) are two different
+states: clicking the button won't fix the former; deal with the timeout or change the schema first. The data source card
+shows the failure reason and the list of databases available on that server. The agent side gets the facts too, and is
+told it can query `information_schema` directly to confirm the table structure itself.
 
-**网页工具报「解析到内网地址 198.18.x.x，已拦截」。** 本机代理（Clash / mihomo 等）开了 TUN + fake-ip，
-查任何域名都先拿到 198.18 段的假地址，被当成内网拦掉了。在 `.env` 里加一行
-`AGENTLAB_HTTP_TOOL_FAKE_IP_RANGES=198.18.0.0/15`，重启后端即可：落在这个段里的解析结果会改向公共 DNS
-核实真实地址，公网放行、内网照拦。核实用的 DoH 地址由 `AGENTLAB_HTTP_TOOL_DOH_URLS` 指定（逗号分隔）。
-不想改配置的话，把代理 DNS 改成 redir-host，或把要访问的域名加进 `fake-ip-filter`。
+**The web tool reports "Resolved to internal address 198.18.x.x; blocked" (「解析到内网地址 198.18.x.x，已拦截」).** The local proxy
+(Clash / mihomo, etc.) has TUN + fake-ip turned on, so looking up any domain first returns a fake address in the 198.18
+range, which is then blocked as an internal address. Add the line `AGENTLAB_HTTP_TOOL_FAKE_IP_RANGES=198.18.0.0/15` to
+`.env` and restart the backend: resolution results that fall in that range are then verified against public DNS to find
+the real address, with public addresses allowed and internal ones still blocked. The DoH URLs used for verification are
+set by `AGENTLAB_HTTP_TOOL_DOH_URLS` (comma-separated). If you'd rather not change the configuration, switch the proxy's
+DNS to redir-host, or add the domains you need to reach to `fake-ip-filter`.
 
-**端口冲突。** 前端默认 5273、后端 8000，通过 `AGENTLAB_WEB_PORT` / `AGENTLAB_PORT` 修改。
+**Port conflicts.** The frontend defaults to 5273 and the backend to 8000; change them with `AGENTLAB_WEB_PORT` /
+`AGENTLAB_PORT`.
 
-**改了后端代码，正在跑的运行显示中断。** `dev.sh` 开着热重载，改一个后端文件就是一次
-服务重启。运行会被挂起（不是取消），断点完好：在运行详情页点「接着跑」，跑完的节点不会重跑，
-后面的人工审批照常停下来等人。
+**After changing backend code, a run in progress shows as interrupted.** `dev.sh` has hot reload on, so changing one
+backend file means one service restart. The run is suspended (not cancelled) and its checkpoint is intact: click Resume
+(「接着跑」) on the run details page; finished nodes won't rerun, and later human approvals still stop and wait for a person
+as usual.
 
-**运行被中止，提示超过时限。** 单次执行（两次人工介入之间的那一段）默认最多 600 秒，
-单次模型调用默认 300 秒没有输出即超时。多半是模型或工具没有响应；确实需要更久，调大
-`AGENTLAB_MAX_RUN_SECONDS` / `AGENTLAB_MODEL_TIMEOUT_SECONDS`。设置页「运行环境」里能看到当前值。
+**A run is aborted with a message that it exceeded the time limit.** A single execution (the stretch between two human
+interventions) is limited to 600 seconds by default, and a single model call times out after 300 seconds without output
+by default. Most likely the model or a tool isn't responding; if it really needs longer, increase
+`AGENTLAB_MAX_RUN_SECONDS` / `AGENTLAB_MODEL_TIMEOUT_SECONDS`. The current values are shown on the Runtime Environment
+(「运行环境」) settings page.
 
-**运行报「走满了 N 步还没跑完」。** 循环按自己 `max_iterations` 声明的轮数另算步数预算，
-配多少轮就能跑多少轮，不受全局上限约束。走到这条报错的，多半是分支连回上游、却没有
-loop 节点给它定轮数上限的环：用 loop 节点包住它。确实需要更多步，调大
-`AGENTLAB_MAX_GRAPH_STEPS`（默认 200）。
+**A run reports "Used up N steps without finishing" (「走满了 N 步还没跑完」).** A loop gets its own step budget, computed from
+the iteration count declared in its `max_iterations`, so it can run as many iterations as are configured, unconstrained
+by the global limit. Hitting this error usually means a cycle where a branch connects back upstream with no loop node to
+cap its iterations: wrap it in a loop node. If you really do need more steps, increase `AGENTLAB_MAX_GRAPH_STEPS`
+(default 200).
 
-**agent 没查完就收了尾。** 时间线里有一条提示写明原因：步数用满、连续几步拿不到新信息、令牌或金额预算用完、
-上下文接近窗口。按提示调节点上或设置里的步数、预算（预算可以设成不限），见
-[agent 的护栏](#agent-的护栏取代固定步数)。
+**An agent wrapped up before it finished querying.** A hint in the timeline states the reason: the steps were used up,
+several consecutive steps brought no new information, the token or spending budget ran out, or the context approached
+the window limit. Following the hint, adjust the steps or budget on the node or in Settings (「设置」) — budgets can be set
+to unlimited; see [Agent Guardrails](#agent-guardrails-replace-a-fixed-step-count).
 
 ---
 
-## 开发与验证
+## Development and Verification
 
 ```bash
-# 后端：约 14300 个测试，-n auto 并行约 1–2 分钟
+# Backend: about 14300 tests; with -n auto they run in parallel in about 1–2 minutes
 cd backend && env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u OPENAI_API_KEY \
   python -m pytest -n auto
 
-# 前端类型检查
+# Frontend type check
 cd frontend && npx tsc -b
 
-# 前端检查：43 项，默认 8 道并行。连 5273 / 8000，先起 ./scripts/dev.sh
+# Frontend checks: 43 items, 8 lanes in parallel by default. They connect to 5273 / 8000, so start ./scripts/dev.sh first
 node scripts/check-all.mjs
-# 另起 2 套只给检查用的「后端 + vite」，各用一份数据拷贝，约 6.5 分钟；边改代码边跑也不被打断
+# Start 2 extra "backend + vite" stacks used only by the checks, each with its own copy of the data, about 6.5 minutes; editing code while they run doesn't interrupt them
 CHECK_DATA_SRC=<数据目录> node scripts/check-all.mjs --stacks 2 --lanes 12
-# 只跑某几项（名字去掉 check- 前缀）
+# Run only some of the items (names without the check- prefix)
 node scripts/check-all.mjs evidence publish
 ```
 
-应用库换成 PostgreSQL 跑同一套（起临时的 `postgres:16` 容器，跑完删掉，见[用 PostgreSQL](#用-postgresql)）：
+To run the same suite with the app database on PostgreSQL (it starts a temporary `postgres:16` container and deletes it
+afterwards; see [Using PostgreSQL](#using-postgresql)):
 
 ```bash
 PYTHON=$(conda run -n agentlab which python) ./scripts/test-postgres.sh
 ```
 
-pytest 前面的 `env -u` 不能省：没配 Key 的 provider 会退回环境变量里的密钥，启动时的 seed 也会拿它种一个
-provider——环境里留着真密钥，测试就可能真的去调接口。
+Don't leave out the `env -u` in front of pytest: providers without a configured key fall back to keys in environment
+variables, and the seed at startup would also use them to create a provider — with a real key left in the environment,
+the tests might really call the API.
 
-`check-all` 的 43 项按 `scripts/check-all.mjs` 里 `ORDER` 的顺序排：
+The 43 `check-all` items, in the order of `ORDER` in `scripts/check-all.mjs`:
 
-| 类别 | 检查 |
+| Category | Checks |
 |---|---|
-| 不开浏览器 | `tokens`（令牌静态扫描）`copy`（界面文案）`trace`（运行态内核的纯函数）`decode`（事件翻译层） |
-| 走线、组件与护栏 | `canvas-layout` `ui-kit` `guards` |
-| 外壳、回答流与运行态 | `shell` `stream` `evidence`（可点击证据）`run-states`（节点卡）`canvas-fx`（画布表层） |
-| 各页面 | `studio` `publish`（发布前检查与自动修复）`chat` `runs` `manage` `versions`（上传表格的版本）`catalog`（数据目录）`catalog-loop`（表助手、审阅队列、导出导入）`catalog-profile`（数据剖析的逐表任务）`catalog-changes`（变化、表详情的变化一节、定时维护、后台任务条）`ui`（端到端，连真数据） |
-| 复核套件与导出 | `schedules`（定时任务）`compare`（运行对比）`verify`（双盲复算、反方审稿）`inquiry`（审批质询）`challenge`（反方审稿）`bundle`（可验证报告）`whatif`（数字推演）`report-export`（报告导出） |
-| 评测与口径账本 | `evals`（题集、加题、发起与进度、结果、对比与 A/B、口径命中与重复度）`ledger`（证据里的「口径」一步、轮次摘要、出具与对账、可沉淀的问题） |
-| 应用平台 | `apps`（应用页、印章、点数字看出处、入口校验、实例页）`inbox`（会签进度、超时、动作确认的哈希卡、核实）`app-editor`（应用编辑、派生、检查、发布时选处置、助手）`capabilities`（能力、端点、身份、通知、审计）`access-keys`（访问密钥）`share`（分享链接与 /s 页）`blueprint`（新建应用、蓝图卡片、试运行、发布摘要）`personal`（个人应用）`records`（记录列表）`files`（文件控件） |
+| No browser | `tokens` (static design-token scan) `copy` (UI copy) `trace` (pure functions of the run-state core) `decode` (event translation layer) |
+| Routing, components, and guardrails | `canvas-layout` `ui-kit` `guards` |
+| Shell, answer stream, and run states | `shell` `stream` `evidence` (clickable evidence) `run-states` (node cards) `canvas-fx` (canvas surface layer) |
+| Pages | `studio` `publish` (pre-publish check and autofix) `chat` `runs` `manage` `versions` (uploaded spreadsheet versions) `catalog` (data catalog) `catalog-loop` (Table Copilot (「表助手」), review queue, export and import) `catalog-profile` (per-table data profiling jobs) `catalog-changes` (changes, the changes section in table details, scheduled maintenance, the background job bar) `ui` (end to end, with real data) |
+| Review suite and exports | `schedules` (schedules) `compare` (run comparison) `verify` (double-blind recomputation, adversarial review) `inquiry` (approval inquiry) `challenge` (adversarial review) `bundle` (verifiable report) `whatif` (what-if sandbox) `report-export` (report export) |
+| Evaluation and caliber ledger | `evals` (test suites, adding questions, starting and progress, results, comparison and A/B, caliber hits and repetition) `ledger` (the Caliber (「口径」) step in evidence, turn summaries, issuance and reconciliation, distillable questions) |
+| App platform | `apps` (app pages, stamps, clicking numbers to see provenance, entry validation, instance pages) `inbox` (joint sign-off progress, timeouts, the hash card for action confirmation, verification) `app-editor` (app editing, derivation, checks, choosing a disposition at publish time, Copilot) `capabilities` (capabilities, endpoints, identity, notifications, audit) `access-keys` (access keys) `share` (share links and the /s page) `blueprint` (creating apps, blueprint cards, trial runs, publish summaries) `personal` (personal apps) `records` (record list) `files` (file controls) |
 
-完整输出写进 `/tmp/agentlab-checks/<时间>/`，终端只给汇总；并行时没过的最后单独重跑一遍，重跑才过的单列成「偶发」。
-`--stacks` 每套拷一份数据、端口自动挑空闲的，后端不热重载、vite 不监听文件，跑完、出错或被中断都收干净。
-`scripts/e2e-check.mjs` 真发起一次运行（Mock，不花钱），会在库里留下记录，所以不在 check-all 里。
-`scripts/check-auth.mjs`（登录、按角色收起的导航、401 跳登录）要另起一套开着本地账号登录的服务单独跑，也不在 check-all 里。
+Full output is written to `/tmp/agentlab-checks/<时间>/` (a timestamped directory), and the terminal gets only the
+summary; items that failed during the parallel run are rerun on their own at the end, and ones that pass only on the
+rerun are listed separately as "Flaky" (「偶发」). With `--stacks`, each stack copies the data and picks free ports
+automatically, the backend runs without hot reload and vite doesn't watch files, and everything is cleaned up after a
+finish, an error, or an interruption. `scripts/e2e-check.mjs` really starts a run (Mock, costs nothing) and leaves
+records in the database, so it isn't part of check-all. `scripts/check-auth.mjs` (login, navigation collapsed by role,
+401 redirecting to login) has to run on its own against a separate service with local-account login turned on, so it
+isn't part of check-all either.
 
-三层前端验证的分工：`check-decode` 守「翻译对不对」，`check-stream` 守「画出来对不对」，
-`check-ui` 守「整条路走得通不通」。三者可各自通过而合起来是坏的——例如 Step 字段全部正确，
-组件却将其渲染为一屏转义 JSON。
+The division of labor among the three layers of frontend verification: `check-decode` guards "is the translation right",
+`check-stream` guards "is it drawn right", and `check-ui` guards "does the whole path go through". The three can each
+pass while the whole is broken — for example, every Step field is correct, yet the component renders it as a screen full
+of escaped JSON.
 
-`check-canvas-fx` 守的是「事件对了但界面没跟上」：把脚本化的事件灌进 store（走的是
-页面上那一份 applyEvent / NodeCard / FlowEdge，只有事件来源是脚本），断言协作矩阵
-真的长出来了、并行度算对了、条形长度和耗时成正比、分支命中的出口被点亮、系统关了
-动效时光效确实不绘制。真跑一张多 agent 的图要连模型、要等十几秒，而且撞不上
-"三个人同时还在跑"那一瞬间——那样的检查会变成偶发失败。
+`check-canvas-fx` guards against "the events are right, but the UI didn't keep up": it pours scripted events into the
+store (going through the same applyEvent / NodeCard / FlowEdge that the page uses; only the source of the events is a
+script) and asserts that the collaboration matrix really appears, the degree of parallelism is computed correctly, bar
+lengths are proportional to durations, the exit a branch took lights up, and light effects really aren't drawn when
+motion is turned off at the system level. Actually running a multi-agent graph needs a model connection and a wait of a
+dozen or more seconds, and still may not hit the moment when "three members are running at once" — a check like that
+would turn into a flaky failure.
 
-`check-canvas-layout` 单独守「图好不好看」里唯一能算的那部分：它把夹具图交给后端
-`/api/copilot/layout` 排版，再直接 `import('/src/canvas/routing.ts')` 用页面上正在跑的那份
-走线代码算路径，然后按几何断言——没有两条线压在同一段上、没有线从别人的卡片中间穿过去、
-每条线的两端都接在节点边缘。连线叠成一团时 `check-ui` 和 `e2e-check` 一个字都不会说。
+`check-canvas-layout` on its own guards the only computable part of "does the graph look good": it hands fixture graphs
+to the backend's `/api/copilot/layout` for layout, then directly calls `import('/src/canvas/routing.ts')` to compute the
+paths with the very routing code running on the page, and then makes geometric assertions — no two edges overlap on the
+same segment, no edge passes through the middle of someone else's card, and both ends of every edge attach to a node's
+border. When edges pile up in a tangle, `check-ui` and `e2e-check` won't say a word.
 
 ## License
 
-This project is **source-available** and is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
+This project is **source-available** and is licensed under the
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
 
 ### Noncommercial Use
 
-You may use, study, modify, experiment with, and develop upon this software for purposes permitted under the PolyForm Noncommercial License 1.0.0.
+You may use, study, modify, experiment with, and develop upon this software for purposes permitted under the PolyForm
+Noncommercial License 1.0.0.
 
 Typical permitted noncommercial uses include:
 
@@ -1374,7 +1902,8 @@ See the [`LICENSE`](./LICENSE) file for the applicable license terms.
 
 **Commercial use is not permitted without prior written authorization from Yilun JIANG.**
 
-If you intend to use this software in a commercial product, commercial service, SaaS offering, customer project, commercial deployment, or other commercial context, you must obtain a separate commercial license before doing so.
+If you intend to use this software in a commercial product, commercial service, SaaS offering, customer project,
+commercial deployment, or other commercial context, you must obtain a separate commercial license before doing so.
 
 For commercial licensing, see [`COMMERCIAL-LICENSE.md`](./COMMERCIAL-LICENSE.md) or contact:
 
