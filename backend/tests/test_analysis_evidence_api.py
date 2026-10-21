@@ -170,7 +170,7 @@ async def test_named_values_and_result_cells_point_at_what_they_cite(client):
     assert value["segment"]["text"] == "61.9%" and value["chain"][0]["render_ok"] is True
     calc = value["chain"][2]
     assert next(v for v in calc["values"] if v["key"] == "top_share") == {
-        "key": "top_share", "raw": "0.618556701031", "rendered": "0.618556701", "cited": True}
+        "key": "top_share", "raw": "0.618556701031", "rendered": "61.9%", "cited": True}
     assert value["chain"][-2]["text"] == "复算一致：按封存的输入重新计算，结论逐项相同"
     assert value["note"] == "这个数取自分析结论的具名的数，由系统按固定规则显示，未经模型转写"
 
@@ -372,10 +372,10 @@ async def test_a_ratio_headline_closes_against_the_overall_ratio(client):
     made = await ratio_run()
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
     inputs = {s["role"]: s for s in body["chain"] if s["step"] == "analysis_input"}
-    assert inputs["headline_base"]["closure"] == {"mode": "ratio", "total_key": "r_base_total", "total": "0.035",
-                                                  "headline": "0.035", "closed": True}
-    assert inputs["headline_target"]["closure"] == {"mode": "ratio", "total_key": "r_target_total", "total": "0.053",
-                                                    "headline": "0.053", "closed": True}
+    assert inputs["headline_base"]["closure"] == {"mode": "ratio", "total_key": "r_base_total", "total": "3.5%",
+                                                  "headline": "3.5%", "closed": True}
+    assert inputs["headline_target"]["closure"] == {"mode": "ratio", "total_key": "r_target_total", "total": "5.3%",
+                                                    "headline": "5.3%", "closed": True}
     assert inputs["headline_base"]["role_label"] == "基期整体比率"
     assert inputs["headline_target"]["role_label"] == "本期整体比率"
     assert next(s for s in body["chain"] if s["step"] == "analysis_recompute")["status"] == "same"

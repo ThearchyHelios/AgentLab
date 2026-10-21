@@ -614,6 +614,15 @@ await section('analysis', '分析结论：判定语、具名的数、结果表�
   check('计算一步：关键数的代入式照服务端', (await calc.locator('[data-ev-analysis-formulas]').innerText()).includes('华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%'))
   check('……具名的数、结果表（表头是给人看的列名）', await calc.locator('[data-ev-analysis-value="top_share"]').count() === 1
     && (await calc.locator('[data-ev-analysis-table] th').allInnerTexts()).join('、').includes('占变化的比重'))
+  // 第 2 波 S1：占比、变化率按百分数显示（以前照原样写 0.8823529412），空格写「—」不写 null
+  check('……具名的数按结论记的格式写：占比 88.2%，不是 0.8823529412',
+    (await calc.locator('[data-ev-analysis-value="top_share"]').innerText()).includes('88.2%')
+    && !(await calc.locator('[data-ev-analysis-value="top_share"]').innerText()).includes('0.88'))
+  const calcRows = (await calc.locator('[data-ev-analysis-table] tbody tr').allInnerTexts()).map((t) => t.replace(/\s+/g, ' '))
+  check('……结果表照结论记的格式写：变化率 -30.0%、占变化的比重 88.2%，空格写「—」',
+    calcRows[0].includes('-30.0%') && calcRows[0].includes('88.2%') && !calcRows[0].includes('null')
+    && !calcRows[0].includes('-0.3') && !(await calc.locator('[data-ev-analysis-table] tbody').innerText()).includes('null'),
+    calcRows[0])
   const inputs = p.locator('[data-ev-analysis-input]')
   check('输入一步：每份一节（基期总数、本期总数、数据）', JSON.stringify(await inputs.evaluateAll((els) => els.map((e) => e.dataset.evAnalysisInput)))
     === JSON.stringify(['headline_base', 'headline_target', 'data']))
@@ -629,6 +638,14 @@ await section('analysis', '分析结论：判定语、具名的数、结果表�
   check('……点输入里的 Q2：焦点跳到那个查询步骤', await page.evaluate(() => document.activeElement?.closest('[data-ev-query-alias]')?.getAttribute('data-ev-query-alias')) === 'Q2')
   check('分析结论的数不走口径账本：没有「口径」一步', await p.locator('[data-ev-ledger]').count() === 0)
   check('面板底下写服务端的说明（判定只说明变化来自哪里）', (await p.locator('[data-ev-analysis-note]').innerText()).includes('判定只说明变化来自哪里'))
+
+  // 没写换算的具名的数、结果表的格：按结论记的格式显示（第 2 波 S1），正文、出处链、整表一致
+  for (const [sid, text] of [['s19', '-30.0%'], ['s21', '88.2%'], ['s23', '88.2%']]) {
+    check(`没写换算的 ${sid === 's23' ? '具名的数 [[a:A1.top_share]]' : '结果表的格 [[v:A1.r0.' + (sid === 's19' ? 'pct' : 'share') + ']]'}按结论记的格式显示 ${text}`,
+      (await box.locator(`[data-seg="${sid}"]`).innerText()) === text, await box.locator(`[data-seg="${sid}"]`).innerText())
+  }
+  check('……整表 [[table:A1 cols=region,delta,pct,share]] 的格也按格式写', (await box.locator('[data-seg="s38"]').innerText()) === '-30.0%'
+    && (await box.locator('[data-seg="s40"]').innerText()) === '88.2%')
 
   // 具名的数、结果表的格：同一条链，「这一处引用的是」写清是哪一项，被引用的那个描出来
   await box.locator('[data-seg="s9"]').click()

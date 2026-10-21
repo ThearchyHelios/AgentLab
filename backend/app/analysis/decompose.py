@@ -29,7 +29,7 @@ from app.analysis import comparable as cmp
 from app.analysis import phrases as ph
 from app.analysis.common import (Env, build, closes, column_label, column_types, label_for, need, refuse,
                                  reserved_check, sign_word, today_param)
-from app.analysis.contract import CallError
+from app.analysis.contract import CONV_PCT, CONV_POINTS, CallError
 from app.analysis.inputs import Snap, as_list, hashable, same_value
 from app.analysis.numbers import canon, to_fraction
 
@@ -225,6 +225,17 @@ def _parent(raw: Mapping[str, Any], env: Env, mode: str, dims: int) -> tuple[dic
         raise CallError("parent_key_missing", f"{name} 里没有「{ph.key_text(key)}」这一段：写 {name} 结果表里的段",
                         reason=f"上一层「{name}」里没有「{ph.key_text(key)}」这一段")
     return {"of": name, "key": key}, dict(zip(columns, hit)), depth
+
+
+#: 结果表里以比率存的列（占比、变化率、权重、比率本身）：引用、展开时按百分数显示（ResultTable.formats 记 pct）
+_RATE_COLUMNS = ("pct", "share")
+
+
+def _rate_formats(columns: Sequence[str], rate: Sequence[str] = _RATE_COLUMNS,
+                  points: Sequence[str] = ()) -> dict[str, str]:
+    """结果表各列记的换算：rate 里的列（占比、变化率、权重、比率本身）记 pct，points 里的列（比率的变化）记 pp。"""
+    return {**{c: CONV_PCT for c in rate if c in columns},
+            **{c: CONV_POINTS for c in points if c in columns}}
 
 
 _FIXED_ADDITIVE = ("base", "target", "delta", "pct", "share", "flag")
@@ -470,7 +481,9 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
     skip = (("offset",) if code == "flat" else ()) + (("comparability",) if outcome is None else ())
     phrase = ph.with_caveats(main, caveats, skip=skip)
     return build(env, params, used, table=table, values=values, verdict=verdict,
-                 criterion=ph.criterion_additive(s, top_k_max=k_max, summed=summed), phrase=phrase, caveats=caveats)
+                 criterion=ph.criterion_additive(s, top_k_max=k_max, summed=summed), phrase=phrase, caveats=caveats,
+                 formats=_rate_formats(columns),
+                 named={k: CONV_PCT for k in ("pct_total", "top_share", "top_k_share")})
 
 
 # --------------------------------------------------------------------------
@@ -681,7 +694,13 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
                "direction": sign_word(delta) if code in ("mix_driven", "rate_driven", "both") else None}
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion,
                  phrase=ph.with_caveats(main, caveats, skip=("comparability",) if outcome is None else ()),
-                 caveats=caveats)
+                 caveats=caveats,
+                 # 权重、各段的比率按百分数显示；结构效应、自身效应、合计影响是比率的变化，按百分点
+                 formats=_rate_formats(columns, rate=("w_base", "w_target", "r_base", "r_target"),
+                                       points=("mix", "rate", "total")),
+                 named={k: CONV_PCT for k in ("r_base_total", "r_target_total")}
+                 | {k: CONV_POINTS for k in ("delta", "mix_total", "rate_total")}
+                 | {"mix_share": CONV_PCT, "rate_share": CONV_PCT})
 
 
 # --------------------------------------------------------------------------
@@ -811,7 +830,8 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
     verdict = {"code": code, "subjects": subjects, "direction": sign_word(delta) if code != "flat" else None}
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion,
                  phrase=ph.with_caveats(main, caveats, skip=("comparability",) if outcome is None else ()),
-                 caveats=caveats)
+                 caveats=caveats, formats=_rate_formats(columns),
+                 named={k: CONV_PCT for k in ("pct_total", "top_share")})
 
 
 __all__ = ["HEADLINE_SHAPE", "PARENT_SHAPE", "SAME_QUERY", "SIMPSON_SHARE", "USED", "additive", "factor", "lmdi",

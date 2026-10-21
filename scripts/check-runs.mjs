@@ -2270,7 +2270,11 @@ await section('证据页签：分析说法违规的审计行写种类的叫法�
       && claimed.every((r) => r.label.includes('，') && !r.label.includes('无证据')), JSON.stringify(claimed.map((r) => r.label)))
     check('……别的无证据行照旧写「无证据」（没挂依据的两句结论）', rows.filter((r) => !r.issue && r.state === '?无证据').length === 2,
       JSON.stringify(rows.map((r) => `${r.issue}:${r.state}`)))
-    check('……有出处那一组：判定语、具名的数、结果表的格三行', rows.filter((r) => r.state.includes('有出处')).length === 3, JSON.stringify(rows.map((r) => r.state)))
+    // 第 2 波 S1 起报告多引了变化率、比重两格、一处没写换算的具名的数、整表展开的 8 格：有出处那一组的行数照夹具里
+    // 审计的「有出处」一组数（不再写死 3）
+    const cited = a.audit.groups.find((g) => g.key === 'cited')?.count ?? 0
+    check('……有出处那一组：判定语、具名的数、结果表的各格，行数和审计的一致', cited > 3
+      && rows.filter((r) => r.state.includes('有出处')).length === cited, `${cited} / ${JSON.stringify(rows.map((r) => r.state))}`)
     await page.route(new RegExp(`/api/runs/${EV_A}/evidence/segments/`), (r) => {
       const sid = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop())
       return a.segments[sid] ? r.fulfill({ json: a.segments[sid] }) : r.fulfill({ status: 404, json: { detail: '没有这个片段' } })

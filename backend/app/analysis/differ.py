@@ -33,7 +33,7 @@ from typing import Any
 from app.analysis import phrases as ph
 from app.analysis import stats
 from app.analysis.common import Env, build, column_label, column_types, label_for, need, refuse, sign_word
-from app.analysis.contract import CallError
+from app.analysis.contract import CONV_PCT, CONV_POINTS, CallError
 from app.analysis.inputs import Snap, as_list, hashable, same_value
 from app.analysis.numbers import canon, to_fraction
 
@@ -389,8 +389,13 @@ def _decide(env: Env, params: dict[str, Any], used: list[str], pairs: list[Pair]
               "test": shown.test, "pairs": str(len(pairs)), "differs": str(len(hits))}
     verdict = {"code": code, "subjects": subjects, "direction": direction}
     phrase = ph.with_caveats(main, caveats, skip=("multiple_comparisons",) if len(tested) > 1 else ())
+    # 比率模式的组的比率按百分数显示，两组的差、差的区间是比率之差，按百分点（均值模式是量，照原样）
+    rate = ("a_value", "b_value") if mode == "rate" else ()
+    points = ("diff", "ci_lo", "ci_hi") if mode == "rate" else ()
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion, phrase=phrase,
-                 caveats=caveats)
+                 caveats=caveats, formats={**{c: CONV_PCT for c in rate}, **{c: CONV_POINTS for c in points}},
+                 named={**{k: CONV_PCT for k in ("a", "b")}, **{k: CONV_POINTS for k in ("diff", "ci_lo", "ci_hi")}}
+                 if mode == "rate" else {})
 
 
 def _sensitivity(pairs: list[Pair], mode: str, alpha: Fraction, min_expected: Fraction,

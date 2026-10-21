@@ -596,7 +596,8 @@
 
   const shifted = (d, k) => ({ neg: d.neg, coef: d.coef, exp: d.exp + k })
 
-  /** _render_numeric：万 / 亿留两位、去尾零，单位接在后面；pct、比率乘 100 加 %（不接单位）；int、.N 改小数位 */
+  /** _render_numeric：万 / 亿留两位、去尾零，单位接在后面；pct、比率乘 100 加 %（不接单位）；pp 乘 100 写成「+1.2 个百分点」；
+   * int、.N 改小数位 */
   function renderNumeric(d, unit, decimals, fmt, conv) {
     if (adjusted(d) >= MAX_DIGITS) throw new Unshown(T.shownTooLong)
     const ratio = fmt === 'percent_of_ratio'
@@ -608,6 +609,20 @@
     if (conv === 'pct') {
       if (unit.includes('%') || unit.includes('％')) throw new Unshown(T.shownPctUnit)
       return `${digitsOf(shifted(d, 2), decimals != null ? Math.max(decimals - 2, 0) : 1, group, false)}%`
+    }
+    if (conv === 'pp') {
+      // 比率的变化按百分点写：一位小数、正数带「+」（0 不带）；不是 0 的值写出来成了 0.0 的多给小数位（最多 4 位），
+      // 不写假的 0（同服务端 engine/evidence._render_numeric 的 pp）
+      if (unit.includes('%') || unit.includes('％')) throw new Unshown(T.shownPctUnit)
+      const points = shifted(d, 2)
+      if (isZero(points)) return `${digitsOf(points, 1, group, false)} 个百分点`
+      let places = 1
+      for (; places < 5; places++) {
+        if (!isZero(quantize(points, -places))) break
+      }
+      if (places >= 5) throw new Unshown(T.shownZero)
+      const out = digitsOf(points, places, group, false)
+      return `${out.startsWith('-') ? out : `+${out}`} 个百分点`
     }
     let places
     if (conv === 'int') places = 0
@@ -652,12 +667,13 @@
 
   /**
    * render_cell(shown(raw))：快照里的一格。kind 是查询时记下的列类型，display 是报告文档记下的单元格显示规则版本
-   * （2 版起 ISO 日期时间的 T 换成空格；3 版起标识列的数不分千位）。plain 是引用上记下的「这一格按标识列显示」：
+   * （2 版起 ISO 日期时间的 T 换成空格；3 版起标识列的数不分千位；4 版起引用分析结论时按结论记的格式换算）。
+   * plain 是引用上记下的「这一格按标识列显示」：
    * 哪几列是标识列服务端按 SQL 和冻结的数据目录判（cell_format.plain_columns），本页解析不了 SQL，照引用上记的渲染——
    * 它只决定分不分千位，值本身照样逐位比对。DECIMAL 落成的数字文本按数渲染、不经 float；文字压成一行，竖线换成 ¦
    */
   function renderCell(raw, token, conv, kind, display, plain = false) {
-    if (display !== 1 && display !== 2 && display !== 3) throw new Unshown(T.shownDisplay(display))
+    if (display !== 1 && display !== 2 && display !== 3 && display !== 4) throw new Unshown(T.shownDisplay(display))
     if (!PY_NUMERIC || !ISO_DATETIME) throw new Unshown(T.shownOld)
     const fmt = display >= 3 && plain === true ? 'plain' : 'thousands'
     let value = raw
@@ -1556,6 +1572,12 @@
   /** 引用上记的换算（|万、|pct 这类），没写是 null */
   const convOf = (cite) => (own(cite, 'conv') === undefined ? null : cite.conv)
 
+  /** 分析结论给这一列 / 这个数记的换算（formats / value_formats：占比、变化率的列 pct，比率的变化 pp），没记是 null */
+  const namedConv = (formats, key) => {
+    const found = isObj(formats) ? formats[key] : null
+    return typeof found === 'string' && found ? found : null
+  }
+
   /**
    * 分析结论的一处引用（checkNumber 已核过工件的哈希和引用链）：引用的值等于结论里记的那个值，正文显示的字等于按服务端
    * 的规则渲染出来的字。判定语按文本格渲染（engine/evidence.render_cell 的 kind=text：压成一行、竖线换成 ¦），具名的数按
@@ -1586,7 +1608,10 @@
       }
       if (!sameValue(cite.value, info.truth)) return { ...info, result: FAIL, reason: T.numAnalysisCell }
       const display = Object.prototype.hasOwnProperty.call(doc, 'cell_display') ? doc.cell_display : 1
-      return checkShown(info, seg, () => renderCell(cell.raw, info.truthToken, convOf(cite),
+      // 没写换算、结论的结果表给这一列记了格式（formats：4 版显示规则起）、文档也按 4 版复核的，按它渲染（服务端同样）；
+      // 写作者自己写了换算的照他的
+      const conv = convOf(cite) ?? (display >= 4 ? namedConv(table.formats, cell.column) : null)
+      return checkShown(info, seg, () => renderCell(cell.raw, info.truthToken, conv,
         columnKind(table, cell.column), display, own(cite, 'plain') === true))
     }
     if (loc.key != null) {
@@ -1597,7 +1622,10 @@
       info.truthToken = tokenAt(tokensOf(art), ['values', loc.key])
       if (typeof raw === 'string' && typeof info.truth === 'number') info.truthText = pyStrip(raw)
       if (!sameValue(cite.value, info.truth)) return { ...info, result: FAIL, reason: T.numValueDiffers }
-      return checkShown(info, seg, () => renderCell(raw, info.truthToken, convOf(cite), null, 1))
+      // 没写换算、结论给这个数记了格式（value_formats；4 版显示规则起）的按它渲染（服务端同样）；写作者自己写了换算的照他的
+      const display = Object.prototype.hasOwnProperty.call(doc, 'cell_display') ? doc.cell_display : 1
+      const conv = convOf(cite) ?? (display >= 4 ? namedConv(result.value_formats, loc.key) : null)
+      return checkShown(info, seg, () => renderCell(raw, info.truthToken, conv, null, 1))
     }
     if (typeof result.phrase !== 'string' || !result.phrase.trim()) return { ...info, result: FAIL, reason: T.numNoPhrase }
     info.truth = result.phrase

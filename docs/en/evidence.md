@@ -98,7 +98,7 @@ In the report-writer node (`report`), the model writes only citation markers, an
 [[see:m:gmv,Q1,A1]]                        basis of a claim sentence; attached at the end of the sentence, not rendered
 ```
 
-Analysis conclusions are numbered A1, A2, … in ledger order, and the writing catalog has a separate Analysis Conclusions section. Judgment words such as "mainly from", "unusual", or "rising steadily" must cite a matching analysis conclusion and agree with its verdict; see [Analysis claim check](analysis.md#analysis-claim-check).
+Analysis conclusions are numbered A1, A2, … in ledger order, and the writing catalog has a separate Analysis Conclusions section. The system shows shares and change rates in analysis conclusions as percentages (`[[a:A1.top_share]]` renders as 62.0%), and changes in rates in percentage points (1.2 percentage points); writers cite them as usual and do not add a conversion. Judgment words such as "mainly from", "unusual", or "rising steadily" must cite a matching analysis conclusion and agree with its verdict; see [Analysis claim check](analysis.md#analysis-claim-check).
 
 ### Handling violations
 

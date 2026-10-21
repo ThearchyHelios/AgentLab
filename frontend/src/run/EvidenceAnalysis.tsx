@@ -192,7 +192,8 @@ function MethodPart({ step }: { step: EvidenceAnalysisStep }) {
   )
 }
 
-/** 计算：关键数的代入式、具名的数（被引用的那个描出来）、结果表（被引用的那一格高亮，遮罩的列写「已遮罩」） */
+/** 计算：关键数的代入式、具名的数（被引用的那个描出来）、结果表（被引用的那一格高亮，遮罩的列写「已遮罩」）。
+ *  数与格都是服务端按结论记的格式写好的字（占比、变化率是百分数，空格是「—」），这里照原样显示 */
 function CalcPart({ step }: { step: EvidenceAnalysisStep }) {
   const table = step.table && Array.isArray(step.table.columns) && Array.isArray(step.table.rows) ? step.table : null
   const labels = table?.labels ?? {}

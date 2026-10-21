@@ -277,6 +277,10 @@ class ResultTable(TypedDict):
     # 列 id → 类型（写法同查询快照的 column_types；第 1 波 W1-a 加，可选）：维度列照输入快照里那一列查询时记下的类型
     # （文本型的码值 "1203" 才不会被渲染成「1,203」；输入没记类型的不写），数值列 number，说明、叫法这类文字列 text
     column_types: NotRequired[dict[str, str]]
+    # 列 id → 换算（第 2 波加，可选）：占比、变化率、权重这类以比率存的列，渲染时按它换算，换算的写法同 [[m:]] 的后缀
+    # （pct 显示成百分数、pp 显示成「+1.2 个百分点」）。引用这一列的一格、展开整表时没写换算的按它渲染，写作者自己写了换算的
+    # 照他的（引用上记下实际用的换算，导出、可验证报告照它渲染）
+    formats: NotRequired[dict[str, str]]
 
 
 class AnalysisRequest(TypedDict, total=False):
@@ -302,6 +306,9 @@ class AnalysisResult(TypedDict, total=False):
     reason: str | None
     table: ResultTable | None
     values: dict[str, Any]    # 具名标量：[[a:A3.top_share]]；数一律十进制字符串
+    # 键 → 换算（第 2 波加，可选）：占比、变化率这类以比率存的数，渲染时按它换算（写法同 ResultTable.formats）。
+    # [[a:A3.top_share]] 没写换算的按它渲染，写作者自己写了换算的照他的
+    value_formats: dict[str, str]
     verdict: Verdict | None
     criterion: str            # 判定标准，一句，照实际阈值写
     phrase: str               # 判定语（app/analysis/phrases 渲染），[[a:A3]] 渲染成它
@@ -417,6 +424,16 @@ class ScopeBlock(TypedDict, total=False):
 #: 复算核对时不比的字段：hypothesis 是 agent 写的话，不是算出来的
 NOT_RECOMPUTED = frozenset({"hypothesis"})
 
+#: 结论里记格式的两处：结果表的 formats（列 id → 换算）、values 的 value_formats（键 → 换算）。换算取值同 [[m:]] 的后缀，
+#: 另加 pp（比率的变化按百分点写：「+1.2 个百分点」）
+TABLE_FORMATS = "formats"
+VALUE_FORMATS = "value_formats"
+#: 比率的换算：pct 按百分数写（0.62 显示成 62.0%）
+CONV_PCT = "pct"
+#: 比率的变化按百分点写（0.012 显示成「+1.2 个百分点」，下降时带负号）：[[m:]] 的后缀里原本没有这一种
+CONV_POINTS = "pp"
+FORMAT_CONVS: tuple[str, ...] = (CONV_PCT, CONV_POINTS)
+
 
 def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
     """两份结论（封存的、复算的）是否逐字段相同（hypothesis 除外）。"""
@@ -425,8 +442,10 @@ def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
 
 
 __all__ = [
-    "ARTIFACT_KIND", "CATALOG_PREFIX", "CAVEATS", "DEFAULTS", "LABELS", "LEDGER_KIND", "MARKER_KIND", "METHODS", "MODES",
-    "MODE_LABELS", "NODE_TYPE", "NOT_RECOMPUTED", "OPS", "OP_LABELS", "RANGES", "REASONS", "SETTINGS_KEY", "TOOL_NAMES",
+    "ARTIFACT_KIND", "CATALOG_PREFIX", "CAVEATS", "CONV_PCT", "CONV_POINTS", "DEFAULTS", "FORMAT_CONVS", "LABELS",
+    "LEDGER_KIND", "MARKER_KIND", "METHODS", "MODES",
+    "MODE_LABELS", "NODE_TYPE", "NOT_RECOMPUTED", "OPS", "OP_LABELS", "RANGES", "REASONS", "SETTINGS_KEY",
+    "TABLE_FORMATS", "TOOL_NAMES", "VALUE_FORMATS",
     "VERDICTS", "AnalysisInput", "AnalysisRequest", "AnalysisResult", "CallError", "Caveat", "Context", "InputSnapshot",
     "MetricComparability", "Probe", "Prober", "ResultTable", "ScopeBlock", "ScopeItem", "Verdict", "catalog_result",
     "effective_settings", "is_result", "ledger_entry", "method_label", "same", "settings_problem",
