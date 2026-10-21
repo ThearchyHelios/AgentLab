@@ -188,6 +188,12 @@ class InputSnapshot(TypedDict, total=False):
     rows: list[list[Any]]
     truncated: bool
     masked: list[str]         # 不能当维度、度量的列（遮罩列、按 SQL 认出改了名字的遮罩列），比较时不分大小写
+    # 以下几项照查询快照里的原样带上（第 1 波 W1-a 加，都可选）：
+    dialect: str              # SQL 的 sqlglot 方言（sqlite / mysql / postgres / oracle）；不给时按探查器的 dialect(数据源名)
+    checks: list[dict[str, Any]]    # 快照里的 SQL 检查结果（level 为 error 的算可比性的数据问题）
+    no_data: list[dict[str, Any]]   # 快照里的「查询区间里这张表没有数据」
+    mask_columns: list[str]   # 没给 masked 时（复算取回的是快照工件本身）按这两项认遮罩列
+    masked_at_query: list[str]
 
 
 class AnalysisInput(TypedDict, total=False):
@@ -201,6 +207,7 @@ class AnalysisInput(TypedDict, total=False):
     row: int                  # 一格时：第几行、哪一列、值（十进制字符串）
     column: str
     value: str | None
+    dialect: str              # 读这份快照的 SQL 用的方言（第 1 波 W1-a 加，可选）：复算按它读，界的写法才一样
 
 
 class Probe(TypedDict, total=False):
@@ -213,6 +220,10 @@ class Probe(TypedDict, total=False):
     max: str | None
     basis: Literal["live", "profile", "observed"]
     at: str                   # 现查的时刻（ISO，服务端时区）
+    # 按运行当天现算的界（CURRENT_DATE、date('now', …)）在库里算出的值（第 1 波 W1-a 加，可选）：有 expr 的这一条记的是界，
+    # 没有 table / column / min / max
+    expr: str                 # 界的 SQL 写法（按这份快照的方言）
+    value: str | None         # 库里算出的日期（带时刻的写成 YYYY-MM-DD HH:MM:SS）
 
 
 class Verdict(TypedDict, total=False):
@@ -284,7 +295,7 @@ class Context(TypedDict, total=False):
     today: date               # 运行当天（服务端时区）：判本期完不完整
     probe: Prober | None      # None 时只用 facts
     catalogs: Mapping[str, Any]   # 数据源名 → 数据目录（app/data/catalog 的 notes）：认度量类型、业务日期列、列的叫法
-    facts: Mapping[str, Any]      # 数据源名 → 剖析事实（探查失败时兜底）
+    facts: Mapping[str, Any]      # 数据源名 → 剖析事实（探查失败时兜底）：{表名: last_facts 的那一项}，或取它的函数
 
 
 # --------------------------------------------------------------------------
