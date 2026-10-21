@@ -11,6 +11,7 @@ A schedule starts formal runs on time, and the origin of each run is recorded as
 - The target can be a workflow, a data source (that is, scheduled maintenance of the data source; see [Data Catalog](data-catalog.md#scheduled-maintenance)), or a test suite (that is, a scheduled evaluation; see [Regression evaluation](evaluation-and-ledger.md#scheduled-evaluations)).
 - App views prefer to bind to existing schedules. A dashboard reads the schedule's latest sealed formal run, and its stamp names the schedule and the run number.
 - When a run is rejected by a person, the schedule pushes "Not issued (rejected)".
+- When a run finishes successfully and is sealed, it is compared once automatically with the same schedule's last successful run, and the trigger history offers Compare With Previous Run (see [Run comparison](evidence.md#run-comparison)).
 - Schedules that target a data source or a test suite don't accept webhooks (they return 422); their notifications go through channel subscriptions under Settings → Notifications.
 - For run concurrency, schedules belong to the scheduled class (see [Run concurrency](postgresql-and-scaling.md#run-concurrency)).
 - The scheduler loop ticks every `AGENTLAB_SCHEDULER_TICK_S`, 15 seconds by default.
@@ -54,7 +55,7 @@ An admin configures SMTP under Settings → Notifications → Mail Service; the 
 | "Data source has changes to handle" | Global channels | Only the source name, the count, and a link; no table names, column names, or values |
 | "Caliber version bumped, answer numbers changed" | Global channels and the answer owner's personal channels | No numbers; `ledger.recall` is pushed at the same time |
 | Daily task digest | Personal channels subscribed to it | Sent at `notify.digest_at`, default 09:00 (server time zone) |
-| Access key expiry reminder | — | Once 7 days and once 1 day before expiry |
+| Access key expiry reminder | Personal keys go to the owner's personal channels subscribed to it; service account keys go to global channels subscribed to it | Once 7 days and once 1 day before expiry; only the key name, its prefix, the owner, the expiry time, and a link to rotate it, never the key itself |
 
 The daily digest and access key reminders are sent only when login is on.
 

@@ -121,6 +121,7 @@ Profiling runs read-only queries to check the catalog's inferences and fill in s
 - The "Checked key count" profiling setting: `DISTINCT … LIMIT` doesn't take a random sample.
 - On MySQL / MariaDB, profiling notes for text columns state the collation, ENUM columns gain the values that don't appear in the data, and date columns state how many invalid dates were excluded.
 - The table list has a Profiling column, and the table details show the last profiling result.
+- The date ranges profiling records aren't reliable for tables fully reloaded every day, so whether the queried range has data is checked live at run time; the ranges recorded by profiling and value observation serve only as a fallback when the live check fails (see [No data in the queried range](evidence.md#no-data-in-the-queried-range)).
 
 By default, it profiles only "tables that need profiling": those never profiled, not finished last time, or that have since gained relationships awaiting verification or new code-value or date columns. On the same data source, drafting and profiling queue up one after the other, and the scope is set from the catalog as it stands when profiling starts, so you can click profile right after drafting finishes.
 

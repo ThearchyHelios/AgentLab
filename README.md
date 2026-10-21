@@ -43,6 +43,7 @@ English | [Simplified Chinese](README.zh-CN.md)
 - Clickable evidence: numbers, table and field names, and verbatim knowledge-base quotes all open to their provenance → [Evidence and Issuance](docs/en/evidence.md)
 - Three-tier issuance: caliber cards plus issuance contracts, checked by value or by citation → [Issuance contracts](docs/en/evidence.md#issuance-contracts-and-tiers)
 - Sealing and exports: one-click seal verification; self-contained report exports and verifiable reports → [Exports](docs/en/evidence.md#exports)
+- Review suite: double-blind recomputation, adversarial review, approval inquiry, the what-if sandbox, run comparison → [Review suite](docs/en/evidence.md#the-review-suite)
 
 **Quality**
 
@@ -88,7 +89,7 @@ See [Deployment](docs/en/deployment.md) and [deploy/README.md](deploy/README.md)
 | **Using and building** | |
 | [Ask Data and Copilot](docs/en/ask-data.md) | What happens after you ask, output review, record retention, how Copilot builds graphs and looks things up |
 | [Workflows](docs/en/workflows.md) | The canvas, node types, passing data, human nodes and rejection, agent guardrails, subworkflows, publishing and gates, runs and resuming |
-| [Evidence and Issuance](docs/en/evidence.md) | Caliber cards, issuance contracts and tiers, citation markers, claim sentences, sealing and verification, report exports and verifiable reports |
+| [Evidence and Issuance](docs/en/evidence.md) | Caliber cards, issuance contracts and tiers, citation markers, claim sentences, no data in the queried range, sealing and verification, report exports and verifiable reports, the review suite |
 | [Data Sources and Spreadsheet Import](docs/en/data-sources.md) | Connecting databases, read-only guarantees, uploading spreadsheets and recipes, accumulating by period, cross-database merges, masked columns |
 | [Data Catalog](docs/en/data-catalog.md) | What the catalog records, drafting and review, export and import, data profiling, SQL checks, introspection scope for large databases, schema and value changes |
 | [Tools, MCP, and the Capability Registry](docs/en/tools.md) | Kinds of tools, approval levels, capability governance, limits on write capabilities, registered endpoints, network rules |
