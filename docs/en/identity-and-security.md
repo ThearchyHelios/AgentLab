@@ -48,7 +48,7 @@ Roles: admin ⊇ builder ⊇ user.
 | MCP stdio, endpoints and credentials, capability governance, model access | ✓ | Read-only | ✗ |
 | Apps: use / view all instances / build and publish | ✓ | Can use and view; managing requires being the creator or having a Manage grant | Use and view per grants |
 | Shared blueprints: read, edit, trial run, create publish plans | ✓ | Ones they created, and ones that come from apps they manage | ✗ |
-| Create personal apps, refresh, submit for review | ✓ | ✓ | Not by default; an admin can enable it under Settings → Apps |
+| Create personal apps, refresh, submit for review | ✓ | ✓ | Not by default; an admin can enable it in the Apps section of Settings → Preferences |
 | Other people's personal apps: name, owner, created and updated times, archiving | ✓ | ✗ | ✗ |
 | Other people's personal apps: pages, refresh and trial-run runs, evidence, attachments, blueprints | ✗ | ✗ | ✗ |
 | Handle tasks assigned to oneself, verify actions | ✓ | ✓ | ✓ |

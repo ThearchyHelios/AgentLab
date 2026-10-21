@@ -112,7 +112,7 @@ Process instances may wait for days, so upgrading in the meantime is normal.
 
 Click Save as My App on a blueprint to make a personal app that only its owner can see.
 
-- Users can create them only after an admin enables this under Settings → Apps.
+- Users can create them only after an admin enables this in the Apps section of Settings → Preferences.
 - The graph of a personal app uses the same allowlist as Ask Data for users. The data-fetch nodes of templates such as Periodic Dashboard and Exception Handling (list only) are simply Call Tool nodes that query data sources.
 - Each refresh is an exploratory run: query results are masked at the tool boundary first, data sources are always read-only, and refreshes share a per-person daily cap with on-demand views.
 - Only the owner can read refreshes and trial runs of personal blueprints: admins and builders can't see these runs, evidence, artifacts, or attachments either, and they aren't listed in run lists.

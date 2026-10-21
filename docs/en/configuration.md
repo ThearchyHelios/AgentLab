@@ -67,16 +67,15 @@ For the app database, checkpoint database, connection pool, PgBouncer, and multi
 | Location | Contents |
 |---|---|
 | Settings → Model Access | Providers and keys |
-| Settings → Preferences | Drafting model; Allow creating share links in the Apps section; evaluation concurrency, per-question time limit, and per-evaluation and daily spending; run concurrency (admins) |
-| Settings → Runtime Environment | Sandbox candidates and their availability, the current choice and its reason; current values such as time limits |
+| Settings → Preferences | Run defaults (default memory scope, default knowledge base, require approval for dangerous tools by default); the evidence judge (judge model and limits); verification (verification model, the switches and limits for double-blind recomputation, adversarial review, and approval inquiry, and the daily spending cap; see [The review suite](evidence.md#the-review-suite)); evaluation concurrency, per-question time limit, and per-evaluation and daily spending; run concurrency (admins); the caliber ledger (automatic issuance by caliber and its daily cap, the caliber matching time limit, the recall limit `ledger.recall_limit`; see [Caliber ledger](evaluation-and-ledger.md#caliber-ledger)); drafting model; apps (the daily cap on on-demand runs per app, letting users create personal apps, allowing share links); interface theme |
 | Settings → General | Public URL |
+| Settings → Runtime Environment | Sandbox candidates and their availability, the current choice and its reason; current values such as time limits |
 | Settings → Identity | Login mode; enabling Ask Data for users |
 | Settings → Notifications | Channel subscriptions; Mail Service (SMTP) |
-| Settings → Apps | Letting users create personal apps |
 | Settings → Access Keys | Service accounts, the personal access key switch, the API reference |
-| The `ledger` group in Settings | The automatic issuance switch `auto_issue`; the recall limit `ledger.recall_limit` |
+| Settings → Audit | Audit records |
 
-Other settings: `notify.digest_at` (the time of the daily task digest), `apps.on_demand_daily_limit` (the daily cap on on-demand runs per app), and the agent token budget, spending budget, and step count.
+Other settings: `notify.digest_at` (the time of the daily task digest), and the agent token budget, spending budget, and step count.
 
 ## Sandbox backend
 
