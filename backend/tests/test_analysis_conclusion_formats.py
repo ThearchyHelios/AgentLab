@@ -105,7 +105,7 @@ def test_the_ratio_decomposition_formats_weights_as_percent_and_effects_as_point
     result = run_sync(analyze("decompose", "ratio", snaps=[rates], query="Q3", by=["region"], period="week",
                               base="2026-W41", target="2026-W42", numerator="refunds", denominator="orders",
                               label="退款率"))
-    # 权重、各段的比率是比率本身 → pct；结构效应、自身效应、合计影响是比率的变化 → pp
+    # 权重是占比、各段分子都不超过分母，比率本身也是占比 → pct；结构效应、自身效应、合计影响是比率的变化 → pp
     assert result["table"]["formats"] == {"w_base": CONV_PCT, "w_target": CONV_PCT, "r_base": CONV_PCT,
                                           "r_target": CONV_PCT, "mix": CONV_POINTS, "rate": CONV_POINTS,
                                           "total": CONV_POINTS}
@@ -356,3 +356,20 @@ def test_the_verifiable_report_renders_the_conclusion_format():
     # 出处面板写结果表记的列名（「占变化的比重」），不把列 id 当叫法
     cell = next(text for text in out["opened"].values() if "结果表 · 第 1 行 · 占变化的比重" in text)
     assert "正文显示61.9%" in cell
+
+def test_a_ratio_with_a_unit_is_not_shown_as_a_percentage():
+    """比率自身是有量纲的比率（客单价 = 销售额 / 订单数，元 / 单，可以大于 1）时不套百分数：以前整体比率 160.76 显示成
+    16,076.0%，各段的 160.62 显示成 16,062.5%，判定语里却是「客单价下降 9.89（-6.2%）」。各段分子都不超过分母的（退款率这种
+    占比）照旧按百分数。"""
+    rows = [["华东", "2026-W41", 160_000, 1000], ["华东", "2026-W42", 141_000, 1000],
+            ["华南", "2026-W41", 180_000, 1100], ["华南", "2026-W42", 175_000, 1100]]
+    snaps = snap("Q5", "SELECT region, week, gmv, orders FROM sales GROUP BY region, week",
+                 ["region", "week", "gmv", "orders"], rows,
+                 types={"region": "text", "week": "text", "gmv": "number", "orders": "number"})
+    result = run_sync(analyze("decompose", "ratio", snaps=[snaps], query="Q5", by=["region"], period="week",
+                              base="2026-W41", target="2026-W42", numerator="gmv", denominator="orders",
+                              label="客单价"))
+    assert result["table"]["formats"] == {"w_base": CONV_PCT, "w_target": CONV_PCT, "mix": CONV_POINTS,
+                                          "rate": CONV_POINTS, "total": CONV_POINTS}
+    assert "r_base_total" not in result["value_formats"] and "r_target_total" not in result["value_formats"]
+    assert result["value_formats"]["mix_share"] == CONV_PCT

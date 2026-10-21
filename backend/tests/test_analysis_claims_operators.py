@@ -189,3 +189,19 @@ def test_a_contradicting_sentence_next_to_the_phrase_is_caught(driver_catalog):
     assert ac.results_of({"A1": stored}) == {}
     assert ac.results_of({"A1": stored}, lambda alias, entry: driver_catalog["A1"]["result"])["A1"]["verdict"]["code"] \
         == "driver"
+
+
+def test_a_factor_source_named_after_the_verb_is_recognised():
+    """V5（真实模型验收 6/2）：因子拆解正确的主来源被判不符。「这波涨幅主要由订单量放大带来」里主来源写在判断词后面
+    （「订单量」），以前只看判断词前面，认成没点名、或者错认到前一个分句的「客单价」上。"""
+    result = {"op": "decompose", "mode": "factor", "status": "ok",
+              "verdict": {"code": "driver", "subjects": [["订单数"]], "direction": "up"},
+              "table": {"columns": ["factor", "base", "target", "pct", "contrib", "share"],
+                        "labels": {"factor": "因子", "share": "占变化的比重"},
+                        "rows": [["订单数", "900", "1100", "0.2222", "200", "0.998"],
+                                 ["客单价", "160", "160", "0", "0", "0.002"]]},
+              "values": {"top_share": "0.998"}, "phrase": "销售额上升 200，主要来自订单数的变化"}
+    text = "这波涨幅主要由订单量放大带来，客单价基本没动。"
+    sentence = ac.Sentence(text=text, shown=text, base=0, analyses=["A2"], names=[None] * (len(text) + 1),
+                           pieces=[], unit=0, phrases=[], inputs=False, quoted=False)
+    assert [v["code"] for v in ac.check_sentence(sentence, {"A2": result})] == []

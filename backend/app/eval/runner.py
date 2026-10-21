@@ -469,12 +469,16 @@ class EvalExecution(runtime.JobRun):
         预留了多少))，评完按实际找补。"""
         from app.engine.spend import eval_spend
 
-        per_item = float(((self.budget.get("estimate") or {}).get("per_item_usd")) or 0.0) * max(1, len(self.arms))
+        # 估不出金额的题集（没评过、模型又不在价格目录里）按 0 预留，但记成「金额估不出」：拿 0 去比上限等于说它不花钱，
+        # 账上也得看得出这一次其实有几笔没计价
+        estimate = (self.budget.get("estimate") or {}).get("per_item_usd")
+        priced = estimate is not None
+        per_item = float(estimate or 0.0) * max(1, len(self.arms))
         cap = self.budget.get("per_run_max_usd")
         if cap is not None and self.spent + self.reserved + per_item > float(cap) + 1e-9:
             return LIMIT_RUN.format(limit=float(cap)), None
         daily = self.budget.get("daily_max_usd")
-        day = await eval_spend.charge(per_item, limit=float(daily) if daily is not None else None, priced=True)
+        day = await eval_spend.charge(per_item, limit=float(daily) if daily is not None else None, priced=priced)
         if day is None:
             return LIMIT_DAILY.format(limit=float(daily)), None
         self.reserved += per_item

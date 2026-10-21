@@ -352,3 +352,29 @@ def test_e1_follows_the_analysis_inputs_down_the_drill():
     assert _query_inputs(found["a2"], found, {"q1": {}, "q2": {}}) == ["q1", "q2"]
     assert _query_inputs({"inputs": ["gone"]}, found, {"q1": {}}) == [], "取不回的输入不算"
 
+
+
+
+async def test_an_estimate_that_cannot_be_computed_still_marks_the_calls_unpriced(monkeypatch):
+    """真实模型验收 V10：题集从没评过、模型又不在价格表里时估不出每题花费。以前按 0 预留却记成「有价」，
+    评测账本上看不出这些都是未计价的调用；现在金额照 0 记，但记成估不出。"""
+    from app.db.base import SessionLocal
+    from app.db.models_eval import EvalSuite
+    from app.engine.spend import eval_spend
+    from app.eval import runner
+    from app.eval.variants import normalize_variant
+    from tests import eval_samples as es
+
+    async def no_estimate(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(runner, "estimate", no_estimate)
+    before = await eval_spend.daily()
+    suite_id = await es.make_suite("none", cases=[{"question": "问 1", "expectations": [{"kind": "ask"}]}],
+                                   budget={"max_parallel": 1})
+    async with SessionLocal() as session:
+        suite = await session.get(EvalSuite, suite_id)
+        [run] = await runner.start(session, suite, [normalize_variant({})], actor="评测测试")
+    await es.wait_eval(run.id)
+    after = await eval_spend.daily()
+    assert after.get("unpriced_calls", 0) > before.get("unpriced_calls", 0), after

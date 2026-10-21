@@ -233,7 +233,8 @@ _RATE_COLUMNS = ("pct", "share")
 
 def _rate_formats(columns: Sequence[str], rate: Sequence[str] = _RATE_COLUMNS,
                   points: Sequence[str] = ()) -> dict[str, str]:
-    """结果表各列记的换算：rate 里的列（占比、变化率、权重、比率本身）记 pct，points 里的列（比率的变化）记 pp。"""
+    """结果表各列记的换算：rate 里的列（占比、变化率、权重）记 pct，points 里的列（比率的变化）记 pp。
+    比率本身（如客单价）不是占比，不进 rate——套上百分数会显示成 16,062.5%。"""
     return {**{c: CONV_PCT for c in rate if c in columns},
             **{c: CONV_POINTS for c in points if c in columns}}
 
@@ -695,11 +696,13 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion,
                  phrase=ph.with_caveats(main, caveats, skip=("comparability",) if outcome is None else ()),
                  caveats=caveats,
-                 # 权重、各段的比率按百分数显示；结构效应、自身效应、合计影响是比率的变化，按百分点
-                 formats=_rate_formats(columns, rate=("w_base", "w_target", "r_base", "r_target"),
+                 # 权重（占比）按百分数；结构效应、自身效应、合计影响是比率的变化，按百分点。各段的比率和整体比率本身：
+                 # 各段分子都不超过分母时它是个占比（退款率），按百分数；否则它是有量纲的比率（客单价，元 / 单，可以大于 1），
+                 # 照原值显示——一律套百分数会把客单价 160.76 显示成 16,076.0%
+                 formats=_rate_formats(columns, rate=("w_base", "w_target") + (("r_base", "r_target") if proportion else ()),
                                        points=("mix", "rate", "total")),
-                 named={k: CONV_PCT for k in ("r_base_total", "r_target_total")}
-                 | {k: CONV_POINTS for k in ("delta", "mix_total", "rate_total")}
+                 named={k: CONV_POINTS for k in ("delta", "mix_total", "rate_total")}
+                 | ({k: CONV_PCT for k in ("r_base_total", "r_target_total")} if proportion else {})
                  | {"mix_share": CONV_PCT, "rate_share": CONV_PCT})
 
 

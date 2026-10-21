@@ -538,18 +538,47 @@ def _subjects(result: Mapping[str, Any]) -> list[str]:
     return out
 
 
+#: 「订单数」写在句子里常写成「订单量」「订单数变多」：比到这几类量词结尾的同一个词根时按同一个段算
+_SUFFIXES = ("数量", "笔数", "单数", "数", "量", "额")
+
+
+def _stem(text: str) -> str:
+    """段的词根：「订单数」「订单量」都是「订单」。去掉结尾的量词，词根至少两个字（「单数」不能把「订单数」拆成「订」，
+    所以短的量词先试）。"""
+    for suffix in _SUFFIXES:
+        if text.endswith(suffix) and len(text) - len(suffix) >= 2:
+            return text[: -len(suffix)]
+    return text
+
+
 def _named(result: Mapping[str, Any], names: str) -> list[str]:
-    """分句里点名的段（原样，按出现的先后）。ASCII 的名字要整词出现（「A」不算点名了「AB」）。"""
+    """分句里点名的段（原样，按出现的先后）。ASCII 的名字要整词出现（「A」不算点名了「AB」）。
+    除了原样的名字，去掉结尾量词的词根也算点名（「订单量」点名了「订单数」）：写作者换个量词的说法很常见。
+    词根只在原样一个都没认出来时才用，免得把「线上」认成「线上渠道」。"""
     flat = _same_length_norm(names)
-    hits: list[tuple[int, str]] = []
-    for key, original in _segment_names(result).items():
+
+    def find(key: str) -> float:
         at = flat.find(key)
         while at >= 0:
             before, after = flat[at - 1:at], flat[at + len(key):at + len(key) + 1]
             if not (key.isascii() and any(ch.isascii() and ch.isalnum() for ch in (before, after) if ch)):
-                hits.append((at, original))
-                break
+                return at
             at = flat.find(key, at + 1)
+        return -1.0
+
+    hits: list[tuple[float, str]] = []
+    for key, original in _segment_names(result).items():
+        at = find(key)
+        if at >= 0:
+            hits.append((at, original))
+    if not hits:
+        for key, original in _segment_names(result).items():
+            stem = _stem(key)
+            if stem == key:
+                continue
+            at = find(stem)
+            if at >= 0:
+                hits.append((at, original))
     return [name for _, name in sorted(hits)]
 
 
@@ -831,7 +860,10 @@ def _object(sentence: Sentence, hit: Hit, left: int, right: int) -> tuple[str, .
         return (names[hit.start:hit.end],)
     if hit.side != "before":
         return (names[left:right],)
-    spans = [names[left:hit.end]]
+    # 「主导」「贡献最大」这类，主语可以在判断词前面（「线上主导」），也可以在它后面（「主要由订单量放大带来」；
+    # 「主要是华东」）：先看整个分句（近的在前），再看前面一个个分句。只看判断词前面会把
+    # 「这波涨幅主要由订单量放大带来」认成没点名，或者错认到前一个分句的名上
+    spans = [names[left:right]]
     cut = left - 1
     while cut > 0:
         prev, _ = _clause(sentence.text, cut, cut)
@@ -1095,7 +1127,10 @@ ANALYSIS_RULES_PROMPT = (
     "没做成的原因，不下这类判断。"
     "没有对应的分析结论，就只陈述数字和变化。\n"
     "- 拆解只说明变化来自哪里，不说明为什么。写原因（因为、由于、导致、受…影响）要有知识库原话或运行输入作依据，"
-    "否则写成待核实的推测，比如「可能与促销结束有关，待核实」。"
+    "否则写成待核实的推测，比如「可能与促销结束有关，待核实」。\n"
+    "- 判定语整句引用（[[a:A1]]）时一句只引用一份结论，不要把几份不同维度、不同期间的判定语用逗号拼成一句；"
+    "要说两件事就分成两句，各自挂各自的依据。\n"
+    "- 「核对不了」「未能核对」是系统对核对情况的说明，不是结论：不要把它写进正文当结论，也不要据此下判断。"
 )
 #: 写作目录里没有分析结论时，拼在写作规则后面
 ANALYSIS_NONE_PROMPT = (

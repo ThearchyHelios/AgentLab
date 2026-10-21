@@ -47,6 +47,8 @@ NOTE_NO_NOTES = "拆解所用的数据源还没有数据目录，候选维度核
 NOTE_NO_DECOMPOSE = "这次没有按维度拆解，候选维度没有核对"
 NOTE_NO_QUERY = "拆解所用的查询取不回来，候选维度核对不了"
 NOTE_NO_FACT = "拆解所用查询的表在数据目录里认不出哪张是事实表，候选维度核对不了"
+NOTE_NOT_MAINTAINED = ("数据目录还没标表类型和字段的度量类型（目录还没维护），列不出候选维度；"
+                       "在数据目录里把事实表、属性列这些标上，这一处就能列出没拆过的维度")
 
 
 def _alias_order(alias: str) -> tuple[int, str]:
@@ -172,6 +174,19 @@ def _related(notes: Mapping[str, Any], tables: Mapping[str, Any]) -> list[tuple[
     return out
 
 
+def _maintained(tables: Mapping[str, Any]) -> bool:
+    """目录维护过没有：任何一张表标了类型，或者任何一个字段标了度量类型。"""
+    for notes in tables.values():
+        if not isinstance(notes, Mapping):
+            continue
+        if _value(notes.get("kind")):
+            return True
+        for body in (notes.get("columns") or {}).values():
+            if isinstance(body, Mapping) and _value(body.get("measure")):
+                return True
+    return False
+
+
 def _fact_tables(names: list[str], tables: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]] | None:
     """查询里的事实表；认不出的为 None。"""
     found = [hit for name in names if (hit := _table_notes(tables, name))]
@@ -227,7 +242,9 @@ def _undecomposed(decomposes: list[dict[str, Any]], catalog: Mapping[str, Any],
             masked = {name_key(str(c)) for c in [*_names(facts_of.get("masked")), *_names(snapshot.get("mask_columns"))]}
             facts = _fact_tables(sql_tables(str(snapshot.get("sql") or "")), tables)
             if facts is None:
-                return None, NOTE_NO_FACT
+                # 目录还没维护（表类型、字段的度量类型都没标）时说清楚是目录没维护，不说成「认不出事实表」——
+                # 后者听着像数据的问题，实际上补一下目录就能列
+                return None, NOTE_NO_FACT if _maintained(tables) else NOTE_NOT_MAINTAINED
             for table, notes in [*facts, *(r for t, n in facts for r in _related(n, tables))]:
                 for column in (notes.get("columns") or {}):
                     known.setdefault(name_key(str(column)), (source, table, name_key(str(column))))
