@@ -116,15 +116,17 @@ const ORDER = [
 const ESTIMATE = {
   challenge: 30,
   stream: 173, chat: 160, studio: 149, manage: 145, runs: 112, publish: 92, shell: 87,
-  evidence: 91, versions: 60, catalog: 150, 'catalog-loop': 60, 'catalog-profile': 90, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
+  evidence: 157, versions: 60, catalog: 150, 'catalog-loop': 60, 'catalog-profile': 90, 'ui-kit': 70, ui: 61, guards: 8, 'canvas-layout': 2, copy: 2, tokens: 1, trace: 1, decode: 1,
   // 占位，换成真检查时按实测改
-  schedules: 60, compare: 45, verify: 71, inquiry: 60, bundle: 16, whatif: 33, 'report-export': 30,
+  schedules: 60, compare: 100, verify: 71, inquiry: 60, bundle: 36, whatif: 33, 'report-export': 30,
   // 应用平台：还没实测，按同类页面估（全是伪造接口、不连真数据）
   apps: 60, inbox: 45, 'app-editor': 45, capabilities: 30, 'access-keys': 30, share: 30,
   // 普通用户建应用：还没实测，按同类页面估
   blueprint: 90, personal: 45, records: 30, files: 30,
   // 下一轮第 4 波：2026-10-16 两套服务、八道并行时的实测
   'catalog-changes': 43, evals: 33, ledger: 31,
+  // 上面的 evidence、compare、bundle 按分析能力一轮第 2 波之后（2026-10-21，两套服务、八道并行）的实测改过：证据面板、
+  // 运行对比、可验证报告各加了分析结论的几段
 }
 // 最慢的两项按段拆成几份。用的是它们自己的段过滤：最后一份用 *_SKIP 兜住「其余全部」，以后新加的段
 // 不用改这里也跑得到（拆出去的那几份要是一段都没对上，那一份会报「一项都没跑」）。
