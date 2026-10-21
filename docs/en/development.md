@@ -97,7 +97,7 @@ Regenerating the lock file requires [uv](https://docs.astral.sh/uv/); installing
 ## Tests
 
 ```bash
-# Backend: about 14300 tests; with -n auto they run in parallel in about 1–2 minutes
+# Backend: about 16000 tests; with -n auto they run in parallel in about 2–3 minutes
 cd backend && env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u OPENAI_API_KEY \
   python -m pytest -n auto
 

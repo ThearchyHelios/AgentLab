@@ -97,7 +97,7 @@ pip install -e 'backend[microvm,dev,db,docs,postgres]' -c backend/requirements.l
 ## 测试
 
 ```bash
-# 后端：约 14300 个测试，-n auto 并行约 1–2 分钟
+# 后端：约 16000 个测试，-n auto 并行约 2–3 分钟
 cd backend && env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u OPENAI_API_KEY \
   python -m pytest -n auto
 
