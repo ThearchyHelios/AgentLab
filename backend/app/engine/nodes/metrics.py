@@ -477,7 +477,7 @@ def _rendered(value: Any, definition: dict[str, Any], display: dict[str, Any]) -
 # 可比性检查（docs/design/analysis-round/00-总方案.md §3.4 第 3 条）
 # --------------------------------------------------------------------------
 
-#: 可比性检查没做成（探查失败、算子出错、还没有算子……）时那条日志的 code
+#: 可比性检查没做成（快照读不出来、探查失败、算子出错、算不了……）时那条日志的 code
 COMPARABILITY_SKIPPED = "metric_comparability_skipped"
 #: 那条日志的说法
 COMPARABILITY_SKIPPED_TEXT = "指标「{name}」用到的两次查询没做成可比性检查：{why}。指标照常计算，两期能不能直接比请自行核对"
@@ -508,7 +508,7 @@ async def _comparability(metric_id: str, name: str, inputs: list[dict[str, Any]]
     哪份是基期：不同的日期、期次里第一处两边写法相同、排得出先后的（真正的日期，或同一种写法的月、周、季、年），早的是基期；
     排不出的（按运行当天现算的界 date('now', '-7 days')），表达式里先出现的那份算本期（「(本周 - 上周) / 上周」的写法）。
 
-    做不成（快照读不出来、探查失败、算子出错、算不了、还没有算子）不挡口径卡：照实记一条日志（COMPARABILITY_SKIPPED），
+    做不成（快照读不出来、探查失败、算子出错、算不了）不挡口径卡：照实记一条日志（COMPARABILITY_SKIPPED），
     这个指标不写 comparability。同一对快照只查一次。"""
     from app.engine.lineage import SNAPSHOT_VIAS
 

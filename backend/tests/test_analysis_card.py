@@ -1,7 +1,8 @@
 """分析卡（节点类型 analysis，docs/design/analysis-round/00-总方案.md §3.2）：画图时的校验、执行、产出的变量、受管规则、
 登记处（叫法、变量表、助手查看、目录影响面、升级提醒）。运行对比按项对齐见 tests/test_analysis_compare.py。
 
-算子（app.analysis.run）换成按请求交回假结论的替身（tests/fixtures/analysis_ops.FakeOps）。库是虚构的零售库 shop。
+算子（app.analysis.run）换成按请求交回假结论的替身（tests/fixtures/analysis_ops.FakeOps）；样例里的下钻那一项另用真算子
+跑一遍（替身不核参数）。库是虚构的零售库 shop：orders(region, week, amount, channel)，华东、华南、华北两周。
 """
 from __future__ import annotations
 
@@ -14,9 +15,8 @@ from sqlalchemy import select
 from app.analysis import contract
 from app.analysis.contract import CallError
 from app.core import artifact_store
-from app.data.engine import engines
 from app.db.base import SessionLocal
-from app.db.models import DataSource, Run, RunEvent
+from app.db.models import Run, RunEvent
 from app.engine.runner import run_manager
 from app.engine.schema import GraphSpec, NodeType, validate_graph
 from tests.fixtures.analysis_ops import FakeOps
@@ -24,16 +24,22 @@ from tests.fixtures.analysis_ops import FakeOps
 TOOL = "db_query__shop"
 WEEKLY = "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week"
 REGION = "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week"
-ROWS = [(1, "华东", "2026-W41", 820.0), (2, "华东", "2026-W42", 700.0), (3, "华南", "2026-W41", 700.0),
-        (4, "华南", "2026-W42", 666.0), (5, "华北", "2026-W41", 600.0), (6, "华北", "2026-W42", 560.0)]
+#: 各地区两周的销售额：华东 820 → 700（线上 500 → 420、线下 320 → 280），华南 700 → 666，华北 600 → 560
+ROWS = [(1, "华东", "2026-W41", 500.0, "线上"), (2, "华东", "2026-W41", 320.0, "线下"), (3, "华东", "2026-W42", 420.0, "线上"),
+        (4, "华东", "2026-W42", 280.0, "线下"), (5, "华南", "2026-W41", 700.0, "线上"), (6, "华南", "2026-W42", 666.0, "线上"),
+        (7, "华北", "2026-W41", 600.0, "线下"), (8, "华北", "2026-W42", 560.0, "线下")]
+#: 华东按渠道（DRILL 的输入）：两个渠道之和 820 → 700，和 WHERE 里华东那一段闭合
+EAST = ("SELECT channel, week, SUM(amount) AS gmv FROM orders WHERE region = '华东' GROUP BY channel, week "
+        "ORDER BY channel, week")
 WOW = {"id": "wow", "op": "baseline", "from": "weekly", "params": {"period": "week", "measure": "gmv",
                                                                      "label": "销售额"}}
 WHERE = {"id": "where", "op": "decompose", "mode": "additive", "from": "by_region",
          "params": {"by": ["region"], "period": "week", "base": "2026-W41", "target": "2026-W42", "measure": "gmv",
                     "headline": {"base": "weekly.r0.gmv", "target": "weekly.r1.gmv"}, "label": "销售额"},
          "hypothesis": "下降是不是集中在某个地区"}
-DRILL = {"id": "east", "op": "decompose", "mode": "additive", "from": "by_region",
-         "params": {"by": ["week"], "period": "week", "base": "2026-W41", "target": "2026-W42", "measure": "gmv",
+#: 下钻：WHERE 里华东那一段按渠道再拆一层，读华东按渠道的那次查询（drill_graph 里的 east_q）
+DRILL = {"id": "east", "op": "decompose", "mode": "additive", "from": "east_q",
+         "params": {"by": ["channel"], "period": "week", "base": "2026-W41", "target": "2026-W42", "measure": "gmv",
                     "parent": {"of": "where", "key": ["华东"]}}}
 
 
@@ -44,30 +50,20 @@ async def engine_up():
     await run_manager.shutdown()
 
 
-async def _shop(tmp_path, options=None):
+async def _shop(tmp_path, scratch_source, options=None):
+    """虚构零售库 shop（tests/conftest.py 的 scratch_source：同名的旧源连同数据目录、现查缓存先删掉，测试结束时再删）。"""
     path = tmp_path / "shop.db"
     db = sqlite3.connect(path)
-    db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT, week TEXT, amount REAL);")
-    db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", ROWS)
+    db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT, week TEXT, amount REAL, channel TEXT);")
+    db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", ROWS)
     db.commit()
     db.close()
-    async with SessionLocal() as session:
-        row = (await session.execute(select(DataSource).where(DataSource.name == "shop"))).scalar_one_or_none()
-        if row is None:
-            row = DataSource(name="shop", kind="sqlite", database=str(path), readonly=True, enabled=True)
-            session.add(row)
-        row.database, row.kind, row.enabled, row.readonly, row.options = str(path), "sqlite", True, True, options or {}
-        await session.commit()
-        source_id = row.id
-    await engines.invalidate(source_id)
-    return source_id
+    return await scratch_source("shop", path, options=options)
 
 
 @pytest.fixture
-async def shop(tmp_path):
-    source_id = await _shop(tmp_path)
-    yield
-    await engines.invalidate(source_id)
+async def shop(tmp_path, scratch_source):
+    return await _shop(tmp_path, scratch_source)
 
 
 def node(nid, ntype, **config):
@@ -88,6 +84,12 @@ def card_graph(items=(WOW, WHERE), *, extra_nodes=(), extra_edges=(), **card):
     edges = [edge("start", "weekly"), edge("weekly", "by_region"), edge("by_region", "card"), edge("card", "out"),
              *extra_edges]
     return {"nodes": nodes, "edges": edges}
+
+
+def drill_graph(items=(WOW, WHERE, DRILL), **card):
+    """带下钻那一项的分析卡：华东按渠道的那次查询（east_q）接在 by_region 后面、分析卡前面。"""
+    return card_graph(items=items, extra_nodes=[node("east_q", "tool", tool=TOOL, args={"sql": EAST})],
+                      extra_edges=[edge("by_region", "east_q"), edge("east_q", "card")], **card)
 
 
 def card_issues(graph, level="error"):
@@ -139,7 +141,7 @@ def test_node_type_and_labels():
 
 
 def test_a_well_formed_card_validates():
-    assert card_issues(card_graph(items=(WOW, WHERE, DRILL), overrides={"main_share": 0.6}), level=None) == []
+    assert card_issues(drill_graph(overrides={"main_share": 0.6}), level=None) == []
 
 
 @pytest.mark.parametrize("items, field, code, why", [
@@ -174,9 +176,9 @@ def test_a_well_formed_card_validates():
      "items[1].params.parent", "analysis.params_invalid", "没有「parent」"),
 ])
 def test_item_problems(items, field, code, why):
-    found = [i for i in card_issues(card_graph(items=items)) if i.field == field]
+    found = [i for i in card_issues(drill_graph(items=items)) if i.field == field]
     assert found and found[0].code == code and why in found[0].message, [i.message for i in card_issues(
-        card_graph(items=items))]
+        drill_graph(items=items))]
 
 
 @pytest.mark.parametrize("extra, why", [
@@ -235,8 +237,7 @@ def test_two_snapshot_items_need_both_nodes():
 
 async def test_the_card_runs_each_item_and_records_it(monkeypatch, shop):
     ops = FakeOps(monkeypatch, verdicts=["outside_band", "driver", "driver"], peek=["wow", "where", "east"])
-    row = await run_graph(card_graph(items=(WOW, WHERE, DRILL), overrides={"main_share": 0.6}),
-                          options={contract.SETTINGS_KEY: {"k_warn": 2.5}})
+    row = await run_graph(drill_graph(overrides={"main_share": 0.6}), options={contract.SETTINGS_KEY: {"k_warn": 2.5}})
     assert row.status == "succeeded", row.error
 
     # 算子拿到的：请求、按上游节点 id 解析的快照（只认台账里的那几份）、阈值（缺省 ← 发起时的快照 ← 卡上的覆盖）
@@ -280,6 +281,25 @@ async def test_the_card_runs_each_item_and_records_it(monkeypatch, shop):
     assert row.output["判定"] == results["wow"]["phrase"]
 
 
+async def test_the_drill_item_holds_up_with_the_real_operator(shop):
+    """上面的 DRILL 换真算子也成立（替身不核参数）：华东按渠道拆，两个渠道之和和上一项里华东那一段闭合，主要来自线上；上一层
+    按存下的工件认（parent 的哈希就是 where 那一项的结论工件），按封存的工件复算逐字段相同。"""
+    import app.analysis as analysis_ops
+
+    row = await run_graph(drill_graph(overrides={"main_share": 0.6}))
+    assert row.status == "succeeded", row.error
+    _, output = await output_of(row.id, "card")
+    results = output["results"]
+    assert results["where"]["verdict"] == "driver" and "主要来自华东" in results["where"]["phrase"]
+    east = artifact_store.load(results["east"]["artifact"])
+    assert east["status"] == "ok" and east["verdict"] == {"code": "driver", "subjects": [["线上"]], "direction": "down"}
+    assert east["values"]["base_total"] == "820" and east["values"]["target_total"] == "700"
+    [parent] = [i for i in east["inputs"] if i.get("role") == "parent"]
+    assert parent["artifact"] == results["where"]["artifact"]
+    again = analysis_ops.recompute(east, artifact_store.load, load_result=artifact_store.load)
+    assert contract.same(east, again)
+
+
 async def test_a_refused_item_does_not_fail_the_card(monkeypatch, shop):
     FakeOps(monkeypatch, statuses=["refused", "ok"])
     row = await run_graph(card_graph())
@@ -320,15 +340,12 @@ async def test_inputs_that_are_not_query_snapshots_fail_clearly(monkeypatch, sho
     assert row.status == "failed" and "不是存成快照的查询结果" in row.error
 
 
-async def test_masked_columns_reach_the_operator(monkeypatch, tmp_path):
-    source_id = await _shop(tmp_path, {"mask_columns": ["region"]})
-    try:
-        ops = FakeOps(monkeypatch)
-        row = await run_graph(card_graph(items=[WHERE]))
-        assert row.status == "succeeded", row.error
-        assert "region" in ops.calls[0]["snapshots"]["by_region"]["masked"]
-    finally:
-        await engines.invalidate(source_id)
+async def test_masked_columns_reach_the_operator(monkeypatch, tmp_path, scratch_source):
+    await _shop(tmp_path, scratch_source, {"mask_columns": ["region"]})
+    ops = FakeOps(monkeypatch)
+    row = await run_graph(card_graph(items=[WHERE]))
+    assert row.status == "succeeded", row.error
+    assert "region" in ops.calls[0]["snapshots"]["by_region"]["masked"]
 
 
 # --------------------------------------------------------------------------

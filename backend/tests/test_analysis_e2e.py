@@ -1,5 +1,6 @@
-"""分析入口接真算子跑一遍（不用替身）：agent 分析工具（含下钻）、分析卡（波动基线 + 变化拆解）、口径卡的可比性挂钩、
-审批恢复时的重放。断言工件、台账、交回模型的那一段、节点产出，并用 analysis.recompute 按封存的工件复算、逐字段相同。
+"""分析入口接真算子跑一遍（不用替身）：agent 的五个分析工具（变化拆解含下钻，波动基线、趋势、差异检验、可比性检查各一次）、
+分析卡（波动基线 + 变化拆解；输入是合并查询的一次）、口径卡的可比性挂钩、审批恢复时的重放。断言工件、台账、交回模型的那一段、
+节点产出，并用 analysis.recompute 按封存的工件复算、逐字段相同。
 
 虚构零售库 shop：orders(day, region, channel, amount)，2026-03-02 起 12 个整周，每周每个地区、渠道两笔（周三、周日），
 最后一周华东掉三成。模型换成脚本（MockChatModel._decide），不调用任何模型。
@@ -25,6 +26,7 @@ from app.engine.runner import run_manager
 
 TOOL = "db_query__shop"
 DECOMPOSE = contract.TOOL_NAMES["decompose"]
+BASELINE, TREND, DIFFER, COMPARABLE = (contract.TOOL_NAMES[op] for op in ("baseline", "trend", "differ", "comparable"))
 WEEK = "date(day, '-6 days', 'weekday 1')"
 BY_REGION = (f"SELECT region, {WEEK} AS week, SUM(amount) AS gmv FROM orders WHERE day >= '2026-05-11' "
              "GROUP BY region, week ORDER BY region, week")
@@ -140,9 +142,9 @@ async def events(run_id, etype=None, node_id=None):
         return [e.data for e in (await session.execute(q.order_by(RunEvent.seq))).scalars()]
 
 
-def agent_graph(approval="never"):
+def agent_graph(approval="never", tools=(TOOL, DECOMPOSE)):
     return chain(node("start", "input"),
-                 node("bot", "agent", prompt="销售额为什么下降", tools=[TOOL, DECOMPOSE], approval=approval),
+                 node("bot", "agent", prompt="销售额为什么下降", tools=list(tools), approval=approval),
                  node("out", "output", fields=[{"name": "answer", "value": "{{ nodes.bot.text }}"}]))
 
 
@@ -199,6 +201,77 @@ async def test_an_agent_decomposes_and_drills_down_with_the_real_operator(monkey
     # 按封存的工件复算，逐字段相同
     recomputes(a1)
     recomputes(a2)
+
+
+async def agent_analysis(monkeypatch, tool, calls):
+    """Agent 依次查库、最后调一次分析工具（真算子）：交回 (那份结论, 交回模型的那一段的 JSON)。顺带断言台账记了这一条（带
+    call_id）、交回模型的编号是「【分析 A1】」、判定语和结论一字不差，并按封存的工件复算、逐字段相同。"""
+    script = Script(monkeypatch, calls)
+    run = await run_manager.start(graph=agent_graph(tools=(TOOL, tool)), input_payload={})
+    row = await wait(run.id)
+    assert row.status == "succeeded", row.error
+    ends = await events(row.id, "tool.end", "bot")
+    artifact = ends[-1]["analysis_artifact"]
+    stored = artifact_store.load(artifact)
+    [finished] = await events(row.id, "node.finished", "bot")
+    [entry] = [e for e in finished["evidence"] if e["kind"] == "analysis"]
+    assert entry == contract.ledger_entry(stored, node_id="bot", exec_no=1, artifact=artifact,
+                                          call_id=f"call_{len(calls) - 1}")
+    assert set(entry["inputs"]) == {e["query_artifact"] for e in ends[:-1]}
+    head, body = script.replies()[-1].split("\n", 1)
+    assert head == "【分析 A1】" and json.loads(body)["phrase"] == stored["phrase"]
+    recomputes(stored)
+    return stored, json.loads(body)
+
+
+def _live(stored):
+    """结论里现查的表范围：按这次运行的数据源探 orders.day。"""
+    return [(p["table"], p["column"], p["basis"], p["max"]) for p in stored["probes"]]
+
+
+async def test_an_agent_puts_the_week_into_its_history_with_the_real_operator(monkeypatch):
+    stored, body = await agent_analysis(monkeypatch, BASELINE, [
+        (TOOL, {"sql": WEEKLY}),
+        (BASELINE, {"query": "Q1", "period": "week", "measure": "gmv", "label": "销售额", "hypothesis": "这周是不是异常"})])
+    assert stored["op"] == "baseline" and stored["status"] == "ok" and stored["hypothesis"] == "这周是不是异常"
+    assert stored["verdict"] == {"code": "far_outside_band", "direction": "down", "subjects": []}
+    assert stored["phrase"].startswith("销售额本期变化 -10.6%，明显超出过去 10 周的常规波动范围")
+    assert "record_low" in {c["code"] for c in stored["caveats"]} and body["verdict"] == "far_outside_band"
+    assert _live(stored) == [("orders", "day", "live", "2026-05-24")]      # 本期完不完整按现查的表范围判
+
+
+async def test_an_agent_asks_for_a_trend_with_the_real_operator(monkeypatch):
+    stored, body = await agent_analysis(monkeypatch, TREND, [
+        (TOOL, {"sql": WEEKLY}), (TREND, {"query": "Q1", "period": "week", "measure": "gmv", "label": "销售额"})])
+    assert stored["op"] == "trend" and stored["status"] == "ok"
+    assert stored["verdict"] == {"code": "no_trend", "direction": None, "subjects": []}
+    assert stored["phrase"] == "过去 12 周销售额没有明显的上升或下降趋势" and stored["values"]["n"] == "12"
+    assert _live(stored) == [("orders", "day", "live", "2026-05-24")] and body["values"] == stored["values"]
+
+
+async def test_an_agent_tests_a_difference_with_the_real_operator(monkeypatch):
+    rows = "SELECT region, amount FROM orders WHERE region IN ('华东', '华南') ORDER BY region, day"
+    stored, body = await agent_analysis(monkeypatch, DIFFER, [
+        (TOOL, {"sql": rows}),
+        (DIFFER, {"mode": "rows", "query": "Q1", "by": ["region"], "value": "amount", "label": "单笔金额"})])
+    assert stored["op"] == "differ" and stored["mode"] == "rows" and stored["status"] == "ok"
+    assert stored["verdict"] == {"code": "differs", "direction": "up", "subjects": [["华东"], ["华南"]]}
+    assert stored["phrase"] == "华东的单笔金额（196.83）高于华南（152），差异站得住"
+    assert stored["values"]["n_a"] == stored["values"]["n_b"] == "48" and stored["values"]["test"] == "welch"
+    assert body["subjects"] == [["华东"], ["华南"]]
+
+
+async def test_an_agent_checks_two_weeks_are_comparable_with_the_real_operator(monkeypatch):
+    stored, body = await agent_analysis(monkeypatch, COMPARABLE, [
+        (TOOL, {"sql": _week_sql("2026-05-18", "2026-05-24")}), (TOOL, {"sql": _week_sql("2026-05-11", "2026-05-17")}),
+        (COMPARABLE, {"base_query": "Q2", "target_query": "Q1", "measure": "gmv"})])
+    assert stored["op"] == "comparable" and stored["status"] == "ok" and stored["phrase"] == "两期可比"
+    assert stored["params"]["base_query"] == "Q2" and stored["params"]["target_query"] == "Q1"
+    values = stored["values"]
+    assert (values["base_start"], values["base_end"], values["target_start"], values["target_end"]) == (
+        "2026-05-11", "2026-05-17", "2026-05-18", "2026-05-24")
+    assert {values[k] for k in ("same_query", "window", "complete", "weekdays", "data")} == {"pass"}
+    assert _live(stored) == [("orders", "day", "live", "2026-05-24")] and body["verdict"] == "comparable"
 
 
 async def test_replaying_after_approvals_does_not_recompute(monkeypatch):
@@ -263,6 +336,31 @@ async def test_an_analysis_card_runs_the_real_operators():
         ("analysis", "wow", wow["artifact"]), ("analysis", "where", where["artifact"])]
     recomputes(baseline)
     recomputes(decomposed)
+
+
+async def test_an_analysis_card_reads_a_merged_query():
+    """分析卡的输入是合并查询（merge 节点）：按合并查询节点的做法取它的快照，输入写明 sqlite 方言（合并查询在 SQLite 里
+    执行），真算子照常拆、复算逐字段相同。"""
+    where = {"id": "where", "op": "decompose", "mode": "additive", "from": "merged",
+             "params": {"by": ["region"], **TWO_WEEKS, "label": "销售额"}}
+    graph = chain(node("start", "input"), node("by_region", "tool", tool=TOOL, args={"sql": BY_REGION}),
+                  node("merged", "merge", inputs={"a": "by_region"}, sql="SELECT region, week, gmv FROM a"),
+                  node("card", "analysis", items=[where]),
+                  node("out", "output", fields=[{"name": "r", "value": "{{ nodes.card.results.where.phrase }}"}]))
+    run = await run_manager.start(graph=graph, input_payload={})
+    row = await wait(run.id)
+    assert row.status == "succeeded", row.error
+    [finished] = await events(row.id, "node.finished", "card")
+    results = artifact_store.load(finished["artifact"])["results"]
+    stored = artifact_store.load(results["where"]["artifact"])
+    assert stored["verdict"]["code"] == "driver" and stored["verdict"]["subjects"] == [["华东"]]
+    assert row.output["r"] == stored["phrase"] and "主要来自华东" in stored["phrase"]
+    [given] = stored["inputs"]
+    [merged] = await events(row.id, "node.finished", "merged")
+    assert (given["ref"], given["role"], given["dialect"]) == ("merged", "data", "sqlite")
+    assert given["artifact"] == merged["evidence"][0]["artifact"]
+    assert [(e["kind"], e["item"]) for e in finished["evidence"]] == [("analysis", "where")]
+    recomputes(stored)
 
 
 # --------------------------------------------------------------------------

@@ -5,7 +5,7 @@
   analysis.comparable_reasons 拆
 - SQL 结构不同（退款额 / 销售额）、两次是同一条 SQL → 不查、不记日志
 - 不同的字面量里没有日期、期次（只差地区、只差门店号）→ 是两段不是两期，不查、不记日志；日期和地区都不同的照查
-- 算子出错、算不了、算子没有实现（NotImplementedError）→ 不挡口径卡，记一条 metric_comparability_skipped
+- 算子出错（调用错误、意料之外的异常）、算不了 → 不挡口径卡，记一条 metric_comparability_skipped
 
 这里的算子是替身（tests/fixtures/analysis_ops.FakeOps）；真算子跑一遍的见 tests/test_analysis_e2e.py。
 """
@@ -192,8 +192,8 @@ def test_which_literals_are_periods(this, last, pairs, order):
 
 
 async def test_an_operator_that_is_not_there_does_not_block_the_card(monkeypatch):
-    """算子没有实现（合并前的骨架抛 NotImplementedError）：口径卡照常算，照实记一条没做成。"""
-    FakeOps(monkeypatch, errors=[NotImplementedError("analysis.run 还没有实现")])
+    """算子抛出意料之外的异常（这里是 NotImplementedError）：口径卡照常算，照实记一条没做成。"""
+    FakeOps(monkeypatch, errors=[NotImplementedError("这种写法还没有实现")])
     _, card, logs = await run_card(graph([{"id": "wow", "name": "销售额环比", "expression": WOW, "decimals": 4}]))
     wow = by_id(card)["wow"]
     assert "comparability" not in wow and wow["value"] == pytest.approx((450 + 300 - 900) / 900, abs=1e-4)
