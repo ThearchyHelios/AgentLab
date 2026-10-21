@@ -225,6 +225,7 @@ def _undecomposed(decomposes: list[dict[str, Any]], catalog: Mapping[str, Any],
         if not snapshots:
             return None, NOTE_NO_QUERY
         known: dict[str, tuple[str, str, str]] = {}     # 这份拆解能对上的列：name_key → (源, 表, 列)
+        bare = False                                    # 目录还没维护（没有任何列说明）：对不上是目录的事，不是数据的事
         for artifact in snapshots:
             try:
                 snapshot = load(str(artifact))
@@ -245,6 +246,7 @@ def _undecomposed(decomposes: list[dict[str, Any]], catalog: Mapping[str, Any],
                 # 目录还没维护（表类型、字段的度量类型都没标）时说清楚是目录没维护，不说成「认不出事实表」——
                 # 后者听着像数据的问题，实际上补一下目录就能列
                 return None, NOTE_NO_FACT if _maintained(tables) else NOTE_NOT_MAINTAINED
+            bare = bare or not any((n.get("columns") or {}) for _, n in facts)
             for table, notes in [*facts, *(r for t, n in facts for r in _related(n, tables))]:
                 for column in (notes.get("columns") or {}):
                     known.setdefault(name_key(str(column)), (source, table, name_key(str(column))))
@@ -253,6 +255,10 @@ def _undecomposed(decomposes: list[dict[str, Any]], catalog: Mapping[str, Any],
         for dim, label in zip(_dims(result), _dim_labels(result)):
             hit = known.get(name_key(dim))
             if hit is None:
+                # 目录一列说明都没有时，「对不上」是目录没维护造成的（单表查询时 _fact_tables 会兜底认出那张表，
+                # 走不到上面 NOTE_NOT_MAINTAINED 那一条），照实说目录没维护，不说成数据对不上
+                if bare or not _maintained(tables):
+                    return None, NOTE_NOT_MAINTAINED
                 return None, f"候选维度核对不了：拆解按的「{label}」对不上数据目录里的列"
             used.add(hit)
     return [label for key, label in pool.items() if key not in used], None

@@ -369,7 +369,8 @@ def test_a_ratio_with_a_unit_is_not_shown_as_a_percentage():
     result = run_sync(analyze("decompose", "ratio", snaps=[snaps], query="Q5", by=["region"], period="week",
                               base="2026-W41", target="2026-W42", numerator="gmv", denominator="orders",
                               label="客单价"))
-    assert result["table"]["formats"] == {"w_base": CONV_PCT, "w_target": CONV_PCT, "mix": CONV_POINTS,
-                                          "rate": CONV_POINTS, "total": CONV_POINTS}
+    assert result["table"]["formats"] == {"w_base": CONV_PCT, "w_target": CONV_PCT}
     assert "r_base_total" not in result["value_formats"] and "r_target_total" not in result["value_formats"]
+    # 影响也是同一个量纲的变化（元 / 单），不能乘一百说成「个百分点」：raw 1.174 不能显示 +117.4 个百分点
+    assert [k for k in ("delta", "mix_total", "rate_total") if k in result["value_formats"]] == []
     assert result["value_formats"]["mix_share"] == CONV_PCT

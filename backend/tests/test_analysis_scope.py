@@ -204,3 +204,16 @@ async def test_the_report_reads_the_catalog_through_the_run_view(shop):
     assert block["not_decomposed"] == ["渠道", "订单状态", "门店类型", "城市"]
     block = await scope.scope_of(catalog, {"mode": "off"}, load=lambda a: snapshot)
     assert block["not_decomposed"] is None and block["note"] == scope.NOTE_NO_CATALOG
+
+
+def test_an_unmaintained_single_table_catalog_says_so_instead_of_a_column_mismatch():
+    """V15（验收复核）：只读一张表、目录还没维护时，_fact_tables 会兜底认出那张表，于是「对不上数据目录里的列」这条
+    把「目录没维护」说成了数据对不上。目录一列说明都没有时照实说目录没维护。"""
+    from app.engine.analysis_scope import NOTE_NOT_MAINTAINED, _undecomposed
+
+    result = {"op": "decompose", "mode": "additive", "inputs": [{"role": "data", "artifact": "a" * 64}],
+              "params": {"by": ["channel"]}, "table": {"columns": ["channel", "base"], "labels": {"channel": "渠道"}}}
+    sources = {"源": {"tables": {"orders": {}}, "masked": []}}
+    snapshots = {"a" * 64: {"source": "源", "sql": "SELECT channel, SUM(amount) AS amt FROM orders GROUP BY channel",
+                            "columns": ["channel", "amt"]}}
+    assert _undecomposed([result], {}, sources, snapshots.get) == (None, NOTE_NOT_MAINTAINED)

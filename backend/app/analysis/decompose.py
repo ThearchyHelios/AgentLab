@@ -693,15 +693,19 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
         values["gap"] = canon(max(gaps.values(), key=abs))
     verdict = {"code": code, "subjects": [_key_strings(x.key) for x in subjects],
                "direction": sign_word(delta) if code in ("mix_driven", "rate_driven", "both") else None}
+    # 显示格式按「这一段（这个数）是占比还是带量纲的比率」分：
+    # - 各段分子都不超过分母时，整体和各段的比率是个占比（退款率）：比率按百分数，结构 / 自身 / 合计影响是比率的变化，
+    #   按百分点
+    # - 否则比率本身带量纲（客单价，元 / 单，可以大于 1）：比率照原值；影响也是同一个量纲的变化（元 / 单），照原值，
+    #   不能乘一百说成「个百分点」——否则判定语写「客单价下降 9.89」、表里同一件事写「-988.7 个百分点」
+    ratio_rate = ("r_base", "r_target") if proportion else ()
+    points = ("mix", "rate", "total") if proportion else ()
+    named_points = ("delta", "mix_total", "rate_total") if proportion else ()
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion,
                  phrase=ph.with_caveats(main, caveats, skip=("comparability",) if outcome is None else ()),
                  caveats=caveats,
-                 # 权重（占比）按百分数；结构效应、自身效应、合计影响是比率的变化，按百分点。各段的比率和整体比率本身：
-                 # 各段分子都不超过分母时它是个占比（退款率），按百分数；否则它是有量纲的比率（客单价，元 / 单，可以大于 1），
-                 # 照原值显示——一律套百分数会把客单价 160.76 显示成 16,076.0%
-                 formats=_rate_formats(columns, rate=("w_base", "w_target") + (("r_base", "r_target") if proportion else ()),
-                                       points=("mix", "rate", "total")),
-                 named={k: CONV_POINTS for k in ("delta", "mix_total", "rate_total")}
+                 formats=_rate_formats(columns, rate=("w_base", "w_target") + ratio_rate, points=points),
+                 named={k: CONV_POINTS for k in named_points}
                  | ({k: CONV_PCT for k in ("r_base_total", "r_target_total")} if proportion else {})
                  | {"mix_share": CONV_PCT, "rate_share": CONV_PCT})
 
