@@ -2663,10 +2663,17 @@ def _context(text: str, start: int, end: int) -> str:
 #: 粗体：**…** 或 __…__，里面可以有标记（标记里的下划线不算收尾，[[m:refund_rate]] 很常见）
 _BOLD = re.compile(r"(\*\*|__)(?P<inner>(?:\[\[" + _MARKER_GUARD + r"[^\[\]\n]*?\]\]|(?!\1)[^\n])+?)\1")
 #: 方向词、因果词：没有数字也没有引用的句子，含这些词才算结论。「同比」「环比」不在里面：它们只说明
-#: 跟谁比，本身不是涨跌；真正的比较结论还会带「增长」「下降」或者数字
+#: 跟谁比，本身不是涨跌；真正的比较结论还会带「增长」「下降」或者数字。
+#: 分析判断词（分析能力一轮，engine/analysis_claims 的说法表）也算：「主要来自」「集中在」「异常」「持续下降」「趋势」
+#: 「显著」，裁判优先判这类句子（judge.claim_priority）。「主要」后面是「包括、内容、分为、有、看」这类的是在列提纲，
+#: 「持续关注」「持续跟进」是建议，「趋势图」「趋势如下」是在引出图表，「集中采购」「分散风险」说的不是数据，都不算
 _DIRECTIONAL = re.compile(
     r"增长|增加|上升|提升|提高|上涨|下降|下滑|减少|降低|回落|下跌|反弹|超过|高于|低于|领先|落后|最高|最低"
     r"|最多|最少|来自|导致|因为|由于|带动|拉动|拖累|驱动|原因|归因|贡献|占比|翻倍|持平|波动"
+    r"|主要(?!包括|内容|分为|分成|有|看|从|是指|指|结论|发现|观点|工作|任务|目的|目标|问题|方面)"
+    r"|集中(?!采购|管理|处理|展示|讨论|培训)|异常|偏离"
+    r"|持续(?!关注|跟踪|跟进|观察|监控|推进|优化|改进|更新)|趋势(?![图表线如：:])|显著|明显高于|明显低于|大幅|激增"
+    r"|骤降|暴跌|飙升|新高|新低|抵消|分散(?!注意|精力|风险|投资|采购)"
     r"|(?<![A-Za-z])(?:increase|decrease|grow|growth|decline|drop|rise|due to|because|driven)(?![A-Za-z])",
     re.I)
 #: 定义句：「同比是将本期与上年同月对比」「增长率是指……」。解释一个概念怎么算，不是对数据下结论
@@ -2838,12 +2845,15 @@ def compose_doc(
     entities: bool = True,
     absence: bool = False,
     masked: dict[str, Any] | None = None,
+    analysis_claims: str | None = None,
 ) -> dict[str, Any]:
     """模型写的原文（带标记）→ 报告文档：渲染后的 markdown、块、句、片段、统计、违规。
 
     entities=False（报告节点 entities: off）：表名、字段名整层不管——不链接、不核对反引号，
     [[t:]] / [[c:]] 解析不了，原因是 ENTITIES_OFF_REASON。
     absence=True（写作目录有省略）：另查缺失断言（absence_claims），和句中的 [[see:]] 一样只在组装时查。
+    analysis_claims（报告节点的分析说法核对，check / strict）：文档顶层记下处置和说法表版本（engine/analysis_claims），
+    判断词核对和裸数字一样在 verify_doc 里做，出口复核照它再核一遍。不给（None、off）的文档不记、不核，和以前一字不差。
     masked（{查询快照工件: 取自遮罩列的结果列}，报告节点按数据源的遮罩算好交进来）：另查直接引用了这些列的格子
     （masked_cells），同样只在组装时查。没给的和以前一字不差。目录里值不给的指标（withhold_metrics 记了 masked 的）被引用
     时也在这里记违规（masked_metrics），不靠这个参数：目录本身说了哪几个不给。
@@ -3002,9 +3012,13 @@ def compose_doc(
     # 没有它的（期 4 之前组装的）一律按原样展示。写在顶层、参与内容哈希，事后补不上：补了哈希就变，封存链就断
     # cell_display：有单元格因为显示规则改了写法（ISO 日期时间）才记，记的是渲染得出这些格子的最低一版，复核照它渲染；
     # 没有的文档和以前一字不差
+    # analysis_claims：报告节点要核分析说法时记下处置和说法表版本，复核照它走（只有带这一项的文档核判断词）
+    from app.engine import analysis_claims as said
+
     doc: dict[str, Any] = {
         "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "provenance": DOC_PROVENANCE,
         **({"cell_display": snaps.needed} if snaps.needed > 1 else {}),
+        **({said.DOC_FIELD: said.record(analysis_claims)} if analysis_claims in said.MODES else {}),
         "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
@@ -3236,6 +3250,7 @@ def verify_doc(
     masks: list[tuple[int, int]] = []                  # 引用渲染出来的字
     syntax: list[tuple[int, int]] = []                 # 结构片段：只涂符号，数字照查
     owners: list[tuple[int, int, str, str]] = []        # (start, end, segment id, unit id)
+    cited_by: dict[int, list[str]] = {}                 # 每句按这次核对的引用算的依据（分析说法核对用）
     pos, tiled = 0, True
     for block, unit in iter_units(doc):
         stats["units"] += 1
@@ -3351,6 +3366,7 @@ def verify_doc(
                                              _unresolved_message("依据", f"see:{again['ref']}", again),
                                              ref=again["ref"], unit=unit.get("id"),
                                              span=list(unit.get("span") or []) or None))
+        cited_by[id(unit)] = cited
         if kind == "claim" and not cited:
             stats["uncited_claims"] += 1
             where = unit.get("span")
@@ -3359,6 +3375,14 @@ def verify_doc(
                             "text": markdown[where[0]:where[1]] if ok_span else ""})
     if tiled and pos != len(markdown):
         violations.append(_violation("segment_mismatch", "正文末尾有一段不属于任何片段，文档可能被修改过"))
+    # 分析说法核对（engine/analysis_claims）：只核记了这一项的文档，按记下的那一版说法表、这次核对的引用核。老文档不核，
+    # 统计也不多这个键
+    from app.engine import analysis_claims as said
+
+    said_found = said.verify(doc, catalog, cited=cited_by)
+    if said_found is not None:
+        violations.extend(said_found)
+        stats["analysis_claims"] = sum(1 for v in said_found if v["code"] in said.CODES)
 
     masks += _header_masks(list(doc.get("blocks") or []), catalog) + _name_masks(markdown, catalog, snaps)
     for token in _bare_numbers(markdown, masks, allow_numbers, syntax):
