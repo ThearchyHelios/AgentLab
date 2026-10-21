@@ -1387,8 +1387,9 @@ function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
 }
 
 /**
- * tool.end 的 analysis（tools/analysis.event_view）折进分析那一行：标题接上编号，副标题是判定语（算不了的就是「…没有做成：原因」，
- * 服务端写好的）；算不了的用提醒色。老服务端没有这一段：preview 只是结论的前一截，判定语多半被截掉，只照参数写叫法，不从里面拼
+ * tool.end 的 analysis（tools/analysis.event_view）折进分析那一行：标题接上这份 Agent 自己的编号（「本节点 A1」），副标题是
+ * 判定语（算不了的就是「…没有做成：原因」，服务端写好的）；算不了的用提醒色。老服务端没有这一段：preview 只是结论的前一截，
+ * 判定语多半被截掉，只照参数写叫法，不从里面拼
  */
 function settleAnalysis(step: Step, d: Record<string, any>): void {
   const view = d.analysis && typeof d.analysis === 'object' ? d.analysis as Record<string, any> : null
@@ -1403,7 +1404,9 @@ function settleAnalysis(step: Step, d: Record<string, any>): void {
     if (typeof view.reason_code === 'string') info.reasonCode = view.reason_code
   }
   step.analysis = info
-  step.title = ANALYSIS_TEXT.step.title(analysisMethodLabel(info.op, info.mode), info.alias)
+  // Agent 工具那一步的编号是这份 Agent 自己的分析容器里的（交回模型的「【分析 A1】」），报告目录里的 A1 按整次运行的台账编，
+  // 两者不一定相同（图里还有分析卡时就不是）：标题写「本节点 A1」，不冒充报告里的编号
+  step.title = ANALYSIS_TEXT.step.nodeTitle(analysisMethodLabel(info.op, info.mode), info.alias)
   if (info.phrase) step.sub = step.sub ? `${info.phrase} · ${step.sub}` : info.phrase
   if (info.status === 'refused') {
     step.level = 'warn'

@@ -462,9 +462,10 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                          agent=name, call_id=cid, preview=content[:1500],
                          duration_ms=int((time.perf_counter() - started) * 1000), **failure,
                          **({"checks": checks} if checks else {}),
-                         # 判定的那一小段同 Agent 节点（event_view）；编号是成员自己的分析容器里的，紧接着 _numbered 按它编
+                         # 判定的那一小段同 Agent 节点（event_view）。不带编号：成员自己的分析容器里的 A1 不是报告目录里的
+                         # A1（协作成员的结论还进不了台账），时间线上照它写「· A1」会和报告里点名的结论对不上
                          **({"analysis_artifact": analysis["artifact"],
-                             "analysis": event_view(analysis["result"], scope.next_alias())} if analysis else {}))
+                             "analysis": event_view(analysis["result"])} if analysis else {}))
                 if analysis is not None and analysis["result"].get("status") == "refused":
                     ctx.emit(EventType.LOG, level="warn", code=ANALYSIS_REFUSED, agent=name, call_id=cid, tool=tname,
                              reason_code=analysis["result"].get("reason_code"),
