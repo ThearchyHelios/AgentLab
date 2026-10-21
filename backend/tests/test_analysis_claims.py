@@ -413,6 +413,19 @@ def test_system_rendered_phrases_quotes_headings_and_code_are_not_scanned():
     assert codes(ac.check_doc(doc, catalog())) == [ac.UNCITED]
 
 
+def test_table_cells_written_by_the_writer_are_not_checked():
+    """表格的格不核（表头、正文都不核）：一格是一个值不是一句话，状态列的「异常」、说明列的「主要来自线上」不是判断
+    （judge.claim_priority 也不送表格的格）。表格外的段落、列表照核。"""
+    raw = ("本周销售额 [[m:gmv]]。[[see:m:gmv]]\n\n| 门店 | 状态 | 说明 |\n|---|---|---|\n| 甲店 | 异常 | 主要来自线上 |\n"
+           "| 乙店 | 正常 | 持续增长 |\n\n```\n异常订单激增\n```\n\n## 主要来自华东的下降\n\n- 华东拖累明显\n")
+    doc = compose_doc(raw, catalog(), analysis_claims="check")
+    tables = {u["id"] for b in doc["blocks"] if b["type"] == "table" for u in b["units"]}
+    assert len(tables) == 9, "表格切成了一格一格"
+    [v] = found(doc)
+    assert v["code"] == ac.UNCITED and v["text"] == "拖累" and v["unit"] not in tables
+    assert [v["text"] for v in found(verify_doc(doc, catalog()))] == ["拖累"]
+
+
 def test_rendered_values_name_segments_but_are_not_judgement_words():
     # [[v:…]] 渲染出来的「华东」能点名，渲染出来的「异常」不是写作者下的判断
     doc = {"markdown": "", "blocks": [{"type": "paragraph", "units": [{"id": "u0", "kind": "claim", "cites": ["A1"],

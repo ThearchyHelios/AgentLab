@@ -20,7 +20,8 @@
    输入（[[i:]]）作依据，或者写成推测（可能、或许、推测、待核实、不排除、疑似）。分句里已有来源一类判断词的，因果词
    并进那一处核。原因说的是数据本身（「由于数据只到 10 月 16 日」「样本少」）的不算
 6. **不扫的地方**：知识库原话（[[q:]] 片段）、系统渲染的判定语（[[a:]] 片段）、别的引用渲染出来的字、标题、代码块、
-   表头；分析范围是文档的结构化字段（analysis_scope），本来就不在正文里
+   表格（表头和正文的格都不扫：一格是一个值不是一句话，状态列的「异常」、说明列的「主要来自线上」不是判断；裁判的预筛
+   judge.claim_priority 也不送表格的格）；分析范围是文档的结构化字段（analysis_scope），本来就不在正文里
 
 违规三种（CODES）：analysis_claim_uncited（有判断词，依据里没有对应种类的分析结论）、analysis_claim_mismatch（挂了，判定、
 点名的段、方向对不上，含挂了算不了的结论）、causal_unsupported（因果词没有依据、也不是推测）。每条带：代码、判断词
@@ -803,13 +804,13 @@ def _sentence(unit: dict[str, Any], aliases: Iterable[str], results: Mapping[str
 def check_doc(doc: dict[str, Any], catalog: Mapping[str, Any], *, cited: Mapping[int, list[str]] | None = None,
               version: int | None = None, load: Any = None) -> list[dict[str, Any]]:
     """一份报告文档的说法违规。cited 是 {id(unit): 这句按重新解析的引用算的依据}（verify_doc 交进来），不给就用文档里
-    记的 cites；load 取回只带摘要的条目的整份结论（results_of）。标题、代码块、表头不核。"""
+    记的 cites；load 取回只带摘要的条目的整份结论（results_of）。标题、代码块、表格（表头和正文的格）不核。"""
     results = results_of(catalog, load)
     available = _available(results)
     out: list[dict[str, Any]] = []
     for block, unit in iter_units(doc):
-        if block.get("type") in ("heading", "code") or unit.get("kind") in ("heading", "code") \
-                or (unit.get("loc") or {}).get("row") == -1:
+        if block.get("type") in ("heading", "code", "table") or unit.get("kind") in ("heading", "code") \
+                or unit.get("loc") is not None:
             continue
         aliases = cited.get(id(unit), []) if cited is not None else unit.get("cites") or []
         sentence = _sentence(unit, aliases, results)
