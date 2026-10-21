@@ -146,11 +146,12 @@ def report_catalog(state: GraphState, spec: GraphSpec, node: GraphNode) -> dict[
     if isinstance(sources, str) and sources != "ancestors":
         sources = [sources]
     if isinstance(sources, list):
-        # evidence_from 只管查询、检索这类证据（连同查询当时的表结构）从哪几个节点来；指标从哪来由 metrics_from 管。
-        # 写了子工作流节点的，它交回来的（子图里的查询，节点 id「子工作流节点 id/…」）一并算
+        # evidence_from 只管查询、检索、分析结论这类证据（连同查询当时的表结构）从哪几个节点来；指标从哪来由 metrics_from 管。
+        # 分析结论按做它的节点认（Agent，或者分析卡）。写了子工作流节点的，它交回来的（子图里的查询，节点 id
+        # 「子工作流节点 id/…」）一并算
         keep = {str(s) for s in sources}
-        ledger = [e for e in ledger
-                  if e.get("kind") not in ("query", "retrieval", "schema") or _outer(e.get("node_id")) in keep]
+        ledger = [e for e in ledger if e.get("kind") not in ("query", "retrieval", "schema", "analysis")
+                  or _outer(e.get("node_id")) in keep]
     nodes = state.get("nodes") or {}
     catalog = build_catalog(
         nodes=nodes,
