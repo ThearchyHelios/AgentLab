@@ -195,12 +195,30 @@ async def test_the_rule_stays_quiet_otherwise(question, graph):
     assert checker.analysis_gaps(level="warning") == []
 
 
-def _ops(tools: list[str]) -> list[dict]:
-    nodes, edges = _graph(tools=tools)
+def _graph_ops(nodes: dict, edges: list[dict]) -> list[dict]:
     return [{"op": "plan", "summary": "查销售额"},
             *({"op": "add_node", "node": {"id": n["id"], "type": n["type"], "label": n["id"],
                                           "config": n["data"]["config"]}} for n in nodes.values()),
             *({"op": "add_edge", "edge": e} for e in edges), {"op": "done", "explanation": "查一下", "run": True}]
+
+
+def _ops(tools: list[str]) -> list[dict]:
+    return _graph_ops(*_graph(tools=tools))
+
+
+def _card_ops(*, subgraph: str | None = None) -> list[dict]:
+    """带分析卡的图：入口 → 查库的 Agent → 分析卡 → 报告 → 出口。subgraph 给了就把分析卡换成一个嵌套它的子工作流节点。"""
+    middle = (_n("check", "analysis", items=[{"id": "wow", "op": "baseline", "from": "q",
+                                              "params": {"period": "week", "measure": "销售额"}}])
+              if subgraph is None else _n("sub", "subgraph", workflow_id=subgraph))
+    nodes = {"start": _n("start", "input"),
+             "q": _n("q", "tool", tool="db_query__shop", args={"sql": "SELECT 1"}),
+             "bot": _n("bot", "agent", prompt="{{ input.question }}", tools=["db_query__shop", "db_schema__shop"]),
+             middle["id"]: middle,
+             "write": _n("write", "report", instructions="回答：{{ input.question }}"),
+             "out": _n("out", "output", fields=[{"name": "回答", "value": "{{ nodes.write.text }}"}])}
+    order = ["start", "q", middle["id"], "write", "out"]
+    return _graph_ops(nodes, [{"source": a, "target": b} for a, b in zip(order, order[1:])])
 
 
 def _scripted(first: list[dict], fix: list[dict], seen: list[str]):
@@ -257,6 +275,8 @@ async def test_a_retry_reads_the_original_question(client, monkeypatch):  # noqa
 
 
 def test_the_catalog_and_the_manual_leave_analysis_out_when_switched_off():
+    """关掉分析工具的那一臂：工具清单里没有五个分析工具，节点手册里一处都不提分析卡、分析工具、analysis_ 开头的配置键和
+    标记——助手不知道有这回事，也不会被教着去用。开着时一字不差（node_reference() 就是 NODE_REFERENCE）。"""
     assert all(f"- {name}（" in _tool_catalog([]) for name in TOOLS)
     off = _tool_catalog([], analysis_tools=False)
     assert not [line for line in off.splitlines() if line.startswith("- analysis_")]
@@ -264,10 +284,15 @@ def test_the_catalog_and_the_manual_leave_analysis_out_when_switched_off():
     assert node_reference() is NODE_REFERENCE
     manual = node_reference(analysis_tools=False)
     assert not any(name in manual for name in TOOLS)
-    # 去掉的是 agent 段里「分析类问题绑分析工具」那一条、分析卡一整条、搭图规则第 7 条；报告段的引用写法、受管规则照留
+    for gone in ("分析卡", "分析工具", "analysis_"):
+        assert gone not in manual, gone
+    # 去掉的是 agent 段里「分析类问题绑分析工具」那一条、分析卡一整条、搭图规则第 7 条；报告段里分析结论的来处和引用写法、
+    # analysis_claims / analysis_scope 两个配置、受管规则里分析卡的那一句也不给（关的那一臂没有分析结论可引）
     assert "- analysis：" not in manual and "\n7. " not in manual and "**问题问的是为什么" not in manual
-    # 别的段落一字不少：只去掉那三段
-    for kept in ("  **默认不要写 max_steps", "- dual_check：", "\n模型字段", "- report：", "[[a:A1]]", "analysis_claims"):
+    assert "[[a:" not in manual and "判定语" not in manual
+    # 别的段落一字不少：报告、双盲复算、反方审稿、受管规则里和分析无关的几条照留
+    for kept in ("  **默认不要写 max_steps", "- dual_check：", "\n模型字段", "- report：", "- challenge：",
+                 "claims: \"require_citation\"", "[[m:指标id]]", "[[see:m:指标id,Q1,K1]]", "受管级别"):
         assert kept in manual, kept
     request = GenerateIn(instruction="上周销售额为什么下降", intent="answer")
     on, off_text = _user_message(request, patch=False), _user_message(request, patch=False, analysis_tools=False)
@@ -316,6 +341,86 @@ async def test_switched_off_the_copilot_sees_no_analysis_and_bound_tools_are_blo
     got = await _ops_of("上周销售额为什么下降", analysis_tools=False)
     [final] = [op for op in got if op["op"] == "final"]
     assert final["next"] == "fail" and [i["level"] for i in final["issues"] if i["code"] == ANALYSIS_TOOLS_OFF] == ["error"]
+
+
+async def test_switched_off_an_analysis_card_is_blocked_and_removed(monkeypatch):
+    """分析卡也挡：关掉分析工具的那一臂，图里有分析卡就交回模型去掉它、把上下游直接连起来。改好了照常运行。"""
+    seen: list[list[tuple[str, str]]] = []
+    fix = [{"op": "remove_node", "id": "check"},
+           {"op": "add_edge", "edge": {"source": "bot", "target": "write"}},
+           {"op": "done", "explanation": "去掉了分析卡"}]
+    _use(monkeypatch, _recording(_card_ops(), fix, seen))
+    got = await _ops_of("上周销售额为什么下降", analysis_tools=False)
+    rounds = [op for op in got if op["op"] == "check" and op["status"] == "repairing"]
+    [issue] = [i for r in rounds for i in r["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
+    assert (issue["level"], issue["node_id"], issue["field"]) == ("error", "check", None)
+    assert issue["message"] == "这次不能用分析卡：「check」是分析卡，这一轮没有分析能力可用，请去掉它"
+    # 交回模型的那一句守规矩：说清去掉它、上下游接回去、数怎么来；关的那一臂手册里没有「分析卡」这个说法，
+    # 所以指节点说它是 analysis 节点
+    assert "「check」是 analysis 节点" in issue["for_model"] and "remove_node" in issue["for_model"]
+    assert "去掉它" in issue["for_model"] and "写进查询" in issue["for_model"]
+    [final] = [op for op in got if op["op"] == "final"]
+    assert final["next"] == "run", final["issues"]
+    assert "check" not in {n["id"] for n in final["graph"]["nodes"]}
+    assert not [i for i in final["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
+
+    # 改不好：照实列出、不运行（图里还留着分析卡）
+    seen.clear()
+    _use(monkeypatch, _recording(_card_ops(), [{"op": "done", "explanation": "x"}], seen))
+    got = await _ops_of("上周销售额为什么下降", analysis_tools=False)
+    [final] = [op for op in got if op["op"] == "final"]
+    assert final["next"] == "fail"
+    [left] = [i for i in final["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
+    assert (left["level"], left["node_id"]) == ("error", "check")
+
+
+async def test_switched_off_a_subgraph_that_uses_analysis_is_blocked(monkeypatch, tmp_path):
+    """钉了版本、里面用了分析能力的子工作流（这里是里面有分析卡）也挡：这一轮用不了它。里面没有分析能力的子工作流光看外层
+    看不出来，照常运行。"""
+    from app.db.base import SessionLocal
+    from app.db.models import Workflow
+
+    async def make(name: str, graph: dict) -> str:
+        async with SessionLocal() as session:
+            row = Workflow(name=name, graph=graph, version=1, published_version=1)
+            session.add(row)
+            await session.commit()
+            return row.id
+
+    inner_card = _graph(tools=("db_query__shop", "db_schema__shop"), card=True)[0]
+    plain_nodes = _graph(tools=("db_query__shop", "db_schema__shop"))[0]
+    with_card = await make("异动分析（虚构）", {"nodes": list(inner_card.values()),
+                                            "edges": [{"source": a, "target": b}
+                                                      for a, b in zip(inner_card, list(inner_card)[1:])]})
+    without_card = await make("只查数（虚构）", {"nodes": list(plain_nodes.values()),
+                                             "edges": [{"source": a, "target": b}
+                                                       for a, b in zip(plain_nodes, list(plain_nodes)[1:])]})
+    seen: list[list[tuple[str, str]]] = []
+    fix = [{"op": "remove_node", "id": "sub"},
+           {"op": "add_edge", "edge": {"source": "q", "target": "write"}},
+           {"op": "done", "explanation": "去掉了子工作流"}]
+    _use(monkeypatch, _recording(_card_ops(subgraph=with_card), fix, seen))
+    got = await _ops_of("上周销售额为什么下降", analysis_tools=False)
+    [repairing] = [op for op in got if op["op"] == "check" and op["status"] == "repairing"]
+    [issue] = [i for i in repairing["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
+    assert (issue["node_id"], issue["field"]) == ("sub", "workflow_id")
+    assert "这次不能用这个子工作流" in issue["message"] and "分析卡或分析工具" in issue["message"]
+    assert "去掉这个 subgraph 节点" in issue["for_model"]
+    [final] = [op for op in got if op["op"] == "final"]
+    assert final["next"] == "run", final["issues"]
+    assert "sub" not in {n["id"] for n in final["graph"]["nodes"]}
+    assert not [i for i in final["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
+
+    # 里面没分析能力的子工作流不挡；开着分析工具时，有分析卡的子工作流也不挡
+    seen.clear()
+    _use(monkeypatch, _recording(_card_ops(subgraph=without_card), [], seen))
+    got = await _ops_of("上周销售额为什么下降", analysis_tools=False)
+    assert not [i for op in got if op["op"] == "check" and op["status"] == "repairing"
+                for i in op["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
+    _use(monkeypatch, _recording(_card_ops(subgraph=with_card), [], seen))
+    got = await _ops_of("上周销售额为什么下降", analysis_tools=True)
+    assert not [i for op in got if op["op"] == "check" and op["status"] == "repairing"
+                for i in op["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
 
 
 async def test_switched_on_bound_analysis_tools_are_fine(monkeypatch):
