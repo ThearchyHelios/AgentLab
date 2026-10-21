@@ -313,3 +313,9 @@ async def test_sequence_periods_say_completeness_cannot_be_checked():
     result = await baseline(rows, basis="level")
     assert {"code": "comparability", "text": "没能核对本期的数据是否到齐（期次不是日期，不知道是哪几天）"} \
         in result["caveats"]
+
+
+async def test_a_falling_trend_whose_last_weeks_rise_says_but():
+    falling = await trend(weeks([200, 196, 190, 188, 181, 176, 170, 165, 160, 162, 165, 168]))
+    assert falling["verdict"]["code"] == "falling" and falling["values"]["run_direction"] == "up"
+    assert falling["phrase"].endswith("，但最近已连续 3 周上升")

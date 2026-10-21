@@ -577,9 +577,11 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
         against = sum(((by_key[x.key][0] + by_key[x.key][1]) / 2 for x in eligible
                        if (by_key[x.key][3] - by_key[x.key][2]) * sign < 0), Fraction(0))
         if weight > 0 and against / weight >= SIMPSON_SHARE:
+            # 判在结构变化上（mix_driven）时判定语正文已经说了结构变化、点了这一段，附带说明只说各段和整体反着变
             star = max(live, key=lambda x: sign * by_key[x.key][4])
             caveats.append(ph.caveat("simpson", ph.simpson_text(label, delta > 0, ph.key_text(star.key),
-                                                                by_key[star.key][0], by_key[star.key][1])))
+                                                                by_key[star.key][0], by_key[star.key][1],
+                                                                shift=code != "mix_driven")))
     if small:
         caveats.append(ph.caveat("small_denominator", ph.small_denominator_text(
             [ph.key_text(x.key) for x in small], den_label, int(env.settings["min_denominator"]))))

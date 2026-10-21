@@ -141,3 +141,18 @@ def test_criteria_are_written_with_the_actual_thresholds():
     assert "3 倍以上算明显超出" in ph.criterion_baseline(DEFAULTS, 12, "周")
     assert "小于 0.05" in ph.criterion_trend(DEFAULTS, 10, "周")
     assert "Fisher" in ph.criterion_differ(DEFAULTS, "rate") and "Welch" in ph.criterion_differ(DEFAULTS, "mean")
+
+
+
+def test_the_run_at_the_end_of_a_trend_says_whether_it_goes_the_same_way():
+    assert ph.trend_phrase("falling", "销售额", 10, "周", "周", "-2.0%", (3, "down")) == \
+        "过去 10 周销售额呈下降趋势（每周约 -2.0%），已连续 3 周下降"
+    assert ph.trend_phrase("falling", "销售额", 10, "周", "周", "-2.0%", (3, "up")) == \
+        "过去 10 周销售额呈下降趋势（每周约 -2.0%），但最近已连续 3 周上升"
+    assert ph.trend_phrase("rising", "订单数", 8, "个月", "月", None, (4, "down")) == \
+        "过去 8 个月订单数呈上升趋势，但最近已连续 4 个月下降"
+
+
+def test_simpson_says_the_shift_only_when_the_phrase_does_not():
+    assert ph.simpson_text("退款率", True, "线上", 0.3, 0.5) == "各段的退款率大多在下降，整体却上升：变化来自结构，线上占比从 30.0% 升到 50.0%"
+    assert ph.simpson_text("退款率", True, "线上", 0.3, 0.5, shift=False) == "各段的退款率大多在下降，整体却上升"

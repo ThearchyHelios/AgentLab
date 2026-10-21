@@ -301,13 +301,16 @@ def offset_text(delta_total: Any, gross_up: Any, gross_down: Any) -> str:
     return f"下降的段合计 {down}，上升的段合计 {up}，互相抵消了一部分"
 
 
-def simpson_text(label: str, overall_up: bool, subject: str, w_base: Any, w_target: Any) -> str:
-    """辛普森：各段的比率大多和整体反着变，整体的变化来自结构。"""
+def simpson_text(label: str, overall_up: bool, subject: str, w_base: Any, w_target: Any, *, shift: bool = True) -> str:
+    """辛普森：各段的比率大多和整体反着变，整体的变化来自结构。判定语正文已经说了结构变化、点了那一段（mix_driven）时
+    shift 为假，只说各段和整体反着变，结构变化不说第二遍。"""
     seg = "上升" if not overall_up else "下降"
     whole = "上升" if overall_up else "下降"
+    head = say("各段的", label, f"大多在{seg}，整体却{whole}")
+    if not shift:
+        return head
     move = "升" if _q(w_target) > _q(w_base) else "降"
-    return say(f"各段的", label, f"大多在{seg}，整体却{whole}：变化来自结构，", subject,
-               f"占比从 {pct(w_base, signed=False)} {move}到 {pct(w_target, signed=False)}")
+    return say(head, "：变化来自结构，", subject, f"占比从 {pct(w_base, signed=False)} {move}到 {pct(w_target, signed=False)}")
 
 
 def small_denominator_text(segments: Sequence[str], denominator: str, minimum: int) -> str:
@@ -478,13 +481,15 @@ def baseline_flat_phrase(verdict: str, label: str, current: str, n: int, unit: s
 
 def trend_phrase(verdict: str, label: str, n: int, unit: str, per: str, slope: str | None,
                  run: tuple[int, str] | None) -> str:
+    """趋势。末尾连续同向的期数（run）和趋势同向时接「，已连续 3 周下降」，反向时接「，但最近已连续 3 周上升」。"""
     if verdict == "no_trend":
         return say(f"过去 {n} {unit}", label, "没有明显的上升或下降趋势")
     word = "上升" if verdict == "rising" else "下降"
     text = say(f"过去 {n} {unit}", label, f"呈{word}趋势") + (f"（每{per}约 {slope}）" if slope else "")
     if run is not None:
         length, direction = run
-        text += f"，已连续 {length} {unit}{'上升' if direction == 'up' else '下降'}"
+        same = (direction == "up") == (verdict == "rising")
+        text += f"，{'' if same else '但最近'}已连续 {length} {unit}{'上升' if direction == 'up' else '下降'}"
     return text
 
 

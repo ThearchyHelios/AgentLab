@@ -301,9 +301,12 @@ async def test_simpson_each_channel_improves_but_the_mix_makes_the_whole_worse()
     rows = [["线上", "W41", 50, 500], ["线上", "W42", 90, 1000], ["线下", "W41", 10, 1000], ["线下", "W42", 4, 500]]
     result = await ratio(rows, label="退款率")
     assert result["verdict"] == {"code": "mix_driven", "subjects": [["线上"]], "direction": "up"}
-    assert result["phrase"].startswith("退款率上升 2.3 个百分点（4.0% 到 6.3%），主要来自结构变化：线上占比从 33.3% 到 66.7%")
+    # 结构变化只说一遍：正文说了结构变化、点了线上，辛普森那一句只说各段和整体反着变
+    assert result["phrase"] == ("退款率上升 2.3 个百分点（4.0% 到 6.3%），主要来自结构变化：线上占比从 33.3% 到 66.7%；"
+                                "各段的退款率大多在下降，整体却上升")
     simpson = next(c for c in result["caveats"] if c["code"] == "simpson")
-    assert simpson["text"] == "各段的退款率大多在下降，整体却上升：变化来自结构，线上占比从 33.3% 升到 66.7%"
+    assert simpson["text"] == "各段的退款率大多在下降，整体却上升"
+    assert result["phrase"].count("结构") == 1
     values = result["values"]
     assert Fraction(values["mix_total"]) + Fraction(values["rate_total"]) == pytest.approx(Fraction(values["delta"]))
     assert result["table"]["columns"][:5] == ["channel", "n_base", "n_target", "d_base", "d_target"]
