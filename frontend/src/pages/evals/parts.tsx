@@ -6,7 +6,8 @@ import { formatCost, formatDateTime, formatNumber } from '../../lib/format'
 import { EVAL_TEXT as T, pct, rateText } from '../../lib/termsEval'
 import { runCostText } from '../../lib/terms'
 import type {
-  EvalExpectation, EvalGoldValue, EvalModelPair, EvalRate, EvalStatus, EvalTrendPoint, EvalUsage, EvalVerdict,
+  EvalExpectation, EvalGoldValue, EvalJudgementView, EvalModelPair, EvalRate, EvalStatus, EvalTrendPoint, EvalUsage,
+  EvalVerdict,
 } from '../../typesEval'
 
 /*
@@ -144,6 +145,8 @@ export function expectationText(e: EvalExpectation): string {
     case 'none': text = E.none; break
     case 'ask': text = E.ask; break
     case 'text': text = E.text(e.points?.length ?? 0); break
+    case 'contribution':
+    case 'verdict': text = analysisText(e); break
     default: text = T.expectation.kind[e.kind as keyof typeof T.expectation.kind] ?? String(e.kind)
   }
   const extra = [
@@ -154,11 +157,50 @@ export function expectationText(e: EvalExpectation): string {
   return extra.length ? `${text}（${extra.join('，')}）` : text
 }
 
+/** 分析期望做哪种分析、分析什么：「变化拆解（可加） · 按地区 · 销售额」，贡献点名不止一段时另写几段 */
+function analysisText(e: EvalExpectation): string {
+  const A = T.analysis
+  const op = e.op ?? 'decompose'
+  const method = A.method(A.op[op] ?? op, e.mode ? A.mode[e.mode] ?? e.mode : null)
+  const p = e.params ?? {}
+  const words = (v: unknown) => (Array.isArray(v) ? v.map(String).join('、') : v == null ? '' : String(v))
+  const about = [
+    words(p.by) && A.by(words(p.by)),
+    words(p.label) || words(p.measure) || words(p.product) || words(p.value)
+      || (p.numerator && p.denominator ? A.ratio(words(p.numerator), words(p.denominator)) : ''),
+  ].filter(Boolean).join(' · ')
+  const text = T.expectation.analysis(method, about)
+  return e.kind === 'contribution' && (e.top_n ?? 1) > 1 ? `${text} · ${T.expectation.topN(e.top_n ?? 1)}` : text
+}
+
+/**
+ * 分析期望的判定（期望、答案各一份）写成字：「主要来源：华东（下降）」「超出常规波动（上升）」「差异站得住（西南高于华东）」。
+ * 判定类、点名的段、方向都是服务端给的，这里只套叫法；没有判定类的（正文里一句对不上的话）写那一句
+ */
+export function judgementText(v: EvalJudgementView | EvalGoldValue | null | undefined): string {
+  if (!v) return '—'
+  const A = T.analysis
+  if (v.status === 'refused') return A.refused(v.reason ?? '')
+  if (!v.judgement) return 'text' in v && v.text ? `「${v.text}」` : '—'
+  const label = A.judgement[v.judgement] ?? v.judgement
+  const subjects = v.subjects ?? []
+  if (subjects.length === 2 && (v.judgement === 'differs' || v.judgement === 'no_evidence')) {
+    const [a, b] = subjects
+    const which = v.judgement === 'no_evidence' || !v.direction ? A.pair(a, b) : v.direction === 'up' ? A.higher(a, b) : A.lower(a, b)
+    return A.withDirection(label, which)
+  }
+  const text = v.judgement === 'source' && subjects.length ? A.withSubjects(label, subjects.join('、')) : label
+  return v.direction ? A.withDirection(text, A.direction[v.direction] ?? v.direction) : text
+}
+
 /** 试算算出来的一份期望值写成字（值都是服务端算好的） */
 export function goldValueText(v: EvalGoldValue | undefined): string {
   if (!v) return '—'
   const G = T.goldValue
   switch (v.kind) {
+    case 'contribution':
+    case 'verdict':
+      return v.status === 'refused' ? G.refused(v.reason ?? '') : G.analysis(judgementText(v), v.phrase ?? '')
     case 'scalar': {
       const dims = v.dims && Object.keys(v.dims).length
         ? G.dims(Object.entries(v.dims).map(([k, x]) => `${k}=${cellText(x)}`).join('、')) : ''

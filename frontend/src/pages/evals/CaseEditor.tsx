@@ -10,7 +10,8 @@ import { EVAL_TEXT } from '../../lib/termsEval'
 import { useCatalog } from '../../store/catalog'
 import type { Run } from '../../types'
 import type {
-  EvalCaliber, EvalCase, EvalCaseBody, EvalCaseKind, EvalExpectation, EvalGold, EvalPreview, EvalRunQuery, EvalSuite, EvalTrial,
+  EvalAnalysisMode, EvalAnalysisOp, EvalCaliber, EvalCase, EvalCaseBody, EvalCaseKind, EvalExpectation, EvalGold, EvalPreview,
+  EvalRunQuery, EvalSuite, EvalTrial,
 } from '../../typesEval'
 import { graphFields, type InputField } from '../schedules/model'
 import { cellText, expectationText, goldValueText } from './parts'
@@ -31,6 +32,11 @@ function modeOf(c: EvalCase | null | undefined): Mode {
 
 /** 题目里那个要答出数（或答「没有数据」、反问）的期望：编辑时据它回填 */
 const mainOf = (c: EvalCase | null | undefined) => c?.expectations.find((e) => e.kind !== 'text') ?? null
+/** 别的期望（一道题配了不止一个，比如贡献再配一个「一个数」）：编辑框不改它们，保存时照旧带上 */
+const othersOf = (c: EvalCase | null | undefined) => {
+  const main = mainOf(c)
+  return (c?.expectations ?? []).filter((e) => e !== main && e.kind !== 'text')
+}
 const pointsOf = (c: EvalCase | null | undefined) => (c?.expectations.find((e) => e.kind === 'text')?.points ?? []).join('\n')
 
 /**
@@ -57,6 +63,8 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
   const [tolerance, setTolerance] = useState('')
   /** 要答出数的那一个期望（点选出来的，或编辑时回填的） */
   const [main, setMain] = useState<EvalExpectation | null>(null)
+  /** 编辑的题另外配的期望：原样保留 */
+  const [others, setOthers] = useState<EvalExpectation[]>([])
   // SQL（写 SQL 定期望、期望没有数据）
   const [sourceId, setSourceId] = useState('')
   const [sql, setSql] = useState('')
@@ -95,6 +103,7 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
     setPoints(pointsOf(c))
     const m = mainOf(c)
     setMain(m)
+    setOthers(othersOf(c))
     setRequired(m?.required !== false)
     setTolerance(m?.tolerance != null ? String(m.tolerance) : '')
     setSourceId(c?.gold?.datasource_id ?? '')
@@ -118,6 +127,7 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
     if (m === mode || editing) return
     setMode(m)
     setMain(null)
+    setOthers([])
     setTrial(null)
     setError(null)
     setPreview(null)
@@ -134,6 +144,7 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
       if (t && (e.kind === 'scalar' || e.kind === 'table')) e.tolerance = Number(t)
       out.push(e)
     }
+    out.push(...others)
     const list = points.split('\n').map((p) => p.trim()).filter(Boolean)
     if (list.length) out.push({ kind: 'text', points: list })
     return out
@@ -339,6 +350,14 @@ export function CaseEditor({ open, onClose, suite, editing, initialQuestion, onS
           </div>
         )}
         {needsMain && !main && mode === 'sql' && <p className="text-2xs text-faint" data-eval-case-no-pick="">{T.noPick}</p>}
+        {!!others.length && (
+          <div className="space-y-0.5 rounded-md border border-dashed p-2.5 text-xs" data-eval-case-others={others.length}>
+            <div className="label">{T.analysisOthers}</div>
+            {others.map((e, i) => (
+              <div key={e.id ?? i} className="text-dim">{EVAL_TEXT.expectation.kind[e.kind]}：{expectationText(e)}</div>
+            ))}
+          </div>
+        )}
 
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label={T.scope} htmlFor="eval-case-scope" hint={T.scopeHint}>
@@ -479,7 +498,178 @@ function SqlPart({ suiteId: _suiteId, sourceId, setSourceId, sql, setSql, previe
       {ok && preview && !!preview.rows.length && (
         <PreviewGrid preview={preview} main={main} setMain={setMain} pickable={pickable} />
       )}
+      {ok && preview && !!preview.rows.length && pickable && (
+        <AnalysisPick columns={preview.columns} main={main} setMain={setMain} />
+      )}
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 分析期望：贡献、判定
+// ---------------------------------------------------------------------------
+
+type ParamKind = 'column' | 'columns' | 'text' | 'int' | 'choice' | 'pairs'
+interface ParamField { key: string; kind: ParamKind; choices?: Record<string, string> }
+
+const A = EVAL_TEXT.analysis
+/** 判定期望能用的分析（贡献恒为变化拆解）、各自的模式（同服务端 contract.MODES） */
+const VERDICT_OPS: EvalAnalysisOp[] = ['baseline', 'trend', 'differ', 'comparable']
+const OP_MODES: Partial<Record<EvalAnalysisOp, EvalAnalysisMode[]>> = {
+  decompose: ['additive', 'ratio', 'factor'], differ: ['rate', 'mean', 'rows'],
+}
+const col = (key: string): ParamField => ({ key, kind: 'column' })
+const PERIODS: ParamField[] = [col('period'), { key: 'base', kind: 'text' }, { key: 'target', kind: 'text' }]
+const LABEL: ParamField = { key: 'label', kind: 'text' }
+const GRAIN: ParamField = { key: 'grain', kind: 'choice', choices: A.grain }
+const GROUPS: ParamField[] = [{ key: 'by', kind: 'columns' }, { key: 'pairs', kind: 'pairs' }, { key: 'reference', kind: 'text' }]
+/** 每种分析（模式）在表单里填哪几个参数：参数名同分析工具（服务端按同一份参数定义校验），叫法在 termsEval */
+const PARAM_FIELDS: Record<string, ParamField[]> = {
+  'decompose:additive': [{ key: 'by', kind: 'columns' }, ...PERIODS, col('measure'), LABEL],
+  'decompose:ratio': [{ key: 'by', kind: 'columns' }, ...PERIODS, col('numerator'), col('denominator'), LABEL],
+  'decompose:factor': [...PERIODS, col('product'), { key: 'factors', kind: 'columns' }, LABEL],
+  baseline: [col('period'), col('measure'), { key: 'target', kind: 'text' },
+    { key: 'basis', kind: 'choice', choices: A.basis }, GRAIN, { key: 'lag', kind: 'int' }, LABEL],
+  trend: [col('period'), col('measure'), GRAIN, LABEL],
+  'differ:rate': [...GROUPS, col('numerator'), col('denominator'), LABEL],
+  'differ:mean': [...GROUPS, col('mean'), col('sd'), col('sum'), col('sumsq'), col('n'), LABEL],
+  'differ:rows': [...GROUPS, col('value'), LABEL],
+  comparable: [...PERIODS, col('measure'), GRAIN],
+}
+const fieldsOf = (e: EvalExpectation): ParamField[] =>
+  PARAM_FIELDS[e.op === 'decompose' || e.op === 'differ' ? `${e.op}:${e.mode}` : e.op ?? ''] ?? []
+
+/** 换了分析方法、模式时，只留下新的那种分析还认的参数 */
+function keepParams(e: EvalExpectation): EvalExpectation {
+  const keys = new Set(fieldsOf(e).map((f) => f.key))
+  const params = Object.fromEntries(Object.entries(e.params ?? {}).filter(([k]) => keys.has(k)))
+  return { ...e, params }
+}
+
+/**
+ * 在预览的结果上定一个分析期望：贡献（变化拆解：选模式、按哪几列拆、期次、度量……，期望点名前几段）或判定（波动基线、
+ * 趋势判断、差异检验、可比性检查）。只填做哪种分析、按哪几列；主要来源、判定由服务端在期望 SQL 的结果上按平台的分析方法算，
+ * 试算时写出来（界面不判）。列从预览结果里选；基期、本期、对照组是期次列、分组列里的值，可以写时间变量
+ */
+function AnalysisPick({ columns, main, setMain }: {
+  columns: string[]; main: EvalExpectation | null; setMain: (e: EvalExpectation | null) => void
+}) {
+  const current = main && (main.kind === 'contribution' || main.kind === 'verdict') ? main : null
+  const start = (kind: 'contribution' | 'verdict') => setMain(kind === 'contribution'
+    ? { kind, op: 'decompose', mode: 'additive', params: {}, top_n: 1 }
+    : { kind, op: 'baseline', params: {} })
+  const update = (patch: Partial<EvalExpectation>) => current && setMain(keepParams({ ...current, ...patch }))
+  const setParam = (key: string, value: unknown) => {
+    if (!current) return
+    const params = { ...(current.params ?? {}) }
+    if (value === '' || value == null || (Array.isArray(value) && !value.length)) delete params[key]
+    else params[key] = value
+    setMain({ ...current, params })
+  }
+  const modes = current?.op ? OP_MODES[current.op] : undefined
+  return (
+    <div className="space-y-2 rounded-md border p-2.5 text-xs" data-eval-analysis={current?.kind ?? ''}>
+      <div className="label">{T.analysisLabel}</div>
+      <p className="text-2xs leading-relaxed text-faint">{T.analysisHint}</p>
+      <div className="flex flex-wrap gap-1.5">
+        {(['contribution', 'verdict'] as const).map((k) => (
+          <button key={k} type="button" data-eval-analysis-kind={k} onClick={() => start(k)}
+                  className={clsx('rounded-md border px-2 py-1 text-left', current?.kind === k ? 'border-[var(--accent)] bg-accent-soft text-fg' : 'text-dim hover:bg-hover')}>
+            {T.analysisKind[k]}
+          </button>
+        ))}
+      </div>
+      {current && (
+        <div className="grid gap-2 sm:grid-cols-2">
+          {current.kind === 'verdict' && (
+            <Field label={T.analysisOp} htmlFor="eval-analysis-op">
+              <select id="eval-analysis-op" className="field" value={current.op} data-eval-analysis-op=""
+                      onChange={(e) => {
+                        const op = e.target.value as EvalAnalysisOp
+                        update({ op, mode: OP_MODES[op]?.[0] })
+                      }}>
+                {VERDICT_OPS.map((o) => <option key={o} value={o}>{A.op[o]}</option>)}
+              </select>
+            </Field>
+          )}
+          {modes && (
+            <Field label={T.analysisMode} htmlFor="eval-analysis-mode">
+              <select id="eval-analysis-mode" className="field" value={current.mode ?? ''} data-eval-analysis-mode=""
+                      onChange={(e) => update({ mode: e.target.value as EvalAnalysisMode })}>
+                {modes.map((m) => <option key={m} value={m}>{A.method(A.op[current.op!], A.mode[m])}</option>)}
+              </select>
+            </Field>
+          )}
+          {current.kind === 'contribution' && (
+            <Field label={T.analysisTopN} htmlFor="eval-analysis-topn">
+              <input id="eval-analysis-topn" className="field tnum w-24" inputMode="numeric" value={current.top_n ?? 1}
+                     data-eval-analysis-topn="" onChange={(e) => update({ top_n: Number(e.target.value) || 1 })} />
+            </Field>
+          )}
+          {fieldsOf(current).map((f) => (
+            <ParamInput key={`${current.op}:${current.mode}:${f.key}`} field={f} columns={columns}
+                        value={(current.params ?? {})[f.key]} onChange={(v) => setParam(f.key, v)} />
+          ))}
+          {fieldsOf(current).some((f) => f.key === 'base') && (
+            <p className="text-2xs leading-relaxed text-faint sm:col-span-2">{T.analysisPeriodHint}</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ParamInput({ field, columns, value, onChange }: {
+  field: ParamField; columns: string[]; value: unknown; onChange: (v: unknown) => void
+}) {
+  const id = `eval-analysis-param-${field.key}`
+  const label = A.param[field.key] ?? field.key
+  if (field.kind === 'columns') {
+    const picked = Array.isArray(value) ? value.map(String) : []
+    return (
+      <div className="sm:col-span-2" data-eval-analysis-param={field.key}>
+        <div className="label">{label}</div>
+        <div className="flex flex-wrap gap-2">
+          {columns.map((c) => (
+            <label key={c} className="flex items-center gap-1">
+              <input type="checkbox" checked={picked.includes(c)} data-eval-analysis-param-col={c}
+                     onChange={(e) => onChange(e.target.checked ? [...picked, c] : picked.filter((x) => x !== c))} />
+              {c}
+            </label>
+          ))}
+        </div>
+      </div>
+    )
+  }
+  if (field.kind === 'pairs') {
+    const text = Array.isArray(value) ? value.map((p) => (Array.isArray(p) ? p.join('，') : String(p))).join('\n') : ''
+    return (
+      <Field label={label} htmlFor={id} hint={T.analysisPairsHint} className="sm:col-span-2">
+        <textarea id={id} className="field min-h-12 text-xs" defaultValue={text} data-eval-analysis-param={field.key}
+                  onChange={(e) => onChange(e.target.value.split('\n').map((line) => line.split(/[,，、]/).map((x) => x.trim())
+                    .filter(Boolean)).filter((pair) => pair.length))} />
+      </Field>
+    )
+  }
+  if (field.kind === 'column' || field.kind === 'choice') {
+    const options = field.kind === 'column' ? Object.fromEntries(columns.map((c) => [c, c])) : field.choices ?? {}
+    return (
+      <Field label={label} htmlFor={id}>
+        <select id={id} className="field" value={value == null ? '' : String(value)} data-eval-analysis-param={field.key}
+                onChange={(e) => onChange(e.target.value)}>
+          <option value="">{field.kind === 'column' ? T.analysisColumn : T.analysisNone}</option>
+          {Object.entries(options).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+        </select>
+      </Field>
+    )
+  }
+  return (
+    <Field label={label} htmlFor={id}>
+      <input id={id} className={clsx('field', field.kind === 'int' && 'tnum w-24')} value={value == null ? '' : String(value)}
+             inputMode={field.kind === 'int' ? 'numeric' : undefined} placeholder={field.kind === 'text' ? T.analysisNone : undefined}
+             data-eval-analysis-param={field.key}
+             onChange={(e) => onChange(field.kind === 'int' ? (e.target.value.trim() ? Number(e.target.value) : '') : e.target.value)} />
+    </Field>
   )
 }
 

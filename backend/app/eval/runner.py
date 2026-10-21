@@ -12,6 +12,9 @@ EvalResult：建评测时就全部建好（pending），进度、「正在做什
 snapshot 视图）：起草、剖析照常进行，也不影响这次评测的可比性。各数据源的上传表格版本、表结构哈希开始和结束各记一次，
 变了在指纹里标出（sources_changed）。
 
+**分析设置。** 题集里有分析期望（贡献、判定）的，开评时拍一份分析设置（判定用的阈值）：算期望、各臂作答的运行都按这一份，
+记进指纹（和上一次比时阈值变了照实标出），重试沿用。别的题集不拍，指纹、作答运行的选项和以前一样。
+
 **并发。** 同时最多 max_parallel 题，且所有臂合起来不超过全局运行并发的四分之一。评测发起的作答、算期望的运行归「系统」类
 （app/cluster/slots.py）：全站的名额按类别有上限和优先级，评测再多也只占得到系统那一类的名额，问数据、试跑优先，不被挤占。
 A/B 的同一题几臂同时开跑。每题时限 per_case_timeout_s：作答一臂超时就取消它正在跑的运行、记超时；
@@ -95,17 +98,22 @@ def leader_of(run: Any) -> str:
 
 
 def prompt_fingerprint() -> str:
-    """助手提示词的指纹：节点手册、输出协议、问数据的请求包法、重来的两种措辞、复核的规则。改了任何一段，和上一次比时
-    就标「提示词变了」。"""
+    """助手提示词的指纹：节点手册、输出协议、问数据的请求包法、重来的两种措辞、复核的规则；平台的分析方法（分析工具的
+    guide：id 带版本，连同全文）、写作者的分析规则（写作目录里分析结论那一段、判断词的写法、重写时补的那句）和说法表的
+    版本。改了任何一段，和上一次比时就标「提示词变了」。"""
     from app.api import copilot
     from app.chat import turn
     from app.core.artifact_store import canonical_json, content_hash
-    from app.engine import review
+    from app.engine import analysis_claims, evidence, review
+    from app.tools.builtin.analysis import METHOD_GUIDE
 
     parts = [copilot.NODE_REFERENCE, copilot._STREAM_PROTOCOL,
              copilot._user_message(copilot.GenerateIn(instruction="{question}", intent="answer"), patch=False),
              turn.RETRY_WITH_BASE, turn.RETRY_FROM_SCRATCH,
-             str(getattr(review, "REVIEW_SYSTEM", "") or getattr(review, "SYSTEM_PROMPT", ""))]
+             str(getattr(review, "REVIEW_SYSTEM", "") or getattr(review, "SYSTEM_PROMPT", "")),
+             METHOD_GUIDE.id, METHOD_GUIDE.text, evidence.ANALYSIS_PROMPT, evidence.ANALYSIS_SEE_ONLY_PROMPT,
+             analysis_claims.ANALYSIS_RULES_PROMPT, analysis_claims.ANALYSIS_NONE_PROMPT,
+             analysis_claims.ANALYSIS_REPAIR_PROMPT, analysis_claims.LEXICON_VERSION]
     return content_hash(canonical_json(parts))[:16]
 
 
@@ -300,6 +308,8 @@ class EvalExecution(runtime.JobRun):
         self.copilot_reason = ""
         self.timeouts: list[bool] = []
         self.tasks: set[asyncio.Task[Any]] = set()
+        #: 这次评测的分析设置快照（有分析期望的题集才拍，_prepare）：算期望、作答的运行都按它
+        self.analysis: dict[str, Any] | None = None
 
     def lane_of(self, job: Any) -> str | None:
         return None
@@ -354,6 +364,13 @@ class EvalExecution(runtime.JobRun):
                         raise runtime.JobFailed(f"拍目录快照没有成功：{e.message}") from e
                     snapshot = snap.artifact_id
             versions = await source_versions(session, sources)
+            # 有分析期望的题集拍一份分析设置（判定用的阈值）：算期望、各臂作答的运行都按这一份（重试沿用拍过的那一份），
+            # 评测期间有人改了设置也不会一边按旧阈值判、一边按新阈值判；记进指纹，和上一次比时阈值变了照实标出
+            self.analysis = (leader.fingerprint or {}).get("analysis")
+            if self.analysis is None and self._analyzes():
+                from app.api.settings import analysis_settings
+
+                self.analysis = await analysis_settings(session)
             for run in runs:
                 fp = dict(run.fingerprint or {})
                 if "sources_before" not in fp:
@@ -366,6 +383,8 @@ class EvalExecution(runtime.JobRun):
                               sources_before=versions,
                               schemas={sid: v.get("schema") for sid, v in versions.items()},
                               cases=_cases_key(results, run.id))
+                if self.analysis is not None:
+                    fp["analysis"] = dict(self.analysis)
                 run.fingerprint = fp
                 run.catalog_snapshot = snapshot if (run.variant.get("catalog") or {}).get("mode") in (
                     "live", "reviewed") else fp.get("snapshot_artifact")
@@ -383,6 +402,13 @@ class EvalExecution(runtime.JobRun):
                 key = (str(r.case_id), int(r.repeat or 0))
                 units.setdefault(key, _Unit(key[0], key[1], {})).results[r.eval_run_id] = r.id
         return list(units.values())
+
+    def _analyzes(self) -> bool:
+        """这次评测的题里有没有分析期望（贡献、判定）。"""
+        from app.eval.judgements import ANALYSIS_KINDS
+
+        return any(e.get("kind") in ANALYSIS_KINDS for case in self.cases.values()
+                   for e in case.get("expectations") or [])
 
     async def _sources(self, session: AsyncSession) -> list[str]:
         """这次评测用得到的数据源：题目限定的、期望查的；有不限数据源的问数据题时，全部启用的源（助手会在它们里面挑）。"""
@@ -490,7 +516,8 @@ class EvalExecution(runtime.JobRun):
         timeout = float(self.budget.get("per_case_timeout_s") or 900)
         ctx = gold_rules.Context(as_of=self.as_of, tz=self.suite["timezone"], cron=self.cron, actor=self.actor,
                                  suite_id=self.suite["id"], suite_name=self.suite["name"], eval_run_id=self.job_id,
-                                 role="gold", extra={"repeat": unit.repeat}, timeout_s=timeout)
+                                 role="gold", extra={"repeat": unit.repeat}, timeout_s=timeout,
+                                 analysis=self.analysis)
 
         async def answer(_before: Any) -> list[Any]:
             return await asyncio.gather(*(self._answer(arm, unit, case, question, values, timeout) for arm in arms))
@@ -515,7 +542,7 @@ class EvalExecution(runtime.JobRun):
                           case_id=unit.case_id, case_seq=case.get("seq"), actor=self.actor,
                           arm=arm.name, repeat=unit.repeat,
                           assistant=arm.variant.get("assistant") or {}, writer=arm.variant.get("writer") or {},
-                          view=arm.view)
+                          view=arm.view, analysis=self.analysis)
         driver = Driver(question, datasource_ids=list(case.get("datasource_ids") or []), ctx=ctx, on_phase=on_phase)
         try:
             if case.get("kind") == "workflow":
@@ -806,13 +833,15 @@ def _cases_key(results: Sequence[EvalResult], run_id: str) -> str:
 
 
 def gold_key(gold: Mapping[str, Any] | None) -> str | None:
-    """期望值的指纹（作答前那一份）：和上一次比时认「数据变了」。"""
+    """期望值的指纹（作答前那一份）：和上一次比时认「数据变了」。分析结论里随运行当天、现查时刻、输入快照的工件变的几项
+    不算（gold.stable_sets：不然分析题每次评测都成了「数据变」）。"""
     from app.core.artifact_store import canonical_json, content_hash
+    from app.eval.gold import stable_sets
 
     before = (gold or {}).get("before") or {}
     if (gold or {}).get("status") not in ("ok", "drifted"):
         return None
-    return content_hash(canonical_json([[s.get("version"), s.get("values")] for s in before.get("sets") or []]))[:16]
+    return content_hash(canonical_json(stable_sets(before.get("sets") or [])))[:16]
 
 
 def _sql_shapes(answer: Any) -> list[dict[str, Any]]:

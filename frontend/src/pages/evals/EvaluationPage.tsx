@@ -10,7 +10,7 @@ import { formatCost, formatDateTime, formatDuration, formatNumber, formatTokens,
 import { EVAL_TEXT, distText, pct, rateText } from '../../lib/termsEval'
 import { useOnReconnect } from '../../store/catalog'
 import type { EvalCompare, EvalPair, EvalResult, EvalRun, EvalRunDetail, EvalScore, EvalSuiteDetail, EvalSummary } from '../../typesEval'
-import { EvalStatusPill, RateCard, StatCard, VerdictChip, cellText, usageCost } from './parts'
+import { EvalStatusPill, RateCard, StatCard, VerdictChip, cellText, judgementText, usageCost } from './parts'
 
 const T = EVAL_TEXT
 type TabKey = 'overview' | 'results' | 'compare' | 'pair'
@@ -223,6 +223,18 @@ function Overview({ run }: { run: EvalRun }) {
         {!!s.not_run && <p className="text-dim" data-eval-not-run={s.not_run}>{O.notRun(s.not_run)}</p>}
         {!!s.errors && <p className="text-dim" data-eval-errors={s.errors}>{O.errors(s.errors)}</p>}
         <p className="text-dim">{O.outcomes}：{distText(s.outcomes as Record<string, number>, T.outcome)}</p>
+        {!!s.outcomes_by_kind && Object.keys(s.outcomes_by_kind).length > 0 && (
+          <div className="text-dim" data-eval-outcomes-by-kind="">
+            <span>{O.outcomesByKind}：</span>
+            <ul className="mt-0.5 space-y-0.5 pl-3">
+              {Object.entries(s.outcomes_by_kind).map(([kind, dist]) => (
+                <li key={kind} data-eval-outcomes-kind={kind}>
+                  {T.expectation.kind[kind as keyof typeof T.expectation.kind] ?? kind}：{distText(dist as Record<string, number>, T.outcome)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {s.text && Object.keys(s.text).length > 0 && <p className="text-dim">{O.text}：{distText(s.text as Record<string, number>, T.textOutcome)}</p>}
       </Section>
       {base && (
@@ -394,8 +406,17 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
                   <td className="px-2 py-1.5">
                     {counted.length ? counted.map((s) => (
                       <div key={s.id} className="tnum" data-eval-score={s.outcome}>
-                        {s.expected !== undefined && <span>{cellText(s.expected)}</span>}
-                        {s.got !== undefined && <span className="text-dim"> → {cellText(s.got)}</span>}
+                        {s.want ? (
+                          <span data-eval-score-judgement="">
+                            {judgementText(s.want)}
+                            {s.found && <span className="text-dim"> → {judgementText(s.found)}</span>}
+                          </span>
+                        ) : (
+                          <>
+                            {s.expected !== undefined && <span>{cellText(s.expected)}</span>}
+                            {s.got !== undefined && <span className="text-dim"> → {cellText(s.got)}</span>}
+                          </>
+                        )}
                         <span className="ml-1 text-2xs text-faint">{scoreText(s)}</span>
                         {s.weak && <span className="ml-1 chip text-[var(--warn)]" title={R.weakHint}>{R.weak}</span>}
                       </div>
@@ -420,12 +441,15 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
                     <td colSpan={8} className="space-y-1.5 px-3 py-2">
                       {r.error && <p className="text-dim"><span className="text-faint">{R.reason}：</span>{r.error}</p>}
                       {r.scores.map((s) => (
-                        <p key={s.id} className="text-dim">
-                          <span className="text-faint">{T.expectation.kind[s.kind]}{s.label ? `「${s.label}」` : ''}：</span>
-                          {scoreText(s)}
-                          {s.key && <span className="text-faint">（{Object.entries(s.key).map(([k, v]) => `${k}=${cellText(v)}`).join('、')}）</span>}
-                          {s.reason && <span> · {s.reason}</span>}
-                        </p>
+                        <Fragment key={s.id}>
+                          <p className="text-dim">
+                            <span className="text-faint">{T.expectation.kind[s.kind]}{s.label ? `「${s.label}」` : ''}：</span>
+                            {scoreText(s)}
+                            {s.key && <span className="text-faint">（{Object.entries(s.key).map(([k, v]) => `${k}=${cellText(v)}`).join('、')}）</span>}
+                            {s.reason && <span> · {s.reason}</span>}
+                          </p>
+                          {s.want && <AnalysisDetail score={s} />}
+                        </Fragment>
                       ))}
                       {r.sql_match?.basis && T.sqlMatchBasis[r.sql_match.basis] && (
                         <p className="text-faint" data-eval-sql-basis={r.sql_match.basis}>{T.sqlMatchBasis[r.sql_match.basis]}</p>
@@ -446,6 +470,32 @@ function Results({ id, live, focusCase }: { id: string; live: boolean; focusCase
           })}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+/**
+ * 分析期望的明细：期望的判定和系统渲染的判定语（期望 SQL 上算的），答案里对上（或对不上）的那一份——引用的分析结论编号和
+ * 它的判定语，或者正文里说出这个判断的那一句。都是服务端给的，照原样写
+ */
+function AnalysisDetail({ score }: { score: EvalScore }) {
+  const R = T.results
+  const want = score.want ?? {}
+  const found = score.found
+  return (
+    <div className="space-y-0.5 border-l-2 pl-2 text-dim" data-eval-analysis-detail={score.id}>
+      <p data-eval-analysis-want="">
+        <span className="text-faint">{R.analysisWant}：</span>{judgementText(want)}
+        {want.method && <span className="text-faint"> · {want.method}</span>}
+        {want.phrase && <span className="block text-faint">{want.phrase}</span>}
+      </p>
+      {found && (
+        <p data-eval-analysis-found={found.alias ?? 'text'}>
+          <span className="text-faint">{R.analysisFound}：</span>
+          {found.alias ? R.analysisCited(found.alias) : found.text ? R.analysisSaid(found.text) : judgementText(found)}
+          {found.alias && found.phrase && <span className="block text-faint">{found.phrase}</span>}
+        </p>
+      )}
     </div>
   )
 }

@@ -11,7 +11,8 @@
 「只参数变」（多半是时间范围理解变了）；作答路径变了是「路径变」；其余「说不清」。SQL 的 same / params_only / changed 和运行
 对比（engine/compare）是同一条规则：data/sql_semantics.normalize_sql 的规范文本和字面量。
 
-**指纹差异**：助手模型、写作模型、目录快照、提示词指纹、表结构、题目、评分规则，哪几项变了。
+**指纹差异**：助手模型、写作模型、目录快照、提示词指纹、表结构、题目、评分规则、分析设置（有分析期望的题集开评时拍的
+那一份判定阈值），哪几项变了。
 
 **A/B**：同一次发起的几臂（共用 pair_id、共用期望）逐题配对，给两臂各自的准确率、配对表（都对 / 都错 / 只 A 对 / 只 B 对）和
 精确 McNemar 双侧 p 值；p ≥ 0.05 时照实写「这批题上看不出差别」。不能判的题不进配对表（单列个数）。
@@ -30,7 +31,8 @@ CAUSES = ("data", "method", "params", "path", "unknown")
 CAUSE_LABEL = {"data": "数据变", "method": "做法变", "params": "只参数变", "path": "路径变", "unknown": "说不清"}
 #: 指纹里比的几项和叫法
 FINGERPRINT_LABEL = {"assistant_model": "助手模型", "writer_model": "写作模型", "catalog": "目录快照",
-                     "prompt": "提示词", "schemas": "表结构", "cases": "题目", "scorer_version": "评分规则"}
+                     "prompt": "提示词", "schemas": "表结构", "cases": "题目", "scorer_version": "评分规则",
+                     "analysis": "分析设置"}
 NO_DIFFERENCE = "这批题上看不出差别"
 SIGNIFICANT = 0.05
 #: 基准能是哪几种状态
