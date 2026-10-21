@@ -4751,7 +4751,11 @@ _DECOMPOSE_NUMBERS = ("base", "target", "delta", "pct", "share", "contrib", "fla
 
 def _decompose_row(result: dict[str, Any]) -> tuple[str, list[Any]] | None:
     """变化拆解的结果表里判定点名的那一段：(这一段的叫法, 那一行)。段按维度列（params.by；乘积模式是 factor 一列）对
-    verdict.subjects 的第一项，对不上就取第一行（结果表按变化的绝对值从大到小排）。叫法是维度值用「·」连起来。"""
+    verdict.subjects 的第一项，对不上就取第一行（结果表按变化的绝对值从大到小排）。维度值和叫法都按算子写段的同一个函数
+    （app.analysis.phrases.key_text：空值写「（空）」、布尔写「是 / 否」，两列用「·」连）：subjects 就是这么写的，拿原值的
+    str 去比，空值、布尔维度的段对不上，代入式会退回第一行。"""
+    from app.analysis.phrases import key_text
+
     table = result.get("table") if isinstance(result.get("table"), dict) else {}
     rows = [r for r in table.get("rows") or [] if isinstance(r, list)]
     columns = [str(c) for c in table.get("columns") or []]
@@ -4768,8 +4772,8 @@ def _decompose_row(result: dict[str, Any]) -> tuple[str, list[Any]] | None:
     picked = rows[0]
     if subjects and at and isinstance(subjects[0], list):
         wanted = [str(v) for v in subjects[0]]
-        picked = next((row for row in rows if [str(row[i]) for i in at if i < len(row)] == wanted), rows[0])
-    name = "·".join(str(picked[i]) for i in at if i < len(picked) and picked[i] is not None)
+        picked = next((row for row in rows if [key_text([row[i]]) for i in at if i < len(row)] == wanted), rows[0])
+    name = key_text([picked[i] for i in at if i < len(picked)]) if at else ""
     return name or "这一段", picked
 
 

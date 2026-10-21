@@ -601,6 +601,25 @@ def test_formulas_substitute_the_key_numbers():
     assert analysis_formulas(fake_result(values={})) == []
 
 
+@pytest.mark.parametrize("keys, named", [((None, "华南", "华北"), "（空）"), ((True, False, None), "是")])
+def test_the_formula_names_the_segment_the_verdict_names(keys, named):
+    """代入式里点名的那一段按判定的 subjects 找，维度值按算子写段的同一个函数比（空值写「（空）」、布尔写「是 / 否」）。
+    这里判定点名的段不在结果表第一行（第一行是反方向变化最大的那段）：以前拿原值的 str 比，对不上就退回第一行，代入式写成了
+    第一行那段。"""
+    store = Store()
+    driver, opposite, other = keys                         # 变化：driver -220、opposite +250、other -180，总共 -150
+    snap = {"columns": ["region", "week", "gmv"], "column_types": {"region": "text", "week": "text", "gmv": "number"},
+            "rows": [[driver, "W41", 1000], [driver, "W42", 780], [opposite, "W41", 500], [opposite, "W42", 750],
+                     [other, "W41", 600], [other, "W42", 420]],
+            "sql": "SELECT region, week, SUM(gmv) AS gmv FROM orders GROUP BY region, week", "source": "shop",
+            "truncated": False}
+    result = real_result(store.put(snap), snap)
+    assert result["verdict"]["code"] == "driver" and result["verdict"]["subjects"] == [[named]]
+    assert [r[0] for r in result["table"]["rows"]] == [opposite, driver, other]     # 按变化的绝对值排
+    texts = {f["label"]: f["text"] for f in analysis_formulas(result)}
+    assert texts["占比"] == f"{named}的占比 = {named}的变化 ÷ 总变化 = -220 ÷ （-150） = 146.7%"
+
+
 def test_formulas_for_factor_ratio_and_baseline():
     store = Store()
     factor_snap = {"columns": ["week", "gmv", "orders", "aov"],
