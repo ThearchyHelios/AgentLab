@@ -370,26 +370,33 @@ export interface EvalImported {
 
 export type EvalCatalogMode = 'live' | 'reviewed' | 'off' | 'snapshot'
 
+/** 分析工具开、关（关的那一臂助手建图时看不到分析工具和分析卡） */
+export type EvalAnalysisTools = 'on' | 'off'
+
+/** 预设对照：目录贡献（当前目录 vs 关，可加「只用已核实和已确认的项」）、分析工具贡献（开 vs 关） */
+export type EvalPreset = 'catalog' | 'catalog_reviewed' | 'analysis_tools'
+
 export interface EvalModelPair {
   provider: string | null
   model: string | null
 }
 
-/** 一臂变体：助手、写作模型，结论裁判，目录，重复次数，名字 */
+/** 一臂变体：助手、写作模型，结论裁判，目录，分析工具，重复次数，名字。加分析工具之前存下的评测记录里没有 analysis（当开） */
 export interface EvalVariant {
   assistant: EvalModelPair
   writer: EvalModelPair
   judge: boolean
   catalog: { mode: EvalCatalogMode; snapshot: string | null }
+  analysis: { tools: EvalAnalysisTools }
   repeats: number
   label: string | null
 }
 
-/** 发起时交上去的：一臂（variant）、几臂的 A/B（arms），或预设的「目录贡献对照」（preset） */
+/** 发起时交上去的：一臂（variant）、几臂的 A/B（arms），或预设的对照（preset：目录贡献、分析工具贡献） */
 export interface EvalStartBody {
   variant?: Partial<EvalVariant>
   arms?: Partial<EvalVariant>[]
-  preset?: 'catalog' | 'catalog_reviewed'
+  preset?: EvalPreset
   baseline_id?: string | null
 }
 

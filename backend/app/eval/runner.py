@@ -239,6 +239,7 @@ async def start(session: AsyncSession, suite: EvalSuite, variants: Sequence[Mapp
                       fingerprint={"variant_key": variant_rules.variant_key(variant, models),
                                    "assistant_model": models.get("assistant"), "writer_model": models.get("writer"),
                                    "catalog_mode": (variant.get("catalog") or {}).get("mode"),
+                                   "analysis_tools": variant_rules.analysis_tools(variant),
                                    "snapshot_artifact": snapshot, "cron": cron},
                       counts={"total": len(cases) * repeats, "done": 0})
         session.add(run)
@@ -531,6 +532,7 @@ class EvalExecution(runtime.JobRun):
 
     async def _answer(self, arm: _Arm, unit: _Unit, case: Mapping[str, Any], question: str,
                       values: Mapping[str, str], timeout: float) -> Any:
+        from app.eval import variants as variant_rules
         from app.eval.answer import Driver, TurnContext, stop_run
 
         result_id = unit.results[arm.run_id]
@@ -542,7 +544,8 @@ class EvalExecution(runtime.JobRun):
                           case_id=unit.case_id, case_seq=case.get("seq"), actor=self.actor,
                           arm=arm.name, repeat=unit.repeat,
                           assistant=arm.variant.get("assistant") or {}, writer=arm.variant.get("writer") or {},
-                          view=arm.view, analysis=self.analysis)
+                          view=arm.view, analysis=self.analysis,
+                          analysis_tools=variant_rules.analysis_tools(arm.variant) == "on")
         driver = Driver(question, datasource_ids=list(case.get("datasource_ids") or []), ctx=ctx, on_phase=on_phase)
         try:
             if case.get("kind") == "workflow":

@@ -7,7 +7,8 @@ app/chat/job.py），生成过程是 api/copilot.answer_ops，几个「决定」
     answer_ops → final.next（chat/turn.next_step）→ launch_run(origin=eval) → 等终态 → review_of_run → 要的话带原图重来一次
 
 - 生成：问法就是 instruction，intent=answer，限定的数据源同题目；助手模型按变体覆盖（GenerateIn.provider / model，挑表、
-  复核跟着换）；读哪份目录按变体（answer_ops 的 catalog_view，查看的表详情、自查的 SQL 检查器都按它）。
+  复核跟着换）；读哪份目录按变体（answer_ops 的 catalog_view，查看的表详情、自查的 SQL 检查器都按它）；分析工具开不开按
+  变体（answer_ops 的 analysis_tools，经 TurnDriver 透传：关的那一臂工具清单不列分析工具，节点手册不讲分析卡）。
 - 结局：reply 直接回答、asked 反问、fail 判失败（建图失败）、ready 只建不跑、retry（老服务端那条路：没自查过的图带着原因
   重来一次）、run 运行。生成过程交出 error（助手本轮未完成）、开流前就拒绝（模型没配好、数据源不在）都是建图失败，另记
   「助手调用失败」——连续几题都这样就止损（runner.py）；只有生成过程一个操作都没给（只写了思考，error.next=retry）时按
@@ -71,6 +72,8 @@ class TurnContext:
     view: Mapping[str, Any] | None = None
     #: 这次评测的分析设置快照（有分析期望的题集才有）：作答的运行按它判（Run.options['analysis']），和算期望同一份
     analysis: Mapping[str, Any] | None = None
+    #: 变体：分析工具开不开（variants.analysis_tools）。关的那一臂建图时助手看不到分析工具（TurnDriver 的 analysis_tools）
+    analysis_tools: bool = True
 
 
 async def writer_usage(run_ids: list[str]) -> dict[str, Any]:
@@ -153,13 +156,14 @@ async def stop_run(run_id: str | None, actor: str | None = None) -> None:
 
 class Driver(TurnDriver):
     """一轮作答（流程在 TurnDriver）。drive() 跑完一轮，结果在 turn 上；on_phase(阶段) 在每一步开始时调（runner 据此写
-    「正在做什么」）。和问数据不一样的：助手模型、目录视图按变体；写作模型按变体写进图；来源 eval、只读和遮罩；停在审批上
-    直接取消（评测不代批）；复核一直等。"""
+    「正在做什么」）。和问数据不一样的：助手模型、目录视图、分析工具开不开按变体；写作模型按变体写进图；来源 eval、只读和
+    遮罩；停在审批上直接取消（评测不代批）；复核一直等。"""
 
     def __init__(self, question: str, *, datasource_ids: list[str], ctx: TurnContext,
                  on_phase: Callable[[str], Awaitable[None]] | None = None) -> None:
         super().__init__(question, datasource_ids=datasource_ids, on_phase=on_phase,
-                         provider=ctx.assistant.get("provider"), model=ctx.assistant.get("model"))
+                         provider=ctx.assistant.get("provider"), model=ctx.assistant.get("model"),
+                         analysis_tools=ctx.analysis_tools)
         self.ctx = ctx
 
     def catalog_view(self) -> Any:

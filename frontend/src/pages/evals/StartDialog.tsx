@@ -6,13 +6,16 @@ import { Field, Modal, Notice, Spinner, toast, useRadioGroup } from '../../compo
 import { errorMessage } from '../../lib/errors'
 import { formatCost, formatDateTime, shortId } from '../../lib/format'
 import { EVAL_TEXT } from '../../lib/termsEval'
-import type { EvalCatalogMode, EvalEstimate, EvalRun, EvalSnapshot, EvalStartBody, EvalSuite, EvalVariant } from '../../typesEval'
+import type {
+  EvalAnalysisTools, EvalCatalogMode, EvalEstimate, EvalRun, EvalSnapshot, EvalStartBody, EvalSuite, EvalVariant,
+} from '../../typesEval'
 import { ModelPick } from './parts'
 
 const T = EVAL_TEXT.start
-const MODES = ['single', 'ab', 'catalog'] as const
+const MODES = ['single', 'ab', 'catalog', 'analysis_tools'] as const
 type Mode = (typeof MODES)[number]
 const CATALOG_MODES: EvalCatalogMode[] = ['live', 'reviewed', 'off', 'snapshot']
+const ANALYSIS_TOOLS: EvalAnalysisTools[] = ['on', 'off']
 
 /** 一臂的变体（表单里的样子）：全部键都在，交上去之前不改形状 */
 export function blankVariant(base?: Partial<EvalVariant>): EvalVariant {
@@ -21,6 +24,7 @@ export function blankVariant(base?: Partial<EvalVariant>): EvalVariant {
     writer: { provider: base?.writer?.provider ?? null, model: base?.writer?.model ?? null },
     judge: base?.judge ?? false,
     catalog: { mode: base?.catalog?.mode ?? 'live', snapshot: base?.catalog?.snapshot ?? null },
+    analysis: { tools: base?.analysis?.tools ?? 'on' },
     repeats: base?.repeats ?? 1,
     label: base?.label ?? null,
   }
@@ -37,12 +41,13 @@ export function snapshotLabel(s: EvalSnapshot): string {
 }
 
 /**
- * 一臂变体的表单：助手、写作模型（缺省按设置），结论裁判，数据目录（当前 / 只用已核实的 / 关 / 快照），重复次数，名字。
- * 题集设置里的「默认变体」也用它（定时评测按默认变体评）
+ * 一臂变体的表单：助手、写作模型（缺省按设置），结论裁判，数据目录（当前 / 只用已核实的 / 关 / 快照），分析工具（开 / 关），
+ * 重复次数，名字。题集设置里的「默认变体」也用它（定时评测按默认变体评）。预设对照里由预设定的那一项（目录、分析工具）不摆
  */
-export function ArmFields({ idPrefix, value, onChange, snapshots, withLabel = false, labelIndex = 0, hideCatalog = false }: {
+export function ArmFields({ idPrefix, value, onChange, snapshots, withLabel = false, labelIndex = 0, hideCatalog = false,
+  hideAnalysis = false }: {
   idPrefix: string; value: EvalVariant; onChange: (v: EvalVariant) => void; snapshots: EvalSnapshot[]
-  withLabel?: boolean; labelIndex?: number; hideCatalog?: boolean
+  withLabel?: boolean; labelIndex?: number; hideCatalog?: boolean; hideAnalysis?: boolean
 }) {
   const set = (patch: Partial<EvalVariant>) => onChange({ ...value, ...patch })
   const usable = usableSnapshots(snapshots)
@@ -82,6 +87,14 @@ export function ArmFields({ idPrefix, value, onChange, snapshots, withLabel = fa
           </select>
         </Field>
       )}
+      {!hideAnalysis && (
+        <Field label={T.analysisTools} htmlFor={`${idPrefix}-analysis`} hint={T.analysisToolsHint}>
+          <select id={`${idPrefix}-analysis`} className="field w-24" value={value.analysis.tools} data-eval-analysis-tools=""
+                  onChange={(e) => set({ analysis: { tools: e.target.value as EvalAnalysisTools } })}>
+            {ANALYSIS_TOOLS.map((m) => <option key={m} value={m}>{T.analysisToolsMode[m]}</option>)}
+          </select>
+        </Field>
+      )}
       <Field label={T.repeats} htmlFor={`${idPrefix}-repeats`} hint={T.repeatsHint}>
         <select id={`${idPrefix}-repeats`} className="field w-24" value={value.repeats} data-eval-repeats=""
                 onChange={(e) => set({ repeats: Number(e.target.value) })}>
@@ -98,8 +111,8 @@ export function ArmFields({ idPrefix, value, onChange, snapshots, withLabel = fa
 }
 
 /**
- * 发起评测：评一次 / A/B 对照（两到三臂） / 目录贡献对照（预设）。填好就向服务端要估算（几项、按上一次每题平均花费估的金额、
- * 生效的预算、同时评几题、今天评测已经花了多少）——估算和发起是同一份请求体，估出来的就是要发起的那一次。
+ * 发起评测：评一次 / A/B 对照（两到三臂） / 目录贡献对照、分析工具贡献对照（预设）。填好就向服务端要估算（几项、按上一次每题
+ * 平均花费估的金额、生效的预算、同时评几题、今天评测已经花了多少）——估算和发起是同一份请求体，估出来的就是要发起的那一次。
  */
 export function StartDialog({ open, onClose, suite, evaluations, onStarted }: {
   open: boolean; onClose: () => void; suite: EvalSuite; evaluations: EvalRun[]; onStarted: (run: EvalRun) => void
@@ -132,7 +145,7 @@ export function StartDialog({ open, onClose, suite, evaluations, onStarted }: {
         const repeats = Math.max(first.repeats, 3)
         return cur.length >= 2 ? cur : [{ ...first, repeats, label: first.label || 'A' }, { ...first, repeats, label: 'B' }]
       }
-      return [m === 'catalog' ? { ...first, repeats: Math.max(first.repeats, 3) } : first]
+      return [m === 'catalog' || m === 'analysis_tools' ? { ...first, repeats: Math.max(first.repeats, 3) } : first]
     })
   }
 
@@ -143,6 +156,10 @@ export function StartDialog({ open, onClose, suite, evaluations, onStarted }: {
     if (mode === 'catalog') {
       const { catalog: _c, label: _l, ...rest } = v
       return { preset: reviewedArm ? 'catalog_reviewed' : 'catalog', variant: rest, ...base }
+    }
+    if (mode === 'analysis_tools') {
+      const { analysis: _a, label: _l, ...rest } = v
+      return { preset: 'analysis_tools', variant: rest, ...base }
     }
     return { variant: v, ...base }
   }, [mode, arms, reviewedArm, baseline])
@@ -207,7 +224,7 @@ export function StartDialog({ open, onClose, suite, evaluations, onStarted }: {
 
         {mode !== 'ab' && (
           <ArmFields idPrefix="eval-arm-0" value={arms[0] ?? blankVariant()} snapshots={snapshots} hideCatalog={mode === 'catalog'}
-                     onChange={(v) => setArms([v])} />
+                     hideAnalysis={mode === 'analysis_tools'} onChange={(v) => setArms([v])} />
         )}
         {mode === 'catalog' && (
           <label className="flex items-center gap-2 text-xs">

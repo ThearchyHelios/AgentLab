@@ -31,11 +31,12 @@ Rules:
 
 ### Run an evaluation
 
-1. Choose the variants: Copilot model, writing model, judge on or off, catalog (current / snapshot / verified only / off), and how many repetitions.
-2. Check the estimated cost, then start. The Catalog contribution preset runs "current vs. off" in one go.
+1. Choose the variants: Copilot model, writing model, judge on or off, catalog (current / snapshot / verified only / off), analysis tools (on / off, on by default), and how many repetitions.
+2. Check the estimated cost, then start. The Catalog contribution preset runs "current vs. off" in one go, and the Analysis tools contribution preset runs "analysis tools on vs. off".
 
 - Evaluations run in the background, and each question goes exactly the way a user's question would in Ask Data (graph building, run, review). Questions that stop at an approval aren't approved on anyone's behalf and are recorded as they are.
 - When Copilot returns only thinking and no operations, the question is retried once automatically.
+- In an arm with analysis tools off, Copilot doesn't see the analysis tools or the analysis card when building the graph, and a graph that still binds analysis tools is sent back to be fixed; workflow questions (which test a pinned version of a published workflow) build no graph and aren't affected. Analysis tools on and off count as different variants, and a comparison with the previous evaluation shows "Analysis tools: on → off".
 - Concurrency, per-question time limits, and per-evaluation and daily spending all have caps, set under Settings → Preferences → Evaluation. Evaluation spending is tallied separately.
 - A question's time limit doesn't include time spent queuing. Under full load, evaluations queue behind Ask Data (see [Run concurrency](postgresql-and-scaling.md#run-concurrency)).
 - An evaluation can be stopped, and you can retry only the unfinished questions. A service restart marks it interrupted, and it doesn't resume by itself.
@@ -50,7 +51,7 @@ Rules:
 Contribution and verdict expectations are scored like this:
 
 - **Correct and traceable**: the answer cites an analysis conclusion whose verdict matches (the same analysis; for a main source, it names the expected segments with the same direction). If the sentence citing it says the opposite, it is wrong.
-- **Correct but uncited**: no matching conclusion is cited, but the body states it correctly by the lexicon (the same judgment words and binding rules; see [Analysis claim check](analysis.md#analysis-claim-check)). Comparability has no judgment words, so only a citation counts.
+- **Correct but uncited**: no matching conclusion is cited, but the body states it correctly by the lexicon (the same judgment words and binding rules; see [Analysis claim check](analysis.md#analysis-claim-check)). Comparability isn't in the lexicon: when the expectation is not comparable, a body that plainly says the two periods can't be compared directly (the current period is incomplete or not over yet, the numbers of days differ, the calibers differ, and so on; statements that are hypothetical, questions, or negated don't count) also falls here; when the expectation is comparable, only a citation counts.
 - **Wrong**: the cited conclusion's verdict doesn't match, the body says the opposite (calling a usual fluctuation unusual, rising falling, or naming another segment as the main source), the analysis was done but not stated, or it wasn't done at all.
 - **Ungradable**: the expectation can't be computed.
 

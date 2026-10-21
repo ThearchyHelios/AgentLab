@@ -444,6 +444,67 @@ async def test_the_api_starts_estimates_and_reports_progress(client, monkeypatch
     assert bad.status_code == 422 and bad.json()["code"] == "eval_variant_invalid"
 
 
+async def test_the_variant_switches_the_analysis_tools(client, monkeypatch):
+    """变体的分析工具（analysis.tools）：缺省开，只认 on、off；同一变体的指纹在开着时和加这一项之前一样（以前的评测照样
+    当基准），关着时不同；变体那一句写「分析工具开 / 关」。「分析工具贡献」预设一次发起开、关两臂，关的那一臂作答的 Driver
+    不给助手分析工具（TurnDriver 的 analysis_tools 透传给 answer_ops，见 test_copilot_analysis）。"""
+    from app.eval import variants
+    from app.eval.cases import CaseInvalid
+
+    on = variants.normalize_variant({})
+    off = variants.normalize_variant({"analysis": {"tools": "off"}})
+    assert on["analysis"] == {"tools": "on"} and off["analysis"] == {"tools": "off"}
+    for bad in ("off", {"tools": "maybe"}, {"tools": None}, {"tools": "off", "mode": "x"}):
+        with pytest.raises(CaseInvalid) as caught:
+            variants.normalize_variant({"analysis": bad})
+        assert (caught.value.field, caught.value.code) == ("variant.analysis", variants.VARIANT_INVALID), bad
+    models = {"assistant": "mock-fast", "writer": None}
+    before = {k: v for k, v in on.items() if k != "analysis"}
+    assert variants.variant_key(on, models) == variants.variant_key(before, models), "开着时和加这一项之前一样"
+    assert variants.variant_key(off, models) != variants.variant_key(on, models)
+    assert variants.describe(before, models) == variants.describe(on, models) \
+        == "助手 mock-fast · 写作 各节点自己的 · 当前目录 · 分析工具开 · 结论裁判关 · 每题 1 次"
+    assert "· 分析工具关 ·" in variants.describe(off, models)
+    arms = variants.analysis_tools_preset({**off, "catalog": {"mode": "off", "snapshot": None}, "repeats": 3,
+                                           "label": "x"})
+    assert [(a["label"], a["analysis"], a["catalog"]["mode"], a["repeats"]) for a in arms] == [
+        ("分析工具开", {"tools": "on"}, "off", 3), ("分析工具关", {"tools": "off"}, "off", 3)]
+
+    seen: list[tuple[str | None, bool]] = []
+
+    async def drive(self):
+        seen.append((self.ctx.arm, self.analysis_tools))
+        self.turn.path = "asked"
+        return self.turn
+
+    monkeypatch.setattr(answer_mod.Driver, "drive", drive)
+    suite_id = await es.make_suite("none", cases=ask_cases(1))
+    estimate = (await client.post(f"/api/evals/suites/{suite_id}/evaluations/estimate",
+                                  json={"preset": "analysis_tools"})).json()
+    assert [(a["label"], a["variant"]["analysis"]["tools"]) for a in estimate["arms"]] == [
+        ("分析工具开", "on"), ("分析工具关", "off")]
+    assert estimate["repeats"] == variants.PAIR_REPEATS and "分析工具关" in estimate["arms"][1]["text"]
+    started = await client.post(f"/api/evals/suites/{suite_id}/evaluations",
+                                json={"preset": "analysis_tools", "variant": {"repeats": 1}})
+    assert started.status_code == 202, started.text
+    lit, dark = started.json()["evaluations"]
+    await es.wait_eval(lit["id"])
+    assert sorted(seen) == [("分析工具关", False), ("分析工具开", True)]
+    assert (lit["fingerprint"]["analysis_tools"], dark["fingerprint"]["analysis_tools"]) == ("on", "off")
+    assert lit["fingerprint"]["variant_key"] != dark["fingerprint"]["variant_key"]
+    # 一臂、A/B 里写的照样认；不合规的照实拒、落到那一格
+    one = await client.post(f"/api/evals/suites/{suite_id}/evaluations/estimate",
+                            json={"variant": {"analysis": {"tools": "off"}}})
+    assert one.json()["arms"][0]["variant"]["analysis"] == {"tools": "off"}
+    bad = await client.post(f"/api/evals/suites/{suite_id}/evaluations/estimate",
+                            json={"arms": [{"label": "开"}, {"label": "关", "analysis": {"tools": "nope"}}]})
+    assert bad.status_code == 422
+    assert (bad.json()["code"], bad.json()["field"]) == ("eval_variant_invalid", "variant.analysis")
+    unknown = await client.post(f"/api/evals/suites/{suite_id}/evaluations/estimate", json={"preset": "tools"})
+    assert unknown.status_code == 422 and unknown.json()["field"] == "preset"
+    assert "analysis_tools" in unknown.json()["detail"]
+
+
 async def test_the_estimate_says_it_cannot_price_instead_of_zero():
     """上一次评测的模型都不在价格目录里（价格目录空）：估算以前写「约 $0」，像不花钱。现在一分都没估出来的写估不出；估出了
     一部分的写「至少」、另有几次估不出（老总表里每题平均记成 0、却有估不出的调用的，也按估不出算）。"""

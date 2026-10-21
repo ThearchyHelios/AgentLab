@@ -21,7 +21,10 @@ comparable 可比（comparable、conditional）/ incomparable 不可比。
 - 对且可追溯：答案引用了（[[a:]]、[[v:A…]]、[[table:A…]]、[[see:A…]]）判定对得上的分析结论（同一个算子，变化拆解还要同一种
   模式；主要来源要点名期望的那几段，方向一致；差异检验比的是同两组）；引用它的那句话里的判断词却和期望对不上的不算。
 - 对但没引用：没引用对得上的结论，但正文按说法表（engine/analysis_claims，同一套词表、同一套绑定规则）写对了：说法表认出的
-  这一类判断词，拿期望的那份分析结论核对得上（点名的段、方向、连续几期都核）。可比性没有对应的判断词，只能引用。
+  这一类判断词，拿期望的那份分析结论核对得上（点名的段、方向、连续几期都核）。可比性不进说法表（说法核对不该打回「本周数据
+  不完整，不能直接比」这种谨慎的提醒），评分另用一张只给自己用的小词表（_INCOMPARABLE）：期望是不可比的，正文明确说了两期
+  不能直接比（不能直接比、不可比、本期不完整、还没过完、只有几天、天数不同、口径不同……；分句里先有否定的、句子里先有假设
+  或疑问的、问句都不算）也算；期望是可比的只能靠引用。
 - 错：引用的分析判定对不上、正文写的和期望相反（把常规波动说成异常、把上升说成下降、主要来源说成别的段），或者根本没做也
   没说。
 - 不能评分：期望算不了。
@@ -79,6 +82,38 @@ _AFFIRMS: dict[str, frozenset[str]] = {
 }
 #: 判断词所在的句子最多留多少字给人看
 _SNIPPET_MAX = 40
+
+#: 数字（阿拉伯、全角、汉字）、期次、分句里的字（不跨句读）、比
+_N = r"[0-9０-９一二两三四五六七八九十]+"
+_PERIOD = "周|月|季|年|期|天|日"
+_IN_CLAUSE = r"[^，,；;。！？!?\n]"
+_COMPARE = "比较|对比|相比|比"
+#: 正文里明确说两期不能直接比的说法：直说不能比的，和说出不能直接比的原因的（本期不完整、还没过完、只有几天、天数不同、
+#: 口径不同）。只给评分用，不进说法表（engine/analysis_claims）：说法核对不该打回「本周数据不完整，不能直接比」这种谨慎的
+#: 提醒
+_INCOMPARABLE = re.compile(
+    # 直说不能比：不能直接比、无法直接比较、不宜简单对比、难以比较……「无法比拟」「比不上」「比得上」不是
+    rf"(?:不能|不可以|无法|不宜|不应该?|不便|难以|很难|不好|没办法)(?:直接|简单)?地?(?:拿来|放在一起)?"
+    rf"(?:{_COMPARE})(?![拟肩]|得上|不上)"
+    # 「没法」要带「直接」「简单」，或者说「比较」「对比」：光说「没法比」多半是说差得远
+    rf"|没法(?:直接|简单)地?(?:拿来|放在一起)?(?:{_COMPARE})(?![拟肩]|得上|不上)|没法(?:比较|对比|相比)"
+    # 不能直接拿本周和上周比
+    rf"|(?:不能|无法|不宜|不好|没法)(?:直接|简单)?(?:拿|把|将){_IN_CLAUSE}{{1,12}}?(?:和|跟|与|同){_IN_CLAUSE}{{1,12}}?"
+    rf"(?:{_COMPARE})(?![拟肩]|得上|不上)"
+    r"|不可比(?!拟)|不具备?可比性|没有可比性|缺乏可比性|可比性(?:不足|不够|存疑|较差|很差)"
+    # 原因：本期不完整、还没过完、只有几天、差几天、不满一周、天数不同、口径不同
+    rf"|(?:数据|统计|{_PERIOD}){_IN_CLAUSE}{{0,4}}?(?:不完整|不全(?!是))"
+    rf"|(?:{_PERIOD}){_IN_CLAUSE}{{0,4}}?(?:还|尚)?(?:没|未)(?:过完|结束|走完)"
+    rf"|(?:只有|仅有|才有|只统计了|只算了|只过了|才过了|才过去|才)\s*{_N}\s*(?:天|日)"
+    rf"|(?:还差|少了?|相差|差了?)\s*{_N}\s*(?:天|日)"
+    r"|(?:不满|不足|不到)\s*(?:一|1)\s*整?(?:周|个?月|季度?|年)"
+    r"|(?:天数|期长|时长|长度)也?(?:不同|不一样|不一致|不等|不相等|对不上|不足|不够)"
+    r"|口径也?(?:不同|不一样|不一致|变了|有变|有变化|发生了?变化|调整过?|改过|改了|有调整)|(?:换了|改了|调整了)(?:统计)?口径"
+)
+#: 可比性的说法前面（同一分句里）有否定的不算说了：「不是不能比」「并非不可比」
+_INCOMPARABLE_DENIED = re.compile(r"不是|并非|并不|未必|不一定")
+#: 句子里在它前面有假设、疑问的不算说了：「如果口径不同，就不能直接比」「是不是不能直接比」
+_INCOMPARABLE_SUPPOSED = re.compile(r"如果|假如|要是|倘若|假设|若是|是否|是不是|能不能|有没有")
 
 
 class ParamsInvalid(ValueError):
@@ -362,10 +397,17 @@ def mismatch(want: Mapping[str, Any], got: Mapping[str, Any]) -> str | None:
 _SENTENCE_END = re.compile(r"(?<=[。！？!?\n])")
 
 
+def _said_something(text: str) -> bool:
+    """这句话里有没有评分要看的说法：说法表的判断词，或者明确说两期不能直接比（_INCOMPARABLE）。"""
+    from app.engine import analysis_claims as said
+
+    return bool(said.scan(text) or incomparable_spans(text))
+
+
 def sentences_of_doc(doc: Mapping[str, Any], aliases: Iterable[str]) -> list[dict[str, Any]]:
-    """报告文档里有判断词的句子：{text: 写作者自己写的字（引用渲染出来的值、判定语、引文涂成 \\x00）, names: 点名用的样子
-    （引用渲染出来的值留着）, analyses: 这句挂的分析结论编号}。标题、代码块、表格不算（同说法核对）。aliases 是文档目录里
-    分析结论的编号。"""
+    """报告文档里有判断词（或者明确说两期不能直接比）的句子：{text: 写作者自己写的字（引用渲染出来的值、判定语、引文涂成
+    \\x00）, names: 点名用的样子（引用渲染出来的值留着）, analyses: 这句挂的分析结论编号}。标题、代码块、表格不算（同说法
+    核对）。aliases 是文档目录里分析结论的编号。"""
     from app.engine import analysis_claims as said
     from app.engine.evidence import iter_units
 
@@ -376,19 +418,17 @@ def sentences_of_doc(doc: Mapping[str, Any], aliases: Iterable[str]) -> list[dic
                 or unit.get("loc") is not None:
             continue
         sentence = said._sentence(unit, unit.get("cites") or [], known)
-        if sentence is not None and said.scan(sentence.text):
+        if sentence is not None and _said_something(sentence.text):
             out.append({"text": sentence.text, "names": sentence.names, "analyses": list(sentence.analyses)})
     return out
 
 
 def sentences_of_text(text: str) -> list[dict[str, Any]]:
-    """没有报告文档时（成果里的文字）：按句末标点切开，有判断词的句子。"""
-    from app.engine import analysis_claims as said
-
+    """没有报告文档时（成果里的文字）：按句末标点切开，有判断词（或者明确说两期不能直接比）的句子。"""
     out = []
     for piece in _SENTENCE_END.split(text or ""):
         piece = piece.strip()
-        if piece and said.scan(piece):
+        if piece and _said_something(piece):
             out.append({"text": piece, "names": piece, "analyses": []})
     return out
 
@@ -459,6 +499,33 @@ def said_in(want: Mapping[str, Any], sentences: Sequence[Mapping[str, Any]], *,
     return good, bad
 
 
+def incomparable_spans(text: str) -> list[tuple[int, int]]:
+    """一句话（写作者自己写的字）里明确说两期不能直接比的几处 [(起, 止)]（_INCOMPARABLE）。同一分句里前面有否定的、
+    句子里前面有假设或疑问的不算，问句整句不算。"""
+    from app.engine import analysis_claims as said
+
+    if text.rstrip("\x00 ").endswith(("？", "?")):
+        return []
+    out = []
+    for m in _INCOMPARABLE.finditer(text):
+        left, _ = said._clause(text, m.start(), m.end())
+        if _INCOMPARABLE_DENIED.search(text[left:m.start()]) or _INCOMPARABLE_SUPPOSED.search(text[:m.start()]):
+            continue
+        out.append((m.start(), m.end()))
+    return out
+
+
+def said_incomparable(sentences: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """正文里明确说两期不能直接比的几处（可比性的期望是不可比时，算说出了它）：{text: 所在分句, judgement: incomparable}。"""
+    out = []
+    for raw in sentences:
+        text = str(raw.get("text") or "")
+        names = str(raw.get("names") or text)
+        for start, end in incomparable_spans(text):
+            out.append({"text": _snippet(names, start, end), "judgement": "incomparable", "subjects": []})
+    return out
+
+
 def _covered(want: Mapping[str, Any], good: Sequence[Mapping[str, Any]]) -> list[str]:
     """主要来源期望点名的段里，正文说对的那几处一处都没点到的（top_n 要点名的前几段都要说到）。"""
     if want.get("judgement") != "source":
@@ -492,6 +559,8 @@ def score(exp: Mapping[str, Any], value: Mapping[str, Any], answer: Any) -> dict
                     "reason": f"引用了 {found['alias']}，同一句却写成「{bad[0]['text']}」：{bad[0]['reason']}"}
         return {"outcome": "traced", "want": want, "found": view(found)}
     good, bad = said_in(value, sentences)
+    if value.get("judgement") == "incomparable":
+        good += said_incomparable(sentences)
     if good:
         missing = _covered(value, good)
         if not missing:
@@ -517,5 +586,6 @@ def score(exp: Mapping[str, Any], value: Mapping[str, Any], answer: Any) -> dict
 
 
 __all__ = ["ANALYSIS_KINDS", "GOLD_REF", "JUDGEMENTS", "ParamsInvalid", "TOP_N_MAX", "VERDICT_OPS", "check_params",
-           "expected", "judgement_code", "mismatch", "norm", "op_text", "param_names", "record_of", "request_of",
-           "said_in", "score", "sentences_of_doc", "sentences_of_text", "steady", "template_texts", "view"]
+           "expected", "incomparable_spans", "judgement_code", "mismatch", "norm", "op_text", "param_names",
+           "record_of", "request_of", "said_in", "said_incomparable", "score", "sentences_of_doc", "sentences_of_text",
+           "steady", "template_texts", "view"]

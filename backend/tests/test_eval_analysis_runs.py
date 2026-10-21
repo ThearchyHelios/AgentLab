@@ -8,6 +8,8 @@ retail_trends（tests/fixtures/acceptance/retail_trends.py，按今天生成）�
 - 重评老结果：明细里没有分析结论那一项的照样重评（从封存重新读）。
 - 从头到尾：助手剧本搭「查库 → 分析卡 → 报告」，报告引用判定语；评测给这一题「对且可追溯」，逐题 E1 等价已证明，作答运行和
   算期望用的是同一份分析设置快照（记进指纹）。
+- 分析工具开、关（变体 analysis.tools，「分析工具贡献」预设对照）：一次发起两臂；关的那一臂助手建图时工具清单里没有分析工具、
+  节点手册里没有分析卡，作答运行里没有分析结论；开的那一臂照常；两臂的指纹、同一变体的指纹都不同。
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 from sqlalchemy import select
 
 from app.core import artifact_store
@@ -237,6 +239,16 @@ def _line(op: dict) -> AIMessageChunk:
     return AIMessageChunk(content=json.dumps(op, ensure_ascii=False) + "\n")
 
 
+def _graph_lines(graph: dict, summary: str):
+    yield _line({"op": "plan", "summary": summary})
+    for n in graph["nodes"]:
+        yield _line({"op": "add_node", "node": {"id": n["id"], "type": n["type"], "label": n["data"]["label"],
+                                                "config": n["data"]["config"]}})
+    for e in graph["edges"]:
+        yield _line({"op": "add_edge", "edge": e})
+    yield _line({"op": "done", "explanation": "拆一下", "run": True})
+
+
 class AnalysisCopilot:
     """助手剧本：直接搭「入口 → 查库 → 分析卡 → 报告 → 出口」并运行；上线前自查直接过。"""
 
@@ -244,14 +256,8 @@ class AnalysisCopilot:
         if "上线前自查" in messages[1][1]:
             yield _line({"op": "done"})
             return
-        yield _line({"op": "plan", "summary": "按地区拆上周销售额的变化"})
-        graph = answer_graph()
-        for n in graph["nodes"]:
-            yield _line({"op": "add_node", "node": {"id": n["id"], "type": n["type"], "label": n["data"]["label"],
-                                                    "config": n["data"]["config"]}})
-        for e in graph["edges"]:
-            yield _line({"op": "add_edge", "edge": e})
-        yield _line({"op": "done", "explanation": "拆一下", "run": True})
+        for line in _graph_lines(answer_graph(), "按地区拆上周销售额的变化"):
+            yield line
 
 
 async def test_an_analysis_case_end_to_end(monkeypatch, source):
@@ -313,3 +319,112 @@ async def test_suites_without_analysis_expectations_take_no_settings_snapshot(mo
             "别的题集的指纹、作答运行的选项和以前一样"
     finally:
         await drop_source(sid)
+
+
+# --------------------------------------------------------------------------
+# 分析工具开、关（变体 analysis.tools；「分析工具贡献」预设对照）
+# --------------------------------------------------------------------------
+
+#: 关的那一臂搭的图里，报告撰写的要求带这个记号：报告撰写的剧本据此不引用分析结论（那一臂没有）
+PLAIN_MARK = "只按查询结果写"
+PLAIN = "## 上周销售额\n\n各地区上周的销售额都在查询结果里。"
+
+
+def plain_graph() -> dict:
+    """没有分析卡的图：入口 → 查库 → 报告 → 出口。"""
+    nodes = [_node("start", "input"),
+             _node("q", "tool", tool=f"db_query__{retail_trends.SOURCE_NAME}",
+                   args={"sql": rendered(REGION["gold"]["sql"])}),
+             _node("write", "report", instructions=f"{PLAIN_MARK}上周的周报"),
+             _node("out", "output", fields=[{"name": "答案", "value": "{{ nodes.write.text }}"}])]
+    ids = [n["id"] for n in nodes]
+    return {"nodes": nodes, "edges": [{"source": a, "target": b} for a, b in zip(ids, ids[1:])]}
+
+
+class SwitchCopilot:
+    """助手剧本：给的工具清单里有分析工具（开着的那一臂）就搭「查库 → 分析卡 → 报告」，没有（关掉的那一臂）就搭「查库 →
+    报告」——照给它看的用。systems 记下每次建图收到的 system。"""
+
+    def __init__(self) -> None:
+        self.systems: list[str] = []
+
+    async def astream(self, messages):
+        if "上线前自查" in messages[1][1]:
+            yield _line({"op": "done"})
+            return
+        role, system = messages[0]
+        assert role == "system"
+        self.systems.append(system)
+        graph = answer_graph() if "analysis_decompose" in system else plain_graph()
+        for line in _graph_lines(graph, "看上周销售额"):
+            yield line
+
+
+def use_writers(monkeypatch) -> None:
+    """报告撰写的剧本：要求里带 PLAIN_MARK 的（关掉分析工具那一臂）写 PLAIN，别的写引用了 A1 的 REPORT。"""
+    from app.providers import mock_model
+
+    def decide(self, messages):
+        said = "\n".join(str(getattr(m, "content", "")) for m in messages)
+        return AIMessage(content=PLAIN if PLAIN_MARK in said else REPORT)
+
+    monkeypatch.setattr(mock_model.MockChatModel, "_decide", decide)
+
+
+async def test_the_analysis_tools_preset_runs_with_and_without_them(monkeypatch, source):
+    from httpx import ASGITransport, AsyncClient
+
+    from app.eval import compare
+    from app.main import app
+    from app.tools.analysis import ANALYSIS_TOOLS
+
+    copilot = SwitchCopilot()
+    es.use_copilot(monkeypatch, copilot)
+    use_writers(monkeypatch)
+    case = case_of(REGION, source["id"])
+    suite_id = await es.make_suite(source["id"], cases=[{k: case[k] for k in ("question", "datasource_ids", "gold",
+                                                                                "expectations")}])
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        started = await client.post(f"/api/evals/suites/{suite_id}/evaluations",
+                                    json={"preset": "analysis_tools", "variant": {"repeats": 1}})
+        assert started.status_code == 202, started.text
+        body = started.json()
+        on, off = body["evaluations"]
+        assert (on["arm"], off["arm"]) == ("分析工具开", "分析工具关") and body["pair_id"] == on["id"] == off["pair_id"]
+        assert on["variant"]["analysis"] == {"tools": "on"} and off["variant"]["analysis"] == {"tools": "off"}
+        assert on["variant"]["catalog"] == off["variant"]["catalog"] == {"mode": "live", "snapshot": None}
+        assert "· 分析工具开 ·" in on["variant_text"] and "· 分析工具关 ·" in off["variant_text"], off["variant_text"]
+        await es.wait_eval(on["id"])
+        pair = (await client.get(f"/api/evals/pairs/{body['pair_id']}")).json()
+    assert [a["arm"] for a in pair["table"]["arms"]] == ["分析工具开", "分析工具关"]
+
+    async with SessionLocal() as session:
+        runs = {r.arm: r for r in (await session.execute(select(EvalRun).where(EvalRun.pair_id == on["id"]))).scalars()}
+        items = {arm: (await session.execute(select(EvalResult).where(EvalResult.eval_run_id == r.id))).scalar_one()
+                 for arm, r in runs.items()}
+        answer_runs = {arm: await session.get(Run, item.run_id) for arm, item in items.items()}
+    assert all(r.status == "succeeded" for r in runs.values()), [(r.arm, r.error) for r in runs.values()]
+    # 建图：两臂各一次，关的那一臂工具清单里没有分析工具、节点手册里没有分析卡；开的那一臂都有
+    assert len(copilot.systems) == 2
+    with_tools = [s for s in copilot.systems if all(name in s for name in ANALYSIS_TOOLS)]
+    without = [s for s in copilot.systems if not any(name in s for name in ANALYSIS_TOOLS)]
+    assert len(with_tools) == len(without) == 1
+    assert "- analysis：分析卡" in with_tools[0] and "- analysis：分析卡" not in without[0]
+
+    # 开的那一臂照常：图里有分析卡，答案引用了分析结论，对且可追溯
+    lit, dark = items["分析工具开"], items["分析工具关"]
+    assert {n["type"] for n in answer_runs["分析工具开"].graph["nodes"]} >= {"analysis", "report"}
+    assert lit.verdict == "pass" and lit.scores[0]["outcome"] == "traced", lit.scores
+    assert [a["alias"] for a in (await score.read_answer(lit.run_id)).analyses] == ["A1"]
+    # 关的那一臂：图里没有分析卡，作答运行里没有分析结论；正文没写这个判断，算错
+    assert "analysis" not in {n["type"] for n in answer_runs["分析工具关"].graph["nodes"]}
+    assert (await score.read_answer(dark.run_id)).analyses == []
+    assert dark.verdict == "fail" and dark.scores[0]["outcome"] == "wrong", dark.scores
+    assert "没有做变化拆解" in dark.scores[0]["reason"], dark.scores[0]
+    # 两臂共用期望；指纹、同一变体的指纹都不同，对比照实写「分析工具：开 → 关」
+    assert lit.gold_run_ids == dark.gold_run_ids
+    fp_on, fp_off = runs["分析工具开"].fingerprint, runs["分析工具关"].fingerprint
+    assert (fp_on["analysis_tools"], fp_off["analysis_tools"]) == ("on", "off")
+    assert fp_on["variant_key"] != fp_off["variant_key"]
+    assert [d for d in compare.fingerprint_diff(fp_on, fp_off) if d["key"] == "analysis_tools"] == \
+        [{"key": "analysis_tools", "label": "分析工具", "before": "开", "after": "关"}]

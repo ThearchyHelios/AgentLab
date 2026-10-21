@@ -5,9 +5,9 @@
  * 统计、结论、能不能做都由服务端给，这里只有叫法和句式：数字一律是服务端算好交来的，这里只负责写成话。
  */
 import type {
-  EvalAnalysisMode, EvalAnalysisOp, EvalCatalogMode, EvalCause, EvalE1Band, EvalE3Band, EvalExpectationKind, EvalGoldKind,
-  EvalJudgement, EvalOutcome, EvalPath, EvalRate, EvalStatus, EvalTextOutcome, EvalTransition, EvalTrialStatus, EvalTrigger,
-  EvalUpgradePolicy, EvalVerdict,
+  EvalAnalysisMode, EvalAnalysisOp, EvalAnalysisTools, EvalCatalogMode, EvalCause, EvalE1Band, EvalE3Band, EvalExpectationKind,
+  EvalGoldKind, EvalJudgement, EvalOutcome, EvalPath, EvalRate, EvalStatus, EvalTextOutcome, EvalTransition, EvalTrialStatus,
+  EvalTrigger, EvalUpgradePolicy, EvalVerdict,
 } from '../typesEval'
 import { formatCost, formatNumber } from './format'
 
@@ -380,12 +380,15 @@ export const EVAL_TEXT = {
   start: {
     title: '发起评测',
     mode: '评测方式',
-    modes: { single: '评一次', ab: 'A/B 对照', catalog: '目录贡献对照' } as Record<'single' | 'ab' | 'catalog', string>,
+    modes: {
+      single: '评一次', ab: 'A/B 对照', catalog: '目录贡献对照', analysis_tools: '分析工具贡献对照',
+    } as Record<'single' | 'ab' | 'catalog' | 'analysis_tools', string>,
     modeHint: {
       single: '按一组变体评一遍题集',
       ab: '两到三臂各自一组变体，共用同一份期望答案，同一题几臂同时作答',
       catalog: '预设的 A/B：当前目录 vs 关目录，可以再加一臂「只用已核实和已确认的项」，量出数据目录帮了多少',
-    } as Record<'single' | 'ab' | 'catalog', string>,
+      analysis_tools: '预设的 A/B：分析工具开 vs 关，量出分析工具（变化拆解、波动基线……）帮了多少',
+    } as Record<'single' | 'ab' | 'catalog' | 'analysis_tools', string>,
     arm: (name: string) => `${name} 臂`,
     addArm: '再加一臂',
     removeArm: '去掉这一臂',
@@ -407,6 +410,9 @@ export const EVAL_TEXT = {
     catalogHint: '当前目录、只用已核实的项都在开评时拍一份快照按它读：评测期间目录被改也不影响可比性',
     snapshot: '选一份目录快照',
     snapshotNone: '还没有可用的目录快照',
+    analysisTools: '分析工具',
+    analysisToolsMode: { on: '开', off: '关' } as Record<EvalAnalysisTools, string>,
+    analysisToolsHint: '关掉时助手建图看不到分析工具和分析卡；工作流题按固定的版本运行，不受影响',
     repeats: '每题重复几次',
     repeatsHint: '模型有随机性：对照建议每题 3 次',
     reviewedArm: '再加一臂「只用已核实和已确认的项」',
@@ -586,7 +592,7 @@ export const EVAL_TEXT = {
     baseText: (short: string, when: string) => `${short} · ${when}`,
     none: '没有可比的上一次：同一题集、同一变体里还没有比这次先发起、已经评完的评测',
     fingerprint: '两次之间变了什么',
-    fingerprintNone: '模型、目录、提示词、表结构、题目、评分规则、分析设置都没变',
+    fingerprintNone: '模型、目录、分析工具、提示词、表结构、题目、评分规则、分析设置都没变',
     changed: '变了',
     transitions: '逐题转移',
     transition: { regressed: '退步', improved: '进步', same: '不变', incomparable: '不可比' } as Record<EvalTransition, string>,
