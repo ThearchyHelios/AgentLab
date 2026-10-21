@@ -454,12 +454,18 @@ def test_the_prompt_rules_depend_on_whether_there_are_conclusions():
     assert "[[a:A1]]" in ac.ANALYSIS_RULES_PROMPT
 
 
-def test_judgement_words_make_a_sentence_a_claim_for_the_judge():
+def test_judgement_words_rank_claims_for_the_judge_but_do_not_make_sentences_claims():
+    """判断词只管裁判送判的先后（judge._JUDGEMENT）：一句话算不算结论仍按原来的方向词、因果词（evidence._DIRECTIONAL），
+    结论句策略要求挂依据、出具缺口照它数——扩了就改了已发布版本的档位。"""
     from app.engine.judge import claim_priority
 
-    doc = compose_doc("华东异常。\n\n下面主要看三个方面。\n\n建议持续关注。\n\n近 8 周的趋势图如下：", catalog())
+    doc = compose_doc("华东异常。\n\n华东异常，退款 12 单。\n\n下面是主要渠道的表现。\n\n促销期间活动效果显著。\n\n"
+                      "整体运行平稳，未见异常。\n\n建议持续关注。\n\n近 8 周的趋势图如下：\n\n华东退款 12 单。", catalog())
     kinds = {doc["markdown"][slice(*u["span"])]: (u["kind"], claim_priority(u, b, doc["markdown"]))
              for b, u in evidence.iter_units(doc)}
-    assert kinds["华东异常。"] == ("claim", 2)
-    assert kinds["下面主要看三个方面。"][0] == "connective" and kinds["建议持续关注。"][0] == "connective"
-    assert kinds["近 8 周的趋势图如下："][0] == "connective", "引出图表的话不算判断"
+    for text in ("华东异常。", "下面是主要渠道的表现。", "促销期间活动效果显著。", "整体运行平稳，未见异常。", "建议持续关注。",
+                 "近 8 周的趋势图如下："):
+        assert kinds[text] == ("connective", None), text
+    assert doc["stats"]["uncited_claims"] == 2, "只有两句带数字的算结论"
+    assert kinds["华东异常，退款 12 单。"] == ("claim", 2), "结论句里的判断词让裁判先判它"
+    assert kinds["华东退款 12 单。"] == ("claim", 3)

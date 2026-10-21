@@ -266,6 +266,24 @@ async def test_the_scope_is_written_only_when_there_are_conclusions(monkeypatch,
 
 
 # --------------------------------------------------------------------------
+# 判断词不改一句话算不算结论：已发布版本的档位不变
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("extra", ["整体运行平稳，未见异常。", "下面是主要渠道的表现。", "促销期间活动效果显著。"])
+async def test_judgement_words_do_not_turn_connective_sentences_into_uncited_claims(monkeypatch, extra):
+    """已发布的受管版本（结论句要挂依据、出口带契约）：没有数字、没有引用的话照旧是连接性的话，不因为带了「主要」「异常」
+    「显著」就算没挂依据的结论、记缺口降档（判断词只给裁判排送判的先后，judge._JUDGEMENT）。"""
+    graph = weekly(numbers="strict", on_violation="flag", claims="require_citation")
+    graph["nodes"][-1]["data"]["config"]["contract"] = {
+        "report_from": "write", "metrics_from": ["caliber"], "required": ["gmv"], "strict": True}
+    script(monkeypatch, f"{PLAIN}\n\n{extra}")
+    issuance = (await finish(graph)).output["_issuance"]
+    assert issuance["tier"] == "formal" and issuance["gaps"] == []
+    assert issuance["claims"] == {"policy": "require_citation", "uncited_claims": 0, "uncited": []}
+
+
+# --------------------------------------------------------------------------
 # 取值写错
 # --------------------------------------------------------------------------
 
