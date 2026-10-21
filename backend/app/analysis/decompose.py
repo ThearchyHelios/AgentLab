@@ -41,6 +41,22 @@ SAME_QUERY = "基期和本期是同一份查询：两期各给一份查询，或
 #: 乘积闭合的最小相对误差
 _FACTOR_REL = Fraction(1, 10 ** 6)
 _NOT_ADDITIVE = {"ratio": "比率", "identifier": "标识", "status": "状态", "attribute": "属性"}
+#: 各模式的结论里记的阈值（下钻时另加 max_drill_depth）
+USED: dict[str, tuple[str, ...]] = {
+    "additive": ("main_share", "concentration", "offset_ratio", "flat_pct", "table_top_k"),
+    "ratio": ("main_share", "flat_pct", "min_denominator", "table_top_k"),
+    "factor": ("main_share", "flat_pct"),
+}
+
+
+def refusal_basis(mode: str, raw: Mapping[str, Any], settings: Mapping[str, Any]) -> tuple[list[str], str]:
+    """还没算就算不了时（分析卡把随数据变化的调用错误记成算不了的结论）结论里记的阈值和判定标准：同这个模式自己算不了时
+    的那一份。"""
+    used = list(USED[mode]) + (["max_drill_depth"] if mode != "factor" and raw.get("parent") is not None else [])
+    if mode == "additive":
+        summed = raw.get("headline") is None and raw.get("parent") is None
+        return used, ph.criterion_additive(settings, top_k_max=None, summed=summed)
+    return used, ph.criterion_ratio(settings) if mode == "ratio" else ph.criterion_factor(settings)
 
 
 @dataclass
@@ -71,8 +87,9 @@ def _sides(raw: Mapping[str, Any], env: Env, roles: Sequence[tuple[str, str]], *
     params: dict[str, Any] = {}
     two = raw.get("base_query") is not None or raw.get("target_query") is not None
     if two:
-        base = env.inputs.snap(need(raw, "base_query", "基期的查询编号"), "基期的查询编号")
-        target = env.inputs.snap(need(raw, "target_query", "本期的查询编号"), "本期的查询编号")
+        base = env.inputs.snap(need(raw, "base_query", "基期的查询编号"), "基期的查询编号", role="base")
+        target = env.inputs.snap(need(raw, "target_query", "本期的查询编号"), "本期的查询编号",
+                                 role="target")
         if base is target:
             raise CallError("same_query", SAME_QUERY)
         params.update(base_query=base.ref, target_query=target.ref)
@@ -116,7 +133,8 @@ def _period_rows(snap: Snap, period: str, wanted: Any, what: str) -> list[int]:
     if not rows:
         values = list(dict.fromkeys(ph.key_text([row[i]]) for row in snap.rows if i < len(row)))
         raise CallError("period_not_found", f"期次列「{period}」里没有「{wanted}」：{what}要写 {snap.ref} 里有的期次值，"
-                                            f"比如 {'、'.join(values[:6])}")
+                                            f"比如 {'、'.join(values[:6])}",
+                        reason=f"期次列「{period}」里没有{what}「{ph.key_text([wanted])}」")
     return rows
 
 
@@ -181,8 +199,12 @@ def _parent(raw: Mapping[str, Any], env: Env, mode: str, dims: int) -> tuple[dic
     if found.get("op") != "decompose" or found.get("mode") != mode:
         raise CallError("parent_not_decompose", f"{name} 不是{'按维度' if mode == 'additive' else '比率'}的变化拆解，"
                                                 "下钻要接在同一种拆解后面")
+    # 上一层先记进输入：它没做成、这期没有那一段时（分析卡记成算不了的结论），复算也要按内容哈希取回它、走到同一处
+    env.inputs.parent(name, content_hash(canonical_json(found)))
     if found.get("status") != "ok" or not isinstance(found.get("table"), Mapping):
-        raise CallError("parent_refused", f"{name} 没有做成，不能在它下面下钻")
+        why = f"（{found['reason']}）" if isinstance(found.get("reason"), str) and found["reason"] else ""
+        raise CallError("parent_refused", f"{name} 没有做成，不能在它下面下钻",
+                        reason=f"上一层「{name}」没有做成{why}，不能在它下面下钻")
     depth = int((found.get("params") or {}).get("depth") or 0) + 1
     limit = int(env.settings["max_drill_depth"])
     if depth > limit:
@@ -196,8 +218,8 @@ def _parent(raw: Mapping[str, Any], env: Env, mode: str, dims: int) -> tuple[dic
     hit = next((row for row in table.get("rows") or []
                 if all(same_value(k, v) for k, v in zip(key, row[:dim_count]))), None)
     if hit is None:
-        raise CallError("parent_key_missing", f"{name} 里没有「{ph.key_text(key)}」这一段：写 {name} 结果表里的段")
-    env.inputs.parent(name, content_hash(canonical_json(found)))
+        raise CallError("parent_key_missing", f"{name} 里没有「{ph.key_text(key)}」这一段：写 {name} 结果表里的段",
+                        reason=f"上一层「{name}」里没有「{ph.key_text(key)}」这一段")
     return {"of": name, "key": key}, dict(zip(columns, hit)), depth
 
 
@@ -220,7 +242,8 @@ def _headline(raw: Mapping[str, Any], env: Env) -> tuple[dict[str, str] | None, 
     for side, what in (("base", "基期总数"), ("target", "本期总数")):
         snap, row, col, value = env.inputs.cell(spec[side], f"headline_{side}", what)
         if value is None:
-            raise CallError("headline_empty", f"{what}那一格（{snap.ref}.r{row}.{col}）是空的：换一格有值的")
+            raise CallError("headline_empty", f"{what}那一格（{snap.ref}.r{row}.{col}）是空的：换一格有值的",
+                            reason=f"{what}那一格（{snap.ref}.r{row}.{col}）是空的")
         out[side] = (value, snap.cell(row, col))
         refs[side] = f"{snap.ref}.r{row}.{col}"
     return refs, out
@@ -260,7 +283,7 @@ def _share_rank(segments: Sequence[Any], share: Any) -> list[Any]:
 
 
 def additive(raw: Mapping[str, Any], env: Env) -> Any:
-    used = ["main_share", "concentration", "offset_ratio", "flat_pct", "table_top_k"]
+    used = list(USED["additive"])
     params, bs, ts, cols, by = _sides(raw, env, [("measure", "度量列")])
     measure = cols["measure"]
     label = label_for(env, raw.get("label"), ts, measure)
@@ -299,7 +322,8 @@ def additive(raw: Mapping[str, Any], env: Env) -> Any:
                       criterion=ph.criterion_additive(env.settings, top_k_max=None, **criterion_args), caveats=caveats)
     segs = _segments(side_b, side_t, Fraction(0))
     if len(segs) < 2:
-        return refuse(env, params, used, "too_few_segments", f"按{ph.dims_text(dims)}只有 {len(segs)} 段，至少要 2 段才拆得开",
+        return refuse(env, params, used, "too_few_segments",
+                      ph.say("按", ph.dims_text(dims), f"只有 {len(segs)} 段，至少要 2 段才拆得开"),
                       criterion=ph.criterion_additive(env.settings, top_k_max=None, **criterion_args), caveats=caveats)
     return _additive_result(env, params, used, segs, by, dims, label, heads, parent_row, outcome, caveats, summed,
                             side_b, side_t)
@@ -419,7 +443,7 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
 
 
 def ratio(raw: Mapping[str, Any], env: Env) -> Any:
-    used = ["main_share", "flat_pct", "min_denominator", "table_top_k"]
+    used = list(USED["ratio"])
     params, bs, ts, cols, by = _sides(raw, env, [("numerator", "分子列"), ("denominator", "分母列")])
     num, den = cols["numerator"], cols["denominator"]
     num_label, den_label = column_label(env, ts, num), column_label(env, ts, den)
@@ -462,7 +486,8 @@ def ratio(raw: Mapping[str, Any], env: Env) -> Any:
     segs = _segments(side_b, side_t, (Fraction(0), Fraction(0)))
     live = [x for x in segs if x.base[1] != 0 or x.target[1] != 0]
     if len(live) < 2:
-        return refuse(env, params, used, "too_few_segments", f"按{ph.dims_text(dims)}只有 {len(live)} 段，至少要 2 段才拆得开",
+        return refuse(env, params, used, "too_few_segments",
+                      ph.say("按", ph.dims_text(dims), f"只有 {len(live)} 段，至少要 2 段才拆得开"),
                       criterion=criterion)
     for when, i in (("基期", 0), ("本期", 1)):
         if sum(((x.base, x.target)[i][1] for x in live), Fraction(0)) == 0:
@@ -635,7 +660,7 @@ def lmdi(base: Sequence[float], target: Sequence[float], m_base: float, m_target
 
 
 def factor(raw: Mapping[str, Any], env: Env) -> Any:
-    used = ["main_share", "flat_pct"]
+    used = list(USED["factor"])
     params, bs, ts, cols, _ = _sides(raw, env, [("product", "乘积列")], by_needed=False)
     product = cols["product"]
     wanted = as_list(raw.get("factors"))
@@ -672,7 +697,8 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
         for col, what in ((product, "乘积列"), *((c, "因子列") for c in factors)):
             value = snap.number(r, col, what)
             if value is None:
-                raise CallError("empty_cell", f"{snap.ref} 第 {r} 行的「{col}」是空的：乘积、因子都要有值")
+                raise CallError("empty_cell", f"{snap.ref} 第 {r} 行的「{col}」是空的：乘积、因子都要有值",
+                                reason=f"{'基期' if when == 'base' else '本期'}的「{col}」那一格是空的（{snap.ref} 第 {r} 行）")
             row.append((value, snap.cell(r, col)))
         cells[when] = row
     if bs is ts:
@@ -736,5 +762,5 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
                  phrase=ph.with_caveats(main, caveats), caveats=caveats)
 
 
-__all__ = ["HEADLINE_SHAPE", "PARENT_SHAPE", "SAME_QUERY", "SIMPSON_SHARE", "additive", "factor", "lmdi", "ratio",
-           "ratio_effects"]
+__all__ = ["HEADLINE_SHAPE", "PARENT_SHAPE", "SAME_QUERY", "SIMPSON_SHARE", "USED", "additive", "factor", "lmdi",
+           "ratio", "ratio_effects", "refusal_basis"]

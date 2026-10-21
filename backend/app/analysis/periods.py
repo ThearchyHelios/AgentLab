@@ -257,7 +257,8 @@ def week_scheme(sql: str, column: str, dialect: str | None) -> str | None:
             return None
         refs = {(name_key(c.table), name_key(c.name)) for c in value.find_all(exp.Column)
                 if not isinstance(c.this, exp.Star)}
-        texts = [_native_format(node, dialect) for node in value.find_all(exp.TimeToStr, exp.ToChar)]  # type: ignore[arg-type]
+        texts = [_native_format(node, dialect)  # type: ignore[arg-type]
+                 for node in value.find_all(exp.TimeToStr, exp.ToChar)]
         if len(refs) != 1 or not texts or any(t is None for t in texts):
             return None
         marks = [m for t in texts for m in _format_marks(t, dialect)]  # type: ignore[arg-type]

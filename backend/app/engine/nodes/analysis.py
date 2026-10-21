@@ -13,7 +13,10 @@ driver……），下游条件分支能按它走（周报「超出常规波动�
 （contract.ledger_entry，带 item），报告的写作目录编成 A{n}；每项另发一条 analysis.end（运行详情、运行对比按项对齐）。
 
 **一项算不了不让卡失败。** 算不了（历史不够、本期不完整、截断……）就是这一项的结论（status refused），照实记、发一条
-analysis_refused 提醒，接着做下一项。调用写错（列不存在、比率当可加……）是模板的毛病：整张卡失败，说清是哪一项、怎么改。
+analysis_refused 提醒，接着做下一项。模板定死了调用，这期的数据里没有要用的那一项（上一层没做成、下钻的段这期没有、期次
+这期没有、总数那一格越界或为空、要比的组这期没有，analysis.DATA_ERRORS）不是写错了，同样记成算不了的一项
+（run 的 refuse_data_errors）。结构性的调用错误（列不存在、遮罩列、比率当可加、重复行、参数写错……）是模板的毛病：整张卡
+失败，说清是哪一项、怎么改。
 
 分析的结果不作口径卡的输入（D16）：口径卡读 nodes.<卡>.results 的，按追不到原始数据处理（受管级发布时另有提示）。
 """
@@ -74,8 +77,9 @@ async def run_analysis(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         who = f"分析项「{item_id}」（{ANALYSIS_OP_LABEL[op]}）"
         request = _request(item, state, ctx, who)
         try:
-            # 下钻（parent）只认这张卡里排在前面、已经做完的项：done 里此刻只有它们
-            result = await analysis_ops.run(request, inputs.get, settings=settings, context=context, parents=done.get)
+            # 下钻（parent）只认这张卡里排在前面、已经做完的项：done 里此刻只有它们（算不了的也在，下钻那一项照实记成算不了）
+            result = await analysis_ops.run(request, inputs.get, settings=settings, context=context, parents=done.get,
+                                            refuse_data_errors=True)
         except CallError as e:
             raise NodeError(ctx.node.id, f"{who}：{e.message}。请在分析卡中改正这一项") from None
         except Exception as e:  # noqa: BLE001 - 算子本身出错：说清是哪一项，原因照实

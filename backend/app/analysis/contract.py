@@ -83,10 +83,12 @@ VERDICTS: dict[str, tuple[str, ...]] = {
     "differ": ("differs", "no_evidence"),
     "comparable": ("comparable", "conditional", "incomparable"),
 }
-#: 算不了的原因（细案 01 §8.2）。算不了也记成结论：写作者可以照实写「历史只有 5 周，判断不了是否异常」
+#: 算不了的原因（细案 01 §8.2）。算不了也记成结论：写作者可以照实写「历史只有 5 周，判断不了是否异常」。最后两种是分析卡
+#: 里随数据变化的调用错误记成的（analysis.run 的 refuse_data_errors，见 app/analysis 的 DATA_ERRORS）：parent_refused 上一层
+#: 没做成；input_unavailable 这次的数据里没有要用的那一项（下钻的段、期次、总数那一格、要比的组……，reason 写是哪一项、哪个值）
 REASONS: tuple[str, ...] = (
     "truncated", "too_few_segments", "history_short", "partial_target", "target_gap", "series_gap",
-    "period_unreadable", "zero_base", "non_positive", "incomparable_sides",
+    "period_unreadable", "zero_base", "non_positive", "incomparable_sides", "parent_refused", "input_unavailable",
 )
 #: 附带说明的种类（caveats[].code）
 CAVEATS: tuple[str, ...] = (
@@ -305,12 +307,16 @@ class AnalysisResult(TypedDict, total=False):
 class CallError(Exception):
     """调用错误（细案 01 §8.1）：列不存在、列被遮罩、角色和目录度量类型冲突、同一键同一期多行、期次不在列里、乘积
     不闭合、parent 不对、下钻超深、这个 Agent 这次执行的分析次数用完（max_calls 按每个 Agent 每次执行计）。不记结论，message
-    交回 agent（一种说法，告诉它怎么改）。"""
+    交回 agent（一种说法，告诉它怎么改）。
 
-    def __init__(self, code: str, message: str) -> None:
+    随数据变化的那几种（app/analysis 的 DATA_ERRORS：这期没有要用的期次、段、组，上一层没做成……）另带 reason：照实说是哪一项、
+    哪个值，不带改法。分析卡（模板定死了调用）按它记成算不了的结论，见 analysis.run 的 refuse_data_errors。"""
+
+    def __init__(self, code: str, message: str, *, reason: str | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.reason = reason
 
 
 #: 现查一列的实际范围：(数据源名, 表, 列) → Probe；查不了返回 None（算子写「核对不了」，不判不可比）

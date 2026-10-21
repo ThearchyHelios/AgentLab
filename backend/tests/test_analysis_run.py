@@ -153,3 +153,97 @@ async def test_ledger_entries_name_the_real_input_snapshots():
 def test_the_call_limit_error_is_spoken_with_the_limit():
     error = analysis.exhausted({"max_calls": 5})
     assert error.code == "max_calls" and error.message == "这个 Agent 这次执行最多做 5 次分析，已经用完：用已有的分析结论写，不再新做分析"
+
+
+# --------------------------------------------------------------------------
+# 随数据变化的调用错误（分析卡传 refuse_data_errors）：记成算不了的结论，复算也成立
+# --------------------------------------------------------------------------
+
+ONE_REGION = snap("Q6", WEEKLY_SQL, ["region", "week", "gmv"], [["华东", "2026-W41", 820], ["华东", "2026-W42", 700]])
+TOTALS = snap("Q7", "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week", ["week", "gmv"],
+              [["2026-W42", 1926], ["2026-W41", None]])
+FACTORS = snap("Q8", "SELECT week, SUM(amount) AS gmv, COUNT(*) AS orders, AVG(amount) AS aov FROM orders "
+                      "GROUP BY week",
+               ["week", "gmv", "orders", "aov"], [["2026-W41", 2120, 20, 106], ["2026-W42", None, 0, None]])
+ONE_GROUP = snap("Q9", "SELECT region, SUM(refund_flag) AS refunds, COUNT(*) AS orders FROM orders GROUP BY region",
+                 ["region", "refunds", "orders"], [["西南", 80, 1000]])
+WEEK_RATES = snap("Q10", "SELECT week, SUM(refund_flag) AS refunds, COUNT(*) AS orders FROM orders GROUP BY week",
+                  ["week", "refunds", "orders"], [["2026-W41", 30, 1000], ["2026-W42", None, 1000]])
+REFUSALS = [WEEKLY, SERIES, RATES, ONE_REGION, TOTALS, FACTORS, ONE_GROUP, WEEK_RATES]
+BY_REGION = {"query": "Q2", "by": ["region"], "period": "week", "base": "2026-W41", "target": "2026-W42",
+             "measure": "gmv"}
+
+
+async def _refused(op, mode=None, *, parents=None, **params):
+    """refuse_data_errors 为真跑两次：逐字节相同、形状照契约、复算逐字段相同（analyze 里按真复算）；不传时照旧是调用错误。"""
+    one = await analyze(op, mode, snaps=REFUSALS, parents=parents, refuse_data_errors=True, **params)
+    two = await analyze(op, mode, snaps=REFUSALS, parents=parents, refuse_data_errors=True, **params)
+    assert json.dumps(one, sort_keys=True, ensure_ascii=False) == json.dumps(two, sort_keys=True, ensure_ascii=False)
+    _assert_shape(one)
+    assert one["status"] == "refused" and one["phrase"] == f"{c.OP_LABELS[op]}没有做成：{one['reason']}"
+    error = await call_error(op, mode, snaps=REFUSALS, parents=parents, **params)
+    assert error.code in analysis.DATA_ERRORS and error.reason == one["reason"]
+    return one
+
+
+def test_the_data_errors_are_exported():
+    assert analysis.DATA_ERRORS == {"parent_refused", "parent_key_missing", "period_not_found", "row_out_of_range",
+                                    "headline_empty", "unknown_group", "too_few_groups", "empty_cell"}
+    assert {"parent_refused", "input_unavailable"} <= set(c.REASONS)
+
+
+async def test_a_drill_under_a_refused_parent_is_itself_refused():
+    parent = await analyze("decompose", "additive", snaps=REFUSALS, **{**BY_REGION, "query": "Q6"})
+    assert parent["reason_code"] == "too_few_segments"
+    result = await _refused("decompose", "additive", parents={"where": parent},
+                            **{**BY_REGION, "by": ["region"], "parent": {"of": "where", "key": ["华东"]}})
+    assert result["reason_code"] == "parent_refused"
+    assert result["reason"] == "上一层「where」没有做成（按地区只有 1 段，至少要 2 段才拆得开），不能在它下面下钻"
+    # 上一层、取过的快照都记进输入（复算按它们走到同一处）；参数照调用原样，阈值同这个模式自己算不了时
+    assert [i["role"] for i in result["inputs"]] == ["parent", "data"]
+    assert result["inputs"][1] == {"ref": "Q2", "artifact": WEEKLY["artifact"], "role": "data",
+                                   "columns": ["region", "gmv", "week"], "rows": "all"}
+    assert result["params"]["parent"] == {"of": "where", "key": ["华东"]}
+    assert result["settings"] == {**{k: c.DEFAULTS[k] for k in ("main_share", "concentration", "offset_ratio",
+                                                                   "flat_pct", "table_top_k")}, "max_drill_depth": 3}
+    assert result["table"] is None and result["verdict"] is None
+
+
+async def test_segments_periods_cells_and_groups_missing_this_time():
+    parent = await analyze("decompose", "additive", snaps=REFUSALS, **BY_REGION)
+    key = await _refused("decompose", "additive", parents={"A1": parent},
+                         **{**BY_REGION, "parent": {"of": "A1", "key": ["东北"]}})
+    assert key["reason_code"] == "input_unavailable" and key["reason"] == "上一层「A1」里没有「东北」这一段"
+    period = await _refused("decompose", "additive", **{**BY_REGION, "target": "2026-W43", "label": "销售额，主要来自华东"})
+    assert period["reason"] == "期次列「week」里没有本期「2026-W43」" and period["params"]["label"] == "销售额"
+    row = await _refused("decompose", "additive", **BY_REGION, headline={"base": "Q7.r5.gmv", "target": "Q7.r0.gmv"})
+    assert row["reason"] == "基期总数那一格（Q7.r5.gmv）不在：Q7 这次只有 2 行"
+    assert [i["role"] for i in row["inputs"]] == ["data", "headline_base"]
+    empty = await _refused("decompose", "additive", **BY_REGION, headline={"base": "Q7.r1.gmv", "target": "Q7.r0.gmv"})
+    assert empty["reason"] == "基期总数那一格（Q7.r1.gmv）是空的"
+    factor = await _refused("decompose", "factor", query="Q8", period="week", base="2026-W41", target="2026-W42",
+                            product="gmv", factors=["orders", "aov"])
+    assert factor["reason"] == "本期的「gmv」那一格是空的（Q8 第 1 行）"
+    target = await _refused("baseline", query="Q1", period="week", measure="gmv", target="2020-01-06")
+    assert target["reason"] == "期次列「week」里没有本期「2020-01-06」（或那一期为空）"
+    assert target["settings"] == {k: c.DEFAULTS[k] for k in ("k_warn", "k_alert", "min_history", "max_history")}
+    side = await _refused("comparable", query="Q2", period="week", base="2026-W40", target="2026-W42")
+    assert side["reason"] == "期次列「week」里没有基期「2026-W40」" and side["settings"] == {}
+    rates = {"by": ["region"], "numerator": "refunds", "denominator": "orders"}
+    group = await _refused("differ", "rate", query="Q3", **rates, pairs=[["华东", "东北"]])
+    assert group["reason"] == "分组列「region」里没有「东北」这一组"
+    assert group["settings"] == {"differ_alpha": 0.05, "min_expected": 5}
+    few = await _refused("differ", "rate", query="Q9", **rates)
+    assert few["reason"] == "分组列「region」里只有 1 组，至少要两组才比得了"
+    weeks = {"query": "Q10", "period": "week", "numerator": "refunds", "denominator": "orders"}
+    gone = await _refused("differ", "rate", **weeks, base="2026-W40", target="2026-W41")
+    assert gone["reason"] == "期次列「week」里没有基期「2026-W40」"
+    null = await _refused("differ", "rate", **weeks, base="2026-W41", target="2026-W42")
+    assert null["reason"] == "「refunds」那一格是空的（Q10 第 1 行）"
+
+
+async def test_structural_call_errors_still_fail_even_when_data_errors_are_refused():
+    for params in ({**BY_REGION, "by": ["channel"]}, {**BY_REGION, "by": ["region", "week"]}):
+        with pytest.raises(CallError) as e:
+            await analyze("decompose", "additive", snaps=REFUSALS, refuse_data_errors=True, check=False, **params)
+        assert e.value.code not in analysis.DATA_ERRORS and e.value.reason is None

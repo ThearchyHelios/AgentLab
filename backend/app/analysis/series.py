@@ -40,6 +40,17 @@ from app.analysis.numbers import canon, to_fraction
 MAD_SCALE = Fraction(14826, 10000)
 #: lag 的上限（周数据同比是 52）
 _LAG_MAX = 260
+#: 结论里记的阈值
+USED: dict[str, tuple[str, ...]] = {
+    "baseline": ("k_warn", "k_alert", "min_history", "max_history"),
+    "trend": ("trend_min_points", "trend_alpha", "max_history"),
+}
+
+
+def refusal_basis(op: str, settings: Mapping[str, Any]) -> tuple[list[str], str]:
+    """还没算就算不了时结论里记的阈值和判定标准（同 decompose.refusal_basis）。"""
+    criterion = ph.criterion_baseline if op == "baseline" else ph.criterion_trend
+    return list(USED[op]), criterion(settings, None, "期")
 
 
 @dataclass
@@ -147,7 +158,7 @@ def _completeness(env: Env, series: Series, item: pd.Period) -> tuple[str, str |
 
 
 def baseline(raw: Mapping[str, Any], env: Env) -> Any:
-    used = ["k_warn", "k_alert", "min_history", "max_history"]
+    used = list(USED["baseline"])
     loaded = _load(raw, env, used)
     if not isinstance(loaded, Series):
         return loaded
@@ -168,7 +179,8 @@ def baseline(raw: Mapping[str, Any], env: Env) -> Any:
         found = next((p for p in series.points if same_value(raw["target"], p[0].raw)), None)
         if found is None:
             raise CallError("period_not_found", f"期次列「{series.period}」里没有「{raw['target']}」（或那一期为空）："
-                                                "本期要写序列里有值的一期，不写就是最后一期")
+                                                "本期要写序列里有值的一期，不写就是最后一期",
+                            reason=f"期次列「{series.period}」里没有本期「{ph.key_text([raw['target']])}」（或那一期为空）")
     else:
         found = series.points[-1]
     target, x_level = found
@@ -277,7 +289,7 @@ def run_length(values: list[Fraction]) -> tuple[int, str | None]:
 
 
 def trend(raw: Mapping[str, Any], env: Env) -> Any:
-    used = ["trend_min_points", "trend_alpha", "max_history"]
+    used = list(USED["trend"])
     loaded = _load(raw, env, used)
     if not isinstance(loaded, Series):
         return loaded
@@ -357,4 +369,4 @@ def _tail_gap(series: Series, ordinal: int) -> str:
     return "再往前缺期"
 
 
-__all__ = ["MAD_SCALE", "baseline", "run_length", "trend", "unreadable_text"]
+__all__ = ["MAD_SCALE", "USED", "baseline", "refusal_basis", "run_length", "trend", "unreadable_text"]

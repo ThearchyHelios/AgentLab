@@ -52,8 +52,10 @@ CATALOGS = {"shop": {"orders": ORDERS}}
 async def analyze(op: str, mode: str | None = None, *, snaps: Sequence[Mapping[str, Any]], today: date = TODAY,
                   catalogs: Mapping[str, Any] | None = None, probe: Any = None, facts: Any = None,
                   parents: Mapping[str, Mapping[str, Any]] | None = None, settings: Mapping[str, Any] | None = None,
-                  hypothesis: str | None = None, check: bool = True, **params: Any) -> dict[str, Any]:
-    """跑一次 analysis.run；check 时再复算一遍，核对和封存的逐字段相同（hypothesis 除外）。"""
+                  hypothesis: str | None = None, check: bool = True, refuse_data_errors: bool = False,
+                  **params: Any) -> dict[str, Any]:
+    """跑一次 analysis.run；check 时再复算一遍，核对和封存的逐字段相同（hypothesis 除外）。refuse_data_errors 同 run（分析卡
+    传真）；复算一律按真。"""
     by_ref = {s["ref"]: s for s in snaps}
     request: dict[str, Any] = {"op": op, "mode": mode, "params": params}
     if hypothesis is not None:
@@ -64,7 +66,7 @@ async def analyze(op: str, mode: str | None = None, *, snaps: Sequence[Mapping[s
     if facts is not None:
         context["facts"] = facts
     result = await analysis.run(request, by_ref.get, settings=effective_settings(settings), context=context,
-                                parents=(parents or {}).get)
+                                parents=(parents or {}).get, refuse_data_errors=refuse_data_errors)
     if check:
         again = recomputed(result, snaps, parents)
         assert same(result, again), _diff(result, again)

@@ -36,6 +36,16 @@ from app.analysis.numbers import canon, to_fraction
 TESTS = {"z": "z 检验", "fisher": "Fisher 精确检验", "welch": "Welch t 检验"}
 
 
+def used_settings(mode: str | None) -> list[str]:
+    """结论里记的阈值：比率看最小期望频数，均值、逐行看最小样本数。"""
+    return ["differ_alpha", "min_expected"] if mode == "rate" else ["differ_alpha", "min_n"]
+
+
+def refusal_basis(mode: str | None, settings: Mapping[str, Any]) -> tuple[list[str], str]:
+    """还没算就算不了时结论里记的阈值和判定标准（同 decompose.refusal_basis）。"""
+    return used_settings(mode), ph.criterion_differ(settings, mode)  # type: ignore[arg-type]
+
+
 @dataclass(eq=False)
 class Group:
     key: Any
@@ -62,7 +72,10 @@ class Pair:
 
 
 def _int(value: Fraction | None, snap: Snap, r: int, column: str) -> int:
-    if value is None or value.denominator != 1 or value < 0:
+    if value is None:
+        raise CallError("empty_cell", f"{snap.ref} 第 {r} 行的「{column}」是空的：计数要有值（在 SQL 里把空值写成 0）",
+                        reason=f"「{column}」那一格是空的（{snap.ref} 第 {r} 行）")
+    if value.denominator != 1 or value < 0:
         raise CallError("not_count", f"{snap.ref} 第 {r} 行的「{column}」不是不小于 0 的整数：比率比较的分子、分母要是计数")
     return int(value)
 
@@ -135,7 +148,7 @@ def _verdict(pairs: Sequence[Pair], alpha: Fraction) -> list[Pair]:
 
 def differ(raw: Mapping[str, Any], env: Env) -> Any:
     mode = env.mode
-    used = ["differ_alpha", "min_expected"] if mode == "rate" else ["differ_alpha", "min_n"]
+    used = used_settings(mode)
     snap = env.inputs.snap(need(raw, "query", "查询编号"), "查询编号")
     params: dict[str, Any] = {"query": snap.ref}
     by_period = raw.get("period") is not None
@@ -230,7 +243,8 @@ def _groups(snap: Snap, group_col: str, cols: Mapping[str, str], mode: str, by_p
     if by_period:
         for w, what in ((params["target"], "本期"), (params["base"], "基期")):
             if not any(same_value(w, g.key) for g in groups.values()):
-                raise CallError("period_not_found", f"期次列「{group_col}」里没有「{w}」：{what}要写 {snap.ref} 里有的期次值")
+                raise CallError("period_not_found", f"期次列「{group_col}」里没有「{w}」：{what}要写 {snap.ref} 里有的期次值",
+                                reason=f"期次列「{group_col}」里没有{what}「{ph.key_text([w])}」")
     return groups
 
 
@@ -238,7 +252,8 @@ def _find(groups: Mapping[Any, Group], value: Any, column: str) -> Group:
     found = next((g for g in groups.values() if same_value(value, g.key)), None)
     if found is None:
         shown = "、".join(g.name for g in list(groups.values())[:8])
-        raise CallError("unknown_group", f"「{value}」不是「{column}」里的值：要比的组写 {shown} 里的")
+        raise CallError("unknown_group", f"「{value}」不是「{column}」里的值：要比的组写 {shown} 里的",
+                        reason=f"分组列「{column}」里没有「{ph.key_text([value])}」这一组")
     return found
 
 
@@ -261,7 +276,8 @@ def _pairs(raw: Mapping[str, Any], params: dict[str, Any], groups: dict[Any, Gro
         params["pairs"] = [[p.a.key, p.b.key] for p in out]
         return out
     if len(groups) < 2:
-        raise CallError("too_few_groups", f"「{group_col}」里只有 {len(groups)} 组，至少要两组才比得了")
+        raise CallError("too_few_groups", f"「{group_col}」里只有 {len(groups)} 组，至少要两组才比得了",
+                        reason=f"分组列「{group_col}」里只有 {len(groups)} 组，至少要两组才比得了")
     if raw.get("reference") is not None:
         ref = _find(groups, raw.get("reference"), group_col)
         params["reference"] = ref.key
@@ -372,4 +388,4 @@ def _sensitivity(pairs: list[Pair], mode: str, alpha: Fraction, min_expected: Fr
     return (value > mean, now) if now != differs else None
 
 
-__all__ = ["TESTS", "differ"]
+__all__ = ["TESTS", "differ", "refusal_basis", "used_settings"]

@@ -497,8 +497,9 @@ def comparable(raw: Mapping[str, Any], env: Any) -> Any:
     params: dict[str, Any] = {}
     two = raw.get("base_query") is not None or raw.get("target_query") is not None
     if two:
-        base = env.inputs.snap(need(raw, "base_query", "基期的查询编号"), "基期的查询编号")
-        target = env.inputs.snap(need(raw, "target_query", "本期的查询编号"), "本期的查询编号")
+        base = env.inputs.snap(need(raw, "base_query", "基期的查询编号"), "基期的查询编号", role="base")
+        target = env.inputs.snap(need(raw, "target_query", "本期的查询编号"), "本期的查询编号",
+                                 role="target")
         if base is target:
             from app.analysis.decompose import SAME_QUERY
 
@@ -529,7 +530,8 @@ def comparable(raw: Mapping[str, Any], env: Any) -> Any:
         for side, what in (("base", "基期"), ("target", "本期")):
             if not rows[side]:
                 raise CallError("period_not_found", f"期次列「{period}」里没有「{params[side]}」：{what}要写 {target.ref} "
-                                                    "里有的期次值")
+                                                    "里有的期次值",
+                                reason=f"期次列「{period}」里没有{what}「{ph.key_text([params[side]])}」")
         env.inputs.use(target, "data", [period, *([measure] if measure else [])], rows["base"] + rows["target"])
         parsed = pd.parse(values, grain, weeks=pd.week_scheme(target.sql, period, target.dialect))
         if parsed is None:
