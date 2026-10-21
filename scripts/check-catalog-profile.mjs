@@ -228,7 +228,8 @@ const sources = () => [
 ]
 const NAMES = [NAME1, NAME2, NAME3]
 
-const DEFAULTS = { enabled: false, table_max_queries: 40, table_max_s: 60, query_timeout_s: 10, sample_size: 2000, max_scan_rows: 100000 }
+const DEFAULTS = { enabled: false, table_max_queries: 40, table_max_s: 60, query_timeout_s: 10, sample_size: 2000, max_scan_rows: 100000,
+  table_concurrency: 1 }
 const settingsOf = (state, src) => {
   const raw = state.sources.find((s) => s.id === src)?.options?.catalog_profile ?? {}
   const out = { ...DEFAULTS, enabled: raw.enabled === true }
@@ -717,13 +718,16 @@ await section('剖析 · 设置：每张表的两项预算、被拒时报错落�
         && await sec.locator('[data-profile-field]').count() === 0)
   await sec.locator('[data-profile-enabled]').check()
   const labels = await sec.locator('label.label').allInnerTexts()
-  check('开启后五项预算展开：每张表最多查询数、每张表时长上限在前，没有整次的查询次数上限、总时长上限',
-    labels.join('、') === '每张表最多查询数、每张表时长上限、单条查询时限、核对键值数、整表统计行数上限', labels.join('、'))
+  check('开启后六项预算展开：每张表最多查询数、每张表时长上限在前，同时剖析的表数在最后，没有整次的查询次数上限、总时长上限',
+    labels.join('、') === '每张表最多查询数、每张表时长上限、单条查询时限、核对键值数、整表统计行数上限、同时剖析的表数', labels.join('、'))
   const units = await sec.locator('[data-profile-field] span').allInnerTexts()
-  check('……每项带单位', units.join(',') === '条,秒,秒,个,行', units.join(','))
+  check('……每项带单位', units.join(',') === '条,秒,秒,个,行,张', units.join(','))
   const hints = await sec.locator('[id$="-hint"]').allInnerTexts()
   check('……写明范围和默认值，说清用完只停这张表', hints.some((h) => h.startsWith('范围 1–200 条，默认 40') && h.includes('用完只停这张表'))
         && hints.some((h) => h.startsWith('范围 10–600 秒，默认 60') && h.includes('只停这张表')), hints.join(' | '))
+  check('……同时剖析的表数写明范围 1–3、默认 1，说清业务库同时要应付几条查询、和分析共用连接',
+    hints.some((h) => h.startsWith('范围 1–3 张，默认 1') && h.includes('业务库同一时刻要应付这么多条查询') && h.includes('和这个数据源上的分析共用连接')),
+    hints.join(' | '))
   check('……旧的两个键不回显成输入框的值', await page.locator('#ds-profile-table_max_queries').inputValue() === ''
         && await page.locator('#ds-profile-table_max_s').inputValue() === '')
   const risk = () => sec.locator('[data-profile-risk]').innerText().catch(() => '')
@@ -731,6 +735,14 @@ await section('剖析 · 设置：每张表的两项预算、被拒时报错落�
     (await risk()).includes('一条一条地发，可随时停止：每张表最多 40 条、60 秒，单条不超过 10 秒'), await risk())
   await page.locator('#ds-profile-table_max_queries').fill('30')
   check('……风险说明跟着填的数走', (await risk()).includes('每张表最多 30 条'), await risk())
+  await page.locator('#ds-profile-table_concurrency').fill('2')
+  check('……同时剖析 2 张：风险说明写明张数，每张表仍一条一条地发', (await risk()).includes('只读查询，同时剖析 2 张表、每张表的查询一条一条地发，可随时停止'),
+    await risk())
+  await page.locator('#ds-profile-table_concurrency').fill('4')
+  const tooMany = await page.locator('#ds-profile-table_concurrency-error').innerText().catch(() => '')
+  check('……填 4 张（超过 3）：就地写明范围', tooMany === '请填写 1 到 3 之间的整数', tooMany)
+  await page.locator('#ds-profile-table_concurrency').fill('')
+  check('……清空回到缺省（一张），风险说明回到「一条一条地发」', (await risk()).includes('只读查询，一条一条地发，可随时停止'), await risk())
   await page.locator('#ds-profile-table_max_queries').fill('500')
   const err = await page.locator('#ds-profile-table_max_queries-error').innerText().catch(() => '')
   check('填错（500 条，超过 200）：就地写明范围，保存按钮禁用', err === '请填写 1 到 200 之间的整数' && await page.locator('[data-source-save]').isDisabled(), err)
@@ -811,7 +823,8 @@ await section('剖析 · 开始前：范围、个数与预算', async () => {
         && (await inBox(page, '[data-profile-scope="all"]')).includes('不含视图'))
   const budget = await inBox(page, '[data-profile-budget]')
   check('预算按表写：每张表最多 40 条、60 秒，单条 10 秒，核对键值数、整表统计门槛，按哪个源的设置',
-    ['每张表最多 40 条查询、60 秒，用完只停这张表', '单条查询不超过 10 秒', '取 2,000 个不同键值核对', '行数超过 100,000 的表不做整表统计', `按「${NAME1}」的数据剖析设置`]
+    ['每张表最多 40 条查询、60 秒，用完只停这张表', '单条查询不超过 10 秒', '取 2,000 个不同键值核对', '行数超过 100,000 的表不做整表统计',
+      '一张表做完再做下一张，查询一条一条地发', `按「${NAME1}」的数据剖析设置`]
       .every((x) => budget.includes(x)), budget)
   check('……按这次的表数估上限：「这次 5 张表，最多约 200 条查询、5 分钟」', (await inBox(page, '[data-profile-budget-total]')) === '这次 5 张表，最多约 200 条查询、5 分钟',
     await inBox(page, '[data-profile-budget-total]'))
@@ -1019,6 +1032,42 @@ await section('剖析 · 进行中：逐表进度、后台继续与停止', asyn
   await sleep(3200)
   check('结束以后不再取进度', polls() === n, `${n} → ${polls()}`)
   check('写请求只有建任务和停止', writes(sent, /./).every((s) => /profile-jobs(\/[^/]+\/cancel)?$/.test(s.key)), JSON.stringify(writes(sent, /./).map((s) => s.key)))
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+})
+
+await section('剖析 · 同时剖析几张表：预算、说法与进行中的几行', async () => {
+  const state = freshState()
+  state.sources = state.sources.map((s) => (s.id === S1 ? { ...s, options: { ...s.options, catalog_profile: { ...PROFILE_ON, table_concurrency: 2 } } } : s))
+  const { page, sent, errors, close } = await open(`/data/catalog/${S1}`, { handlers: handlers(state) })
+  await page.locator('[data-catalog-row]').first().waitFor()
+  await openDialog(page)
+  const budget = await inBox(page, '[data-profile-budget]')
+  check('预算多写一行「同时剖析 2 张表，每张表的查询一条一条地发」', budget.includes('同时剖析 2 张表，每张表的查询一条一条地发'), budget)
+  check('……估算：查询数照表数算，时长按两张一轮算（5 张分 3 轮）：「这次 5 张表，最多约 200 条查询、3 分钟」',
+    (await inBox(page, '[data-profile-budget-total]')) === '这次 5 张表，最多约 200 条查询、3 分钟', await inBox(page, '[data-profile-budget-total]'))
+  check('……醒目一句写明同时剖析 2 张表', (await inBox(page, '[data-profile-readonly]')).includes('只读查询，同时剖析 2 张表、每张表的查询一条一条地发，可随时停止'),
+    await inBox(page, '[data-profile-readonly]'))
+  await page.locator('[data-profile-start]').click()
+  await until(async () => (await phase(page)) === 'running')
+  const job = state.pjobs.at(-1)
+  check('任务记着这次的设置：同时剖析 2 张', job.settings.table_concurrency === 2, JSON.stringify(job.settings))
+  settle(state, job, 'orders', { status: 'running', done: { relation: 1, codes: 0, date: 0 }, queries: 6, elapsed_ms: 4000,
+    current: '正在核对 orders.customer_id → customers.id' })
+  settle(state, job, 'visits', { status: 'running', done: { relation: 0 }, queries: 2, elapsed_ms: 3000, current: '正在估算 visits 的行数' })
+  check('进行中：两张表一起写「剖析中」，各写各正在做的那一项', await until(async () =>
+    (await inBox(page, '[data-profile-task="orders"] [data-profile-task-status]')) === '剖析中'
+    && (await inBox(page, '[data-profile-task="visits"] [data-profile-task-status]')) === '剖析中')
+    && (await inBox(page, '[data-profile-task="orders"] [data-profile-task-note]')) === '正在核对 orders.customer_id → customers.id'
+    && (await inBox(page, '[data-profile-task="visits"] [data-profile-task-note]')) === '正在估算 visits 的行数',
+  `${await inBox(page, '[data-profile-task="orders"]')} | ${await inBox(page, '[data-profile-task="visits"]')}`)
+  check('……别的表还写「排队」，头部仍是做完几张 / 共几张、已发的查询合起来算', (await inBox(page, '[data-profile-task="products"] [data-profile-task-status]')) === '排队'
+        && (await inBox(page, '[data-profile-progress]')) === '0 / 5 张表' && (await inBox(page, '[data-profile-queries]')).includes('已发 8 条查询'),
+  await textOf(box(page).locator('[role="status"]')))
+  await page.keyboard.press('Escape')
+  check('表清单：两张都写「剖析中」', await until(async () => (await rowProfile(page, 'orders')) === '剖析中' && (await rowProfile(page, 'visits')) === '剖析中'),
+    `${await rowProfile(page, 'orders')} / ${await rowProfile(page, 'visits')}`)
+  check('写请求只有建任务', writes(sent, /./).every((s) => /profile-jobs$/.test(s.key)), JSON.stringify(writes(sent, /./).map((s) => s.key)))
   check('没有运行时报错', errors.length === 0, errors[0] ?? '')
   await close()
 })

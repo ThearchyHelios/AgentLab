@@ -16,7 +16,8 @@ hooks 回调（后台任务据此把进度落库），整张表结束把结论�
 
 - 默认关闭，按数据源在 options.catalog_profile 里开启（profile_settings）；
 - 每条查询先过守卫的只读判定（不论数据源本身可写与否），再交给查询层 run_query：同一套连接、守卫和
-  时限，不另开连接；查询一条一条发，不并发；
+  时限，不另开连接；一张表的查询一条一条发，不并发；同时剖析几张表按设置（table_concurrency，缺省 1、最多
+  MAX_TABLE_CONCURRENCY），所以同一时刻对业务库最多这么多条查询；
 - 单条查询的时限取设置和数据源查询时限中小的，且不超过这张表剩下的时长；
 - 每张表有自己的预算（TableBudget：查询次数、时长），用完只停这张表，剩下的项记「这张表的查询次数（时长）用完」，下一张
   表拿满额。整个任务一个查询器（SourceRunner）管任务级止损：连续 3 条查询失败（多半是连接断了、没有权限）、最近 10 条里
@@ -87,6 +88,9 @@ class ProfileSettings:
     #: 行数不超过它的表才做 COUNT(DISTINCT)、MIN/MAX 这类整表统计；更大的、或者不知道多大的表只看前若干行。
     #: 填 0 表示一律不做整表统计
     max_scan_rows: int = 100_000
+    #: 同时剖析几张表（每张表的查询仍一条一条发）。缺省 1：一张做完再做下一张；大于 1 时业务库同时要应付这么多条查询，
+    #: 和这个源上的分析共用连接池，所以上限是 MAX_TABLE_CONCURRENCY
+    table_concurrency: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -105,7 +109,11 @@ _NUMBER_FIELDS: dict[str, tuple[str, float, float, bool]] = {
     "query_timeout_s": ("单条查询时限（秒）", 1, 60, False),
     "sample_size": ("核对键值数", 10, 10_000, True),
     "max_scan_rows": ("整表统计行数上限", 0, 10_000_000, True),
+    "table_concurrency": ("同时剖析的表数", 1, 3, True),
 }
+#: 同时剖析的表数的上限：数据源的连接池常驻 3 条、临时再借 2 条（data/engine.EngineCache），和这个源上的分析共用，
+#: 剖析最多占常驻的 3 条，临时的留给分析
+MAX_TABLE_CONCURRENCY = int(_NUMBER_FIELDS["table_concurrency"][2])
 _ENABLED_LABEL = "开启数据剖析"
 _KNOWN_KEYS = frozenset({"enabled", *_NUMBER_FIELDS})
 #: 以前的整次预算（一次剖析最多几条查询、总时长）。现在预算按表算，这两项不再有意义：启动时从库里删掉
@@ -979,7 +987,8 @@ class _TableOutcome:
 @dataclass
 class ProfileContext:
     """一个剖析任务共用的：源（上传源是绑定当前快照的视图）、设置、方言、查询器（任务级止损在它身上）、表结构、遮罩的
-    列（小写，任务每张表开始前按数据源最新的设置换掉）、已经估过的行数（父表的行数核对关系时会用到，不重复估）。"""
+    列（小写，任务每张表开始前按数据源最新的设置换掉）、已经估过的行数（父表的行数核对关系时会用到，不重复估）。
+    同时剖析的几张表共用这一份（都在同一个事件循环里）。"""
 
     source: Any
     settings: ProfileSettings
@@ -989,6 +998,8 @@ class ProfileContext:
     #: 遮罩的列（小写）。遮罩按列名生效、不分大小写、不分表，和证据面板的比法一致
     masked: set[str]
     sizes: dict[str, TableSize] = field(default_factory=dict)
+    #: 正在估哪张表的行数（见 _TableCx.size）：同时剖析的几张表要估同一张时只估一次
+    size_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: 对象索引里探查范围外的对象（name_key）：关系指向它们时说「在探查范围外」，不说「表结构里没有」
     outside: frozenset[str] = frozenset()
 
@@ -1080,15 +1091,19 @@ class _TableCx:
             await self.hooks.query(self.result)
 
     async def size(self, table: str, result: TableResult) -> TableSize:
-        """表有多大，一个任务里每张表只估一次。途中没查成的记进 result（行数估算这一项）。"""
+        """表有多大，一个任务里每张表只估一次。途中没查成的记进 result（行数估算这一项）。同时剖析的几张表要估同一张
+        （同一张父表，或者它自己正在剖析）时后来的等先来的估完、用它的结果，查询记在先来的那张表上；先来的没估成（停止、
+        预算用完）就自己估。"""
         if table not in self.job.sizes:
-            async def run(sql: str, **kw: Any) -> QueryResult:
-                return await self.run(sql, kind="row_estimate", target=table, **kw)
+            async with self.job.size_locks.setdefault(table, asyncio.Lock()):
+                if table not in self.job.sizes:
+                    async def run(sql: str, **kw: Any) -> QueryResult:
+                        return await self.run(sql, kind="row_estimate", target=table, **kw)
 
-            size, skips = await estimate_size(run, self.dialect, self.tables[table], table,
-                                              max_scan_rows=self.settings.max_scan_rows)
-            self.job.sizes[table] = size
-            result.skipped += [ProfileSkip("row_estimate", table, s.reason, s.detail) for s in skips]
+                    size, skips = await estimate_size(run, self.dialect, self.tables[table], table,
+                                                      max_scan_rows=self.settings.max_scan_rows)
+                    self.job.sizes[table] = size
+                    result.skipped += [ProfileSkip("row_estimate", table, s.reason, s.detail) for s in skips]
         return self.job.sizes[table]
 
     async def size_with_data(self, table: str, result: TableResult) -> TableSize:

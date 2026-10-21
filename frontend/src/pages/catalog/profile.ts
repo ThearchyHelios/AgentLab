@@ -9,21 +9,23 @@ import { formatTime, parseServerTime } from '../../lib/format'
 // 规则跟着服务端（backend/app/data/catalog_profile.py 的 ProfileSettings、profile_settings、
 // profile_settings_problem）走：缺省即关闭；读的时候宽松（某一项不对就用缺省），写的时候严格（超出范围的拒收）。
 //
-// 预算按表算（每张表最多查询数、每张表时长上限），没有整次的总量上限。以前的「查询次数上限」「总时长上限」按整次剖析算，
+// 预算按表算（每张表最多查询数、每张表时长上限），没有整次的总量上限；同时剖析几张表另有一项（缺省 1）。
+// 以前的「查询次数上限」「总时长上限」按整次剖析算，
 // 含义不同：服务端启动时把这两个旧键删掉、保存时摘掉，这里读的时候也不认它们（表单里没有、保存时不带）。
 // ===========================================================================
 
 /** 数据源 options 里剖析设置的键 */
 export const PROFILE_OPTION = 'catalog_profile'
 
-/** 设置里的数值项，也是表单上的顺序：先是按表的两项预算，再是单条查询和抽样 */
+/** 设置里的数值项，也是表单上的顺序：先是按表的两项预算，再是单条查询和抽样，最后是同时剖析几张表 */
 export const PROFILE_NUMBER_KEYS: readonly CatalogProfileNumberKey[] = [
-  'table_max_queries', 'table_max_s', 'query_timeout_s', 'sample_size', 'max_scan_rows',
+  'table_max_queries', 'table_max_s', 'query_timeout_s', 'sample_size', 'max_scan_rows', 'table_concurrency',
 ]
 
 /** 缺省值（服务端 ProfileSettings 的默认） */
 export const PROFILE_DEFAULTS: CatalogProfileSettings = {
   enabled: false, table_max_queries: 40, table_max_s: 60, query_timeout_s: 10, sample_size: 2000, max_scan_rows: 100_000,
+  table_concurrency: 1,
 }
 
 /** 各数值项的范围（服务端 _NUMBER_FIELDS）：下限、上限、是否必须是整数 */
@@ -33,6 +35,7 @@ export const PROFILE_LIMITS: Record<CatalogProfileNumberKey, { min: number; max:
   query_timeout_s: { min: 1, max: 60, integer: false },
   sample_size: { min: 10, max: 10_000, integer: true },
   max_scan_rows: { min: 0, max: 10_000_000, integer: true },
+  table_concurrency: { min: 1, max: 3, integer: true },
 }
 
 /** 一个数：数字和数字写成的文字都认（同服务端 _number）。不合规返回 null */

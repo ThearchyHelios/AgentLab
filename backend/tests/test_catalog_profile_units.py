@@ -21,7 +21,7 @@ def test_settings_default_off_and_parse_leniently():
     s = profile_settings({})
     assert s == ProfileSettings()
     assert s.enabled is False and s.table_max_queries == 40 and s.table_max_s == 60 and s.query_timeout_s == 10
-    assert s.sample_size == 2000 and s.max_scan_rows == 100_000
+    assert s.sample_size == 2000 and s.max_scan_rows == 100_000 and s.table_concurrency == 1
     on = profile_settings({PROFILE_OPTION: {"enabled": True, "table_max_queries": "30", "sample_size": 500}})
     assert on.enabled is True and on.table_max_queries == 30 and on.sample_size == 500
     # 库里存着的值不对（老数据、手改过）：那一项用缺省，不因此开启，也不报错；迁移前的旧键不看
@@ -42,6 +42,9 @@ def test_settings_default_off_and_parse_leniently():
     ({"query_timeout_s": 61}, "单条查询时限"),
     ({"sample_size": 5}, "核对键值数"),
     ({"max_scan_rows": -1}, "整表统计行数上限"),
+    ({"table_concurrency": 0}, "同时剖析的表数"),
+    ({"table_concurrency": 4}, "同时剖析的表数"),
+    ({"table_concurrency": 1.5}, "同时剖析的表数"),
     ({"enabled": "true"}, "开启数据剖析"),
     ({"table_max_queries": True}, "每张表最多查询数"),
 ])
@@ -57,7 +60,7 @@ def test_settings_problem_rejects_unknown_keys_and_wrong_shape():
     assert profile_settings_problem({PROFILE_OPTION: None}) is None
     assert profile_settings_problem({PROFILE_OPTION: {"enabled": True, "table_max_queries": 200, "table_max_s": 10.5,
                                                       "query_timeout_s": 1.5, "sample_size": 10,
-                                                      "max_scan_rows": 0}}) is None
+                                                      "max_scan_rows": 0, "table_concurrency": 3}}) is None
 
 
 def test_legacy_whole_run_budgets_are_stripped_not_rejected():

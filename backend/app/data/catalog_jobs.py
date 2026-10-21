@@ -370,7 +370,7 @@ async def ensure_draft_free(session: AsyncSession, row: Any, *, then: str = THEN
 
 async def ensure_idle(session: AsyncSession, row: Any, kind: str = "import") -> None:
     """同步写操作（kind：import 导入目录、sync_draft 同步起草）要求源空闲：没有在起草（DraftBusy，同 ensure_draft_free），
-    也没有排队或进行中的剖析任务（catalog_profile_jobs.ProfileBusy，说法里写明进行到第几张）。说法最后一句按 kind 说
+    也没有排队或进行中的剖析任务（catalog_profile_jobs.ProfileBusy，说法里写明做完了几张）。说法最后一句按 kind 说
     这次要做的事（_then）。"""
     from app.data import catalog_profile_jobs
 

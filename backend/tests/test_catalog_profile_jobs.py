@@ -8,6 +8,8 @@
 - 服务重启标中断、不续跑；关停时同样；重试只带没做完的表
 - 任务级止损：连续 3 条失败、最近 10 条 7 条超时（停下、后面的表带同一句原因），最近 6 条 4 条超时提醒、好转后清掉
 - 每张表开始前重读数据源：停用、关掉剖析就停；遮罩按最新的设置
+- 同时剖析几张表（table_concurrency）：同一时刻对业务库的查询最多这么多条、每张表仍一条一条发；几张一起显示进行中、按顺序
+  开始；停止、止损、停用时正在做的几张各自收尾；一张让任务出错时另几张照停止收尾；同一张表的行数只估一次
 - 范围：需要剖析 / 全部 / 指定；空表一条查询记 skipped；视图跳过；没有可剖析的项；挑不出表 409；profile_due 的三种情形
 - 留痕：IN 列表里抽到的键值不进 AgentLab 的库
 - 设置迁移：旧键启动时删掉，老页面带着旧键保存只摘掉
@@ -35,7 +37,8 @@ from app.data.guard import SqlRejected
 from app.db.base import SessionLocal, utcnow
 from app.db.models import CatalogProfileJob, CatalogProfileTask, DataSource
 from tests.test_catalog_profile import (  # noqa: F401
-    ACTOR, _detail, _finished, _job, _notes, _on, _profile, _relation, _start, _table, _url, client, make_source,
+    ACTOR, _detail, _finished, _job, _notes, _on, _profile, _reasons, _relation, _start, _table, _url, client,
+    make_source,
 )
 
 
@@ -523,6 +526,239 @@ async def test_masks_follow_the_latest_settings_table_by_table(client, make_sour
     channels = _table(done, "channels")
     assert {(s["target"], s["reason"]) for s in channels["skipped"]} >= {("channel_type", "masked")}
     assert not any("channel_type" in q["sql"].lower() for q in channels["query_log"])
+
+
+# --------------------------------------------------------------------------
+# 同时剖析几张表
+# --------------------------------------------------------------------------
+
+
+class InFlight:
+    """记下同一时刻最多有几条查询在业务库上、每个执行者（一张表在一个执行者里做完）同时最多几条。每条稍等一下，让同时
+    剖析的几张表真能叠在一起。"""
+
+    def __init__(self, real) -> None:
+        self.real = real
+        self.now = self.most = 0
+        self.by_runner: dict[int, int] = {}
+        self.most_per_runner = 0
+
+    async def __call__(self, source, sql, *, limits=None):
+        me = id(asyncio.current_task())
+        self.now += 1
+        self.by_runner[me] = self.by_runner.get(me, 0) + 1
+        self.most = max(self.most, self.now)
+        self.most_per_runner = max(self.most_per_runner, self.by_runner[me])
+        try:
+            await asyncio.sleep(0.005)
+            return await self.real(source, sql, limits=limits)
+        finally:
+            self.now -= 1
+            self.by_runner[me] -= 1
+
+
+class Hold:
+    """查询等放行才发（when 说哪些要等）；waiting 是此刻在等的条数。"""
+
+    def __init__(self, real, when=lambda source, sql, **kw: True) -> None:
+        self.real, self.when = real, when
+        self.waiting = 0
+        self.release = asyncio.Event()
+
+    async def __call__(self, source, sql, *, limits=None):
+        if self.when(source, sql, limits=limits):
+            self.waiting += 1
+            try:
+                await self.release.wait()
+            finally:
+                self.waiting -= 1
+        return await self.real(source, sql, limits=limits)
+
+
+def _hold(monkeypatch, when=lambda source, sql, **kw: True) -> Hold:
+    hold = Hold(data_engine.run_query, when)
+    monkeypatch.setattr(data_engine, "run_query", hold)
+    return hold
+
+
+async def _waiting(hold: Hold, n: int) -> None:
+    async def enough() -> bool:
+        return hold.waiting >= n
+
+    await until(enough)
+
+
+@pytest.mark.parametrize("width", [1, 2, 3])
+async def test_queries_in_flight_never_exceed_the_tables_side_by_side(client, make_source, scenic_db, monkeypatch,
+                                                                      width):
+    sid = await make_source(scenic_db, options=_on(table_concurrency=width), draft=["visits", "orders"])
+    flight = InFlight(data_engine.run_query)
+    monkeypatch.setattr(data_engine, "run_query", flight)
+    job = await _profile(client, sid, ["visits", "orders", "channels", "members", "gates"])
+    assert job["status"] == "succeeded" and job["settings"]["table_concurrency"] == width
+    assert flight.most == width, "同一时刻对业务库的查询最多同时剖析的表数那么多条"
+    assert flight.most_per_runner == 1, "每张表的查询仍一条一条发"
+    assert job["queries"] == sum(t["queries"] for t in job["tables"])
+
+
+async def test_tables_side_by_side_show_as_running_together_and_start_in_order(client, make_source, scenic_db,
+                                                                               monkeypatch):
+    sid = await make_source(scenic_db, options=_on(table_concurrency=2))
+    hold = _hold(monkeypatch)
+    job = (await _start(client, sid, ["channels", "visits", "orders"])).json()["job"]
+    await _waiting(hold, 2)
+    await asyncio.sleep(0.1)
+    assert hold.waiting == 2, "第三张等前两张中有一张做完才开始"
+    running = await _job(client, sid, job["id"])
+    by = {t["table_name"]: t for t in running["tasks"]}
+    assert by["channels"]["status"] == by["visits"]["status"] == "running"
+    assert by["channels"]["current"] and by["visits"]["current"]
+    assert by["orders"]["status"] == "pending"
+    busy = await _start(client, sid, ["orders"])
+    assert busy.status_code == 409 and "正在剖析：已完成 0 / 3 张表" in busy.json()["detail"]
+    assert "orders 在这次剖析里，排第 3 张" in busy.json()["detail"]
+
+    hold.release.set()
+    done = await _finished(client, sid, job["id"])
+    assert done["status"] == "succeeded"
+    by = {t["table_name"]: t for t in done["tasks"]}
+    assert by["orders"]["started_at"] >= min(by["channels"]["finished_at"], by["visits"]["finished_at"])
+
+
+def _at_orders_codes(source, sql, **kw) -> bool:
+    return "GROUP BY status" in sql and "FROM orders" in sql
+
+
+async def test_stopping_side_by_side_tables_writes_what_each_has_done(client, make_source, scenic_db, monkeypatch):
+    """visits、orders 同时停在码值上：两张做完的项都照常写进目录，没做的记停止；还没开始的 channels 记停止。"""
+    sid = await make_source(scenic_db, options=_on(table_concurrency=2), draft=["visits", "orders"])
+    hold = _hold(monkeypatch, lambda source, sql, **kw: _at_visits_codes(source, sql) or _at_orders_codes(source, sql))
+    job = (await _start(client, sid, ["visits", "orders", "channels"])).json()["job"]
+    await _waiting(hold, 2)
+
+    r = await client.post(f"{_url(sid)}/{job['id']}/cancel")
+    assert r.status_code == 200, r.text
+    stopped = r.json()["job"]
+    by = {t["table_name"]: t for t in stopped["tasks"]}
+    assert stopped["status"] == "cancelled"
+    assert by["visits"]["status"] == by["orders"]["status"] == "partial"
+    assert by["visits"]["error"] == "剖析已停止：已做完的 4 项照常写进了数据目录，剩下 2 项没查"
+    assert by["orders"]["error"].startswith("剖析已停止：已做完的 ")
+    assert by["channels"]["status"] == "cancelled" and by["channels"]["error"] is None
+    assert _relation((await _notes(client, sid, "visits"))["notes"], "gate_id")["status"] == "verified"
+    orders = (await _notes(client, sid, "orders"))["notes"]
+    assert _relation(orders, "channel_id")["source"] == "fk" and _relation(orders, "channel_id")["cardinality"]
+
+
+async def test_three_failures_stop_side_by_side_tables_and_nothing_new_starts(client, make_source, scenic_db,
+                                                                              monkeypatch):
+    """行数照常估出来，之后的查询等 visits、orders 各发出一条才一起失败；第 3 条失败时两张都还有要查的项：两张都没做完，
+    剩下的项记止损的原因；后面的表不再开始。"""
+    sid = await make_source(scenic_db, options=_on(table_concurrency=2), draft=["visits", "orders"])
+    real, sent, both = data_engine.run_query, 0, asyncio.Event()
+
+    async def broken(source, sql, *, limits=None):
+        nonlocal sent
+        if " AS one FROM " in sql:                   # 估行数
+            return await real(source, sql, limits=limits)
+        sent += 1
+        if sent == 2:
+            both.set()
+        await both.wait()
+        raise RuntimeError("connection refused by the server")
+
+    monkeypatch.setattr(data_engine, "run_query", broken)
+    job = await _profile(client, sid, ["visits", "orders", "channels", "members"])
+    assert job["status"] == "partial" and job["stop_reason"] == "failed"
+    assert job["error"] == "连续 3 条查询失败，已停止剖析：connection refused by the server"
+    assert job["errors"] == 3 and all(q["outcome"] == "error" for t in job["tables"] for q in t["query_log"][1:])
+    visits, orders, channels, members = (_table(job, n) for n in ("visits", "orders", "channels", "members"))
+    assert visits["status"] == orders["status"] == "partial", "同时在做的两张都收尾"
+    assert visits["error"] == orders["error"] == job["error"]
+    assert "failed" in _reasons(visits) and "failed" in _reasons(orders)
+    assert channels["status"] == members["status"] == "cancelled"
+    assert channels["error"] == members["error"] == job["error"]
+    assert channels["queries"] == members["queries"] == 0, "止损之后不再开始新的表"
+
+
+async def test_disabling_the_source_lets_side_by_side_tables_finish(client, make_source, scenic_db, monkeypatch):
+    sid = await make_source(scenic_db, options=_on(table_concurrency=2))
+    hold = _hold(monkeypatch, lambda source, sql, **kw: "FROM channels" in sql or "FROM orders" in sql)
+    job = (await _start(client, sid, ["channels", "orders", "visits"])).json()["job"]
+    await _waiting(hold, 2)
+    async with SessionLocal() as session:
+        row = await session.get(DataSource, sid)
+        row.enabled = False
+        await session.commit()
+    hold.release.set()
+    done = await _finished(client, sid, job["id"])
+    by = {t["table_name"]: t for t in done["tasks"]}
+    assert by["channels"]["status"] == by["orders"]["status"] == "ok", "正在做的几张做完"
+    assert by["visits"]["status"] == "cancelled"
+    assert "已停用" in by["visits"]["error"] and by["visits"]["error"] == done["error"]
+    assert done["status"] == "partial" and done["stop_reason"] is None
+
+
+async def test_a_table_failing_the_job_stops_the_side_by_side_tables_with_its_reason(client, make_source, scenic_db,
+                                                                                     monkeypatch):
+    """visits 取码值时快照被改动、任务整体失败：同时在做的 channels 照停止收尾（做完的项照常写），原因写快照这一句；还没
+    开始的 orders 记失败。"""
+    from app.data.engine import SnapshotTampered
+
+    sid = await make_source(scenic_db, options=_on(table_concurrency=2), draft=["visits"])
+    real_codes = catalog_profile._check_codes
+    said = "数据文件与登记的版本不一致，可能被修改过，已拒绝查询"
+
+    async def tampered(cx, table, *args, **kwargs):
+        if table == "visits":
+            raise SnapshotTampered(said)
+        return await real_codes(cx, table, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_profile, "_check_codes", tampered)
+    hold = _hold(monkeypatch, lambda source, sql, **kw: "FROM channels" in sql)
+    job = await _profile(client, sid, ["visits", "channels", "orders"])
+    assert hold.waiting == 0, "等着的那条查询停掉了"
+    assert job["status"] == "failed" and job["error"] == said
+    visits, channels, orders = (_table(job, n) for n in ("visits", "channels", "orders"))
+    assert visits["status"] == "failed" and visits["error"].startswith(f"{said}：已查完的 4 项没有写进数据目录")
+    assert channels["status"] == "partial"
+    assert channels["error"].startswith(f"{said}：已做完的 0 项照常写进了数据目录")
+    assert {s["reason"] for s in channels["skipped"]} >= {"cancelled"}
+    assert orders["status"] == "failed" and orders["error"] == said
+
+
+async def test_side_by_side_tables_estimate_a_shared_table_once(monkeypatch):
+    """两张表同时要同一张表的行数：后来的等先来的估完、用它的结果；先来的没估成（停了），后来的自己估。"""
+    calls: list[str] = []
+    release = asyncio.Event()
+
+    async def estimate(run, dialect, meta, table, *, max_scan_rows):
+        calls.append(table)
+        await release.wait()
+        if len(calls) == 1 and fail_first:
+            raise catalog_profile._Stop("budget")
+        return catalog_profile.TableSize(rows=12, method="count"), []
+
+    monkeypatch.setattr(catalog_profile, "estimate_size", estimate)
+    source = SimpleNamespace(id="s", name="shop", kind="sqlite", options={},
+                             schema_cache={"tables": {"members": {"columns": [{"name": "id", "type": "INTEGER"}]}}})
+    for fail_first in (False, True):
+        calls.clear()
+        release.clear()
+        cx = catalog_profile.make_context(source, ProfileSettings(enabled=True, table_concurrency=2), options={})
+        a, b = (catalog_profile._TableCx(cx, name, catalog_profile.TableResult(table=name),
+                                         catalog_profile.TableHooks()) for name in ("visits", "orders"))
+        first = asyncio.ensure_future(a.size("members", a.result))
+        second = asyncio.ensure_future(b.size("members", b.result))
+        await asyncio.sleep(0.01)
+        assert calls == ["members"], "后来的在等，没有再估一遍"
+        release.set()
+        got = await asyncio.gather(first, second, return_exceptions=True)
+        if fail_first:
+            assert isinstance(got[0], catalog_profile._Stop) and got[1].rows == 12
+            assert calls == ["members", "members"], "先来的没估成，后来的自己估"
+        else:
+            assert got[0].rows == got[1].rows == 12 and calls == ["members"]
 
 
 # --------------------------------------------------------------------------

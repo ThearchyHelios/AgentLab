@@ -499,7 +499,7 @@ async def _start_profile(session: AsyncSession, row: DataSource, source: Any, *,
 async def create_profile_job(source_id: str, payload: ProfileJobIn, x_actor: str | None = Header(default=None),
                              session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """建后台剖析任务，马上返回（202，任务是排队中）。tables 非空时范围是 selected（表结构里没有、视图、没有可剖析的项照样
-    建进任务、状态 skipped），否则按 scope（缺省 needed）挑。同源有排队或进行中的剖析任务 409 profile_busy（说清进行到第几张；
+    建进任务、状态 skipped），否则按 scope（缺省 needed）挑。同源有排队或进行中的剖析任务 409 profile_busy（说清做完了几张；
     界面改去 GET /profile-jobs/active 显示那一个），按范围挑出 0 张表 409 profile_nothing；同源有起草任务时照建，排在它后面
     （waiting_for = "draft"），起草结束后自动开始。"""
     if payload.tables and len(payload.tables) > catalog_profile_jobs.MAX_TABLES:

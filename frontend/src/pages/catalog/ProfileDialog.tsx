@@ -34,7 +34,7 @@ import type { ProfileStartBody } from './profileJob'
 //
 // 开始前：范围（已选 / 当前筛选 / 需要剖析的表（默认）/ 全部表 / 取值观察，个数按清单上每行的 profile_due、profile_checks、
 // 有没有数据目录算；取值观察只观察不剖析，最近观察过的服务端这次不观察，张数是上限）、按表写的预算和这次最多约几条查询、
-// 醒目一句「只读查询、一条一条发、可随时停止」；同一个数据源有起草任务时按钮写「排队剖析」。
+// 醒目一句「只读查询、一条一条发（同时剖析几张表时写明张数）、可随时停止」；同一个数据源有起草任务时按钮写「排队剖析」。
 // 进行中：几张 / 共几张、已发几条查询、用时，按表数的真进度条，停止；逐表一行（状态、各类检查的进度、查询数、用时、正在做
 // 哪一项），点一行展开这张表的检查清单、发现和发过的查询。
 // 结束后：汇总（各状态几张、核实了什么）、止损和停止的原因照实写、按「有发现 / 有跳过 / 失败」筛、重试没做完的表；码值的
@@ -288,7 +288,7 @@ export function ProfileDialog({
         {settings.enabled && <Budget settings={settings} sourceName={sourceName} tables={picked.tables.length} onSettings={onSettings} />}
         <p className="flex items-start gap-1.5 rounded-md px-2 py-1.5 text-2xs leading-relaxed text-dim" data-profile-readonly=""
            style={{ background: 'var(--st-waiting-soft)' }}>
-          <ShieldAlert size={12} className="mt-px shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden /> <span>{PT.readOnly}</span>
+          <ShieldAlert size={12} className="mt-px shrink-0" style={{ color: 'var(--st-waiting)' }} aria-hidden /> <span>{PT.readOnly(settings.table_concurrency)}</span>
         </p>
         {draftActive && settings.enabled && (
           <p className="flex items-start gap-1.5 text-2xs leading-relaxed text-dim" data-profile-queue="">
@@ -359,12 +359,16 @@ export function ProfileDialog({
   )
 }
 
-/** 确认前写明预算：按表的查询数和时长、单条时限、抽样规模、整表统计的门槛，再按这次的表数估一个上限 */
+/**
+ * 确认前写明预算：按表的查询数和时长、单条时限、抽样规模、整表统计的门槛、同时剖析几张表，再按这次的表数估一个上限
+ * （时长按同时剖析的张数分几轮算）
+ */
 function Budget({ settings: s, sourceName, tables, onSettings }: {
   settings: CatalogProfileSettings; sourceName: string; tables: number; onSettings: () => void
 }) {
   const lines = [PT.budgetPerTable(s.table_max_queries, s.table_max_s), PT.budgetQuery(s.query_timeout_s), PT.budgetSample(s.sample_size),
-    PT.budgetScan(s.max_scan_rows)]
+    PT.budgetScan(s.max_scan_rows), PT.budgetPace(s.table_concurrency)]
+  const rounds = Math.ceil(tables / Math.max(1, s.table_concurrency))
   return (
     <div className="rounded-lg border px-3 py-2.5" data-profile-budget={`${s.table_max_queries},${s.table_max_s},${s.query_timeout_s}`}>
       <div className="mb-1.5 flex flex-wrap items-center gap-2 text-2xs">
@@ -384,7 +388,7 @@ function Budget({ settings: s, sourceName, tables, onSettings }: {
       </ul>
       {tables > 0 && (
         <p className="tnum mt-1.5 text-xs font-medium" data-profile-budget-total={tables * s.table_max_queries}>
-          {PT.budgetTotal(tables, tables * s.table_max_queries, spanText(tables * s.table_max_s))}
+          {PT.budgetTotal(tables, tables * s.table_max_queries, spanText(rounds * s.table_max_s))}
         </p>
       )}
     </div>
@@ -588,7 +592,7 @@ export function checksText(t: Pick<CatalogProfileTaskRow, 'checks_by_kind'>): st
 
 /**
  * 没来得及收尾的表：开始剖析了（有开始时刻），却以「已停止」结束。正常收尾的表状态按逐表算（完成、部分完成、失败、跳过），
- * 不会是已停止；没开始就停下的表没有开始时刻。只有进程被杀（下次启动时才标中断）或停止时服务端没在跑它，正在做的那张才以
+ * 不会是已停止；没开始就停下的表没有开始时刻。只有进程被杀（下次启动时才标中断）或停止时服务端没在跑它，正在做的那几张才以
  * 已停止结束——目录只在整张表结束时和它的结果一起写，它这次一项结论都没写进去（服务端把查完的项改记跳过，这张表的原因
  * 写明查完的几项没写进目录；一项都还没查完时原因就是任务的那一句）
  */
