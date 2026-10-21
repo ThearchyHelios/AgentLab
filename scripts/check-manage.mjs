@@ -1628,7 +1628,7 @@ await section('数据 · 遮罩列（证据面板的 mask_columns）', async () 
     && await field.locator('[data-mask-chip="phone"]').count() === 1)
   const boundary = await field.locator('[data-mask-boundary]').innerText().catch(() => '')
   check('写明遮罩只减少暴露、不是安全边界', boundary.includes('遮罩只减少暴露，不是安全边界'), boundary)
-  // 口径同 README.zh-CN.md「哪些角色看得到原值」：未开启登录时对谁都只减少暴露，开了登录对使用者是边界——两头都说清
+  // 口径同 docs/zh-CN/identity-and-security.md「哪些角色看得到原值」：未开启登录时对谁都只减少暴露，开了登录对使用者是边界——两头都说清
   check('……并写明开启登录后对使用者是边界', await field.locator('[data-mask-boundary]').getAttribute('data-mask-boundary') === 'off'
     && boundary.includes('开启登录后，遮罩对使用者是边界'), boundary)
   check('高级连接参数里不再另摆一个遮罩的文本框（只有这一处）', await ed.locator('#ds-adv-mask_columns').count() === 0)

@@ -48,6 +48,6 @@ echo "测试库：127.0.0.1:${PORT}/${DB}（容器 ${NAME}，结束后删除）"
 cd "$ROOT/backend"
 args=("$@")
 [ ${#args[@]} -eq 0 ] && args=(-n auto)
-# 同 README.zh-CN.md「开发与验证」：环境里的密钥不带进测试
+# 同 docs/zh-CN/development.md「测试」：环境里的密钥不带进测试
 env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u OPENAI_API_KEY \
   "$PY" -m pytest "${args[@]}"

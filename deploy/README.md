@@ -250,8 +250,8 @@ docker run --rm --user 10001:10001 -v "$(pwd)/data:/data" --env-file agentlab.en
 
 **多进程。** 换成 PostgreSQL 之后可以在容器里起几个工作进程：`agentlab.env` 里加 `AGENTLAB_WORKERS=4`（缺省 1）再
 `./deploy.sh upgrade`。几个进程共用一个端口，各自在库里登记、续租约；一个进程没了，别的进程在租约到期后接手它留下的运行、
-问数据和后台任务（规矩见仓库 [README.zh-CN.md](../README.zh-CN.md#多进程)「多进程」）。SQLite 时设大于 1 会启动失败（照实报错：SQLite 只支持单进程）。
-几台机器、几个容器指着同一个库也行，但数据目录要放在共享存储上、每台挂在同一个路径，限制见仓库 [README.zh-CN.md](../README.zh-CN.md#多进程)「多进程」。
+问数据和后台任务（规矩见仓库 [docs/zh-CN/postgresql-and-scaling.md](../docs/zh-CN/postgresql-and-scaling.md#多进程)「多进程」）。SQLite 时设大于 1 会启动失败（照实报错：SQLite 只支持单进程）。
+几台机器、几个容器指着同一个库也行，但数据目录要放在共享存储上、每台挂在同一个路径，限制见仓库 [docs/zh-CN/postgresql-and-scaling.md](../docs/zh-CN/postgresql-and-scaling.md#多台机器)「多台机器」。
 
 内置 PostgreSQL 是直连（中间没有 PgBouncer），多进程时什么都不用另设（不用 `AGENTLAB_DATABASE_DIRECT_URL`；设了它、或者
 `AGENTLAB_DB_PGBOUNCER=1`，deploy.sh 照实拦下）。库还是 SQLite 时 `AGENTLAB_WORKERS` 大于 1，deploy.sh 在起容器之前就拦下。新旧版本的进程不能同时
@@ -317,7 +317,7 @@ cp ../agentlab-<旧版本>-linux-__AGENTLAB_ARCH__/agentlab.env .   # 沿用原�
 - **默认不开登录。** 不开登录时，同一网络里打得开页面的人都能用它：跑工作流、花你配的模型额度、
   读你接入的数据源、在沙箱里执行代码，审批记的是各自填的署名、未经核实。只在信得过的网络里这样用。
   多人使用请开登录：`agentlab.env` 里设 `AGENTLAB_AUTH_MODE=local`（账号密码）或 `oidc`（单点登录），
-  `./deploy.sh install` 生效，第一次打开登录页时建第一个管理员。角色、权限和遮罩的边界见仓库 [README.zh-CN.md](../README.zh-CN.md#身份与权限) 的「身份与权限」。
+  `./deploy.sh install` 生效，第一次打开登录页时建第一个管理员。角色、权限和遮罩的边界见仓库 [docs/zh-CN/identity-and-security.md](../docs/zh-CN/identity-and-security.md)。
 - 忘了管理员密码：`docker exec -it agentlab python -m app.auth reset-admin`（不给 `--password` 时随机生成并打印一次）。
 - 用防火墙限制能访问端口的来源。注意 Docker 发布的端口会绕过 ufw 的默认规则，要么把 `BIND_ADDR`
   设成具体网卡的地址或 `127.0.0.1`，要么在 `DOCKER-USER` 链里加规则。
