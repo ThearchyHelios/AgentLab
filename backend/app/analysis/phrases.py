@@ -219,10 +219,11 @@ def _shorten(text: str) -> str:
 
 
 def _judges(text: str) -> bool:
-    """叫法里有没有说法表的判断词（「主要来自」「历史新高」……）。说法核对在 engine 里，在这里导入免得循环导入。"""
+    """叫法里有没有说法表的判断词（「主要来自」「历史新高」……）。说法核对在 engine 里，在这里导入免得循环导入。
+    叫法是一个名字不是一句话，按词认（bare）：整句话才成立的那些不核的规矩（没说变化的构成、建议计划……）不用。"""
     from app.engine.analysis_claims import scan
 
-    return bool(scan(text))
+    return bool(scan(text, bare=True))
 
 
 def _scrub(text: str) -> str:
