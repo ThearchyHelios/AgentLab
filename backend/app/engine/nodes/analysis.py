@@ -56,7 +56,12 @@ async def run_analysis(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if errors := [i for i in analysis_issues(ctx.run.spec, ctx.node) if i.level == "error"]:
         raise NodeError(ctx.node.id, errors[0].message)
     items: list[dict[str, Any]] = ctx.config["items"]
-    settings = await settings_of(run_snapshot(ctx.run), ctx.config.get("overrides") or None)
+    overrides = ctx.config.get("overrides") or None
+    settings = await settings_of(run_snapshot(ctx.run), overrides)
+    # 画图时阈值覆盖只能对着缺省值校验；合并了这次运行的设置快照以后再核一遍（管理员把「超出常规波动」调到 3、卡上把「明显
+    # 超出」覆盖成 2.5，就永远判不出超出）。这是配置错误，不是数据问题：让卡失败、说清冲突在哪
+    if overrides and (problem := contract.settings_problem(settings)):
+        raise NodeError(ctx.node.id, f"阈值覆盖和这次运行的分析设置冲突：{problem}。请改分析卡上的阈值覆盖")
 
     queries = [e for e in state.get("evidence") or [] if isinstance(e, dict) and e.get("kind") == "query"]
     inputs: dict[str, InputSnapshot] = {}

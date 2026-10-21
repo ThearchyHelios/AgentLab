@@ -68,3 +68,16 @@ async def test_a_structural_call_error_still_fails_the_card_and_names_the_item()
     assert row.status == "failed"
     assert "分析项「where」（变化拆解）" in row.error and "没有「channel」这一列" in row.error
     assert "请在分析卡中改正这一项" in row.error
+
+
+async def test_overrides_that_conflict_with_the_run_settings_fail_the_card():
+    # 画图时对着缺省值校验能过（缺省「超出常规波动」是 2）；这次运行的设置把它调到 3，卡上覆盖的「明显超出」2.5 就永远判不出
+    card = node("card", "analysis", items=[WHERE], overrides={"k_alert": 2.5})
+    graph = chain(node("start", "input"), node("by_region", "tool", tool=TOOL, args={"sql": BY_REGION}), card)
+    run = await run_manager.start(graph=graph, input_payload={}, options={"analysis": {"k_warn": 3.0}})
+    row = await wait(run.id)
+    assert row.status == "failed"
+    assert "阈值覆盖和这次运行的分析设置冲突：「明显超出」的倍数要大于「超出常规波动」的倍数" in row.error
+    assert await events(row.id, "analysis.end", "card") == []
+    ok = await run_manager.start(graph=graph, input_payload={}, options={"analysis": {"k_warn": 2.0}})
+    assert (await wait(ok.id)).status == "succeeded"
