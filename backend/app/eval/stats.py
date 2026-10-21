@@ -3,6 +3,8 @@
 
 - 准确率和可追溯准确率：分母是能判的题（通过 + 不通过）；不能评分、跳过的单列，既不算对也不算错，没跑的（停止、中断、
   到了上限、止损没开评）另列 not_run，出错的另列 errors。都带 Wilson 95% 区间和样本数——题集小、模型有随机性，差两三题就可能被读成「变好了」「变差了」（评测-D10：只展示、不卡门）。
+- 各期望的结论（必需的、文字要点除外）合起来一份，另按期望的种类各一份（outcomes_by_kind：贡献、判定这些分析题和
+  一个数、多行分开看）。
 - 作答路径、出具档位（声明了出具的按 formal / degraded / withheld，没声明的单列「探索问答」）、复核结论（verdict × severity）
   和自动重来的次数、复核用时超过问数据页等待（25 秒）的题数。
 - 结论裁判（打开了才有）：supported / partial / contradicted / insufficient / 未判的句数；文字要点的判断单列。
@@ -77,6 +79,11 @@ def summarize(results: Sequence[Mapping[str, Any]], *, judge_on: bool = False) -
     traced = [r for r in passed if r.get("traced")]
     outcomes = Counter(s.get("outcome") for r in done for s in r.get("scores") or []
                        if s.get("required") and s.get("kind") != "text")
+    by_kind: dict[str, Counter] = {}
+    for r in done:
+        for s in r.get("scores") or []:
+            if s.get("required") and s.get("kind") != "text":
+                by_kind.setdefault(str(s.get("kind")), Counter())[s.get("outcome")] += 1
     text = Counter(s.get("outcome") for r in done for s in r.get("scores") or [] if s.get("kind") == "text")
     answered = [r for r in done if r.get("path")]
     tiers = Counter((r.get("tier") or "explore") for r in answered if r.get("path") == "ran")
@@ -113,6 +120,7 @@ def summarize(results: Sequence[Mapping[str, Any]], *, judge_on: bool = False) -
         "accuracy": rate(len(passed), len(graded)),
         "traced_accuracy": rate(len(traced), len(graded)),
         "outcomes": dict(outcomes),
+        "outcomes_by_kind": {kind: dict(found) for kind, found in by_kind.items()},
         "text": dict(text),
         "paths": dict(Counter(r.get("path") for r in answered)),
         "tiers": {k: tiers.get(k, 0) for k in TIERS},

@@ -14,7 +14,8 @@ app/chat/job.py），生成过程是 api/copilot.answer_ops，几个「决定」
   同一个规矩先带着原因重来一次，还不行才记建图失败。每次重来的原因照实记在 retries。
 - 运行：fill_input 填入口字段（单轮，history 为空），来源 eval，名字「评测：题集名·第 n 题」，选项带目录视图（Run.options
   的 catalog_view：运行时的 db_schema、冻结快照、自查都按它）、只读和遮罩（同使用者的问数据运行：评测页会显示答案里的数，
-  遮罩值不能从这里露出来；评测不写业务库）。写作模型按变体写进图的 defaults：节点自己点了模型的不覆盖，照实记在
+  遮罩值不能从这里露出来；评测不写业务库），有分析期望的题集另带这次评测的分析设置快照（判定用的阈值和算期望同一份）。
+  写作模型按变体写进图的 defaults：节点自己点了模型的不覆盖，照实记在
   own_models。
 - 终态：停在审批上（危险工具、人工节点）的直接取消、记「评测不代批」；被驳回的（cancelled + end_reason=rejected，总方案
   X9）记路径「被驳回」，不算运行失败；失败、被停止记运行失败。
@@ -68,6 +69,8 @@ class TurnContext:
     writer: Mapping[str, Any] = field(default_factory=dict)
     #: 目录视图（Run.options['catalog_view'] 的形状）
     view: Mapping[str, Any] | None = None
+    #: 这次评测的分析设置快照（有分析期望的题集才有）：作答的运行按它判（Run.options['analysis']），和算期望同一份
+    analysis: Mapping[str, Any] | None = None
 
 
 async def writer_usage(run_ids: list[str]) -> dict[str, Any]:
@@ -116,14 +119,18 @@ def with_writer(graph: dict[str, Any], writer: Mapping[str, Any]) -> tuple[dict[
     return out, own
 
 
-def _options(view: Mapping[str, Any] | None) -> dict[str, Any]:
-    """作答运行带的选项：目录视图、只读、遮罩（见模块说明）。"""
+def _options(view: Mapping[str, Any] | None, analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """作答运行带的选项：目录视图、只读、遮罩（见模块说明）；有分析期望的题集另带这次评测的分析设置快照（发起时
+    engine/launch 见调用方给了就照它的，不再现读设置）：判「主要来自」「超出常规波动」的阈值和算期望的是同一份。"""
+    from app.analysis.contract import SETTINGS_KEY
     from app.data.catalog_view import OPTION_KEY
     from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
 
     out: dict[str, Any] = {MASK_RESULTS_OPTION: True, READ_ONLY_OPTION: True}
     if view:
         out[OPTION_KEY] = dict(view)
+    if analysis is not None:
+        out[SETTINGS_KEY] = dict(analysis)
     return out
 
 
@@ -168,8 +175,8 @@ class Driver(TurnDriver):
             "suite_id": self.ctx.suite_id, "eval_run_id": self.ctx.eval_run_id, "case_id": self.ctx.case_id,
             "role": "answer", "arm": self.ctx.arm, "repeat": self.ctx.repeat, "attempt": self.turn.attempts}.items()
             if v is not None}
-        return {"actor": self.ctx.actor, "options": _options(self.ctx.view), "origin_kind": "eval", "origin": origin,
-                "workflow_name": run_name(self.ctx.suite_name, self.ctx.case_seq)}
+        return {"actor": self.ctx.actor, "options": _options(self.ctx.view, self.ctx.analysis), "origin_kind": "eval",
+                "origin": origin, "workflow_name": run_name(self.ctx.suite_name, self.ctx.case_seq)}
 
     async def on_interrupted(self, run_id: str, row: Any) -> Any | None:
         t = self.turn

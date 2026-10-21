@@ -3,8 +3,13 @@
 **期望不靠人填数，也不冻结数值。** 每次要期望（保存题目时试算一次、评测时作答前后各一次）都在业务库上重算一遍：
 
 - SQL 题、从运行认定：建一张「入口 → 调用工具（db_query__数据源，args.sql = 按截至时间渲染好的 SQL）→ 出口」的裸图，
-  以来源 eval 跑探索运行。期望值取这次运行封存的查询快照里指定的格、列或整张表（cases.py 的 expectations）。从运行认定
+  以来源 eval 发起探索运行。期望值取这次运行封存的查询快照里指定的格、列或整张表（cases.py 的 expectations）。从运行认定
   的题和 SQL 题算法一样，只是 SQL 出自某次运行里的一条查询、记着谁在什么时候认定的。
+- 分析期望（贡献、判定）：在同一份查询快照上用平台的算子算一次分析（app.analysis.run，和作答里的分析工具、分析卡同一个
+  函数；随数据变化的调用错误记成算不了，refuse_data_errors），判定就是期望（app/eval/judgements.py）。阈值用这次评测的
+  分析设置快照（Context.analysis，和作答的运行同一份；试算时现读设置），遮罩列、目录事实、现查表的日期范围和分析工具
+  同一套取法（app/tools/analysis.py）。算不了的这一项照实记（评分时不能评分），参数和期望 SQL 的结果对不上（列不在、期次
+  不在）的整题没有可用的值。
 - 口径题：app/ledger/derive.caliber_probe 从钉住版本拷出口径卡读的取数节点、接一张 caliber_from 固定到那一版的口径卡，
   跑探索运行，期望值就是口径卡的指标（取整、单位、比率都由口径卡自己定）。不可复用的卡拒收并给原因。
 
@@ -31,7 +36,8 @@ unresolved_caliber_upgrades（和正式运行用的是同一个判断），再�
 - incomparable：旧题归档，按新版本另建一道新题、重开基线。
 
 **作答前后各算一次**（bracket / settle，第 3 波的执行调它）：两次一样才判；不一样就记「作答期间数据变了，不判」。A/B 两臂
-共用同一次算出的期望：在 answer 里同时跑两臂即可。
+共用同一次算出的期望：在 answer 里同时跑两臂即可。两次比的是期望值本身：分析结论里随运行当天、现查时刻、输入快照的
+工件变的几项不比（judgements.steady）。
 """
 from __future__ import annotations
 
@@ -157,6 +163,8 @@ class Context:
     #: 记进运行 origin 的其余字段（臂、第几次重复、试算……）
     extra: Mapping[str, Any] = field(default_factory=dict)
     timeout_s: float = TRIAL_TIMEOUT_S
+    #: 这次评测的分析设置快照（runner 开评时拍一份，作答的运行带同一份）；没有（试算）时现读设置
+    analysis: Mapping[str, Any] | None = None
 
     def variables(self) -> dict[str, str]:
         return variable_values(self.as_of, self.tz, self.cron)
@@ -388,6 +396,83 @@ def _values(expectations: Sequence[Mapping[str, Any]], pick: Callable[[Mapping[s
 
 
 # ==========================================================================
+# 分析期望：在期望 SQL 的快照上算一次分析（app/eval/judgements.py）
+# ==========================================================================
+
+
+@dataclass
+class _Analyses:
+    """一道题的几项分析期望共用的那几样：输入快照（含遮罩列）、阈值、算子的运行期依赖。用到时才备（_prepared）。"""
+
+    snapshot: dict[str, Any]
+    artifact: str
+    run_id: str
+    ctx: Context
+    ready: tuple[Any, dict[str, Any], Any] | None = None
+
+
+async def _prepared(found: _Analyses) -> tuple[Any, dict[str, Any], Any]:
+    """(算子的输入快照, 阈值, 运行期依赖)：遮罩列、目录事实、现查表的日期范围同分析工具（app/tools/analysis.py），按这次
+    探针运行固定的数据版本解析数据源；阈值是这次评测的分析设置快照，没有（试算）现读设置。"""
+    if found.ready is not None:
+        return found.ready
+    from app.db.base import SessionLocal
+    from app.db.models import Run
+    from app.eval.judgements import GOLD_REF
+    from app.tools.analysis import context_of, input_snapshot, masked_of, settings_of
+    from app.tools.registry import ToolContext
+
+    inp = input_snapshot(found.snapshot, ref=GOLD_REF, artifact=found.artifact, node_id=QUERY_NODE,
+                         masked=await masked_of(found.snapshot, found.artifact))
+    async with SessionLocal() as session:
+        row = await session.get(Run, found.run_id)
+        versions = dict(row.data_versions) if row is not None and row.data_versions is not None else None
+    tool_ctx = ToolContext(run_id=found.run_id, node_id=QUERY_NODE, data_versions=versions, mask_results=True,
+                           force_readonly=True, fixed_scope=True)
+    context = await context_of([inp], tool_ctx=tool_ctx)
+    found.ready = (inp, await settings_of(found.ctx.analysis), context)
+    return found.ready
+
+
+async def _analysis_value(exp: Mapping[str, Any], at: int, found: _Analyses) -> dict[str, Any]:
+    """一项分析期望的期望值（judgements.expected）。算不了（历史不够、本期不完整……）照实记成这一项的结论；参数和期望 SQL
+    的结果对不上（列不在、期次不在、不是乘积关系……）抛 _NoValue（整题没有可用的值，试算时照实交回去改）。"""
+    import app.analysis as analysis_ops   # 按模块取 run：测试换替身时只换模块上的这一个函数
+    from app.analysis.contract import CallError
+    from app.eval import judgements
+
+    where = f"第 {at + 1} 个期望（{'贡献' if exp.get('kind') == 'contribution' else '判定'}）"
+    if found.snapshot.get("truncated"):
+        raise _NoValue("期望 SQL 的结果被截断（只取回了前一部分行），分析期望算不准：请缩小范围或在 SQL 里汇总")
+    inp, settings, context = await _prepared(found)
+    try:
+        request = judgements.request_of(exp, found.ctx.variables(), found.snapshot)
+    except judgements.ParamsInvalid as e:
+        raise _NoValue(f"{where}的{e.message}") from None
+    try:
+        result = await analysis_ops.run(request, lambda name: inp if name == judgements.GOLD_REF else None,
+                                        settings=settings, context=context, refuse_data_errors=True)
+    except CallError as e:
+        raise _NoValue(f"{where}的分析参数和期望 SQL 的结果对不上：{e.message}") from None
+    return judgements.expected(exp, result)
+
+
+async def _sql_values(case: Mapping[str, Any], snapshot: dict[str, Any], artifact: str, run_id: str,
+                      ctx: Context) -> dict[str, dict[str, Any]]:
+    """SQL 题每个期望的值（按期望的先后）：取格、列、整张表的照快照取，分析期望在同一份快照上算。取不到抛 _NoValue。"""
+    from app.eval.judgements import ANALYSIS_KINDS
+
+    found = _Analyses(snapshot=snapshot, artifact=artifact, run_id=run_id, ctx=ctx)
+    out: dict[str, dict[str, Any]] = {}
+    for at, exp in enumerate(case["expectations"]):
+        if exp.get("kind") not in NEEDS_GOLD:
+            continue
+        out[exp["id"]] = await _analysis_value(exp, at, found) if exp.get("kind") in ANALYSIS_KINDS \
+            else _sql_value(exp, snapshot)
+    return out
+
+
+# ==========================================================================
 # SQL 探针（SQL 题、从运行认定）
 # ==========================================================================
 
@@ -437,7 +522,7 @@ async def _sql_gold(case: Mapping[str, Any], ctx: Context) -> GoldOutcome:
     if problem := masked_problem(snapshot):
         return _outcome("refused", ctx.as_of, problem, GOLD_MASKED, run_ids=runs, rendered=rendered)
     try:
-        values = _values(case["expectations"], lambda e: _sql_value(e, snapshot))
+        values = await _sql_values(case, snapshot, artifact_id, ran.run_id, ctx)
     except _NoValue as e:
         return _outcome("no_value", ctx.as_of, str(e), GOLD_NO_VALUE, run_ids=runs, rendered=rendered)
     return _outcome("ok", ctx.as_of, sets=[GoldSet(run_id=ran.run_id, snapshot=artifact_id, values=values)],
@@ -622,10 +707,23 @@ class Settled:
                 "after": self.after.to_dict() if self.after is not None else None}
 
 
+def stable_sets(sets: Sequence[Any]) -> list[list[Any]]:
+    """比较用的几份期望值：[[版本, {期望 id: 值}]]，分析结论里随运行当天、现查时刻、输入快照的工件变的几项去掉
+    （judgements.steady）。sets 是 GoldSet 或它的 to_dict。作答前后两次（_fingerprint）、和上一次比的「数据变了」
+    （runner.gold_key）都按它。"""
+    from app.eval.judgements import steady
+
+    out = []
+    for s in sets:
+        version, values = (s.version, s.values) if isinstance(s, GoldSet) else (s.get("version"), s.get("values"))
+        out.append([version, {k: steady(v) for k, v in values.items()} if isinstance(values, Mapping) else values])
+    return out
+
+
 def _fingerprint(outcome: GoldOutcome) -> str:
     from app.core.artifact_store import canonical_json
 
-    return canonical_json([[s.version, s.values] for s in outcome.sets])
+    return canonical_json(stable_sets(outcome.sets))
 
 
 def settle(before: GoldOutcome, after: GoldOutcome | None) -> Settled:
@@ -717,4 +815,4 @@ __all__ = ["CANCEL_GRACE_S", "Context", "DISPOSE_INVALID", "DISPOSE_NOTHING", "D
            "GOLD_DRIFTED", "GOLD_FAILED", "GOLD_MASKED", "GOLD_NO_VALUE", "GOLD_TIMEOUT", "GoldOutcome", "GoldSet",
            "QUERY_NODE", "ROLES", "STATUSES", "Settled", "TRIAL_TIMEOUT_S", "UPGRADE_LABEL", "UPGRADE_PENDING",
            "UpgradeState", "bracket", "compute_gold", "masked_problem", "plan_dispose", "settle", "sql_probe_graph",
-           "upgrade_state"]
+           "stable_sets", "upgrade_state"]

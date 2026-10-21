@@ -14,8 +14,14 @@ history 是多轮追问的位置：评测-D12 本轮只做单轮，非空一律�
 - none 期望答「没有数据」：期望 SQL 返回 0 行。
 - ask 期望反问（问法含糊）：不能和要答出数的期望写在一起，不要期望答案的来源。
 - text 文字要点（points）：由裁判判，单列「模型判断」，不计入准确率（评测-D4），所以 required 恒为 false。
+- contribution 贡献：在期望 SQL 的结果上做一次变化拆解（mode：additive / ratio / factor；params 同分析工具的参数，
+  见 app/eval/judgements.py），top_n 是期望点名主要来源的前几段（缺省 1）。期望是算出的主要来源和方向。
+- verdict 判定：op 是 baseline / trend / differ / comparable（differ 另写 mode），params 同对应的分析工具。期望是算出的
+  判定类（常规 / 异常、上升 / 下降 / 无趋势、站得住 / 不足以下结论、可比 / 不可比）。
+  这两种的参数不写输入（就是期望 SQL 的结果）、不写阈值（按这次评测的分析设置）；文字参数可以带 {{ schedule.* }}。
 **数值期望不许人填**（评测-D4）：期望里写了 value、values、expected、answer、rows 这类键的一律拒收——期望值只能由 SQL、
-口径或从运行认定的 SQL 算出来（app/eval/gold.py），人填的数会过期、会填错，也说不清是哪个口径。
+口径或从运行认定的 SQL 算出来（app/eval/gold.py），人填的数会过期、会填错，也说不清是哪个口径。分析期望同样：写了
+segment、subjects、direction、verdict 这类键（人填的来源、方向、判定）的拒收，判定由平台的算子在期望 SQL 上算。
 
 **期望答案的来源**（gold；scalar、table、set、none 要它，ask、text 不要）：
 - sql：{datasource_id, sql}。SQL 可以带 {{ schedule.* }}，按评测的截至时间渲染；保存前过只读守卫。
@@ -48,14 +54,15 @@ GOLD_GUARD = "eval_gold_guard"
 #: 口径题指的卡不能当口径题（422）：不存在、不是口径卡、不能复用、取数节点引用了入口字段以外的值
 CALIBER_NOT_REUSABLE = "eval_caliber_not_reusable"
 
-EXPECTATION_KINDS = ("scalar", "table", "set", "none", "ask", "text")
-#: 要期望答案来源的期望：数都由 SQL / 口径算
-NEEDS_GOLD = ("scalar", "table", "set", "none")
+EXPECTATION_KINDS = ("scalar", "table", "set", "none", "ask", "text", "contribution", "verdict")
+#: 要期望答案来源的期望：数都由 SQL / 口径算，分析的判定由算子在期望 SQL 的结果上算
+NEEDS_GOLD = ("scalar", "table", "set", "none", "contribution", "verdict")
 #: 不计入准确率的（评测-D4：文字要点由裁判判，单列）
 UNCOUNTED = ("text",)
 GOLD_KINDS = ("sql", "caliber", "from_run")
-#: 期望里出现这些键就是在人填数（评测-D4）
-HUMAN_VALUE_KEYS = ("value", "values", "expected", "answer", "rows", "number")
+#: 期望里出现这些键就是在人填数（评测-D4）；后几个是人填分析的结论（来源的段、方向、判定）
+HUMAN_VALUE_KEYS = ("value", "values", "expected", "answer", "rows", "number", "segment", "segments", "subjects",
+                    "direction", "verdict", "judgement", "driver")
 
 #: 每种期望认的键（另有 id、kind、required、label）
 _EXPECTATION_KEYS: dict[str, tuple[str, ...]] = {
@@ -65,6 +72,8 @@ _EXPECTATION_KEYS: dict[str, tuple[str, ...]] = {
     "none": (),
     "ask": (),
     "text": ("points",),
+    "contribution": ("op", "mode", "params", "top_n"),
+    "verdict": ("op", "mode", "params"),
 }
 _COMMON_KEYS = ("id", "kind", "required", "label")
 #: 期望答案来源的键（客户端能写的）；from_run 只能由服务端建
@@ -198,6 +207,9 @@ def _expectation(raw: Any, i: int, *, gold_kind: str | None, taken: set[str]) ->
     if kind not in EXPECTATION_KINDS:
         raise CaseInvalid(f"{where}的种类只能是 {'、'.join(EXPECTATION_KINDS)}", f"{path}.kind")
     human = [k for k in HUMAN_VALUE_KEYS if k in raw]
+    if human and kind in ("contribution", "verdict"):
+        raise CaseInvalid(f"{where}写了「{human[0]}」：分析期望的来源、方向、判定不许人填，由平台的分析方法在期望 SQL 的结果上"
+                          "算出来。请写清做哪种分析、按哪几列", f"{path}.{human[0]}")
     if human:
         raise CaseInvalid(f"{where}写了「{human[0]}」：数值期望不许人填，期望值只能由期望 SQL、口径或从运行认定的 SQL "
                           "算出来。请写清从期望答案的结果里取哪一格、哪一列或整张表", f"{path}.{human[0]}")
@@ -274,6 +286,42 @@ def _expectation(raw: Any, i: int, *, gold_kind: str | None, taken: set[str]) ->
         if len(points) > POINTS_MAX or any(len(p.strip()) > POINT_MAX for p in points):
             raise CaseInvalid(f"{where}最多 {POINTS_MAX} 条要点，每条不超过 {POINT_MAX} 个字符", f"{path}.points")
         out["points"] = [p.strip() for p in points]
+    elif kind in ("contribution", "verdict"):
+        out.update(_analysis_expectation(raw, kind, where, path))
+    return out
+
+
+def _analysis_expectation(raw: Mapping[str, Any], kind: str, where: str, path: str) -> dict[str, Any]:
+    """贡献、判定两种期望的分析方法、模式、参数（app/eval/judgements.py）。贡献恒为变化拆解，判定是另外四种分析。"""
+    from app.analysis.contract import MODES
+    from app.eval import judgements
+
+    ops = ("decompose",) if kind == "contribution" else judgements.VERDICT_OPS
+    op = raw.get("op") if raw.get("op") not in (None, "") else ("decompose" if kind == "contribution" else None)
+    if op not in ops:
+        said = "、".join(judgements.op_text(o) for o in ops)
+        raise CaseInvalid(f"{where}（{'贡献' if kind == 'contribution' else '判定'}）的分析方法只能是{said}"
+                          + ("" if op is None else f"（当前为「{op}」）"), f"{path}.op")
+    out: dict[str, Any] = {"op": op}
+    modes = MODES.get(op)
+    mode = raw.get("mode")
+    if modes:
+        if mode not in modes:
+            said = "、".join(judgements.op_text(op, m) for m in modes)
+            raise CaseInvalid(f"{where}要选一种模式：{said}", f"{path}.mode")
+        out["mode"] = mode
+    elif mode not in (None, ""):
+        raise CaseInvalid(f"{where}是{judgements.op_text(op)}，没有模式可选，请去掉模式", f"{path}.mode")
+    try:
+        params = judgements.check_params(op, out.get("mode"), raw.get("params"))
+    except judgements.ParamsInvalid as e:
+        raise CaseInvalid(f"{where}的{e.message}", f"{path}.params" + (f".{e.key}" if e.key else "")) from None
+    for key, text in judgements.template_texts(params):
+        check_variables(f"{where}的参数「{key}」", text, f"{path}.params.{key}")
+    out["params"] = params
+    if kind == "contribution":
+        out["top_n"] = _int(raw.get("top_n", 1), f"{where}点名主要来源的前几段", f"{path}.top_n", low=1,
+                            high=judgements.TOP_N_MAX)
     return out
 
 
@@ -300,8 +348,8 @@ def normalize_expectations(raw: Any, *, gold_kind: str | None, case_kind: str) -
     if "ask" in kinds and case_kind == "workflow":
         raise CaseInvalid("工作流题不会反问，期望反问只用于问数据题", "expectations")
     if gold_kind is not None and not kinds & set(NEEDS_GOLD):
-        raise CaseInvalid("有期望答案的来源，却没有要它算的期望：请加一个「一个数」「多行」「名单」或「没有数据」的期望，"
-                          "或者去掉期望答案的来源", "gold")
+        raise CaseInvalid("有期望答案的来源，却没有要它算的期望：请加一个「一个数」「多行」「名单」「没有数据」「贡献」"
+                          "或「判定」的期望，或者去掉期望答案的来源", "gold")
     return out
 
 
