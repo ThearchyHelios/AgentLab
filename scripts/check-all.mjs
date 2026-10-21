@@ -147,7 +147,8 @@ const TIMEOUT_MS = Number(process.env.CHECK_TIMEOUT_MS ?? 15 * 60_000)
 // 各检查只跑其中几段、只跑一套主题的开关。壳里留着一个 ONLY=… 就会让整套检查悄悄只跑一小截，
 // 却照样报「全部通过」，所以一律不传给子进程
 const FILTERS = ['CHECK_ONLY', 'ONLY', 'THEMES', 'FX_ONLY', 'FX_SKIP', 'STUDIO_ONLY', 'RUN_STATES_ONLY', 'RUN_STATES_SKIP',
-  'UI_KIT_ONLY', 'CHECK_THEME', 'EVIDENCE_ONLY', 'PUBLISH_ONLY', 'RUNS_ONLY']
+  'UI_KIT_ONLY', 'CHECK_THEME', 'EVIDENCE_ONLY', 'PUBLISH_ONLY', 'RUNS_ONLY', 'STREAM_ONLY', 'COMPARE_ONLY', 'INQUIRY_ONLY',
+  'SHARE_ONLY', 'ACCESS_KEYS_ONLY', 'APP_EDITOR_ONLY', 'CAPABILITIES_ONLY']
 // 另起的后端不拿会话里的模型密钥：seed 见到它们会种一个真的 provider
 const SECRETS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_API_KEY']
 // 另起的几套不许占这几个口：开发（5273 / 8000）和沙箱（5373 / 8100）
