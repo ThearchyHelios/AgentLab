@@ -18,7 +18,7 @@ This page lists, newest first, the changes in each update that affect users and 
 - The report export and the verifiable report include analysis conclusions and their input snapshots, recomputed from the sealed inputs for verification.
 - Settings gain a Preferences → Analysis section (see [Analysis settings](configuration.md#analysis-settings)). It is snapshotted into a run only when the graph has an analysis card or an agent with analysis tools, so the start records of other runs don't change at all.
 - Ask Data: Copilot gains a graph shape for analytical questions, and its self-check reminds it to give the querying agent the analysis tools (one round only). The review merges several analyses that couldn't be done into one "n analyses couldn't be done" note, without an automatic redo; analysis calls that were wrong but later fixed no longer count as a gap, and ones never fixed no longer trigger a redo of the whole turn.
-- Evaluation gains contribution and verdict expectations, and the scoring rules move to version 3 (see [Regression evaluation](evaluation-and-ledger.md#regression-evaluation)).
+- Evaluation gains contribution and verdict expectations (computed from the expected SQL with the same analyses, never typed in by hand), and the scoring rules move to version 3, so old evaluations can be re-scored under the new rules; Copilot's prompt fingerprint now includes the analysis method, so comparisons with evaluations from before the upgrade flag "Prompt changed" (see [Regression evaluation](evaluation-and-ledger.md#regression-evaluation)).
 
 ## 2026-10, orchestration improvements wave 2: PostgreSQL and multiple processes
 
