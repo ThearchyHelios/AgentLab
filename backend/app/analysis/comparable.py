@@ -3,11 +3,12 @@
 
 五项检查，每项 pass / warn / fail / unknown（unknown 只写「核对不了」，不判不可比）：
 
-- 同口径：两份 SQL 一字不差 → pass；规范化（data/sql_semantics.normalize_sql）后只差字面量：把时间条件的界（data/coverage
-  认出的时间谓词的界，整个表达式）和像日期的字面量换成同一个占位再比，一样就是只差日期 → pass，不一样就是比的两段不是
-  两期 → fail「两边除了日期，筛选的还不一样」；规范形式不同交给口径账本的 explain_sql_diff，等价 → pass，只差时间范围、排序
-  → pass，否则 fail，写出差在哪些方面（只写方面，不写 SQL 原文里的值）。两份来自不同的数据源 fail。同一份快照里按期次分组
-  的天然同口径。
+- 同口径：两份 SQL 一字不差 → pass；否则两边都去掉最外层的 ORDER BY（没有 LIMIT 时排序不改结果），把时间条件的界（data/
+  coverage 认出的时间谓词的界，整个表达式：字面量、按运行当天现算的都算）和像日期的字面量换成同一个占位，再规范化
+  （data/sql_semantics.normalize_sql）比：一样就是只差日期 → pass；只差字面量就是比的两段不是两期 → fail「两边除了日期，
+  筛选的还不一样」；还不一样交给口径账本的 explain_sql_diff（同样去掉最外层的 ORDER BY，现算的界换成按先后编号的日期字面量：
+  它只认字面量的时间范围），等价 → pass，只差时间范围、排序 → pass，否则 fail，写出差在哪些方面（只写方面，不写 SQL 原文里
+  的值）。两份来自不同的数据源 fail。同一份快照里按期次分组的天然同口径。
 - 窗口长度：用 data/coverage 的 filters 取业务日期列（目录的 business_date；没写就取唯一那一列时间谓词）上的区间，界是字面
   量的直接解析，按运行当天现算的在库里算（Book 的 bound，记进 probes）；算两边天数。整月对整月、整季对整季算一样长。
   不相等：度量是流量 fail，比率、存量、没标的 warn。按期次分组的：两期粒度相同，一样长。
@@ -70,7 +71,8 @@ class Span:
     table: str | None = None
     column: str | None = None
     sql_window: Any = None
-    unit: str | None = None          # 这一段是不是整月、整季、整年（calendar_unit），按期次时是粒度
+    unit: str | None = None          # 这一段是不是整月、整季、整年（calendar_unit），按期次时是粒度（不是整期的为 None）
+    short: int | None = None         # 按期次的这一期不到整期时有几天（periods.short_days：跨年被切开的周）
 
 
 @dataclass
@@ -93,14 +95,26 @@ class Outcome:
 # --------------------------------------------------------------------------
 
 
+def _unordered(sql: str, read: str | None) -> Any:
+    """解析成语法树，去掉最外层的 ORDER BY（同一层有 LIMIT / OFFSET 时排序决定取哪几行，不去）。解析不了为 None。"""
+    from app.data import coverage
+
+    tree = coverage.parse_sql(sql, read)
+    if tree is not None and tree.args.get("order") is not None and not tree.args.get("limit") \
+            and not tree.args.get("offset"):
+        tree.set("order", None)
+    return tree
+
+
 def _undated(sql: str, read: str | None) -> tuple[str, tuple[str, ...]] | None:
-    """时间条件的界、像日期的字面量换成同一个占位之后的规范形式（文本 + 剩下的字面量）。解析不了为 None。"""
+    """去掉最外层的 ORDER BY、时间条件的界和像日期的字面量换成同一个占位之后的规范形式（文本 + 剩下的字面量）。解析不了为
+    None。"""
     from sqlglot import exp
 
     from app.data import coverage
     from app.data.sql_semantics import normalize_sql
 
-    tree = coverage.parse_sql(sql, read)
+    tree = _unordered(sql, read)
     if tree is None:
         return None
     for flt in coverage.filters(tree):
@@ -114,6 +128,28 @@ def _undated(sql: str, read: str | None) -> tuple[str, tuple[str, ...]] | None:
     if normalized.parse_error:
         return None
     return normalized.text, normalized.literals
+
+
+def _for_diff(sql: str, read: str | None) -> str:
+    """交给 explain_sql_diff 的写法：去掉最外层的 ORDER BY；按运行当天现算的界换成按先后编号的日期字面量（它只认字面量的
+    时间范围，现算的界写法不一样会落进兜底的「写法不同」）。解析不了的原样交。"""
+    from sqlglot import exp
+
+    from app.data import coverage
+
+    tree = _unordered(sql, read)
+    if tree is None:
+        return sql
+    n = 0
+    for flt in coverage.filters(tree):
+        for _, node, _ in flt.conds:
+            if node.parent is not None and not coverage.literal_bound(node)[0]:
+                n += 1
+                node.replace(exp.Literal.string(f"1900-01-{n:02d}"))
+    try:
+        return tree.sql(dialect=read)
+    except Exception:  # noqa: BLE001 - 写不回去就交原文
+        return sql
 
 
 def same_query(base: Snap, target: Snap) -> Check:
@@ -132,17 +168,17 @@ def same_query(base: Snap, target: Snap) -> Check:
     if na.parse_error or nb.parse_error:
         check.reasons = ["SQL 解析不了"]
         return check
-    if na.text == nb.text:
-        ua, ub = _undated(a, read), _undated(b, read)
-        if ua is None or ub is None:
-            return check
-        if ua == ub:
-            check.status = "pass"
-        else:
-            check.status, check.reasons = "fail", ["两边除了日期，筛选的还不一样"]
+    ua, ub = _undated(a, read), _undated(b, read)
+    if ua is None or ub is None:
+        return check
+    if ua == ub:
+        check.status = "pass"
+        return check
+    if ua[0] == ub[0]:
+        check.status, check.reasons = "fail", ["两边除了日期，筛选的还不一样"]
         return check
     try:
-        diff = explain_sql_diff(a, b, read)
+        diff = explain_sql_diff(_for_diff(a, read), _for_diff(b, read), read)
     except Exception:  # noqa: BLE001 - 比不了就当核对不了
         return check
     aspects = [d.aspect for d in diff.items]
@@ -238,7 +274,9 @@ def period_span(label: str, snap: Snap, period: Any, item: pd.Period, grain: str
     """按期次分组的一份快照里的一期：这一期覆盖的日子，加上 SQL 在期次那一列上的时间条件。"""
     from app.data import coverage
 
-    span = Span(label, snap, item.start, item.end, unit=grain)
+    span = Span(label, snap, item.start, item.end, unit=grain, short=pd.short_days(item, grain))
+    if span.short:
+        span.unit = None
     found = date_source(snap.sql, period)
     if found is None:
         return span
@@ -268,10 +306,13 @@ def _range(span: Span, book: Book) -> tuple[bool, date | None, date | None, bool
 
 
 def span_coverage(span: Span, today: date, book: Book) -> tuple[str, str | None]:
-    """这一段（窗口或一期）的数据齐不齐：(pass / short / unknown, 不齐的那一句)。没过完（终点不早于运行当天：当天的数据还没
-    到齐）、SQL 的时间条件截掉了一部分、表里的数据没到（最晚早于终点）或来得晚（最早晚于起点），都算不齐。"""
+    """这一段（窗口或一期）的数据齐不齐：(pass / short / unknown, 不齐的那一句)。这一期本身不到整期（跨年被切开的周）、没过完
+    （终点不早于运行当天：当天的数据还没到齐）、SQL 的时间条件截掉了一部分、表里的数据没到（最晚早于终点）或来得晚（最早晚于
+    起点），都算不齐。"""
     if span.start is None or span.end is None:
         return "unknown", None
+    if span.short:
+        return "short", f"{span.label}只有 {span.start.isoformat()} 到 {span.end.isoformat()} 这 {span.short} 天，不是整周"
     lo, hi = span.start, span.end
     window = span.sql_window
     if window is not None:
@@ -417,18 +458,30 @@ def compare_queries(base: Snap, target: Snap, measure: str | None, facts: Facts,
 
 def compare_periods(snap: Snap, period: str, base: pd.Period, target: pd.Period, grain: str, measure: str | None,
                     facts: Facts, book: Book, today: date) -> Outcome:
-    """同一份快照里按期次分组的两期：天然同口径；窗口按期次的粒度；整期看这两期各自齐不齐。"""
+    """同一份快照里按期次分组的两期：天然同口径；窗口按期次的粒度（有一期不到整期的按实际天数比，星期构成也照算）；整期看
+    这两期各自齐不齐。期次不知道是哪几天的（序号、认不出算法的周号）窗口、整期、星期构成都核对不了。"""
     same = Check("same_query", status="pass")
     b_span = period_span("基期", snap, period, base, grain, measure, facts, book)
     t_span = period_span("本期", snap, period, target, grain, measure, facts, book)
     flow = bool(measure) and facts.measure(snap, measure)[0] == "flow"  # type: ignore[arg-type]
-    if grain == "seq":
+    whole = not (b_span.short or t_span.short)
+    if grain == "seq" or base.start is None or target.start is None:
         checks = [same, Check("window"), Check("complete"), Check("weekdays"), _data_check([("", snap)], measure)]
     else:
-        checks = [same, _window_check(b_span, t_span, flow, grouped=True),
+        checks = [same, _window_check(b_span, t_span, flow, grouped=whole),
                   _complete_check([b_span, t_span], today, book, flow),
-                  _weekday_check(b_span, t_span, grain=grain), _data_check([("", snap)], measure)]
+                  _weekday_check(b_span, t_span, grain=grain if whole else None), _data_check([("", snap)], measure)]
     return _decide(checks, b_span, t_span)
+
+
+def period_complete(snap: Snap, period: str, item: pd.Period, grain: str, measure: str | None, facts: Facts,
+                    book: Book, today: date) -> tuple[str, str | None, str | None]:
+    """按期次分组的一份快照里本期齐不齐（波动基线、趋势、单份快照的变化拆解共用）：(pass / short / unknown, 不齐的那一句,
+    核对不了时附带说明的那一句)。期次没有日期（序号）、周号认不出算法的，起止不知道，一律核对不了，不判齐。"""
+    if item.start is None:
+        return "unknown", None, ph.UNKNOWN_WEEKS if grain == "week" else ph.NO_DATES
+    status, why = span_coverage(period_span("本期", snap, period, item, grain, measure, facts, book), today, book)
+    return status, why, ph.UNVERIFIED_COMPLETE if status == "unknown" else None
 
 
 def table_of(outcome: Outcome) -> dict[str, Any]:
@@ -479,8 +532,9 @@ def comparable(raw: Mapping[str, Any], env: Any) -> Any:
     params: dict[str, Any] = {}
     two = raw.get("base_query") is not None or raw.get("target_query") is not None
     if two:
-        base = env.inputs.snap(need(raw, "base_query", "基期的查询编号"), "基期的查询编号")
-        target = env.inputs.snap(need(raw, "target_query", "本期的查询编号"), "本期的查询编号")
+        base = env.inputs.snap(need(raw, "base_query", "基期的查询编号"), "基期的查询编号", role="base")
+        target = env.inputs.snap(need(raw, "target_query", "本期的查询编号"), "本期的查询编号",
+                                 role="target")
         if base is target:
             from app.analysis.decompose import SAME_QUERY
 
@@ -511,9 +565,11 @@ def comparable(raw: Mapping[str, Any], env: Any) -> Any:
         for side, what in (("base", "基期"), ("target", "本期")):
             if not rows[side]:
                 raise CallError("period_not_found", f"期次列「{period}」里没有「{params[side]}」：{what}要写 {target.ref} "
-                                                    "里有的期次值")
+                                                    "里有的期次值",
+                                reason=f"期次列「{period}」里没有{what}「{ph.key_text([params[side]])}」")
         env.inputs.use(target, "data", [period, *([measure] if measure else [])], rows["base"] + rows["target"])
-        parsed = pd.parse(values, grain)
+        parsed = pd.parse(values, grain, weeks=pd.week_scheme(target.sql, period, target.dialect)) if grain \
+            else pd.parse_compared(values, target.sql, period, target.dialect)
         if parsed is None:
             item_b = item_t = pd.Period(None, 0, None, None)
             grain = "seq"
@@ -538,5 +594,5 @@ def _only_number(snap: Snap) -> str | None:
 
 
 __all__ = ["CHECKS", "CHECK_NAMES", "Check", "Outcome", "STATUS_NAMES", "Span", "comparable", "compare_periods",
-           "compare_queries", "period_span", "reasons", "same_query", "span_coverage", "sql_span", "table_of",
-           "values_of"]
+           "compare_queries", "period_complete", "period_span", "reasons", "same_query", "span_coverage", "sql_span",
+           "table_of", "values_of"]

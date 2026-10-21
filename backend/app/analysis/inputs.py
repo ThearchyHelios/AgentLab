@@ -60,6 +60,7 @@ class Snap:
     dialect: str | None = None
     columns: list[str] = field(default_factory=list)
     rows: list[list[Any]] = field(default_factory=list)
+    named: list[str] = field(default_factory=list)        # 调用里认过的列（按先后，Inputs.settle 记用法用）
 
     def __post_init__(self) -> None:
         self.columns = [str(c) for c in self.data.get("columns") or []]
@@ -117,6 +118,8 @@ class Snap:
         column = hits[0]
         if column.lower() in self.masked:
             raise CallError("masked_column", f"「{column}」是遮罩列，不能当{role}：换一列，或者在 SQL 里不选它")
+        if column not in self.named:
+            self.named.append(column)
         return column
 
     def index(self, column: str) -> int:
@@ -157,18 +160,20 @@ class Inputs:
         self._resolve = resolve
         self._dialect = dialect
         self._snaps: dict[str, Snap] = {}
+        self._roles: dict[str, str] = {}
         self.records: list[AnalysisInput] = []
 
-    def snap(self, name: Any, role: str) -> Snap:
-        """按名字取一份快照。"""
+    def snap(self, name: Any, what: str, *, role: str = "data") -> Snap:
+        """按名字取一份快照。what 是调用错误里的叫法；role 是这份快照在结论里的角色（第一次取时的为准，settle 用）。"""
         if not isinstance(name, str) or not name.strip():
-            raise CallError("missing_query", f"没写{role}：写本节点查过的查询编号（如 Q3）")
+            raise CallError("missing_query", f"没写{what}：写本节点查过的查询编号（如 Q3）")
         key = name.strip()
         if key not in self._snaps:
             found = self._resolve(key)
             if not isinstance(found, Mapping):
-                raise CallError("unknown_query", f"没有叫「{key}」的查询结果：{role}写本节点查过的查询编号（如 Q3）")
+                raise CallError("unknown_query", f"没有叫「{key}」的查询结果：{what}写本节点查过的查询编号（如 Q3）")
             self._snaps[key] = Snap(key, found, self._dialect(key, found) if self._dialect else found.get("dialect"))
+            self._roles[key] = role
         return self._snaps[key]
 
     def cell(self, ref: Any, role: str, label: str) -> tuple[Snap, int, str, Fraction | None]:
@@ -176,10 +181,11 @@ class Inputs:
         found = _CELL.match(ref.strip()) if isinstance(ref, str) else None
         if found is None:
             raise CallError("bad_cell", f"{label}要写成单元格「编号.r行.列」（如 Q1.r0.gmv），现在是「{ref}」")
-        snap = self.snap(found.group("name"), label)
+        snap = self.snap(found.group("name"), label, role=role)
         row = int(found.group("row"))
         if row >= len(snap.rows):
-            raise CallError("row_out_of_range", f"{snap.ref} 没有第 {row} 行（共 {len(snap.rows)} 行，从 r0 数起）：改{label}")
+            raise CallError("row_out_of_range", f"{snap.ref} 没有第 {row} 行（共 {len(snap.rows)} 行，从 r0 数起）：改{label}",
+                            reason=f"{label}那一格（{ref.strip()}）不在：{snap.ref} 这次只有 {len(snap.rows)} 行")
         column = snap.column(found.group("column"), label)
         value = snap.number(row, column, label)
         self.record({"ref": f"{snap.ref}.r{row}.{column}", "role": role, "row": row, "column": column,
@@ -208,6 +214,18 @@ class Inputs:
         entry: dict[str, Any] = {"ref": name, "artifact": artifact, "role": "parent"}
         if entry not in self.records:
             self.records.append(entry)  # type: ignore[arg-type]
+
+    def settle(self) -> None:
+        """调用在算出结果之前就算不了时（随数据变化的调用错误记成算不了的结论）：取过、还没记下用法的快照照样记一条（角色照
+        第一次取时的，列是调用里认过的那几列，行记 all），复算才按名字取得回它们、走到同一处。"""
+        recorded = set()
+        for item in self.records:
+            cell = _CELL.match(str(item.get("ref") or "")) if "row" in item else None
+            recorded.add(cell.group("name") if cell else item.get("ref"))
+        for key, snap in self._snaps.items():
+            if key not in recorded:
+                self.record({"ref": key, "role": self._roles.get(key, "data"), "columns": list(snap.named),
+                             "rows": "all"}, snap)
 
 
 def as_list(value: Any) -> list[Any]:

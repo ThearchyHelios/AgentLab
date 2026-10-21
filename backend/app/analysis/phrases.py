@@ -11,9 +11,11 @@
 - 百分点：比率的变化（2.1% 到 2.5% 是上升 0.4 个百分点）。
 
 **label 消毒**（§7.3）：判定语里的度量叫法、因子名、维度叫法是 agent 或数据给的。agent 给的 label（以及目录里的叫法、
-当叫法用的列名）去掉数字、百分号、单位符号、引用标记，不超过 20 字，消毒后为空就退回下一个来源：不然模型可以把
-「销售额（同比 +30%）」塞进 label，借系统渲染绕过裸数字检测。去数字按出具校验抽数字的同一个函数（engine/issuance 的
-extract_numbers：阿拉伯数字、中文数字、带万 / 亿 / 成 / 倍的写法），再去掉剩下的数字字符。维度值是数据，照原样。
+当叫法用的列名）去掉数字、百分号、单位符号、引用标记，截到第一个分句标点之前，不超过 20 字；里面有说法表的判断词的整个
+不要；消毒后为空就退回下一个来源：不然模型可以把「销售额（同比 +30%）」「销售额，主要来自华东」塞进 label，借系统渲染绕过
+裸数字检测和说法核对（判定语不受说法核对）。去数字按出具校验抽数字的同一个函数（engine/issuance 的 extract_numbers：阿拉伯
+数字、中文数字、带万 / 亿 / 成 / 倍的写法），再去掉剩下的数字字符。消毒反复做到不再变化：消过的再消一遍不变，复算拿记下的
+叫法再消，判定语逐字相同。维度值是数据，照原样。
 
 **附带说明**：判定语后面用「；」接，最多两条（按 PHRASE_ORDER 的先后），其余只在证据面板。度量类型没标、以各段之和为
 总数这类方法上的交代不进判定语。
@@ -29,9 +31,9 @@ from typing import Any
 from app.analysis.contract import OP_LABELS
 from app.analysis.numbers import fixed, to_fraction
 
-#: 附带说明进判定语的先后；不在这里的（measure_unlabeled、headline_basis）只在证据面板
-PHRASE_ORDER = ("comparability", "simpson", "offset", "outlier_sensitive", "small_sample", "record_high", "record_low",
-                "multiple_comparisons", "weekday_effect", "small_denominator", "null_values")
+#: 附带说明进判定语的先后；不在这里的（measure_unlabeled、headline_basis、partial_periods）只在证据面板
+PHRASE_ORDER = ("comparability", "untested", "simpson", "offset", "outlier_sensitive", "small_sample", "record_high",
+                "record_low", "multiple_comparisons", "weekday_effect", "small_denominator", "null_values")
 #: 判定语里最多接几条附带说明
 PHRASE_CAVEATS = 2
 #: 消毒后的叫法最多几个字
@@ -168,13 +170,63 @@ _DIGITS = re.compile(r"[0-9０-９]")
 _SYMBOLS = re.compile(r"[%％‰‱¥￥$＄€£₩℃°+＋\-−–±×÷=＝<>＜＞~～^*]")
 _EMPTY_BRACKETS = re.compile(r"[（(【\[]\s*[)）】\]]")
 _EDGE_PUNCT = "，,、：:；;。.！!？? 　"
+#: 分句的标点：叫法截到第一个之前（「销售额，主要来自华东」只留「销售额」）
+_CLAUSE = re.compile(r"[，。；：！？、,.;:!?]")
+#: 截出来以后还没配上对的左括号（「销售额（含税，元）」截成「销售额（含税」）连同后面的都不要
+_OPENERS = {"（": "）", "(": ")", "【": "】"}
 
 
 def clean_label(text: Any) -> str:
-    """消毒（见文件头）：去引用标记、数字（出具校验认的数字写法连同后缀，再加剩下的数字字符）、百分号和单位符号、空括号，
-    压掉多余空白，不超过 LABEL_MAX 字。可能消成空串。"""
+    """消毒（见文件头）：去引用标记、数字（出具校验认的数字写法连同后缀，再加剩下的数字字符）、百分号和单位符号、空括号、
+    多余空白，反复做到不再变化（去掉一处可能拼出新的一处：「销售额[ [v:Q1.r0.gmv] ]」去完数字成了「销售额[[v:Q.r.gmv]]」），
+    再去掉剩下的方括号，截到第一个分句标点之前、去掉没配上对的左括号，不超过 LABEL_MAX 字；整个过程再做到不再变化，所以
+    消过的再消一遍不变。消完的叫法里有说法表的判断词（engine/analysis_claims.scan 认得出的）就整个不要。可能消成空串。"""
     if not isinstance(text, str):
         return ""
+    out = text
+    for _ in range(len(text) + 2):
+        again = _shorten(_settle(out))
+        if again == out:
+            break
+        out = again
+    return "" if out and _judges(out) else out
+
+
+def _settle(text: str) -> str:
+    """去引用标记、数字、符号、空括号，做到不再变化（每一遍只会变短或只换空白，一定停得下来）。"""
+    out = text
+    for _ in range(len(text) + 2):
+        again = _scrub(out)
+        if again == out:
+            break
+        out = again
+    return out
+
+
+def _shorten(text: str) -> str:
+    """去掉剩下的方括号，截到第一个分句标点之前，去掉没配上对的左括号连同后面的，不超过 LABEL_MAX 字。"""
+    out = _CLAUSE.split(text.replace("[", "").replace("]", ""), maxsplit=1)[0]
+    open_at: list[tuple[int, str]] = []
+    for i, ch in enumerate(out):
+        if ch in _OPENERS:
+            open_at.append((i, _OPENERS[ch]))
+        elif open_at and ch == open_at[-1][1]:
+            open_at.pop()
+    if open_at:
+        out = out[:open_at[0][0]]
+    out = re.sub(r"\s+", " ", out).strip(_EDGE_PUNCT)
+    return out[:LABEL_MAX].strip(_EDGE_PUNCT)
+
+
+def _judges(text: str) -> bool:
+    """叫法里有没有说法表的判断词（「主要来自」「历史新高」……）。说法核对在 engine 里，在这里导入免得循环导入。"""
+    from app.engine.analysis_claims import scan
+
+    return bool(scan(text))
+
+
+def _scrub(text: str) -> str:
+    """一遍：去引用标记、数字、符号，收拾去掉以后留下的空白、标点、空括号。"""
     from app.engine.issuance import extract_numbers
 
     raw = _MARKER.sub("", text)
@@ -193,8 +245,7 @@ def clean_label(text: Any) -> str:
     out = re.sub(r"([，,、：:；;])[，,、：:；;]+", r"\1", out)
     while _EMPTY_BRACKETS.search(out):
         out = _EMPTY_BRACKETS.sub("", out)
-    out = re.sub(r"\s+", " ", out).strip(_EDGE_PUNCT)
-    return out[:LABEL_MAX].strip(_EDGE_PUNCT)
+    return re.sub(r"\s+", " ", out).strip(_EDGE_PUNCT)
 
 
 def pick_label(*candidates: Any, fallback: str = "这一列") -> str:
@@ -250,13 +301,16 @@ def offset_text(delta_total: Any, gross_up: Any, gross_down: Any) -> str:
     return f"下降的段合计 {down}，上升的段合计 {up}，互相抵消了一部分"
 
 
-def simpson_text(label: str, overall_up: bool, subject: str, w_base: Any, w_target: Any) -> str:
-    """辛普森：各段的比率大多和整体反着变，整体的变化来自结构。"""
+def simpson_text(label: str, overall_up: bool, subject: str, w_base: Any, w_target: Any, *, shift: bool = True) -> str:
+    """辛普森：各段的比率大多和整体反着变，整体的变化来自结构。判定语正文已经说了结构变化、点了那一段（mix_driven）时
+    shift 为假，只说各段和整体反着变，结构变化不说第二遍。"""
     seg = "上升" if not overall_up else "下降"
     whole = "上升" if overall_up else "下降"
+    head = say("各段的", label, f"大多在{seg}，整体却{whole}")
+    if not shift:
+        return head
     move = "升" if _q(w_target) > _q(w_base) else "降"
-    return say(f"各段的", label, f"大多在{seg}，整体却{whole}：变化来自结构，", subject,
-               f"占比从 {pct(w_base, signed=False)} {move}到 {pct(w_target, signed=False)}")
+    return say(head, "：变化来自结构，", subject, f"占比从 {pct(w_base, signed=False)} {move}到 {pct(w_target, signed=False)}")
 
 
 def small_denominator_text(segments: Sequence[str], denominator: str, minimum: int) -> str:
@@ -292,6 +346,12 @@ def multiple_text(pairs: int) -> str:
     return f"比了 {pairs} 对，已按次数校正"
 
 
+def untested_pairs_text(count: int, reasons: Sequence[str]) -> str:
+    """差异检验里拿不到 p 值的那几对（不算进比了几对）：另有 1 对算不了（华北的样本量为 0）。"""
+    shown = list(dict.fromkeys(reasons))
+    return f"另有 {count} 对算不了（{'，'.join(shown[:3])}{'等' if len(shown) > 3 else ''}）"
+
+
 def outlier_text(largest: bool, now_differs: bool) -> str:
     which = "最大" if largest else "最小"
     return f"去掉{which}的一笔后，差异{'变得站得住' if now_differs else '不再站得住'}"
@@ -306,6 +366,13 @@ def small_sample_mean_text(group: str, n: int, minimum: int) -> str:
 
 
 UNVERIFIED_COMPLETE = "没能核对本期的数据是否到齐（查不到表里这一列的日期范围）"
+UNKNOWN_WEEKS = "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+NO_DATES = "没能核对本期的数据是否到齐（期次不是日期，不知道是哪几天）"
+
+
+def partial_periods_text(count: int) -> str:
+    """按年截断的周号算法里跨年切开的那几期（不到整周）没有算进历史。"""
+    return f"有 {count} 期不到整周（跨年被切开），没有算进历史"
 
 
 def with_caveats(main: str, caveats: Sequence[Mapping[str, str]], *, skip: Iterable[str] = ()) -> str:
@@ -414,13 +481,15 @@ def baseline_flat_phrase(verdict: str, label: str, current: str, n: int, unit: s
 
 def trend_phrase(verdict: str, label: str, n: int, unit: str, per: str, slope: str | None,
                  run: tuple[int, str] | None) -> str:
+    """趋势。末尾连续同向的期数（run）和趋势同向时接「，已连续 3 周下降」，反向时接「，但最近已连续 3 周上升」。"""
     if verdict == "no_trend":
         return say(f"过去 {n} {unit}", label, "没有明显的上升或下降趋势")
     word = "上升" if verdict == "rising" else "下降"
     text = say(f"过去 {n} {unit}", label, f"呈{word}趋势") + (f"（每{per}约 {slope}）" if slope else "")
     if run is not None:
         length, direction = run
-        text += f"，已连续 {length} {unit}{'上升' if direction == 'up' else '下降'}"
+        same = (direction == "up") == (verdict == "rising")
+        text += f"，{'' if same else '但最近'}已连续 {length} {unit}{'上升' if direction == 'up' else '下降'}"
     return text
 
 
@@ -501,14 +570,16 @@ CRITERION_COMPARABLE = ("只差日期、窗口一样长、是整期、星期构�
 
 
 __all__ = [
-    "CRITERION_COMPARABLE", "EMPTY_KEY", "HEADLINE_BASIS", "KEY_JOIN", "LABEL_MAX", "MEASURE_WORDS",
-    "PHRASE_CAVEATS", "PHRASE_ORDER", "UNVERIFIED_COMPLETE", "WEEKDAY_EFFECT", "amount", "band_text",
+    "CRITERION_COMPARABLE", "EMPTY_KEY", "HEADLINE_BASIS", "KEY_JOIN", "LABEL_MAX", "MEASURE_WORDS", "NO_DATES",
+    "PHRASE_CAVEATS", "PHRASE_ORDER", "UNKNOWN_WEEKS", "UNVERIFIED_COMPLETE", "WEEKDAY_EFFECT", "amount", "band_text",
     "baseline_flat_phrase", "baseline_phrase", "caveat", "change", "clean_label", "comparable_phrase",
     "criterion_additive", "criterion_baseline", "criterion_differ", "criterion_factor", "criterion_ratio",
     "criterion_trend", "current_text", "decompose_concentrated", "decompose_dispersed", "decompose_driver",
     "decompose_flat", "decompose_unclosed", "differ_pair", "differ_phrase", "dims_text", "factor_both",
     "factor_driver", "key_text", "multiple_text", "names", "no_evidence_phrase", "null_periods_text",
-    "null_segments_text", "number", "offset_text", "outlier_text", "pct", "pick_label", "points", "ratio_both",
+    "null_segments_text", "number", "offset_text", "outlier_text", "partial_periods_text", "pct", "pick_label",
+    "untested_pairs_text",
+    "points", "ratio_both",
     "ratio_change", "ratio_mix", "ratio_rate", "ratio_value", "record_text", "refused", "say", "share_words",
     "simpson_text", "small_denominator_text", "small_sample_mean_text", "small_sample_rate_text", "threshold_pct",
     "trend_phrase", "unconfirmed_text", "unlabeled_text", "with_caveats",

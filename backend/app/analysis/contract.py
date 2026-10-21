@@ -83,16 +83,20 @@ VERDICTS: dict[str, tuple[str, ...]] = {
     "differ": ("differs", "no_evidence"),
     "comparable": ("comparable", "conditional", "incomparable"),
 }
-#: 算不了的原因（细案 01 §8.2）。算不了也记成结论：写作者可以照实写「历史只有 5 周，判断不了是否异常」
+#: 算不了的原因（细案 01 §8.2）。算不了也记成结论：写作者可以照实写「历史只有 5 周，判断不了是否异常」。最后两种是分析卡
+#: 里随数据变化的调用错误记成的（analysis.run 的 refuse_data_errors，见 app/analysis 的 DATA_ERRORS）：parent_refused 上一层
+#: 没做成；input_unavailable 这次的数据里没有要用的那一项（下钻的段、期次、总数那一格、要比的组……，reason 写是哪一项、哪个值）。
+#: untestable：差异检验一对都拿不到 p 值（两组各 1 个样本、样本量为 0……）
 REASONS: tuple[str, ...] = (
     "truncated", "too_few_segments", "history_short", "partial_target", "target_gap", "series_gap",
-    "period_unreadable", "zero_base", "non_positive", "incomparable_sides",
+    "period_unreadable", "zero_base", "non_positive", "incomparable_sides", "parent_refused", "input_unavailable",
+    "untestable",
 )
 #: 附带说明的种类（caveats[].code）
 CAVEATS: tuple[str, ...] = (
     "offset", "simpson", "small_denominator", "record_high", "record_low", "weekday_effect",
     "multiple_comparisons", "outlier_sensitive", "small_sample", "measure_unlabeled", "null_values",
-    "headline_basis", "comparability",
+    "headline_basis", "comparability", "partial_periods", "untested",
 )
 
 # --------------------------------------------------------------------------
@@ -163,7 +167,8 @@ LABELS: dict[str, str] = {
 
 def settings_problem(values: Mapping[str, Any]) -> str | None:
     """一组分析设置（或分析卡上的覆盖）哪里不对：不认识的键、类型不对、超出范围、k_alert 不大于 k_warn、
-    max_history 小于 min_history。都对返回 None。说法给人看。"""
+    max_history 小于 min_history、concentration 小于 main_share（一段占了「主要」那么多还够不上「集中」，判定语会说「没有哪一段
+    占到」一个比它小的数）。没写的项按缺省补齐了比。都对返回 None。说法给人看（键的叫法取 LABELS）。"""
     for key, value in values.items():
         if key not in RANGES:
             return f"不认识的分析设置：{key}"
@@ -180,6 +185,8 @@ def settings_problem(values: Mapping[str, Any]) -> str | None:
         return f"{LABELS['k_alert']}要大于{LABELS['k_warn']}"
     if merged["max_history"] < merged["min_history"]:
         return f"{LABELS['max_history']}不能小于{LABELS['min_history']}"
+    if merged["concentration"] < merged["main_share"]:
+        return f"{LABELS['concentration']}不能小于{LABELS['main_share']}"
     return None
 
 
@@ -305,12 +312,16 @@ class AnalysisResult(TypedDict, total=False):
 class CallError(Exception):
     """调用错误（细案 01 §8.1）：列不存在、列被遮罩、角色和目录度量类型冲突、同一键同一期多行、期次不在列里、乘积
     不闭合、parent 不对、下钻超深、这个 Agent 这次执行的分析次数用完（max_calls 按每个 Agent 每次执行计）。不记结论，message
-    交回 agent（一种说法，告诉它怎么改）。"""
+    交回 agent（一种说法，告诉它怎么改）。
 
-    def __init__(self, code: str, message: str) -> None:
+    随数据变化的那几种（app/analysis 的 DATA_ERRORS：这期没有要用的期次、段、组，上一层没做成……）另带 reason：照实说是哪一项、
+    哪个值，不带改法。分析卡（模板定死了调用）按它记成算不了的结论，见 analysis.run 的 refuse_data_errors。"""
+
+    def __init__(self, code: str, message: str, *, reason: str | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.reason = reason
 
 
 #: 现查一列的实际范围：(数据源名, 表, 列) → Probe；查不了返回 None（算子写「核对不了」，不判不可比）

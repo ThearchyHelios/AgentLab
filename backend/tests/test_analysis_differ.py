@@ -136,6 +136,44 @@ async def test_two_periods_of_the_same_group():
 async def test_a_group_with_one_value_cannot_be_tested():
     s = snap("Q1", "SELECT channel, amount FROM orders", ["channel", "amount"], [["线上", 5], ["线下", 4], ["线下", 6]])
     result = await analyze("differ", "rows", snaps=[s], query="Q1", by="channel", value="amount")
-    assert result["verdict"]["code"] == "no_evidence" and result["values"]["p"] is None
-    assert result["table"]["rows"][0][-1] == "样本不够，算不了"
+    assert result["status"] == "refused" and result["reason_code"] == "untestable"
+    assert result["reason"] == "线上只有 1 个样本，算不了差异"
+    assert result["phrase"] == "差异检验没有做成：线上只有 1 个样本，算不了差异"
+
+
+async def test_no_pair_with_a_p_value_is_refused_not_said_to_be_noise():
+    sql = "SELECT region, AVG(amount) AS m, 0 AS sd, COUNT(*) AS n FROM orders GROUP BY 1"
+    means = snap("Q1", sql, ["region", "m", "sd", "n"], [["华东", 120, 0, 1], ["华南", 80, 0, 1]])
+    mean = await analyze("differ", "mean", snaps=[means], query="Q1", by="region", mean="m", sd="sd", n="n",
+                         label="客单价")
+    assert mean["reason_code"] == "untestable" and mean["reason"] == "华东只有 1 个样本、华南只有 1 个样本，算不了差异"
+    assert mean["verdict"] is None and mean["settings"] == {"differ_alpha": 0.05, "min_n": 30}
+    rows = snap("Q2", "SELECT region, amount FROM orders", ["region", "amount"], [["华东", 120], ["华南", 80]])
+    one = await analyze("differ", "rows", snaps=[rows], query="Q2", by="region", value="amount")
+    assert one["reason"] == "华东只有 1 个样本、华南只有 1 个样本，算不了差异"
+    zero = await rate([["华东", 0, 0], ["华南", 3, 10]])
+    assert zero["reason_code"] == "untestable" and zero["reason"] == "华东的样本量为 0，算不了差异"
+
+
+async def test_pairs_without_a_p_value_are_named_and_not_counted():
+    result = await rate([["西南", 80, 1000], ["华东", 40, 1000], ["华北", 0, 0]])
+    rows = {r[0]: r for r in result["table"]["rows"]}
+    assert rows["华北"][-1] == "华北的样本量为 0，算不了" and rows["华北"][10] is None
+    note = next(c for c in result["caveats"] if c["code"] == "untested")
+    assert note["text"] == "另有 1 对算不了（华北的样本量为 0）"
+    # 华北一单都没有：西南的其余合计就是华东，两对都站得住；华北那一对不算进「比了几对」
+    assert result["phrase"] == ("比了 2 对，2 对差异站得住：西南的退款率（8.0%）高于其余各地区（4.0%）；华东的退款率（4.0%）"
+                                "低于其余各地区（8.0%）；另有 1 对算不了（华北的样本量为 0）")
+    assert {"code": "multiple_comparisons", "text": "比了 2 对，已按次数校正"} in result["caveats"]
+
+
+async def test_the_outlier_is_looked_for_in_the_real_groups_not_in_the_pooled_rest():
+    # 三组各和其余合计比：最远的那一笔在第二组（华南）。只在真实的各组里找、由各组重建「其余」合计，去掉它以后华南高出来就站得住
+    base = [10, 11, 9, 10, 12, 8, 10, 11, 10, 9, 11, 10]
+    rows = ([["华东", v] for v in base] + [["华南", v + 2] for v in base[:-1]] + [["华南", 100]]
+            + [["华北", v] for v in base])
+    s = snap("Q1", "SELECT region, amount FROM orders", ["region", "amount"], rows)
+    result = await analyze("differ", "rows", snaps=[s], query="Q1", by="region", value="amount", label="客单价")
+    assert result["verdict"]["code"] == "no_evidence"
+    assert {"code": "outlier_sensitive", "text": "去掉最大的一笔后，差异变得站得住"} in result["caveats"]
     assert math.isfinite(float(result["values"]["diff"]))

@@ -2,9 +2,10 @@
 
 **参数**（AnalysisRequest.params；列名不分大小写，按快照认）：
 
-- 一份快照：query（编号）、period（期次列）、base / target（期次列里的两个值）；或两份快照：base_query、target_query（各自
-  只有维度列和度量列，先做可比性检查：口径结构不同的不拆，算不了 incomparable_sides；其余不可比的照样算，判定后附上
-  可比性结论）。
+- 一份快照：query（编号）、period（期次列）、base / target（期次列里的两个值），本期齐不齐同波动基线那一套（comparable.
+  period_complete：不到整期、没过完、数据没到 → partial_target；核对不了的附说明，只在证据面板）；或两份快照：base_query、
+  target_query（各自只有维度列和度量列，先做可比性检查：口径结构不同的不拆，算不了 incomparable_sides；其余不可比的照样算，
+  判定后附上可比性结论）。
 - additive：by（维度列，1–2 列）、measure（度量列）；可选 headline {base, target}（基期、本期总数各一格，如 Q1.r1.gmv，用来
   核对闭合）、parent {of: A3, key: [华东]}（下钻：这一层各段之和要等于 A3 里华东那一段）。
 - ratio：by、numerator（分子列）、denominator（分母列）；可选 headline {base, target}（整体比率的两格）、parent（上一层的比率
@@ -26,8 +27,8 @@ from typing import Any
 
 from app.analysis import comparable as cmp
 from app.analysis import phrases as ph
-from app.analysis.common import (Env, build, closes, column_label, column_types, label_for, need, refuse, sign_word,
-                                 today_param)
+from app.analysis.common import (Env, build, closes, column_label, column_types, label_for, need, refuse,
+                                 reserved_check, sign_word, today_param)
 from app.analysis.contract import CallError
 from app.analysis.inputs import Snap, as_list, hashable, same_value
 from app.analysis.numbers import canon, to_fraction
@@ -41,6 +42,22 @@ SAME_QUERY = "基期和本期是同一份查询：两期各给一份查询，或
 #: 乘积闭合的最小相对误差
 _FACTOR_REL = Fraction(1, 10 ** 6)
 _NOT_ADDITIVE = {"ratio": "比率", "identifier": "标识", "status": "状态", "attribute": "属性"}
+#: 各模式的结论里记的阈值（下钻时另加 max_drill_depth）
+USED: dict[str, tuple[str, ...]] = {
+    "additive": ("main_share", "concentration", "offset_ratio", "flat_pct", "table_top_k"),
+    "ratio": ("main_share", "flat_pct", "min_denominator", "table_top_k"),
+    "factor": ("main_share", "flat_pct"),
+}
+
+
+def refusal_basis(mode: str, raw: Mapping[str, Any], settings: Mapping[str, Any]) -> tuple[list[str], str]:
+    """还没算就算不了时（分析卡把随数据变化的调用错误记成算不了的结论）结论里记的阈值和判定标准：同这个模式自己算不了时
+    的那一份。"""
+    used = list(USED[mode]) + (["max_drill_depth"] if mode != "factor" and raw.get("parent") is not None else [])
+    if mode == "additive":
+        summed = raw.get("headline") is None and raw.get("parent") is None
+        return used, ph.criterion_additive(settings, top_k_max=None, summed=summed)
+    return used, ph.criterion_ratio(settings) if mode == "ratio" else ph.criterion_factor(settings)
 
 
 @dataclass
@@ -65,14 +82,16 @@ def _key_strings(key: Sequence[Any]) -> list[str]:
     return [ph.key_text([k]) for k in key]
 
 
-def _sides(raw: Mapping[str, Any], env: Env, roles: Sequence[tuple[str, str]], *, by_needed: bool = True
-           ) -> tuple[dict[str, Any], Snap, Snap, dict[str, str], list[str]]:
-    """一份或两份快照：(规范化的参数, 基期快照, 本期快照, {角色: 列名}, 维度列)。roles 是 [(参数名, 角色的叫法)]。"""
+def _sides(raw: Mapping[str, Any], env: Env, roles: Sequence[tuple[str, str]], *, by_needed: bool = True,
+           reserved: Sequence[str] = ()) -> tuple[dict[str, Any], Snap, Snap, dict[str, str], list[str]]:
+    """一份或两份快照：(规范化的参数, 基期快照, 本期快照, {角色: 列名}, 维度列)。roles 是 [(参数名, 角色的叫法)]；reserved 是
+    结果表固定的列名，维度列不能叫这些。"""
     params: dict[str, Any] = {}
     two = raw.get("base_query") is not None or raw.get("target_query") is not None
     if two:
-        base = env.inputs.snap(need(raw, "base_query", "基期的查询编号"), "基期的查询编号")
-        target = env.inputs.snap(need(raw, "target_query", "本期的查询编号"), "本期的查询编号")
+        base = env.inputs.snap(need(raw, "base_query", "基期的查询编号"), "基期的查询编号", role="base")
+        target = env.inputs.snap(need(raw, "target_query", "本期的查询编号"), "本期的查询编号",
+                                 role="target")
         if base is target:
             raise CallError("same_query", SAME_QUERY)
         params.update(base_query=base.ref, target_query=target.ref)
@@ -88,6 +107,8 @@ def _sides(raw: Mapping[str, Any], env: Env, roles: Sequence[tuple[str, str]], *
         if two:
             for c in by:
                 base.column(c, "维度列")
+        for c in by:
+            reserved_check(c, reserved, "维度列")
         params["by"] = by
     cols: dict[str, str] = {}
     for key, what in roles:
@@ -116,7 +137,8 @@ def _period_rows(snap: Snap, period: str, wanted: Any, what: str) -> list[int]:
     if not rows:
         values = list(dict.fromkeys(ph.key_text([row[i]]) for row in snap.rows if i < len(row)))
         raise CallError("period_not_found", f"期次列「{period}」里没有「{wanted}」：{what}要写 {snap.ref} 里有的期次值，"
-                                            f"比如 {'、'.join(values[:6])}")
+                                            f"比如 {'、'.join(values[:6])}",
+                        reason=f"期次列「{period}」里没有{what}「{ph.key_text([wanted])}」")
     return rows
 
 
@@ -181,8 +203,12 @@ def _parent(raw: Mapping[str, Any], env: Env, mode: str, dims: int) -> tuple[dic
     if found.get("op") != "decompose" or found.get("mode") != mode:
         raise CallError("parent_not_decompose", f"{name} 不是{'按维度' if mode == 'additive' else '比率'}的变化拆解，"
                                                 "下钻要接在同一种拆解后面")
+    # 上一层先记进输入：它没做成、这期没有那一段时（分析卡记成算不了的结论），复算也要按内容哈希取回它、走到同一处
+    env.inputs.parent(name, content_hash(canonical_json(found)))
     if found.get("status") != "ok" or not isinstance(found.get("table"), Mapping):
-        raise CallError("parent_refused", f"{name} 没有做成，不能在它下面下钻")
+        why = f"（{found['reason']}）" if isinstance(found.get("reason"), str) and found["reason"] else ""
+        raise CallError("parent_refused", f"{name} 没有做成，不能在它下面下钻",
+                        reason=f"上一层「{name}」没有做成{why}，不能在它下面下钻")
     depth = int((found.get("params") or {}).get("depth") or 0) + 1
     limit = int(env.settings["max_drill_depth"])
     if depth > limit:
@@ -196,8 +222,8 @@ def _parent(raw: Mapping[str, Any], env: Env, mode: str, dims: int) -> tuple[dic
     hit = next((row for row in table.get("rows") or []
                 if all(same_value(k, v) for k, v in zip(key, row[:dim_count]))), None)
     if hit is None:
-        raise CallError("parent_key_missing", f"{name} 里没有「{ph.key_text(key)}」这一段：写 {name} 结果表里的段")
-    env.inputs.parent(name, content_hash(canonical_json(found)))
+        raise CallError("parent_key_missing", f"{name} 里没有「{ph.key_text(key)}」这一段：写 {name} 结果表里的段",
+                        reason=f"上一层「{name}」里没有「{ph.key_text(key)}」这一段")
     return {"of": name, "key": key}, dict(zip(columns, hit)), depth
 
 
@@ -220,7 +246,8 @@ def _headline(raw: Mapping[str, Any], env: Env) -> tuple[dict[str, str] | None, 
     for side, what in (("base", "基期总数"), ("target", "本期总数")):
         snap, row, col, value = env.inputs.cell(spec[side], f"headline_{side}", what)
         if value is None:
-            raise CallError("headline_empty", f"{what}那一格（{snap.ref}.r{row}.{col}）是空的：换一格有值的")
+            raise CallError("headline_empty", f"{what}那一格（{snap.ref}.r{row}.{col}）是空的：换一格有值的",
+                            reason=f"{what}那一格（{snap.ref}.r{row}.{col}）是空的")
         out[side] = (value, snap.cell(row, col))
         refs[side] = f"{snap.ref}.r{row}.{col}"
     return refs, out
@@ -249,6 +276,30 @@ def _comparability(env: Env, params: dict[str, Any], base: Snap, target: Snap, m
     return outcome, outcome.structure
 
 
+def _period_complete(env: Env, params: dict[str, Any], snap: Snap, measure: str | None
+                     ) -> tuple[str | None, dict[str, str] | None]:
+    """一份快照按期次分组时本期齐不齐（同波动基线那一套，comparable.period_complete；期次按 periods.parse_compared 认）：
+    (不齐时 partial_target 的原因, 核对不了时的附带说明)。两份快照的在可比性检查里核过整期，不在这里核。"""
+    from app.analysis import periods as pd
+
+    if "base_query" in params:
+        return None, None
+    params["today"] = today_param(env)
+    period = params["period"]
+    i = snap.index(period)
+    values = [row[i] if i < len(row) else None for row in snap.rows]
+    parsed = pd.parse_compared(values, snap.sql, period, snap.dialect)
+    if parsed is None:
+        return None, ph.caveat("comparability", ph.NO_DATES)
+    items, grain = parsed
+    target = next(item for item, v in zip(items, values) if same_value(params["target"], v))
+    status, why, note = cmp.period_complete(snap, period, target, grain, measure, env.facts, env.book,
+                                            env.today)  # type: ignore[arg-type]
+    if status == "short":
+        return f"{why}，和完整的{pd.PER_WORD[grain]}比没有意义", None
+    return None, ph.caveat("comparability", note) if status == "unknown" and note else None
+
+
 def _share_rank(segments: Sequence[Any], share: Any) -> list[Any]:
     """按 share 从大到小（一样大的按先出现的）。"""
     return sorted(segments, key=lambda s: -share(s))
@@ -260,8 +311,8 @@ def _share_rank(segments: Sequence[Any], share: Any) -> list[Any]:
 
 
 def additive(raw: Mapping[str, Any], env: Env) -> Any:
-    used = ["main_share", "concentration", "offset_ratio", "flat_pct", "table_top_k"]
-    params, bs, ts, cols, by = _sides(raw, env, [("measure", "度量列")])
+    used = list(USED["additive"])
+    params, bs, ts, cols, by = _sides(raw, env, [("measure", "度量列")], reserved=_FIXED_ADDITIVE)
     measure = cols["measure"]
     label = label_for(env, raw.get("label"), ts, measure)
     if raw.get("label") is not None:
@@ -297,9 +348,16 @@ def additive(raw: Mapping[str, Any], env: Env) -> Any:
     if structure is not None:
         return refuse(env, params, used, "incomparable_sides", f"{structure}，不是同一个量的两期，不拆",
                       criterion=ph.criterion_additive(env.settings, top_k_max=None, **criterion_args), caveats=caveats)
+    partial, note = _period_complete(env, params, ts, measure)
+    if partial is not None:
+        return refuse(env, params, used, "partial_target", partial,
+                      criterion=ph.criterion_additive(env.settings, top_k_max=None, **criterion_args), caveats=caveats)
+    if note is not None:
+        caveats.append(note)
     segs = _segments(side_b, side_t, Fraction(0))
     if len(segs) < 2:
-        return refuse(env, params, used, "too_few_segments", f"按{ph.dims_text(dims)}只有 {len(segs)} 段，至少要 2 段才拆得开",
+        return refuse(env, params, used, "too_few_segments",
+                      ph.say("按", ph.dims_text(dims), f"只有 {len(segs)} 段，至少要 2 段才拆得开"),
                       criterion=ph.criterion_additive(env.settings, top_k_max=None, **criterion_args), caveats=caveats)
     return _additive_result(env, params, used, segs, by, dims, label, heads, parent_row, outcome, caveats, summed,
                             side_b, side_t)
@@ -321,7 +379,7 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
             gaps[side] = heads[side][0] - total
         if parent_row is not None:
             expect = to_fraction(parent_row.get(side))
-            if expect is None or not closes(total, expect, parent_row.get(side)):
+            if expect is None or not closes(total, expect, None, exact=True):
                 gaps.setdefault(side, (expect or Fraction(0)) - total)
     closed = not gaps
     deltas = {x.key: x.target - x.base for x in segs}
@@ -408,7 +466,9 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
         values["gap"] = canon(max(gaps.values(), key=abs))
     verdict = {"code": code, "subjects": [_key_strings(x.key) for x in subjects],
                "direction": sign_word(delta) if code in ("driver", "concentrated", "dispersed") else None}
-    phrase = ph.with_caveats(main, caveats, skip=("offset",) if code == "flat" else ())
+    # 一份快照时 comparability 只会是本期核对不了的那句（同波动基线，只在证据面板）；两份快照的可比性结论照旧进判定语
+    skip = (("offset",) if code == "flat" else ()) + (("comparability",) if outcome is None else ())
+    phrase = ph.with_caveats(main, caveats, skip=skip)
     return build(env, params, used, table=table, values=values, verdict=verdict,
                  criterion=ph.criterion_additive(s, top_k_max=k_max, summed=summed), phrase=phrase, caveats=caveats)
 
@@ -419,8 +479,9 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
 
 
 def ratio(raw: Mapping[str, Any], env: Env) -> Any:
-    used = ["main_share", "flat_pct", "min_denominator", "table_top_k"]
-    params, bs, ts, cols, by = _sides(raw, env, [("numerator", "分子列"), ("denominator", "分母列")])
+    used = list(USED["ratio"])
+    params, bs, ts, cols, by = _sides(raw, env, [("numerator", "分子列"), ("denominator", "分母列")],
+                                      reserved=_FIXED_RATIO)
     num, den = cols["numerator"], cols["denominator"]
     num_label, den_label = column_label(env, ts, num), column_label(env, ts, den)
     label = ph.pick_label(raw.get("label"), ph.say(num_label, "与", den_label, "之比"))
@@ -459,10 +520,14 @@ def ratio(raw: Mapping[str, Any], env: Env) -> Any:
     outcome, structure = _comparability(env, params, bs, ts, den)
     if structure is not None:
         return refuse(env, params, used, "incomparable_sides", f"{structure}，不是同一个量的两期，不拆", criterion=criterion)
+    partial, note = _period_complete(env, params, ts, den)
+    if partial is not None:
+        return refuse(env, params, used, "partial_target", partial, criterion=criterion)
     segs = _segments(side_b, side_t, (Fraction(0), Fraction(0)))
     live = [x for x in segs if x.base[1] != 0 or x.target[1] != 0]
     if len(live) < 2:
-        return refuse(env, params, used, "too_few_segments", f"按{ph.dims_text(dims)}只有 {len(live)} 段，至少要 2 段才拆得开",
+        return refuse(env, params, used, "too_few_segments",
+                      ph.say("按", ph.dims_text(dims), f"只有 {len(live)} 段，至少要 2 段才拆得开"),
                       criterion=criterion)
     for when, i in (("基期", 0), ("本期", 1)):
         if sum(((x.base, x.target)[i][1] for x in live), Fraction(0)) == 0:
@@ -475,7 +540,7 @@ def ratio(raw: Mapping[str, Any], env: Env) -> Any:
                               ph.say(ph.key_text(x.key), f"{when}的", den_label, "为 0 而", num_label,
                                      "不为 0，比率拆不了"), criterion=criterion)
     return _ratio_result(env, params, used, segs, by, dims, label, num_label, den_label, heads, parent_row, outcome,
-                         criterion, target_snap=ts)
+                         criterion, target_snap=ts, note=note)
 
 
 def ratio_effects(segs: Sequence[tuple[Fraction, Fraction, Fraction, Fraction]]
@@ -504,7 +569,8 @@ def ratio_effects(segs: Sequence[tuple[Fraction, Fraction, Fraction, Fraction]]
 def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[Segment], by: list[str],
                   dims: list[str], label: str, num_label: str, den_label: str,
                   heads: Mapping[str, tuple[Fraction, Any]], parent_row: Mapping[str, Any] | None,
-                  outcome: cmp.Outcome | None, criterion: str, *, target_snap: Snap) -> Any:
+                  outcome: cmp.Outcome | None, criterion: str, *, target_snap: Snap,
+                  note: Mapping[str, str] | None = None) -> Any:
     main_share, flat_pct = env.threshold("main_share"), env.threshold("flat_pct")
     min_den = env.threshold("min_denominator")
     live = [x for x in segs if x.base[1] != 0 or x.target[1] != 0]
@@ -522,7 +588,7 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
                 "d_target": sum((x.target[1] for x in live), Fraction(0))}
         for col, total in sums.items():
             expect = to_fraction(parent_row.get(col))
-            if expect is None or not closes(total, expect, parent_row.get(col)):
+            if expect is None or not closes(total, expect, None, exact=True):
                 gaps.setdefault("base" if col.endswith("base") else "target", (expect or Fraction(0)) - total)
     closed = not gaps
     mix_total = sum((e[4] for e in effects), Fraction(0))
@@ -552,9 +618,11 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
         against = sum(((by_key[x.key][0] + by_key[x.key][1]) / 2 for x in eligible
                        if (by_key[x.key][3] - by_key[x.key][2]) * sign < 0), Fraction(0))
         if weight > 0 and against / weight >= SIMPSON_SHARE:
+            # 判在结构变化上（mix_driven）时判定语正文已经说了结构变化、点了这一段，附带说明只说各段和整体反着变
             star = max(live, key=lambda x: sign * by_key[x.key][4])
             caveats.append(ph.caveat("simpson", ph.simpson_text(label, delta > 0, ph.key_text(star.key),
-                                                                by_key[star.key][0], by_key[star.key][1])))
+                                                                by_key[star.key][0], by_key[star.key][1],
+                                                                shift=code != "mix_driven")))
     if small:
         caveats.append(ph.caveat("small_denominator", ph.small_denominator_text(
             [ph.key_text(x.key) for x in small], den_label, int(env.settings["min_denominator"]))))
@@ -564,6 +632,8 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
                                                                       ph.say(num_label, "或", den_label))))
     if outcome is not None and outcome.verdict != "comparable":
         caveats.append(ph.caveat("comparability", outcome.phrase))
+    if note is not None:
+        caveats.append(dict(note))
     total_text = ph.ratio_change(R, R2, proportion=proportion)
     if code == "mix_driven":
         star = subjects[0]
@@ -610,7 +680,8 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
     verdict = {"code": code, "subjects": [_key_strings(x.key) for x in subjects],
                "direction": sign_word(delta) if code in ("mix_driven", "rate_driven", "both") else None}
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion,
-                 phrase=ph.with_caveats(main, caveats), caveats=caveats)
+                 phrase=ph.with_caveats(main, caveats, skip=("comparability",) if outcome is None else ()),
+                 caveats=caveats)
 
 
 # --------------------------------------------------------------------------
@@ -635,7 +706,7 @@ def lmdi(base: Sequence[float], target: Sequence[float], m_base: float, m_target
 
 
 def factor(raw: Mapping[str, Any], env: Env) -> Any:
-    used = ["main_share", "flat_pct"]
+    used = list(USED["factor"])
     params, bs, ts, cols, _ = _sides(raw, env, [("product", "乘积列")], by_needed=False)
     product = cols["product"]
     wanted = as_list(raw.get("factors"))
@@ -672,7 +743,8 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
         for col, what in ((product, "乘积列"), *((c, "因子列") for c in factors)):
             value = snap.number(r, col, what)
             if value is None:
-                raise CallError("empty_cell", f"{snap.ref} 第 {r} 行的「{col}」是空的：乘积、因子都要有值")
+                raise CallError("empty_cell", f"{snap.ref} 第 {r} 行的「{col}」是空的：乘积、因子都要有值",
+                                reason=f"{'基期' if when == 'base' else '本期'}的「{col}」那一格是空的（{snap.ref} 第 {r} 行）")
             row.append((value, snap.cell(r, col)))
         cells[when] = row
     if bs is ts:
@@ -683,6 +755,9 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
     outcome, structure = _comparability(env, params, bs, ts, product)
     if structure is not None:
         return refuse(env, params, used, "incomparable_sides", f"{structure}，不是同一个量的两期，不拆", criterion=criterion)
+    partial, note = _period_complete(env, params, ts, product)
+    if partial is not None:
+        return refuse(env, params, used, "partial_target", partial, criterion=criterion)
     if any(v <= 0 for row in cells.values() for v, _ in row):
         return refuse(env, params, used, "non_positive", "乘积或因子里有不大于 0 的值，对数拆解要求全为正", criterion=criterion)
     for when, row in cells.items():
@@ -706,6 +781,8 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
     caveats: list[dict[str, str]] = []
     if outcome is not None and outcome.verdict != "comparable":
         caveats.append(ph.caveat("comparability", outcome.phrase))
+    if note is not None:
+        caveats.append(note)
     total_text = ph.change(delta, M)
     top = max(range(len(factors)), key=lambda i: shares[i] if shares[i] is not None else -math.inf)
     if flat:
@@ -733,8 +810,9 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
               "top_share": canon(shares[top]) if shares[top] is not None else None}
     verdict = {"code": code, "subjects": subjects, "direction": sign_word(delta) if code != "flat" else None}
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion,
-                 phrase=ph.with_caveats(main, caveats), caveats=caveats)
+                 phrase=ph.with_caveats(main, caveats, skip=("comparability",) if outcome is None else ()),
+                 caveats=caveats)
 
 
-__all__ = ["HEADLINE_SHAPE", "PARENT_SHAPE", "SAME_QUERY", "SIMPSON_SHARE", "additive", "factor", "lmdi", "ratio",
-           "ratio_effects"]
+__all__ = ["HEADLINE_SHAPE", "PARENT_SHAPE", "SAME_QUERY", "SIMPSON_SHARE", "USED", "additive", "factor", "lmdi",
+           "ratio", "ratio_effects", "refusal_basis"]

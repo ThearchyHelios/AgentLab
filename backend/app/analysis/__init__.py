@@ -5,8 +5,11 @@
 - run：按请求算一份分析结论。resolve 按调用里写的名字（Q3、来源节点 id）取回输入快照；单元格写成「名字.r行.列」
   （Q1.r0.gmv），由这里拆开再经 resolve 取快照。parents 按名字（A3、分析卡里的项 id）取回上一层拆解，下钻用。
   调用写错抛 contract.CallError；算不了返回 status refused 的结论。唯一的异步来自 context["probe"]（现查表的日期范围）。
+  refuse_data_errors 为真时（分析卡：调用是模板定死的，这期的数据里没有要用的那一项不是写错了），随数据变化的调用错误
+  （DATA_ERRORS）也记成算不了的结论：上一层没做成 parent_refused，其余 input_unavailable，原因照实写是哪一项、哪个值；
+  结构性的（列不存在、遮罩列、比率当可加、重复行、参数写错）照旧抛。agent 工具不传，调用错误交回模型改调用。
 - recompute：按结论里记下的 params、settings、probes 和输入快照（按 sha256 取回）重算一遍，不现查；和封存的用
-  contract.same 比。
+  contract.same 比。一律按 refuse_data_errors 为真复现：分析卡记下的这类结论复算也成立。
 
 契约（名字、形状、缺省阈值）在 contract.py。各算子在 decompose.py（变化拆解）、series.py（波动基线、趋势）、differ.py
 （差异检验）、comparable.py（可比性检查）；统计在 stats.py，判定语和数的写法在 phrases.py，现查在 probe.py。
@@ -31,6 +34,14 @@ from app.analysis.contract import (MODES, OP_LABELS, OPS, AnalysisRequest, Analy
 Resolver = Callable[[str], InputSnapshot | None]
 #: 按名字取回上一层的分析结论（下钻）；没有返回 None
 ParentResolver = Callable[[str], AnalysisResult | None]
+
+#: 随数据变化的调用错误（CallError.code）：调用本身没写错，是这期的数据里没有要用的那一项。分析卡里（refuse_data_errors）
+#: 记成算不了的结论，不让卡失败：上一层没做成（parent_refused）；下钻的段这期没有（parent_key_missing）；期次这期没有
+#: （period_not_found：变化拆解、波动基线的本期、差异检验按期比、可比性检查）；按位置取的总数那一格越界或为空
+#: （row_out_of_range、headline_empty）；要比的组这期没有（unknown_group、too_few_groups）；要用的那一格这期为空
+#: （empty_cell：乘积拆解的乘积、因子，差异检验的计数）
+DATA_ERRORS = frozenset({"parent_refused", "parent_key_missing", "period_not_found", "row_out_of_range",
+                         "headline_empty", "unknown_group", "too_few_groups", "empty_cell"})
 
 
 def _op_mode(request: Mapping[str, Any]) -> tuple[str, str | None]:
@@ -69,9 +80,44 @@ def _env(op: str, mode: str | None, settings: Mapping[str, Any], inputs: Any, fa
                parents=parents, hypothesis=hypothesis if isinstance(hypothesis, str) else None)
 
 
+def _data_refusal(op: str, mode: str | None, raw: Mapping[str, Any], env: Any, error: CallError) -> AnalysisResult:
+    """随数据变化的调用错误记成的算不了的结论。params 记调用原样（label 照样消毒；调用还没走完、规范化不完整，复算拿它重走一遍
+    走到同一处），取过的快照都记进输入（Inputs.settle），阈值和判定标准同这个算子自己算不了时那一份。"""
+    from app.analysis import decompose, differ, series
+    from app.analysis import phrases as ph
+    from app.analysis.common import build
+
+    env.inputs.settle()
+    params = dict(raw)
+    if params.get("label") is not None:
+        params["label"] = ph.clean_label(params["label"]) or None
+    if op == "decompose":
+        used, criterion = decompose.refusal_basis(mode, raw, env.settings)  # type: ignore[arg-type]
+    elif op in ("baseline", "trend"):
+        used, criterion = series.refusal_basis(op, env.settings)
+    elif op == "differ":
+        used, criterion = differ.refusal_basis(mode, env.settings)
+    else:
+        used, criterion = [], ph.CRITERION_COMPARABLE
+    code = "parent_refused" if error.code == "parent_refused" else "input_unavailable"
+    reason = error.reason or error.message
+    return build(env, params, used, status="refused", reason_code=code, reason=reason, criterion=criterion,
+                 phrase=ph.refused(op, reason))
+
+
+def _compute_or_refuse(op: str, mode: str | None, raw: Mapping[str, Any], env: Any, refuse_data_errors: bool
+                       ) -> AnalysisResult:
+    try:
+        return _compute(op, mode, raw, env)
+    except CallError as e:
+        if refuse_data_errors and e.code in DATA_ERRORS:
+            return _data_refusal(op, mode, raw, env, e)
+        raise
+
+
 async def run(request: AnalysisRequest, resolve: Resolver, *, settings: Mapping[str, Any], context: Context,
-              parents: ParentResolver | None = None) -> AnalysisResult:
-    """算一份分析结论。settings 是 contract.effective_settings 算好的阈值。"""
+              parents: ParentResolver | None = None, refuse_data_errors: bool = False) -> AnalysisResult:
+    """算一份分析结论。settings 是 contract.effective_settings 算好的阈值。refuse_data_errors 见文件头（分析卡传真）。"""
     from app.analysis.common import DERIVED_PARAMS
     from app.analysis.facts import Facts
     from app.analysis.inputs import Inputs
@@ -97,7 +143,7 @@ async def run(request: AnalysisRequest, resolve: Resolver, *, settings: Mapping[
         book = Book(known)
         env = _env(op, mode, full, Inputs(resolve, dialect), Facts(catalogs=context.get("catalogs")), book, today,
                    parents, request.get("hypothesis"))
-        result = _compute(op, mode, raw, env)
+        result = _compute_or_refuse(op, mode, raw, env, refuse_data_errors)
         missing = book.missing
         if not missing or rounds == MAX_ROUNDS:
             return result
@@ -109,7 +155,8 @@ def recompute(result: AnalysisResult, load: Callable[[str], InputSnapshot | None
               load_result: Callable[[str], AnalysisResult | None] | None = None) -> AnalysisResult:
     """复算：load 按 sha256 取回输入快照，load_result 按 sha256 取回 parent 那份结论。用结论里记下的 params（含运行当天、
     目录事实）、settings、probes，不现查、不读目录。取不回输入时抛 CallError（code input_missing）；方法升版后调用不再成立
-    时同样抛 CallError（照 run 的说法）。和封存的那份用 contract.same 比。"""
+    时同样抛 CallError（照 run 的说法）。随数据变化的调用错误一律记成算不了（同 run 的 refuse_data_errors 为真），分析卡记下
+    的这类结论复算也成立。和封存的那份用 contract.same 比。"""
     from app.analysis.common import DERIVED_PARAMS
     from app.analysis.facts import Facts
     from app.analysis.inputs import _CELL, Inputs
@@ -150,7 +197,7 @@ def recompute(result: AnalysisResult, load: Callable[[str], InputSnapshot | None
     env = _env(op, mode, settings, Inputs(resolve, dialect), Facts(recorded=params.get("catalog") or {}),
                Book(result.get("probes") or []), today, parents, result.get("hypothesis"))
     raw = {k: v for k, v in params.items() if k not in DERIVED_PARAMS}
-    return _compute(op, mode, raw, env)
+    return _compute_or_refuse(op, mode, raw, env, True)
 
 
 def exhausted(settings: Mapping[str, Any]) -> CallError:
@@ -174,4 +221,5 @@ def comparable_reasons(result: Mapping[str, Any]) -> list[str]:
     return reasons(result)
 
 
-__all__ = ["ParentResolver", "Resolver", "comparable_reasons", "exhausted", "make_prober", "recompute", "run"]
+__all__ = ["DATA_ERRORS", "ParentResolver", "Resolver", "comparable_reasons", "exhausted", "make_prober", "recompute",
+           "run"]

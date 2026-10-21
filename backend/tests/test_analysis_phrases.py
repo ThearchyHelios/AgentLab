@@ -60,6 +60,28 @@ def test_labels_are_scrubbed_of_numbers_units_and_markers():
     assert ph.pick_label("2026", None, "2026") == "这一列"
 
 
+def test_scrubbing_a_scrubbed_label_changes_nothing():
+    # 去掉一处可能拼出新的一处：去完数字的「销售额[[v:Q.r.gmv]]」又是一个引用标记，要接着去
+    assert ph.clean_label("销售额[ [v:Q1.r0.gmv] ]") == "销售额"
+    assert ph.clean_label("[ [see:A1] ]销售额") == "销售额" and ph.clean_label("销售额[1[v:x]2]") == "销售额"
+    for text in ("销售额[ [v:Q1.r0.gmv] ]", "销售额 [ [ a:A1 ] ]", "销售额（ ）（3）", "销售额（同比 +30%，3.5万）",
+                 "近三成客户的退款率", "【线上】销售额", "退款率 (%)", "销售额（", "  ，销售额。", "一[二]三",
+                 "销售额" * 30, "[[a:A1]]主要来自[[v:Q1.r0.region]]"):
+        once = ph.clean_label(text)
+        assert ph.clean_label(once) == once, text
+
+
+def test_labels_stop_at_the_first_clause_and_judgments_fall_back():
+    assert ph.clean_label("销售额，主要来自华东") == "销售额"
+    assert ph.clean_label("订单数; 销售额") == "订单数" and ph.clean_label("订单数、销售额") == "订单数"
+    assert ph.clean_label("销售额（含税，元）") == "销售额"               # 截完没配上对的括号也不要
+    # 判定语不受说法核对：叫法里有判断词的整个不要，退回下一个来源（目录叫法、当叫法用的列名同样处理）
+    assert ph.clean_label("销售额主要来自华东") == "" and ph.clean_label("历史新高的销售额") == ""
+    assert ph.pick_label("销售额主要来自华东", "实收金额", "gmv") == "实收金额"
+    assert ph.pick_label(None, "历史新高的销售额", "gmv") == "gmv"
+    assert ph.pick_label(None, None, "主要来自华东") == "这一列"
+
+
 def test_numbers_stuffed_into_a_label_never_reach_the_phrase():
     label = ph.pick_label("销售额（同比 +30%，3.5万）", "销售额", "gmv")
     phrase = ph.decompose_driver(label, ph.change(-194, 2220), "华东", "-120", Fraction(6186, 10000))
@@ -119,3 +141,18 @@ def test_criteria_are_written_with_the_actual_thresholds():
     assert "3 倍以上算明显超出" in ph.criterion_baseline(DEFAULTS, 12, "周")
     assert "小于 0.05" in ph.criterion_trend(DEFAULTS, 10, "周")
     assert "Fisher" in ph.criterion_differ(DEFAULTS, "rate") and "Welch" in ph.criterion_differ(DEFAULTS, "mean")
+
+
+
+def test_the_run_at_the_end_of_a_trend_says_whether_it_goes_the_same_way():
+    assert ph.trend_phrase("falling", "销售额", 10, "周", "周", "-2.0%", (3, "down")) == \
+        "过去 10 周销售额呈下降趋势（每周约 -2.0%），已连续 3 周下降"
+    assert ph.trend_phrase("falling", "销售额", 10, "周", "周", "-2.0%", (3, "up")) == \
+        "过去 10 周销售额呈下降趋势（每周约 -2.0%），但最近已连续 3 周上升"
+    assert ph.trend_phrase("rising", "订单数", 8, "个月", "月", None, (4, "down")) == \
+        "过去 8 个月订单数呈上升趋势，但最近已连续 4 个月下降"
+
+
+def test_simpson_says_the_shift_only_when_the_phrase_does_not():
+    assert ph.simpson_text("退款率", True, "线上", 0.3, 0.5) == "各段的退款率大多在下降，整体却上升：变化来自结构，线上占比从 30.0% 升到 50.0%"
+    assert ph.simpson_text("退款率", True, "线上", 0.3, 0.5, shift=False) == "各段的退款率大多在下降，整体却上升"

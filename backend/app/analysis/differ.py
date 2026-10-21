@@ -16,6 +16,10 @@
 按 A − B 的正负）；否则 no_evidence。用了 Fisher（比率）或有一组样本数小于 min_n（均值）→ small_sample。判定语不出现「p 值」
 「显著性」：differs 说「差异站得住」，no_evidence 说「差异可能只是样本波动」，p 值、区间在表和证据面板里。
 
+拿不到 p 值的一对（比率有一组样本量为 0；均值、逐行有一组不到 2 个样本，或均值、标准差为空）不算进比了几对、不参与校正，表里
+照实写哪一组怎么了；一对都拿不到时算不了（untestable），不硬判「可能只是样本波动」；只有一部分拿不到的，判定语后接一句
+「另有 n 对算不了」（untested）。
+
 subjects 是判定说的那一对 [[A], [B]]（只比一对时就是那一对，比了几对时是校正后最站得住的那一对；几对都不站得住时为空），
 direction 是 A 相对 B。
 """
@@ -34,6 +38,16 @@ from app.analysis.inputs import Snap, as_list, hashable, same_value
 from app.analysis.numbers import canon, to_fraction
 
 TESTS = {"z": "z 检验", "fisher": "Fisher 精确检验", "welch": "Welch t 检验"}
+
+
+def used_settings(mode: str | None) -> list[str]:
+    """结论里记的阈值：比率看最小期望频数，均值、逐行看最小样本数。"""
+    return ["differ_alpha", "min_expected"] if mode == "rate" else ["differ_alpha", "min_n"]
+
+
+def refusal_basis(mode: str | None, settings: Mapping[str, Any]) -> tuple[list[str], str]:
+    """还没算就算不了时结论里记的阈值和判定标准（同 decompose.refusal_basis）。"""
+    return used_settings(mode), ph.criterion_differ(settings, mode)  # type: ignore[arg-type]
 
 
 @dataclass(eq=False)
@@ -62,14 +76,21 @@ class Pair:
 
 
 def _int(value: Fraction | None, snap: Snap, r: int, column: str) -> int:
-    if value is None or value.denominator != 1 or value < 0:
+    if value is None:
+        raise CallError("empty_cell", f"{snap.ref} 第 {r} 行的「{column}」是空的：计数要有值（在 SQL 里把空值写成 0）",
+                        reason=f"「{column}」那一格是空的（{snap.ref} 第 {r} 行）")
+    if value.denominator != 1 or value < 0:
         raise CallError("not_count", f"{snap.ref} 第 {r} 行的「{column}」不是不小于 0 的整数：比率比较的分子、分母要是计数")
     return int(value)
 
 
+#: 「其余各组合计」的键（不是分组列里的值）
+REST_KEY = ("__rest__",)
+
+
 def _pool(name: str, groups: Sequence[Group], mode: str) -> Group:
     """「其余各组合计」：比率把成功数、试验数加起来；均值按各组的均值、方差、样本数合并；逐行的值并在一起。"""
-    out = Group(("__rest__",), name, rows=[r for g in groups for r in g.rows])
+    out = Group(REST_KEY, name, rows=[r for g in groups for r in g.rows])
     if mode == "rate":
         out.x, out.n = sum(g.x for g in groups), sum(g.n for g in groups)
         return out
@@ -124,6 +145,22 @@ def _test(pair: Pair, mode: str, min_expected: Fraction) -> None:
     pair.ci = stats.welch_interval(float(a.mean), float(a.var), a.n, float(b.mean), float(b.var), b.n)
 
 
+def _gap(group: Group, mode: str) -> str | None:
+    """一组为什么算不了检验；算得了为 None。"""
+    if mode == "rate":
+        return ph.say(group.name, "的样本量为 0") if group.n == 0 else None
+    if group.n < 2:
+        return ph.say(group.name, "没有样本" if group.n == 0 else "只有 1 个样本")
+    if group.mean is None or group.var is None:
+        return ph.say(group.name, "的均值或标准差为空")
+    return None
+
+
+def untested_text(pair: Pair, mode: str) -> str:
+    """这一对拿不到 p 值的原因：哪一组、怎么了（两组都有就都写）。"""
+    return "、".join(dict.fromkeys(why for g in (pair.a, pair.b) if (why := _gap(g, mode)))) or "样本不够"
+
+
 def _verdict(pairs: Sequence[Pair], alpha: Fraction) -> list[Pair]:
     """Holm 校正后站得住的那几对（按校正后的 p 从小到大，一样的按先后）。"""
     adjusted = stats.holm([p.p for p in pairs])
@@ -135,7 +172,7 @@ def _verdict(pairs: Sequence[Pair], alpha: Fraction) -> list[Pair]:
 
 def differ(raw: Mapping[str, Any], env: Env) -> Any:
     mode = env.mode
-    used = ["differ_alpha", "min_expected"] if mode == "rate" else ["differ_alpha", "min_n"]
+    used = used_settings(mode)
     snap = env.inputs.snap(need(raw, "query", "查询编号"), "查询编号")
     params: dict[str, Any] = {"query": snap.ref}
     by_period = raw.get("period") is not None
@@ -230,7 +267,8 @@ def _groups(snap: Snap, group_col: str, cols: Mapping[str, str], mode: str, by_p
     if by_period:
         for w, what in ((params["target"], "本期"), (params["base"], "基期")):
             if not any(same_value(w, g.key) for g in groups.values()):
-                raise CallError("period_not_found", f"期次列「{group_col}」里没有「{w}」：{what}要写 {snap.ref} 里有的期次值")
+                raise CallError("period_not_found", f"期次列「{group_col}」里没有「{w}」：{what}要写 {snap.ref} 里有的期次值",
+                                reason=f"期次列「{group_col}」里没有{what}「{ph.key_text([w])}」")
     return groups
 
 
@@ -238,7 +276,8 @@ def _find(groups: Mapping[Any, Group], value: Any, column: str) -> Group:
     found = next((g for g in groups.values() if same_value(value, g.key)), None)
     if found is None:
         shown = "、".join(g.name for g in list(groups.values())[:8])
-        raise CallError("unknown_group", f"「{value}」不是「{column}」里的值：要比的组写 {shown} 里的")
+        raise CallError("unknown_group", f"「{value}」不是「{column}」里的值：要比的组写 {shown} 里的",
+                        reason=f"分组列「{column}」里没有「{ph.key_text([value])}」这一组")
     return found
 
 
@@ -261,7 +300,8 @@ def _pairs(raw: Mapping[str, Any], params: dict[str, Any], groups: dict[Any, Gro
         params["pairs"] = [[p.a.key, p.b.key] for p in out]
         return out
     if len(groups) < 2:
-        raise CallError("too_few_groups", f"「{group_col}」里只有 {len(groups)} 组，至少要两组才比得了")
+        raise CallError("too_few_groups", f"「{group_col}」里只有 {len(groups)} 组，至少要两组才比得了",
+                        reason=f"分组列「{group_col}」里只有 {len(groups)} 组，至少要两组才比得了")
     if raw.get("reference") is not None:
         ref = _find(groups, raw.get("reference"), group_col)
         params["reference"] = ref.key
@@ -279,6 +319,12 @@ def _decide(env: Env, params: dict[str, Any], used: list[str], pairs: list[Pair]
     min_expected = env.threshold("min_expected") if mode == "rate" else Fraction(0)
     for pair in pairs:
         _test(pair, mode, min_expected)
+    tested = [p for p in pairs if p.p is not None]
+    untested = [p for p in pairs if p.p is None]
+    if not tested:
+        shown = list(dict.fromkeys(untested_text(p, mode) for p in pairs))
+        return refuse(env, params, used, "untestable",
+                      "，".join(shown[:3]) + ("等" if len(shown) > 3 else "") + "，算不了差异", criterion=criterion)
     hits = _verdict(pairs, alpha)
     caveats: list[dict[str, str]] = []
     if mode == "rows":
@@ -293,24 +339,26 @@ def _decide(env: Env, params: dict[str, Any], used: list[str], pairs: list[Pair]
         small = sorted((g for p in pairs for g in (p.a, p.b) if g.n < min_n), key=lambda g: g.n)
         if small:
             caveats.append(ph.caveat("small_sample", ph.small_sample_mean_text(small[0].name, small[0].n, min_n)))
-    tested = [p for p in pairs if p.p is not None]
     if len(tested) > 1:
         caveats.append(ph.caveat("multiple_comparisons", ph.multiple_text(len(tested))))
+    if untested:
+        caveats.append(ph.caveat("untested", ph.untested_pairs_text(len(untested),
+                                                                     [untested_text(p, mode) for p in untested])))
     fmt = (lambda v: ph.pct(v, signed=False)) if mode == "rate" else (lambda v: ph.amount(v))
     if hits:
         code = "differs"
         head = hits[0]
         main = ph.differ_phrase([ph.differ_pair(p.a.name, p.b.name, label, fmt(p.a_value), fmt(p.b_value),
                                                 p.diff > 0) for p in hits],  # type: ignore[operator]
-                                len(pairs))
+                                len(tested))
         subjects = [[head.a.name], [head.b.name]]
         direction = sign_word(head.diff)  # type: ignore[arg-type]
     else:
         code = "no_evidence"
-        head = pairs[0] if len(pairs) == 1 else None
+        head = tested[0] if len(tested) == 1 else None
         sizes = (ph.amount(head.a.n), ph.amount(head.b.n)) if head is not None else None
         main = ph.no_evidence_phrase(head.a.name if head else None, head.b.name if head else None, label, sizes,
-                                     len(pairs))
+                                     len(tested))
         subjects = [[head.a.name], [head.b.name]] if head is not None else []
         direction = None
     value_name = "比率" if mode == "rate" else "均值"
@@ -318,7 +366,7 @@ def _decide(env: Env, params: dict[str, Any], used: list[str], pairs: list[Pair]
     for p in pairs:
         flags = []
         if p.p is None:
-            flags.append("样本不够，算不了")
+            flags.append(f"{untested_text(p, mode)}，算不了")
         if p.test == "fisher":
             flags.append("样本少，用了精确检验")
         rows.append([p.a.name, p.b.name, canon(p.a_value), canon(p.b_value), canon(p.diff),
@@ -326,7 +374,7 @@ def _decide(env: Env, params: dict[str, Any], used: list[str], pairs: list[Pair]
                      TESTS.get(p.test or "") or None, canon(p.p), canon(p.p_adj), "、".join(flags) or None])
     columns = ["a", "b", "a_value", "b_value", "diff", "ci_lo", "ci_hi", "a_n", "b_n", "test", "p", "p_adj", "flag"]
     # 组、对照组照分组列（期次列）在快照里的类型；和「其余各组合计」比时对照组那一列有一格是叫法，写 text
-    rest = any(p.b.key == ("__rest__",) for p in pairs)
+    rest = any(p.b.key == REST_KEY for p in pairs)
     table = {"columns": columns,
              "labels": {"a": "组", "b": "对照组", "a_value": f"组的{value_name}", "b_value": f"对照组的{value_name}",
                         "diff": "差", "ci_lo": "差的区间下限", "ci_hi": "差的区间上限", "a_n": "组的样本量",
@@ -334,37 +382,32 @@ def _decide(env: Env, params: dict[str, Any], used: list[str], pairs: list[Pair]
              "rows": rows,
              "column_types": column_types(columns, dims={"a": kind, "b": "text" if rest else kind},
                                           texts=("test", "flag"))}
-    shown = head if head is not None else pairs[0]
+    shown = head if head is not None else tested[0]
     values = {"a": canon(shown.a_value), "b": canon(shown.b_value), "diff": canon(shown.diff),
               "ci_lo": canon(shown.ci[0]) if shown.ci else None, "ci_hi": canon(shown.ci[1]) if shown.ci else None,
               "p": canon(shown.p), "p_adj": canon(shown.p_adj), "n_a": str(shown.a.n), "n_b": str(shown.b.n),
               "test": shown.test, "pairs": str(len(pairs)), "differs": str(len(hits))}
     verdict = {"code": code, "subjects": subjects, "direction": direction}
-    phrase = ph.with_caveats(main, caveats, skip=("multiple_comparisons",) if len(pairs) > 1 else ())
+    phrase = ph.with_caveats(main, caveats, skip=("multiple_comparisons",) if len(tested) > 1 else ())
     return build(env, params, used, table=table, values=values, verdict=verdict, criterion=criterion, phrase=phrase,
                  caveats=caveats)
 
 
 def _sensitivity(pairs: list[Pair], mode: str, alpha: Fraction, min_expected: Fraction,
                  differs: bool) -> tuple[bool, bool] | None:
-    """rows 模式的敏感性：去掉比较的各组里离均值最远的那一个值重算，判定变了交回 (去掉的是不是偏大的那一笔, 现在站不站得住)。"""
-    everything = [(g, i, v) for g in dict.fromkeys(g for p in pairs for g in (p.a, p.b)) for i, v in enumerate(g.values)]
+    """rows 模式的敏感性：去掉比较的各组里离均值最远的那一个值重算，判定变了交回 (去掉的是不是偏大的那一笔, 现在站不站得住)。
+    只在真实的各组里找（「其余各组合计」是它们的值并在一起，不另算一份），去掉以后由各组重建每一对的「其余」合计。"""
+    groups = list(dict.fromkeys(g for p in pairs for g in (p.a, p.b) if g.key != REST_KEY))
+    everything = [(g, i, v) for g in groups for i, v in enumerate(g.values)]
     if len(everything) < 3:
         return None
     mean = sum((v for _, _, v in everything), Fraction(0)) / len(everything)
     group, index, value = max(everything, key=lambda t: abs(t[2] - mean))
-    trimmed = []
-    for p in pairs:
-        def cut(g: Group) -> Group:
-            if g is not group and not (g.key == ("__rest__",) and any(v is value for v in g.values)):
-                return g
-            values = list(g.values)
-            for k, v in enumerate(values):
-                if v is value:
-                    del values[k]
-                    break
-            return _moments(Group(g.key, g.name, rows=g.rows, values=values))
-        trimmed.append(Pair(cut(p.a), cut(p.b)))
+    cut = {g: g for g in groups}
+    cut[group] = _moments(Group(group.key, group.name, rows=group.rows,
+                                values=[v for k, v in enumerate(group.values) if k != index]))
+    trimmed = [Pair(cut[p.a], _pool(p.b.name, [cut[g] for g in groups if g is not p.a], mode)
+                    if p.b.key == REST_KEY else cut[p.b]) for p in pairs]
     for p in trimmed:
         _test(p, mode, min_expected)
     now = bool(_verdict(trimmed, alpha))
@@ -372,4 +415,4 @@ def _sensitivity(pairs: list[Pair], mode: str, alpha: Fraction, min_expected: Fr
     return (value > mean, now) if now != differs else None
 
 
-__all__ = ["TESTS", "differ"]
+__all__ = ["REST_KEY", "TESTS", "differ", "refusal_basis", "untested_text", "used_settings"]

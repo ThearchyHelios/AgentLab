@@ -30,7 +30,7 @@ class FakeOps:
         monkeypatch.setattr(analysis_ops, "run", self.run)
 
     async def run(self, request: dict[str, Any], resolve: Any, *, settings: Any, context: Any,
-                  parents: Any = None) -> dict[str, Any]:
+                  parents: Any = None, refuse_data_errors: bool = False) -> dict[str, Any]:
         params = request.get("params") or {}
         names = [params[k] for k in ("query", "base_query", "target_query") if params.get(k)]
         snapshots = {name: resolve(name) for name in names}
@@ -38,7 +38,7 @@ class FakeOps:
         if isinstance(params.get("parent"), dict) and parents is not None:
             parent = parents(params["parent"]["of"])
         self.calls.append({"request": request, "snapshots": snapshots, "settings": dict(settings), "context": context,
-                           "parent": parent, "parents": parents,
+                           "parent": parent, "parents": parents, "refuse_data_errors": refuse_data_errors,
                            "visible": {n: parents is not None and parents(n) is not None for n in self.peek}})
         error = self.errors.pop(0) if self.errors else None
         if error is not None:

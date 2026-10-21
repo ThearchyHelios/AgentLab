@@ -9,6 +9,7 @@ from fractions import Fraction
 
 import pytest
 
+from app.analysis import DATA_ERRORS
 from app.analysis.decompose import lmdi, ratio_effects
 from tests.analysis_samples import analyze, call_error, fixed_prober, notes, snap
 
@@ -56,8 +57,10 @@ async def test_a_driver_is_named_with_its_share_and_the_whole_shape_is_filled():
                                  "columns": ["region", "week", "gmv"], "rows": "all"}]
     assert result["hypothesis"] == "华东拖累" and result["probes"] == []
     assert result["criterion"].endswith("以各段之和为总数")
-    assert {c["code"] for c in result["caveats"]} == {"headline_basis"}
+    # 期次是现成的一列「2026-W41」，认不出是按哪种周号算的：本期齐不齐核对不了，只附在证据面板（不进判定语）
+    assert {c["code"] for c in result["caveats"]} == {"headline_basis", "comparability"}
     assert result["params"]["catalog"] == {"labels": {"region": "地区"}, "measures": {"gmv": "flow"}}
+    assert result["params"]["today"] == "2026-10-21"
 
 
 async def test_the_segments_add_up_to_the_total_digit_for_digit():
@@ -127,6 +130,29 @@ async def test_a_rounded_headline_closes_within_its_written_precision():
         assert (result["verdict"]["code"] != "unclosed") is closes, written
 
 
+async def test_a_headline_rounded_by_the_database_to_a_whole_number_closes_within_half_a_unit():
+    # SQLite 的 ROUND() 交回浮点 2120.0：取到了个位，最短写法里的「.0」不是一位小数的书写精度
+    rows = [["华东", "2026-W41", "1120.2"], ["华东", "2026-W42", "700"], ["华北", "2026-W41", "1000.2"],
+            ["华北", "2026-W42", "600"]]
+    for written, closes in ((2120.0, True), (2121.0, False), (2120.5, False)):
+        head = snap("Q1", "SELECT ROUND(SUM(amount)) AS gmv FROM orders", ["gmv_base", "gmv"], [[written, 1300.0]])
+        result = await additive(rows, snaps=[weekly(rows), head], headline=["Q1.r0.gmv_base", "Q1.r0.gmv"])
+        assert (result["verdict"]["code"] != "unclosed") is closes, written
+
+
+async def test_a_drill_closes_against_the_exact_value_of_the_parent_segment():
+    top = await additive()                                             # 华东 820 → 700
+    near = snap("Q4", "SELECT province, week, SUM(amount) AS gmv FROM orders WHERE region = '华东' GROUP BY 1, 2",
+                ["province", "week", "gmv"],
+                [["沪", "2026-W41", "500.4"], ["沪", "2026-W42", "410"], ["苏", "2026-W41", 320],
+                 ["苏", "2026-W42", "290.3"]])
+    params = {"query": "Q4", "by": ["province"], "period": "week", "base": "2026-W41", "target": "2026-W42",
+              "measure": "gmv", "parent": {"of": "A3", "key": ["华东"]}}
+    off = await analyze("decompose", "additive", snaps=[near], parents={"A3": top}, **params)
+    # 上一层那一段是算出来的精确值，不是取整过的总数：820.4 对 820、700.3 对 700 都不闭合
+    assert off["verdict"]["code"] == "unclosed" and off["values"]["gap"] == "-0.4"
+
+
 async def test_drilling_down_checks_closure_against_the_parent_segment():
     top = await additive()
     province = snap("Q4", "SELECT province, week, SUM(amount) AS gmv FROM orders WHERE region = '华东' GROUP BY 1, 2",
@@ -139,7 +165,7 @@ async def test_drilling_down_checks_closure_against_the_parent_segment():
     assert child["params"]["depth"] == 1 and child["params"]["parent"] == {"of": "A3", "key": ["华东"]}
     assert child["inputs"][0]["role"] == "parent" and child["inputs"][0]["ref"] == "A3"
     assert "max_drill_depth" in child["settings"]
-    assert {c["code"] for c in child["caveats"]} == set()                    # 有 parent 就不是「以各段之和为总数」
+    assert {c["code"] for c in child["caveats"]} == {"comparability"}        # 有 parent 就不是「以各段之和为总数」
     short = snap("Q4", province["sql"], ["province", "week", "gmv"],
                  [["沪", "2026-W41", 500], ["沪", "2026-W42", 410], ["苏", "2026-W41", 300], ["苏", "2026-W42", 290]])
     unclosed = await analyze("decompose", "additive", snaps=[short], parents={"A3": top}, **params)
@@ -301,9 +327,12 @@ async def test_simpson_each_channel_improves_but_the_mix_makes_the_whole_worse()
     rows = [["线上", "W41", 50, 500], ["线上", "W42", 90, 1000], ["线下", "W41", 10, 1000], ["线下", "W42", 4, 500]]
     result = await ratio(rows, label="退款率")
     assert result["verdict"] == {"code": "mix_driven", "subjects": [["线上"]], "direction": "up"}
-    assert result["phrase"].startswith("退款率上升 2.3 个百分点（4.0% 到 6.3%），主要来自结构变化：线上占比从 33.3% 到 66.7%")
+    # 结构变化只说一遍：正文说了结构变化、点了线上，辛普森那一句只说各段和整体反着变
+    assert result["phrase"] == ("退款率上升 2.3 个百分点（4.0% 到 6.3%），主要来自结构变化：线上占比从 33.3% 到 66.7%；"
+                                "各段的退款率大多在下降，整体却上升")
     simpson = next(c for c in result["caveats"] if c["code"] == "simpson")
-    assert simpson["text"] == "各段的退款率大多在下降，整体却上升：变化来自结构，线上占比从 33.3% 升到 66.7%"
+    assert simpson["text"] == "各段的退款率大多在下降，整体却上升"
+    assert result["phrase"].count("结构") == 1
     values = result["values"]
     assert Fraction(values["mix_total"]) + Fraction(values["rate_total"]) == pytest.approx(Fraction(values["delta"]))
     assert result["table"]["columns"][:5] == ["channel", "n_base", "n_target", "d_base", "d_target"]
@@ -448,3 +477,84 @@ async def test_dimension_columns_keep_the_type_recorded_at_query_time():
     factor_result = await factor([["W41", "1000", 100, "10"], ["W42", "1320", 120, "11"]])
     assert factor_result["table"]["column_types"] == {"factor": "text", "base": "number", "target": "number",
                                                        "pct": "number", "contrib": "number", "share": "number"}
+
+
+
+async def test_a_label_cannot_carry_a_judgment_into_the_phrase():
+    cut = await additive(label="销售额，主要来自华南")
+    assert cut["params"]["label"] == "销售额" and cut["phrase"].startswith("销售额下降 194")
+    assert "华南" not in cut["phrase"]
+    judged = await additive(label="主要来自华南的销售额")
+    assert "label" not in judged["params"]                       # 消成空了，退回目录里的叫法
+    assert judged["phrase"].startswith("销售额下降 194") and "华南" not in judged["phrase"]
+    # 消过一遍会变的叫法：复算拿记下的叫法再消，判定语逐字相同（analyze 核对复算逐字段相同）
+    marked = await additive(label="销售额[ [v:Q1.r0.gmv] ]")
+    assert marked["params"]["label"] == "销售额" and marked["phrase"].startswith("销售额下降 194")
+
+
+async def test_a_dimension_named_like_a_result_column_is_a_call_error():
+    rows = [["线上", "2026-W41", 820], ["线上", "2026-W42", 700], ["线下", "2026-W41", 600], ["线下", "2026-W42", 560]]
+    flagged = snap("Q2", "SELECT channel AS flag, week, SUM(amount) AS gmv FROM orders GROUP BY 1, 2",
+                   ["flag", "week", "gmv"], rows)
+    error = await call_error("decompose", "additive", snaps=[flagged], query="Q2", by=["flag"], period="week",
+                             base="2026-W41", target="2026-W42", measure="gmv")
+    assert error.code == "reserved_column" and "在 SQL 里给它换个别名" in error.message and "AS flag_name" in error.message
+    assert error.code not in DATA_ERRORS                               # 结构性的：分析卡里照旧让卡失败
+    ratio_rows = [["线上", "W41", 50, 1000], ["线上", "W42", 80, 1000], ["线下", "W41", 20, 1000], ["线下", "W42", 26, 1000]]
+    mixed = snap("Q1", "SELECT channel AS Mix, week, SUM(refund_flag) AS refunds, COUNT(*) AS orders FROM orders "
+                       "GROUP BY 1, 2", ["Mix", "week", "refunds", "orders"], ratio_rows)
+    error = await call_error("decompose", "ratio", snaps=[mixed], query="Q1", by="Mix", period="week", base="W41",
+                             target="W42", numerator="refunds", denominator="orders")
+    assert error.code == "reserved_column" and "「Mix」" in error.message
+
+
+
+# --------------------------------------------------------------------------
+# 一份快照按期次分组：本期齐不齐（同波动基线那一套）
+# --------------------------------------------------------------------------
+
+WEEK_START = ("SELECT region, date(order_date, '-6 days', 'weekday 1') AS week, SUM(amount) AS gmv FROM orders "
+              "GROUP BY 1, 2")
+DAY_SQL = "SELECT region, order_date AS day, SUM(amount) AS gmv FROM orders GROUP BY 1, 2"
+
+
+def _two(base, target, *, sql=WEEK_START, col="week"):
+    rows = [["华东", base, 820], ["华东", target, 700], ["华北", base, 600], ["华北", target, 560]]
+    return snap("Q2", sql, ["region", col, "gmv"], rows, types={"region": "text", col: "text", "gmv": "number"})
+
+
+async def test_one_snapshot_by_period_checks_the_target_is_whole():
+    probe = fixed_prober({("orders", "order_date"): ("2025-01-01", "2026-10-20")})
+    ask = {"query": "Q2", "by": ["region"], "period": "week", "measure": "gmv", "label": "销售额"}
+    # 运行当天 10-21：10-19 那一周没过完
+    partial = await analyze("decompose", "additive", snaps=[_two("2026-10-12", "2026-10-19")], probe=probe,
+                            base="2026-10-12", target="2026-10-19", **ask)
+    assert partial["reason_code"] == "partial_target"
+    assert partial["reason"] == "本期数据只到 2026-10-20，还差 5 天，和完整的周比没有意义"
+    assert partial["params"]["today"] == "2026-10-21" and partial["probes"][0]["column"] == "order_date"
+    whole = await analyze("decompose", "additive", snaps=[_two("2026-10-05", "2026-10-12")], probe=probe,
+                          base="2026-10-05", target="2026-10-12", **ask)
+    assert whole["status"] == "ok" and not [c for c in whole["caveats"] if c["code"] == "comparability"]
+    # 查不到表的范围：只附一句核对不了，不进判定语
+    unknown = await analyze("decompose", "additive", snaps=[_two("2026-10-05", "2026-10-12")],
+                            base="2026-10-05", target="2026-10-12", **ask)
+    note = next(c["text"] for c in unknown["caveats"] if c["code"] == "comparability")
+    assert note == "没能核对本期的数据是否到齐（查不到表里这一列的日期范围）" and note not in unknown["phrase"]
+    ratio_rows = [["线上", "2026-10-12", 50, 1000], ["线上", "2026-10-19", 80, 1000], ["线下", "2026-10-12", 20, 1000],
+                  ["线下", "2026-10-19", 26, 1000]]
+    ratio_snap = snap("Q1", "SELECT channel, date(order_date, '-6 days', 'weekday 1') AS week, SUM(refund_flag) AS "
+                            "refunds, COUNT(*) AS orders FROM orders GROUP BY 1, 2",
+                      ["channel", "week", "refunds", "orders"], ratio_rows)
+    refused = await analyze("decompose", "ratio", snaps=[ratio_snap], probe=probe, query="Q1", by="channel",
+                            period="week", base="2026-10-12", target="2026-10-19", numerator="refunds",
+                            denominator="orders")
+    assert refused["reason_code"] == "partial_target"
+
+
+async def test_two_days_a_week_apart_from_a_plain_date_column_are_two_days():
+    # 期次列直接取的日期：昨天（10-20）对上周同一天，不是两周；10-20 当天的数据已经到了
+    probe = fixed_prober({("orders", "order_date"): ("2025-01-01", "2026-10-20")})
+    result = await analyze("decompose", "additive", snaps=[_two("2026-10-13", "2026-10-20", sql=DAY_SQL, col="day")],
+                           probe=probe, query="Q2", by=["region"], period="day", base="2026-10-13",
+                           target="2026-10-20", measure="gmv")
+    assert result["status"] == "ok" and not [c for c in result["caveats"] if c["code"] == "comparability"]

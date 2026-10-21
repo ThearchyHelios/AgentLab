@@ -907,13 +907,14 @@ def _analysis_item_ok(key: str, value: Any) -> bool:
 
 def analysis_values(stored: Any) -> dict[str, Any]:
     """库里存的（或刚写进来的）analysis 一组 → 补齐缺省；存坏了的项按缺省。两两之间的大小对不上的（「明显超出」不大于
-    「超出常规波动」、最多用几期历史小于至少几期）那一对都按缺省：只换掉一项，可能换出另一种对不上。"""
+    「超出常规波动」、最多用几期历史小于至少几期、「集中」的合计占比小于「主要来源」的占比）那一对都按缺省：只换掉一项，可能
+    换出另一种对不上。"""
     stored = stored if isinstance(stored, dict) else {}
     out = dict(analysis_contract.DEFAULTS)
     for key in analysis_contract.DEFAULTS:
         if key in stored and _analysis_item_ok(key, stored[key]):
             out[key] = float(stored[key]) if analysis_contract.RANGES[key][0] is float else stored[key]
-    for pair in (("k_warn", "k_alert"), ("min_history", "max_history")):
+    for pair in (("k_warn", "k_alert"), ("min_history", "max_history"), ("main_share", "concentration")):
         if analysis_contract.settings_problem({k: out[k] for k in pair}) is not None:
             out.update({k: analysis_contract.DEFAULTS[k] for k in pair})
     return out
