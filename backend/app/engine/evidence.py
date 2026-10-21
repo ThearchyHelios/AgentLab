@@ -2106,8 +2106,11 @@ def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snap
 
 
 def resolve_ref(ref: str, catalog: dict[str, Any], *, cells_allowed: bool = True,
-                loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
-    """片段上记的 ref（m:gmv|万、i:week、v:Q1.r0.amount）→ Citation。证据接口点开片段时用它重新解析。"""
+                loader: Loader | _Snapshots | None = None, display: int | None = None) -> dict[str, Any]:
+    """片段上记的 ref（m:gmv|万、i:week、v:Q1.r0.amount）→ Citation。证据接口点开片段时用它重新解析。display 是按哪一版
+    单元格显示规则渲染（文档记下的那一版，doc_cell_display；复核按它），不给按 loader 的（缺省当前版）。"""
+    if display is not None:
+        loader = _snapshots(loader, display=display)
     return resolve_marker(_parse_ref(ref), catalog, cells_allowed=cells_allowed, loader=loader)
 
 
@@ -4057,11 +4060,18 @@ def _analysis_sources(entry: dict[str, Any], catalog: dict[str, Any]) -> str:
                     f"，另有 {missing} 份输入不在这份目录里" if missing else ""])
 
 
+#: 写作目录里一条分析结论的几种样子，从全到简（_analysis_prompt 的 level）：full 连同结果表的前 table_top_k 段；compact 不列
+#: 各段，结果表只写一句；brief 只留判定语和具名的数；head 只列编号、方法和来自哪几个查询
+ANALYSIS_LEVELS = ("full", "compact", "brief", "head")
+
+
 def _analysis_prompt(entry: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, *,
-                     table: bool = True) -> list[str]:
+                     level: str = "full") -> list[str]:
     """一条分析结论在写作目录里的样子：编号、方法、来自哪几个查询，判定语（[[a:A1]] 渲染出来的那一句）、判定标准、具名的数
-    （可引用的键，值按渲染规则写）、附带说明、输入查询的 SQL 检查问题、算不了的原因；table 为真时再列结果表的前
-    table_top_k 段，其余写「其余 n 段」。agent 写的假设不列：它不是结论，只在证据面板显示。
+    （可引用的键，值按渲染规则写）、附带说明、输入查询的 SQL 检查问题、算不了的原因；level 为 full 时再列结果表的前
+    table_top_k 段，其余写「其余 n 段」。目录放不下时往简里降（ANALYSIS_LEVELS）：compact 结果表只写一句；brief 只留
+    判定语和具名的数（判定标准、附带说明、SQL 检查的提醒、算不了的原因那句不列，判定语里本来就写着）；head 只列编号那一行。
+    agent 写的假设不列：它不是结论，只在证据面板显示。
 
     受管级别的正式出具、契约没开「单元格引用」时，Agent 现场做的分析只列判定语和判定标准，写明只能当依据（[[see:A1]]），
     不列数和表：列出来的数写作者只能照抄成没有出处的数。"""
@@ -4070,8 +4080,11 @@ def _analysis_prompt(entry: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
     result, why = snaps.analysis(alias, entry)
     if result is None:
         return [f"{head}（{why}，不要引用）"]
+    if level == "head":
+        return [head]
+    brief = level == "brief"
     lines = [head]
-    if note := _sql_check_note(entry.get("artifact"), snaps, "这次分析的输入查询"):
+    if not brief and (note := _sql_check_note(entry.get("artifact"), snaps, "这次分析的输入查询")):
         lines.append(note)
     phrase = _clean(str(result.get("phrase") or ""))
     see_only = not cells_allowed and not analysis_card(entry)
@@ -4080,13 +4093,15 @@ def _analysis_prompt(entry: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
                      f"[[see:{alias}]] 作依据）")
     else:
         lines.append(f"  判定语 [[a:{alias}]] = {phrase}" if phrase else f"  （没有判定语，不要写 [[a:{alias}]]）")
-    if result.get("status") == "refused":
+    if brief:
+        pass
+    elif result.get("status") == "refused":
         lines.append(f"  算不了：{_clean(str(result.get('reason') or '没有写原因'))}。这条结论不能当「异常」「主要来自」"
                      "「呈上升趋势」这类判断的依据，只能照实写算不了的原因")
     elif criterion := _clean(str(result.get("criterion") or "")):
         lines.append(f"  判定标准：{criterion}")
     caveats = [_clean(str(c.get("text") or "")) for c in result.get("caveats") or [] if isinstance(c, dict)]
-    if caveats := [c for c in caveats if c]:
+    if not brief and (caveats := [c for c in caveats if c]):
         lines.append(f"  附带说明：{'；'.join(caveats)}")
     if see_only:
         return lines
@@ -4100,6 +4115,8 @@ def _analysis_prompt(entry: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
     if shown:
         more = f"，另有 {len(values) - _PROMPT_VALUES} 个" if len(values) > _PROMPT_VALUES else ""
         lines.append(f"  具名的数（写 [[a:{alias}.键]]）：{'，'.join(shown)}{more}")
+    if brief:
+        return lines
     snapshot, why = snaps.table(alias, entry)
     if why is not None:
         return lines
@@ -4107,7 +4124,7 @@ def _analysis_prompt(entry: dict[str, Any], catalog: dict[str, Any], snaps: _Sna
     labels = snapshot.get("labels") or {}
     rows = snapshot["rows"]
     named = "、".join(f"{c}（{_clean(str(labels[c]))}）" if labels.get(c) else c for c in columns)
-    if not table:
+    if level != "full":
         lines.append(f"  结果表共 {len(rows)} 段，列 {named}（这里没列出各段；要列出就单独一行写 [[table:{alias}]]）")
         return lines
     settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
@@ -4135,12 +4152,13 @@ _TOP_K = 10
 
 @dataclass
 class _AnalysisLines:
-    """写作目录里「分析结论」一段：每条结论两种样子——full 连同结果表的前 table_top_k 段，compact 只有判定、判定标准、
-    具名的数和说明。放得下时全按 full；放不下时先按 compact 列出，再按顺序补上结果表，排在查询的行前面（_trimmed_catalog）。"""
+    """写作目录里「分析结论」一段：每条结论四种样子（ANALYSIS_LEVELS，从全到简）。放得下时全按 full；放不下时这一段最多占
+    预算的 1/_PROMPT_ANALYSIS_SHARE：先按 compact 列出，还超就从后往前降成 brief、再降成 head，然后按顺序补上结果表，排在
+    查询的行前面（_trimmed_catalog）。"""
 
     order: list[str]
-    full: dict[str, list[str]]
-    compact: dict[str, list[str]]
+    #: 样子 → {编号: 那几行}
+    levels: dict[str, dict[str, list[str]]]
     #: 有 Agent 现场做的分析只能当依据（受管级别的出具、契约没开「单元格引用」）
     see_only: bool = False
 
@@ -4148,15 +4166,19 @@ class _AnalysisLines:
     def of(cls, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool) -> "_AnalysisLines":
         entries = [e for e in catalog.values() if isinstance(e, dict) and e.get("kind") == LEDGER_KIND]
         return cls([e["alias"] for e in entries],
-                   {e["alias"]: _analysis_prompt(e, catalog, snaps, cells_allowed) for e in entries},
-                   {e["alias"]: _analysis_prompt(e, catalog, snaps, cells_allowed, table=False) for e in entries},
+                   {level: {e["alias"]: _analysis_prompt(e, catalog, snaps, cells_allowed, level=level)
+                            for e in entries} for level in ANALYSIS_LEVELS},
                    see_only=not cells_allowed and any(not analysis_card(e) for e in entries))
 
+    def shape(self, alias: str, level: str) -> list[str]:
+        return self.levels[level][alias]
+
     def lines(self, tier: dict[str, str] | None = None) -> list[str]:
-        """这一段的文字：tier 里记成 compact 的按 compact，其余按 full。没有分析结论时是空的（目录和以前一字不差）。"""
+        """这一段的文字：每条按 tier 里记的样子，没记的按 full。没有分析结论时是空的（目录和以前一字不差）。"""
         if not self.order:
             return []
-        shapes = [self.compact[a] if (tier or {}).get(a) == "compact" else self.full[a] for a in self.order]
+        shapes = [self.shape(a, level if (level := (tier or {}).get(a)) in ANALYSIS_LEVELS else "full")
+                  for a in self.order]
         head = [f"\n{ANALYSIS_PROMPT}", *([ANALYSIS_SEE_ONLY_PROMPT] if self.see_only else [])]
         return [*head, *(line for shape in shapes for line in shape)]
 
@@ -4176,6 +4198,8 @@ CATALOG_MAX_CHARS = 160_000
 _PROMPT_COMPACT_ROWS = 3
 #: 放不下时表和字段、知识库检索两节合起来最多占预算的几分之一（剩下的给查询）
 _PROMPT_TAIL_SHARE = 4
+#: 放不下时分析结论一段最多占预算的几分之一：几十份结论、每份上千段时，不能把查询挤得只剩一行摘要
+_PROMPT_ANALYSIS_SHARE = 2
 _PROMPT_CUT = "\n…（目录太长，后面的省略了）"
 
 
@@ -4451,16 +4475,17 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
                      pinned: list[str], analyses: _AnalysisLines | None = None) -> WriterCatalog:
     """放不下时的目录。以前从头截断：查询按编号排，前面的节点占满预算，后面的节点一次都不露面。
 
-    1. 口径卡指标、运行输入、结构化字段一律列出（第一优先）；分析结论的判定、判定标准、具名的数、说明也一律列出
+    1. 口径卡指标、运行输入、结构化字段一律列出（第一优先）；分析结论的判定、判定标准、具名的数、说明也列出，只是这一段
+       最多占预算的 1/_PROMPT_ANALYSIS_SHARE：超了就按结论的先后从后往前降，先只留判定语和具名的数，再只列编号
     2. 表和字段、知识库检索两节合起来最多占预算的 1/_PROMPT_TAIL_SHARE
-    3. 分析结论的结果表（前 table_top_k 段）先补：判定是从原始明细算出来的结论，比原始明细更值得留
+    3. 分析结论的结果表（前 table_top_k 段）先补（不超过那个上限）：判定是从原始明细算出来的结论，比原始明细更值得留
     4. 每次查询先只占一行摘要；结构化字段引用到的查询先展开（pinned），再按产出它的节点分组、轮流展开：
        第一轮每次列前 _PROMPT_COMPACT_ROWS 行，第二轮补到 _PROMPT_ROWS 行，放不下为止
     5. 开头写明目录有省略、各来源省略了几次，以及没展开的查询怎么用（OMITTED_RULES）
     最后整份量一次：超了就把最后展开的退回去（先退查询，最后才退分析结论的结果表）；指标和字段本身就超（极少见）
     才从尾部截断。
     """
-    analyses = analyses or _AnalysisLines([], {}, {})
+    analyses = analyses or _AnalysisLines([], {})
     if tail and len("\n".join(tail)) > budget // _PROMPT_TAIL_SHARE:
         tail = _cut_lines(tail, budget // _PROMPT_TAIL_SHARE, "…（表和字段、知识库检索太长，后面的省略了）")
     tables: dict[str, list[str]] = {}
@@ -4493,9 +4518,7 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
         notice = (f"注意：证据太多，这份目录有省略（篇幅上限约 {budget} 字）。共 {len(queries)} 次查询："
                   f"{n['full']} 次列出前 {_PROMPT_ROWS} 行，{n['compact']} 次只列前 {_PROMPT_COMPACT_ROWS} 行，"
                   f"{n['omitted']} 次只列编号和摘要。各来源：{per}。")
-        if bare := sum(1 for alias in analyses.order if tier[alias] == "compact"):
-            notice += (f"另有 {len(analyses.order)} 条分析结论，判定和具名的数都列出了，其中 {bare} 条没列出结果表的各段"
-                       "（要列出就单独一行写整表引用，系统照结果表生成）。")
+        notice += _analysis_notice(Counter(tier[alias] for alias in analyses.order), len(analyses.order))
         body = [*head, notice, OMITTED_RULES, *first, *analyses.lines(tier), *rules]
         for r, entries in zip(stats, groups.values()):
             body.append(f"\n来自「{r['title']}」的查询（共 {r['total']} 次，展开 {r['full'] + r['compact']} 次）：")
@@ -4510,14 +4533,24 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
     def size(lines: list[str]) -> int:
         return sum(len(line) + 1 for line in lines)
 
+    # 分析结论一段最多占预算的 1/_PROMPT_ANALYSIS_SHARE：超了按结论的先后从后往前降，先只留判定语和具名的数，再只列编号
+    cap = budget // _PROMPT_ANALYSIS_SHARE
+    for level in ("brief", "head"):
+        for alias in reversed(analyses.order):
+            if size(analyses.lines(tier)) <= cap:
+                break
+            tier[alias] = level
     # 省略情况那句里的数字会变长几位：留一点余量，最后再整份量一次
     remaining = budget - len(assemble()) - 8 * (len(groups) + 3)
     upgraded: list[tuple[str, str]] = []
+    listed = size(analyses.lines(tier))
     for alias in analyses.order:
-        # 分析结论的结果表先补，排在查询的行前面；整份量下来超了，最后才退回它们
-        if (delta := size(analyses.full[alias]) - size(analyses.compact[alias])) <= remaining:
+        # 分析结论的结果表先补，排在查询的行前面（这一段照样不超过上限）；整份量下来超了，最后才退回它们
+        delta = size(analyses.shape(alias, "full")) - size(analyses.shape(alias, "compact"))
+        if tier[alias] == "compact" and delta <= remaining and listed + delta <= cap:
             tier[alias] = "full"
             remaining -= delta
+            listed += delta
             upgraded.append((alias, "compact"))
     for alias in pinned:
         if tier.get(alias) == "brief" and (delta := size(compact[alias]) - size(brief[alias])) <= remaining:
@@ -4549,6 +4582,29 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
         text = text[:budget - len(_PROMPT_CUT)].rsplit("\n", 1)[0] + _PROMPT_CUT
     return WriterCatalog(text=text, budget=budget, queries=len(queries), trimmed=True, nodes=rows(),
                          omitted=[e["alias"] for e in queries if tier[e["alias"]] == "brief"], empty_sources=empty)
+
+
+#: 目录有省略、分析结论只是结果表没列各段时，开头那句里接的说明（给模型看）
+ANALYSIS_TABLES_OMITTED_PROMPT = ("另有 {total} 条分析结论，判定和具名的数都列出了，其中 {bare} 条没列出结果表的各段"
+                                  "（要列出就单独一行写整表引用，系统照结果表生成）。")
+#: 分析结论还降到了只留判定语和具名的数、只列编号时接的说明（给模型看）：各样子各有几条（ANALYSIS_LEVEL_PROMPT_WORDS），
+#: 以及没列出的怎么引用
+ANALYSIS_TRIMMED_PROMPT = ("另有 {total} 条分析结论，这一段最多占篇幅的一半：{parts}。没列出的也能引用：判定语单独写 "
+                           "[[a:编号]]，系统照结论渲染；要列出结果表就单独一行写整表引用，系统照结果表生成；没列出的具名的数"
+                           "不要编造。")
+ANALYSIS_LEVEL_PROMPT_WORDS = (("full", "列出了结果表的前几段"), ("compact", "没列出结果表的各段"),
+                               ("brief", "只列了判定语和具名的数（判定标准、附带说明没列）"), ("head", "只列了编号"))
+
+
+def _analysis_notice(levels: Counter, total: int) -> str:
+    """目录有省略时开头那句里分析结论的情况：都列全了的不说；只是结果表没列各段的照旧一句；还降到了只留判定语和具名的数、
+    只列编号的，照实写各有几条，以及没列出的怎么引用。"""
+    if not total or levels["full"] == total:
+        return ""
+    if not levels["brief"] and not levels["head"]:
+        return ANALYSIS_TABLES_OMITTED_PROMPT.format(total=total, bare=levels["compact"])
+    parts = "，".join(f"{levels[level]} 条{word}" for level, word in ANALYSIS_LEVEL_PROMPT_WORDS if levels[level])
+    return ANALYSIS_TRIMMED_PROMPT.format(total=total, parts=parts)
 
 
 def catalog_prompt(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUDGET, cells_allowed: bool = True,
@@ -4748,7 +4804,11 @@ _DECOMPOSE_NUMBERS = ("base", "target", "delta", "pct", "share", "contrib", "fla
 
 def _decompose_row(result: dict[str, Any]) -> tuple[str, list[Any]] | None:
     """变化拆解的结果表里判定点名的那一段：(这一段的叫法, 那一行)。段按维度列（params.by；乘积模式是 factor 一列）对
-    verdict.subjects 的第一项，对不上就取第一行（结果表按变化的绝对值从大到小排）。叫法是维度值用「·」连起来。"""
+    verdict.subjects 的第一项，对不上就取第一行（结果表按变化的绝对值从大到小排）。维度值和叫法都按算子写段的同一个函数
+    （app.analysis.phrases.key_text：空值写「（空）」、布尔写「是 / 否」，两列用「·」连）：subjects 就是这么写的，拿原值的
+    str 去比，空值、布尔维度的段对不上，代入式会退回第一行。"""
+    from app.analysis.phrases import key_text
+
     table = result.get("table") if isinstance(result.get("table"), dict) else {}
     rows = [r for r in table.get("rows") or [] if isinstance(r, list)]
     columns = [str(c) for c in table.get("columns") or []]
@@ -4765,8 +4825,8 @@ def _decompose_row(result: dict[str, Any]) -> tuple[str, list[Any]] | None:
     picked = rows[0]
     if subjects and at and isinstance(subjects[0], list):
         wanted = [str(v) for v in subjects[0]]
-        picked = next((row for row in rows if [str(row[i]) for i in at if i < len(row)] == wanted), rows[0])
-    name = "·".join(str(picked[i]) for i in at if i < len(picked) and picked[i] is not None)
+        picked = next((row for row in rows if [key_text([row[i]]) for i in at if i < len(row)] == wanted), rows[0])
+    name = key_text([picked[i] for i in at if i < len(picked)]) if at else ""
     return name or "这一段", picked
 
 

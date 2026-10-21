@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Any
@@ -26,6 +27,7 @@ from app.analysis.contract import CallError, effective_settings, ledger_entry
 from app.analysis.testing import fake_result
 from app.core.artifact_store import canonical_json, content_hash
 from app.engine.evidence import (
+    ANALYSIS_LEVELS,
     ANALYSIS_CELLS_REASON,
     StreamRenderer,
     analysis_formulas,
@@ -473,6 +475,65 @@ def test_trimmed_catalogs_keep_the_judgments_and_fill_result_tables_before_query
     assert "另有 1 条分析结论，判定和具名的数都列出了，其中 1 条没列出结果表的各段" in tight.text
 
 
+def _analysis_part(text: str) -> str:
+    """写作目录里「分析结论」一段（从那段开头的说明到查询结果那段之前）。"""
+    start = text.index("\n分析结论（")
+    end = text.find("\n查询结果（", start)
+    return text[start:end if end >= 0 else len(text)]
+
+
+def _many_analyses(n: int, queries: int = 30) -> tuple[Store, dict[str, Any]]:
+    """n 份分析结论（A1…An，内容各不相同）、1 + queries 次查询的写作目录。"""
+    store, ledger, q, _ = setup()
+    for i in range(n - 1):
+        res = fake_result(inputs=[{"ref": "Q2", "artifact": q, "role": "data", "columns": ["region", "week", "gmv"],
+                                   "rows": "all"}], hypothesis=f"假设 {i}")
+        ledger.append(ledger_entry(res, node_id="an", exec_no=1, artifact=store.put(res), item=f"i{i}"))
+    many = [{"kind": "query", "node_id": "fetch", "exec": i + 2, "artifact": store.put({**SNAPSHOT, "sql": f"-- {i}"}),
+             "tool": "db_query__shop", "source": "shop", "columns": SNAPSHOT["columns"], "rows": 8}
+            for i in range(queries)]
+    return store, build_catalog(nodes={}, ledger=[*ledger, *many], loader=store.load)
+
+
+@pytest.mark.parametrize("n, first, last, words", [
+    # 先截结果表的段，还超就从后往前只留判定语和具名的数
+    (20, "compact", "brief", ("条没列出结果表的各段", "条只列了判定语和具名的数")),
+    # 都只留判定语和具名的数还超：再从后往前只列编号
+    (80, "brief", "head", ("条只列了判定语和具名的数", "条只列了编号")),
+])
+def test_the_analysis_part_of_a_trimmed_catalog_takes_at_most_half_of_the_budget(n, first, last, words):
+    """几十份结论时，分析结论一段最多占预算的一半：按结论的先后从后往前降，先截结果表的段、再只留判定语和具名的数、再只列
+    编号，开头照实写各有几条、没列的照样能引用；剩下的篇幅给查询展开。以前这一段没有上限，40 份结论、每份上千段时在 51.2k
+    的预算里占了 50.6k，查询只剩一行摘要。"""
+    store, catalog = _many_analyses(n)
+    budget = 12_000
+    writer = writer_catalog(catalog, loader=store.load, budget=budget)
+    assert writer.trimmed and len(writer.text) <= budget
+    part = _analysis_part(writer.text)
+    assert len(part) <= budget // 2
+    blocks = [b.strip("\n") for b in re.split(r"\n(?=- A\d+：)", part)[1:]]
+    assert len(blocks) == n                                  # 每条结论都还在，编号连着
+
+    def level(block: str) -> str:
+        if "\n" not in block:
+            return "head"
+        if "判定标准：" not in block:
+            return "brief"
+        return "full" if "\n  r0：" in block else "compact"
+
+    assert level(blocks[0]) == first and level(blocks[-1]) == last
+    assert blocks[-1].startswith(f"- A{n}：变化拆解（可加），来自 Q1")
+    for block in blocks:
+        if level(block) == "brief":
+            assert "判定语 [[a:" in block and "具名的数（写 [[a:" in block and "附带说明" not in block
+    order = [ANALYSIS_LEVELS.index(level(b)) for b in blocks]
+    assert order == sorted(order)                            # 越往后越简
+    notice = next(line for line in writer.text.split("\n") if line.startswith("注意："))
+    assert f"另有 {n} 条分析结论，这一段最多占篇幅的一半：" in notice and all(w in notice for w in words), notice
+    assert "没列出的也能引用：判定语单独写 [[a:编号]]" in notice
+    assert writer.queries == 31 and writer.compact > 0      # 查询照样有展开的
+
+
 def test_metric_comparability_is_spoken_in_the_writer_catalog():
     card = {"kind": "metric_set", "caliber": "周报", "caliber_version": "v1", "artifact": "c" * 64, "metrics": [
         {"id": "wow", "name": "环比", "value": -0.087, "unit": "", "comparability": {
@@ -599,6 +660,25 @@ def test_formulas_substitute_the_key_numbers():
     }
     assert analysis_formulas(fake_result(status="refused", reason_code="history_short")) == []
     assert analysis_formulas(fake_result(values={})) == []
+
+
+@pytest.mark.parametrize("keys, named", [((None, "华南", "华北"), "（空）"), ((True, False, None), "是")])
+def test_the_formula_names_the_segment_the_verdict_names(keys, named):
+    """代入式里点名的那一段按判定的 subjects 找，维度值按算子写段的同一个函数比（空值写「（空）」、布尔写「是 / 否」）。
+    这里判定点名的段不在结果表第一行（第一行是反方向变化最大的那段）：以前拿原值的 str 比，对不上就退回第一行，代入式写成了
+    第一行那段。"""
+    store = Store()
+    driver, opposite, other = keys                         # 变化：driver -220、opposite +250、other -180，总共 -150
+    snap = {"columns": ["region", "week", "gmv"], "column_types": {"region": "text", "week": "text", "gmv": "number"},
+            "rows": [[driver, "W41", 1000], [driver, "W42", 780], [opposite, "W41", 500], [opposite, "W42", 750],
+                     [other, "W41", 600], [other, "W42", 420]],
+            "sql": "SELECT region, week, SUM(gmv) AS gmv FROM orders GROUP BY region, week", "source": "shop",
+            "truncated": False}
+    result = real_result(store.put(snap), snap)
+    assert result["verdict"]["code"] == "driver" and result["verdict"]["subjects"] == [[named]]
+    assert [r[0] for r in result["table"]["rows"]] == [opposite, driver, other]     # 按变化的绝对值排
+    texts = {f["label"]: f["text"] for f in analysis_formulas(result)}
+    assert texts["占比"] == f"{named}的占比 = {named}的变化 ÷ 总变化 = -220 ÷ （-150） = 146.7%"
 
 
 def test_formulas_for_factor_ratio_and_baseline():

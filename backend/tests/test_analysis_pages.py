@@ -20,7 +20,9 @@ import app.bundle
 import app.report_export
 from app.main import app as asgi
 from tests.test_analysis_bundle import bundle_of, card_bundle
-from tests.test_analysis_evidence_api import LAST_WEEK, SCOPE, TEXT, THIS_WEEK, comparability_card, sealed_run, seg_id
+from tests.test_analysis_evidence_api import (
+    LAST_WEEK, SCOPE, TEXT, THIS_WEEK, comparability_card, ratio_run, sealed_run, seg_id,
+)
 
 NODE = shutil.which("node")
 pytestmark = pytest.mark.skipif(NODE is None, reason="没有 node，无法执行页面上的脚本")
@@ -155,6 +157,23 @@ async def test_the_export_page_opens_the_analysis_steps_and_the_scope_numbers():
     assert out["scope:A1"]["steps"] == opened["steps"]
 
 
+async def test_the_export_page_speaks_of_the_overall_ratio_for_a_ratio_decomposition():
+    """比率拆解的总数那一格是整体比率：导出页写「整体比率那一格」「整体比率 x 与各段分子之和 ÷ 分母之和 y 闭合」，不说
+    「各段之和」。可加拆解照旧（上一个用例的页面里没有「整体比率」）。"""
+    made = await ratio_run()
+    async with AsyncClient(transport=ASGITransport(app=asgi), base_url="http://test") as client:
+        html = (await client.get(f"/api/runs/{made['run']}/report.html")).text
+    data = re.search(r'<script type="application/json" id="report-data">(.*?)</script>', html, re.S).group(1)
+    phrase = seg_id(made["doc"], "a:A1")
+    out = run_node(RUN_RUNTIME, RUNTIME, {"data": data, "segs": [
+        {"seg": phrase, "kind": "analysis", "state": "deterministic", "text": made["result"]["phrase"]}]})
+    body = out[phrase]["body"]
+    for text in ("基期整体比率", "整体比率那一格", "整体比率 0.035 与各段分子之和 ÷ 分母之和 0.035 闭合",
+                 "整体比率 0.053 与各段分子之和 ÷ 分母之和 0.053 闭合"):
+        assert text in body, text
+    assert "各段之和 0.0" not in body
+
+
 async def test_the_bundle_page_shows_the_analysis_detail_and_the_scope():
     bundle, _, _ = bundle_of(doc_extra=SCOPE)
     out = run_node(RUN_VERIFIER, VERIFIER, {"data": json.dumps(bundle), "seal": bundle["meta"]["manifest_hash"]})
@@ -164,7 +183,8 @@ async def test_the_bundle_page_shows_the_analysis_detail_and_the_scope():
     assert "没拆渠道" in scope and "这次做了 2 次差异检验，几次检验之间没有按次数校正" in scope
     phrase = next(text for text in out["opened"].values() if "出处分析结论 A1 的判定语" in text)
     assert "核对结果✓ 通过" in phrase and "分析结论里的值「销售额下降 194（-8.7%）" in phrase
-    assert "判定语销售额下降 194（-8.7%）" in phrase and "方法与版本decompose.additive@1" in phrase
+    # 方法写服务端带来的叫法和 id（和导出页同一个写法），不只写 id
+    assert "判定语销售额下降 194（-8.7%）" in phrase and "方法与版本变化拆解（可加） · decompose.additive@1" in phrase
     assert "输入数据 · Q1" in phrase                       # 输入的角色写叫法，不写 data
     assert "复算一致：按封存的输入重新计算，结论逐项相同（导出时服务端按封存的输入复算的结论；本页只核哈希" in phrase
     value = next(text for text in out["opened"].values() if "具名的数「top_share」" in text)
@@ -196,7 +216,7 @@ def test_the_bundle_page_shows_the_comparability_in_the_metric_detail():
     out = run_node(RUN_VERIFIER, VERIFIER, {"data": json.dumps(bundle), "seal": bundle["meta"]["manifest_hash"]})
     assert out["verified"] == ""
     [detail] = out["opened"].values()
-    for text in ("两期可比性", "判定两期可比", "判定标准只差日期", "方法与版本comparable@1", "各项检查", "同口径",
+    for text in ("两期可比性", "判定两期可比", "判定标准只差日期", "方法与版本可比性检查 · comparable@1", "各项检查", "同口径",
                  "复算一致：按封存的输入重新计算，结论逐项相同（导出时服务端按封存的输入复算的结论"):
         assert text in detail, text
 

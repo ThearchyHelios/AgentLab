@@ -194,7 +194,7 @@ async def run_tool(op: str, ctx: ToolContext, args: BaseModel) -> dict[str, Any]
     request = request_of(op, args)
     await prepare(scope)
     context = await context_of(list(scope.queries.values()), tool_ctx=ctx, cache=scope.source_cache,
-                               probe_cache=scope.probe_cache)
+                               probe_cache=scope.probe_cache, tables_cache=scope.tables_cache)
     result = await analysis_ops.run(request, scope.resolve, settings=settings, context=context, parents=scope.parent)
     artifact = await store(result, run_id=ctx.run_id, node_id=scope.node_id)
     return {"analysis_artifact": artifact, "result": result}

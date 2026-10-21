@@ -26,15 +26,12 @@ from app.analysis import contract
 from app.core import artifact_store
 from app.data import catalog as data_catalog
 from app.data.catalog import make_item
-from app.data.engine import engines
-from app.data.introspect import introspect
 from app.db.base import SessionLocal
-from app.db.models import DataSource, Run, RunEvent
+from app.db.models import Run, RunEvent
 from app.engine import analysis_claims as ac
 from app.engine.evidence import iter_segments
 from app.engine.runner import run_manager
 from app.main import app
-from tests.fixtures.sources import drop_source
 
 TOOL = "db_query__shop"
 DECOMPOSE = contract.TOOL_NAMES["decompose"]
@@ -74,7 +71,7 @@ async def engine_up():
 
 
 @pytest.fixture(autouse=True)
-async def shop(tmp_path):
+async def shop(tmp_path, scratch_source):
     path = tmp_path / "shop.db"
     db = sqlite3.connect(path)
     db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, week TEXT, region TEXT, channel TEXT, amount INTEGER);")
@@ -84,25 +81,14 @@ async def shop(tmp_path):
     db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", [(i, w, r, c, a) for i, (r, w, c, a) in enumerate(rows, 1)])
     db.commit()
     db.close()
+    # scratch_source 建的是新源（同名的旧源连同数据目录、现查缓存先删掉），测试结束时删掉、数据目录随外键级联删除：同一个
+    # 测试进程里别的用例也用名叫 shop 的源，留着这份目录会改掉它们的判定（比如金额标成了流量，窗口长度不同就从有条件可比
+    # 变成不可比）
+    source_id = await scratch_source("shop", path, schema=True)
     async with SessionLocal() as session:
-        row = (await session.execute(select(DataSource).where(DataSource.name == "shop"))).scalar_one_or_none()
-        if row is None:
-            row = DataSource(name="shop", kind="sqlite", database=str(path), readonly=True, enabled=True)
-            session.add(row)
-        row.database, row.kind, row.enabled, row.readonly, row.options = str(path), "sqlite", True, True, {}
-        await session.commit()
-        row.schema_cache = await introspect(row)
-        await session.commit()
         for table, notes in NOTES.items():
-            current = await data_catalog.read_entry(session, row.id, table)
-            await data_catalog.write_entry(session, row.id, table, notes, if_version=current.version if current else 0,
-                                           actor=None)
-        source_id = row.id
-    await engines.invalidate(source_id)
-    yield
-    # 删掉这个源（数据目录随外键级联删除）：同一个测试进程里别的用例也用名叫 shop 的源，留着这份目录会改掉它们的判定
-    # （比如金额标成了流量，窗口长度不同就从有条件可比变成不可比）
-    await drop_source(source_id)
+            await data_catalog.write_entry(session, source_id, table, notes, if_version=0, actor=None)
+    return source_id
 
 
 def _node(nid, ntype, **config):

@@ -95,8 +95,10 @@
     calc: '计算', dValues: '具名的数', dFormulas: '关键数的代入式', dResultTable: '结果表',
     resultRows: (shown, total) => `列出 ${shown} 行，共 ${total} 行`,
     analysisInput: '输入', dRole: '角色', dRef: '调用里写的名字', dColumnsUsed: '用到的列', dRowsUsed: '用到的行',
-    allRows: '全部行', dHeadline: '总数那一格', dClosure: '闭合核对',
+    allRows: '全部行', dHeadline: '总数那一格', dHeadlineRatio: '整体比率那一格', dClosure: '闭合核对',
     closureOk: (h, t) => `总数 ${h} 与各段之和 ${t} 闭合`, closureBad: (h, t) => `总数 ${h} 与各段之和 ${t} 对不上`,
+    ratioClosureOk: (h, t) => `整体比率 ${h} 与各段分子之和 ÷ 分母之和 ${t} 闭合`,
+    ratioClosureBad: (h, t) => `整体比率 ${h} 与各段分子之和 ÷ 分母之和 ${t} 对不上`,
     dParent: '下钻自', recompute: '复算', seal: '封存', inputOfAnalysis: (alias) => `分析结论 ${alias} 的输入`,
     inLedger: '封存范围内的台账记过这份分析结论', notInLedger: '封存范围内的台账里没有这份分析结论',
     viaCard: '记在口径卡的指标集里，随卡封存（不进台账）',
@@ -541,10 +543,13 @@
     return h('section', { class: 'part', 'data-step': 'analysis_calc' }, h('h3', {}, T.calc), h('div', { class: 'part-body' }, ...body))
   }
 
-  /** 分析结论 · 输入：角色、落到哪个 Q、用到的列和行、总数那一格和闭合核对、下钻的上一层 */
+  /** 分析结论 · 输入：角色、落到哪个 Q、用到的列和行、总数（比率拆解是整体比率）那一格和闭合核对、下钻的上一层 */
   function analysisInputPart(step) {
     const rows = Array.isArray(step.rows) ? step.rows.map((r) => `第 ${Number(r) + 1} 行`).join('、') : step.rows === 'all' ? T.allRows : null
     const closure = isObj(step.closure) ? step.closure : null
+    const ratio = closure !== null && closure.mode === 'ratio'
+    const closed = closure && (ratio ? (closure.closed ? T.ratioClosureOk : T.ratioClosureBad)
+      : (closure.closed ? T.closureOk : T.closureBad))
     const body = [kv([
       [T.dRole, String(step.role_label || step.role || NONE)],
       step.ref ? [T.dRef, h('code', {}, String(step.ref))] : null,
@@ -553,8 +558,8 @@
       step.node_id ? [T.dNode, nodeLabel(step.node_id)] : null,
       Array.isArray(step.columns) && step.columns.length ? [T.dColumnsUsed, step.columns.join('、')] : null,
       rows ? [T.dRowsUsed, rows] : null,
-      'value' in step ? [T.dHeadline, `${step.column ? `第 ${Number(step.row) + 1} 行「${step.column}」 = ` : ''}${valueText(step.value)}`] : null,
-      closure ? [T.dClosure, closure.closed ? T.closureOk(closure.headline, closure.total) : T.closureBad(closure.headline, closure.total)] : null,
+      'value' in step ? [ratio ? T.dHeadlineRatio : T.dHeadline, `${step.column ? `第 ${Number(step.row) + 1} 行「${step.column}」 = ` : ''}${valueText(step.value)}`] : null,
+      closure ? [T.dClosure, closed(closure.headline, closure.total)] : null,
       step.phrase ? [T.dPhrase, String(step.phrase)] : null,
     ])]
     const bits = integrity(step)

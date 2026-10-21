@@ -336,17 +336,22 @@ def _queries(side: Side) -> list[_Query]:
 
 
 def _analysis_items(side: Side) -> dict[str, tuple[dict[str, dict[str, Any]], int]]:
-    """封存范围内每张分析卡各项最后一次的结论（analysis.end，engine/nodes/analysis.py 每项一条）：{卡: ({项: 事件数据},
-    执行了几次)}，项按记下的先后。循环里执行了几次的，同一项后一次的盖过前一次。"""
+    """封存范围内每张分析卡各项最后一次做完的结论（analysis.end，engine/nodes/analysis.py 每项一条）：{卡: ({项: 事件数据},
+    执行了几次)}，项按记下的先后。只认后面跟着这张卡 node.finished 的那几次执行：执行到一半失败的（前几项已经发了
+    analysis.end，后面一项让卡失败），那次的判定不是这次运行的结果，不列，也不算执行次数。循环里执行了几次的，同一项后
+    一次的盖过前一次。"""
     out: dict[str, tuple[dict[str, dict[str, Any]], int]] = {}
+    pending: dict[str, dict[str, dict[str, Any]]] = {}       # 卡 → 这一次执行里已经做完的项（还没见到 node.finished）
     for _, etype, node_id, data in side.events:
         if not node_id or not isinstance(data, dict):
             continue
-        if etype == EventType.ANALYSIS_END and isinstance(data.get("item"), str):
+        if etype == EventType.NODE_STARTED:
+            pending.pop(node_id, None)
+        elif etype == EventType.ANALYSIS_END and isinstance(data.get("item"), str):
+            pending.setdefault(node_id, {})[data["item"]] = data
+        elif etype == EventType.NODE_FINISHED and node_id in pending:
             items, runs = out.setdefault(node_id, ({}, 0))
-            items[data["item"]] = data
-        elif etype == EventType.NODE_FINISHED and node_id in out:
-            items, runs = out[node_id]
+            items.update(pending.pop(node_id))
             out[node_id] = (items, runs + 1)
     return out
 

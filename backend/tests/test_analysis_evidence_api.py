@@ -178,6 +178,51 @@ async def test_named_values_and_result_cells_point_at_what_they_cite(client):
     assert cell["note"] == "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写"
 
 
+#: 按门店拆的快照：门店码是文本（"1203"），渲染时不加千分位
+STORES: dict[str, Any] = {
+    "columns": ["store", "week", "gmv"], "column_types": {"store": "text", "week": "text", "gmv": "number"},
+    "rows": [["1203", "W41", 820], ["1203", "W42", 700], ["1305", "W41", 600], ["1305", "W42", 560],
+             ["2201", "W41", 700], ["2201", "W42", 666]],
+    "sql": "SELECT store, week, SUM(gmv) AS gmv FROM orders GROUP BY store, week ORDER BY store, week",
+    "source": "shop", "truncated": False, "row_count": 6,
+}
+#: 按时段拆的快照：时段是 ISO 日期时间（带 T），文档按 2 版显示规则写成空格
+SLOTS: dict[str, Any] = {
+    "columns": ["slot", "week", "gmv"], "column_types": {"slot": "text", "week": "text", "gmv": "number"},
+    "rows": [["2026-10-12T08:00:00", "W41", 820], ["2026-10-12T08:00:00", "W42", 700],
+             ["2026-10-12T20:00:00", "W41", 600], ["2026-10-12T20:00:00", "W42", 560]],
+    "sql": "SELECT slot, week, SUM(gmv) AS gmv FROM orders GROUP BY slot, week ORDER BY slot, week",
+    "source": "shop", "truncated": False, "row_count": 4,
+}
+
+
+@pytest.mark.parametrize("snapshot, by, shown", [
+    (STORES, "store", "1203"),
+    (SLOTS, "slot", "2026-10-12 08:00:00"),
+])
+async def test_a_result_cell_rerenders_the_way_it_was_composed(client, monkeypatch, snapshot, by, shown):
+    """证据接口按组装时同一套规则重新渲染结果表的格（evidence.resolve_ref，按文档记下的单元格显示规则）：文本码值照结果表
+    记的列类型不加千分位，ISO 日期时间的 T 换成空格。以前不看列类型和显示规则，渲染成「1,203」「2026-10-12T08:00:00」，
+    render_ok 为假，证据面板和导出页报假的「与按结论渲染的结果不一致」。"""
+    import tests.test_analysis_evidence_api as here
+
+    monkeypatch.setattr(here, "SNAPSHOT", snapshot)
+    q = await artifact_store.put_json(snapshot, kind="query_snapshot")
+    result = await analyzed({"Q2": (snapshot, q)}, by=[by])
+    ref = f"v:A1.r0.{by}"
+    made = await sealed_run(f"{by} [[{ref}]] 变化 [[v:A1.r0.delta]]。[[see:A1]]", result=result)
+    segment = next(s for s in iter_segments(made["doc"]) if s.get("ref") == ref)
+    assert segment["text"] == shown
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{segment['id']}")).json()
+    judged = body["chain"][0]
+    assert judged["rendered"] == shown and judged["render_ok"] is True
+    assert judged["cited"] == {"what": "cell", "row": 0, "column": by, "raw": snapshot["rows"][0][0]}
+    # 导出页的数据块是同一条链
+    data = data_block((await client.get(f"/api/runs/{made['run']}/report.html")).text)
+    chain = data["chains"][data["refs"][segment["id"]]]
+    assert chain[0]["step"] == "analysis" and chain[0]["render_ok"] is True
+
+
 async def test_the_recompute_gets_the_sealed_inputs_by_hash(client, monkeypatch):
     """复算的 load 交工件原内容（不加出处、不改列的类型），只认封存范围内交回过的查询；别的一律当取不回。"""
     seen: dict[str, Any] = {}
@@ -242,6 +287,25 @@ async def test_a_tampered_result_is_said_and_not_shown(client):
     assert seal["hash_ok"] is False and seal["sealed"] is False and body["seal"]["covered"] is False
 
 
+def test_suspicious_name_hints_do_not_read_the_analysis_results(monkeypatch):
+    """可疑实体找「最接近的名字」时按封存的台账重建目录（_scope_catalog）：分析结论不进，不读盘、不复验哈希（候选只看表和
+    字段，用不到结论的内容）。以前每点开一个可疑的名字，就把这次运行的分析结论全读一遍。"""
+    from app.api import evidence as api
+    from app.engine import evidence as engine_evidence
+
+    read: list[str] = []
+    monkeypatch.setattr(engine_evidence, "load_artifact", lambda artifact: read.append(artifact))
+    q, a = "1" * 64, "2" * 64
+    entries = [_query_entry(SNAPSHOT, q), {"kind": "analysis", "node_id": "an", "exec": 1, "artifact": a,
+                                           "op": "decompose", "mode": "additive", "item": "drop", "inputs": [q]}]
+    graph = {**GRAPH, "edges": [{"source": "fetch", "target": "an"}, {"source": "an", "target": "write"}]}
+    sealed = api._Sealed(run_id="r", graph=graph, seal={"sealed": True, "ok": True}, events=[], entries=entries)
+    for report in ("write", "nope"):
+        catalog = api._scope_catalog(sealed, report)
+        assert "Q1" in catalog and not [e for e in catalog.values() if e.get("kind") == "analysis"]
+    assert read == []
+
+
 async def test_agent_analyses_are_marked_as_such(client):
     made = await sealed_run(TEXT, item=None, call_id="call-9")
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
@@ -260,9 +324,48 @@ async def test_headline_inputs_show_the_closure(client):
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
     inputs = [s for s in body["chain"] if s["step"] == "analysis_input"]
     assert [s["role"] for s in inputs] == ["headline_base", "headline_target", "data"]
-    assert inputs[0]["closure"] == {"total_key": "base_total", "total": "2,220", "headline": "2,220", "closed": True}
-    assert inputs[1]["closure"] == {"total_key": "target_total", "total": "2,026", "headline": "2,026", "closed": True}
+    assert inputs[0]["closure"] == {"mode": "additive", "total_key": "base_total", "total": "2,220", "headline": "2,220",
+                                    "closed": True}
+    assert inputs[1]["closure"] == {"mode": "additive", "total_key": "target_total", "total": "2,026",
+                                    "headline": "2,026", "closed": True}
+    assert [s["role_label"] for s in inputs[:2]] == ["基期总数", "本期总数"]
     assert inputs[1]["query"] == "Q2" and inputs[1]["sealed"] is True and inputs[2]["query"] == "Q1"
+    assert next(s for s in body["chain"] if s["step"] == "analysis_recompute")["status"] == "same"
+
+
+async def ratio_run() -> dict[str, Any]:
+    """一次封存的运行：按渠道拆退款率（比率拆解），给了整体比率的两格（headline，0.035 → 0.053），报告引用判定语。"""
+    rates = {"columns": ["channel", "week", "refunds", "orders"],
+             "column_types": {"channel": "text", "week": "text", "refunds": "number", "orders": "number"},
+             "rows": [["线上", "W41", 50, 1000], ["线上", "W42", 80, 1000], ["线下", "W41", 20, 1000],
+                      ["线下", "W42", 26, 1000]],
+             "sql": "SELECT channel, week, SUM(refund_flag) AS refunds, COUNT(*) AS orders FROM orders GROUP BY 1, 2",
+             "source": "shop", "truncated": False, "row_count": 4}
+    head = {"columns": ["week", "rate"], "column_types": {"week": "text", "rate": "number"},
+            "rows": [["W41", "0.035"], ["W42", "0.053"]],
+            "sql": "SELECT week, SUM(refund_flag) * 1.0 / COUNT(*) AS rate FROM orders GROUP BY week",
+            "source": "shop", "truncated": False, "row_count": 2}
+    r, h = (artifact_store.content_hash(artifact_store.canonical_json(c)) for c in (rates, head))
+    result = await analyzed({"Q2": (rates, r), "Q5": (head, h)}, {"op": "decompose", "mode": "ratio", "params": {}},
+                            query="Q2", by=["channel"], period="week", base="W41", target="W42", numerator="refunds",
+                            denominator="orders", label="退款率", headline={"base": "Q5.r0.rate", "target": "Q5.r1.rate"})
+    assert result["status"] == "ok" and result["verdict"]["code"] != "unclosed"
+    return await sealed_run("[[a:A1]]。", result=result, queries=[rates, head])
+
+
+async def test_a_ratio_headline_closes_against_the_overall_ratio(client):
+    """比率拆解给了整体比率的两格（headline）：闭合核对对着结论里的整体比率，即各段分子之和 ÷ 分母之和（r_base_total、
+    r_target_total），角色写「基期整体比率」「本期整体比率」，closure.mode 写明是比率（导出页照它说「各段分子之和 ÷ 分母
+    之和」，不说「各段之和」）。以前只认可加拆解的总数键，比率拆解的 headline 不显示闭合核对。"""
+    made = await ratio_run()
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
+    inputs = {s["role"]: s for s in body["chain"] if s["step"] == "analysis_input"}
+    assert inputs["headline_base"]["closure"] == {"mode": "ratio", "total_key": "r_base_total", "total": "0.035",
+                                                  "headline": "0.035", "closed": True}
+    assert inputs["headline_target"]["closure"] == {"mode": "ratio", "total_key": "r_target_total", "total": "0.053",
+                                                    "headline": "0.053", "closed": True}
+    assert inputs["headline_base"]["role_label"] == "基期整体比率"
+    assert inputs["headline_target"]["role_label"] == "本期整体比率"
     assert next(s for s in body["chain"] if s["step"] == "analysis_recompute")["status"] == "same"
 
 
@@ -432,6 +535,36 @@ async def test_the_html_export_carries_the_analysis_chain_and_the_scope(client):
     assert 'data-seg="scope:A1"' in html and "（按地区）" in html
     assert data["refs"]["scope:A1"] == data["refs"][phrase]
     assert f'data-seg="{phrase}"' in html and 'data-kind="analysis"' in html
+
+
+async def test_the_export_recomputes_each_conclusion_once(client, monkeypatch):
+    """导出页里同一份结论被判定语、具名的数、整表的每一格、句末依据、分析范围各引一处，引用键不同、各接一条链，复算只做
+    一次（按结论工件记在这一次请求里）；分析范围的编号和正文的判定语同一个引用键，不再另建一条链。以前每条链各复算一次，
+    1000 段的拆解导出一次复算三十多次。"""
+    calls: list[str] = []
+    real = analysis.recompute
+
+    def counting(result, load, *, load_result=None):
+        calls.append(str(result.get("method")))
+        return real(result, load, load_result=load_result)
+
+    monkeypatch.setattr(analysis, "recompute", counting)
+    text = ("[[a:A1]]。华东占 [[a:A1.top_share|pct]]。[[see:A1]]\n\n"
+            "[[table:A1 cols=region,delta,share rows=0-3]]")
+    made = await sealed_run(text, doc_extra=SCOPE)
+    data = data_block((await client.get(f"/api/runs/{made['run']}/report.html")).text)
+    assert calls == ["decompose.additive@1"]
+    cells = [s["id"] for s in iter_segments(made["doc"]) if str(s.get("ref") or "").startswith("v:A1.")]
+    assert len(cells) == 12
+    keys = {data["refs"][sid] for sid in [*cells, seg_id(made["doc"], "a:A1"), seg_id(made["doc"], "a:A1.top_share|pct")]}
+    assert len(keys) == 14                                  # 每处引用各一条链
+    for key in keys:
+        [again] = [s for s in data["chains"][key] if s["step"] == "analysis_recompute"]
+        assert again["status"] == "same"
+    assert data["refs"]["scope:A1"] == data["refs"][seg_id(made["doc"], "a:A1")]
+    # 下一次请求重新复算（缓存只活在一次请求里）
+    await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")
+    assert len(calls) == 2
 
 
 async def test_docs_without_a_scope_render_no_scope(client):

@@ -1,5 +1,6 @@
-"""分析入口接真算子跑一遍（不用替身）：agent 分析工具（含下钻）、分析卡（波动基线 + 变化拆解）、口径卡的可比性挂钩、
-审批恢复时的重放。断言工件、台账、交回模型的那一段、节点产出，并用 analysis.recompute 按封存的工件复算、逐字段相同。
+"""分析入口接真算子跑一遍（不用替身）：agent 的五个分析工具（变化拆解含下钻，波动基线、趋势、差异检验、可比性检查各一次）、
+分析卡（波动基线 + 变化拆解；输入是合并查询的一次）、口径卡的可比性挂钩、审批恢复时的重放。断言工件、台账、交回模型的那一段、
+节点产出，并用 analysis.recompute 按封存的工件复算、逐字段相同。
 
 虚构零售库 shop：orders(day, region, channel, amount)，2026-03-02 起 12 个整周，每周每个地区、渠道两笔（周三、周日），
 最后一周华东掉三成。模型换成脚本（MockChatModel._decide），不调用任何模型。
@@ -19,13 +20,13 @@ import app.analysis as analysis_ops
 from app.analysis import contract
 from app.core import artifact_store
 from app.core.artifact_store import canonical_json, content_hash
-from app.data.engine import engines
 from app.db.base import SessionLocal
-from app.db.models import DataSource, Run, RunEvent
+from app.db.models import Run, RunEvent
 from app.engine.runner import run_manager
 
 TOOL = "db_query__shop"
 DECOMPOSE = contract.TOOL_NAMES["decompose"]
+BASELINE, TREND, DIFFER, COMPARABLE = (contract.TOOL_NAMES[op] for op in ("baseline", "trend", "differ", "comparable"))
 WEEK = "date(day, '-6 days', 'weekday 1')"
 BY_REGION = (f"SELECT region, {WEEK} AS week, SUM(amount) AS gmv FROM orders WHERE day >= '2026-05-11' "
              "GROUP BY region, week ORDER BY region, week")
@@ -64,24 +65,15 @@ async def engine_up():
 
 
 @pytest.fixture(autouse=True)
-async def shop(tmp_path):
+async def shop(tmp_path, scratch_source):
+    """虚构零售库 shop（tests/conftest.py 的 scratch_source：同名的旧源连同数据目录、现查缓存先删掉，用完再删）。"""
     path = tmp_path / "shop.db"
     db = sqlite3.connect(path)
     db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, day TEXT, region TEXT, channel TEXT, amount INTEGER);")
     db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", _orders())
     db.commit()
     db.close()
-    async with SessionLocal() as session:
-        row = (await session.execute(select(DataSource).where(DataSource.name == "shop"))).scalar_one_or_none()
-        if row is None:
-            row = DataSource(name="shop", kind="sqlite", database=str(path), readonly=True, enabled=True)
-            session.add(row)
-        row.database, row.kind, row.enabled, row.readonly, row.options = str(path), "sqlite", True, True, {}
-        await session.commit()
-        source_id = row.id
-    await engines.invalidate(source_id)
-    yield
-    await engines.invalidate(source_id)
+    return await scratch_source("shop", path)
 
 
 def node(nid, ntype, **config):
@@ -150,9 +142,9 @@ async def events(run_id, etype=None, node_id=None):
         return [e.data for e in (await session.execute(q.order_by(RunEvent.seq))).scalars()]
 
 
-def agent_graph(approval="never"):
+def agent_graph(approval="never", tools=(TOOL, DECOMPOSE)):
     return chain(node("start", "input"),
-                 node("bot", "agent", prompt="销售额为什么下降", tools=[TOOL, DECOMPOSE], approval=approval),
+                 node("bot", "agent", prompt="销售额为什么下降", tools=list(tools), approval=approval),
                  node("out", "output", fields=[{"name": "answer", "value": "{{ nodes.bot.text }}"}]))
 
 
@@ -209,6 +201,77 @@ async def test_an_agent_decomposes_and_drills_down_with_the_real_operator(monkey
     # 按封存的工件复算，逐字段相同
     recomputes(a1)
     recomputes(a2)
+
+
+async def agent_analysis(monkeypatch, tool, calls):
+    """Agent 依次查库、最后调一次分析工具（真算子）：交回 (那份结论, 交回模型的那一段的 JSON)。顺带断言台账记了这一条（带
+    call_id）、交回模型的编号是「【分析 A1】」、判定语和结论一字不差，并按封存的工件复算、逐字段相同。"""
+    script = Script(monkeypatch, calls)
+    run = await run_manager.start(graph=agent_graph(tools=(TOOL, tool)), input_payload={})
+    row = await wait(run.id)
+    assert row.status == "succeeded", row.error
+    ends = await events(row.id, "tool.end", "bot")
+    artifact = ends[-1]["analysis_artifact"]
+    stored = artifact_store.load(artifact)
+    [finished] = await events(row.id, "node.finished", "bot")
+    [entry] = [e for e in finished["evidence"] if e["kind"] == "analysis"]
+    assert entry == contract.ledger_entry(stored, node_id="bot", exec_no=1, artifact=artifact,
+                                          call_id=f"call_{len(calls) - 1}")
+    assert set(entry["inputs"]) == {e["query_artifact"] for e in ends[:-1]}
+    head, body = script.replies()[-1].split("\n", 1)
+    assert head == "【分析 A1】" and json.loads(body)["phrase"] == stored["phrase"]
+    recomputes(stored)
+    return stored, json.loads(body)
+
+
+def _live(stored):
+    """结论里现查的表范围：按这次运行的数据源探 orders.day。"""
+    return [(p["table"], p["column"], p["basis"], p["max"]) for p in stored["probes"]]
+
+
+async def test_an_agent_puts_the_week_into_its_history_with_the_real_operator(monkeypatch):
+    stored, body = await agent_analysis(monkeypatch, BASELINE, [
+        (TOOL, {"sql": WEEKLY}),
+        (BASELINE, {"query": "Q1", "period": "week", "measure": "gmv", "label": "销售额", "hypothesis": "这周是不是异常"})])
+    assert stored["op"] == "baseline" and stored["status"] == "ok" and stored["hypothesis"] == "这周是不是异常"
+    assert stored["verdict"] == {"code": "far_outside_band", "direction": "down", "subjects": []}
+    assert stored["phrase"].startswith("销售额本期变化 -10.6%，明显超出过去 10 周的常规波动范围")
+    assert "record_low" in {c["code"] for c in stored["caveats"]} and body["verdict"] == "far_outside_band"
+    assert _live(stored) == [("orders", "day", "live", "2026-05-24")]      # 本期完不完整按现查的表范围判
+
+
+async def test_an_agent_asks_for_a_trend_with_the_real_operator(monkeypatch):
+    stored, body = await agent_analysis(monkeypatch, TREND, [
+        (TOOL, {"sql": WEEKLY}), (TREND, {"query": "Q1", "period": "week", "measure": "gmv", "label": "销售额"})])
+    assert stored["op"] == "trend" and stored["status"] == "ok"
+    assert stored["verdict"] == {"code": "no_trend", "direction": None, "subjects": []}
+    assert stored["phrase"] == "过去 12 周销售额没有明显的上升或下降趋势" and stored["values"]["n"] == "12"
+    assert _live(stored) == [("orders", "day", "live", "2026-05-24")] and body["values"] == stored["values"]
+
+
+async def test_an_agent_tests_a_difference_with_the_real_operator(monkeypatch):
+    rows = "SELECT region, amount FROM orders WHERE region IN ('华东', '华南') ORDER BY region, day"
+    stored, body = await agent_analysis(monkeypatch, DIFFER, [
+        (TOOL, {"sql": rows}),
+        (DIFFER, {"mode": "rows", "query": "Q1", "by": ["region"], "value": "amount", "label": "单笔金额"})])
+    assert stored["op"] == "differ" and stored["mode"] == "rows" and stored["status"] == "ok"
+    assert stored["verdict"] == {"code": "differs", "direction": "up", "subjects": [["华东"], ["华南"]]}
+    assert stored["phrase"] == "华东的单笔金额（196.83）高于华南（152），差异站得住"
+    assert stored["values"]["n_a"] == stored["values"]["n_b"] == "48" and stored["values"]["test"] == "welch"
+    assert body["subjects"] == [["华东"], ["华南"]]
+
+
+async def test_an_agent_checks_two_weeks_are_comparable_with_the_real_operator(monkeypatch):
+    stored, body = await agent_analysis(monkeypatch, COMPARABLE, [
+        (TOOL, {"sql": _week_sql("2026-05-18", "2026-05-24")}), (TOOL, {"sql": _week_sql("2026-05-11", "2026-05-17")}),
+        (COMPARABLE, {"base_query": "Q2", "target_query": "Q1", "measure": "gmv"})])
+    assert stored["op"] == "comparable" and stored["status"] == "ok" and stored["phrase"] == "两期可比"
+    assert stored["params"]["base_query"] == "Q2" and stored["params"]["target_query"] == "Q1"
+    values = stored["values"]
+    assert (values["base_start"], values["base_end"], values["target_start"], values["target_end"]) == (
+        "2026-05-11", "2026-05-17", "2026-05-18", "2026-05-24")
+    assert {values[k] for k in ("same_query", "window", "complete", "weekdays", "data")} == {"pass"}
+    assert _live(stored) == [("orders", "day", "live", "2026-05-24")] and body["verdict"] == "comparable"
 
 
 async def test_replaying_after_approvals_does_not_recompute(monkeypatch):
@@ -275,6 +338,31 @@ async def test_an_analysis_card_runs_the_real_operators():
     recomputes(decomposed)
 
 
+async def test_an_analysis_card_reads_a_merged_query():
+    """分析卡的输入是合并查询（merge 节点）：按合并查询节点的做法取它的快照，输入写明 sqlite 方言（合并查询在 SQLite 里
+    执行），真算子照常拆、复算逐字段相同。"""
+    where = {"id": "where", "op": "decompose", "mode": "additive", "from": "merged",
+             "params": {"by": ["region"], **TWO_WEEKS, "label": "销售额"}}
+    graph = chain(node("start", "input"), node("by_region", "tool", tool=TOOL, args={"sql": BY_REGION}),
+                  node("merged", "merge", inputs={"a": "by_region"}, sql="SELECT region, week, gmv FROM a"),
+                  node("card", "analysis", items=[where]),
+                  node("out", "output", fields=[{"name": "r", "value": "{{ nodes.card.results.where.phrase }}"}]))
+    run = await run_manager.start(graph=graph, input_payload={})
+    row = await wait(run.id)
+    assert row.status == "succeeded", row.error
+    [finished] = await events(row.id, "node.finished", "card")
+    results = artifact_store.load(finished["artifact"])["results"]
+    stored = artifact_store.load(results["where"]["artifact"])
+    assert stored["verdict"]["code"] == "driver" and stored["verdict"]["subjects"] == [["华东"]]
+    assert row.output["r"] == stored["phrase"] and "主要来自华东" in stored["phrase"]
+    [given] = stored["inputs"]
+    [merged] = await events(row.id, "node.finished", "merged")
+    assert (given["ref"], given["role"], given["dialect"]) == ("merged", "data", "sqlite")
+    assert given["artifact"] == merged["evidence"][0]["artifact"]
+    assert [(e["kind"], e["item"]) for e in finished["evidence"]] == [("analysis", "where")]
+    recomputes(stored)
+
+
 # --------------------------------------------------------------------------
 # 口径卡的可比性挂钩：真 comparable
 # --------------------------------------------------------------------------
@@ -312,3 +400,86 @@ async def test_a_caliber_card_checks_two_periods_with_the_real_operator(this_wee
     assert any(p.get("table") == "orders" and p.get("basis") == "live" for p in stored["probes"])
     recomputes(stored)
     assert not [e for e in await events(row.id, "log", "card") if e.get("code") == "metric_comparability_skipped"]
+
+
+def _region_sql(region: str, start: str, end: str) -> str:
+    return f"SELECT SUM(amount) AS gmv FROM orders WHERE region = '{region}' AND day BETWEEN '{start}' AND '{end}'"
+
+
+@pytest.mark.parametrize("south_week, verdict", [
+    (("2026-05-18", "2026-05-24"), None),             # 同一周、只差地区：是两段不是两期，不查
+    (("2026-05-11", "2026-05-17"), "incomparable"),   # 日期和地区都不同：两边除了日期，筛选的还不一样
+])
+async def test_a_ratio_between_two_regions_is_not_a_period_comparison(south_week, verdict):
+    """华东对华南的倍数：两份同形 SQL 只差地区字面量，不做可比性检查，带契约的出口照常正式出具（以前判成两期不可比、降档）。
+    日期和地区都不同的照查，真算子判不可比，出口记缺口降档。"""
+    metrics = [{"id": "times", "name": "华东对华南的倍数", "decimals": 4,
+                "expression": "cell(nodes.east, 0, 'gmv') / cell(nodes.south, 0, 'gmv')"}]
+    graph = chain(node("start", "input"),
+                  node("east", "tool", tool=TOOL, args={"sql": _region_sql("华东", "2026-05-18", "2026-05-24")}),
+                  node("south", "tool", tool=TOOL, args={"sql": _region_sql("华南", *south_week)}),
+                  node("card", "metrics", caliber="周报口径", metrics=metrics),
+                  node("out", "output", fields=[{"name": "r", "value": "{{ nodes.card.text }}"}],
+                       contract={"metrics_from": ["card"], "required": ["times"]}))
+    run = await run_manager.start(graph=graph, input_payload={})
+    row = await wait(run.id)
+    assert row.status == "succeeded", row.error
+    [finished] = await events(row.id, "node.finished", "card")
+    [metric] = artifact_store.load(finished["artifact"])["metrics"]
+    issuance = row.output["_issuance"]
+    assert not [e for e in await events(row.id, "log", "card") if e.get("code") == "metric_comparability_skipped"]
+    if verdict is None:
+        assert "comparability" not in metric
+        assert issuance["tier"] == "formal" and not issuance.get("gaps") and not issuance.get("comparability")
+        return
+    found = metric["comparability"]
+    assert found["verdict"] == verdict and found["reasons"] == ["两边除了日期，筛选的还不一样"]
+    assert issuance["tier"] == "degraded"
+    assert issuance["gaps"] == ["指标「华东对华南的倍数」两期不可比：两边除了日期，筛选的还不一样"]
+    recomputes(artifact_store.load(found["artifact"]))
+
+
+# --------------------------------------------------------------------------
+# 测试夹具：复用名叫 shop 的源，前后都删干净
+# --------------------------------------------------------------------------
+
+
+async def test_a_scratch_source_starts_clean_and_forgets_its_probes(tmp_path):
+    """分析相关的用例都建名叫 shop 的源（tests/conftest.py 的 scratch_source）：别的用例留下的数据目录、coverage 的现查缓存里
+    按同一个源 id 记下的表范围（5 分钟有效）会改掉这次的判定。sqlite_source 建的源是新的 id，同名的旧源连同数据目录、现查
+    缓存先删掉；forget_source 删源（数据目录随外键级联删除）、清掉现查缓存里它的表范围。"""
+    from app.analysis.probe import make_prober
+    from app.data import catalog as data_catalog
+    from app.data import coverage
+    from app.data.catalog import make_item
+    from app.db.models import CatalogNote, DataSource
+    from tests.fixtures.sources import forget_source, sqlite_source
+
+    path = tmp_path / "other.db"
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE orders (day TEXT, amount INTEGER); INSERT INTO orders VALUES ('2026-01-05', 1);")
+    db.close()
+
+    async def leave_traces(source_id):
+        async with SessionLocal() as session:
+            await data_catalog.write_entry(session, source_id, "orders", {"columns": {"amount": {
+                "measure": make_item("flow", "human")}}}, if_version=0, actor=None)
+            row = await session.get(DataSource, source_id)
+        probe = await make_prober({"scratch": row})("scratch", "orders", "day")
+        assert probe["max"] == "2026-01-05" and probe["basis"] == "live"
+        assert any(k[0] == source_id for k in coverage._LIVE)
+
+    async def traces(source_id):
+        async with SessionLocal() as session:
+            notes = (await session.execute(select(CatalogNote).where(CatalogNote.source_id == source_id))).scalars().all()
+            row = await session.get(DataSource, source_id)
+        return {"row": row is not None, "catalog": len(notes), "probes": sum(k[0] == source_id for k in coverage._LIVE)}
+
+    old = await sqlite_source("scratch", path)
+    await leave_traces(old)
+    new = await sqlite_source("scratch", path)
+    assert new != old and await traces(old) == {"row": False, "catalog": 0, "probes": 0}
+    assert await traces(new) == {"row": True, "catalog": 0, "probes": 0}
+    await leave_traces(new)
+    await forget_source(new)
+    assert await traces(new) == {"row": False, "catalog": 0, "probes": 0}
