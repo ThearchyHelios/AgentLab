@@ -233,6 +233,10 @@ def compare(base: Side, target: Side) -> dict[str, Any]:
     - queries：每对查询一项 {node_id, node_title, ordinal, structure, base_sql, target_sql, literals: [{base,
       target}]（只列不同的字面量）, base_rows, target_rows, base_truncated, target_truncated, base_artifact,
       target_artifact, differences: [结构上差在哪], problem?（快照读不出来、被改过）}
+    - analyses：分析卡每一项一条 {node_id, title, item, op, mode, base, target（各自 {status, verdict, direction,
+      phrase, artifact} 或 None）, change}：两次运行的分析卡按节点和项的标识对齐（analysis.end 事件，循环里执行了几次的取
+      最后一次），change 是 same（判定和判定语都一样）/ verdict（状态或判定变了）/ phrase（判定一样、判定语里的数变了）/
+      added / removed。只列出两次的判定，不拆变化来源
     - notes：整体的说明：连线、默认设置、运行输入的变化，口径卡执行了几次、读不出来，遮罩
     """
     return _Compare(base, target).result()
@@ -328,6 +332,38 @@ def _queries(side: Side) -> list[_Query]:
                 add(node_id, artifact, entry.get("tool"), entry.get("call_id"), merged.get(node_id),
                     entry.get("source"))
     return out
+
+
+def _analysis_items(side: Side) -> dict[str, tuple[dict[str, dict[str, Any]], int]]:
+    """封存范围内每张分析卡各项最后一次的结论（analysis.end，engine/nodes/analysis.py 每项一条）：{卡: ({项: 事件数据},
+    执行了几次)}，项按记下的先后。循环里执行了几次的，同一项后一次的盖过前一次。"""
+    out: dict[str, tuple[dict[str, dict[str, Any]], int]] = {}
+    for _, etype, node_id, data in side.events:
+        if not node_id or not isinstance(data, dict):
+            continue
+        if etype == EventType.ANALYSIS_END and isinstance(data.get("item"), str):
+            items, runs = out.setdefault(node_id, ({}, 0))
+            items[data["item"]] = data
+        elif etype == EventType.NODE_FINISHED and node_id in out:
+            items, runs = out[node_id]
+            out[node_id] = (items, runs + 1)
+    return out
+
+
+def _analysis_side(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    if data is None:
+        return None
+    return {"status": data.get("status"), "verdict": data.get("verdict"), "direction": data.get("direction"),
+            "phrase": data.get("phrase") or "", "artifact": data.get("analysis_artifact")}
+
+
+def _analysis_change(base: dict[str, Any] | None, target: dict[str, Any] | None) -> str:
+    if base is None or target is None:
+        return ADDED if base is None else REMOVED
+    if (base.get("status"), base.get("verdict"), base.get("direction")) != \
+            (target.get("status"), target.get("verdict"), target.get("direction")):
+        return "verdict"
+    return "same" if (base.get("phrase") or "") == (target.get("phrase") or "") else "phrase"
 
 
 def _outputs(side: Side) -> dict[str, tuple[Any, ...]]:
@@ -803,8 +839,9 @@ class _Compare:
         summary = {name: 0 for name in CLASSES}
         for m in metrics:
             summary[m["classification"]] += 1
+        analyses = self._analyses()
         return {"target": self.target.run, "base": self.base.run, "summary": summary, "template": self.template,
-                "metrics": metrics, "queries": queries, "notes": list(dict.fromkeys(self.notes))}
+                "metrics": metrics, "analyses": analyses, "queries": queries, "notes": list(dict.fromkeys(self.notes))}
 
     def _title_of(self, node: dict[str, Any]) -> str:
         return str(_data(node).get("label") or node.get("id"))
@@ -1394,6 +1431,25 @@ class _Compare:
             self.notes.append(DEFAULTS_CHANGED)
         return {"base_version": self.base.run.get("version"), "target_version": self.target.run.get("version"),
                 "same_graph": not nodes and same_edges and same_defaults, "nodes": nodes}, changed, inherited
+
+    # ---------------------------------------------------------------- 分析卡
+
+    def _analyses(self) -> list[dict[str, Any]]:
+        """两次运行的分析卡按节点、项的标识对齐（最小可用：列出两次的判定和判定语，不拆变化来源）。"""
+        before, after = _analysis_items(self.base), _analysis_items(self.target)
+        out: list[dict[str, Any]] = []
+        for node_id in [*after, *(n for n in before if n not in after)]:
+            b, t = before.get(node_id, ({}, 0)), after.get(node_id, ({}, 0))
+            for side, (_, runs) in (("基准运行", b), ("这次运行", t)):
+                if runs > 1:
+                    self.notes.append(f"分析卡「{self.title(node_id)}」在{side}中执行了 {runs} 次，按最后一次对比")
+            for item in [*t[0], *(i for i in b[0] if i not in t[0])]:
+                bi, ti = b[0].get(item), t[0].get(item)
+                meta = ti or bi or {}
+                out.append({"node_id": node_id, "title": self.title(node_id), "item": item, "op": meta.get("op"),
+                            "mode": meta.get("mode"), "base": _analysis_side(bi), "target": _analysis_side(ti),
+                            "change": _analysis_change(bi, ti)})
+        return out
 
     # ---------------------------------------------------------------- 指标
 
