@@ -51,6 +51,16 @@ def test_fingerprint_diff_lists_what_changed():
     assert "before" not in diff[1], "表结构只说变没变"
 
 
+def test_the_analysis_tools_show_as_on_and_off():
+    """分析工具这一项写开、关；加这一项之前的评测指纹里没有它，那时一直开着：和现在开着的比不算变了。"""
+    old = {"assistant_model": "m1", "catalog": "live:aaa", "scorer_version": 3}
+    on, off = {**old, "analysis_tools": "on"}, {**old, "analysis_tools": "off"}
+    assert compare.fingerprint_diff(old, on) == [] and compare.fingerprint_diff(on, on) == []
+    item = {"key": "analysis_tools", "label": "分析工具"}
+    assert compare.fingerprint_diff(on, off) == [{**item, "before": "开", "after": "关"}]
+    assert compare.fingerprint_diff(off, old) == [{**item, "before": "关", "after": "开"}]
+
+
 def test_the_pair_table():
     a = [_row("c1", "pass"), _row("c2", "pass"), _row("c3", "fail"), _row("c4", "ungradable")]
     b = [_row("c1", "pass"), _row("c2", "fail"), _row("c3", "fail"), _row("c4", "pass")]

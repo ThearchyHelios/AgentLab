@@ -18,8 +18,8 @@
   POST /catalog-snapshots/shadow（后台起草，202）、GET /catalog-snapshots/{id}、POST /catalog-snapshots/{id}/stop。
 - 评测（app/eval/runner.py，后台任务）：POST /suites/{id}/evaluations/estimate（发起前的估算：几项、按上一次每题平均花费估的
   金额、生效的预算、同时评几题）；POST /suites/{id}/evaluations（发起，202；variant 一臂，或 arms 几臂的 A/B，或
-  preset=catalog / catalog_reviewed「目录贡献」预设对照）；GET /suites/{id}/evaluations（历次）；GET /evaluations/{id}（进度、
-  总表、和上一次比的计数）；GET /evaluations/{id}/results（逐题）、GET /evaluations/{id}/results/{rid}（一题的明细）；
+  preset=catalog / catalog_reviewed「目录贡献」、preset=analysis_tools「分析工具贡献」预设对照）；
+  GET /suites/{id}/evaluations（历次）；GET /evaluations/{id}（进度、总表、和上一次比的计数）；GET /evaluations/{id}/results（逐题）、GET /evaluations/{id}/results/{rid}（一题的明细）；
   POST /evaluations/{id}/stop、/retry（只重做没做完的）、/rescore（按新评分规则重评，只读封存、不调模型）、/pin（钉住当基线）；
   GET /evaluations/{id}/compare?base=（和上一次或点名的那一次比：指纹差异、逐题转移和归因）；GET /pairs/{pair_id}（A/B 配对表和
   精确 McNemar）；POST /suites/{id}/cleanup（按保留规则清理更早的明细）。「口径命中与重复度」的 E1–E4 直接用口径账本的
@@ -855,8 +855,8 @@ EVALUATION_NOT_FOUND = "eval_evaluation_not_found"
 PAIR_NOT_FOUND = "eval_pair_not_found"
 RESULT_NOT_FOUND = "eval_result_not_found"
 CLEANED = "eval_details_cleaned"
-#: 预设对照
-PRESETS = ("catalog", "catalog_reviewed")
+#: 预设对照：目录贡献（当前目录 vs 关，可加只用已核实的项）、分析工具贡献（开 vs 关）
+PRESETS = ("catalog", "catalog_reviewed", "analysis_tools")
 
 
 def _refused(e: CaseInvalid) -> CodedHTTPException:
@@ -865,7 +865,8 @@ def _refused(e: CaseInvalid) -> CodedHTTPException:
 
 async def _arms(session: AsyncSession, suite: EvalSuite, body: dict[str, Any]) -> list[dict[str, Any]]:
     """请求体 → 规范化的几臂变体：{variant}（一臂，不写用题集的缺省变体）、{arms: [变体…]}（A/B）或 {preset: catalog |
-    catalog_reviewed}（目录贡献对照：当前目录 vs 关，可加只用已核实的项；模型照 variant 或题集的缺省）。A/B 缺省每题 3 次。"""
+    catalog_reviewed | analysis_tools}（目录贡献对照：当前目录 vs 关，可加只用已核实的项；分析工具贡献对照：开 vs 关；别的项
+    照 variant 或题集的缺省）。A/B 缺省每题 3 次。"""
     from app.eval import variants as variant_rules
 
     judge = bool((await _site(session))["judge"])
@@ -877,6 +878,8 @@ async def _arms(session: AsyncSession, suite: EvalSuite, body: dict[str, Any]) -
                 raise CaseInvalid(f"预设对照只能是 {'、'.join(PRESETS)}", "preset", variant_rules.VARIANT_INVALID)
             base = variant_rules.normalize_variant({**dict(suite.default_variant or {}), **dict(body.get("variant") or {})},
                                                    judge_default=judge, repeats_default=variant_rules.PAIR_REPEATS)
+            if preset == "analysis_tools":
+                return variant_rules.analysis_tools_preset(base)
             return variant_rules.catalog_preset(base, reviewed=preset == "catalog_reviewed")
         if raw_arms is not None:
             if not isinstance(raw_arms, list) or not 2 <= len(raw_arms) <= variant_rules.ARMS_MAX:
