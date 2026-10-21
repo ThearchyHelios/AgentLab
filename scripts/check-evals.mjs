@@ -135,7 +135,7 @@ const QUERIES = [
     row_count: 5, truncated: false, masked: true },
 ]
 const VARIANT = { assistant: { provider: null, model: null }, writer: { provider: null, model: null }, judge: false,
-  catalog: { mode: 'live', snapshot: null }, repeats: 1, label: null }
+  catalog: { mode: 'live', snapshot: null }, analysis: { tools: 'on' }, repeats: 1, label: null }
 const SUMMARY = {
   scorer_version: 1, items: 3, done: 3, cases: 3, verdicts: { pass: 2, fail: 1, ungradable: 0, skipped: 0 }, not_run: 0,
   accuracy: RATE(2, 3), traced_accuracy: RATE(1, 3), outcomes: { traced: 1, untraced: 1, wrong: 1 }, text: {},
@@ -152,7 +152,7 @@ const SUMMARY = {
 }
 const EVAL_DONE = {
   id: 'ev-1', suite_id: 'suite-a', status: 'succeeded', trigger: 'manual', schedule_id: null, variant: VARIANT,
-  resolved_models: { assistant: 'model-a', writer: null, judge: false }, variant_text: '助手 model-a · 写作 各节点自己的 · 当前目录 · 结论裁判关 · 每题 1 次',
+  resolved_models: { assistant: 'model-a', writer: null, judge: false }, variant_text: '助手 model-a · 写作 各节点自己的 · 当前目录 · 分析工具开 · 结论裁判关 · 每题 1 次',
   catalog_snapshot: 'snap-live', as_of: iso(NOW - 2 * H), repeats: 1, fingerprint: {}, pair_id: null, arm: null, baseline_id: 'ev-old',
   pinned: false, budget: BUDGET, counts: { total: 3, done: 3, passed: 2, failed: 1 }, usage: {}, summary: SUMMARY, stop_reason: null,
   error: null, created_by: '检查员甲', created_at: iso(NOW - 2 * H), started_at: iso(NOW - 2 * H), finished_at: iso(NOW - H),
@@ -219,7 +219,8 @@ const EVAL_AN = { ...EVAL_DONE, id: 'ev-an', counts: { total: 4, done: 4, passed
     outcomes_by_kind: { contribution: { traced: 1 }, verdict: { untraced: 1, wrong: 1, ungradable: 1 } } } }
 const COMPARE = {
   base: EVAL_OLD, cleaned: false,
-  fingerprint_diff: [{ key: 'writer_model', label: '写作模型', before: 'model-a', after: 'model-b' }, { key: 'schemas', label: '表结构' }],
+  fingerprint_diff: [{ key: 'writer_model', label: '写作模型', before: 'model-a', after: 'model-b' },
+    { key: 'analysis_tools', label: '分析工具', before: '开', after: '关' }, { key: 'schemas', label: '表结构' }],
   transitions: { counts: { regressed: 1, improved: 1, same: 1, incomparable: 0 }, causes: { data: 0, method: 1, params: 1, path: 0, unknown: 0 },
     items: [{ case_id: 'case-2', case_seq: 2, before: 'pass', after: 'fail', transition: 'regressed', cause: 'method' },
       { case_id: 'case-1', case_seq: 1, before: 'fail', after: 'pass', transition: 'improved', cause: 'params' },
@@ -227,12 +228,21 @@ const COMPARE = {
 }
 const PAIR_A = { ...EVAL_DONE, id: 'ev-pa', pair_id: 'ev-pa', arm: '当前目录', trigger: 'pair' }
 const PAIR_B = { ...EVAL_DONE, id: 'ev-pb', pair_id: 'ev-pa', arm: '关目录', trigger: 'pair' }
+// 分析工具贡献对照的两臂：名字、变体那一句都是服务端给的（variants.analysis_tools_preset、describe）
+const TOOLS_TEXT = (on) => `助手 model-a · 写作 各节点自己的 · 当前目录 · 分析工具${on ? '开' : '关'} · 结论裁判关 · 每题 3 次`
+const PAIR_TA = { ...EVAL_DONE, id: 'ev-ta', pair_id: 'ev-ta', arm: '分析工具开', trigger: 'pair', variant_text: TOOLS_TEXT(true),
+  variant: { ...VARIANT, repeats: 3, label: '分析工具开' } }
+const PAIR_TB = { ...EVAL_DONE, id: 'ev-tb', pair_id: 'ev-ta', arm: '分析工具关', trigger: 'pair', variant_text: TOOLS_TEXT(false),
+  variant: { ...VARIANT, analysis: { tools: 'off' }, repeats: 3, label: '分析工具关' } }
+const PAIR_TOOLS = { pair_id: 'ev-ta', evaluations: [PAIR_TA, PAIR_TB], cleaned: false,
+  table: { arms: [{ arm: '分析工具开', accuracy: RATE(3, 4) }, { arm: '分析工具关', accuracy: RATE(2, 4) }],
+    pairs: [{ a: '分析工具开', b: '分析工具关', both: 2, neither: 1, only_a: 1, only_b: 0, excluded: 0, p_value: 1, note: '这批题上看不出差别' }] } }
 const PAIR = { pair_id: 'ev-pa', evaluations: [PAIR_A, PAIR_B], cleaned: false,
   table: { arms: [{ arm: '当前目录', accuracy: RATE(3, 4) }, { arm: '关目录', accuracy: RATE(1, 4) }],
     pairs: [{ a: '当前目录', b: '关目录', both: 1, neither: 1, only_a: 2, only_b: 0, excluded: 0, p_value: 0.5, note: '这批题上看不出差别' }] } }
 const ESTIMATE = (arms) => ({
   arms: arms.map((a, i) => ({ label: arms.length > 1 ? a : null, variant: VARIANT, models: { assistant: 'model-a', writer: null, judge: false },
-    text: `助手 model-a · 写作 各节点自己的 · ${a} · 结论裁判关 · 每题 ${arms.length > 1 ? 3 : 1} 次` })),
+    text: `助手 model-a · 写作 各节点自己的 · ${a.startsWith('分析工具') ? `当前目录 · ${a}` : `${a} · 分析工具开`} · 结论裁判关 · 每题 ${arms.length > 1 ? 3 : 1} 次` })),
   cases: 3, repeats: arms.length > 1 ? 3 : 1, estimate: { items: 3 * (arms.length > 1 ? 3 : 1) * arms.length, per_item_usd: 0.014,
     total_usd: 0.042 * (arms.length > 1 ? 3 : 1) * arms.length, basis: 'ev-1', note: '按这个题集上一次评测的每题平均花费估算' },
   budget: BUDGET, parallel: 2, spend: { usd: 0.37, calls: 12, unpriced_calls: 0, daily_max_usd: 5 },
@@ -282,7 +292,8 @@ const USER = { mode: 'local', username: 'li', display_name: '使用者乙', role
 function freshState(patch = {}) {
   return {
     suites: [clone(SUITE), clone(SUITE_B)], cases: { 'suite-a': [clone(CASE_SQL), clone(CASE_CAL), clone(CASE_ASK)], 'suite-b': [] },
-    evaluations: { 'ev-1': clone(EVAL_DONE), 'ev-old': clone(EVAL_OLD), 'ev-pa': clone(PAIR_A), 'ev-pb': clone(PAIR_B) },
+    evaluations: { 'ev-1': clone(EVAL_DONE), 'ev-old': clone(EVAL_OLD), 'ev-pa': clone(PAIR_A), 'ev-pb': clone(PAIR_B),
+      'ev-ta': clone(PAIR_TA), 'ev-tb': clone(PAIR_TB) },
     writes: [], me: null, eval: { max_parallel: 2, per_case_timeout_s: 900, per_run_max_usd: 2, daily_max_usd: 5, keep_runs: 20, judge: false },
     ...patch,
   }
@@ -376,8 +387,8 @@ function reply(state, method, path, url, body) {
     }
     if (method === 'POST' && rest === '/evaluations/estimate') {
       write()
-      const arms = body.preset ? (body.preset === 'catalog_reviewed' ? ['当前目录', '只用已核实和已确认的项', '关目录'] : ['当前目录', '关目录'])
-        : body.arms ? body.arms.map((a, i) => a.label || 'ABC'[i]) : ['当前目录']
+      const arms = body.preset ? ({ catalog_reviewed: ['当前目录', '只用已核实和已确认的项', '关目录'], analysis_tools: ['分析工具开', '分析工具关'] }[body.preset]
+        ?? ['当前目录', '关目录']) : body.arms ? body.arms.map((a, i) => a.label || 'ABC'[i]) : ['当前目录']
       return { json: ESTIMATE(arms) }
     }
     if (method === 'POST' && rest === '/evaluations') {
@@ -433,6 +444,7 @@ function reply(state, method, path, url, body) {
   if (method === 'POST' && path === '/evals/suites/suite-a/cleanup') { write(); return { json: { runs: 2, results: 6, deleted_runs: 8, files: 3 } } }
   if (method === 'GET' && path === '/workflows') return { json: [WF_WEEK] }
   if (method === 'GET' && path === '/evals/pairs/ev-pa') return { json: PAIR }
+  if (method === 'GET' && path === '/evals/pairs/ev-ta') return { json: PAIR_TOOLS }
   if (method === 'GET' && path === '/evals/calibers') return { json: { calibers: CALIBERS } }
   if (method === 'GET' && path === '/workflows/wf-week/versions/3') return { json: VERSION_WEEK }
   if (method === 'GET' && path === '/evals/runs/run-chat-1/queries') return { json: { queries: QUERIES } }
@@ -899,7 +911,25 @@ await section('发起评测：估算和发起同一份请求体；评一次、A/
   await until(async () => (await page.locator('[data-eval-estimate-arm]').count()) === 3)
   await shot(page, 'start-catalog')
   check('估算写三臂', await page.locator('[data-eval-estimate-arm]').count() === 3)
+  check('目录贡献对照：目录由预设定、不摆，分析工具照样能选', await page.locator('[data-eval-catalog-mode]').count() === 0
+    && await page.locator('[data-eval-analysis-tools]').count() === 1)
+  await page.locator('[data-eval-start-mode="analysis_tools"]').click()
+  await until(() => writes(state, /estimate$/).some((w) => w.body?.preset === 'analysis_tools'))
+  const tools = lastWrite(state, /estimate$/)?.body
+  check('分析工具贡献对照：预设 analysis_tools，变体里不带分析工具和名字（开、关两臂由服务端定），每题 3 次',
+    tools?.preset === 'analysis_tools' && !('analysis' in (tools.variant ?? {})) && !('label' in (tools.variant ?? {}))
+      && tools.variant?.repeats === 3 && tools.variant?.catalog?.mode === 'live', JSON.stringify(tools))
+  check('……分析工具由预设定、不摆，目录照样能选', await page.locator('[data-eval-analysis-tools]').count() === 0
+    && await page.locator('[data-eval-catalog-mode]').count() === 1)
+  await until(async () => (await page.locator('[data-eval-estimate-arm]').count()) === 2)
+  check('……估算写开、关两臂，各自的变体那一句照服务端写', (await text(page, '[data-eval-estimate-arm="分析工具关"]')).includes('分析工具关')
+    && (await text(page, '[data-eval-estimate-arm="分析工具开"]')).includes('分析工具开'), await text(page, '[data-eval-estimate]'))
+  await shot(page, 'start-analysis-tools')
   await page.locator('[data-eval-start-mode="single"]').click()
+  await page.locator('#eval-arm-0-analysis').selectOption('off')
+  await until(() => writes(state, /estimate$/).some((w) => !w.body?.preset && w.body?.variant?.analysis?.tools === 'off'))
+  check('评一次：分析工具选「关」，变体里带 analysis.tools=off', lastWrite(state, /estimate$/)?.body?.variant?.analysis?.tools === 'off',
+    JSON.stringify(lastWrite(state, /estimate$/)?.body))
   await sleep(500)
   await page.locator('[data-eval-start-submit]').click()
   await until(() => lastWrite(state, /^POST \/evals\/suites\/suite-a\/evaluations$/))
@@ -982,6 +1012,8 @@ await section('逐题结果、和上一次比、A/B 配对表', async () => {
   await page.locator('[data-eval-transitions]').waitFor()
   check('对比：指纹差异写哪几项变了', (await text(page, '[data-eval-fingerprint]')).includes('写作模型：model-a → model-b')
     && (await text(page, '[data-eval-fingerprint]')).includes('表结构：变了'))
+  check('对比：分析工具开、关照服务端写前后', (await text(page, '[data-eval-fingerprint]')).includes('分析工具：开 → 关'),
+    await text(page, '[data-eval-fingerprint]'))
   check('转移和归因', (await text(page, '[data-eval-transitions]')).includes('退步 1') && (await text(page, '[data-eval-transitions]')).includes('做法变 1')
     && await page.locator('[data-eval-transition="regressed"]').count() === 1)
   await shot(page, 'run-compare')
@@ -995,6 +1027,16 @@ await section('逐题结果、和上一次比、A/B 配对表', async () => {
     && await text(page, '[data-eval-pair-only-b]') === '0' && await text(page, '[data-eval-pair-neither]') === '1')
   check('p 值和「这批题上看不出差别」照服务端写', (await text(page, '[data-eval-pair-p]')).includes('p = 0.5') && (await text(page, '[data-eval-pair-p]')).includes('看不出差别'))
   check('两臂各自链到自己的详情', await page.locator('[data-eval-pair-arm="关目录"]').getAttribute('href') === '/evals/runs/ev-pb?tab=pair')
+
+  // 分析工具贡献对照：两臂的名字、变体那一句（分析工具开 / 关）照服务端写
+  await page.goto(`${WEB}/evals/runs/ev-tb?tab=pair`, { waitUntil: 'networkidle' })
+  await page.locator('[data-eval-pair-row]').waitFor()
+  check('分析工具贡献对照：两臂各写自己的分析工具开、关', (await text(page, '[data-eval-pair-arm="分析工具开"]')).includes('分析工具开 · 结论裁判关')
+    && (await text(page, '[data-eval-pair-arm="分析工具关"]')).includes('分析工具关 · 结论裁判关')
+    && (await text(page, '[data-eval-pair-row]')).includes('分析工具开 vs 分析工具关'))
+  check('……这一臂的详情页头写它的变体（分析工具关）', (await text(page, '[data-eval-run-head]')).includes(TOOLS_TEXT(false)),
+    await text(page, '[data-eval-run-head]'))
+  await shot(page, 'run-pair-tools')
   check('没有页面报错', !errors.length, errors.join(' ｜ '))
 })
 
