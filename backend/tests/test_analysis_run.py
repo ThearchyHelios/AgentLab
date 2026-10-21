@@ -44,8 +44,10 @@ async def _run(op, mode, params, *, probe=None, **kw):
 
 
 def _assert_shape(result):
-    """结论的字段、取值严格按契约。"""
-    assert set(result) == set(c.AnalysisResult.__annotations__)
+    """结论的字段、取值严格按契约。两样可选的（第 2 波 S1 加）：结论的 value_formats（具名的数的换算）、结果表的
+    formats（以比率存的列的换算）——都为空时整项不写，和以前的结论一字不差。"""
+    assert set(result) <= set(c.AnalysisResult.__annotations__)
+    assert set(c.AnalysisResult.__annotations__) - set(result) <= {"value_formats"}
     assert result["op"] in c.OPS and result["method"] == c.METHODS[(result["op"], result["mode"])]
     assert result["status"] in ("ok", "refused")
     if result["status"] == "refused":
@@ -57,11 +59,15 @@ def _assert_shape(result):
         assert all(isinstance(s, list) and all(isinstance(x, str) for x in s) for s in result["verdict"]["subjects"])
         assert result["verdict"]["direction"] in (None, "up", "down")
         table = result["table"]
-        assert set(table) == {"columns", "labels", "rows", "column_types"}
+        assert set(table) - {"formats"} == {"columns", "labels", "rows", "column_types"}
         assert set(table["labels"]) == set(table["columns"]) and set(table["column_types"]) <= set(table["columns"])
         assert list(table["column_types"]) == [c for c in table["columns"] if c in table["column_types"]]
         assert set(table["column_types"].values()) <= {"number", "text", "date", "datetime", "time", "boolean"}
         assert all(len(r) == len(table["columns"]) for r in table["rows"])
+        assert set(table.get("formats") or {}) <= set(table["columns"])
+        assert set((table.get("formats") or {}).values()) <= set(c.FORMAT_CONVS)
+    assert set(result.get("value_formats") or {}) <= set(result["values"])
+    assert set((result.get("value_formats") or {}).values()) <= set(c.FORMAT_CONVS)
     assert all(v is None or isinstance(v, str) for v in result["values"].values())
     assert all(set(cv) == {"code", "text"} and cv["code"] in c.CAVEATS for cv in result["caveats"])
     assert set(result["settings"]) <= set(c.DEFAULTS)

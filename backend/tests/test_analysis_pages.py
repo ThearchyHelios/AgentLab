@@ -159,7 +159,8 @@ async def test_the_export_page_opens_the_analysis_steps_and_the_scope_numbers():
 
 async def test_the_export_page_speaks_of_the_overall_ratio_for_a_ratio_decomposition():
     """比率拆解的总数那一格是整体比率：导出页写「整体比率那一格」「整体比率 x 与各段分子之和 ÷ 分母之和 y 闭合」，不说
-    「各段之和」。可加拆解照旧（上一个用例的页面里没有「整体比率」）。"""
+    「各段之和」。比率按结论记的格式写成百分数（3.5%，不是 0.035），两格一致。可加拆解照旧（上一个用例的页面里没有
+    「整体比率」）。"""
     made = await ratio_run()
     async with AsyncClient(transport=ASGITransport(app=asgi), base_url="http://test") as client:
         html = (await client.get(f"/api/runs/{made['run']}/report.html")).text
@@ -168,8 +169,8 @@ async def test_the_export_page_speaks_of_the_overall_ratio_for_a_ratio_decomposi
     out = run_node(RUN_RUNTIME, RUNTIME, {"data": data, "segs": [
         {"seg": phrase, "kind": "analysis", "state": "deterministic", "text": made["result"]["phrase"]}]})
     body = out[phrase]["body"]
-    for text in ("基期整体比率", "整体比率那一格", "整体比率 0.035 与各段分子之和 ÷ 分母之和 0.035 闭合",
-                 "整体比率 0.053 与各段分子之和 ÷ 分母之和 0.053 闭合"):
+    for text in ("基期整体比率", "整体比率那一格", "整体比率 3.5% 与各段分子之和 ÷ 分母之和 3.5% 闭合",
+                 "整体比率 5.3% 与各段分子之和 ÷ 分母之和 5.3% 闭合"):
         assert text in body, text
     assert "各段之和 0.0" not in body
 
