@@ -150,11 +150,12 @@ class TurnDriver:
     # ------------------------------------------------------------------ 子类给的差异
 
     def generate_in(self, instruction: str, base_graph: dict[str, Any] | None) -> Any:
-        """这一次生成的请求（api/copilot.GenerateIn）。"""
+        """这一次生成的请求（api/copilot.GenerateIn）。question 是这一轮原本的问题：重来时 instruction 是带着原因的那段话，
+        自查按原本的问题判分析意图。"""
         from app.api.copilot import GenerateIn
 
         return GenerateIn(instruction=instruction, base_graph=base_graph, intent="answer", provider=self.provider,
-                          model=self.model, datasource_ids=self.datasource_ids or None)
+                          model=self.model, datasource_ids=self.datasource_ids or None, question=self.question)
 
     def catalog_view(self) -> Any:
         """这一轮读哪一份数据目录（data/catalog_view.py），None 是当前目录。"""

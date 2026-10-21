@@ -707,12 +707,17 @@ class GraphChecker:
     """图的自查：按运行时同一套规则（copilot._blocking_issues）挑出挡路的问题，交回模型改。
 
     known 给了（升级证据）：只把这一轮冒出来的问题交回去（图上原来就有的不归这一轮管），一个修改都没落地时不修。
+
+    question 给了（问数据：用户问的那句话）：问题是分析类（app/analysis/intent）、查库的 Agent 却没绑分析工具时另提一条
+    （analysis_gaps），同 coverage 只交回模型改一轮。
     """
 
     def __init__(self, applier: GraphApplier, *, scope: set[str] | None = None, sources: list[Any] | None = None,
                  baseline: list[dict[str, Any]] | None = None, level: str | None = None,
                  defaults: dict[str, Any] | None = None, checkers: dict[str, Any] | None = None,
-                 known: set[Any] | None = None, chat_user: bool = False) -> None:
+                 known: set[Any] | None = None, chat_user: bool = False, question: str | None = None) -> None:
+        from app.analysis.intent import analysis_intent
+
         self.applier = applier
         #: 图要以开登录后 user 角色的身份在问数据里发起（D-c）：使用者不能用的节点、工具也算挡路
         self.chat_user = chat_user
@@ -728,6 +733,10 @@ class GraphChecker:
         self._coverage_cache: Any = None
         #: 这类问题已经交回模型改过一轮：之后不再挡（修正后仍在的留在检查结果里当提醒，由模型在说明里照实告诉用户）
         self._coverage_given = False
+        #: 用户问题的分析意图（问为什么、怎么变了、是否异常、趋势……），不是分析类问题为 None
+        self.intent = analysis_intent(question) if question else None
+        #: 「分析类问题、Agent 没绑分析工具」已经交回模型改过一轮：之后不再挡，同 _coverage_given
+        self._analysis_given = False
 
     def blocking(self) -> list[dict[str, Any]] | None:
         from app.api.copilot import _blocking_issues
@@ -743,7 +752,10 @@ class GraphChecker:
             # 查的区间里表里没有数据：交回模型改一轮（换有这段数据的表，或者在说明里照实告诉用户）；改过一轮仍在的不挡
             covered = [] if self._coverage_given or errors is None else await self.coverage()
             self._coverage_given = self._coverage_given or bool(covered)
-            return [*refused, *(errors or []), *covered]
+            # 分析类问题、查库的 Agent 没绑分析工具：同样只交回模型改一轮（用不上分析的，模型在说明里讲一句为什么就行）
+            analysis = [] if self._analysis_given or errors is None else self.analysis_gaps()
+            self._analysis_given = self._analysis_given or bool(analysis)
+            return [*refused, *(errors or []), *covered, *analysis]
         from app.engine.autofix import _sig
 
         if not self.applier.effective:
@@ -793,9 +805,49 @@ class GraphChecker:
         return await coverage.sql_gaps(source, sql, facts=_profile_facts(row), masked=masked_columns(row.options),
                                        cache=self._coverage_cache, budget=COVERAGE_BUDGET_S)
 
+    def analysis_gaps(self, *, level: str = "error") -> list[dict[str, Any]]:
+        """问题是分析类（self.intent），图里没有分析卡，查库的 Agent 一个分析工具都没绑：一条问题（形状同自查的问题，code 是
+        ANALYSIS_TOOLS_MISSING），指向第一个查库的 Agent。没有查库的 Agent 的图（只用调用工具节点取数、选用了口径）不提：这条
+        说的是「查库的 Agent 要绑分析工具」，别的结构由助手按节点手册定。level 给 warning 时是收尾那一步的提醒。"""
+        if self.intent is None:
+            return []
+        from app.analysis.contract import TOOL_NAMES
+        from app.tools.datasource import QUERY_PREFIX
+
+        bound = set(TOOL_NAMES.values())
+        querying: tuple[str, str] | None = None
+        for nid, node in self.applier.nodes.items():
+            ntype = (node or {}).get("type")
+            if ntype == NodeType.ANALYSIS:
+                return []
+            if ntype != NodeType.AGENT:
+                continue
+            data = (node or {}).get("data") or {}
+            tools = {t.strip() for t in (data.get("config") or {}).get("tools") or [] if isinstance(t, str)}
+            if tools & bound:
+                return []
+            if querying is None and any(t.startswith(QUERY_PREFIX) for t in tools):
+                querying = (nid, str(data.get("label") or "").strip() or nid)
+        if querying is None:
+            return []
+        nid, title = querying
+        asked = f"问题问的是{self.intent.label}（「{self.intent.text}」）"
+        names = "、".join(TOOL_NAMES[op] for op in ANALYSIS_TOOL_ORDER)
+        return [{"level": level, "node_id": nid, "edge_id": None, "field": "tools", "code": ANALYSIS_TOOLS_MISSING,
+                 "message": f"{asked}，查库的「{title}」没有绑定分析工具：变化从哪来、是否异常、是不是趋势只能由模型自己判断，"
+                            "报告里的这类判断没有分析结论可依据",
+                 "for_model": f"{asked}。按「分析类问题」的形状改：给查库的 agent「{nid}」的 tools 加上 {names}"
+                              "（db_query__、db_schema__ 照留），平台会把分析方法注入它的 system，prompt 里写清要回答的问题、"
+                              "比哪两期就行；report 的 instructions 让它按分析结论写、判断直接引用判定语。问的其实不是原因、"
+                              "异常、趋势这类、确实用不上分析的，不改这一处，在 done 的 explanation 里说一句为什么"}]
+
 
 #: 自查时一条 SQL 的覆盖检查最多花多少秒（data/coverage.py）：搭图要等它，比查询时的 BUDGET_S 短
 COVERAGE_BUDGET_S = 8.0
+#: 分析类问题、查库的 Agent 没绑分析工具（GraphChecker.analysis_gaps）那条问题的 code
+ANALYSIS_TOOLS_MISSING = "analysis_tools_missing"
+#: 自查让助手绑分析工具时列出的先后：先定现象（可比性、基线、趋势），再拆、再检验（同分析方法 tools/builtin/analysis.py）
+ANALYSIS_TOOL_ORDER = ("comparable", "baseline", "trend", "decompose", "differ")
 
 
 async def _probe_source(row: Any) -> Any:
