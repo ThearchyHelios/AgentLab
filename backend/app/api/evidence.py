@@ -224,6 +224,9 @@ class _Sealed:
     #: 节点 id → node.started 上记的名字、类型。子工作流里的节点（「子工作流节点 id/…」）不在这次运行的图上，名字从这里取
     labels: dict[str, str] = field(default_factory=dict)
     types: dict[str, str] = field(default_factory=dict)
+    #: 这一次请求里复算过的分析结论：结论工件 id → 复算的结论（_analysis_recheck）。导出页里同一份结论被判定语、具名的数、
+    #: 整表的每一格、分析范围各引一处，各接一条链，复算只做一次。只活在这一次请求里：下一次请求重新取、重新验
+    rechecks: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def sealed(self) -> bool:
@@ -1130,7 +1133,7 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
     inputs, steps = await _analysis_inputs(alias, result, catalog, doc, sealed, masks, queries=queries)
     hidden = {str(c).lower() for q in steps for c in q.get("masked") or []}
     calc = _analysis_calc(alias, result, judged["cited"], hidden)
-    again = await _analysis_recheck(result, sealed)
+    again = await _analysis_recheck(result, sealed, artifact)
     recheck = {"step": "analysis_recompute", "alias": alias, **again}
     return [judged, method, calc, *inputs, *steps, recheck, seal]
 
@@ -1230,10 +1233,21 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
     return steps, found
 
 
-async def _analysis_recheck(result: dict[str, Any], sealed: _Sealed) -> dict[str, Any]:
+async def _analysis_recheck(result: dict[str, Any], sealed: _Sealed, artifact: str | None = None) -> dict[str, Any]:
     """复算（evidence.analysis_recheck）：输入快照交工件原内容，下钻的上一层交那份结论，都按 sha256 取回、复验哈希，在线程里
     复算、比较。只认封存范围内的——输入快照要是这次运行交回过的查询（sealed.queries），上一层要是台账记过的分析结论；
-    不在范围内、哈希对不上的一律当取不回（复算照实说取不回哪一份）。"""
+    不在范围内、哈希对不上的一律当取不回（复算照实说取不回哪一份）。
+
+    artifact 是这份结论的工件 id（内容寻址）：一次请求里同一份结论只复算一次，结果记在 sealed.rechecks。"""
+    if artifact and artifact in sealed.rechecks:
+        return dict(sealed.rechecks[artifact])
+    again = await _recheck_now(result, sealed)
+    if artifact:
+        sealed.rechecks[artifact] = again
+    return dict(again)
+
+
+async def _recheck_now(result: dict[str, Any], sealed: _Sealed) -> dict[str, Any]:
     snapshots = {str(i["artifact"]) for i in result.get("inputs") or []
                  if isinstance(i, dict) and i.get("artifact") and i.get("role") != "parent"}
     parents = {str(i["artifact"]) for i in result.get("inputs") or []
@@ -3268,22 +3282,24 @@ def scope_aliases(doc: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-async def _scope_chains(doc: dict[str, Any], sealed: _Sealed, report_node: str) -> dict[str, list[dict[str, Any]]]:
-    """分析范围里每个编号的出处链（和点开正文里的判定语同一条 _chain，按那条结论的判定语认）：{编号: 链}。目录里没有的
-    编号不给（文档里写着、目录里却没有，只能是文档有问题，范围那一项点不开）。"""
+def _scope_cite_key(alias: str) -> tuple:
+    """分析范围里一个编号的引用键：和正文里引用判定语（[[a:A1]]）的片段同一个键（_export_cite_key），共用一条链。"""
+    return (LEDGER_KIND, alias, "resolved", None, None, None, None, None, None)
+
+
+async def _scope_chain(alias: str, doc: dict[str, Any], sealed: _Sealed, report_node: str) -> list[dict[str, Any]] | None:
+    """分析范围里一个编号的出处链（和点开正文里的判定语同一条 _chain，按那条结论的判定语认）。目录里没有的编号为 None
+    （文档里写着、目录里却没有，只能是文档有问题，范围那一项点不开）。"""
     catalog = doc.get("catalog") if isinstance(doc.get("catalog"), dict) else {}
-    out: dict[str, list[dict[str, Any]]] = {}
-    for alias in scope_aliases(doc):
-        entry = catalog.get(alias)
-        if not isinstance(entry, dict) or entry.get("kind") != LEDGER_KIND:
-            continue
-        result, _ = _analysis_of(str(entry.get("artifact") or ""))
-        seg = {"id": SCOPE_REF.format(alias=alias), "kind": LEDGER_KIND, "state": "deterministic",
-               "text": render_cell(result.get("phrase"), kind="text") if result and result.get("phrase") else alias,
-               "cite": {"alias": alias, "kind": LEDGER_KIND, "status": "resolved", "locator": {},
-                        "eid": entry.get("eid")}}
-        out[alias] = await _chain(seg, doc, sealed, report_node)
-    return out
+    entry = catalog.get(alias)
+    if not isinstance(entry, dict) or entry.get("kind") != LEDGER_KIND:
+        return None
+    result, _ = _analysis_of(str(entry.get("artifact") or ""))
+    seg = {"id": SCOPE_REF.format(alias=alias), "kind": LEDGER_KIND, "state": "deterministic",
+           "text": render_cell(result.get("phrase"), kind="text") if result and result.get("phrase") else alias,
+           "cite": {"alias": alias, "kind": LEDGER_KIND, "status": "resolved", "locator": {},
+                    "eid": entry.get("eid")}}
+    return await _chain(seg, doc, sealed, report_node)
 
 
 async def _export_withheld(sealed: _Sealed, doc: dict[str, Any]) -> frozenset[str]:
@@ -3391,14 +3407,17 @@ async def export_report_html(run_id: str, report: str | None = None) -> Response
             refs[sid] = str(ck)
             if key is not None:
                 memo[key] = str(ck)
-    # 系统写的「分析范围」：每个编号点得开，链和点开正文里的判定语是同一条（引用键相同的共用）
-    for alias, chain in (await _scope_chains(doc, sealed, chosen.node_id)).items():
-        sid = SCOPE_REF.format(alias=alias)
-        ck = (LEDGER_KIND, alias, "resolved", None, None, None, None, None, None)
+    # 系统写的「分析范围」：每个编号点得开，链和点开正文里的判定语是同一条（引用键相同的共用：正文已经引了判定语的，
+    # 不再建一遍）
+    for alias in scope_aliases(doc):
+        ck = _scope_cite_key(alias)
         if ck not in memo:
+            chain = await _scope_chain(alias, doc, sealed, chosen.node_id)
+            if chain is None:
+                continue
             memo[ck] = str(ck)
             chains[str(ck)] = chain
-        refs[sid] = memo[ck]
+        refs[SCOPE_REF.format(alias=alias)] = memo[ck]
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if run is None:      # 两次读之间被删掉了

@@ -479,6 +479,36 @@ async def test_the_html_export_carries_the_analysis_chain_and_the_scope(client):
     assert f'data-seg="{phrase}"' in html and 'data-kind="analysis"' in html
 
 
+async def test_the_export_recomputes_each_conclusion_once(client, monkeypatch):
+    """导出页里同一份结论被判定语、具名的数、整表的每一格、句末依据、分析范围各引一处，引用键不同、各接一条链，复算只做
+    一次（按结论工件记在这一次请求里）；分析范围的编号和正文的判定语同一个引用键，不再另建一条链。以前每条链各复算一次，
+    1000 段的拆解导出一次复算三十多次。"""
+    calls: list[str] = []
+    real = analysis.recompute
+
+    def counting(result, load, *, load_result=None):
+        calls.append(str(result.get("method")))
+        return real(result, load, load_result=load_result)
+
+    monkeypatch.setattr(analysis, "recompute", counting)
+    text = ("[[a:A1]]。华东占 [[a:A1.top_share|pct]]。[[see:A1]]\n\n"
+            "[[table:A1 cols=region,delta,share rows=0-3]]")
+    made = await sealed_run(text, doc_extra=SCOPE)
+    data = data_block((await client.get(f"/api/runs/{made['run']}/report.html")).text)
+    assert calls == ["decompose.additive@1"]
+    cells = [s["id"] for s in iter_segments(made["doc"]) if str(s.get("ref") or "").startswith("v:A1.")]
+    assert len(cells) == 12
+    keys = {data["refs"][sid] for sid in [*cells, seg_id(made["doc"], "a:A1"), seg_id(made["doc"], "a:A1.top_share|pct")]}
+    assert len(keys) == 14                                  # 每处引用各一条链
+    for key in keys:
+        [again] = [s for s in data["chains"][key] if s["step"] == "analysis_recompute"]
+        assert again["status"] == "same"
+    assert data["refs"]["scope:A1"] == data["refs"][seg_id(made["doc"], "a:A1")]
+    # 下一次请求重新复算（缓存只活在一次请求里）
+    await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")
+    assert len(calls) == 2
+
+
 async def test_docs_without_a_scope_render_no_scope(client):
     made = await sealed_run(TEXT)
     html = (await client.get(f"/api/runs/{made['run']}/report.html")).text
