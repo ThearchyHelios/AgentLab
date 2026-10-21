@@ -527,9 +527,11 @@ export function StudioPage() {
           <span className="max-w-56 truncate font-medium @max-[1120px]:max-w-32">{workflow?.name ?? '选择工作流'}</span>
           <ChevronDown size={12} className="shrink-0 text-faint" />
         </button>
-        {/* 改名只改名字，画布上没保存的改动不受影响；内置模板不给改名（见 renameWorkflow） */}
+        {/* 改名只改名字，画布上没保存的改动不受影响；内置模板不给改名（见 renameWorkflow）。
+            窄屏收起来：工具栏挤不下，改名在「切换工作流」的列表里照样有 */}
         {workflow && !workflow.is_template && (
-          <IconButton label={`重命名「${workflow.name}」`} title="重命名" className="-ml-1 shrink-0 text-faint hover:text-dim"
+          <IconButton label={`重命名「${workflow.name}」`} title="重命名"
+                      className="-ml-1 shrink-0 text-faint hover:text-dim @max-[880px]:hidden"
                       onClick={() => void renameWorkflow(workflow, refresh)} icon={<Pencil size={12} />} />
         )}
 

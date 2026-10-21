@@ -1030,7 +1030,8 @@ _ANALYSIS_KEYS = ("node_id", "exec", "artifact", "call_id", "item", "op", "mode"
 def _analysis_entry(entry: dict[str, Any], alias: str, snaps: _Snapshots) -> dict[str, Any]:
     """台账里的一条分析结论 → 写作目录的 A 条目：照抄台账的键，带上从工件取回、复验过哈希的整份结论（result，
     analysis.contract.catalog_result 读它）。取不回、哈希不符、形状不对的不带 result，记 unreadable（以编号开头的一句，引用
-    它时照实说）。rows 是结果表的行数：依据 [[see:A1.r3]] 按它核对，存进报告文档的摘要里也留着。"""
+    它时照实说）。rows 是结果表的行数：依据 [[see:A1.r3]] 按它核对，存进报告文档的摘要里也留着；labels 是结果表记的列名
+    （列 id → 给人看的名字）：证据面板、读屏的出处写「结果表第 1 行「占变化的比重」」，不把列 id 当叫法。"""
     out: dict[str, Any] = {"alias": alias, "kind": LEDGER_KIND, "eid": make_eid(LEDGER_KIND, entry.get("artifact"), {}),
                            "locator": {}, **{k: entry[k] for k in _ANALYSIS_KEYS if k in entry}}
     result, why = snaps.analysis(alias, {"artifact": entry.get("artifact")})
@@ -1039,8 +1040,11 @@ def _analysis_entry(entry: dict[str, Any], alias: str, snaps: _Snapshots) -> dic
     else:
         out["result"] = result
         table = result.get("table")
-        if isinstance(table, dict) and isinstance(table.get("rows"), list):
-            out["rows"] = len(table["rows"])
+        if isinstance(table, dict):
+            if isinstance(table.get("rows"), list):
+                out["rows"] = len(table["rows"])
+            if isinstance(table.get("labels"), dict) and table["labels"]:
+                out["labels"] = {str(k): str(v) for k, v in table["labels"].items()}
     phrase = _clean(str((result or {}).get("phrase") or ""))
     name = method_label(out.get("op"), out.get("mode"))
     out["label"] = f"{name} · {phrase}" if phrase else name

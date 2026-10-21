@@ -70,7 +70,7 @@ async def test_tool_end_carries_the_phrase_and_the_same_number_the_model_got(mon
     assert error["call_error"] == "unknown_column" and "analysis" not in error
 
 
-async def test_a_team_member_numbers_its_own_analyses(monkeypatch, shop):
+async def test_a_team_member_analysis_carries_no_number(monkeypatch, shop):
     Script(monkeypatch, [(TOOL, {"sql": SQL}), (DECOMPOSE, DECOMPOSE_ARGS)],
            route={"assignments": [{"agent": "分析员", "instruction": "拆一下销售额的变化"}], "done": False})
     nodes = [node("start", "input"),
@@ -82,7 +82,10 @@ async def test_a_team_member_numbers_its_own_analyses(monkeypatch, shop):
                                   input_payload={})
     row = await wait(run.id)
     assert row.status == "succeeded", row.error
-    [end] = [e for e in await events(row.id, "tool.end", "team") if e.get("analysis_artifact")]
-    assert end["agent"] == "分析员"
-    assert (end["analysis"]["alias"], end["analysis"]["op"], end["analysis"]["verdict"]) == ("A1", "decompose", "driver")
+    ends = [e for e in await events(row.id, "tool.end", "team") if e.get("analysis_artifact")]
+    assert [e["agent"] for e in ends] == ["分析员"]
+    end = ends[0]
+    # 不带编号：成员自己的分析容器里的 A1 不是报告目录里的 A1（协作成员的结论还进不了台账），报告目录另按整次运行的台账编
+    assert end["analysis"]["alias"] is None
+    assert (end["analysis"]["op"], end["analysis"]["verdict"]) == ("decompose", "driver")
     assert json.dumps(end["analysis"], ensure_ascii=False).count("下降是不是集中在某个地区") == 0, "Agent 写的假设不带"

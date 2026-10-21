@@ -262,10 +262,13 @@ export function sourceOf(seg: EvidenceSegment, doc?: Pick<EvidenceDocData, 'cata
   if (!cite) return ''
   const entry = cite.alias ? doc?.catalog?.[cite.alias] : undefined
   if (cite.kind === 'analysis' || entry?.kind === 'analysis') {
-    // 分析结论：判定语（[[a:A1]]）、具名的数（[[a:A1.top_share]]）、结果表的一格（[[v:A1.r0.delta]]，cite 的种类是 cell）
+    // 分析结论：判定语（[[a:A1]]）、具名的数（[[a:A1.top_share]]）、结果表的一格（[[v:A1.r0.delta]]，cite 的种类是 cell）。
+    // 结果表的格写结果表记的列名（目录条目上的 labels），不把列 id 当叫法
     const E = ANALYSIS_TEXT.evidence
     const loc = cite.locator ?? {}
-    const what = cite.kind === 'cell' ? E.citedCell(Number(loc.row) || 0, String(loc.column ?? ''))
+    const column = String(loc.column ?? '')
+    const labels = entry && typeof entry.labels === 'object' && entry.labels ? entry.labels as Record<string, string> : {}
+    const what = cite.kind === 'cell' ? E.citedCell(Number(loc.row) || 0, labels[column] || column)
       : loc.key ? E.citedValue(loc.key) : E.citedPhrase
     return [`${E.title} ${cite.alias ?? ''}`.trim(), what].join(' · ')
   }

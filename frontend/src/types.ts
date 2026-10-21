@@ -2435,8 +2435,16 @@ export interface EvidenceAnalysisStep {
   artifact?: string | null
   eid?: string
   eid_ok?: boolean
-  /** 这一处引用的是结论的哪一项：判定语、具名的数（key）、结果表的一格（row、column） */
-  cited?: { what?: 'phrase' | 'value' | 'cell' | string; key?: string; row?: number; column?: string; raw?: unknown; conv?: string }
+  /** 这一处引用的是结论的哪一项：判定语、具名的数（key）、结果表的一格（row、column；column_label 是结果表的列名，给人看的） */
+  cited?: {
+    what?: 'phrase' | 'value' | 'cell' | string
+    key?: string
+    row?: number
+    column?: string
+    column_label?: string | null
+    raw?: unknown
+    conv?: string
+  }
   rendered?: string
   render_ok?: boolean
   hash_ok?: boolean | null
@@ -2448,6 +2456,8 @@ export interface EvidenceAnalysisStep {
   verdict?: AnalysisVerdict | null
   caveats?: AnalysisCaveat[]
   hypothesis?: string
+  /** 「在验证什么」那一行的说法：谁写的照实说，服务端按台账条目给（Agent 写的假设 / 分析卡上写的『在验证什么』） */
+  hypothesis_label?: string
   hypothesis_note?: string
   note?: string
   // ---- analysis_method：方法、参数、实际用的阈值、现查结果 ----
@@ -2479,6 +2489,8 @@ export interface EvidenceAnalysisStep {
   row?: number
   column?: string
   value?: string | null
+  /** 那一格的值按服务端的规则渲染出来的字（render_cell：千分位、NULL 写「—」），和闭合核对里的写法一致 */
+  value_rendered?: string
   /** 输入落到报告目录的哪个 Q */
   query?: string | null
   sealed?: boolean
@@ -4589,7 +4601,6 @@ export interface RunCompareQuery {
   problem?: string
 }
 
-/** GET /runs/{id}/compare?base=。任一未封存或封存核对不一致 409；不是同一工作流、是同一次运行 422 */
 /** 运行对比里分析卡的一边（analysis.end 那一项）：没有这一项为 null */
 export interface RunCompareAnalysisSide {
   status?: string | null
@@ -4614,6 +4625,7 @@ export interface RunCompareAnalysis {
   change: 'same' | 'verdict' | 'phrase' | 'added' | 'removed' | string
 }
 
+/** GET /runs/{id}/compare?base=。任一未封存或封存核对不一致 409；不是同一工作流、是同一次运行 422 */
 export interface RunComparison {
   target: RunCompareRef
   base: RunCompareRef

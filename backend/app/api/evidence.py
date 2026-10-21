@@ -1015,8 +1015,12 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
 # 分析结论的出处链
 # --------------------------------------------------------------------------
 
-#: Agent 写的假设（hypothesis）旁边那句：它不是结论，只在证据面板显示（细案 01 §7.3）
-HYPOTHESIS_NOTE = "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+#: 「在验证什么」（hypothesis）旁边那句：它不是结论，只在证据面板显示（细案 01 §7.3）。谁写的照实说：Agent 现场做的
+#: （台账条目带 call_id）写「Agent 写的假设」，分析卡做的（带 item）是模板作者写的，写「分析卡上写的『在验证什么』」
+HYPOTHESIS_LABEL = "Agent 写的假设"
+HYPOTHESIS_NOTE = f"{HYPOTHESIS_LABEL}：说明这次在验证什么，不是分析结论，也不进报告正文"
+CARD_HYPOTHESIS_LABEL = "分析卡上写的『在验证什么』"
+CARD_HYPOTHESIS_NOTE = f"{CARD_HYPOTHESIS_LABEL}：模板作者写的那一句，不是分析结论，也不进报告正文"
 UNSEALED_ANALYSIS = "这份分析结论不属于封存范围内的任何事件（封存前的台账里没有它），不能作为证据展示"
 TAMPERED_ANALYSIS = "分析结论与哈希不一致，疑似被修改，不展示其中的判定和数"
 MISSING_ANALYSIS = "无法读取分析结论"
@@ -1063,7 +1067,10 @@ def _catalog_alias_of(catalog: dict[str, Any], artifact: Any) -> str | None:
 
 
 def _analysis_cited(cite: dict[str, Any], result: dict[str, Any] | None) -> dict[str, Any]:
-    """这一处引用的是结论的哪一项：判定语（phrase）、具名标量（value：键、原值、换算）、结果表的一格（cell：行、列、原值）。"""
+    """这一处引用的是结论的哪一项：判定语（phrase）、具名标量（value：键、原值、换算）、结果表的一格（cell：行、列、原值）。
+
+    结果表的列写给人看：column 是稳定的列 id（share、delta……，引用里就是这么写的），column_label 是结果表记的列名
+    （「占变化的比重」）；页面照原样显示 column_label，不把列 id 当叫法。"""
     locator = cite.get("locator") or {}
     if cite.get("kind") == "cell":
         row, column = locator.get("row"), locator.get("column")
@@ -1072,7 +1079,9 @@ def _analysis_cited(cite: dict[str, Any], result: dict[str, Any] | None) -> dict
         if table is not None:
             with contextlib.suppress(Exception):
                 raw, column = locate_cell(table, row, column)
-        return {"what": "cell", "row": row, "column": column, "raw": raw}
+        labels = (table or {}).get("labels") if isinstance((table or {}).get("labels"), dict) else {}
+        return {"what": "cell", "row": row, "column": column,
+                "column_label": str(labels.get(column) or column) if column is not None else None, "raw": raw}
     if locator.get("key"):
         values = (result or {}).get("values") if isinstance((result or {}).get("values"), dict) else {}
         return {"what": "value", "key": locator["key"], "raw": values.get(locator["key"]),
@@ -1104,11 +1113,13 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
     """分析结论的出处链（00-总方案 §3.3）：判定 → 方法 → 计算 → 输入 → 复算 → 封存。
 
     - 判定（analysis）：判定语、判定标准、判定码和点名的段、附带说明、算不了的原因，这一处引用的是哪一项（判定语、具名标量、
-      结果表的一格）；Agent 写的假设另列，标成「Agent 写的假设」（HYPOTHESIS_NOTE）
+      结果表的一格，列另写结果表记的列名 column_label）；「在验证什么」另列，谁写的照实标：Agent 现场做的写「Agent 写的假设」
+      （HYPOTHESIS_NOTE），分析卡做的写「分析卡上写的『在验证什么』」（CARD_HYPOTHESIS_NOTE，模板作者写的）
     - 方法（analysis_method）：方法与版本、规范化后的参数、实际用的阈值（只列这个算子用到的）、现查的表范围（probes）
     - 计算（analysis_calc）：结果表（前 table_top_k 段，加上被引用的那一行附近）、具名的数、关键数的代入式
       （evidence.analysis_formulas）
-    - 输入（analysis_input，每份一步）：落到报告目录的哪个 Q、用了哪些列和行、headline 那一格和结论里总数的闭合核对、
+    - 输入（analysis_input，每份一步）：落到报告目录的哪个 Q、用了哪些列和行、headline 那一格（值另由服务端渲染成 value_rendered，
+      和闭合核对同一个写法）和结论里总数的闭合核对、
       下钻的上一层是哪个 A；后面接上每份输入快照的查询步骤（只认封存范围内交回过的，遮罩照查询步骤的办法）
     - 复算（analysis_recompute）：按 sha256 取回封存的输入、用同一个函数复算，和封存的逐字段比（evidence.analysis_recheck）；
       方法升过版、复算不了都照实写
@@ -1154,7 +1165,11 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
         phrase=result.get("phrase"), criterion=result.get("criterion"), verdict=verdict,
         caveats=[{k: c.get(k) for k in ("code", "text")} for c in result.get("caveats") or [] if isinstance(c, dict)])
     if isinstance(result.get("hypothesis"), str) and result["hypothesis"].strip():
-        judged.update(hypothesis=result["hypothesis"], hypothesis_note=HYPOTHESIS_NOTE)
+        # 谁写的照实说：分析卡（台账条目带 item）是模板作者写的，Agent 工具（带 call_id）是现场写的
+        card = judged["origin"] == "card"
+        judged.update(hypothesis=result["hypothesis"],
+                      hypothesis_label=CARD_HYPOTHESIS_LABEL if card else HYPOTHESIS_LABEL,
+                      hypothesis_note=CARD_HYPOTHESIS_NOTE if card else HYPOTHESIS_NOTE)
     settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
     method = {
         "step": "analysis_method", "alias": alias, "method": result.get("method"),
@@ -1235,6 +1250,10 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
             "role_label": roles.get(role, role or "输入"), "artifact": artifact or None,
             **{k: item[k] for k in ("columns", "rows", "row", "column", "value") if k in item},
         }
+        # 那一格的值由服务端渲染（render_cell：千分位、NULL 写「—」，和闭合核对里的字同一个写法），页面照原样显示
+        if "value" in item:
+            with contextlib.suppress(RenderError):
+                step["value_rendered"] = render_cell(item.get("value"))
         if role == "parent":
             step["alias"] = _catalog_alias_of(catalog, artifact)
             parent, ok = _analysis_of(artifact)

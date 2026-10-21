@@ -748,7 +748,7 @@ await section('分析：Agent 的分析工具、分析卡的每一项一行，�
     && await page.locator('[data-step-kind="analysis"]:not([data-step-status="failed"]) svg.lucide-chart-column-stacked').count() === 5,
     String(await rows.count()))
   const line = async (i) => (await rows.nth(i).innerText().catch(() => '')).replace(/\s+/g, ' ')
-  check('做成的一行：标题写算子的叫法和编号，副标题是判定语', (await line(1)).includes('变化拆解（可加） · A1')
+  check('做成的一行：标题写算子的叫法和本节点的编号（报告目录里的编号另算），副标题是判定语', (await line(1)).includes('变化拆解（可加） · 本节点 A1')
     && (await line(1)).includes('主要来自华东（-300，占 88.2%）'), await line(1))
   check('……标题里不出现工具名 analysis_decompose', !(await page.locator('[data-turn]').first().innerText()).includes('analysis_decompose'))
   await rows.nth(1).locator('button').first().click()
@@ -790,7 +790,8 @@ await section('分析：Agent 的分析工具、分析卡的每一项一行，�
 
   const team = await open('syn=analysis-team', { w: 1100, h: 900 })
   const tl = (await team.page.locator('[data-step-kind="analysis"]').first().innerText().catch(() => '')).replace(/\s+/g, ' ')
-  check('协作成员的分析：编号是成员自己的，副标题接着写是谁调用的', tl.includes('变化拆解（可加） · A1') && tl.includes('分析员 调用'), tl)
+  check('协作成员的分析：不带编号（进不了台账，报告目录里的 A1 另算），副标题接着写是谁调用的', tl.includes('变化拆解（可加）') && !tl.includes('本节点 A1')
+    && tl.includes('分析员 调用'), tl)
   await team.page.close()
 })
 

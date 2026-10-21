@@ -5,7 +5,8 @@
 真的 recompute：按 sha256 取回封存的输入快照、下钻的上一层结论，逐字段比。只有要它出错、升版的几处用 monkeypatch。
 
 - 证据图：A1 条目带算子、判定；「派生自」的边 A1 → Q1
-- 片段接口：判定 → 方法 → 计算 → 输入（接查询步骤）→ 复算 → 封存；Agent 写的假设标出来；复算不了照实写，不让接口出错
+- 片段接口：判定 → 方法 → 计算 → 输入（接查询步骤）→ 复算 → 封存；「在验证什么」谁写的照实标（Agent 写的假设 / 分析卡上
+  写的『在验证什么』）；复算不了照实写，不让接口出错
 - 审计：分析判定、分析结论的叫法；分析说法核对的违规单列一行
 - 报告导出：数据块里有分析结论那几步；文档带「分析范围」的，正文后面渲染、编号点得开
 - 指标步骤带可比性：口径卡指标上的可比性结论（不进台账）照卡上记的 sha256 取回，点得开（判定 → … → 复算 → 封存）
@@ -135,7 +136,9 @@ async def test_the_phrase_opens_judgment_method_calculation_inputs_recompute_and
     assert judged["verdict"] == {"code": "driver", "subjects": [["华东"]], "direction": "down"}
     assert judged["cited"] == {"what": "phrase"} and judged["render_ok"] is True and judged["eid_ok"] is True
     assert judged["origin"] == "card" and judged["item"] == "drop" and judged["label"] == "分析"
-    assert judged["hypothesis"] == "华东拖累" and judged["hypothesis_note"].startswith("Agent 写的假设")
+    # 分析卡做的：模板作者写的「在验证什么」，不标成 Agent 写的假设
+    assert judged["hypothesis"] == "华东拖累" and judged["hypothesis_label"] == "分析卡上写的『在验证什么』"
+    assert judged["hypothesis_note"].startswith("分析卡上写的『在验证什么』")
     assert {c["code"] for c in judged["caveats"]} == {"measure_unlabeled", "headline_basis", "comparability"}
     assert method["method"] == "decompose.additive@1" and method["method_label"] == "变化拆解（可加）"
     assert {s["key"]: s["label"] for s in method["settings"]}["main_share"] == "「主要来源」的占比"
@@ -173,7 +176,8 @@ async def test_named_values_and_result_cells_point_at_what_they_cite(client):
 
     cell = (await client.get(
         f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'v:A1.r0.delta')}")).json()
-    assert cell["chain"][0]["cited"] == {"what": "cell", "row": 0, "column": "delta", "raw": "-120"}
+    assert cell["chain"][0]["cited"] == {"what": "cell", "row": 0, "column": "delta", "column_label": "变化",
+                                         "raw": "-120"}
     assert cell["chain"][2]["table"]["highlight"] == {"cells": [[0, "delta"]]}
     assert cell["note"] == "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写"
 
@@ -216,7 +220,9 @@ async def test_a_result_cell_rerenders_the_way_it_was_composed(client, monkeypat
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{segment['id']}")).json()
     judged = body["chain"][0]
     assert judged["rendered"] == shown and judged["render_ok"] is True
-    assert judged["cited"] == {"what": "cell", "row": 0, "column": by, "raw": snapshot["rows"][0][0]}
+    # column_label 是结果表记的列名：维度列照输入快照里的列名（store、slot），不另起叫法
+    assert judged["cited"] == {"what": "cell", "row": 0, "column": by, "column_label": by,
+                               "raw": snapshot["rows"][0][0]}
     # 导出页的数据块是同一条链
     data = data_block((await client.get(f"/api/runs/{made['run']}/report.html")).text)
     chain = data["chains"][data["refs"][segment["id"]]]
@@ -307,9 +313,12 @@ def test_suspicious_name_hints_do_not_read_the_analysis_results(monkeypatch):
 
 
 async def test_agent_analyses_are_marked_as_such(client):
+    """Agent 现场做的：谁做的写 Agent，「在验证什么」照旧标「Agent 写的假设」（分析卡上那一句是模板作者写的，另说）"""
     made = await sealed_run(TEXT, item=None, call_id="call-9")
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
-    assert body["chain"][0]["origin"] == "agent" and body["chain"][0]["call_id"] == "call-9"
+    judged = body["chain"][0]
+    assert judged["origin"] == "agent" and judged["call_id"] == "call-9"
+    assert judged["hypothesis_label"] == "Agent 写的假设" and judged["hypothesis_note"].startswith("Agent 写的假设")
 
 
 async def test_headline_inputs_show_the_closure(client):
@@ -329,6 +338,9 @@ async def test_headline_inputs_show_the_closure(client):
     assert inputs[1]["closure"] == {"mode": "additive", "total_key": "target_total", "total": "2,026",
                                     "headline": "2,026", "closed": True}
     assert [s["role_label"] for s in inputs[:2]] == ["基期总数", "本期总数"]
+    # 那一格的值服务端渲染好了（render_cell：千分位），和闭合核对里的字同一个写法；页面照原样显示
+    assert inputs[0]["value"] == "2220" and inputs[0]["value_rendered"] == "2,220"
+    assert inputs[1]["value"] == "2026" and inputs[1]["value_rendered"] == "2,026"
     assert inputs[1]["query"] == "Q2" and inputs[1]["sealed"] is True and inputs[2]["query"] == "Q1"
     assert next(s for s in body["chain"] if s["step"] == "analysis_recompute")["status"] == "same"
 

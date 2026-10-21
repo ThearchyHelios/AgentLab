@@ -8,7 +8,8 @@
  * 的数、说法违规的原话都是服务端写好的，界面照原样显示，不按判定码、原因码自己拼。规矩同 terms.ts 开头的术语表。
  *
  * 术语：一次分析的结果叫「分析结论」，编号 A1、A2……；系统写的那一句叫「判定语」；判定的依据叫「判定标准」；做不成的叫「没有做成」
- * （服务端判定语的写法），原因叫「算不了的原因」；写错的调用叫「调用有误」，不记成结论；Agent 写的那句叫「Agent 写的假设」。
+ * （服务端判定语的写法），原因叫「算不了的原因」；写错的调用叫「调用有误」，不记成结论；「这次在验证什么」那一句谁写的照实说：
+ * Agent 现场做的那句叫「Agent 写的假设」，分析卡上那条是模板作者写的，叫「分析卡上写的『在验证什么』」。
  */
 import { formatNumber } from './format'
 
@@ -221,8 +222,11 @@ export const ANALYSIS_TEXT = {
   step: {
     /** 运行中的状态字（store/chat） */
     running: (label: string) => `正在执行分析：${label}…`,
-    /** 一步的标题：「变化拆解（可加）· A1」；分析卡的一项：「变化拆解（可加）· where」 */
-    title: (method: string, alias?: string | null) => (alias ? `${method} · ${alias}` : method),
+    /** 分析卡的一项：「变化拆解（可加）· where」。标识是这一项在分析卡里的 id，不是报告目录里的编号 */
+    title: (method: string, item?: string | null) => (item ? `${method} · ${item}` : method),
+    /** Agent 工具那一步：「变化拆解（可加）· 本节点 A1」。编号是这份 Agent 自己的分析容器里的（交回模型的「【分析 A1】」），
+     *  报告目录里的 A1 按整次运行的台账编，两者不一定是同一个（图里还有分析卡时就不是） */
+    nodeTitle: (method: string, alias?: string | null) => (alias ? `${method} · 本节点 ${alias}` : method),
     callError: '调用有误，没有记成结论',
     callErrorNext: '这次调用没有记成结论，Agent 会按这条说明改正参数后重新调用',
     refused: '没有做成',
@@ -261,6 +265,7 @@ export const ANALYSIS_TEXT = {
     citedCell: (row: number, column: string) => `结果表第 ${formatNumber(row + 1)} 行「${column}」`,
     who: '谁做的',
     origin: { card: '分析卡（模板定好的分析）', agent: 'Agent 现场做的分析', metric: '口径卡执行时自动做的可比性检查' } as Record<string, string>,
+    /** 「在验证什么」那一行：服务端按谁写的给说法（Agent 写的是假设，分析卡上那一条是模板作者写的），照原样显示 */
     hypothesis: 'Agent 写的假设',
     refused: '这次分析没有做成',
     renderOk: '与按结论渲染的结果一致',

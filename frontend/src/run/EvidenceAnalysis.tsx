@@ -97,7 +97,8 @@ function JudgedPart({ step, recompute, seal, overall }: {
   const verdict = step.verdict && typeof step.verdict === 'object' ? step.verdict : null
   const cited = step.cited ?? {}
   const citedText = cited.what === 'value' ? E.citedValue(String(cited.key ?? ''))
-    : cited.what === 'cell' ? E.citedCell(Number(cited.row) || 0, String(cited.column ?? '')) : E.citedPhrase
+    // 结果表的格写列名（服务端照结果表记的 labels 给），不把列 id 当叫法；老接口没给列名的照旧写 id
+    : cited.what === 'cell' ? E.citedCell(Number(cited.row) || 0, String(cited.column_label || cited.column || '')) : E.citedPhrase
   const refused = step.status === 'refused'
   const trusted = !!overall?.sealed && overall.ok !== false
   const problems = [
@@ -135,7 +136,7 @@ function JudgedPart({ step, recompute, seal, overall }: {
               {step.caveats.map((c, i) => <li key={`${c.code ?? ''}-${i}`}>{c.text}</li>)}
             </ul>
           )] : null,
-          step.hypothesis ? [E.hypothesis, (
+          step.hypothesis ? [step.hypothesis_label || E.hypothesis, (
             <span key="h" data-ev-analysis-hypothesis="">
               {step.hypothesis}
               {step.hypothesis_note && <span className="mt-0.5 block text-2xs text-faint">{step.hypothesis_note}</span>}
@@ -267,7 +268,9 @@ function InputPart({ step, onQuery, trusted }: { step: EvidenceAnalysisStep; onQ
         rows ? [E.rowsUsed, rows] : null,
         'value' in step && !parent ? [ratio ? E.headlineRatio : E.headline, (
           <span key="v" className="tnum">
-            {step.column != null && typeof step.row === 'number' ? `${E.cellAt(step.row, step.column)} = ` : ''}{valueText(step.value)}
+            {step.column != null && typeof step.row === 'number' ? `${E.cellAt(step.row, step.column)} = ` : ''}
+            {/* 那一格的值服务端渲染好了（千分位、NULL 写「—」，和闭合核对同一个写法），照原样显示；老接口没给的按值本身写 */}
+            {step.value_rendered ?? valueText(step.value)}
           </span>
         )] : null,
         closure && closed ? [E.closure, (

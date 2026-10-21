@@ -739,13 +739,13 @@ export function analysisTeamRun(): RunEvent[] {
   ev('tool.end', 'team', { tool: 'analysis_decompose', agent: '分析员', call_id: 'm2', duration_ms: 8,
     preview: '{\n  "analysis_artifact": "a1f0", \n  "result": {\n    "op": "decompose",\n    "mode": "additive",\n    "method": "decompose.additive@1",',
     analysis_artifact: 'a1f0c3d2b4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9',
-    analysis: { alias: 'A1', op: 'decompose', mode: 'additive', status: 'ok', verdict: 'driver', direction: 'down', phrase: TEAM_PHRASE,
+    analysis: { alias: null, op: 'decompose', mode: 'additive', status: 'ok', verdict: 'driver', direction: 'down', phrase: TEAM_PHRASE,
                 reason_code: null } }, 0.01)
   ev('tool.start', 'team', { tool: 'analysis_baseline', agent: '分析员', call_id: 'm3', args: { query: 'Q1', period: 'week', measure: 'gmv' } }, 0.1)
   ev('tool.end', 'team', { tool: 'analysis_baseline', agent: '分析员', call_id: 'm3', duration_ms: 4,
     preview: '{\n  "analysis_artifact": "b2e1",',
     analysis_artifact: 'b2e1d4c3a5f6e70819203b4c5d6e7f8091a2b3c4d5e6f70819203b4c5d6e7f80',
-    analysis: { alias: 'A2', op: 'baseline', mode: null, status: 'refused', verdict: null, direction: null,
+    analysis: { alias: null, op: 'baseline', mode: null, status: 'refused', verdict: null, direction: null,
                 phrase: '波动基线没有做成：只有 0 期历史，至少要 8 期', reason_code: 'history_short' } }, 0.01)
   ev('log', 'team', { level: 'warn', code: 'analysis_refused', agent: '分析员', call_id: 'm3', tool: 'analysis_baseline',
     reason_code: 'history_short', reason: '只有 0 期历史，至少要 8 期', message: '分析员 的 analysis_baseline 没有做成：只有 0 期历史，至少要 8 期' })

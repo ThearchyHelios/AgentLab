@@ -423,7 +423,16 @@
      "op": "decompose",
      "rows": 4,
      "status": "ok",
-     "verdict": "driver"
+     "verdict": "driver",
+     "labels": {
+      "base": "基期",
+      "delta": "变化",
+      "flag": "说明",
+      "pct": "变化率",
+      "region": "地区",
+      "share": "占变化的比重",
+      "target": "本期"
+     }
     },
     "A2": {
      "alias": "A2",
@@ -460,7 +469,14 @@
      "op": "comparable",
      "rows": 5,
      "status": "ok",
-     "verdict": "comparable"
+     "verdict": "comparable",
+     "labels": {
+      "base": "基期",
+      "check": "检查项",
+      "note": "说明",
+      "status": "结果",
+      "target": "本期"
+     }
     },
     "Q1": {
      "alias": "Q1",
@@ -673,7 +689,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -897,7 +914,8 @@
        "total": "2,700",
        "headline": "2,700",
        "closed": true
-      }
+      },
+      "value_rendered": "2,700"
      },
      {
       "step": "analysis_input",
@@ -918,7 +936,8 @@
        "total": "2,360",
        "headline": "2,360",
        "closed": true
-      }
+      },
+      "value_rendered": "2,360"
      },
      {
       "step": "analysis_input",
@@ -1300,7 +1319,8 @@
        "what": "cell",
        "row": 0,
        "column": "delta",
-       "raw": "-300"
+       "raw": "-300",
+       "column_label": "变化"
       },
       "rendered": "-300",
       "render_ok": true,
@@ -1326,7 +1346,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -1555,7 +1576,8 @@
        "total": "2,700",
        "headline": "2,700",
        "closed": true
-      }
+      },
+      "value_rendered": "2,700"
      },
      {
       "step": "analysis_input",
@@ -1576,7 +1598,8 @@
        "total": "2,360",
        "headline": "2,360",
        "closed": true
-      }
+      },
+      "value_rendered": "2,360"
      },
      {
       "step": "analysis_input",
@@ -1984,7 +2007,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -2209,7 +2233,8 @@
        "total": "2,700",
        "headline": "2,700",
        "closed": true
-      }
+      },
+      "value_rendered": "2,700"
      },
      {
       "step": "analysis_input",
@@ -2230,7 +2255,8 @@
        "total": "2,360",
        "headline": "2,360",
        "closed": true
-      }
+      },
+      "value_rendered": "2,360"
      },
      {
       "step": "analysis_input",
@@ -3280,7 +3306,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -3504,7 +3531,8 @@
        "total": "2,700",
        "headline": "2,700",
        "closed": true
-      }
+      },
+      "value_rendered": "2,700"
      },
      {
       "step": "analysis_input",
@@ -3525,7 +3553,8 @@
        "total": "2,360",
        "headline": "2,360",
        "closed": true
-      }
+      },
+      "value_rendered": "2,360"
      },
      {
       "step": "analysis_input",
@@ -3871,7 +3900,8 @@
       "verdict": null,
       "caveats": [],
       "hypothesis": "这周的下降算不算异常",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -4075,7 +4105,8 @@
       },
       "caveats": [],
       "hypothesis": "两周能不能直接比",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文",
+      "hypothesis_label": "Agent 写的假设"
      },
      {
       "step": "analysis_method",
@@ -5028,7 +5059,16 @@
      "op": "decompose",
      "rows": 4,
      "status": "ok",
-     "verdict": "driver"
+     "verdict": "driver",
+     "labels": {
+      "base": "基期",
+      "delta": "变化",
+      "flag": "说明",
+      "pct": "变化率",
+      "region": "地区",
+      "share": "占变化的比重",
+      "target": "本期"
+     }
     },
     "Q1": {
      "alias": "Q1",
@@ -5189,7 +5229,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "分析卡上写的『在验证什么』：模板作者写的那一句，不是分析结论，也不进报告正文",
+      "hypothesis_label": "分析卡上写的『在验证什么』"
      },
      {
       "step": "analysis_method",
@@ -5413,7 +5454,8 @@
        "total": "2,700",
        "headline": "2,700",
        "closed": true
-      }
+      },
+      "value_rendered": "2,700"
      },
      {
       "step": "analysis_input",
@@ -5434,7 +5476,8 @@
        "total": "2,360",
        "headline": "2,360",
        "closed": true
-      }
+      },
+      "value_rendered": "2,360"
      },
      {
       "step": "analysis_input",
@@ -6056,7 +6099,8 @@
        "what": "cell",
        "row": 0,
        "column": "delta",
-       "raw": "-300"
+       "raw": "-300",
+       "column_label": "变化"
       },
       "rendered": "-300",
       "render_ok": true,
@@ -6082,7 +6126,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "分析卡上写的『在验证什么』：模板作者写的那一句，不是分析结论，也不进报告正文",
+      "hypothesis_label": "分析卡上写的『在验证什么』"
      },
      {
       "step": "analysis_method",
@@ -6311,7 +6356,8 @@
        "total": "2,700",
        "headline": "2,700",
        "closed": true
-      }
+      },
+      "value_rendered": "2,700"
      },
      {
       "step": "analysis_input",
@@ -6332,7 +6378,8 @@
        "total": "2,360",
        "headline": "2,360",
        "closed": true
-      }
+      },
+      "value_rendered": "2,360"
      },
      {
       "step": "analysis_input",
@@ -6714,7 +6761,8 @@
        "what": "cell",
        "row": 0,
        "column": "delta",
-       "raw": "-300"
+       "raw": "-300",
+       "column_label": "变化"
       },
       "rendered": "-300",
       "render_ok": true,
@@ -6740,7 +6788,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "分析卡上写的『在验证什么』：模板作者写的那一句，不是分析结论，也不进报告正文",
+      "hypothesis_label": "分析卡上写的『在验证什么』"
      },
      {
       "step": "analysis_method",
@@ -6969,7 +7018,8 @@
        "total": "2,700",
        "headline": "2,700",
        "closed": true
-      }
+      },
+      "value_rendered": "2,700"
      },
      {
       "step": "analysis_input",
@@ -6990,7 +7040,8 @@
        "total": "2,360",
        "headline": "2,360",
        "closed": true
-      }
+      },
+      "value_rendered": "2,360"
      },
      {
       "step": "analysis_input",
@@ -7924,7 +7975,8 @@
        }
       ],
       "hypothesis": "下降是不是集中在某个地区",
-      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+      "hypothesis_note": "分析卡上写的『在验证什么』：模板作者写的那一句，不是分析结论，也不进报告正文",
+      "hypothesis_label": "分析卡上写的『在验证什么』"
      },
      {
       "step": "analysis_method",
@@ -8148,7 +8200,8 @@
        "total": "2,700",
        "headline": "2,700",
        "closed": true
-      }
+      },
+      "value_rendered": "2,700"
      },
      {
       "step": "analysis_input",
@@ -8169,7 +8222,8 @@
        "total": "2,360",
        "headline": "2,360",
        "closed": true
-      }
+      },
+      "value_rendered": "2,360"
      },
      {
       "step": "analysis_input",

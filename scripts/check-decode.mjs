@@ -127,17 +127,17 @@ await section('分析：Agent 的分析工具、分析卡的每一项', async ()
     && wrong.sub === '调用有误，没有记成结论' && !!wrong.next?.includes('Agent 会按这条说明改正参数'), `${wrong?.status} ${wrong?.sub}`)
   check('……服务端的原话留在展开区，调用错误的代码记在这一行', !!wrong?.result?.includes('Q2 里没有「sales」这一列')
     && wrong.analysis?.callError === 'unknown_column', wrong?.result)
-  check('做成的：标题接上本节点的编号（A1，和交回模型的「【分析 A1】」同一个）', decompose?.title === '变化拆解（可加） · A1', decompose?.title)
+  check('做成的：标题接上本节点的编号（A1，和交回模型的「【分析 A1】」同一个）', decompose?.title === '变化拆解（可加） · 本节点 A1', decompose?.title)
   check('……副标题是服务端渲染的判定语', decompose?.sub === '销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）', decompose?.sub)
   check('……结论工件可下钻，Agent 写的假设另记、不进参数', !!decompose?.artifact && decompose.analysis?.hypothesis === '下降是不是集中在某个地区'
     && !decompose.detail?.includes('hypothesis') && !decompose.detail?.includes('null'), decompose?.detail?.slice(0, 80))
   check('……preview（结论 JSON 的前一截）不摆出来', !decompose?.result, decompose?.result?.slice(0, 40))
   check('算不了的：一条结论（不是失败），提醒色，判定语就是「…没有做成：原因」', baseline?.status === 'done' && baseline.level === 'warn'
-    && baseline.title === '波动基线 · A2' && baseline.sub === '波动基线没有做成：只有 0 期历史，至少要 8 期', `${baseline?.title} ${baseline?.sub}`)
+    && baseline.title === '波动基线 · 本节点 A2' && baseline.sub === '波动基线没有做成：只有 0 期历史，至少要 8 期', `${baseline?.title} ${baseline?.sub}`)
   check('……下一步说能照实写原因、不能据此下判断', !!baseline?.next?.includes('算不了也是一条结论'))
   check('……紧跟着的「没有做成」提醒折进这一行，不另起一行', !all.some((s) => s.code === 'analysis_refused'),
     all.filter((s) => s.code === 'analysis_refused').map((s) => s.title).join(' | '))
-  check('可比性检查也有编号和判定语', comparable?.title === '可比性检查 · A3' && !!comparable.sub?.startsWith('两期可比'), comparable?.title)
+  check('可比性检查也有编号和判定语', comparable?.title === '可比性检查 · 本节点 A3' && !!comparable.sub?.startsWith('两期可比'), comparable?.title)
   check('分析那几行是正常的子步骤：不当成运行出错（运行照样完成）', all.some((s) => s.kind === 'lifecycle' && s.title === '完成'))
   const claims = all.find((s) => s.code === 'report_analysis_claims')
   check('报告的分析说法重写后仍有：说成人话（几处、已在报告中标注），副标题点名判断词', claims?.title === '报告有 3 处分析说法未通过核对，已在报告中标注'
@@ -170,8 +170,8 @@ await section('分析：Agent 的分析工具、分析卡的每一项', async ()
 
   // 协作成员的分析：编号是成员自己的，副标题接着写是谁调用的
   const team = flatten(mod.decodeRun(synthetic.analysisTeamRun(), { status: 'succeeded' })).filter((s) => s.kind === 'analysis')
-  check('协作成员调分析工具：编号是成员自己的，副标题写判定语和谁调用的', team[0]?.title === '变化拆解（可加） · A1'
-    && team[0].sub === `${synthetic.TEAM_PHRASE} · 分析员 调用` && team[1]?.title === '波动基线 · A2', team.map((s) => `${s.title}：${s.sub}`).join(' | '))
+  check('协作成员调分析工具：不带编号（成员容器里的 A1 不是报告目录里的），副标题写判定语和谁调用的', team[0]?.title === '变化拆解（可加）'
+    && team[0].sub === `${synthetic.TEAM_PHRASE} · 分析员 调用` && team[1]?.title === '波动基线', team.map((s) => `${s.title}：${s.sub}`).join(' | '))
 })
 
 await section('合并查询', async () => {
