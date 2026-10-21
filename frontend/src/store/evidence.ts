@@ -94,6 +94,9 @@ interface EvidenceState {
 export const docKey = (runId: string, report?: string) => `${runId}@${report ?? ''}`
 export const askKey = (runId: string, report: string | undefined, unit: string) => `${docKey(runId, report)}:${unit}`
 
+/** 分析范围里一个编号的片段 id 前缀（证据面板拼的「scope:A1」，不在正文里；同服务端导出页的 SCOPE_REF） */
+export const SCOPE_SEG = 'scope:'
+
 /**
  * 片段的缓存键：`runId:segId`。一次运行里有好几份报告时片段 id 会撞（每份都从 s0 数起），
  * 带上报告节点：`runId:segId@report`
@@ -159,8 +162,15 @@ export const useEvidence = create<EvidenceState>((set, get) => {
     }),
     loadGraph: (runId) => fill('graphs', runId, () => api.evidence.graph(runId)),
     reloadGraph: (runId) => fill('graphs', runId, () => api.evidence.graph(runId), true),
+    // 分析范围里的编号（片段 id「scope:A1」，证据面板拼的，不在正文里）：取那份分析结论的出处链，按片段答复的样子放进同一张表
     loadSegment: (runId, segmentId, report) =>
-      fill('segments', segmentKey(runId, segmentId, report), () => api.evidence.segment(runId, segmentId, { report })),
+      fill('segments', segmentKey(runId, segmentId, report), () => (segmentId.startsWith(SCOPE_SEG)
+        ? api.evidence.analysis(runId, segmentId.slice(SCOPE_SEG.length), { report }).then((r) => ({
+          report: r.report, chain: r.chain ?? [], seal: r.seal, redacted: r.redacted,
+          // 不带 text：范围里的这一项写的是文档自己记着的判定语，正文这份是不是封存的那一份按工件 id 认
+          segment: { id: segmentId, kind: 'analysis' },
+        }))
+        : api.evidence.segment(runId, segmentId, { report }))),
     // 最近一次运行 → 它封存范围内的报告核对（report.checked）。审计接口的 reports 带着结论句策略（claims，
     // 章上「无证据」要不要算没挂依据的结论句靠它）；只要 reports，所以只取最小的「可疑实体」那一组行。
     // 老后端没有审计接口时退回证据图（没有 claims，没挂依据的结论句不计入）。没有运行、没有报告都是空表，不画章

@@ -2135,7 +2135,8 @@ export interface EvidenceGraph {
               challenge_verdicts?: EvidenceChallengeVerdicts }[]
   evidence?: { alias?: string; eid?: string; kind?: string; label?: string; node_id?: string; artifact?: string
                sealed?: boolean; cited_by?: string[]; report?: string }[]
-  edges?: { from: string; to: string; rel: string }[]
+  /** cites（片段 → 证据）、supports（句子 → 依据）、derived_from（分析结论 → 它的输入 Q、下钻的上一层 A）；report 是哪份报告的边 */
+  edges?: { from: string; to: string; rel: string; report?: string }[]
 }
 
 /**

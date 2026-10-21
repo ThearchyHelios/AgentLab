@@ -6,6 +6,7 @@
  */
 
 import type { Approval, Run, RunStatus, RunUsage } from '../../types'
+import { ANALYSIS_TEXT, analysisMethodLabel } from '../../lib/termsAnalysis'
 import {
   RUN_STATUS_ORDER, STATUS, resolveStatus, serverStatusOf, type StatusCode,
 } from '../../lib/status'
@@ -341,6 +342,7 @@ export const ARTIFACT_KIND_LABEL: Record<string, string> = {
   challenge: '反方审稿记录',
   inquiry_answer: INQUIRY_TEXT.artifactKind,
   metric_input: RUN_ARTIFACTS_TEXT.kindMetricInput,
+  analysis_result: ANALYSIS_TEXT.evidence.title,
 }
 export const artifactKindLabel = (kind: string): string => ARTIFACT_KIND_LABEL[kind] ?? kind
 
@@ -355,6 +357,10 @@ export function artifactDescription(kind: string, meta?: Record<string, any> | n
     case 'metric_set': return meta?.caliber
       ? `口径卡「${meta.caliber}」${meta.version ?? ''}` : '口径卡的指标、算式和输入'
     case 'report_doc': return '报告：逐段的片段和每个数字的出处'
+    // 一份分析结论（工件行的 meta 里有 {op, status}）：哪一种分析，没有做成的照实写
+    case 'analysis_result': return meta?.op
+      ? `${analysisMethodLabel(meta.op)}${meta.status === 'refused' ? `（${ANALYSIS_TEXT.step.refused}）` : ''}`
+      : ANALYSIS_TEXT.artifactHint
     // 查库时冻结的表结构（工件行的 meta 里有 {source, tables: 表数量}）：报告里的表名、字段名按它核对
     case 'schema_snapshot': return meta?.source
       ? `表结构：数据源「${meta.source}」${typeof meta.tables === 'number' ? ` · ${meta.tables} 张表` : ''}` : '查询时保存的表结构'

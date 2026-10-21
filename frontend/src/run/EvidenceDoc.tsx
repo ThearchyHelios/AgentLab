@@ -1,7 +1,7 @@
 import {
   Fragment, forwardRef, memo, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo,
   useRef, useState, type CSSProperties, type FocusEvent as ReactFocusEvent,
-  type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type RefObject,
+  type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject,
 } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -10,10 +10,12 @@ import {
 import clsx from 'clsx'
 import { rovingTarget } from '../components/ui'
 import {
-  EVIDENCE_STATE, alertTier, claimCounts, claimLabel, claimProblems, conflicting, docTally, segmentKind, segmentLabel,
-  segmentState, tallySummary, unitText, isJudged, limitOf, unitVerdict, verdictMissing, verdictState, withVerdicts,
+  EVIDENCE_STATE, alertTier, claimCounts, claimLabel, claimProblems, codePointIndex, conflicting, docTally, segmentKind,
+  segmentLabel, segmentState, tallySummary, unitText, isJudged, limitOf, unitVerdict, verdictMissing, verdictState, withVerdicts,
   type EvidenceStateCode, type EvidenceTally as Tally,
 } from '../lib/evidence'
+import { ANALYSIS_TEXT } from '../lib/termsAnalysis'
+import { ScopeSection, isClaimViolation } from './EvidenceAnalysis'
 import { formatNumber } from '../lib/format'
 import {
   CHALLENGE_TEXT, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, INQUIRY_TEXT, JUDGE_TEXT, LEDGER_TEXT, claimTally, evidenceTally,
@@ -54,6 +56,11 @@ import { BlockView, Markdown, StyledSlice, inlineStyles, numericColumns, type In
  * 口径账本（next-round 02 做法 3）：来自口径的数字后面挂一个小标记，写明受管还是已发布（悬停写是哪一份口径、怎么认的）；
  * 相关口径的数不加标记，只在证据面板的「口径」一步里说。标签按运行另取（GET /runs/{id}/ledger，store/ledger 按退避
  * 等比对出结果），正式运行、没有运行的文档不取。
+ *
+ * 分析能力一轮：判定语（[[a:A1]]）是一个系统渲染的片段，和数字一样画「有出处」、点得开（证据面板的分析一步）。说法违规
+ * （判断词未挂分析结论、判断与分析结论不符、因果说法没有依据，文档的 violations 按 unit / segment / span 给）标在正文上：判断词
+ * 那几个字画琥珀色波浪线，那段文字是一个可点的片段，句末挂「说法待核」，n / N 跳得到；点开看服务端的原话和所挂的结论。正文
+ * 后面是系统写的「分析范围」（文档的 analysis_scope），编号点得开。
  *
  * 长报告：事件都挂在容器上（片段只带 data-seg），块用 memo，外加
  * content-visibility: auto；超过 TEXT_CAP 的部分先折叠，跳转到折叠里的片段时自动展开。
@@ -125,8 +132,47 @@ interface Model {
   grid: Map<string, string>
 }
 
+/**
+ * 说法违规落在哪段文字上：片段 id → 违规的种类、判断词在这段文字里的位置（UTF-16 下标，[起, 止)）。服务端的 span 是全文的码点
+ * 位置，片段自己的 span 也是，相减后按码点换成下标；没给 span 的整段都算。只认说法违规（isClaimViolation）、能落到一段非结构
+ * 片段上的
+ */
+type ClaimMarks = Map<string, { codes: string[]; ranges: [number, number][] }>
+
+export function claimMarksOf(doc: EvidenceDocData): ClaimMarks {
+  const out: ClaimMarks = new Map()
+  const list = (doc.violations ?? []).filter((v) => isClaimViolation(v) && v.segment)
+  if (!list.length) return out
+  const segs = new Map<string, EvidenceSegment>()
+  for (const b of doc.blocks ?? []) for (const u of b.units ?? []) for (const sg of u.segments ?? []) segs.set(sg.id, sg)
+  for (const v of list) {
+    const seg = segs.get(v.segment!)
+    if (!seg || seg.kind === 'structural' || segmentState(seg)) continue
+    const mark = out.get(seg.id) ?? { codes: [], ranges: [] }
+    if (!mark.codes.includes(v.code)) mark.codes.push(v.code)
+    const at = codePointIndex(seg.text)
+    const from = v.span && seg.span ? v.span[0] - seg.span[0] : 0
+    const to = v.span && seg.span ? v.span[1] - seg.span[0] : Infinity
+    const a = Math.max(0, Math.min(seg.text.length, at(Math.max(0, from))))
+    const z = Math.max(a, Math.min(seg.text.length, to === Infinity ? seg.text.length : at(Math.max(0, to))))
+    if (z > a) mark.ranges.push([a, z])
+    out.set(seg.id, mark)
+  }
+  for (const m of out.values()) {
+    // 有重叠的合在一起；一处位置都没认出来的整段画线
+    m.ranges.sort((x, y) => x[0] - y[0])
+    m.ranges = m.ranges.reduce<[number, number][]>((acc, r) => {
+      const last = acc[acc.length - 1]
+      if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1])
+      else acc.push([...r])
+      return acc
+    }, [])
+  }
+  return out
+}
+
 function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVerdict>, ask = false,
-  marks?: Record<string, string>): Model {
+  marks?: Record<string, string>, claims?: ClaimMarks): Model {
   const order: string[] = []
   const index = new Map<string, number>()
   const seg = new Map<string, { seg: EvidenceSegment; unit: EvidenceUnit; block: number }>()
@@ -146,13 +192,15 @@ function buildModel(blocks: EvidenceBlock[], overlay?: Record<string, EvidenceVe
       for (const s of unit.segments ?? []) {
         if (s.kind !== 'structural') total += s.text.length
         const state = segmentState(s)
-        if (!state) continue
+        // 说法违规落在的那段文字：本身没有状态，也进键盘顺序，算第 1 轮的问题（n / N 跳得到）
+        const claimed = !state && !!claims?.has(s.id)
+        if (!state && !claimed) continue
         seg.set(s.id, { seg: s, unit, block: b })
         index.set(s.id, order.length)
         order.push(s.id)
         if (first) { unitFirst.push(s.id); first = false }
         unitOf.set(s.id, unitFirst.length - 1)
-        const t = alertTier(state)
+        const t = claimed ? 1 : alertTier(state)
         if (t) tiered.push([s.id, t])
         if (loc) {
           cell.set(s.id, { block: b, row: loc.row, col: loc.col })
@@ -377,7 +425,9 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
   const graph = useRunGraph(runId, report, artifact, settled)
   // 被反方审过的句子：句末挂标记（和裁判的判定并在一个徽标里），点开是整句面板
   const marks = useMemo(() => challengeMarks(graph, report, artifact), [graph, report, artifact])
-  const model = useMemo(() => buildModel(blocks, overlay, ask, marks), [blocks, overlay, ask, marks])
+  // 说法违规标在正文上：判断词画线、那段文字可点（文档的 violations，服务端核出来的）
+  const claimMarks = useMemo(() => claimMarksOf(doc), [doc])
+  const model = useMemo(() => buildModel(blocks, overlay, ask, marks, claimMarks), [blocks, overlay, ask, marks, claimMarks])
   // 来自口径的数字上的小标记：按运行取的口径账本里这份报告的标签（只画 caliber 一种）
   const ledger = useRunLedger(runId, ledgerEnabled(runId, runClass))
   const labels = report ? ledger?.data?.reports?.[report]?.labels : undefined
@@ -478,8 +528,28 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
     setAnnounce(`${EVIDENCE_TEXT.violations}：${formatNumber(doc.violations?.length ?? 0)} 条`)
   }, [claim, instance, doc])
 
+  /**
+   * 打开一份分析结论：分析范围里的编号、说法违规里所挂的结论。正文引用了它的判定语就落到那个片段（看得到上下文），没引用的打开
+   * 它自己的出处链（分析范围那一项）
+   */
+  const openAnalysis = useCallback((alias: string, opts?: { scope?: boolean }) => {
+    const phrase = !opts?.scope
+      ? [...model.seg.values()].find((x) => x.seg.kind === 'analysis' && x.seg.cite?.alias === alias && !x.seg.cite?.locator?.key)
+      : undefined
+    if (phrase) {
+      focusSeg(phrase.seg.id, { flash: true })
+      openSeg(phrase.seg.id)
+      return
+    }
+    if (doc.catalog?.[alias]?.kind !== 'analysis') return
+    claim(instance)
+    setView({ kind: 'scope', alias })
+    setAnnounce(`${ANALYSIS_TEXT.evidence.title} ${alias}`)
+  }, [model, doc, focusSeg, openSeg, claim, instance])
+
   const close = useCallback((refocus = true) => {
-    const back = view?.kind === 'seg' ? view.id : view?.kind === 'unit' ? badgeKey(view.id) : current
+    const back = view?.kind === 'seg' ? view.id : view?.kind === 'unit' ? badgeKey(view.id)
+      : view?.kind === 'scope' ? `scope:${view.alias}` : current
     setView(null)
     setAnnounce('')
     if (refocus && back) requestAnimationFrame(() => segEl(back)?.focus())
@@ -616,6 +686,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
       onClose={() => close()}
       onLocate={(id) => { focusSeg(id, { flash: true }); openSeg(id) }}
       onViolations={openViolations}
+      onAnalysis={(alias) => openAnalysis(alias)}
     />
   )
 
@@ -676,7 +747,7 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
             <DocBlock block={block} dense={dense} doc={doc} visual={visual}
                       current={b === currentBlock ? current : null}
                       active={b === activeBlock ? activeSeg : null}
-                      panelId={panelId} model={model} ask={ask} calibers={caliberMarks} />
+                      panelId={panelId} model={model} ask={ask} calibers={caliberMarks} claims={claimMarks} />
             {mode === 'inline' && b === activeBlock && panelNode}
           </Fragment>
         ))}
@@ -695,6 +766,11 @@ export const EvidenceDoc = forwardRef<EvidenceDocHandle, {
           <button type="button" className="text-[var(--accent)] hover:underline" onClick={() => setExpanded(false)}>收起</button>
         </div>
       )}
+      {doc.analysis_scope && (
+        // 系统写的「分析范围」：不是写作者写的，随报告封存（不进正文、不过核对）；编号点得开
+        <ScopeSection scope={doc.analysis_scope} onOpen={(alias) => openAnalysis(alias, { scope: true })} />
+      )}
+      {mode === 'inline' && view?.kind === 'scope' && panelNode}
       {mode === 'dock' && panelNode && dock && createPortal(panelNode, dock)}
       {mode !== 'inline' && mode !== 'dock' && panelNode && createPortal(panelNode, document.body)}
     </div>
@@ -890,10 +966,12 @@ export function ClaimTally({ claims, lead }: { claims: ClaimTallyCounts; lead: b
 /** 列表项的开头：结构片段里带着行首的 - / 1. 。列表项被分成几句时，后面几句接在同一项里 */
 const ITEM_START = /(^|\n)[ \t]*([-*+]|\d+[.)])[ \t]+$/
 
-const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, active, panelId, model, ask, calibers }: {
+const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, active, panelId, model, ask, calibers, claims }: {
   block: EvidenceBlock
   /** 来自口径的数字：片段 id → 小标记（口径账本） */
   calibers?: CaliberMarks
+  /** 说法违规落在的文字：片段 id → 判断词的位置 */
+  claims?: ClaimMarks
   dense: boolean
   doc: EvidenceDocData
   /** 句末徽标从这里取：这一句眼下的判定（封存后追加的盖过文档里的） */
@@ -918,7 +996,7 @@ const DocBlock = memo(function DocBlock({ block, dense, doc, visual, current, ac
   }
   const unit = (u: EvidenceUnit, opts?: { code?: boolean; tag?: boolean }) => (
     <UnitView key={u.id} unit={u} doc={doc} current={current} active={active} panelId={panelId}
-              code={opts?.code} tag={opts?.tag ?? true} badge={model.badge.get(badgeKey(u.id))} calibers={calibers}
+              code={opts?.code} tag={opts?.tag ?? true} badge={model.badge.get(badgeKey(u.id))} calibers={calibers} claims={claims}
               ask={ask && askable(u, block) ? (model.ask.has(askKey(u.id)) ? 'roving' : 'follow') : undefined} />
   )
 
@@ -1047,10 +1125,11 @@ function ChallengeMark({ verdict, look, after }: { verdict: string; look: MarkLo
  * 一枚徽标（也是按钮），证据相矛盾（和旧的证据不支持）的整句铺浅底——字本身不画线。被反方审过的
  * 句子同样挂徽标（和判定并在一起），点开都是整句面板
  */
-function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask, calibers }: {
+function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask, calibers, claims }: {
   unit: EvidenceUnit; doc: EvidenceDocData; current: string | null; active: string | null; panelId: string
   code?: boolean; tag: boolean; badge?: Badge
   calibers?: CaliberMarks
+  claims?: ClaimMarks
   /**
    * 审批质询的「质询」：roving 是这一句一个可点的都没有，「质询」本身进键盘顺序；follow 跟在这一句后面，焦点在这一句上时
    * 按 Tab 到达
@@ -1062,6 +1141,7 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask, 
   const styles = useMemo<InlineStyles | null>(() => (code ? null : inlineStyles(text)), [text, code])
   let pos = 0
   const alerts = new Set<EvidenceStateCode>()
+  let claimTag = false
   const nodes = segs.map((s) => {
     const from = pos
     pos += s.text.length
@@ -1069,6 +1149,32 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask, 
     const body = styles
       ? <StyledSlice text={text} styles={styles} from={from} to={pos} links={!state} />
       : s.text
+    const claimed = !state ? claims?.get(s.id) : undefined
+    if (claimed) {
+      // 说法违规：判断词画琥珀色波浪线，整段文字是一个可点的片段（点开看服务端的原话），句末挂「说法待核」
+      claimTag = true
+      const slice = (a: number, z: number) => (styles
+        ? <StyledSlice text={text} styles={styles} from={from + a} to={from + z} links={false} /> : s.text.slice(a, z))
+      const parts: ReactNode[] = []
+      let at = 0
+      claimed.ranges.forEach(([a, z], k) => {
+        if (a > at) parts.push(<Fragment key={`t${k}`}>{slice(at, a)}</Fragment>)
+        parts.push(<span key={`w${k}`} className="ev-claim-word" data-ev-claim-word="">{slice(a, z)}</span>)
+        at = z
+      })
+      if (at < s.text.length) parts.push(<Fragment key="rest">{slice(at, s.text.length)}</Fragment>)
+      const open = active === s.id
+      const labels = claimed.codes.map((c) => ANALYSIS_TEXT.claim.label[c] ?? c).join('、')
+      return (
+        <button key={s.id} type="button" className="ev-seg" data-seg={s.id} data-ev-state="claim"
+                data-ev-claim-issue={claimed.codes.join(' ')} tabIndex={current === s.id ? 0 : -1}
+                aria-label={`${s.text}，${ANALYSIS_TEXT.claim.tag}：${labels}`} aria-expanded={open}
+                aria-controls={open ? panelId : undefined} title={ANALYSIS_TEXT.claim.hint}
+                style={{ '--ev-soft': 'var(--st-waiting-soft)' } as CSSProperties}>
+          {s.strong ? <strong className="font-semibold">{parts}</strong> : parts}
+        </button>
+      )
+    }
     if (!state) return <span key={s.id}>{s.strong ? <strong className="font-semibold">{body}</strong> : body}</span>
     const meta = EVIDENCE_STATE[state]
     if (meta.alert && TAG_TEXT[state]) alerts.add(state)
@@ -1133,6 +1239,11 @@ function UnitView({ unit, doc, current, active, panelId, code, tag, badge, ask, 
           {EVIDENCE_STATE[state].glyph}{TAG_TEXT[state]}
         </span>
       ))}
+      {tag && claimTag && (
+        <span className="ev-tag" aria-hidden="true" title={ANALYSIS_TEXT.claim.hint} data-ev-tag="claim">
+          ?{ANALYSIS_TEXT.claim.tag}
+        </span>
+      )}
       {badge && (meta || look) && (
         <button
           type="button"

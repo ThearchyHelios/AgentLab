@@ -140,8 +140,6 @@ export function settingValueProblem(key: AnalysisSettingKey, raw: string): strin
   return null
 }
 
-const short = (text: string, n = 24) => (text.length > n ? `${text.slice(0, n - 1)}…` : text)
-
 export const ANALYSIS_TEXT = {
   /** 记录页工件清单里分析结论那一行的说明（工件没记算子时） */
   artifactHint: '分析结论：判定、方法、计算、输入和复算所需的一切',
@@ -301,6 +299,8 @@ export const ANALYSIS_TEXT = {
     parent: '下钻自',
     gotoInput: (alias: string) => `查看输入 ${alias}`,
     inputOfAnalysis: (alias: string) => `分析结论 ${alias} 的输入`,
+    /** 整句面板「挂的依据」里一份分析结论派生自谁（证据图的 derived_from 边） */
+    derivedFrom: (aliases: string[]) => `派生自 ${aliases.join('、')}`,
     recompute: '复算',
     seal: '封存',
     artifact: '结论工件',
@@ -387,5 +387,3 @@ export const ANALYSIS_TEXT = {
     item: (title: string, item: string) => `${title} · ${item}`,
   },
 }
-
-export const shortPhrase = short

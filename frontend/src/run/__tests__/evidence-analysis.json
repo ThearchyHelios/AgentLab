@@ -1,0 +1,9456 @@
+{
+ "_comment": "分析能力一轮（W2-c）证据面板、正文的前端夹具：/tmp/agentlab-fix/w2c/test_zz_w2c_capture.py 生成（照 backend/tests/test_analysis_e2e_claims.py 的虚构零售库 shop，数据目录标了地区、渠道是属性；Agent、写作模型都换成脚本）。agent：Agent 查两次库、写错一次变化拆解、做变化拆解（A1 主要来自华东）、波动基线（A2 两周历史不够，算不了）、可比性检查（A3），报告引用 A1 的判定语、结果表的一格、具名的数，另有三句说法违规（主要来自华南、异常、由于），文档末尾系统写的分析范围；card：分析卡两项（A1 波动基线算不了、A2 按地区拆解），报告里有一张表引用结果表的格；metric：口径卡的环比用到两份同形查询，指标上挂着可比性。片段接口、证据图、审计、分析范围里每个编号的出处链（GET …/evidence/analyses/{alias}）都是真后端答的。只用通用名",
+ "agent": {
+  "run_id": "ed3de345aac143089fb3d0777d9056ec",
+  "run_class": "exploratory",
+  "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389",
+  "doc": {
+   "analysis_claims": {
+    "lexicon": 1,
+    "mode": "check"
+   },
+   "analysis_scope": {
+    "corrected": null,
+    "decomposed": [
+     {
+      "alias": "A1",
+      "dims": [
+       "地区"
+      ],
+      "mode": "additive",
+      "op": "decompose",
+      "parent": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "reason": null,
+      "verdict": "driver"
+     }
+    ],
+    "excluded": [],
+    "not_decomposed": [
+     "渠道"
+    ],
+    "note": null,
+    "phenomena": [
+     {
+      "alias": "A3",
+      "dims": [],
+      "mode": null,
+      "op": "comparable",
+      "parent": null,
+      "phrase": "两期可比，窗口长度、整期、星期构成核对不了",
+      "reason": null,
+      "verdict": "comparable"
+     }
+    ],
+    "refused": [
+     {
+      "alias": "A2",
+      "dims": [],
+      "mode": null,
+      "op": "baseline",
+      "parent": null,
+      "phrase": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "reason": "只有 0 期历史，至少要 8 期",
+      "verdict": null
+     }
+    ],
+    "tests": 0
+   },
+   "blocks": [
+    {
+     "id": "b0",
+     "level": 2,
+     "type": "heading",
+     "units": [
+      {
+       "cites": [],
+       "id": "u0",
+       "kind": "heading",
+       "see": [],
+       "segments": [
+        {
+         "id": "s0",
+         "kind": "structural",
+         "span": [
+          0,
+          3
+         ],
+         "state": "neutral",
+         "text": "## "
+        },
+        {
+         "id": "s1",
+         "kind": "text",
+         "span": [
+          3,
+          7
+         ],
+         "state": "neutral",
+         "text": "本周销售"
+        }
+       ],
+       "span": [
+        3,
+        7
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b1",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [
+        "A1"
+       ],
+       "id": "u1",
+       "kind": "claim",
+       "see": [
+        {
+         "alias": "A1",
+         "eid": "ev:analysis:10fb652eb3e403a8",
+         "kind": "analysis",
+         "locator": {},
+         "ref": "A1",
+         "role": "support",
+         "status": "resolved"
+        }
+       ],
+       "segments": [
+        {
+         "id": "s2",
+         "kind": "structural",
+         "span": [
+          7,
+          9
+         ],
+         "state": "neutral",
+         "text": "\n\n"
+        },
+        {
+         "cite": {
+          "alias": "A1",
+          "eid": "ev:analysis:10fb652eb3e403a8",
+          "kind": "analysis",
+          "locator": {},
+          "ref": "A1",
+          "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+          "role": "value",
+          "status": "resolved"
+         },
+         "id": "s3",
+         "kind": "analysis",
+         "ref": "a:A1",
+         "span": [
+          9,
+          47
+         ],
+         "state": "deterministic",
+         "text": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）"
+        },
+        {
+         "id": "s4",
+         "kind": "text",
+         "span": [
+          47,
+          48
+         ],
+         "state": "neutral",
+         "text": "。"
+        }
+       ],
+       "span": [
+        9,
+        48
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b2",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [
+        "A1"
+       ],
+       "id": "u2",
+       "kind": "claim",
+       "see": [],
+       "segments": [
+        {
+         "id": "s5",
+         "kind": "structural",
+         "span": [
+          48,
+          50
+         ],
+         "state": "neutral",
+         "text": "\n\n"
+        },
+        {
+         "id": "s6",
+         "kind": "text",
+         "span": [
+          50,
+          57
+         ],
+         "state": "neutral",
+         "text": "华东的变化为 "
+        },
+        {
+         "cite": {
+          "alias": "A1",
+          "eid": "ev:cell:164abd36aeac4c3b",
+          "kind": "cell",
+          "locator": {
+           "column": "delta",
+           "row": 0
+          },
+          "ref": "A1.r0.delta",
+          "rendered": "-300",
+          "role": "value",
+          "status": "resolved",
+          "value": -300
+         },
+         "id": "s7",
+         "kind": "number",
+         "ref": "v:A1.r0.delta",
+         "span": [
+          57,
+          61
+         ],
+         "state": "deterministic",
+         "text": "-300"
+        },
+        {
+         "id": "s8",
+         "kind": "text",
+         "span": [
+          61,
+          68
+         ],
+         "state": "neutral",
+         "text": "，占总变化的 "
+        },
+        {
+         "cite": {
+          "alias": "A1",
+          "conv": "pct",
+          "eid": "ev:analysis:efc6267321553bc3",
+          "kind": "analysis",
+          "locator": {
+           "key": "top_share"
+          },
+          "ref": "A1.top_share",
+          "rendered": "88.2%",
+          "role": "value",
+          "status": "resolved",
+          "value": 0.882352941176
+         },
+         "id": "s9",
+         "kind": "number",
+         "ref": "a:A1.top_share|pct",
+         "span": [
+          68,
+          73
+         ],
+         "state": "deterministic",
+         "text": "88.2%"
+        },
+        {
+         "id": "s10",
+         "kind": "text",
+         "span": [
+          73,
+          74
+         ],
+         "state": "neutral",
+         "text": "。"
+        }
+       ],
+       "span": [
+        50,
+        74
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b3",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [
+        "A1"
+       ],
+       "id": "u3",
+       "kind": "claim",
+       "see": [
+        {
+         "alias": "A1",
+         "eid": "ev:analysis:10fb652eb3e403a8",
+         "kind": "analysis",
+         "locator": {},
+         "ref": "A1",
+         "role": "support",
+         "status": "resolved"
+        }
+       ],
+       "segments": [
+        {
+         "id": "s11",
+         "kind": "structural",
+         "span": [
+          74,
+          76
+         ],
+         "state": "neutral",
+         "text": "\n\n"
+        },
+        {
+         "id": "s12",
+         "kind": "text",
+         "span": [
+          76,
+          87
+         ],
+         "state": "neutral",
+         "text": "其中下降主要来自华南。"
+        }
+       ],
+       "span": [
+        76,
+        87
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b4",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [],
+       "id": "u4",
+       "kind": "claim",
+       "see": [],
+       "segments": [
+        {
+         "id": "s13",
+         "kind": "structural",
+         "span": [
+          87,
+          89
+         ],
+         "state": "neutral",
+         "text": "\n\n"
+        },
+        {
+         "id": "s14",
+         "kind": "text",
+         "span": [
+          89,
+          99
+         ],
+         "state": "neutral",
+         "text": "销售额出现异常下降。"
+        }
+       ],
+       "span": [
+        89,
+        99
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b5",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [],
+       "id": "u5",
+       "kind": "claim",
+       "see": [],
+       "segments": [
+        {
+         "id": "s15",
+         "kind": "structural",
+         "span": [
+          99,
+          101
+         ],
+         "state": "neutral",
+         "text": "\n\n"
+        },
+        {
+         "id": "s16",
+         "kind": "text",
+         "span": [
+          101,
+          115
+         ],
+         "state": "neutral",
+         "text": "由于促销结束，订单有所减少。"
+        }
+       ],
+       "span": [
+        101,
+        115
+       ]
+      }
+     ]
+    }
+   ],
+   "catalog": {
+    "A1": {
+     "alias": "A1",
+     "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+     "call_id": "call_3",
+     "eid": "ev:analysis:10fb652eb3e403a8",
+     "exec": 1,
+     "inputs": [
+      "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901"
+     ],
+     "kind": "analysis",
+     "label": "变化拆解（可加） · 销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+     "locator": {},
+     "mode": "additive",
+     "node_id": "bot",
+     "op": "decompose",
+     "rows": 4,
+     "status": "ok",
+     "verdict": "driver"
+    },
+    "A2": {
+     "alias": "A2",
+     "artifact": "2e4139852d4ca46f8ee328ce44cb2ddde14f79e54c1371b3a77e15bf232b0122",
+     "call_id": "call_4",
+     "eid": "ev:analysis:436f6b967aa1414c",
+     "exec": 1,
+     "inputs": [
+      "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc"
+     ],
+     "kind": "analysis",
+     "label": "波动基线 · 波动基线没有做成：只有 0 期历史，至少要 8 期",
+     "locator": {},
+     "mode": null,
+     "node_id": "bot",
+     "op": "baseline",
+     "status": "refused",
+     "verdict": null
+    },
+    "A3": {
+     "alias": "A3",
+     "artifact": "afa2ea2ba75e5eb20e7f3372e3a9dea164eddb0338fa51c6b2fd9a808c09072a",
+     "call_id": "call_5",
+     "eid": "ev:analysis:bb168f2c30497439",
+     "exec": 1,
+     "inputs": [
+      "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901"
+     ],
+     "kind": "analysis",
+     "label": "可比性检查 · 两期可比，窗口长度、整期、星期构成核对不了",
+     "locator": {},
+     "mode": null,
+     "node_id": "bot",
+     "op": "comparable",
+     "rows": 5,
+     "status": "ok",
+     "verdict": "comparable"
+    },
+    "Q1": {
+     "alias": "Q1",
+     "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+     "call_id": "call_0",
+     "columns": [
+      "week",
+      "gmv"
+     ],
+     "eid": "ev:query:ad723c3d0c0ae28c",
+     "exec": 1,
+     "kind": "query",
+     "label": "db_query__shop · 2 行",
+     "locator": {},
+     "node_id": "bot",
+     "rows": 2,
+     "source": "shop",
+     "tool": "db_query__shop",
+     "truncated": false,
+     "via": "6c603c020e74d0ad9022eb472d9a8cb4e1c3fc95b60f276a53e0ebfce9ba16d8"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+     "call_id": "call_1",
+     "columns": [
+      "region",
+      "week",
+      "gmv"
+     ],
+     "eid": "ev:query:c390b8b187033425",
+     "exec": 1,
+     "kind": "query",
+     "label": "db_query__shop · 8 行",
+     "locator": {},
+     "node_id": "bot",
+     "rows": 8,
+     "source": "shop",
+     "tool": "db_query__shop",
+     "truncated": false,
+     "via": "6f9f2696d27966294fc257843c079ff745509f15bdfe64ef6ee23ca24318ddc5"
+    }
+   },
+   "entity_syntax": 2,
+   "markdown": "## 本周销售\n\n销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。\n\n华东的变化为 -300，占总变化的 88.2%。\n\n其中下降主要来自华南。\n\n销售额出现异常下降。\n\n由于促销结束，订单有所减少。",
+   "node_id": "write",
+   "provenance": 1,
+   "run_id": "ed3de345aac143089fb3d0777d9056ec",
+   "schema": "agentlab.report/1",
+   "source": "## 本周销售\n\n[[a:A1]]。[[see:A1]]\n\n华东的变化为 [[v:A1.r0.delta]]，占总变化的 [[a:A1.top_share|pct]]。\n\n其中下降主要来自华南。[[see:A1]]\n\n销售额出现异常下降。\n\n由于促销结束，订单有所减少。",
+   "stats": {
+    "analysis_claims": 3,
+    "claims": 5,
+    "connective": 0,
+    "entities": 0,
+    "headings": 1,
+    "numbers": 2,
+    "numbers_cited": 2,
+    "quotes": 0,
+    "see": 2,
+    "segments": 17,
+    "uncited_claims": 2,
+    "uncited_numbers": 0,
+    "units": 6,
+    "unknown_entities": 0,
+    "unresolved": 0,
+    "unverified_entities": 0,
+    "values": 1,
+    "violations": 3
+   },
+   "violations": [
+    {
+     "analyses": [
+      "A1"
+     ],
+     "claim": "source",
+     "code": "analysis_claim_mismatch",
+     "context": "其中下降主要来自华南。",
+     "for_model": "A1 判的主要来源是华东，不是华南，不能写「主要来自华南」：照判定改写（或者直接引用判定 [[a:A1]]），或者删掉这个判断",
+     "message": "「主要来自华南」与所挂的分析结论 A1 对不上：判定的主要来源是华东，不是华南",
+     "op": "decompose",
+     "segment": "s12",
+     "span": [
+      80,
+      84
+     ],
+     "text": "主要来自",
+     "unit": "u3"
+    },
+    {
+     "analyses": [],
+     "claim": "anomaly",
+     "code": "analysis_claim_uncited",
+     "context": "销售额出现异常下降。",
+     "for_model": "这次没有波动基线的结论，不能写「异常」：只写本期的数和变化，不说「异常」「大幅」「显著下降」「激增」「历史新高」「正常波动」这类判断",
+     "message": "「异常」是分析判断，这句没有挂波动基线的分析结论，系统无法核对",
+     "op": "baseline",
+     "segment": "s14",
+     "span": [
+      94,
+      96
+     ],
+     "text": "异常",
+     "unit": "u4"
+    },
+    {
+     "analyses": [],
+     "claim": "causal",
+     "code": "causal_unsupported",
+     "context": "由于促销结束，订单有所减少。",
+     "for_model": "「由于促销结束」没有依据：数据只能说明变化来自哪里；要写原因，引用知识库原话，或写成「可能与…有关，待核实」",
+     "message": "「由于促销结束」是原因判断，这句没有知识库原话或运行输入作依据，也没有写成推测",
+     "segment": "s16",
+     "span": [
+      101,
+      103
+     ],
+     "text": "由于",
+     "unit": "u5"
+    }
+   ]
+  },
+  "segments": {
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+     "kind": "analysis",
+     "state": "deterministic",
+     "span": [
+      9,
+      47
+     ],
+     "unit": "u1",
+     "ref": "a:A1",
+     "cite": {
+      "alias": "A1",
+      "eid": "ev:analysis:10fb652eb3e403a8",
+      "kind": "analysis",
+      "locator": {},
+      "ref": "A1",
+      "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "role": "value",
+      "status": "resolved"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。",
+     "span": [
+      9,
+      48
+     ],
+     "cites": [
+      "A1"
+     ],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A1",
+      "op": "decompose",
+      "mode": "additive",
+      "method_label": "变化拆解（可加）",
+      "origin": "agent",
+      "call_id": "call_3",
+      "node_id": "bot",
+      "label": "问数据",
+      "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+      "eid": "ev:analysis:10fb652eb3e403a8",
+      "eid_ok": true,
+      "cited": {
+       "what": "phrase"
+      },
+      "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "criterion": "一段占总变化的一半以上算主要来源，最多前 2 段合计占 80% 以上算集中，总变化不到基期的 0.5% 算基本持平，各段之和要和总数对得上才判断变化来自哪里",
+      "verdict": {
+       "code": "driver",
+       "direction": "down",
+       "subjects": [
+        [
+         "华东"
+        ]
+       ]
+      },
+      "caveats": [
+       {
+        "code": "comparability",
+        "text": "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+       }
+      ],
+      "hypothesis": "下降是不是集中在某个地区",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A1",
+      "method": "decompose.additive@1",
+      "method_label": "变化拆解（可加）",
+      "params": {
+       "base": "2026-W41",
+       "by": [
+        "region"
+       ],
+       "catalog": {
+        "labels": {
+         "region": "地区",
+         "week": "周"
+        },
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "headline": {
+        "base": "Q1.r0.gmv",
+        "target": "Q1.r1.gmv"
+       },
+       "label": "销售额",
+       "measure": "gmv",
+       "period": "week",
+       "query": "Q2",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "main_share",
+        "label": "「主要来源」的占比",
+        "value": 0.5
+       },
+       {
+        "key": "concentration",
+        "label": "「集中」的合计占比",
+        "value": 0.8
+       },
+       {
+        "key": "offset_ratio",
+        "label": "记为「抵消」的比例",
+        "value": 0.25
+       },
+       {
+        "key": "flat_pct",
+        "label": "「基本持平」的幅度",
+        "value": 0.005
+       },
+       {
+        "key": "table_top_k",
+        "label": "列出前几段",
+        "value": 10
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A1",
+      "values": [
+       {
+        "key": "base_total",
+        "raw": "2700",
+        "rendered": "2,700"
+       },
+       {
+        "key": "delta_total",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_down",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_up",
+        "raw": "0",
+        "rendered": "0"
+       },
+       {
+        "key": "pct_total",
+        "raw": "-0.125925925926",
+        "rendered": "-0.1259259259"
+       },
+       {
+        "key": "segments",
+        "raw": "4",
+        "rendered": "4"
+       },
+       {
+        "key": "target_total",
+        "raw": "2360",
+        "rendered": "2,360"
+       },
+       {
+        "key": "top_k",
+        "raw": "1",
+        "rendered": "1"
+       },
+       {
+        "key": "top_k_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       },
+       {
+        "key": "top_key",
+        "raw": "华东",
+        "rendered": "华东"
+       },
+       {
+        "key": "top_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       }
+      ],
+      "formulas": [
+       {
+        "label": "总变化",
+        "text": "总变化 = 本期合计 − 基期合计 = 2,360 − 2,700 = -340"
+       },
+       {
+        "label": "变化率",
+        "text": "变化率 = 总变化 ÷ 基期合计 = -340 ÷ 2,700 = -12.6%"
+       },
+       {
+        "label": "占比",
+        "text": "华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%"
+       }
+      ],
+      "table": {
+       "columns": [
+        "region",
+        "base",
+        "target",
+        "delta",
+        "pct",
+        "share",
+        "flag"
+       ],
+       "labels": {
+        "base": "基期",
+        "delta": "变化",
+        "flag": "说明",
+        "pct": "变化率",
+        "region": "地区",
+        "share": "占变化的比重",
+        "target": "本期"
+       },
+       "total_rows": 4,
+       "row_index": [
+        0,
+        1,
+        2,
+        3
+       ],
+       "rows": [
+        [
+         "华东",
+         "1000",
+         "700",
+         "-300",
+         "-0.3",
+         "0.882352941176",
+         null
+        ],
+        [
+         "华南",
+         "800",
+         "780",
+         "-20",
+         "-0.025",
+         "0.0588235294118",
+         null
+        ],
+        [
+         "华北",
+         "600",
+         "590",
+         "-10",
+         "-0.0166666666667",
+         "0.0294117647059",
+         null
+        ],
+        [
+         "西南",
+         "300",
+         "290",
+         "-10",
+         "-0.0333333333333",
+         "0.0294117647059",
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": []
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q1.r0.gmv",
+      "role": "headline_base",
+      "role_label": "基期总数",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "row": 0,
+      "column": "gmv",
+      "value": "2700",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "base_total",
+       "total": "2,700",
+       "headline": "2,700",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q1.r1.gmv",
+      "role": "headline_target",
+      "role_label": "本期总数",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "row": 1,
+      "column": "gmv",
+      "value": "2360",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "target_total",
+       "total": "2,360",
+       "headline": "2,360",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q2",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "bot",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "region",
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "region"
+        ],
+        [
+         1,
+         "region"
+        ],
+        [
+         2,
+         "region"
+        ],
+        [
+         3,
+         "region"
+        ],
+        [
+         4,
+         "region"
+        ],
+        [
+         5,
+         "region"
+        ],
+        [
+         6,
+         "region"
+        ],
+        [
+         7,
+         "region"
+        ],
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A1",
+      "method": "decompose.additive@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A1",
+      "node_id": "bot",
+      "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "note": "判定语由系统按平台的方法算出判定、按模板写成，未经模型转写；判定标准、计算过程、输入和复算见出处链。判定只说明变化来自哪里，不说明原因",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s7": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "segment": {
+     "id": "s7",
+     "text": "-300",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      57,
+      61
+     ],
+     "unit": "u2",
+     "ref": "v:A1.r0.delta",
+     "cite": {
+      "alias": "A1",
+      "eid": "ev:cell:164abd36aeac4c3b",
+      "kind": "cell",
+      "locator": {
+       "column": "delta",
+       "row": 0
+      },
+      "ref": "A1.r0.delta",
+      "rendered": "-300",
+      "role": "value",
+      "status": "resolved",
+      "value": -300
+     }
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "华东的变化为 -300，占总变化的 88.2%。",
+     "span": [
+      50,
+      74
+     ],
+     "cites": [
+      "A1"
+     ],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b2",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A1",
+      "op": "decompose",
+      "mode": "additive",
+      "method_label": "变化拆解（可加）",
+      "origin": "agent",
+      "call_id": "call_3",
+      "node_id": "bot",
+      "label": "问数据",
+      "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+      "eid": "ev:analysis:10fb652eb3e403a8",
+      "eid_ok": true,
+      "cited": {
+       "what": "cell",
+       "row": 0,
+       "column": "delta",
+       "raw": "-300"
+      },
+      "rendered": "-300",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "criterion": "一段占总变化的一半以上算主要来源，最多前 2 段合计占 80% 以上算集中，总变化不到基期的 0.5% 算基本持平，各段之和要和总数对得上才判断变化来自哪里",
+      "verdict": {
+       "code": "driver",
+       "direction": "down",
+       "subjects": [
+        [
+         "华东"
+        ]
+       ]
+      },
+      "caveats": [
+       {
+        "code": "comparability",
+        "text": "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+       }
+      ],
+      "hypothesis": "下降是不是集中在某个地区",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A1",
+      "method": "decompose.additive@1",
+      "method_label": "变化拆解（可加）",
+      "params": {
+       "base": "2026-W41",
+       "by": [
+        "region"
+       ],
+       "catalog": {
+        "labels": {
+         "region": "地区",
+         "week": "周"
+        },
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "headline": {
+        "base": "Q1.r0.gmv",
+        "target": "Q1.r1.gmv"
+       },
+       "label": "销售额",
+       "measure": "gmv",
+       "period": "week",
+       "query": "Q2",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "main_share",
+        "label": "「主要来源」的占比",
+        "value": 0.5
+       },
+       {
+        "key": "concentration",
+        "label": "「集中」的合计占比",
+        "value": 0.8
+       },
+       {
+        "key": "offset_ratio",
+        "label": "记为「抵消」的比例",
+        "value": 0.25
+       },
+       {
+        "key": "flat_pct",
+        "label": "「基本持平」的幅度",
+        "value": 0.005
+       },
+       {
+        "key": "table_top_k",
+        "label": "列出前几段",
+        "value": 10
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A1",
+      "values": [
+       {
+        "key": "base_total",
+        "raw": "2700",
+        "rendered": "2,700"
+       },
+       {
+        "key": "delta_total",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_down",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_up",
+        "raw": "0",
+        "rendered": "0"
+       },
+       {
+        "key": "pct_total",
+        "raw": "-0.125925925926",
+        "rendered": "-0.1259259259"
+       },
+       {
+        "key": "segments",
+        "raw": "4",
+        "rendered": "4"
+       },
+       {
+        "key": "target_total",
+        "raw": "2360",
+        "rendered": "2,360"
+       },
+       {
+        "key": "top_k",
+        "raw": "1",
+        "rendered": "1"
+       },
+       {
+        "key": "top_k_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       },
+       {
+        "key": "top_key",
+        "raw": "华东",
+        "rendered": "华东"
+       },
+       {
+        "key": "top_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       }
+      ],
+      "formulas": [
+       {
+        "label": "总变化",
+        "text": "总变化 = 本期合计 − 基期合计 = 2,360 − 2,700 = -340"
+       },
+       {
+        "label": "变化率",
+        "text": "变化率 = 总变化 ÷ 基期合计 = -340 ÷ 2,700 = -12.6%"
+       },
+       {
+        "label": "占比",
+        "text": "华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%"
+       }
+      ],
+      "table": {
+       "columns": [
+        "region",
+        "base",
+        "target",
+        "delta",
+        "pct",
+        "share",
+        "flag"
+       ],
+       "labels": {
+        "base": "基期",
+        "delta": "变化",
+        "flag": "说明",
+        "pct": "变化率",
+        "region": "地区",
+        "share": "占变化的比重",
+        "target": "本期"
+       },
+       "total_rows": 4,
+       "row_index": [
+        0,
+        1,
+        2,
+        3
+       ],
+       "rows": [
+        [
+         "华东",
+         "1000",
+         "700",
+         "-300",
+         "-0.3",
+         "0.882352941176",
+         null
+        ],
+        [
+         "华南",
+         "800",
+         "780",
+         "-20",
+         "-0.025",
+         "0.0588235294118",
+         null
+        ],
+        [
+         "华北",
+         "600",
+         "590",
+         "-10",
+         "-0.0166666666667",
+         "0.0294117647059",
+         null
+        ],
+        [
+         "西南",
+         "300",
+         "290",
+         "-10",
+         "-0.0333333333333",
+         "0.0294117647059",
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": [
+         [
+          0,
+          "delta"
+         ]
+        ]
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q1.r0.gmv",
+      "role": "headline_base",
+      "role_label": "基期总数",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "row": 0,
+      "column": "gmv",
+      "value": "2700",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "base_total",
+       "total": "2,700",
+       "headline": "2,700",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q1.r1.gmv",
+      "role": "headline_target",
+      "role_label": "本期总数",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "row": 1,
+      "column": "gmv",
+      "value": "2360",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "target_total",
+       "total": "2,360",
+       "headline": "2,360",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q2",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "bot",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "region",
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "region"
+        ],
+        [
+         1,
+         "region"
+        ],
+        [
+         2,
+         "region"
+        ],
+        [
+         3,
+         "region"
+        ],
+        [
+         4,
+         "region"
+        ],
+        [
+         5,
+         "region"
+        ],
+        [
+         6,
+         "region"
+        ],
+        [
+         7,
+         "region"
+        ],
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A1",
+      "method": "decompose.additive@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A1",
+      "node_id": "bot",
+      "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "note": "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "segment": {
+     "id": "s9",
+     "text": "88.2%",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      68,
+      73
+     ],
+     "unit": "u2",
+     "ref": "a:A1.top_share|pct",
+     "cite": {
+      "alias": "A1",
+      "conv": "pct",
+      "eid": "ev:analysis:efc6267321553bc3",
+      "kind": "analysis",
+      "locator": {
+       "key": "top_share"
+      },
+      "ref": "A1.top_share",
+      "rendered": "88.2%",
+      "role": "value",
+      "status": "resolved",
+      "value": 0.882352941176
+     }
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "华东的变化为 -300，占总变化的 88.2%。",
+     "span": [
+      50,
+      74
+     ],
+     "cites": [
+      "A1"
+     ],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b2",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A1",
+      "op": "decompose",
+      "mode": "additive",
+      "method_label": "变化拆解（可加）",
+      "origin": "agent",
+      "call_id": "call_3",
+      "node_id": "bot",
+      "label": "问数据",
+      "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+      "eid": "ev:analysis:10fb652eb3e403a8",
+      "eid_ok": true,
+      "cited": {
+       "what": "value",
+       "key": "top_share",
+       "raw": "0.882352941176",
+       "conv": "pct"
+      },
+      "rendered": "88.2%",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "criterion": "一段占总变化的一半以上算主要来源，最多前 2 段合计占 80% 以上算集中，总变化不到基期的 0.5% 算基本持平，各段之和要和总数对得上才判断变化来自哪里",
+      "verdict": {
+       "code": "driver",
+       "direction": "down",
+       "subjects": [
+        [
+         "华东"
+        ]
+       ]
+      },
+      "caveats": [
+       {
+        "code": "comparability",
+        "text": "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+       }
+      ],
+      "hypothesis": "下降是不是集中在某个地区",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A1",
+      "method": "decompose.additive@1",
+      "method_label": "变化拆解（可加）",
+      "params": {
+       "base": "2026-W41",
+       "by": [
+        "region"
+       ],
+       "catalog": {
+        "labels": {
+         "region": "地区",
+         "week": "周"
+        },
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "headline": {
+        "base": "Q1.r0.gmv",
+        "target": "Q1.r1.gmv"
+       },
+       "label": "销售额",
+       "measure": "gmv",
+       "period": "week",
+       "query": "Q2",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "main_share",
+        "label": "「主要来源」的占比",
+        "value": 0.5
+       },
+       {
+        "key": "concentration",
+        "label": "「集中」的合计占比",
+        "value": 0.8
+       },
+       {
+        "key": "offset_ratio",
+        "label": "记为「抵消」的比例",
+        "value": 0.25
+       },
+       {
+        "key": "flat_pct",
+        "label": "「基本持平」的幅度",
+        "value": 0.005
+       },
+       {
+        "key": "table_top_k",
+        "label": "列出前几段",
+        "value": 10
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A1",
+      "values": [
+       {
+        "key": "base_total",
+        "raw": "2700",
+        "rendered": "2,700"
+       },
+       {
+        "key": "delta_total",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_down",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_up",
+        "raw": "0",
+        "rendered": "0"
+       },
+       {
+        "key": "pct_total",
+        "raw": "-0.125925925926",
+        "rendered": "-0.1259259259"
+       },
+       {
+        "key": "segments",
+        "raw": "4",
+        "rendered": "4"
+       },
+       {
+        "key": "target_total",
+        "raw": "2360",
+        "rendered": "2,360"
+       },
+       {
+        "key": "top_k",
+        "raw": "1",
+        "rendered": "1"
+       },
+       {
+        "key": "top_k_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       },
+       {
+        "key": "top_key",
+        "raw": "华东",
+        "rendered": "华东"
+       },
+       {
+        "key": "top_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412",
+        "cited": true
+       }
+      ],
+      "formulas": [
+       {
+        "label": "总变化",
+        "text": "总变化 = 本期合计 − 基期合计 = 2,360 − 2,700 = -340"
+       },
+       {
+        "label": "变化率",
+        "text": "变化率 = 总变化 ÷ 基期合计 = -340 ÷ 2,700 = -12.6%"
+       },
+       {
+        "label": "占比",
+        "text": "华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%"
+       }
+      ],
+      "table": {
+       "columns": [
+        "region",
+        "base",
+        "target",
+        "delta",
+        "pct",
+        "share",
+        "flag"
+       ],
+       "labels": {
+        "base": "基期",
+        "delta": "变化",
+        "flag": "说明",
+        "pct": "变化率",
+        "region": "地区",
+        "share": "占变化的比重",
+        "target": "本期"
+       },
+       "total_rows": 4,
+       "row_index": [
+        0,
+        1,
+        2,
+        3
+       ],
+       "rows": [
+        [
+         "华东",
+         "1000",
+         "700",
+         "-300",
+         "-0.3",
+         "0.882352941176",
+         null
+        ],
+        [
+         "华南",
+         "800",
+         "780",
+         "-20",
+         "-0.025",
+         "0.0588235294118",
+         null
+        ],
+        [
+         "华北",
+         "600",
+         "590",
+         "-10",
+         "-0.0166666666667",
+         "0.0294117647059",
+         null
+        ],
+        [
+         "西南",
+         "300",
+         "290",
+         "-10",
+         "-0.0333333333333",
+         "0.0294117647059",
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": []
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q1.r0.gmv",
+      "role": "headline_base",
+      "role_label": "基期总数",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "row": 0,
+      "column": "gmv",
+      "value": "2700",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "base_total",
+       "total": "2,700",
+       "headline": "2,700",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q1.r1.gmv",
+      "role": "headline_target",
+      "role_label": "本期总数",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "row": 1,
+      "column": "gmv",
+      "value": "2360",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "target_total",
+       "total": "2,360",
+       "headline": "2,360",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q2",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "bot",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "region",
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "region"
+        ],
+        [
+         1,
+         "region"
+        ],
+        [
+         2,
+         "region"
+        ],
+        [
+         3,
+         "region"
+        ],
+        [
+         4,
+         "region"
+        ],
+        [
+         5,
+         "region"
+        ],
+        [
+         6,
+         "region"
+        ],
+        [
+         7,
+         "region"
+        ],
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A1",
+      "method": "decompose.additive@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A1",
+      "node_id": "bot",
+      "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "note": "这个数取自分析结论的具名的数，由系统按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s12": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "segment": {
+     "id": "s12",
+     "text": "其中下降主要来自华南。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      76,
+      87
+     ],
+     "unit": "u3"
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "其中下降主要来自华南。",
+     "span": [
+      76,
+      87
+     ],
+     "cites": [
+      "A1"
+     ],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b3",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句附有依据：A1。依据是否支持这句话，系统无法确定性核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [
+     {
+      "analyses": [
+       "A1"
+      ],
+      "claim": "source",
+      "code": "analysis_claim_mismatch",
+      "context": "其中下降主要来自华南。",
+      "for_model": "A1 判的主要来源是华东，不是华南，不能写「主要来自华南」：照判定改写（或者直接引用判定 [[a:A1]]），或者删掉这个判断",
+      "message": "「主要来自华南」与所挂的分析结论 A1 对不上：判定的主要来源是华东，不是华南",
+      "op": "decompose",
+      "segment": "s12",
+      "span": [
+       80,
+       84
+      ],
+      "text": "主要来自",
+      "unit": "u3"
+     }
+    ],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s14": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "segment": {
+     "id": "s14",
+     "text": "销售额出现异常下降。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      89,
+      99
+     ],
+     "unit": "u4"
+    },
+    "unit": {
+     "id": "u4",
+     "kind": "claim",
+     "text": "销售额出现异常下降。",
+     "span": [
+      89,
+      99
+     ],
+     "cites": [],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句没有附依据。句子是否有依据，系统无法核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [
+     {
+      "analyses": [],
+      "claim": "anomaly",
+      "code": "analysis_claim_uncited",
+      "context": "销售额出现异常下降。",
+      "for_model": "这次没有波动基线的结论，不能写「异常」：只写本期的数和变化，不说「异常」「大幅」「显著下降」「激增」「历史新高」「正常波动」这类判断",
+      "message": "「异常」是分析判断，这句没有挂波动基线的分析结论，系统无法核对",
+      "op": "baseline",
+      "segment": "s14",
+      "span": [
+       94,
+       96
+      ],
+      "text": "异常",
+      "unit": "u4"
+     }
+    ],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s16": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "segment": {
+     "id": "s16",
+     "text": "由于促销结束，订单有所减少。",
+     "kind": "text",
+     "state": "neutral",
+     "span": [
+      101,
+      115
+     ],
+     "unit": "u5"
+    },
+    "unit": {
+     "id": "u5",
+     "kind": "claim",
+     "text": "由于促销结束，订单有所减少。",
+     "span": [
+      101,
+      115
+     ],
+     "cites": [],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b5",
+     "type": "paragraph"
+    },
+    "chain": [],
+    "note": "这是结论句中的文字，这句没有附依据。句子是否有依据，系统无法核对，只能由模型判断（模型的判断不是确定性的）",
+    "violations": [
+     {
+      "analyses": [],
+      "claim": "causal",
+      "code": "causal_unsupported",
+      "context": "由于促销结束，订单有所减少。",
+      "for_model": "「由于促销结束」没有依据：数据只能说明变化来自哪里；要写原因，引用知识库原话，或写成「可能与…有关，待核实」",
+      "message": "「由于促销结束」是原因判断，这句没有知识库原话或运行输入作依据，也没有写成推测",
+      "segment": "s16",
+      "span": [
+       101,
+       103
+      ],
+      "text": "由于",
+      "unit": "u5"
+     }
+    ],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "graph": {
+   "run_id": "ed3de345aac143089fb3d0777d9056ec",
+   "schema": "agentlab.evidence/1",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 78,
+    "legacy": false
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389",
+     "doc_sealed": true,
+     "hash_ok": true,
+     "ok": false,
+     "repairs": 1,
+     "fields": [
+      "周报"
+     ],
+     "stats": {
+      "analysis_claims": 3,
+      "claims": 5,
+      "connective": 0,
+      "entities": 0,
+      "headings": 1,
+      "numbers": 2,
+      "numbers_cited": 2,
+      "quotes": 0,
+      "see": 2,
+      "segments": 17,
+      "uncited_claims": 2,
+      "uncited_numbers": 0,
+      "units": 6,
+      "unknown_entities": 0,
+      "unresolved": 0,
+      "unverified_entities": 0,
+      "values": 1,
+      "violations": 3
+     },
+     "claims": "off",
+     "judge": null,
+     "post_seal_verdicts": {},
+     "judge_meta": null
+    }
+   ],
+   "evidence": [
+    {
+     "alias": "A1",
+     "eid": "ev:analysis:10fb652eb3e403a8",
+     "kind": "analysis",
+     "label": "变化拆解（可加） · 销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+     "node_id": "bot",
+     "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+     "sealed": true,
+     "cited_by": [
+      "s3",
+      "s7",
+      "s9"
+     ],
+     "units": [
+      "u1",
+      "u2",
+      "u3"
+     ],
+     "report": "write",
+     "op": "decompose",
+     "mode": "additive",
+     "status": "ok",
+     "verdict": "driver",
+     "call_id": "call_3"
+    },
+    {
+     "alias": "A2",
+     "eid": "ev:analysis:436f6b967aa1414c",
+     "kind": "analysis",
+     "label": "波动基线 · 波动基线没有做成：只有 0 期历史，至少要 8 期",
+     "node_id": "bot",
+     "artifact": "2e4139852d4ca46f8ee328ce44cb2ddde14f79e54c1371b3a77e15bf232b0122",
+     "sealed": true,
+     "cited_by": [],
+     "units": [],
+     "report": "write",
+     "op": "baseline",
+     "status": "refused",
+     "call_id": "call_4"
+    },
+    {
+     "alias": "A3",
+     "eid": "ev:analysis:bb168f2c30497439",
+     "kind": "analysis",
+     "label": "可比性检查 · 两期可比，窗口长度、整期、星期构成核对不了",
+     "node_id": "bot",
+     "artifact": "afa2ea2ba75e5eb20e7f3372e3a9dea164eddb0338fa51c6b2fd9a808c09072a",
+     "sealed": true,
+     "cited_by": [],
+     "units": [],
+     "report": "write",
+     "op": "comparable",
+     "status": "ok",
+     "verdict": "comparable",
+     "call_id": "call_5"
+    },
+    {
+     "alias": "Q1",
+     "eid": "ev:query:ad723c3d0c0ae28c",
+     "kind": "query",
+     "label": "db_query__shop · 2 行",
+     "node_id": "bot",
+     "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+     "sealed": true,
+     "cited_by": [],
+     "units": [],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "week",
+      "gmv"
+     ],
+     "rows": 2,
+     "truncated": false
+    },
+    {
+     "alias": "Q2",
+     "eid": "ev:query:c390b8b187033425",
+     "kind": "query",
+     "label": "db_query__shop · 8 行",
+     "node_id": "bot",
+     "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+     "sealed": true,
+     "cited_by": [],
+     "units": [],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "region",
+      "week",
+      "gmv"
+     ],
+     "rows": 8,
+     "truncated": false
+    }
+   ],
+   "edges": [
+    {
+     "from": "s3",
+     "to": "A1",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u1",
+     "to": "A1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "s7",
+     "to": "A1",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s9",
+     "to": "A1",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u3",
+     "to": "A1",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "A1",
+     "to": "Q1",
+     "rel": "derived_from",
+     "report": "write"
+    },
+    {
+     "from": "A1",
+     "to": "Q2",
+     "rel": "derived_from",
+     "report": "write"
+    },
+    {
+     "from": "A2",
+     "to": "Q1",
+     "rel": "derived_from",
+     "report": "write"
+    },
+    {
+     "from": "A3",
+     "to": "Q2",
+     "rel": "derived_from",
+     "report": "write"
+    },
+    {
+     "from": "A1.r0.delta",
+     "to": "A1",
+     "rel": "cell_of",
+     "report": "write"
+    }
+   ],
+   "mode": "cited"
+  },
+  "audit": {
+   "run_id": "ed3de345aac143089fb3d0777d9056ec",
+   "schema": "agentlab.evidence.audit/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 78,
+    "legacy": false,
+    "events": 45,
+    "message": "事件记录与封存时一致"
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389",
+     "hash_ok": true,
+     "doc_sealed": true,
+     "fields": [
+      "周报"
+     ],
+     "stats": {
+      "analysis_claims": 3,
+      "claims": 5,
+      "connective": 0,
+      "entities": 0,
+      "headings": 1,
+      "numbers": 2,
+      "numbers_cited": 2,
+      "quotes": 0,
+      "see": 2,
+      "segments": 17,
+      "uncited_claims": 2,
+      "uncited_numbers": 0,
+      "units": 6,
+      "unknown_entities": 0,
+      "unresolved": 0,
+      "unverified_entities": 0,
+      "values": 1,
+      "violations": 3
+     },
+     "claims": "off",
+     "judge": null,
+     "post_seal_verdicts": {},
+     "judge_meta": null
+    }
+   ],
+   "groups": [
+    {
+     "key": "cited",
+     "label": "有出处",
+     "count": 3,
+     "rows": [
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "周报",
+       "segment": "s3",
+       "unit": "u1",
+       "kind": "analysis",
+       "text": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "a:A1",
+       "alias": "A1",
+       "evidence_kind": "analysis",
+       "evidence": "变化拆解（可加） · 销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+       "eid": "ev:analysis:10fb652eb3e403a8",
+       "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+       "node_id": "bot",
+       "sealed": true,
+       "span": [
+        9,
+        47
+       ],
+       "sentence": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。",
+       "note": "判定语由系统按平台的方法算出判定、按模板写成，未经模型转写；判定标准、计算过程、输入和复算见出处链。判定只说明变化来自哪里，不说明原因"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "周报",
+       "segment": "s7",
+       "unit": "u2",
+       "kind": "number",
+       "text": "-300",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "v:A1.r0.delta",
+       "alias": "A1",
+       "evidence_kind": "analysis",
+       "evidence": "A1.r0.delta",
+       "eid": "ev:cell:164abd36aeac4c3b",
+       "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+       "node_id": "bot",
+       "sealed": true,
+       "span": [
+        57,
+        61
+       ],
+       "sentence": "华东的变化为 -300，占总变化的 88.2%。",
+       "note": "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "周报",
+       "segment": "s9",
+       "unit": "u2",
+       "kind": "number",
+       "text": "88.2%",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "a:A1.top_share|pct",
+       "alias": "A1",
+       "evidence_kind": "analysis",
+       "evidence": "A1.top_share",
+       "eid": "ev:analysis:efc6267321553bc3",
+       "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+       "node_id": "bot",
+       "sealed": true,
+       "span": [
+        68,
+        73
+       ],
+       "sentence": "华东的变化为 -300，占总变化的 88.2%。",
+       "note": "这个数取自分析结论的具名的数，由系统按固定规则显示，未经模型转写"
+      }
+     ]
+    },
+    {
+     "key": "none",
+     "label": "无证据",
+     "count": 5,
+     "rows": [
+      {
+       "group": "none",
+       "report": "write",
+       "field": "周报",
+       "segment": "s12",
+       "unit": "u3",
+       "kind": "violation",
+       "text": "主要来自",
+       "state": "none",
+       "issue": "analysis_claim_mismatch",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        80,
+        84
+       ],
+       "sentence": "其中下降主要来自华南。",
+       "note": "「主要来自华南」与所挂的分析结论 A1 对不上：判定的主要来源是华东，不是华南"
+      },
+      {
+       "group": "none",
+       "report": "write",
+       "field": "周报",
+       "segment": null,
+       "unit": "u4",
+       "kind": "claim",
+       "text": "销售额出现异常下降。",
+       "state": "none",
+       "issue": "uncited_claim",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        89,
+        99
+       ],
+       "sentence": "销售额出现异常下降。",
+       "note": "这句结论没有附依据（既没有引用，也没有注明依据）"
+      },
+      {
+       "group": "none",
+       "report": "write",
+       "field": "周报",
+       "segment": "s14",
+       "unit": "u4",
+       "kind": "violation",
+       "text": "异常",
+       "state": "none",
+       "issue": "analysis_claim_uncited",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        94,
+        96
+       ],
+       "sentence": "销售额出现异常下降。",
+       "note": "「异常」是分析判断，这句没有挂波动基线的分析结论，系统无法核对"
+      },
+      {
+       "group": "none",
+       "report": "write",
+       "field": "周报",
+       "segment": null,
+       "unit": "u5",
+       "kind": "claim",
+       "text": "由于促销结束，订单有所减少。",
+       "state": "none",
+       "issue": "uncited_claim",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        101,
+        115
+       ],
+       "sentence": "由于促销结束，订单有所减少。",
+       "note": "这句结论没有附依据（既没有引用，也没有注明依据）"
+      },
+      {
+       "group": "none",
+       "report": "write",
+       "field": "周报",
+       "segment": "s16",
+       "unit": "u5",
+       "kind": "violation",
+       "text": "由于",
+       "state": "none",
+       "issue": "causal_unsupported",
+       "ref": null,
+       "alias": null,
+       "evidence_kind": null,
+       "evidence": null,
+       "eid": null,
+       "artifact": null,
+       "node_id": null,
+       "sealed": null,
+       "span": [
+        101,
+        103
+       ],
+       "sentence": "由于促销结束，订单有所减少。",
+       "note": "「由于促销结束」是原因判断，这句没有知识库原话或运行输入作依据，也没有写成推测"
+      }
+     ]
+    },
+    {
+     "key": "suspicious",
+     "label": "可疑名称",
+     "count": 0,
+     "rows": []
+    },
+    {
+     "key": "candidate",
+     "label": "按数值猜测",
+     "count": 0,
+     "rows": []
+    }
+   ],
+   "counts": {
+    "cited": 3,
+    "none": 5,
+    "suspicious": 0,
+    "candidate": 0
+   },
+   "total": 8
+  },
+  "analyses": {
+   "A1": {
+    "run_id": "ed3de345aac143089fb3d0777d9056ec",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "alias": "A1",
+    "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A1",
+      "op": "decompose",
+      "mode": "additive",
+      "method_label": "变化拆解（可加）",
+      "origin": "agent",
+      "call_id": "call_3",
+      "node_id": "bot",
+      "label": "问数据",
+      "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+      "eid": "ev:analysis:10fb652eb3e403a8",
+      "eid_ok": true,
+      "cited": {
+       "what": "phrase"
+      },
+      "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "criterion": "一段占总变化的一半以上算主要来源，最多前 2 段合计占 80% 以上算集中，总变化不到基期的 0.5% 算基本持平，各段之和要和总数对得上才判断变化来自哪里",
+      "verdict": {
+       "code": "driver",
+       "direction": "down",
+       "subjects": [
+        [
+         "华东"
+        ]
+       ]
+      },
+      "caveats": [
+       {
+        "code": "comparability",
+        "text": "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+       }
+      ],
+      "hypothesis": "下降是不是集中在某个地区",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A1",
+      "method": "decompose.additive@1",
+      "method_label": "变化拆解（可加）",
+      "params": {
+       "base": "2026-W41",
+       "by": [
+        "region"
+       ],
+       "catalog": {
+        "labels": {
+         "region": "地区",
+         "week": "周"
+        },
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "headline": {
+        "base": "Q1.r0.gmv",
+        "target": "Q1.r1.gmv"
+       },
+       "label": "销售额",
+       "measure": "gmv",
+       "period": "week",
+       "query": "Q2",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "main_share",
+        "label": "「主要来源」的占比",
+        "value": 0.5
+       },
+       {
+        "key": "concentration",
+        "label": "「集中」的合计占比",
+        "value": 0.8
+       },
+       {
+        "key": "offset_ratio",
+        "label": "记为「抵消」的比例",
+        "value": 0.25
+       },
+       {
+        "key": "flat_pct",
+        "label": "「基本持平」的幅度",
+        "value": 0.005
+       },
+       {
+        "key": "table_top_k",
+        "label": "列出前几段",
+        "value": 10
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A1",
+      "values": [
+       {
+        "key": "base_total",
+        "raw": "2700",
+        "rendered": "2,700"
+       },
+       {
+        "key": "delta_total",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_down",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_up",
+        "raw": "0",
+        "rendered": "0"
+       },
+       {
+        "key": "pct_total",
+        "raw": "-0.125925925926",
+        "rendered": "-0.1259259259"
+       },
+       {
+        "key": "segments",
+        "raw": "4",
+        "rendered": "4"
+       },
+       {
+        "key": "target_total",
+        "raw": "2360",
+        "rendered": "2,360"
+       },
+       {
+        "key": "top_k",
+        "raw": "1",
+        "rendered": "1"
+       },
+       {
+        "key": "top_k_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       },
+       {
+        "key": "top_key",
+        "raw": "华东",
+        "rendered": "华东"
+       },
+       {
+        "key": "top_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       }
+      ],
+      "formulas": [
+       {
+        "label": "总变化",
+        "text": "总变化 = 本期合计 − 基期合计 = 2,360 − 2,700 = -340"
+       },
+       {
+        "label": "变化率",
+        "text": "变化率 = 总变化 ÷ 基期合计 = -340 ÷ 2,700 = -12.6%"
+       },
+       {
+        "label": "占比",
+        "text": "华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%"
+       }
+      ],
+      "table": {
+       "columns": [
+        "region",
+        "base",
+        "target",
+        "delta",
+        "pct",
+        "share",
+        "flag"
+       ],
+       "labels": {
+        "base": "基期",
+        "delta": "变化",
+        "flag": "说明",
+        "pct": "变化率",
+        "region": "地区",
+        "share": "占变化的比重",
+        "target": "本期"
+       },
+       "total_rows": 4,
+       "row_index": [
+        0,
+        1,
+        2,
+        3
+       ],
+       "rows": [
+        [
+         "华东",
+         "1000",
+         "700",
+         "-300",
+         "-0.3",
+         "0.882352941176",
+         null
+        ],
+        [
+         "华南",
+         "800",
+         "780",
+         "-20",
+         "-0.025",
+         "0.0588235294118",
+         null
+        ],
+        [
+         "华北",
+         "600",
+         "590",
+         "-10",
+         "-0.0166666666667",
+         "0.0294117647059",
+         null
+        ],
+        [
+         "西南",
+         "300",
+         "290",
+         "-10",
+         "-0.0333333333333",
+         "0.0294117647059",
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": []
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q1.r0.gmv",
+      "role": "headline_base",
+      "role_label": "基期总数",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "row": 0,
+      "column": "gmv",
+      "value": "2700",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "base_total",
+       "total": "2,700",
+       "headline": "2,700",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q1.r1.gmv",
+      "role": "headline_target",
+      "role_label": "本期总数",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "row": 1,
+      "column": "gmv",
+      "value": "2360",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "target_total",
+       "total": "2,360",
+       "headline": "2,360",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "Q2",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "bot",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "region",
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "region"
+        ],
+        [
+         1,
+         "region"
+        ],
+        [
+         2,
+         "region"
+        ],
+        [
+         3,
+         "region"
+        ],
+        [
+         4,
+         "region"
+        ],
+        [
+         5,
+         "region"
+        ],
+        [
+         6,
+         "region"
+        ],
+        [
+         7,
+         "region"
+        ],
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A1",
+      "method": "decompose.additive@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A1",
+      "node_id": "bot",
+      "artifact": "6d06b2913312497d982d4e36e0c94a57c377b990110bac960d72d64979d7c12d",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "A2": {
+    "run_id": "ed3de345aac143089fb3d0777d9056ec",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "alias": "A2",
+    "rendered": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A2",
+      "op": "baseline",
+      "mode": null,
+      "method_label": "波动基线",
+      "origin": "agent",
+      "call_id": "call_4",
+      "node_id": "bot",
+      "label": "问数据",
+      "artifact": "2e4139852d4ca46f8ee328ce44cb2ddde14f79e54c1371b3a77e15bf232b0122",
+      "eid": "ev:analysis:436f6b967aa1414c",
+      "eid_ok": true,
+      "cited": {
+       "what": "phrase"
+      },
+      "rendered": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "refused",
+      "reason_code": "history_short",
+      "reason": "只有 0 期历史，至少要 8 期",
+      "phrase": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "criterion": "本期和过去最多 52 期的中位数比，差不到 2 倍稳健标准差（1.4826 倍的中位绝对偏差）算常规波动，2 到 3 倍算超出，3 倍以上算明显超出；历史至少要 8 期",
+      "verdict": null,
+      "caveats": [],
+      "hypothesis": "这周的下降算不算异常",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A2",
+      "method": "baseline.robust@1",
+      "method_label": "波动基线",
+      "params": {
+       "basis": "change",
+       "grain": "week",
+       "label": "销售额",
+       "lag": 1,
+       "measure": "gmv",
+       "period": "week",
+       "query": "Q1",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "k_warn",
+        "label": "「超出常规波动」的倍数",
+        "value": 2.0
+       },
+       {
+        "key": "k_alert",
+        "label": "「明显超出」的倍数",
+        "value": 3.0
+       },
+       {
+        "key": "min_history",
+        "label": "至少几期历史",
+        "value": 8
+       },
+       {
+        "key": "max_history",
+        "label": "最多用几期历史",
+        "value": 52
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A2",
+      "values": [],
+      "formulas": []
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "Q1",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q1",
+      "node_id": "bot",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "8fa60a625e4a072804462dd66dde6b1634f9fbd8244183e626a6fdcd8acb87fc",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A2",
+      "method": "baseline.robust@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A2",
+      "node_id": "bot",
+      "artifact": "2e4139852d4ca46f8ee328ce44cb2ddde14f79e54c1371b3a77e15bf232b0122",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "A3": {
+    "run_id": "ed3de345aac143089fb3d0777d9056ec",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+    },
+    "alias": "A3",
+    "rendered": "两期可比，窗口长度、整期、星期构成核对不了",
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A3",
+      "op": "comparable",
+      "mode": null,
+      "method_label": "可比性检查",
+      "origin": "agent",
+      "call_id": "call_5",
+      "node_id": "bot",
+      "label": "问数据",
+      "artifact": "afa2ea2ba75e5eb20e7f3372e3a9dea164eddb0338fa51c6b2fd9a808c09072a",
+      "eid": "ev:analysis:bb168f2c30497439",
+      "eid_ok": true,
+      "cited": {
+       "what": "phrase"
+      },
+      "rendered": "两期可比，窗口长度、整期、星期构成核对不了",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "两期可比，窗口长度、整期、星期构成核对不了",
+      "criterion": "只差日期、窗口一样长、是整期、星期构成相同、两边查询都没有数据问题才算可比；只有提醒项算有条件可比，有一项不通过算不可比；核对不了的项不判不可比",
+      "verdict": {
+       "code": "comparable",
+       "direction": null,
+       "subjects": []
+      },
+      "caveats": [],
+      "hypothesis": "两周能不能直接比",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A3",
+      "method": "comparable@1",
+      "method_label": "可比性检查",
+      "params": {
+       "base": "2026-W41",
+       "catalog": {
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "grain": "week",
+       "measure": "gmv",
+       "period": "week",
+       "query": "Q2",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A3",
+      "values": [
+       {
+        "key": "complete",
+        "raw": "unknown",
+        "rendered": "unknown"
+       },
+       {
+        "key": "data",
+        "raw": "pass",
+        "rendered": "pass"
+       },
+       {
+        "key": "same_query",
+        "raw": "pass",
+        "rendered": "pass"
+       },
+       {
+        "key": "weekdays",
+        "raw": "unknown",
+        "rendered": "unknown"
+       },
+       {
+        "key": "window",
+        "raw": "unknown",
+        "rendered": "unknown"
+       }
+      ],
+      "formulas": [],
+      "table": {
+       "columns": [
+        "check",
+        "status",
+        "base",
+        "target",
+        "note"
+       ],
+       "labels": {
+        "base": "基期",
+        "check": "检查项",
+        "note": "说明",
+        "status": "结果",
+        "target": "本期"
+       },
+       "total_rows": 5,
+       "row_index": [
+        0,
+        1,
+        2,
+        3,
+        4
+       ],
+       "rows": [
+        [
+         "同口径",
+         "通过",
+         null,
+         null,
+         null
+        ],
+        [
+         "窗口长度",
+         "核对不了",
+         null,
+         null,
+         null
+        ],
+        [
+         "整期",
+         "核对不了",
+         null,
+         null,
+         null
+        ],
+        [
+         "星期构成",
+         "核对不了",
+         null,
+         null,
+         null
+        ],
+        [
+         "数据问题",
+         "通过",
+         null,
+         null,
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": []
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A3",
+      "ref": "Q2",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "bot",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "94f47ca377dfd4fddc3e4bdba0466cbefdd6c4b66beaf4468332a9dd51be7901",
+      "node_id": "bot",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A3"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A3",
+      "method": "comparable@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A3",
+      "node_id": "bot",
+      "artifact": "afa2ea2ba75e5eb20e7f3372e3a9dea164eddb0338fa51c6b2fd9a808c09072a",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "issuance": {
+   "mode": "citations",
+   "tier": "formal",
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "d115c361e8ae4f6d06bd4f839c6f6f6c62c0721575b048da7350834f8ce41389"
+   },
+   "calibers": [],
+   "metrics_checked": 0,
+   "missing_required": [],
+   "missing_expected": [],
+   "unmatched_numbers": [],
+   "unresolved": [],
+   "matched_numbers": 2,
+   "matched": [
+    {
+     "token": "-300",
+     "metric": null,
+     "cell": "A1.r0.delta",
+     "segment": "s7",
+     "unit": "u2",
+     "start": 57,
+     "end": 61,
+     "span": [
+      57,
+      61
+     ],
+     "eid": "ev:cell:164abd36aeac4c3b"
+    },
+    {
+     "token": "88.2%",
+     "metric": null,
+     "analysis": "A1.top_share",
+     "segment": "s9",
+     "unit": "u2",
+     "start": 68,
+     "end": 73,
+     "span": [
+      68,
+      73
+     ],
+     "eid": "ev:analysis:efc6267321553bc3"
+    }
+   ],
+   "stats": {
+    "units": 6,
+    "segments": 17,
+    "claims": 5,
+    "connective": 0,
+    "headings": 1,
+    "numbers": 2,
+    "numbers_cited": 2,
+    "values": 1,
+    "entities": 0,
+    "quotes": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "unknown_entities": 0,
+    "unverified_entities": 0,
+    "see": 2,
+    "uncited_claims": 2,
+    "violations": 3,
+    "analysis_claims": 3
+   },
+   "gaps": [],
+   "declared_at": "2026-10-21T10:36:36.123894+00:00",
+   "analysis_claims": {
+    "mode": "check",
+    "count": 3,
+    "counts": {
+     "analysis_claim_mismatch": 1,
+     "analysis_claim_uncited": 1,
+     "causal_unsupported": 1
+    },
+    "counted": false,
+    "violations": [
+     {
+      "code": "analysis_claim_mismatch",
+      "text": "主要来自",
+      "claim": "source",
+      "op": "decompose",
+      "analyses": [
+       "A1"
+      ],
+      "unit": "u3",
+      "segment": "s12",
+      "span": [
+       80,
+       84
+      ],
+      "message": "「主要来自华南」与所挂的分析结论 A1 对不上：判定的主要来源是华东，不是华南",
+      "context": "其中下降主要来自华南。"
+     },
+     {
+      "code": "analysis_claim_uncited",
+      "text": "异常",
+      "claim": "anomaly",
+      "op": "baseline",
+      "unit": "u4",
+      "segment": "s14",
+      "span": [
+       94,
+       96
+      ],
+      "message": "「异常」是分析判断，这句没有挂波动基线的分析结论，系统无法核对",
+      "context": "销售额出现异常下降。"
+     },
+     {
+      "code": "causal_unsupported",
+      "text": "由于",
+      "claim": "causal",
+      "unit": "u5",
+      "segment": "s16",
+      "span": [
+       101,
+       103
+      ],
+      "message": "「由于促销结束」是原因判断，这句没有知识库原话或运行输入作依据，也没有写成推测",
+      "context": "由于促销结束，订单有所减少。"
+     }
+    ]
+   }
+  }
+ },
+ "card": {
+  "run_id": "ffeb7bfbcde6480fbddb573a6c6558af",
+  "run_class": "exploratory",
+  "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75",
+  "doc": {
+   "analysis_claims": {
+    "lexicon": 1,
+    "mode": "check"
+   },
+   "analysis_scope": {
+    "corrected": null,
+    "decomposed": [
+     {
+      "alias": "A2",
+      "dims": [
+       "地区"
+      ],
+      "mode": "additive",
+      "op": "decompose",
+      "parent": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "reason": null,
+      "verdict": "driver"
+     }
+    ],
+    "excluded": [],
+    "not_decomposed": [
+     "渠道"
+    ],
+    "note": null,
+    "phenomena": [],
+    "refused": [
+     {
+      "alias": "A1",
+      "dims": [],
+      "mode": null,
+      "op": "baseline",
+      "parent": null,
+      "phrase": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "reason": "只有 0 期历史，至少要 8 期",
+      "verdict": null
+     }
+    ],
+    "tests": 0
+   },
+   "blocks": [
+    {
+     "id": "b0",
+     "level": 2,
+     "type": "heading",
+     "units": [
+      {
+       "cites": [],
+       "id": "u0",
+       "kind": "heading",
+       "see": [],
+       "segments": [
+        {
+         "id": "s0",
+         "kind": "structural",
+         "span": [
+          0,
+          3
+         ],
+         "state": "neutral",
+         "text": "## "
+        },
+        {
+         "id": "s1",
+         "kind": "text",
+         "span": [
+          3,
+          7
+         ],
+         "state": "neutral",
+         "text": "本周销售"
+        }
+       ],
+       "span": [
+        3,
+        7
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b1",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [
+        "A2"
+       ],
+       "id": "u1",
+       "kind": "claim",
+       "see": [
+        {
+         "alias": "A2",
+         "eid": "ev:analysis:b11cf44f63eaa443",
+         "kind": "analysis",
+         "locator": {},
+         "ref": "A2",
+         "role": "support",
+         "status": "resolved"
+        }
+       ],
+       "segments": [
+        {
+         "id": "s2",
+         "kind": "structural",
+         "span": [
+          7,
+          9
+         ],
+         "state": "neutral",
+         "text": "\n\n"
+        },
+        {
+         "cite": {
+          "alias": "A2",
+          "eid": "ev:analysis:b11cf44f63eaa443",
+          "kind": "analysis",
+          "locator": {},
+          "ref": "A2",
+          "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+          "role": "value",
+          "status": "resolved"
+         },
+         "id": "s3",
+         "kind": "analysis",
+         "ref": "a:A2",
+         "span": [
+          9,
+          47
+         ],
+         "state": "deterministic",
+         "text": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）"
+        },
+        {
+         "id": "s4",
+         "kind": "text",
+         "span": [
+          47,
+          48
+         ],
+         "state": "neutral",
+         "text": "。"
+        }
+       ],
+       "span": [
+        9,
+        48
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b2",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [
+        "A1"
+       ],
+       "id": "u2",
+       "kind": "claim",
+       "see": [],
+       "segments": [
+        {
+         "id": "s5",
+         "kind": "structural",
+         "span": [
+          48,
+          50
+         ],
+         "state": "neutral",
+         "text": "\n\n"
+        },
+        {
+         "cite": {
+          "alias": "A1",
+          "eid": "ev:analysis:88367707fd963815",
+          "kind": "analysis",
+          "locator": {},
+          "ref": "A1",
+          "rendered": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+          "role": "value",
+          "status": "resolved"
+         },
+         "id": "s6",
+         "kind": "analysis",
+         "ref": "a:A1",
+         "span": [
+          50,
+          75
+         ],
+         "state": "deterministic",
+         "text": "波动基线没有做成：只有 0 期历史，至少要 8 期"
+        }
+       ],
+       "span": [
+        50,
+        75
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b3",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [
+        "A2"
+       ],
+       "id": "u3",
+       "kind": "claim",
+       "see": [],
+       "segments": [
+        {
+         "id": "s7",
+         "kind": "structural",
+         "span": [
+          75,
+          77
+         ],
+         "state": "neutral",
+         "text": "\n\n"
+        },
+        {
+         "id": "s8",
+         "kind": "text",
+         "span": [
+          77,
+          84
+         ],
+         "state": "neutral",
+         "text": "华东的变化为 "
+        },
+        {
+         "cite": {
+          "alias": "A2",
+          "eid": "ev:cell:8f04cbf82264a3bb",
+          "kind": "cell",
+          "locator": {
+           "column": "delta",
+           "row": 0
+          },
+          "ref": "A2.r0.delta",
+          "rendered": "-300",
+          "role": "value",
+          "status": "resolved",
+          "value": -300
+         },
+         "id": "s9",
+         "kind": "number",
+         "ref": "v:A2.r0.delta",
+         "span": [
+          84,
+          88
+         ],
+         "state": "deterministic",
+         "text": "-300"
+        },
+        {
+         "id": "s10",
+         "kind": "text",
+         "span": [
+          88,
+          89
+         ],
+         "state": "neutral",
+         "text": "。"
+        }
+       ],
+       "span": [
+        77,
+        89
+       ]
+      }
+     ]
+    },
+    {
+     "id": "b4",
+     "type": "table",
+     "units": [
+      {
+       "cites": [],
+       "id": "u4",
+       "kind": "connective",
+       "loc": {
+        "col": 0,
+        "row": -1
+       },
+       "see": [],
+       "segments": [
+        {
+         "id": "s11",
+         "kind": "structural",
+         "span": [
+          89,
+          93
+         ],
+         "state": "neutral",
+         "text": "\n\n| "
+        },
+        {
+         "id": "s12",
+         "kind": "text",
+         "span": [
+          93,
+          95
+         ],
+         "state": "neutral",
+         "text": "地区"
+        }
+       ],
+       "span": [
+        93,
+        95
+       ]
+      },
+      {
+       "cites": [],
+       "id": "u5",
+       "kind": "connective",
+       "loc": {
+        "col": 1,
+        "row": -1
+       },
+       "see": [],
+       "segments": [
+        {
+         "id": "s13",
+         "kind": "structural",
+         "span": [
+          95,
+          98
+         ],
+         "state": "neutral",
+         "text": " | "
+        },
+        {
+         "id": "s14",
+         "kind": "text",
+         "span": [
+          98,
+          100
+         ],
+         "state": "neutral",
+         "text": "变化"
+        }
+       ],
+       "span": [
+        98,
+        100
+       ]
+      },
+      {
+       "cites": [],
+       "id": "u6",
+       "kind": "connective",
+       "loc": {
+        "col": 0,
+        "row": 0
+       },
+       "see": [],
+       "segments": [
+        {
+         "id": "s15",
+         "kind": "structural",
+         "span": [
+          100,
+          115
+         ],
+         "state": "neutral",
+         "text": " |\n|---|---|\n| "
+        },
+        {
+         "id": "s16",
+         "kind": "text",
+         "span": [
+          115,
+          117
+         ],
+         "state": "neutral",
+         "text": "华东"
+        }
+       ],
+       "span": [
+        115,
+        117
+       ]
+      },
+      {
+       "cites": [
+        "A2"
+       ],
+       "id": "u7",
+       "kind": "claim",
+       "loc": {
+        "col": 1,
+        "row": 0
+       },
+       "see": [],
+       "segments": [
+        {
+         "id": "s17",
+         "kind": "structural",
+         "span": [
+          117,
+          120
+         ],
+         "state": "neutral",
+         "text": " | "
+        },
+        {
+         "cite": {
+          "alias": "A2",
+          "eid": "ev:cell:8f04cbf82264a3bb",
+          "kind": "cell",
+          "locator": {
+           "column": "delta",
+           "row": 0
+          },
+          "ref": "A2.r0.delta",
+          "rendered": "-300",
+          "role": "value",
+          "status": "resolved",
+          "value": -300
+         },
+         "id": "s18",
+         "kind": "number",
+         "ref": "v:A2.r0.delta",
+         "span": [
+          120,
+          124
+         ],
+         "state": "deterministic",
+         "text": "-300"
+        },
+        {
+         "id": "s19",
+         "kind": "structural",
+         "span": [
+          124,
+          126
+         ],
+         "state": "neutral",
+         "text": " |"
+        }
+       ],
+       "span": [
+        120,
+        124
+       ]
+      }
+     ]
+    }
+   ],
+   "catalog": {
+    "A1": {
+     "alias": "A1",
+     "artifact": "c3ab06e1330c51f0567f410f6275a2726a38cad2bd092e145dc6c70260545e9b",
+     "eid": "ev:analysis:88367707fd963815",
+     "exec": 1,
+     "inputs": [
+      "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e"
+     ],
+     "item": "wow",
+     "kind": "analysis",
+     "label": "波动基线 · 波动基线没有做成：只有 0 期历史，至少要 8 期",
+     "locator": {},
+     "mode": null,
+     "node_id": "card",
+     "op": "baseline",
+     "status": "refused",
+     "verdict": null
+    },
+    "A2": {
+     "alias": "A2",
+     "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+     "eid": "ev:analysis:b11cf44f63eaa443",
+     "exec": 1,
+     "inputs": [
+      "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9"
+     ],
+     "item": "where",
+     "kind": "analysis",
+     "label": "变化拆解（可加） · 销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+     "locator": {},
+     "mode": "additive",
+     "node_id": "card",
+     "op": "decompose",
+     "rows": 4,
+     "status": "ok",
+     "verdict": "driver"
+    },
+    "Q1": {
+     "alias": "Q1",
+     "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+     "columns": [
+      "week",
+      "gmv"
+     ],
+     "eid": "ev:query:30fcabb3fa33690b",
+     "exec": 1,
+     "kind": "query",
+     "label": "db_query__shop · 2 行",
+     "locator": {},
+     "node_id": "weekly",
+     "rows": 2,
+     "source": "shop",
+     "tool": "db_query__shop",
+     "truncated": false,
+     "via": "b1dacecebc489f096e7582673486790ee51a258afc93144289992bfa7f9eb59d"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+     "columns": [
+      "region",
+      "week",
+      "gmv"
+     ],
+     "eid": "ev:query:d3b62a2e9c2b52a7",
+     "exec": 1,
+     "kind": "query",
+     "label": "db_query__shop · 8 行",
+     "locator": {},
+     "node_id": "by_region",
+     "rows": 8,
+     "source": "shop",
+     "tool": "db_query__shop",
+     "truncated": false,
+     "via": "452f5b41122353bb5a478d4ba092e8321eb371edced6dbc6ccd0c920291eff54"
+    }
+   },
+   "entity_syntax": 2,
+   "markdown": "## 本周销售\n\n销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。\n\n波动基线没有做成：只有 0 期历史，至少要 8 期\n\n华东的变化为 -300。\n\n| 地区 | 变化 |\n|---|---|\n| 华东 | -300 |",
+   "node_id": "write",
+   "provenance": 1,
+   "run_id": "ffeb7bfbcde6480fbddb573a6c6558af",
+   "schema": "agentlab.report/1",
+   "source": "## 本周销售\n\n[[a:A2]]。[[see:A2]]\n\n[[a:A1]]\n\n华东的变化为 [[v:A2.r0.delta]]。\n\n| 地区 | 变化 |\n|---|---|\n| 华东 | [[v:A2.r0.delta]] |",
+   "stats": {
+    "analysis_claims": 0,
+    "claims": 4,
+    "connective": 3,
+    "entities": 0,
+    "headings": 1,
+    "numbers": 2,
+    "numbers_cited": 2,
+    "quotes": 0,
+    "see": 1,
+    "segments": 20,
+    "uncited_claims": 0,
+    "uncited_numbers": 0,
+    "units": 8,
+    "unknown_entities": 0,
+    "unresolved": 0,
+    "unverified_entities": 0,
+    "values": 2,
+    "violations": 0
+   },
+   "violations": []
+  },
+  "segments": {
+   "s3": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75"
+    },
+    "segment": {
+     "id": "s3",
+     "text": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+     "kind": "analysis",
+     "state": "deterministic",
+     "span": [
+      9,
+      47
+     ],
+     "unit": "u1",
+     "ref": "a:A2",
+     "cite": {
+      "alias": "A2",
+      "eid": "ev:analysis:b11cf44f63eaa443",
+      "kind": "analysis",
+      "locator": {},
+      "ref": "A2",
+      "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "role": "value",
+      "status": "resolved"
+     }
+    },
+    "unit": {
+     "id": "u1",
+     "kind": "claim",
+     "text": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。",
+     "span": [
+      9,
+      48
+     ],
+     "cites": [
+      "A2"
+     ],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b1",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A2",
+      "op": "decompose",
+      "mode": "additive",
+      "method_label": "变化拆解（可加）",
+      "origin": "card",
+      "item": "where",
+      "node_id": "card",
+      "label": "异动分析",
+      "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+      "eid": "ev:analysis:b11cf44f63eaa443",
+      "eid_ok": true,
+      "cited": {
+       "what": "phrase"
+      },
+      "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "criterion": "一段占总变化的一半以上算主要来源，最多前 2 段合计占 80% 以上算集中，总变化不到基期的 0.5% 算基本持平，各段之和要和总数对得上才判断变化来自哪里",
+      "verdict": {
+       "code": "driver",
+       "direction": "down",
+       "subjects": [
+        [
+         "华东"
+        ]
+       ]
+      },
+      "caveats": [
+       {
+        "code": "comparability",
+        "text": "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+       }
+      ],
+      "hypothesis": "下降是不是集中在某个地区",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A2",
+      "method": "decompose.additive@1",
+      "method_label": "变化拆解（可加）",
+      "params": {
+       "base": "2026-W41",
+       "by": [
+        "region"
+       ],
+       "catalog": {
+        "labels": {
+         "region": "地区",
+         "week": "周"
+        },
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "headline": {
+        "base": "weekly.r0.gmv",
+        "target": "weekly.r1.gmv"
+       },
+       "label": "销售额",
+       "measure": "gmv",
+       "period": "week",
+       "query": "by_region",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "main_share",
+        "label": "「主要来源」的占比",
+        "value": 0.5
+       },
+       {
+        "key": "concentration",
+        "label": "「集中」的合计占比",
+        "value": 0.8
+       },
+       {
+        "key": "offset_ratio",
+        "label": "记为「抵消」的比例",
+        "value": 0.25
+       },
+       {
+        "key": "flat_pct",
+        "label": "「基本持平」的幅度",
+        "value": 0.005
+       },
+       {
+        "key": "table_top_k",
+        "label": "列出前几段",
+        "value": 10
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A2",
+      "values": [
+       {
+        "key": "base_total",
+        "raw": "2700",
+        "rendered": "2,700"
+       },
+       {
+        "key": "delta_total",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_down",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_up",
+        "raw": "0",
+        "rendered": "0"
+       },
+       {
+        "key": "pct_total",
+        "raw": "-0.125925925926",
+        "rendered": "-0.1259259259"
+       },
+       {
+        "key": "segments",
+        "raw": "4",
+        "rendered": "4"
+       },
+       {
+        "key": "target_total",
+        "raw": "2360",
+        "rendered": "2,360"
+       },
+       {
+        "key": "top_k",
+        "raw": "1",
+        "rendered": "1"
+       },
+       {
+        "key": "top_k_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       },
+       {
+        "key": "top_key",
+        "raw": "华东",
+        "rendered": "华东"
+       },
+       {
+        "key": "top_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       }
+      ],
+      "formulas": [
+       {
+        "label": "总变化",
+        "text": "总变化 = 本期合计 − 基期合计 = 2,360 − 2,700 = -340"
+       },
+       {
+        "label": "变化率",
+        "text": "变化率 = 总变化 ÷ 基期合计 = -340 ÷ 2,700 = -12.6%"
+       },
+       {
+        "label": "占比",
+        "text": "华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%"
+       }
+      ],
+      "table": {
+       "columns": [
+        "region",
+        "base",
+        "target",
+        "delta",
+        "pct",
+        "share",
+        "flag"
+       ],
+       "labels": {
+        "base": "基期",
+        "delta": "变化",
+        "flag": "说明",
+        "pct": "变化率",
+        "region": "地区",
+        "share": "占变化的比重",
+        "target": "本期"
+       },
+       "total_rows": 4,
+       "row_index": [
+        0,
+        1,
+        2,
+        3
+       ],
+       "rows": [
+        [
+         "华东",
+         "1000",
+         "700",
+         "-300",
+         "-0.3",
+         "0.882352941176",
+         null
+        ],
+        [
+         "华南",
+         "800",
+         "780",
+         "-20",
+         "-0.025",
+         "0.0588235294118",
+         null
+        ],
+        [
+         "华北",
+         "600",
+         "590",
+         "-10",
+         "-0.0166666666667",
+         "0.0294117647059",
+         null
+        ],
+        [
+         "西南",
+         "300",
+         "290",
+         "-10",
+         "-0.0333333333333",
+         "0.0294117647059",
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": []
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "weekly.r0.gmv",
+      "role": "headline_base",
+      "role_label": "基期总数",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "row": 0,
+      "column": "gmv",
+      "value": "2700",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "base_total",
+       "total": "2,700",
+       "headline": "2,700",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "weekly.r1.gmv",
+      "role": "headline_target",
+      "role_label": "本期总数",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "row": 1,
+      "column": "gmv",
+      "value": "2360",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "target_total",
+       "total": "2,360",
+       "headline": "2,360",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "by_region",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "by_region",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "node_id": "weekly",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+      "node_id": "by_region",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "region",
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "region"
+        ],
+        [
+         1,
+         "region"
+        ],
+        [
+         2,
+         "region"
+        ],
+        [
+         3,
+         "region"
+        ],
+        [
+         4,
+         "region"
+        ],
+        [
+         5,
+         "region"
+        ],
+        [
+         6,
+         "region"
+        ],
+        [
+         7,
+         "region"
+        ],
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A2",
+      "method": "decompose.additive@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A2",
+      "node_id": "card",
+      "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "note": "判定语由系统按平台的方法算出判定、按模板写成，未经模型转写；判定标准、计算过程、输入和复算见出处链。判定只说明变化来自哪里，不说明原因",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s6": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75"
+    },
+    "segment": {
+     "id": "s6",
+     "text": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+     "kind": "analysis",
+     "state": "deterministic",
+     "span": [
+      50,
+      75
+     ],
+     "unit": "u2",
+     "ref": "a:A1",
+     "cite": {
+      "alias": "A1",
+      "eid": "ev:analysis:88367707fd963815",
+      "kind": "analysis",
+      "locator": {},
+      "ref": "A1",
+      "rendered": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "role": "value",
+      "status": "resolved"
+     }
+    },
+    "unit": {
+     "id": "u2",
+     "kind": "claim",
+     "text": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+     "span": [
+      50,
+      75
+     ],
+     "cites": [
+      "A1"
+     ],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b2",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A1",
+      "op": "baseline",
+      "mode": null,
+      "method_label": "波动基线",
+      "origin": "card",
+      "item": "wow",
+      "node_id": "card",
+      "label": "异动分析",
+      "artifact": "c3ab06e1330c51f0567f410f6275a2726a38cad2bd092e145dc6c70260545e9b",
+      "eid": "ev:analysis:88367707fd963815",
+      "eid_ok": true,
+      "cited": {
+       "what": "phrase"
+      },
+      "rendered": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "refused",
+      "reason_code": "history_short",
+      "reason": "只有 0 期历史，至少要 8 期",
+      "phrase": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "criterion": "本期和过去最多 52 期的中位数比，差不到 2 倍稳健标准差（1.4826 倍的中位绝对偏差）算常规波动，2 到 3 倍算超出，3 倍以上算明显超出；历史至少要 8 期",
+      "verdict": null,
+      "caveats": []
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A1",
+      "method": "baseline.robust@1",
+      "method_label": "波动基线",
+      "params": {
+       "basis": "change",
+       "grain": "week",
+       "label": "销售额",
+       "lag": 1,
+       "measure": "gmv",
+       "period": "week",
+       "query": "weekly",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "k_warn",
+        "label": "「超出常规波动」的倍数",
+        "value": 2.0
+       },
+       {
+        "key": "k_alert",
+        "label": "「明显超出」的倍数",
+        "value": 3.0
+       },
+       {
+        "key": "min_history",
+        "label": "至少几期历史",
+        "value": 8
+       },
+       {
+        "key": "max_history",
+        "label": "最多用几期历史",
+        "value": 52
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A1",
+      "values": [],
+      "formulas": []
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "weekly",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "node_id": "weekly",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A1",
+      "method": "baseline.robust@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A1",
+      "node_id": "card",
+      "artifact": "c3ab06e1330c51f0567f410f6275a2726a38cad2bd092e145dc6c70260545e9b",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "note": "判定语由系统按平台的方法算出判定、按模板写成，未经模型转写；判定标准、计算过程、输入和复算见出处链。判定只说明变化来自哪里，不说明原因",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s9": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75"
+    },
+    "segment": {
+     "id": "s9",
+     "text": "-300",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      84,
+      88
+     ],
+     "unit": "u3",
+     "ref": "v:A2.r0.delta",
+     "cite": {
+      "alias": "A2",
+      "eid": "ev:cell:8f04cbf82264a3bb",
+      "kind": "cell",
+      "locator": {
+       "column": "delta",
+       "row": 0
+      },
+      "ref": "A2.r0.delta",
+      "rendered": "-300",
+      "role": "value",
+      "status": "resolved",
+      "value": -300
+     }
+    },
+    "unit": {
+     "id": "u3",
+     "kind": "claim",
+     "text": "华东的变化为 -300。",
+     "span": [
+      77,
+      89
+     ],
+     "cites": [
+      "A2"
+     ],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b3",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A2",
+      "op": "decompose",
+      "mode": "additive",
+      "method_label": "变化拆解（可加）",
+      "origin": "card",
+      "item": "where",
+      "node_id": "card",
+      "label": "异动分析",
+      "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+      "eid": "ev:analysis:b11cf44f63eaa443",
+      "eid_ok": true,
+      "cited": {
+       "what": "cell",
+       "row": 0,
+       "column": "delta",
+       "raw": "-300"
+      },
+      "rendered": "-300",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "criterion": "一段占总变化的一半以上算主要来源，最多前 2 段合计占 80% 以上算集中，总变化不到基期的 0.5% 算基本持平，各段之和要和总数对得上才判断变化来自哪里",
+      "verdict": {
+       "code": "driver",
+       "direction": "down",
+       "subjects": [
+        [
+         "华东"
+        ]
+       ]
+      },
+      "caveats": [
+       {
+        "code": "comparability",
+        "text": "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+       }
+      ],
+      "hypothesis": "下降是不是集中在某个地区",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A2",
+      "method": "decompose.additive@1",
+      "method_label": "变化拆解（可加）",
+      "params": {
+       "base": "2026-W41",
+       "by": [
+        "region"
+       ],
+       "catalog": {
+        "labels": {
+         "region": "地区",
+         "week": "周"
+        },
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "headline": {
+        "base": "weekly.r0.gmv",
+        "target": "weekly.r1.gmv"
+       },
+       "label": "销售额",
+       "measure": "gmv",
+       "period": "week",
+       "query": "by_region",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "main_share",
+        "label": "「主要来源」的占比",
+        "value": 0.5
+       },
+       {
+        "key": "concentration",
+        "label": "「集中」的合计占比",
+        "value": 0.8
+       },
+       {
+        "key": "offset_ratio",
+        "label": "记为「抵消」的比例",
+        "value": 0.25
+       },
+       {
+        "key": "flat_pct",
+        "label": "「基本持平」的幅度",
+        "value": 0.005
+       },
+       {
+        "key": "table_top_k",
+        "label": "列出前几段",
+        "value": 10
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A2",
+      "values": [
+       {
+        "key": "base_total",
+        "raw": "2700",
+        "rendered": "2,700"
+       },
+       {
+        "key": "delta_total",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_down",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_up",
+        "raw": "0",
+        "rendered": "0"
+       },
+       {
+        "key": "pct_total",
+        "raw": "-0.125925925926",
+        "rendered": "-0.1259259259"
+       },
+       {
+        "key": "segments",
+        "raw": "4",
+        "rendered": "4"
+       },
+       {
+        "key": "target_total",
+        "raw": "2360",
+        "rendered": "2,360"
+       },
+       {
+        "key": "top_k",
+        "raw": "1",
+        "rendered": "1"
+       },
+       {
+        "key": "top_k_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       },
+       {
+        "key": "top_key",
+        "raw": "华东",
+        "rendered": "华东"
+       },
+       {
+        "key": "top_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       }
+      ],
+      "formulas": [
+       {
+        "label": "总变化",
+        "text": "总变化 = 本期合计 − 基期合计 = 2,360 − 2,700 = -340"
+       },
+       {
+        "label": "变化率",
+        "text": "变化率 = 总变化 ÷ 基期合计 = -340 ÷ 2,700 = -12.6%"
+       },
+       {
+        "label": "占比",
+        "text": "华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%"
+       }
+      ],
+      "table": {
+       "columns": [
+        "region",
+        "base",
+        "target",
+        "delta",
+        "pct",
+        "share",
+        "flag"
+       ],
+       "labels": {
+        "base": "基期",
+        "delta": "变化",
+        "flag": "说明",
+        "pct": "变化率",
+        "region": "地区",
+        "share": "占变化的比重",
+        "target": "本期"
+       },
+       "total_rows": 4,
+       "row_index": [
+        0,
+        1,
+        2,
+        3
+       ],
+       "rows": [
+        [
+         "华东",
+         "1000",
+         "700",
+         "-300",
+         "-0.3",
+         "0.882352941176",
+         null
+        ],
+        [
+         "华南",
+         "800",
+         "780",
+         "-20",
+         "-0.025",
+         "0.0588235294118",
+         null
+        ],
+        [
+         "华北",
+         "600",
+         "590",
+         "-10",
+         "-0.0166666666667",
+         "0.0294117647059",
+         null
+        ],
+        [
+         "西南",
+         "300",
+         "290",
+         "-10",
+         "-0.0333333333333",
+         "0.0294117647059",
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": [
+         [
+          0,
+          "delta"
+         ]
+        ]
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "weekly.r0.gmv",
+      "role": "headline_base",
+      "role_label": "基期总数",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "row": 0,
+      "column": "gmv",
+      "value": "2700",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "base_total",
+       "total": "2,700",
+       "headline": "2,700",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "weekly.r1.gmv",
+      "role": "headline_target",
+      "role_label": "本期总数",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "row": 1,
+      "column": "gmv",
+      "value": "2360",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "target_total",
+       "total": "2,360",
+       "headline": "2,360",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "by_region",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "by_region",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "node_id": "weekly",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+      "node_id": "by_region",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "region",
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "region"
+        ],
+        [
+         1,
+         "region"
+        ],
+        [
+         2,
+         "region"
+        ],
+        [
+         3,
+         "region"
+        ],
+        [
+         4,
+         "region"
+        ],
+        [
+         5,
+         "region"
+        ],
+        [
+         6,
+         "region"
+        ],
+        [
+         7,
+         "region"
+        ],
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A2",
+      "method": "decompose.additive@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A2",
+      "node_id": "card",
+      "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "note": "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "s18": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75"
+    },
+    "segment": {
+     "id": "s18",
+     "text": "-300",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      120,
+      124
+     ],
+     "unit": "u7",
+     "ref": "v:A2.r0.delta",
+     "cite": {
+      "alias": "A2",
+      "eid": "ev:cell:8f04cbf82264a3bb",
+      "kind": "cell",
+      "locator": {
+       "column": "delta",
+       "row": 0
+      },
+      "ref": "A2.r0.delta",
+      "rendered": "-300",
+      "role": "value",
+      "status": "resolved",
+      "value": -300
+     }
+    },
+    "unit": {
+     "id": "u7",
+     "kind": "claim",
+     "text": "-300",
+     "span": [
+      120,
+      124
+     ],
+     "cites": [
+      "A2"
+     ],
+     "on_demand": {
+      "available": false,
+      "reason": "not_a_claim",
+      "message": "这句不是结论句（标题、连接性文字、表格单元格或代码），无需模型裁判"
+     }
+    },
+    "block": {
+     "id": "b4",
+     "type": "table"
+    },
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A2",
+      "op": "decompose",
+      "mode": "additive",
+      "method_label": "变化拆解（可加）",
+      "origin": "card",
+      "item": "where",
+      "node_id": "card",
+      "label": "异动分析",
+      "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+      "eid": "ev:analysis:b11cf44f63eaa443",
+      "eid_ok": true,
+      "cited": {
+       "what": "cell",
+       "row": 0,
+       "column": "delta",
+       "raw": "-300"
+      },
+      "rendered": "-300",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "criterion": "一段占总变化的一半以上算主要来源，最多前 2 段合计占 80% 以上算集中，总变化不到基期的 0.5% 算基本持平，各段之和要和总数对得上才判断变化来自哪里",
+      "verdict": {
+       "code": "driver",
+       "direction": "down",
+       "subjects": [
+        [
+         "华东"
+        ]
+       ]
+      },
+      "caveats": [
+       {
+        "code": "comparability",
+        "text": "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+       }
+      ],
+      "hypothesis": "下降是不是集中在某个地区",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A2",
+      "method": "decompose.additive@1",
+      "method_label": "变化拆解（可加）",
+      "params": {
+       "base": "2026-W41",
+       "by": [
+        "region"
+       ],
+       "catalog": {
+        "labels": {
+         "region": "地区",
+         "week": "周"
+        },
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "headline": {
+        "base": "weekly.r0.gmv",
+        "target": "weekly.r1.gmv"
+       },
+       "label": "销售额",
+       "measure": "gmv",
+       "period": "week",
+       "query": "by_region",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "main_share",
+        "label": "「主要来源」的占比",
+        "value": 0.5
+       },
+       {
+        "key": "concentration",
+        "label": "「集中」的合计占比",
+        "value": 0.8
+       },
+       {
+        "key": "offset_ratio",
+        "label": "记为「抵消」的比例",
+        "value": 0.25
+       },
+       {
+        "key": "flat_pct",
+        "label": "「基本持平」的幅度",
+        "value": 0.005
+       },
+       {
+        "key": "table_top_k",
+        "label": "列出前几段",
+        "value": 10
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A2",
+      "values": [
+       {
+        "key": "base_total",
+        "raw": "2700",
+        "rendered": "2,700"
+       },
+       {
+        "key": "delta_total",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_down",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_up",
+        "raw": "0",
+        "rendered": "0"
+       },
+       {
+        "key": "pct_total",
+        "raw": "-0.125925925926",
+        "rendered": "-0.1259259259"
+       },
+       {
+        "key": "segments",
+        "raw": "4",
+        "rendered": "4"
+       },
+       {
+        "key": "target_total",
+        "raw": "2360",
+        "rendered": "2,360"
+       },
+       {
+        "key": "top_k",
+        "raw": "1",
+        "rendered": "1"
+       },
+       {
+        "key": "top_k_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       },
+       {
+        "key": "top_key",
+        "raw": "华东",
+        "rendered": "华东"
+       },
+       {
+        "key": "top_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       }
+      ],
+      "formulas": [
+       {
+        "label": "总变化",
+        "text": "总变化 = 本期合计 − 基期合计 = 2,360 − 2,700 = -340"
+       },
+       {
+        "label": "变化率",
+        "text": "变化率 = 总变化 ÷ 基期合计 = -340 ÷ 2,700 = -12.6%"
+       },
+       {
+        "label": "占比",
+        "text": "华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%"
+       }
+      ],
+      "table": {
+       "columns": [
+        "region",
+        "base",
+        "target",
+        "delta",
+        "pct",
+        "share",
+        "flag"
+       ],
+       "labels": {
+        "base": "基期",
+        "delta": "变化",
+        "flag": "说明",
+        "pct": "变化率",
+        "region": "地区",
+        "share": "占变化的比重",
+        "target": "本期"
+       },
+       "total_rows": 4,
+       "row_index": [
+        0,
+        1,
+        2,
+        3
+       ],
+       "rows": [
+        [
+         "华东",
+         "1000",
+         "700",
+         "-300",
+         "-0.3",
+         "0.882352941176",
+         null
+        ],
+        [
+         "华南",
+         "800",
+         "780",
+         "-20",
+         "-0.025",
+         "0.0588235294118",
+         null
+        ],
+        [
+         "华北",
+         "600",
+         "590",
+         "-10",
+         "-0.0166666666667",
+         "0.0294117647059",
+         null
+        ],
+        [
+         "西南",
+         "300",
+         "290",
+         "-10",
+         "-0.0333333333333",
+         "0.0294117647059",
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": [
+         [
+          0,
+          "delta"
+         ]
+        ]
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "weekly.r0.gmv",
+      "role": "headline_base",
+      "role_label": "基期总数",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "row": 0,
+      "column": "gmv",
+      "value": "2700",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "base_total",
+       "total": "2,700",
+       "headline": "2,700",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "weekly.r1.gmv",
+      "role": "headline_target",
+      "role_label": "本期总数",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "row": 1,
+      "column": "gmv",
+      "value": "2360",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "target_total",
+       "total": "2,360",
+       "headline": "2,360",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "by_region",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "by_region",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "node_id": "weekly",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+      "node_id": "by_region",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "region",
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "region"
+        ],
+        [
+         1,
+         "region"
+        ],
+        [
+         2,
+         "region"
+        ],
+        [
+         3,
+         "region"
+        ],
+        [
+         4,
+         "region"
+        ],
+        [
+         5,
+         "region"
+        ],
+        [
+         6,
+         "region"
+        ],
+        [
+         7,
+         "region"
+        ],
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A2",
+      "method": "decompose.additive@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A2",
+      "node_id": "card",
+      "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "note": "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "graph": {
+   "run_id": "ffeb7bfbcde6480fbddb573a6c6558af",
+   "schema": "agentlab.evidence/1",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 39,
+    "legacy": false
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75",
+     "doc_sealed": true,
+     "hash_ok": true,
+     "ok": true,
+     "repairs": 0,
+     "fields": [
+      "周报"
+     ],
+     "stats": {
+      "analysis_claims": 0,
+      "claims": 4,
+      "connective": 3,
+      "entities": 0,
+      "headings": 1,
+      "numbers": 2,
+      "numbers_cited": 2,
+      "quotes": 0,
+      "see": 1,
+      "segments": 20,
+      "uncited_claims": 0,
+      "uncited_numbers": 0,
+      "units": 8,
+      "unknown_entities": 0,
+      "unresolved": 0,
+      "unverified_entities": 0,
+      "values": 2,
+      "violations": 0
+     },
+     "claims": "off",
+     "judge": null,
+     "post_seal_verdicts": {},
+     "judge_meta": null
+    }
+   ],
+   "evidence": [
+    {
+     "alias": "A1",
+     "eid": "ev:analysis:88367707fd963815",
+     "kind": "analysis",
+     "label": "波动基线 · 波动基线没有做成：只有 0 期历史，至少要 8 期",
+     "node_id": "card",
+     "artifact": "c3ab06e1330c51f0567f410f6275a2726a38cad2bd092e145dc6c70260545e9b",
+     "sealed": true,
+     "cited_by": [
+      "s6"
+     ],
+     "units": [
+      "u2"
+     ],
+     "report": "write",
+     "op": "baseline",
+     "status": "refused",
+     "item": "wow"
+    },
+    {
+     "alias": "A2",
+     "eid": "ev:analysis:b11cf44f63eaa443",
+     "kind": "analysis",
+     "label": "变化拆解（可加） · 销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+     "node_id": "card",
+     "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+     "sealed": true,
+     "cited_by": [
+      "s3",
+      "s9",
+      "s18"
+     ],
+     "units": [
+      "u1",
+      "u3",
+      "u7"
+     ],
+     "report": "write",
+     "op": "decompose",
+     "mode": "additive",
+     "status": "ok",
+     "verdict": "driver",
+     "item": "where"
+    },
+    {
+     "alias": "Q1",
+     "eid": "ev:query:30fcabb3fa33690b",
+     "kind": "query",
+     "label": "db_query__shop · 2 行",
+     "node_id": "weekly",
+     "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+     "sealed": true,
+     "cited_by": [],
+     "units": [],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "week",
+      "gmv"
+     ],
+     "rows": 2,
+     "truncated": false
+    },
+    {
+     "alias": "Q2",
+     "eid": "ev:query:d3b62a2e9c2b52a7",
+     "kind": "query",
+     "label": "db_query__shop · 8 行",
+     "node_id": "by_region",
+     "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+     "sealed": true,
+     "cited_by": [],
+     "units": [],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "region",
+      "week",
+      "gmv"
+     ],
+     "rows": 8,
+     "truncated": false
+    }
+   ],
+   "edges": [
+    {
+     "from": "s3",
+     "to": "A2",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "u1",
+     "to": "A2",
+     "rel": "supports",
+     "report": "write"
+    },
+    {
+     "from": "s6",
+     "to": "A1",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s9",
+     "to": "A2",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "s18",
+     "to": "A2",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "A1",
+     "to": "Q1",
+     "rel": "derived_from",
+     "report": "write"
+    },
+    {
+     "from": "A2",
+     "to": "Q1",
+     "rel": "derived_from",
+     "report": "write"
+    },
+    {
+     "from": "A2",
+     "to": "Q2",
+     "rel": "derived_from",
+     "report": "write"
+    },
+    {
+     "from": "A2.r0.delta",
+     "to": "A2",
+     "rel": "cell_of",
+     "report": "write"
+    }
+   ],
+   "mode": "cited"
+  },
+  "audit": {
+   "run_id": "ffeb7bfbcde6480fbddb573a6c6558af",
+   "schema": "agentlab.evidence.audit/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 39,
+    "legacy": false,
+    "events": 25,
+    "message": "事件记录与封存时一致"
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75",
+     "hash_ok": true,
+     "doc_sealed": true,
+     "fields": [
+      "周报"
+     ],
+     "stats": {
+      "analysis_claims": 0,
+      "claims": 4,
+      "connective": 3,
+      "entities": 0,
+      "headings": 1,
+      "numbers": 2,
+      "numbers_cited": 2,
+      "quotes": 0,
+      "see": 1,
+      "segments": 20,
+      "uncited_claims": 0,
+      "uncited_numbers": 0,
+      "units": 8,
+      "unknown_entities": 0,
+      "unresolved": 0,
+      "unverified_entities": 0,
+      "values": 2,
+      "violations": 0
+     },
+     "claims": "off",
+     "judge": null,
+     "post_seal_verdicts": {},
+     "judge_meta": null
+    }
+   ],
+   "groups": [
+    {
+     "key": "cited",
+     "label": "有出处",
+     "count": 4,
+     "rows": [
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "周报",
+       "segment": "s3",
+       "unit": "u1",
+       "kind": "analysis",
+       "text": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "a:A2",
+       "alias": "A2",
+       "evidence_kind": "analysis",
+       "evidence": "变化拆解（可加） · 销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+       "eid": "ev:analysis:b11cf44f63eaa443",
+       "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+       "node_id": "card",
+       "sealed": true,
+       "span": [
+        9,
+        47
+       ],
+       "sentence": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。",
+       "note": "判定语由系统按平台的方法算出判定、按模板写成，未经模型转写；判定标准、计算过程、输入和复算见出处链。判定只说明变化来自哪里，不说明原因"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "周报",
+       "segment": "s6",
+       "unit": "u2",
+       "kind": "analysis",
+       "text": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "a:A1",
+       "alias": "A1",
+       "evidence_kind": "analysis",
+       "evidence": "波动基线 · 波动基线没有做成：只有 0 期历史，至少要 8 期",
+       "eid": "ev:analysis:88367707fd963815",
+       "artifact": "c3ab06e1330c51f0567f410f6275a2726a38cad2bd092e145dc6c70260545e9b",
+       "node_id": "card",
+       "sealed": true,
+       "span": [
+        50,
+        75
+       ],
+       "sentence": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+       "note": "判定语由系统按平台的方法算出判定、按模板写成，未经模型转写；判定标准、计算过程、输入和复算见出处链。判定只说明变化来自哪里，不说明原因"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "周报",
+       "segment": "s9",
+       "unit": "u3",
+       "kind": "number",
+       "text": "-300",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "v:A2.r0.delta",
+       "alias": "A2",
+       "evidence_kind": "analysis",
+       "evidence": "A2.r0.delta",
+       "eid": "ev:cell:8f04cbf82264a3bb",
+       "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+       "node_id": "card",
+       "sealed": true,
+       "span": [
+        84,
+        88
+       ],
+       "sentence": "华东的变化为 -300。",
+       "note": "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写"
+      },
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "周报",
+       "segment": "s18",
+       "unit": "u7",
+       "kind": "number",
+       "text": "-300",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "v:A2.r0.delta",
+       "alias": "A2",
+       "evidence_kind": "analysis",
+       "evidence": "A2.r0.delta",
+       "eid": "ev:cell:8f04cbf82264a3bb",
+       "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+       "node_id": "card",
+       "sealed": true,
+       "span": [
+        120,
+        124
+       ],
+       "sentence": "-300",
+       "note": "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写"
+      }
+     ]
+    },
+    {
+     "key": "none",
+     "label": "无证据",
+     "count": 0,
+     "rows": []
+    },
+    {
+     "key": "suspicious",
+     "label": "可疑名称",
+     "count": 0,
+     "rows": []
+    },
+    {
+     "key": "candidate",
+     "label": "按数值猜测",
+     "count": 0,
+     "rows": []
+    }
+   ],
+   "counts": {
+    "cited": 4,
+    "none": 0,
+    "suspicious": 0,
+    "candidate": 0
+   },
+   "total": 4
+  },
+  "analyses": {
+   "A1": {
+    "run_id": "ffeb7bfbcde6480fbddb573a6c6558af",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75"
+    },
+    "alias": "A1",
+    "rendered": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A1",
+      "op": "baseline",
+      "mode": null,
+      "method_label": "波动基线",
+      "origin": "card",
+      "item": "wow",
+      "node_id": "card",
+      "label": "异动分析",
+      "artifact": "c3ab06e1330c51f0567f410f6275a2726a38cad2bd092e145dc6c70260545e9b",
+      "eid": "ev:analysis:88367707fd963815",
+      "eid_ok": true,
+      "cited": {
+       "what": "phrase"
+      },
+      "rendered": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "refused",
+      "reason_code": "history_short",
+      "reason": "只有 0 期历史，至少要 8 期",
+      "phrase": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+      "criterion": "本期和过去最多 52 期的中位数比，差不到 2 倍稳健标准差（1.4826 倍的中位绝对偏差）算常规波动，2 到 3 倍算超出，3 倍以上算明显超出；历史至少要 8 期",
+      "verdict": null,
+      "caveats": []
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A1",
+      "method": "baseline.robust@1",
+      "method_label": "波动基线",
+      "params": {
+       "basis": "change",
+       "grain": "week",
+       "label": "销售额",
+       "lag": 1,
+       "measure": "gmv",
+       "period": "week",
+       "query": "weekly",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "k_warn",
+        "label": "「超出常规波动」的倍数",
+        "value": 2.0
+       },
+       {
+        "key": "k_alert",
+        "label": "「明显超出」的倍数",
+        "value": 3.0
+       },
+       {
+        "key": "min_history",
+        "label": "至少几期历史",
+        "value": 8
+       },
+       {
+        "key": "max_history",
+        "label": "最多用几期历史",
+        "value": 52
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A1",
+      "values": [],
+      "formulas": []
+     },
+     {
+      "step": "analysis_input",
+      "of": "A1",
+      "ref": "weekly",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "node_id": "weekly",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A1"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A1",
+      "method": "baseline.robust@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A1",
+      "node_id": "card",
+      "artifact": "c3ab06e1330c51f0567f410f6275a2726a38cad2bd092e145dc6c70260545e9b",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   },
+   "A2": {
+    "run_id": "ffeb7bfbcde6480fbddb573a6c6558af",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75"
+    },
+    "alias": "A2",
+    "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+    "chain": [
+     {
+      "step": "analysis",
+      "alias": "A2",
+      "op": "decompose",
+      "mode": "additive",
+      "method_label": "变化拆解（可加）",
+      "origin": "card",
+      "item": "where",
+      "node_id": "card",
+      "label": "异动分析",
+      "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+      "eid": "ev:analysis:b11cf44f63eaa443",
+      "eid_ok": true,
+      "cited": {
+       "what": "phrase"
+      },
+      "rendered": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "render_ok": true,
+      "hash_ok": true,
+      "status": "ok",
+      "reason_code": null,
+      "reason": null,
+      "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+      "criterion": "一段占总变化的一半以上算主要来源，最多前 2 段合计占 80% 以上算集中，总变化不到基期的 0.5% 算基本持平，各段之和要和总数对得上才判断变化来自哪里",
+      "verdict": {
+       "code": "driver",
+       "direction": "down",
+       "subjects": [
+        [
+         "华东"
+        ]
+       ]
+      },
+      "caveats": [
+       {
+        "code": "comparability",
+        "text": "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+       }
+      ],
+      "hypothesis": "下降是不是集中在某个地区",
+      "hypothesis_note": "Agent 写的假设：说明这次在验证什么，不是分析结论，也不进报告正文"
+     },
+     {
+      "step": "analysis_method",
+      "alias": "A2",
+      "method": "decompose.additive@1",
+      "method_label": "变化拆解（可加）",
+      "params": {
+       "base": "2026-W41",
+       "by": [
+        "region"
+       ],
+       "catalog": {
+        "labels": {
+         "region": "地区",
+         "week": "周"
+        },
+        "measures": {
+         "gmv": "flow"
+        }
+       },
+       "headline": {
+        "base": "weekly.r0.gmv",
+        "target": "weekly.r1.gmv"
+       },
+       "label": "销售额",
+       "measure": "gmv",
+       "period": "week",
+       "query": "by_region",
+       "target": "2026-W42",
+       "today": "2026-10-21"
+      },
+      "settings": [
+       {
+        "key": "main_share",
+        "label": "「主要来源」的占比",
+        "value": 0.5
+       },
+       {
+        "key": "concentration",
+        "label": "「集中」的合计占比",
+        "value": 0.8
+       },
+       {
+        "key": "offset_ratio",
+        "label": "记为「抵消」的比例",
+        "value": 0.25
+       },
+       {
+        "key": "flat_pct",
+        "label": "「基本持平」的幅度",
+        "value": 0.005
+       },
+       {
+        "key": "table_top_k",
+        "label": "列出前几段",
+        "value": 10
+       }
+      ],
+      "probes": []
+     },
+     {
+      "step": "analysis_calc",
+      "alias": "A2",
+      "values": [
+       {
+        "key": "base_total",
+        "raw": "2700",
+        "rendered": "2,700"
+       },
+       {
+        "key": "delta_total",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_down",
+        "raw": "-340",
+        "rendered": "-340"
+       },
+       {
+        "key": "gross_up",
+        "raw": "0",
+        "rendered": "0"
+       },
+       {
+        "key": "pct_total",
+        "raw": "-0.125925925926",
+        "rendered": "-0.1259259259"
+       },
+       {
+        "key": "segments",
+        "raw": "4",
+        "rendered": "4"
+       },
+       {
+        "key": "target_total",
+        "raw": "2360",
+        "rendered": "2,360"
+       },
+       {
+        "key": "top_k",
+        "raw": "1",
+        "rendered": "1"
+       },
+       {
+        "key": "top_k_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       },
+       {
+        "key": "top_key",
+        "raw": "华东",
+        "rendered": "华东"
+       },
+       {
+        "key": "top_share",
+        "raw": "0.882352941176",
+        "rendered": "0.8823529412"
+       }
+      ],
+      "formulas": [
+       {
+        "label": "总变化",
+        "text": "总变化 = 本期合计 − 基期合计 = 2,360 − 2,700 = -340"
+       },
+       {
+        "label": "变化率",
+        "text": "变化率 = 总变化 ÷ 基期合计 = -340 ÷ 2,700 = -12.6%"
+       },
+       {
+        "label": "占比",
+        "text": "华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%"
+       }
+      ],
+      "table": {
+       "columns": [
+        "region",
+        "base",
+        "target",
+        "delta",
+        "pct",
+        "share",
+        "flag"
+       ],
+       "labels": {
+        "base": "基期",
+        "delta": "变化",
+        "flag": "说明",
+        "pct": "变化率",
+        "region": "地区",
+        "share": "占变化的比重",
+        "target": "本期"
+       },
+       "total_rows": 4,
+       "row_index": [
+        0,
+        1,
+        2,
+        3
+       ],
+       "rows": [
+        [
+         "华东",
+         "1000",
+         "700",
+         "-300",
+         "-0.3",
+         "0.882352941176",
+         null
+        ],
+        [
+         "华南",
+         "800",
+         "780",
+         "-20",
+         "-0.025",
+         "0.0588235294118",
+         null
+        ],
+        [
+         "华北",
+         "600",
+         "590",
+         "-10",
+         "-0.0166666666667",
+         "0.0294117647059",
+         null
+        ],
+        [
+         "西南",
+         "300",
+         "290",
+         "-10",
+         "-0.0333333333333",
+         "0.0294117647059",
+         null
+        ]
+       ],
+       "masked": [],
+       "highlight": {
+        "cells": []
+       }
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "weekly.r0.gmv",
+      "role": "headline_base",
+      "role_label": "基期总数",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "row": 0,
+      "column": "gmv",
+      "value": "2700",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "base_total",
+       "total": "2,700",
+       "headline": "2,700",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "weekly.r1.gmv",
+      "role": "headline_target",
+      "role_label": "本期总数",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "row": 1,
+      "column": "gmv",
+      "value": "2360",
+      "query": "Q1",
+      "node_id": "weekly",
+      "sealed": true,
+      "closure": {
+       "mode": "additive",
+       "total_key": "target_total",
+       "total": "2,360",
+       "headline": "2,360",
+       "closed": true
+      }
+     },
+     {
+      "step": "analysis_input",
+      "of": "A2",
+      "ref": "by_region",
+      "role": "data",
+      "role_label": "数据",
+      "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": "all",
+      "query": "Q2",
+      "node_id": "by_region",
+      "sealed": true
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "ec8a1a81d76fc960f4028b7e93e60e32cc84be7249edf18ef550970a6c59611e",
+      "node_id": "weekly",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "2026-W41",
+        2700
+       ],
+       [
+        "2026-W42",
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1
+      ],
+      "total_rows": 2,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "81b47f64b0d0919842039e3492a594d69dea9a25e7f6b93ff0efc3d5bebbd0a9",
+      "node_id": "by_region",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": [
+       [
+        "华东",
+        "2026-W41",
+        1000
+       ],
+       [
+        "华东",
+        "2026-W42",
+        700
+       ],
+       [
+        "华北",
+        "2026-W41",
+        600
+       ],
+       [
+        "华北",
+        "2026-W42",
+        590
+       ],
+       [
+        "华南",
+        "2026-W41",
+        800
+       ],
+       [
+        "华南",
+        "2026-W42",
+        780
+       ],
+       [
+        "西南",
+        "2026-W41",
+        300
+       ],
+       [
+        "西南",
+        "2026-W42",
+        290
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7
+      ],
+      "total_rows": 8,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+       ],
+       "cols": [
+        "region",
+        "week",
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "region"
+        ],
+        [
+         1,
+         "region"
+        ],
+        [
+         2,
+         "region"
+        ],
+        [
+         3,
+         "region"
+        ],
+        [
+         4,
+         "region"
+        ],
+        [
+         5,
+         "region"
+        ],
+        [
+         6,
+         "region"
+        ],
+        [
+         7,
+         "region"
+        ],
+        [
+         0,
+         "week"
+        ],
+        [
+         1,
+         "week"
+        ],
+        [
+         2,
+         "week"
+        ],
+        [
+         3,
+         "week"
+        ],
+        [
+         4,
+         "week"
+        ],
+        [
+         5,
+         "week"
+        ],
+        [
+         6,
+         "week"
+        ],
+        [
+         7,
+         "week"
+        ],
+        [
+         0,
+         "gmv"
+        ],
+        [
+         1,
+         "gmv"
+        ],
+        [
+         2,
+         "gmv"
+        ],
+        [
+         3,
+         "gmv"
+        ],
+        [
+         4,
+         "gmv"
+        ],
+        [
+         5,
+         "gmv"
+        ],
+        [
+         6,
+         "gmv"
+        ],
+        [
+         7,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number",
+       "region": "text",
+       "week": "text"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ],
+      "input_of": "A2"
+     },
+     {
+      "step": "analysis_recompute",
+      "alias": "A2",
+      "method": "decompose.additive@1",
+      "status": "same",
+      "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+     },
+     {
+      "step": "analysis_seal",
+      "alias": "A2",
+      "node_id": "card",
+      "artifact": "fce97813bea8e5e060681d5d44249705e86a6feb1f5912165984aec0c951f7dc",
+      "ledger": true,
+      "hash_ok": true,
+      "eid_ok": true,
+      "sealed": true
+     }
+    ],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "issuance": {
+   "mode": "citations",
+   "tier": "formal",
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "047519f5bcdfea3056d2a226585cb7c33969a9f6b908940672b6bfee16a8ec75"
+   },
+   "calibers": [],
+   "metrics_checked": 0,
+   "missing_required": [],
+   "missing_expected": [],
+   "unmatched_numbers": [],
+   "unresolved": [],
+   "matched_numbers": 2,
+   "matched": [
+    {
+     "token": "-300",
+     "metric": null,
+     "cell": "A2.r0.delta",
+     "segment": "s9",
+     "unit": "u3",
+     "start": 84,
+     "end": 88,
+     "span": [
+      84,
+      88
+     ],
+     "eid": "ev:cell:8f04cbf82264a3bb"
+    },
+    {
+     "token": "-300",
+     "metric": null,
+     "cell": "A2.r0.delta",
+     "segment": "s18",
+     "unit": "u7",
+     "start": 120,
+     "end": 124,
+     "span": [
+      120,
+      124
+     ],
+     "eid": "ev:cell:8f04cbf82264a3bb"
+    }
+   ],
+   "stats": {
+    "units": 8,
+    "segments": 20,
+    "claims": 4,
+    "connective": 3,
+    "headings": 1,
+    "numbers": 2,
+    "numbers_cited": 2,
+    "values": 2,
+    "entities": 0,
+    "quotes": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "unknown_entities": 0,
+    "unverified_entities": 0,
+    "see": 1,
+    "uncited_claims": 0,
+    "violations": 0,
+    "analysis_claims": 0
+   },
+   "gaps": [],
+   "declared_at": "2026-10-21T10:36:36.611189+00:00"
+  }
+ },
+ "metric": {
+  "run_id": "153afe100eb0406e8be4d9dc7adac8d6",
+  "run_class": "exploratory",
+  "doc_artifact": "e8572d3a890d844783f980891af048db3b71d7533b85ce3ca00926acc199fdca",
+  "doc": {
+   "analysis_claims": {
+    "lexicon": 1,
+    "mode": "check"
+   },
+   "blocks": [
+    {
+     "id": "b0",
+     "type": "paragraph",
+     "units": [
+      {
+       "cites": [
+        "m:wow"
+       ],
+       "id": "u0",
+       "kind": "claim",
+       "see": [],
+       "segments": [
+        {
+         "id": "s0",
+         "kind": "text",
+         "span": [
+          0,
+          3
+         ],
+         "state": "neutral",
+         "text": "环比 "
+        },
+        {
+         "cite": {
+          "alias": "m:wow",
+          "eid": "ev:metric:a2ec409041e4deb7",
+          "kind": "metric",
+          "locator": {
+           "metric": "wow"
+          },
+          "ref": "wow",
+          "rendered": "-12.6%",
+          "role": "value",
+          "status": "resolved",
+          "value": -0.126
+         },
+         "id": "s1",
+         "kind": "number",
+         "ref": "m:wow",
+         "span": [
+          3,
+          9
+         ],
+         "state": "deterministic",
+         "text": "-12.6%"
+        },
+        {
+         "id": "s2",
+         "kind": "text",
+         "span": [
+          9,
+          10
+         ],
+         "state": "neutral",
+         "text": "。"
+        }
+       ],
+       "span": [
+        0,
+        10
+       ]
+      }
+     ]
+    }
+   ],
+   "catalog": {
+    "Q1": {
+     "alias": "Q1",
+     "artifact": "5659261ab82f038f44106c558cab3c57aed2e86eb9eb0426d34c81cfc5029278",
+     "columns": [
+      "gmv"
+     ],
+     "eid": "ev:query:60498acf9bf713c7",
+     "exec": 1,
+     "kind": "query",
+     "label": "db_query__shop · 1 行",
+     "locator": {},
+     "node_id": "this_week",
+     "rows": 1,
+     "source": "shop",
+     "tool": "db_query__shop",
+     "truncated": false,
+     "via": "03718830cc3618e9dd3bc6bb750cc06845e4e2cc35b90499c02826e79f8441c1"
+    },
+    "Q2": {
+     "alias": "Q2",
+     "artifact": "0f9d43f91a5ea754fca6cf494fc69b373fa1fadd85eaccf1dbca2b1d65542e2c",
+     "columns": [
+      "gmv"
+     ],
+     "eid": "ev:query:62b02f6bb6886f1c",
+     "exec": 1,
+     "kind": "query",
+     "label": "db_query__shop · 1 行",
+     "locator": {},
+     "node_id": "last_week",
+     "rows": 1,
+     "source": "shop",
+     "tool": "db_query__shop",
+     "truncated": false,
+     "via": "e42968afbe8ea4ca5b056fb9535eda96efba5113e3feedcff683a8c84f4dbccb"
+    },
+    "m:wow": {
+     "alias": "m:wow",
+     "artifact": "bc5a8e29e70745eed2c7dfabc866532ba1ef1953cbc1cc8d77d9eb02da0cdf84",
+     "caliber": "周报口径",
+     "comparability": {
+      "artifact": "f5d88bbccf1fdaf6ad3724cf6a2f5e0eea5defdd386e8c85cf663bc2ec14fde2",
+      "phrase": "两期可比，窗口长度、整期、星期构成核对不了",
+      "reasons": [],
+      "verdict": "comparable"
+     },
+     "decimals": 3,
+     "eid": "ev:metric:a2ec409041e4deb7",
+     "format": "percent_of_ratio",
+     "kind": "metric",
+     "label": "环比 = -12.6%",
+     "locator": {
+      "metric": "wow"
+     },
+     "name": "环比",
+     "node_id": "kpi",
+     "rendered": "-12.6%",
+     "status": "ok",
+     "unit": "",
+     "value": -0.126,
+     "version": "v1"
+    }
+   },
+   "entity_syntax": 2,
+   "markdown": "环比 -12.6%。",
+   "node_id": "write",
+   "provenance": 1,
+   "run_id": "153afe100eb0406e8be4d9dc7adac8d6",
+   "schema": "agentlab.report/1",
+   "source": "环比 [[m:wow]]。",
+   "stats": {
+    "analysis_claims": 0,
+    "claims": 1,
+    "connective": 0,
+    "entities": 0,
+    "headings": 0,
+    "numbers": 1,
+    "numbers_cited": 1,
+    "quotes": 0,
+    "see": 0,
+    "segments": 3,
+    "uncited_claims": 0,
+    "uncited_numbers": 0,
+    "units": 1,
+    "unknown_entities": 0,
+    "unresolved": 0,
+    "unverified_entities": 0,
+    "values": 0,
+    "violations": 0
+   },
+   "violations": []
+  },
+  "segments": {
+   "s1": {
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "e8572d3a890d844783f980891af048db3b71d7533b85ce3ca00926acc199fdca"
+    },
+    "segment": {
+     "id": "s1",
+     "text": "-12.6%",
+     "kind": "number",
+     "state": "deterministic",
+     "span": [
+      3,
+      9
+     ],
+     "unit": "u0",
+     "ref": "m:wow",
+     "cite": {
+      "alias": "m:wow",
+      "eid": "ev:metric:a2ec409041e4deb7",
+      "kind": "metric",
+      "locator": {
+       "metric": "wow"
+      },
+      "ref": "wow",
+      "rendered": "-12.6%",
+      "role": "value",
+      "status": "resolved",
+      "value": -0.126
+     }
+    },
+    "unit": {
+     "id": "u0",
+     "kind": "claim",
+     "text": "环比 -12.6%。",
+     "span": [
+      0,
+      10
+     ],
+     "cites": [
+      "m:wow"
+     ],
+     "on_demand": {
+      "available": true,
+      "reason": null,
+      "message": null
+     }
+    },
+    "block": {
+     "id": "b0",
+     "type": "paragraph"
+    },
+    "chain": [
+     {
+      "step": "metric",
+      "alias": "m:wow",
+      "metric": "wow",
+      "name": "环比",
+      "value": -0.126,
+      "unit": "",
+      "decimals": 3,
+      "format": "percent_of_ratio",
+      "conv": null,
+      "rendered": "-12.6%",
+      "caliber": "周报口径",
+      "version": "v1",
+      "expression": "(cell(nodes.this_week, 0, 'gmv') - cell(nodes.last_week, 0, 'gmv')) / cell(nodes.last_week, 0, 'gmv')",
+      "substituted": "(2360 - 2700) / 2700",
+      "recompute_ok": true,
+      "status": "ok",
+      "node_id": "kpi",
+      "artifact": "bc5a8e29e70745eed2c7dfabc866532ba1ef1953cbc1cc8d77d9eb02da0cdf84",
+      "eid": "ev:metric:a2ec409041e4deb7",
+      "eid_ok": true,
+      "hash_ok": true,
+      "render_ok": true,
+      "sealed": true,
+      "source": null,
+      "caliber_upgrade": null,
+      "comparability": {
+       "verdict": "comparable",
+       "phrase": "两期可比，窗口长度、整期、星期构成核对不了",
+       "reasons": [],
+       "artifact": "f5d88bbccf1fdaf6ad3724cf6a2f5e0eea5defdd386e8c85cf663bc2ec14fde2",
+       "hash_ok": true,
+       "sealed": true,
+       "method": "comparable@1",
+       "criterion": "只差日期、窗口一样长、是整期、星期构成相同、两边查询都没有数据问题才算可比；只有提醒项算有条件可比，有一项不通过算不可比；核对不了的项不判不可比",
+       "caveats": [],
+       "probes": [],
+       "steps": [
+        {
+         "step": "analysis",
+         "alias": "",
+         "op": "comparable",
+         "mode": null,
+         "method_label": "可比性检查",
+         "origin": "metric",
+         "node_id": "kpi",
+         "label": "周报口径",
+         "artifact": "f5d88bbccf1fdaf6ad3724cf6a2f5e0eea5defdd386e8c85cf663bc2ec14fde2",
+         "eid": "ev:analysis:3cfd497192a30e70",
+         "eid_ok": true,
+         "cited": {
+          "what": "phrase"
+         },
+         "rendered": "两期可比，窗口长度、整期、星期构成核对不了",
+         "render_ok": true,
+         "hash_ok": true,
+         "status": "ok",
+         "reason_code": null,
+         "reason": null,
+         "phrase": "两期可比，窗口长度、整期、星期构成核对不了",
+         "criterion": "只差日期、窗口一样长、是整期、星期构成相同、两边查询都没有数据问题才算可比；只有提醒项算有条件可比，有一项不通过算不可比；核对不了的项不判不可比",
+         "verdict": {
+          "code": "comparable",
+          "direction": null,
+          "subjects": []
+         },
+         "caveats": []
+        },
+        {
+         "step": "analysis_method",
+         "alias": "",
+         "method": "comparable@1",
+         "method_label": "可比性检查",
+         "params": {
+          "base_query": "last_week",
+          "catalog": {
+           "measures": {
+            "gmv": "flow"
+           }
+          },
+          "measure": "gmv",
+          "target_query": "this_week",
+          "today": "2026-10-21"
+         },
+         "settings": [],
+         "probes": []
+        },
+        {
+         "step": "analysis_calc",
+         "alias": "",
+         "values": [
+          {
+           "key": "complete",
+           "raw": "unknown",
+           "rendered": "unknown"
+          },
+          {
+           "key": "data",
+           "raw": "pass",
+           "rendered": "pass"
+          },
+          {
+           "key": "same_query",
+           "raw": "pass",
+           "rendered": "pass"
+          },
+          {
+           "key": "weekdays",
+           "raw": "unknown",
+           "rendered": "unknown"
+          },
+          {
+           "key": "window",
+           "raw": "unknown",
+           "rendered": "unknown"
+          }
+         ],
+         "formulas": [],
+         "table": {
+          "columns": [
+           "check",
+           "status",
+           "base",
+           "target",
+           "note"
+          ],
+          "labels": {
+           "base": "基期",
+           "check": "检查项",
+           "note": "说明",
+           "status": "结果",
+           "target": "本期"
+          },
+          "total_rows": 5,
+          "row_index": [
+           0,
+           1,
+           2,
+           3,
+           4
+          ],
+          "rows": [
+           [
+            "同口径",
+            "通过",
+            null,
+            null,
+            null
+           ],
+           [
+            "窗口长度",
+            "核对不了",
+            null,
+            null,
+            null
+           ],
+           [
+            "整期",
+            "核对不了",
+            "核对不了",
+            "核对不了",
+            null
+           ],
+           [
+            "星期构成",
+            "核对不了",
+            null,
+            null,
+            null
+           ],
+           [
+            "数据问题",
+            "通过",
+            null,
+            null,
+            null
+           ]
+          ],
+          "masked": [],
+          "highlight": {
+           "cells": []
+          }
+         }
+        },
+        {
+         "step": "analysis_input",
+         "of": "",
+         "ref": "last_week",
+         "role": "base",
+         "role_label": "基期",
+         "artifact": "0f9d43f91a5ea754fca6cf494fc69b373fa1fadd85eaccf1dbca2b1d65542e2c",
+         "columns": [
+          "gmv"
+         ],
+         "rows": "all",
+         "query": "Q2",
+         "node_id": "last_week",
+         "sealed": true
+        },
+        {
+         "step": "analysis_input",
+         "of": "",
+         "ref": "this_week",
+         "role": "target",
+         "role_label": "本期",
+         "artifact": "5659261ab82f038f44106c558cab3c57aed2e86eb9eb0426d34c81cfc5029278",
+         "columns": [
+          "gmv"
+         ],
+         "rows": "all",
+         "query": "Q1",
+         "node_id": "this_week",
+         "sealed": true
+        },
+        {
+         "step": "analysis_recompute",
+         "alias": "",
+         "method": "comparable@1",
+         "status": "same",
+         "text": "复算一致：按封存的输入重新计算，结论逐项相同"
+        },
+        {
+         "step": "analysis_seal",
+         "alias": "",
+         "node_id": "kpi",
+         "artifact": "f5d88bbccf1fdaf6ad3724cf6a2f5e0eea5defdd386e8c85cf663bc2ec14fde2",
+         "ledger": false,
+         "hash_ok": true,
+         "eid_ok": true,
+         "sealed": true,
+         "via": "metric_set",
+         "note": "这份可比性结论不进台账：口径卡执行时自动做的，记在封存过的口径卡指标集里（卡上记着它的 sha256），随卡一起封存"
+        }
+       ]
+      },
+      "untraced": []
+     },
+     {
+      "step": "input",
+      "artifact": "5659261ab82f038f44106c558cab3c57aed2e86eb9eb0426d34c81cfc5029278",
+      "eid": "ev:cell:31abb0e1cb0cb3ca",
+      "locator": {
+       "column": "gmv",
+       "row": 0
+      },
+      "node_id": "this_week",
+      "path": "cell(nodes.this_week, 0, 'gmv')",
+      "status": "verified",
+      "value": 2360,
+      "via": "tool_cell",
+      "query": "Q1",
+      "cell": "Q1.r0.gmv"
+     },
+     {
+      "step": "input",
+      "artifact": "0f9d43f91a5ea754fca6cf494fc69b373fa1fadd85eaccf1dbca2b1d65542e2c",
+      "eid": "ev:cell:f3221a76e3c58c31",
+      "locator": {
+       "column": "gmv",
+       "row": 0
+      },
+      "node_id": "last_week",
+      "path": "cell(nodes.last_week, 0, 'gmv')",
+      "status": "verified",
+      "value": 2700,
+      "via": "tool_cell",
+      "query": "Q2",
+      "cell": "Q2.r0.gmv"
+     },
+     {
+      "step": "query",
+      "alias": "Q1",
+      "artifact": "5659261ab82f038f44106c558cab3c57aed2e86eb9eb0426d34c81cfc5029278",
+      "node_id": "this_week",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT SUM(amount) AS gmv FROM orders WHERE week = '2026-W42'",
+      "columns": [
+       "gmv"
+      ],
+      "rows": [
+       [
+        2360
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ]
+     },
+     {
+      "step": "query",
+      "alias": "Q2",
+      "artifact": "0f9d43f91a5ea754fca6cf494fc69b373fa1fadd85eaccf1dbca2b1d65542e2c",
+      "node_id": "last_week",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "sql": "SELECT SUM(amount) AS gmv FROM orders WHERE week = '2026-W41'",
+      "columns": [
+       "gmv"
+      ],
+      "rows": [
+       [
+        2700
+       ]
+      ],
+      "row_offset": 0,
+      "row_index": [
+       0
+      ],
+      "total_rows": 1,
+      "truncated": false,
+      "highlight": {
+       "rows": [
+        0
+       ],
+       "cols": [
+        "gmv"
+       ],
+       "cells": [
+        [
+         0,
+         "gmv"
+        ]
+       ]
+      },
+      "masked": [],
+      "hash_ok": true,
+      "sealed": true,
+      "column_types": {
+       "gmv": "number"
+      },
+      "schema_artifact": "4c3229daead9cdde26fab4b3156cfc17eba8cec291a35b54e2af392a8a694aec",
+      "catalog": [
+       {
+        "table": "orders",
+        "version": 1
+       }
+      ]
+     }
+    ],
+    "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写",
+    "violations": [],
+    "seal": {
+     "sealed": true,
+     "ok": true,
+     "covered": true
+    },
+    "redacted": {
+     "columns": []
+    }
+   }
+  },
+  "graph": {
+   "run_id": "153afe100eb0406e8be4d9dc7adac8d6",
+   "schema": "agentlab.evidence/1",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 25,
+    "legacy": false
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "e8572d3a890d844783f980891af048db3b71d7533b85ce3ca00926acc199fdca",
+     "doc_sealed": true,
+     "hash_ok": true,
+     "ok": true,
+     "repairs": 0,
+     "fields": [
+      "周报"
+     ],
+     "stats": {
+      "analysis_claims": 0,
+      "claims": 1,
+      "connective": 0,
+      "entities": 0,
+      "headings": 0,
+      "numbers": 1,
+      "numbers_cited": 1,
+      "quotes": 0,
+      "see": 0,
+      "segments": 3,
+      "uncited_claims": 0,
+      "uncited_numbers": 0,
+      "units": 1,
+      "unknown_entities": 0,
+      "unresolved": 0,
+      "unverified_entities": 0,
+      "values": 0,
+      "violations": 0
+     },
+     "claims": "off",
+     "judge": null,
+     "post_seal_verdicts": {},
+     "judge_meta": null
+    }
+   ],
+   "evidence": [
+    {
+     "alias": "Q1",
+     "eid": "ev:query:60498acf9bf713c7",
+     "kind": "query",
+     "label": "db_query__shop · 1 行",
+     "node_id": "this_week",
+     "artifact": "5659261ab82f038f44106c558cab3c57aed2e86eb9eb0426d34c81cfc5029278",
+     "sealed": true,
+     "cited_by": [],
+     "units": [],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv"
+     ],
+     "rows": 1,
+     "truncated": false
+    },
+    {
+     "alias": "Q2",
+     "eid": "ev:query:62b02f6bb6886f1c",
+     "kind": "query",
+     "label": "db_query__shop · 1 行",
+     "node_id": "last_week",
+     "artifact": "0f9d43f91a5ea754fca6cf494fc69b373fa1fadd85eaccf1dbca2b1d65542e2c",
+     "sealed": true,
+     "cited_by": [],
+     "units": [],
+     "report": "write",
+     "tool": "db_query__shop",
+     "source": "shop",
+     "columns": [
+      "gmv"
+     ],
+     "rows": 1,
+     "truncated": false
+    },
+    {
+     "alias": "m:wow",
+     "eid": "ev:metric:a2ec409041e4deb7",
+     "kind": "metric",
+     "label": "环比 = -12.6%",
+     "node_id": "kpi",
+     "artifact": "bc5a8e29e70745eed2c7dfabc866532ba1ef1953cbc1cc8d77d9eb02da0cdf84",
+     "sealed": true,
+     "cited_by": [
+      "s1"
+     ],
+     "units": [
+      "u0"
+     ],
+     "report": "write"
+    }
+   ],
+   "edges": [
+    {
+     "from": "s1",
+     "to": "m:wow",
+     "rel": "cites",
+     "report": "write"
+    },
+    {
+     "from": "m:wow",
+     "to": "cell(nodes.this_week, 0, 'gmv')",
+     "rel": "input",
+     "node_id": "this_week",
+     "report": "write",
+     "cell": "Q1.r0.gmv"
+    },
+    {
+     "from": "m:wow",
+     "to": "cell(nodes.last_week, 0, 'gmv')",
+     "rel": "input",
+     "node_id": "last_week",
+     "report": "write",
+     "cell": "Q2.r0.gmv"
+    },
+    {
+     "from": "Q1.r0.gmv",
+     "to": "Q1",
+     "rel": "cell_of",
+     "report": "write"
+    },
+    {
+     "from": "Q2.r0.gmv",
+     "to": "Q2",
+     "rel": "cell_of",
+     "report": "write"
+    }
+   ],
+   "mode": "cited"
+  },
+  "audit": {
+   "run_id": "153afe100eb0406e8be4d9dc7adac8d6",
+   "schema": "agentlab.evidence.audit/1",
+   "mode": "cited",
+   "seal": {
+    "sealed": true,
+    "ok": true,
+    "manifest_seq": 25,
+    "legacy": false,
+    "events": 23,
+    "message": "事件记录与封存时一致"
+   },
+   "reports": [
+    {
+     "node_id": "write",
+     "doc_artifact": "e8572d3a890d844783f980891af048db3b71d7533b85ce3ca00926acc199fdca",
+     "hash_ok": true,
+     "doc_sealed": true,
+     "fields": [
+      "周报"
+     ],
+     "stats": {
+      "analysis_claims": 0,
+      "claims": 1,
+      "connective": 0,
+      "entities": 0,
+      "headings": 0,
+      "numbers": 1,
+      "numbers_cited": 1,
+      "quotes": 0,
+      "see": 0,
+      "segments": 3,
+      "uncited_claims": 0,
+      "uncited_numbers": 0,
+      "units": 1,
+      "unknown_entities": 0,
+      "unresolved": 0,
+      "unverified_entities": 0,
+      "values": 0,
+      "violations": 0
+     },
+     "claims": "off",
+     "judge": null,
+     "post_seal_verdicts": {},
+     "judge_meta": null
+    }
+   ],
+   "groups": [
+    {
+     "key": "cited",
+     "label": "有出处",
+     "count": 1,
+     "rows": [
+      {
+       "group": "cited",
+       "report": "write",
+       "field": "周报",
+       "segment": "s1",
+       "unit": "u0",
+       "kind": "number",
+       "text": "-12.6%",
+       "state": "deterministic",
+       "issue": null,
+       "ref": "m:wow",
+       "alias": "m:wow",
+       "evidence_kind": "metric",
+       "evidence": "环比 = -12.6%",
+       "eid": "ev:metric:a2ec409041e4deb7",
+       "artifact": "bc5a8e29e70745eed2c7dfabc866532ba1ef1953cbc1cc8d77d9eb02da0cdf84",
+       "node_id": "kpi",
+       "sealed": true,
+       "span": [
+        3,
+        9
+       ],
+       "sentence": "环比 -12.6%。",
+       "note": "数字由系统从证据中取出、按口径卡的格式显示，未经模型转写"
+      }
+     ]
+    },
+    {
+     "key": "none",
+     "label": "无证据",
+     "count": 0,
+     "rows": []
+    },
+    {
+     "key": "suspicious",
+     "label": "可疑名称",
+     "count": 0,
+     "rows": []
+    },
+    {
+     "key": "candidate",
+     "label": "按数值猜测",
+     "count": 0,
+     "rows": []
+    }
+   ],
+   "counts": {
+    "cited": 1,
+    "none": 0,
+    "suspicious": 0,
+    "candidate": 0
+   },
+   "total": 1
+  },
+  "analyses": {},
+  "issuance": {
+   "mode": "citations",
+   "tier": "formal",
+   "report": {
+    "node_id": "write",
+    "doc_artifact": "e8572d3a890d844783f980891af048db3b71d7533b85ce3ca00926acc199fdca"
+   },
+   "calibers": [],
+   "metrics_checked": 0,
+   "missing_required": [],
+   "missing_expected": [],
+   "unmatched_numbers": [],
+   "unresolved": [],
+   "matched_numbers": 1,
+   "matched": [
+    {
+     "token": "-12.6%",
+     "metric": "wow",
+     "caliber": "周报口径 @ v1",
+     "segment": "s1",
+     "unit": "u0",
+     "start": 3,
+     "end": 9,
+     "span": [
+      3,
+      9
+     ],
+     "eid": "ev:metric:a2ec409041e4deb7"
+    }
+   ],
+   "stats": {
+    "units": 1,
+    "segments": 3,
+    "claims": 1,
+    "connective": 0,
+    "headings": 0,
+    "numbers": 1,
+    "numbers_cited": 1,
+    "values": 0,
+    "entities": 0,
+    "quotes": 0,
+    "uncited_numbers": 0,
+    "unresolved": 0,
+    "unknown_entities": 0,
+    "unverified_entities": 0,
+    "see": 0,
+    "uncited_claims": 0,
+    "violations": 0,
+    "analysis_claims": 0
+   },
+   "gaps": [],
+   "declared_at": "2026-10-21T10:36:37.326911+00:00"
+  }
+ }
+}
