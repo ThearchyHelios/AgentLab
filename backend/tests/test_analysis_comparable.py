@@ -204,3 +204,55 @@ async def test_one_snapshot_of_sqlite_weeks_uses_the_real_days_of_each_week():
     plain = snap("Q1", sql, ["week", "orders"], rows, types={"week": "text", "orders": "number"})
     unknown = await analyze("comparable", snaps=[plain], query="Q1", period="week", base="2026-W41", target="2026-W42")
     assert unknown["phrase"] == "两期可比，窗口长度、整期、星期构成核对不了"
+
+
+def _same(a, b):
+    from app.analysis.comparable import same_query
+    from app.analysis.inputs import Snap
+
+    return same_query(Snap("Q1", {"sql": a, "source": "shop"}, "sqlite"),
+                      Snap("Q2", {"sql": b, "source": "shop"}, "sqlite"))
+
+
+def test_the_same_query_ignores_the_outer_order_and_how_run_day_bounds_are_written():
+    by_region = ("SELECT region, SUM(amount) AS gmv FROM orders WHERE order_date BETWEEN '{a}' AND '{b}' "
+                 "GROUP BY region{tail}")
+    # 只有一边带 ORDER BY：排序不改结果
+    check = _same(by_region.format(a="2026-10-05", b="2026-10-11", tail=""),
+                  by_region.format(a="2026-10-12", b="2026-10-18", tail=" ORDER BY gmv DESC"))
+    assert check.status == "pass" and check.reasons == []
+    # 按运行当天现算的界写法不一样（上周对本周到今天）
+    window = "SELECT SUM(amount) AS gmv FROM orders WHERE order_date >= {a} AND order_date < {b}"
+    assert _same(window.format(a="date('now', 'weekday 1', '-14 days')", b="date('now', 'weekday 1', '-7 days')"),
+                 window.format(a="date('now', 'weekday 1', '-7 days')", b="date('now')")).status == "pass"
+    assert _same(window.format(a="date('now', 'weekday 1', '-14 days')", b="date('now', 'weekday 1', '-7 days')"),
+                 "SELECT SUM(amount) AS gmv FROM orders WHERE order_date >= date('now', 'weekday 1', '-7 days')"
+                 ).status == "pass"
+
+
+def test_what_still_makes_two_queries_different():
+    base = "SELECT region, SUM(amount) AS gmv FROM orders WHERE order_date >= '2026-10-05' GROUP BY region"
+    # 带 LIMIT 时排序决定取哪几段
+    top = _same(base + " ORDER BY gmv DESC LIMIT 2", base.replace("2026-10-05", "2026-10-12") + " LIMIT 2")
+    assert top.status == "fail"
+    # 除了日期还差别的筛选、按别的时间列、多一个条件
+    other = _same(base.replace("WHERE", "WHERE region = '华东' AND"),
+                  base.replace("WHERE", "WHERE region = '华南' AND").replace("2026-10-05", "2026-10-12"))
+    assert (other.status, other.reasons) == ("fail", ["两边除了日期，筛选的还不一样"])
+    paid = _same(base, base.replace("order_date", "paid_at").replace("2026-10-05", "2026-10-12"))
+    assert paid.status == "fail" and paid.reasons == ["两份查询的口径结构不同（差在时间列）"]
+    extra = _same(base, base.replace("GROUP BY", "AND status = 'paid' GROUP BY").replace("2026-10-05", "2026-10-12"))
+    assert extra.status == "fail" and "筛选条件" in extra.reasons[0]
+
+
+async def test_decomposing_two_snapshots_that_differ_only_in_order_is_not_refused():
+    a = ("SELECT region, SUM(amount) AS gmv FROM orders WHERE order_date BETWEEN '2026-10-05' AND '2026-10-11' "
+         "GROUP BY region")
+    b = ("SELECT region, SUM(amount) AS gmv FROM orders WHERE order_date BETWEEN '2026-10-12' AND '2026-10-18' "
+         "GROUP BY region ORDER BY gmv DESC")
+    base = snap("Q1", a, ["region", "gmv"], [["华东", 820], ["华南", 700], ["华北", 600]], types={"region": "text"})
+    target = snap("Q2", b, ["region", "gmv"], [["华东", 700], ["华南", 666], ["华北", 560]], types={"region": "text"})
+    result = await analyze("decompose", "additive", snaps=[base, target], probe=fixed_prober(RANGE), base_query="Q1",
+                           target_query="Q2", by=["region"], measure="gmv", label="销售额")
+    assert result["status"] == "ok" and result["verdict"]["code"] == "driver"
+    assert not [c for c in result["caveats"] if c["code"] == "comparability"]
