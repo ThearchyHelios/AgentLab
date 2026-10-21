@@ -16,10 +16,12 @@ Each question in a test suite is a question plus an expected answer. The expecta
 - A metric of a published caliber.
 - A query identified from an Ask Data run.
 - "No data", or a clarifying question back.
+- The main source of a change (contribution): an expected SQL statement plus change decomposition parameters; the main source (one segment or the top few) and the direction are computed with the same analyses the answer uses.
+- A verdict: an expected SQL statement plus parameters for a fluctuation baseline, trend test, difference test, or comparability check; the class of verdict is computed with the same analyses: usual fluctuation or unusual; rising, falling, or no clear trend; a difference that holds up or not enough to conclude; comparable or not comparable (see [Analysis](analysis.md#the-five-analyses)).
 
 Rules:
 
-- Numeric values may not be typed in by hand.
+- Numeric values may not be typed in by hand; nor may the segments, directions, and verdicts in contribution and verdict expectations, which are computed from the expected SQL with the same analyses, once before and once after the answer.
 - Text key points are judged by the judge, listed separately, and not counted toward accuracy.
 - After a caliber version bump, questions that use it show a notice at the top. Each question takes one of three options: switch to pinning the new version, compute one expectation for each of the old and new versions, or archive the old question and create a new one. Until then, the question is skipped in evaluations.
 - Test suites can be imported and exported.
@@ -42,7 +44,9 @@ Rules:
 - **Comparison**: against the previous evaluation or a baseline, with per-question transitions and attribution.
 - **A/B paired table**: exact McNemar test; display only, not a gate.
 
-Evaluation runs are left out of usage statistics. The scoring rules are at version 2; old evaluations can be re-scored under the new rules from the evaluation details (reading only the sealed records, without calling models).
+Contribution and verdict expectations are scored like this: an answer that cites an analysis conclusion whose verdict matches is correct and traceable; body text that states it correctly by the lexicon without citing it is correct but uncited; a source or verdict that doesn't match, or the opposite answer, is wrong; an expectation that itself can't be computed (the expected SQL returns too little history, say) can't be scored. The input queries of analysis conclusions also count as queries the answer cited.
+
+Evaluation runs are left out of usage statistics. The scoring rules are at version 3 (which adds contribution and verdict expectations); old evaluations can be re-scored under the new rules from the evaluation details (reading only the sealed records, without calling models).
 
 ### Scheduled evaluations
 
@@ -68,6 +72,7 @@ After an exploratory run is sealed, the system compares the answer with publishe
 - Judging is number by number: when a report cites several columns of one query (for example sales, order count, first and last day), each number is compared on its own column against the caliber's metric column, and extra queried columns don't affect it. This applies only when removing the other columns wouldn't change the number; queries with DISTINCT, truncation after sorting by another column, or extra grouping columns are still compared as a whole.
 - When a multi-row query has no `ORDER BY`, citing one of its cells doesn't count as "from a caliber", and recall and reconciliation mark it "Row order undefined".
 - An answer is issued automatically only when every number in it that comes from data is proven to come from the same caliber.
+- Numbers in analysis conclusions (shares, changes, fluctuation ranges) are derived from query results, so they aren't compared or labeled with a caliber and aren't counted in the summary line.
 
 When writing a caliber's data-fetch SQL, it is best not to round (`ROUND(SUM(x), 2)`) or wrap values in `COALESCE(…, 0)`. Leave rounding and defaults to the caliber card's decimal places and display settings; otherwise Ask Data queries written without rounding will never be recognized as equivalent (and where they differ is stated plainly).
 

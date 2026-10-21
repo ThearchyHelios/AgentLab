@@ -2,16 +2,26 @@ English | [Simplified Chinese](../zh-CN/tools.md)
 
 # Tools, MCP, and the Capability Registry
 
-This page covers the tools workflows can call (built-in tools, custom tools, and MCP), their approval levels, how admins govern them in the capability registry, and how to register endpoints for external systems. It is for builders and admins. The user interface is currently available in Simplified Chinese only.
+This page covers the tools workflows can call (built-in tools, including the analysis tools, custom tools, and MCP), their approval levels, how admins govern them in the capability registry, and how to register endpoints for external systems. It is for builders and admins. The user interface is currently available in Simplified Chinese only.
 
 ## Kinds of tools
 
-- **Built-in tools**: 15 of them.
+- **Built-in tools**: 23 of them, 5 of which are analysis tools (see below).
 - **Custom tools**: an HTTP template, or Python in the sandbox.
 - **MCP**: connect MCP servers (stdio or http).
 - **Data source tools**: each data source's query tool, `db_query__<source>`, plus `db_schema__` for looking up schemas at run time (see [Data Sources](data-sources.md)).
 
 Who can configure what: MCP stdio, endpoints and credentials, and capability governance can be changed only by admins; builders can read them, and users can't see them (see the [permission table](identity-and-security.md#permission-table)).
+
+## Analysis tools
+
+The five analysis tools are the platform's deterministic analyses: `analysis_decompose` (change decomposition), `analysis_baseline` (fluctuation baseline), `analysis_trend` (trend test), `analysis_differ` (difference test), and `analysis_comparable` (comparability check). They don't query any database; they analyze only results that the agent they are bound to queried during this execution. The platform computes the verdicts with fixed methods and thresholds, and the system writes the verdict phrases (see [Analysis tools for agents](analysis.md#analysis-tools-for-agents)).
+
+- Their parameters include no thresholds. Binding any one of them injects the platform's built-in analysis method into the agent's system prompt, once.
+- They are read-only, write nothing, and aren't dangerous tools, so under the default approval policy they don't wait for approval; users can use them in Ask Data too.
+- They can be bound only to agents: putting one in a Call Tool node is a canvas validation error. For fixed analyses in a template, use an analysis card (see [Analysis cards](analysis.md#analysis-cards)).
+- Each agent can run at most 12 analyses per execution (changed under Settings → Preferences → Analysis).
+- They don't connect to data sources: they read snapshots already queried during this execution, and what they return is an analysis conclusion, not a query result.
 
 ## Approval levels
 
