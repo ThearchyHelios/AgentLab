@@ -104,6 +104,7 @@ from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent, Workflow
 from app.engine import analysis_claims, direct_select, recompute
 from app.engine.evidence import (
+    CELL_DISPLAY,
     ENTITY_KINDS,
     GUESS_NOTE,
     GUESS_SCHEMA,
@@ -116,6 +117,7 @@ from app.engine.evidence import (
     analysis_recheck,
     build_catalog,
     closest_entities,
+    doc_cell_display,
     find_segment,
     guess_sources,
     input_eid,
@@ -126,6 +128,7 @@ from app.engine.evidence import (
     query_entry_fields,
     render_cell,
     render_metric,
+    resolve_ref,
     schema_column,
     schema_table,
     sql_tables,
@@ -1041,17 +1044,22 @@ def _analysis_cited(cite: dict[str, Any], result: dict[str, Any] | None) -> dict
     return {"what": "phrase"}
 
 
-def _analysis_rendered(cite: dict[str, Any], result: dict[str, Any]) -> str | None:
-    """按封存的结论重新渲染这一处引用（判定语按文本格、具名标量和结果表的格按单元格的规则）。渲染不出来是 None。"""
-    try:
-        cited = _analysis_cited(cite, result)
-        if cited["what"] == "phrase":
-            return render_cell(result.get("phrase"), kind="text") if isinstance(result.get("phrase"), str) else None
-        if cited["what"] == "value":
-            return render_cell(cited["raw"], cite.get("conv"))
-        return render_cell(cited["raw"], cite.get("conv"), plain=cite.get("plain") is True)
-    except RenderError:
-        return None
+def _analysis_rendered(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any], result: dict[str, Any],
+                       doc: dict[str, Any]) -> str | None:
+    """按封存的结论把这一处引用重新解析一遍，交回渲染出来的字（渲染不出来是 None）。和组装、出口复核同一个函数
+    （evidence.resolve_ref，按文档记下的那一版单元格显示规则）：判定语按文本格，具名标量按单元格的规则，结果表的格照结果表
+    记的列类型（文本码值 "1203" 不加千分位）、显示规则（ISO 日期时间的 T 换成空格）、标识列不分千位。片段上没记引用的
+    （口径卡指标上的可比性、分析范围里的编号）按判定语渲染。"""
+    ref = seg.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        phrase = result.get("phrase")
+        try:
+            return render_cell(phrase, kind="text") if isinstance(phrase, str) else None
+        except RenderError:
+            return None
+    alias = str(cite.get("alias") or entry.get("alias") or "")
+    again = resolve_ref(ref, {alias: {**entry, "result": result}}, display=doc_cell_display(doc) or CELL_DISPLAY)
+    return again.get("rendered") if again.get("status") == "resolved" else None
 
 
 async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any], doc: dict[str, Any],
@@ -1082,7 +1090,7 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
     in_ledger = sealed.trusted and (str(entry.get("node_id") or ""), artifact) in sealed.ledger \
         if chained is None else sealed.trusted and chained
     eid = make_eid(LEDGER_KIND, artifact or None, {})
-    rendered = _analysis_rendered(cite, result) if result is not None else None
+    rendered = _analysis_rendered(seg, cite, entry, result, doc) if result is not None else None
     judged: dict[str, Any] = {
         "step": "analysis", "alias": alias, "op": entry.get("op"), "mode": entry.get("mode"),
         "method_label": method_label(entry.get("op"), entry.get("mode")),

@@ -178,6 +178,51 @@ async def test_named_values_and_result_cells_point_at_what_they_cite(client):
     assert cell["note"] == "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写"
 
 
+#: 按门店拆的快照：门店码是文本（"1203"），渲染时不加千分位
+STORES: dict[str, Any] = {
+    "columns": ["store", "week", "gmv"], "column_types": {"store": "text", "week": "text", "gmv": "number"},
+    "rows": [["1203", "W41", 820], ["1203", "W42", 700], ["1305", "W41", 600], ["1305", "W42", 560],
+             ["2201", "W41", 700], ["2201", "W42", 666]],
+    "sql": "SELECT store, week, SUM(gmv) AS gmv FROM orders GROUP BY store, week ORDER BY store, week",
+    "source": "shop", "truncated": False, "row_count": 6,
+}
+#: 按时段拆的快照：时段是 ISO 日期时间（带 T），文档按 2 版显示规则写成空格
+SLOTS: dict[str, Any] = {
+    "columns": ["slot", "week", "gmv"], "column_types": {"slot": "text", "week": "text", "gmv": "number"},
+    "rows": [["2026-10-12T08:00:00", "W41", 820], ["2026-10-12T08:00:00", "W42", 700],
+             ["2026-10-12T20:00:00", "W41", 600], ["2026-10-12T20:00:00", "W42", 560]],
+    "sql": "SELECT slot, week, SUM(gmv) AS gmv FROM orders GROUP BY slot, week ORDER BY slot, week",
+    "source": "shop", "truncated": False, "row_count": 4,
+}
+
+
+@pytest.mark.parametrize("snapshot, by, shown", [
+    (STORES, "store", "1203"),
+    (SLOTS, "slot", "2026-10-12 08:00:00"),
+])
+async def test_a_result_cell_rerenders_the_way_it_was_composed(client, monkeypatch, snapshot, by, shown):
+    """证据接口按组装时同一套规则重新渲染结果表的格（evidence.resolve_ref，按文档记下的单元格显示规则）：文本码值照结果表
+    记的列类型不加千分位，ISO 日期时间的 T 换成空格。以前不看列类型和显示规则，渲染成「1,203」「2026-10-12T08:00:00」，
+    render_ok 为假，证据面板和导出页报假的「与按结论渲染的结果不一致」。"""
+    import tests.test_analysis_evidence_api as here
+
+    monkeypatch.setattr(here, "SNAPSHOT", snapshot)
+    q = await artifact_store.put_json(snapshot, kind="query_snapshot")
+    result = await analyzed({"Q2": (snapshot, q)}, by=[by])
+    ref = f"v:A1.r0.{by}"
+    made = await sealed_run(f"{by} [[{ref}]] 变化 [[v:A1.r0.delta]]。[[see:A1]]", result=result)
+    segment = next(s for s in iter_segments(made["doc"]) if s.get("ref") == ref)
+    assert segment["text"] == shown
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{segment['id']}")).json()
+    judged = body["chain"][0]
+    assert judged["rendered"] == shown and judged["render_ok"] is True
+    assert judged["cited"] == {"what": "cell", "row": 0, "column": by, "raw": snapshot["rows"][0][0]}
+    # 导出页的数据块是同一条链
+    data = data_block((await client.get(f"/api/runs/{made['run']}/report.html")).text)
+    chain = data["chains"][data["refs"][segment["id"]]]
+    assert chain[0]["step"] == "analysis" and chain[0]["render_ok"] is True
+
+
 async def test_the_recompute_gets_the_sealed_inputs_by_hash(client, monkeypatch):
     """复算的 load 交工件原内容（不加出处、不改列的类型），只认封存范围内交回过的查询；别的一律当取不回。"""
     seen: dict[str, Any] = {}

@@ -2106,8 +2106,11 @@ def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snap
 
 
 def resolve_ref(ref: str, catalog: dict[str, Any], *, cells_allowed: bool = True,
-                loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
-    """片段上记的 ref（m:gmv|万、i:week、v:Q1.r0.amount）→ Citation。证据接口点开片段时用它重新解析。"""
+                loader: Loader | _Snapshots | None = None, display: int | None = None) -> dict[str, Any]:
+    """片段上记的 ref（m:gmv|万、i:week、v:Q1.r0.amount）→ Citation。证据接口点开片段时用它重新解析。display 是按哪一版
+    单元格显示规则渲染（文档记下的那一版，doc_cell_display；复核按它），不给按 loader 的（缺省当前版）。"""
+    if display is not None:
+        loader = _snapshots(loader, display=display)
     return resolve_marker(_parse_ref(ref), catalog, cells_allowed=cells_allowed, loader=loader)
 
 
