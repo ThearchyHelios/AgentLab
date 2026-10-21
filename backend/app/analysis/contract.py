@@ -208,6 +208,7 @@ class AnalysisInput(TypedDict, total=False):
     column: str
     value: str | None
     dialect: str              # 读这份快照的 SQL 用的方言（第 1 波 W1-a 加，可选）：复算按它读，界的写法才一样
+    masked: list[str]         # 这份快照当时不能当维度、度量的列（小写，只记列名；第 1 波 W1-a 加，可选）：复算按它认
 
 
 class Probe(TypedDict, total=False):

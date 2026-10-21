@@ -198,6 +198,8 @@ class Inputs:
             out["artifact"] = snap.artifact
         if snap.dialect:
             out["dialect"] = snap.dialect
+        if snap.masked:
+            out["masked"] = sorted(snap.masked)       # 只记列名（复算按它认遮罩列，快照工件里不一定都有）
         out.update({k: v for k, v in entry.items() if k != "ref"})
         if out not in self.records:
             self.records.append(out)  # type: ignore[arg-type]
