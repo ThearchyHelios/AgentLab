@@ -374,6 +374,26 @@ def _pinned_under_name(pins: dict[str, Any], name: str) -> bool:
     return any(isinstance(entry, dict) and entry.get("name") == name for entry in pins.values())
 
 
+async def resolved_source(name: str, ctx: ToolContext) -> tuple[DataSource, Any] | None:
+    """按名字找启用着的数据源，按这次运行固定的版本解析成查询用的那个源（_resolve，同 build_datasource_tools）：(数据源的行,
+    查询用的源)。找不到、固定的版本没了返回 None。
+
+    分析（app/tools/analysis.py）读目录、剖析事实、现查表的日期范围时用：查的要和这次运行的查询是同一版数据。用自己的短
+    会话，不提交（行上已经读出来的属性会话关了照样能读）。"""
+    from app.db.base import SessionLocal
+
+    async with SessionLocal() as session:
+        row = (await session.execute(select(DataSource).where(
+            DataSource.name == name, DataSource.enabled.is_(True)))).scalar_one_or_none()
+        if row is None:
+            return None
+        try:
+            source, _ = await _resolve(session, row, ctx)
+        except table_versions.SnapshotMissing:
+            return None
+        return row, source
+
+
 async def _resolve(session: AsyncSession, row: DataSource, ctx: ToolContext) -> tuple[Any, bool]:
     """查询该用的源，以及它的版本是不是这次运行固定的。
 
@@ -784,29 +804,15 @@ def _unchecked_tables(sql: str, source: Any, outside: frozenset[str]) -> list[st
 
 async def _coverage(source: Any, sql: str, payload: Mapping[str, Any], mask: list[str]) -> list[dict[str, Any]]:
     """查询区间里这张表没有数据的那几列（data/coverage.result_gaps）。只在结果里有整列是 0 或空的数值列时才查库；遮罩列
-    不探查；现查表的范围不成时退回剖析、取值观察记下的范围（上传表格的快照对不上就不用）。从不抛异常。"""
+    不探查；现查表的范围不成时退回剖析、取值观察记下的范围（上传表格的快照对不上就不用）。从不抛异常。
+
+    剖析事实的取法只有一处（analysis.probe.profile_facts）：分析的可比性检查现查不成时退回的也是它。"""
+    from app.analysis.probe import profile_facts
     from app.data import coverage
 
     if not coverage.zero_columns(payload):
         return []
-
-    async def facts(table: str) -> Mapping[str, Any] | None:
-        from app.data.catalog_profile_jobs import last_facts
-        from app.db.base import SessionLocal
-
-        source_id = getattr(source, "id", None)
-        if not source_id:
-            return None
-        name = data_catalog.resolve_table_name(getattr(source, "schema_cache", None), table) or table
-        async with SessionLocal() as session:
-            found = (await last_facts(session, str(source_id), [name])).get(name)
-        snapshot = getattr(source, "snapshot_id", None)
-        if found and snapshot and found.get("snapshot_id") != snapshot:
-            # 上传表格：剖析时是另一版数据，范围对不上这次读的这一版
-            return None
-        return found
-
-    return await coverage.result_gaps(source, sql, payload, facts=facts, masked=mask)
+    return await coverage.result_gaps(source, sql, payload, facts=profile_facts(source), masked=mask)
 
 
 async def _sql_checks(checker: SqlChecker, sql: str) -> list[dict[str, Any]]:

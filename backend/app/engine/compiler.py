@@ -13,7 +13,7 @@ from app.core.events import EventType
 from app.engine.context import NodeContext, NodeError, NodeRejected, RunContext
 from app.engine.expressions import open_template_scope, template_scope
 from app.engine.nodes import (
-    challenge, control, dual_check, human, io, knowledge, llm, merge, metrics, multi, report, tools,
+    analysis, challenge, control, dual_check, human, io, knowledge, llm, merge, metrics, multi, report, tools,
 )
 from app.engine.schema import (
     GATE_TYPES, REJECT_HANDLE, GraphNode, GraphSpec, NodeType, approve_mode, back_edges, innermost_loops,
@@ -42,6 +42,7 @@ RUNNERS: dict[NodeType, NodeRunner] = {
     NodeType.VALIDATE: human.run_validate,
     NodeType.MEMORY: knowledge.run_memory,
     NodeType.METRICS: metrics.run_metrics,
+    NodeType.ANALYSIS: analysis.run_analysis,
     NodeType.RETRIEVE: knowledge.run_retrieve,
     NodeType.REPORT: report.run_report,
     NodeType.DUAL_CHECK: dual_check.run_dual_check,

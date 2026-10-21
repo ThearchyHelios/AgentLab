@@ -309,6 +309,17 @@ def analyze(spec: GraphSpec) -> VariableReport:
             f"nodes.{node.id}", kind="node", label=f"「{label}」这一步的输出",
             produced_by=node.id, produced_by_label=label, order=order,
         )
+        # 分析卡每一项的结论（engine/nodes/analysis.py 的 card_view）：条件分支按判定走、成果取判定语都从这里取
+        if node.type == "analysis" and isinstance(cfg.get("items"), list):
+            for item in cfg["items"]:
+                item_id = item.get("id") if isinstance(item, dict) else None
+                if isinstance(item_id, str) and item_id:
+                    ensure(
+                        f"nodes.{node.id}.results.{item_id}", kind="node",
+                        label=f"「{label}」分析项「{item_id}」的结论",
+                        produced_by=node.id, produced_by_label=label, order=order,
+                        description="status 状态、verdict 判定、direction 方向、values 关键数、phrase 判定语",
+                    )
 
     # 每个根命名空间本身也是合法引用：{{ input }} 取整个输入 dict，
     # {{ vars }} 取整个变量池——template_context 里它们就是顶层的键。
@@ -344,6 +355,17 @@ def analyze(spec: GraphSpec) -> VariableReport:
                     target.refs.append(VarRef(
                         node_id=node.id, node_label=label, field=field, expr=m.group(0),
                     ))
+
+        # 分析卡的输入同样按节点 id 选（主输入、两份查询、总数两格落在的节点）：记成对上游节点的引用
+        if node.type == "analysis" and isinstance(cfg.get("items"), list):
+            from app.engine.schema import analysis_refs
+
+            for i, item in enumerate(cfg["items"]):
+                for field, source in analysis_refs(item) if isinstance(item, dict) else []:
+                    target = index.get(f"nodes.{source}")
+                    if target is not None:
+                        target.refs.append(VarRef(node_id=node.id, node_label=label, field=f"items[{i}].{field}",
+                                                  expr=f"nodes.{source}"))
 
         # 合并查询的输入按节点 id 选，不写模板：不认这一条的话，变量表里看不出上游那条查询被谁用了。
         # 选错的节点（不存在、不在上游、不是查询）由 validate_graph 报，这里只记引用

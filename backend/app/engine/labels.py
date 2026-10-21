@@ -21,7 +21,7 @@ TYPE_LABEL: dict[str, str] = {
     "supervisor": "多 Agent 协作", "tool": "调用工具", "code": "沙箱代码", "merge": "合并查询",
     "branch": "条件分支", "loop": "循环", "subgraph": "子工作流",
     "memory": "长期记忆", "retrieve": "知识检索", "transform": "数据整形",
-    "human": "人工审批", "validate": "结构校验", "metrics": "口径卡", "report": "报告撰写",
+    "human": "人工审批", "validate": "结构校验", "metrics": "口径卡", "analysis": "分析卡", "report": "报告撰写",
     "dual_check": "双盲复算", "challenge": "反方审稿",
 }
 
@@ -99,8 +99,17 @@ _FIELD_BY_TYPE: dict[str, dict[str, str]] = {
               "stop_on_reject": "驳回即终止运行"},
     "validate": {"source": "待校验内容", "fail_fast": "校验失败即中断"},
     "merge": {"inputs": "输入", "sql": "合并 SQL"},
+    "analysis": {"items": "分析项", "overrides": "阈值覆盖"},
     "dual_check": DUAL_CHECK_FIELD_LABEL,
     "challenge": CHALLENGE_LABEL,
+}
+
+#: 分析卡一项里的分析方法、模式的叫法（app/analysis/contract.py 的 OPS、MODES；前端分析卡的表单照这一份）
+ANALYSIS_OP_LABEL: dict[str, str] = {"decompose": "变化拆解", "baseline": "波动基线", "trend": "趋势",
+                                     "differ": "差异检验", "comparable": "可比性检查"}
+ANALYSIS_MODE_LABEL: dict[str, dict[str, str]] = {
+    "decompose": {"additive": "可加（按维度算贡献）", "ratio": "比率（拆结构与自身）", "factor": "乘积（拆因子）"},
+    "differ": {"rate": "比率", "mean": "均值", "rows": "逐行的值"},
 }
 
 #: 出具契约里的键（canvas/issues.ts 的 CONTRACT_KEYS、SUB_KEYS）

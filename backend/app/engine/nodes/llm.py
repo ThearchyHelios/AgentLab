@@ -10,6 +10,7 @@ from langchain_core.tools import BaseTool
 from langgraph.func import task
 from sqlalchemy import select
 
+from app.analysis.contract import CallError, ledger_entry
 from app.core import artifact_store
 from app.core.config import settings
 from app.core.errors import describe_exception, not_configured, raw_detail
@@ -49,6 +50,17 @@ from app.providers.factory import (
 )
 from app.engine.sql_problems import event_checks
 from app.data import catalog_view
+from app.tools.analysis import (
+    REFUSED_CODE as ANALYSIS_REFUSED,
+    SCOPE_KEY as ANALYSIS_SCOPE_KEY,
+    AnalysisScope,
+    call_error_text,
+    input_snapshot,
+    is_analysis_tool,
+    payload_of,
+    reply_text,
+    run_snapshot,
+)
 from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_scope_fixed, run_versions
 from app.tools.registry import (
     ToolArgsError,
@@ -57,6 +69,7 @@ from app.tools.registry import (
     args_model_of,
     build_tools,
     describe_args,
+    guides_text,
     prepare_args,
 )
 from app.tools.trust import asks_trustable, ask_gate, call_policy, node_task, trust_key_of
@@ -110,7 +123,10 @@ async def _load_skills(names: list[str]) -> str:
     return "# 适用的方法论\n\n" + "\n\n".join(blocks)
 
 
-async def _build_messages(state: GraphState, ctx: NodeContext) -> list[BaseMessage]:
+async def _build_messages(state: GraphState, ctx: NodeContext, tools: list[BaseTool] | None = None
+                          ) -> list[BaseMessage]:
+    """发给模型的消息。tools 是这个节点绑定的工具：它们带的方法说明（ToolSpec.guide，如分析方法）接在 Skill 后面，同一份
+    只注入一次。模型调用节点没有工具，不注入；没有带说明的工具时 system 和以前一字不差。"""
     tctx = template_context(state)
     messages: list[BaseMessage] = []
 
@@ -121,6 +137,8 @@ async def _build_messages(state: GraphState, ctx: NodeContext) -> list[BaseMessa
     skill_text = await _load_skills(ctx.cfg("skills", []) or [])
     if skill_text:
         system_parts.append(skill_text)
+    if guide := guides_text(tools):
+        system_parts.append(guide)
     if system_parts:
         messages.append(SystemMessage(content="\n\n".join(system_parts)))
 
@@ -328,7 +346,9 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-async def _resolve_tools(ctx: NodeContext, state: GraphState) -> list[BaseTool]:
+async def _resolve_tools(ctx: NodeContext, state: GraphState, scope: AnalysisScope | None = None) -> list[BaseTool]:
+    """建这个节点绑的工具。scope 是本节点的分析容器（绑了分析工具才有）：经 ToolContext.extra 交给分析工具，工具建在
+    查询之前，查一次往里放一次（_record_call）。"""
     names = ctx.cfg("tools", []) or []
     # 遮罩、只读的运行：记忆范围、知识库只认运行定下的，模型在参数里挑的也不算（tools/registry.ToolContext.fixed_scope）
     fixed = run_scope_fixed(ctx.run)
@@ -346,6 +366,7 @@ async def _resolve_tools(ctx: NodeContext, state: GraphState) -> list[BaseTool]:
         catalog_view=catalog_view.of_run(ctx.run),
         # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
         emit=ctx.emit,
+        extra={ANALYSIS_SCOPE_KEY: scope} if scope is not None else {},
     )
     async with SessionLocal() as session:
         try:
@@ -425,14 +446,17 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         except ProviderNotConfigured as e:
             raise NodeError(ctx.node.id, not_configured(e)) from e
 
-    tools = await _resolve_tools(ctx, state)
+    # 绑了分析工具才建分析容器：本节点查过的结果、做过的分析都放在这里（app/tools/analysis.py），编号和交回模型的一致
+    scope = (AnalysisScope(node_id=ctx.node.id, snapshot=run_snapshot(ctx.run))
+             if any(is_analysis_tool(n) for n in ctx.cfg("tools", []) or []) else None)
+    tools = await _resolve_tools(ctx, state, scope)
     tool_map = {t.name: t for t in tools}
     # 默认串行：一轮只调一个工具，拿到结果再想下一步。并行更快，但一批工具
     # 中间没有任何新的思考——第二个调用是照着"还没看到第一个结果"时的判断发出来的
     parallel_tools = bool(ctx.cfg("parallel_tools", False))
     model = bind_tools_safely(base_model, tools, parallel=parallel_tools)
 
-    messages = await _build_messages(state, ctx)
+    messages = await _build_messages(state, ctx, tools)
     # 护栏（engine/guards.py）。None 是升级前发起的运行：默认 12 步、没有别的护栏，和以前一样
     guard = _guard(ctx, model_id)
     # 证据台账、工具结果前的编号、cite_fields：升级前发起的运行一样都不加（见 evidence.ledger_enabled）
@@ -493,6 +517,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             # 到点就收回控制权，驱动的收尾在后台做完。模型拿到的是"等了多久、为什么放弃"
             content, ok = str(e), False
             extra = {"error": str(e), "timed_out": True}
+        except CallError as e:
+            # 分析调用写错了（列不存在、列被遮罩、分析次数用完……，细案 01 §8.1）：不记结论、不进台账，原话交回模型照着改
+            content, ok = call_error_text(e), False
+            extra = {"error": content[:300], "call_error": e.code}
         except Exception as e:  # noqa: BLE001 - 工具失败要喂回模型，让它自己纠错
             content = f"工具执行失败：{describe_exception(e)}"
             schema = args_model_of(tool)
@@ -522,6 +550,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         query = query_entry_fields(content) if evidence_on and ok and is_platform_query(name) else None
         if query and not await snapshot_owned(query["artifact"], ctx.run.run_id, name):
             query = None
+        # 分析工具交回的结论工件：同查询快照，记进 tool.end（封存范围内），证据接口、时间线从这里认这一步的结论
+        analysis = payload_of(content) if ok and is_analysis_tool(name) else None
         ctx.emit(
             EventType.TOOL_END if ok else EventType.TOOL_ERROR,
             tool=name,
@@ -530,12 +560,18 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             preview=content[:2000],
             artifact=snapshot_id,
             **({"query_artifact": query["artifact"]} if query else {}),
+            **({"analysis_artifact": analysis["artifact"]} if analysis else {}),
             # 查询当时数据源的表结构快照：和查询快照一样落在封存范围内，证据接口从这里认它
             **({"schema_artifact": query["schema_artifact"]} if query and query.get("schema_artifact") else {}),
             # 这次查询的 SQL 检查结果单独带上：preview 截到前 2000 个字符，checks 通常在截掉的那段里
             **({"checks": checks} if ok and name.startswith(QUERY_PREFIX) and (checks := event_checks(content)) else {}),
             **extra,
         )
+        if analysis is not None and analysis["result"].get("status") == "refused":
+            # 算不了是一条结论（照常交回模型、进台账），照实提醒一句。发在 task 里：重放取 checkpoint，不会再发一遍
+            ctx.emit(EventType.LOG, level="warn", code=ANALYSIS_REFUSED, call_id=call_id, tool=name,
+                     reason_code=analysis["result"].get("reason_code"), reason=analysis["result"].get("reason"),
+                     message=f"{name} 没有做成：{analysis['result'].get('reason') or '原因未知'}")
         outcome: dict[str, Any] = {"content": content, "ok": ok, "duration_ms": elapsed}
         if evidence_on:
             outcome.update(snapshot=snapshot_id, query_artifact=query["artifact"] if query else None)
@@ -731,7 +767,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             if evidence_on:
                 # 编号只取决于 tool_step 的返回值（重放时取自 checkpoint），重放出来的还是这一套
                 content = _record_call(ctx.node.id, exec_no, call_id, name, args, outcome, record,
-                                       queries, entries)
+                                       queries, entries, scope)
             transcript.append(record)
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
             if guard:
@@ -870,12 +906,16 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
 def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict[str, Any],
                  outcome: dict[str, Any], record: dict[str, Any], queries: list[dict[str, Any]],
-                 entries: list[dict[str, Any]]) -> str:
+                 entries: list[dict[str, Any]], scope: AnalysisScope | None = None) -> str:
     """把一次执行过的工具调用记进台账、调用记录和本节点的查询清单，返回给模型看的内容。
 
     查库成功的结果前面加一行「【证据 Q1】」：模型在循环里就知道每次查询的编号，cite_fields
     抽取时照这个编号写出处。编号只在本节点内有效；报告目录里的 Q1… 按全局台账另编，两边
     靠工件 id 对应，不靠编号。
+
+    绑了分析工具的节点（scope）：每次查询另往分析容器里放一份输入快照（编号同上）；分析工具交回的结论记一条 kind analysis
+    的台账（contract.ledger_entry，带 call_id），编号 An，交回模型的换成「【分析 An】」那一段（app/tools/analysis.py）。
+    编号同样只取决于 tool_step 的返回值，重放出来的还是这一套。
     """
     content = outcome["content"]
     record["call_id"] = call_id
@@ -884,6 +924,15 @@ def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict
         record["via"] = snapshot
         entries.append({"kind": "tool", "node_id": node_id, "exec": exec_no, "artifact": snapshot,
                         "call_id": call_id, "tool": name})
+    if scope is not None and outcome.get("ok") and is_analysis_tool(name):
+        found = payload_of(content)
+        if found is None:
+            return content
+        alias = scope.add_result(found["result"], found["artifact"])
+        record.update(alias=alias, analysis_artifact=found["artifact"])
+        entries.append(ledger_entry(found["result"], node_id=node_id, exec_no=exec_no, artifact=found["artifact"],
+                                    call_id=call_id))
+        return reply_text(alias, found["result"])
     if not artifact or not is_platform_query(name):
         return content
     try:
@@ -909,6 +958,8 @@ def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict
     queries.append({"alias": alias, "call_id": call_id, "tool": name, "sql": str(args.get("sql") or ""),
                     "artifact": artifact, "via": snapshot, "columns": fields["columns"],
                     "rows": data.get("rows") or [], "truncated": fields["truncated"]})
+    if scope is not None:
+        scope.add_query(alias, input_snapshot(data, ref=alias, artifact=artifact, node_id=node_id))
     return f"【证据 {alias}】\n{content}"
 
 
