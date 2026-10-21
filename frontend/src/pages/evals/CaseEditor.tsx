@@ -7,6 +7,8 @@ import { Field, Modal, Notice, Spinner, toast, useRadioGroup } from '../../compo
 import { errorMessage } from '../../lib/errors'
 import { formatDateTime, formatTime, shortId } from '../../lib/format'
 import { EVAL_TEXT } from '../../lib/termsEval'
+import { ANALYSIS_TEXT, isAnalysisOp } from '../../lib/termsAnalysis'
+import { paramSpecs, paramText, paramValue, type ParamSpec } from '../../canvas/analysisItems'
 import { useCatalog } from '../../store/catalog'
 import type { Run } from '../../types'
 import type {
@@ -509,35 +511,19 @@ function SqlPart({ suiteId: _suiteId, sourceId, setSourceId, sql, setSql, previe
 // 分析期望：贡献、判定
 // ---------------------------------------------------------------------------
 
-type ParamKind = 'column' | 'columns' | 'text' | 'int' | 'choice' | 'pairs'
-interface ParamField { key: string; kind: ParamKind; choices?: Record<string, string> }
-
 const A = EVAL_TEXT.analysis
 /** 判定期望能用的分析（贡献恒为变化拆解）、各自的模式（同服务端 contract.MODES） */
 const VERDICT_OPS: EvalAnalysisOp[] = ['baseline', 'trend', 'differ', 'comparable']
 const OP_MODES: Partial<Record<EvalAnalysisOp, EvalAnalysisMode[]>> = {
   decompose: ['additive', 'ratio', 'factor'], differ: ['rate', 'mean', 'rows'],
 }
-const col = (key: string): ParamField => ({ key, kind: 'column' })
-const PERIODS: ParamField[] = [col('period'), { key: 'base', kind: 'text' }, { key: 'target', kind: 'text' }]
-const LABEL: ParamField = { key: 'label', kind: 'text' }
-const GRAIN: ParamField = { key: 'grain', kind: 'choice', choices: A.grain }
-const GROUPS: ParamField[] = [{ key: 'by', kind: 'columns' }, { key: 'pairs', kind: 'pairs' }, { key: 'reference', kind: 'text' }]
-/** 每种分析（模式）在表单里填哪几个参数：参数名同分析工具（服务端按同一份参数定义校验），叫法在 termsEval */
-const PARAM_FIELDS: Record<string, ParamField[]> = {
-  'decompose:additive': [{ key: 'by', kind: 'columns' }, ...PERIODS, col('measure'), LABEL],
-  'decompose:ratio': [{ key: 'by', kind: 'columns' }, ...PERIODS, col('numerator'), col('denominator'), LABEL],
-  'decompose:factor': [...PERIODS, col('product'), { key: 'factors', kind: 'columns' }, LABEL],
-  baseline: [col('period'), col('measure'), { key: 'target', kind: 'text' },
-    { key: 'basis', kind: 'choice', choices: A.basis }, GRAIN, { key: 'lag', kind: 'int' }, LABEL],
-  trend: [col('period'), col('measure'), GRAIN, LABEL],
-  'differ:rate': [...GROUPS, col('numerator'), col('denominator'), LABEL],
-  'differ:mean': [...GROUPS, col('mean'), col('sd'), col('sum'), col('sumsq'), col('n'), LABEL],
-  'differ:rows': [...GROUPS, col('value'), LABEL],
-  comparable: [...PERIODS, col('measure'), GRAIN],
-}
-const fieldsOf = (e: EvalExpectation): ParamField[] =>
-  PARAM_FIELDS[e.op === 'decompose' || e.op === 'differ' ? `${e.op}:${e.mode}` : e.op ?? ''] ?? []
+/**
+ * 每种分析（模式）在表单里填哪几个参数：和分析卡的一项同一份（canvas/analysisItems.paramSpecs），不另抄。
+ * 那张表里本来就没有评测期望不许写的几样——输入（query）、总数核对（headline）、下钻（parent）、两份查询
+ * （base_query、target_query）：期望的输入只有期望 SQL 这一份快照（服务端 judgements._NOT_IN_EXPECTATION）
+ */
+const fieldsOf = (e: EvalExpectation): ParamSpec[] =>
+  e.op && isAnalysisOp(e.op) ? paramSpecs(e.op, e.mode) : []
 
 /** 换了分析方法、模式时，只留下新的那种分析还认的参数 */
 function keepParams(e: EvalExpectation): EvalExpectation {
@@ -607,7 +593,7 @@ function AnalysisPick({ columns, main, setMain }: {
             </Field>
           )}
           {fieldsOf(current).map((f) => (
-            <ParamInput key={`${current.op}:${current.mode}:${f.key}`} field={f} columns={columns}
+            <ParamInput key={`${current.op}:${current.mode}:${f.key}`} spec={f} columns={columns}
                         value={(current.params ?? {})[f.key]} onChange={(v) => setParam(f.key, v)} />
           ))}
           {fieldsOf(current).some((f) => f.key === 'base') && (
@@ -619,15 +605,17 @@ function AnalysisPick({ columns, main, setMain }: {
   )
 }
 
-function ParamInput({ field, columns, value, onChange }: {
-  field: ParamField; columns: string[]; value: unknown; onChange: (v: unknown) => void
+function ParamInput({ spec, columns, value, onChange }: {
+  spec: ParamSpec; columns: string[]; value: unknown; onChange: (v: unknown) => void
 }) {
-  const id = `eval-analysis-param-${field.key}`
-  const label = A.param[field.key] ?? field.key
-  if (field.kind === 'columns') {
+  const key = spec.key
+  const id = `eval-analysis-param-${key}`
+  const label = A.param[key] ?? key
+  const text = paramText(spec.kind, value)
+  if (spec.kind === 'columns') {
     const picked = Array.isArray(value) ? value.map(String) : []
     return (
-      <div className="sm:col-span-2" data-eval-analysis-param={field.key}>
+      <div className="sm:col-span-2" data-eval-analysis-param={key}>
         <div className="label">{label}</div>
         <div className="flex flex-wrap gap-2">
           {columns.map((c) => (
@@ -641,34 +629,46 @@ function ParamInput({ field, columns, value, onChange }: {
       </div>
     )
   }
-  if (field.kind === 'pairs') {
-    const text = Array.isArray(value) ? value.map((p) => (Array.isArray(p) ? p.join('，') : String(p))).join('\n') : ''
+  if (spec.kind === 'pairs') {
     return (
       <Field label={label} htmlFor={id} hint={T.analysisPairsHint} className="sm:col-span-2">
-        <textarea id={id} className="field min-h-12 text-xs" defaultValue={text} data-eval-analysis-param={field.key}
-                  onChange={(e) => onChange(e.target.value.split('\n').map((line) => line.split(/[,，、]/).map((x) => x.trim())
-                    .filter(Boolean)).filter((pair) => pair.length))} />
+        <textarea id={id} className="field min-h-12 text-xs" defaultValue={text} data-eval-analysis-param={key}
+                  onChange={(e) => onChange(paramValue('pairs', e.target.value))} />
       </Field>
     )
   }
-  if (field.kind === 'column' || field.kind === 'choice') {
-    const options = field.kind === 'column' ? Object.fromEntries(columns.map((c) => [c, c])) : field.choices ?? {}
+  if (spec.kind === 'basis' || spec.kind === 'grain') {
+    // 和分析卡同两份下拉：空着是缺省（比较方式缺省「和比较期比的变化率」、粒度按期的写法推断），其余每种各有叫法
+    const opts = spec.kind === 'basis' ? A.basis : A.grain
     return (
       <Field label={label} htmlFor={id}>
-        <select id={id} className="field" value={value == null ? '' : String(value)} data-eval-analysis-param={field.key}
+        <select id={id} className="field" value={text} data-eval-analysis-param={key}
                 onChange={(e) => onChange(e.target.value)}>
-          <option value="">{field.kind === 'column' ? T.analysisColumn : T.analysisNone}</option>
+          {Object.entries(opts).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+        </select>
+      </Field>
+    )
+  }
+  if (spec.kind === 'column') {
+    const options = Object.fromEntries(columns.map((c) => [c, c]))
+    return (
+      <Field label={label} htmlFor={id}>
+        <select id={id} className="field" value={text} data-eval-analysis-param={key}
+                onChange={(e) => onChange(e.target.value)}>
+          <option value="">{T.analysisColumn}</option>
           {Object.entries(options).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
         </select>
       </Field>
     )
   }
+  // 期次、对照组、叫法可以写 {{ schedule.* }} 这类时间变量；整数的格子写了不是整数的字照原样交给服务端校验
   return (
     <Field label={label} htmlFor={id}>
-      <input id={id} className={clsx('field', field.kind === 'int' && 'tnum w-24')} value={value == null ? '' : String(value)}
-             inputMode={field.kind === 'int' ? 'numeric' : undefined} placeholder={field.kind === 'text' ? T.analysisNone : undefined}
-             data-eval-analysis-param={field.key}
-             onChange={(e) => onChange(field.kind === 'int' ? (e.target.value.trim() ? Number(e.target.value) : '') : e.target.value)} />
+      <input id={id} className={clsx('field', spec.kind === 'int' && 'tnum w-24')} value={text}
+             inputMode={spec.kind === 'int' ? 'numeric' : undefined}
+             placeholder={ANALYSIS_TEXT.node.paramPlaceholder[key]}
+             data-eval-analysis-param={key}
+             onChange={(e) => onChange(paramValue(spec.kind, e.target.value))} />
     </Field>
   )
 }

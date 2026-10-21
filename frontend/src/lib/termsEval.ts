@@ -10,7 +10,7 @@ import type {
   EvalTrigger, EvalUpgradePolicy, EvalVerdict,
 } from '../typesEval'
 import { formatCost, formatNumber } from './format'
-import { ANALYSIS_MODE_LABEL, ANALYSIS_OP_LABEL } from './termsAnalysis'
+import { ANALYSIS_MODE_LABEL, ANALYSIS_OP_LABEL, ANALYSIS_TEXT } from './termsAnalysis'
 
 /** 比率写成百分数：0.756 → 「75.6%」；没有分母（null）写「—」 */
 export function pct(rate: number | null | undefined, digits = 1): string {
@@ -336,14 +336,10 @@ export const EVAL_TEXT = {
     ratio: (numerator: string, denominator: string) => `${numerator} ÷ ${denominator}`,
     /** 答案里同类的分析没有做成 */
     refused: (reason: string) => `没有做成：${reason}`,
-    param: {
-      by: '维度列', period: '期次列', base: '基期', target: '本期', measure: '度量列', numerator: '分子列', denominator: '分母列',
-      product: '乘积列', factors: '因子列', label: '度量的叫法', basis: '比较方式', grain: '粒度', lag: '和往前第几期比',
-      pairs: '比哪几对', reference: '对照组', mean: '均值列', sd: '标准差列', sum: '合计列', sumsq: '平方和列', n: '样本数列',
-      value: '逐行的值列',
-    } as Record<string, string>,
-    basis: { change: '和比较期比的变化率', level: '值本身' } as Record<string, string>,
-    grain: { day: '天', week: '周', month: '月', quarter: '季度' } as Record<string, string>,
+    /** 参数格的叫法只有 lib/termsAnalysis 一份（ANALYSIS_TEXT.node.param / basis / grain）：分析卡和评测页的分析期望按同一份参数名 */
+    param: ANALYSIS_TEXT.node.param,
+    basis: ANALYSIS_TEXT.node.basis,
+    grain: ANALYSIS_TEXT.node.grain,
   },
   upgrade: {
     title: (seq: number) => `第 ${seq} 题：处置口径升版`,
