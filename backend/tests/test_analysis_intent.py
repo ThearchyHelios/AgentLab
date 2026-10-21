@@ -41,6 +41,7 @@ POSITIVE = [
     # 波动
     ("最近销售额波动大吗", "fluctuation"),
     ("这是不是正常波动", "fluctuation"),
+    ("销售额同比变化大不大", "fluctuation"),
     # 趋势
     ("线上销售额的趋势怎么样", "trend"),
     ("看一下近半年订单数的走势", "trend"),
