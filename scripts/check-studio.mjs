@@ -846,6 +846,14 @@ await section('窄屏：次要按钮收进「更多」、助手栏默认收起�
   check('768 宽：最右的控件也在视口里、工具栏不溢出', bar.right <= bar.vw && bar.sw <= bar.cw, JSON.stringify({ right: bar.right, vw: bar.vw, sw: bar.sw, cw: bar.cw }))
   check('768 宽：运行和收起助手栏都露在外面', bar.names.includes('运行') && bar.names.some((n) => n.includes('助手栏')), bar.names.join(' '))
 
+  // 改名那个小铅笔收起来了（768 宽挤不下）：改名还在「切换工作流」的列表里
+  check('768 宽：工具栏上看不到改名的图标（挤不下）', !bar.names.some((n) => n.includes('重命名')), bar.names.join(' '))
+  await page.locator('button[title^="切换、新建"]').click()
+  await page.waitForTimeout(250)
+  check('……改名在「切换工作流」的列表里照样有', await count(page, '[role="listbox"][aria-label="工作流"] [aria-label^="重命名"]') > 0)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(200)
+
   const more = page.getByRole('button', { name: '更多操作' })
   check('窄屏把次要按钮收进「更多操作」', await more.count() === 1 && await more.isVisible())
   await more.click()
