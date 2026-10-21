@@ -102,7 +102,7 @@ from app.data.provenance_types import (
 from app.data.table_versions import SnapshotManifestMismatch, SnapshotMissing
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent, Workflow
-from app.engine import direct_select, recompute
+from app.engine import analysis_claims, direct_select, recompute
 from app.engine.evidence import (
     ENTITY_KINDS,
     GUESS_NOTE,
@@ -4651,7 +4651,7 @@ _INTEGRITY = frozenset({"bad_schema", "segment_mismatch", "structural_text", "re
 #: 「有出处」的单元格片段，不单列的话审计表、导出的 CSV 里只有一行普通的「有出处」）；分析说法核对的三种（判断词没挂分析
 #: 结论、判断和结论对不上、因果说法没有依据，engine/analysis_claims.py）：句子里的判定语、数照样是「有出处」的片段，说法本身
 #: 有问题要单独看得到
-ANALYSIS_CLAIM_CODES = frozenset({"analysis_claim_uncited", "analysis_claim_mismatch", "causal_unsupported"})
+ANALYSIS_CLAIM_CODES = analysis_claims.CODES
 _LISTED_ALWAYS = _INTEGRITY | {"masked_cell"} | ANALYSIS_CLAIM_CODES
 UNCITED_CLAIM = "这句结论没有附依据（既没有引用，也没有注明依据）"
 UNCITED_CLAIM_COUNTED = "这句结论没有附依据。本报告要求结论句附依据，出具时计入缺口"
