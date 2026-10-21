@@ -95,6 +95,31 @@ def test_the_autofix_writes_it_in():
     assert write["data"]["config"]["analysis_claims"] == "strict"
 
 
+def test_an_unrecognized_value_is_left_to_its_own_fix_like_claims():
+    """analysis_claims 写了认不出的值：门禁 G3 跳过、交给校验报，自动修复的 G3 那一条也不碰它（以前顺手改成了 strict），
+    由校验那条问题自己的修复管——照 claims 的做法：受管级别改成 strict，别的级别三档要人选。"""
+    graph = traceable({**STRICT, "numbers": "off", "analysis_claims": "loose"})
+    spec = GraphSpec.model_validate(graph)
+    fixes = {f["id"]: f for f in plan_fixes(spec, publish_issues(spec, level="governed"), level="governed")}
+    assert fixes["governed.report_policy:write"]["preview"] == {"field": "numbers", "before": "off", "after": "strict"}
+    bad = fixes["report.analysis_claims_invalid:write"]
+    assert bad["kind"] == "auto" and bad["preview"] == {"field": "analysis_claims", "before": "loose", "after": "strict"}
+    out = apply_fixes(graph, list(fixes), level="governed")
+    write = next(n for n in out["graph"]["nodes"] if n["id"] == "write")["data"]["config"]
+    assert out["ok"] is True and write["analysis_claims"] == "strict" and write["numbers"] == "strict"
+
+    published = traceable({"analysis_claims": "loose"})
+    spec = GraphSpec.model_validate(published)
+    fid = "report.analysis_claims_invalid:write"
+    [fix] = [f for f in plan_fixes(spec, publish_issues(spec, level="published"), level="published") if f["id"] == fid]
+    assert fix["kind"] == "choice" and [o["value"] for o in fix["options"]] == ["off", "check", "strict"]
+    assert [o["label"] for o in fix["options"]] == [option_label("analysis_claims", v) for v in ("off", "check", "strict")]
+    assert "default" not in fix
+    out = apply_fixes(published, [fid], {fid: "check"}, level="published")
+    assert out["applied"] == [fid] and next(n for n in out["graph"]["nodes"] if n["id"] == "write")[
+        "data"]["config"]["analysis_claims"] == "check"
+
+
 def test_a_governed_upgrade_writes_the_strict_setting():
     from app.engine.upgrade import _policy
 
