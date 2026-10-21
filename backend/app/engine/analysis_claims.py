@@ -12,8 +12,9 @@
    「不但」「不少」「无论」「未来」这类不是否定
 3. **怎么挂**：一句话的分析依据 = 句中的 [[a:]]、[[v:A…]]、[[table:A…]] 和句末 [[see:A…]]（组装、复核时按重新解析的
    引用算，见 evidence.verify_doc）。类要的 op 必须在依据里出现，几个里任一个对得上就算对；挂了算不了的结论算对不上
-4. **点名的段**：判断词所在分句里出现的结论结果表的维度值（全半角归一，两个字以上、不是纯数字）。来源类要点名的段都在
-   判定的 subjects 里；拖累要那一段变化为负，拉动、带动为正（不在 subjects 里、但那一段的变化占总变化过半的也算拖累）
+4. **点名的段**：判断词所在分句里出现的结论结果表的维度值（全半角归一，两个字以上、不是纯数字）。来源类要判定说了主要
+   来源（driver、concentrated，比率拆解的 mix_driven、rate_driven），点名的段都在 subjects 里；拖累要那一段变化为负，
+   拉动、带动为正（不在 subjects 里、但那一段的变化占总变化过半的也算拖累）
 5. **来源和因果的分界**：句子挂了拆解、因果词所在分句点名的是这份结论的段或因子（「下降主要由华东造成」）→ 按来源核，
    这是记账意义上的「来自」；点名的不是（「由于促销结束导致下降」）→ 按因果核：同一句要有知识库原话（[[q:]]）或运行
    输入（[[i:]]）作依据，或者写成推测（可能、或许、推测、待核实、不排除、疑似）。分句里已有来源一类判断词的，因果词
@@ -40,7 +41,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from app.analysis.contract import catalog_result
+from app.analysis.contract import LEDGER_KIND, OP_LABELS, catalog_result, method_label
 from app.engine.evidence import _Reason, _violation, iter_units
 
 #: 说法表的版本：改了判断词、类、绑定规则就升版本，老版本留在 LEXICONS 里给老文档复核用
@@ -53,10 +54,6 @@ UNCITED = "analysis_claim_uncited"
 MISMATCH = "analysis_claim_mismatch"
 CAUSAL = "causal_unsupported"
 CODES = frozenset({UNCITED, MISMATCH, CAUSAL})
-
-#: 各算子给人看的叫法（违规说法里用）
-_OP_TEXT = {"decompose": "变化拆解", "baseline": "波动基线", "trend": "趋势", "differ": "差异检验",
-            "comparable": "可比性检查"}
 
 # --------------------------------------------------------------------------
 # 说法表 v1
@@ -197,6 +194,9 @@ _V1 = Lexicon(
 
 LEXICONS: dict[int, Lexicon] = {1: _V1}
 
+#: 能挂「主要来自」这类来源判断的拆解判定（判定语就是这么说的）：一段或一个因子为主、集中在前几段，比率拆解里结构为主、
+#: 各段自身为主
+_SOURCE_VERDICTS = frozenset({"driver", "concentrated", "mix_driven", "rate_driven"})
 #: 有这几类判断的分句里，因果词并进它们核（「下降主要由华东造成」：说的是记账意义上的来源）
 _SOURCE_KEYS = frozenset({"source", "source_not", "dispersed", "offset", "mix"})
 #: 拆解结果表里不是维度的列（params.by 对不上时按「不是度量列」认维度，跳过这些）
@@ -404,7 +404,7 @@ def _named(result: Mapping[str, Any], names: str) -> list[str]:
         at = flat.find(key)
         while at >= 0:
             before, after = flat[at - 1:at], flat[at + len(key):at + len(key) + 1]
-            if not (key.isascii() and ((before and before.isalnum()) or (after and after.isalnum()))):
+            if not (key.isascii() and any(ch.isascii() and ch.isalnum() for ch in (before, after) if ch)):
                 hits.append((at, original))
                 break
             at = flat.find(key, at + 1)
@@ -507,7 +507,8 @@ def _check(lex: Lexicon, hit: Hit, result: Mapping[str, Any], names: str) -> _Mi
     if key in ("source", "source_not"):
         subjects = _subjects(result)
         named = _named(result, names)
-        top = code in ("driver", "concentrated")
+        # 判定语说「主要来自」的几种：一段（一个因子）为主、集中在前几段；比率拆解的结构为主、各段自身为主
+        top = code in _SOURCE_VERDICTS
         if key == "source_not":
             inside = [n for n in named if _named_value(n) in {_named_value(s) for s in subjects}]
             if top and (inside or not named):
@@ -548,8 +549,9 @@ def _check(lex: Lexicon, hit: Hit, result: Mapping[str, Any], names: str) -> _Mi
         return _Miss("没有记下此消彼长（各段的变化方向大多一致）", "这份结论没有记下各段此消彼长")
     if key == "mix":
         if result.get("mode") != "ratio":
-            return _Miss("是按维度的可加拆解，说明不了结构变化：结构变化要挂比率拆解",
-                         "这是按维度的可加拆解，说明不了结构变化（结构变化要挂比率拆解）")
+            done, wanted = method_label("decompose", result.get("mode")), method_label("decompose", "ratio")
+            return _Miss(f"是{done}，说明不了结构变化：结构变化要挂{wanted}",
+                         f"这是{done}，说明不了结构变化：结构变化要挂{wanted}")
         return None if code in ("mix_driven", "both") else _verdict_miss(result)
     if key == "anomaly":
         if code not in ("outside_band", "far_outside_band"):
@@ -623,7 +625,8 @@ _FALLBACK = {
 
 
 def _op_text(claim: Claim) -> str:
-    return "比率拆解" if claim.mode == "ratio" else _OP_TEXT.get(claim.op or "", claim.op or "")
+    """这一类要挂的分析怎么叫：算子、模式的叫法从契约取（结构变化是「变化拆解（比率）」）。"""
+    return method_label(claim.op, claim.mode) if claim.mode else OP_LABELS.get(claim.op or "", claim.op or "")
 
 
 def _snippet(shown: str, start: int, end: int, limit: int = 16) -> str:
@@ -740,11 +743,18 @@ def _available(results: Mapping[str, Mapping[str, Any]]) -> dict[str, list[str]]
 # --------------------------------------------------------------------------
 
 
-def results_of(catalog: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """写作目录里的分析结论：{A 编号: 结论}（contract.catalog_result 读）。"""
+def results_of(catalog: Mapping[str, Any], load: Any = None) -> dict[str, dict[str, Any]]:
+    """写作目录里的分析结论：{A 编号: 结论}（contract.catalog_result 读）。条目只带摘要、不带整份结论的（存进报告文档的
+    目录就是这样）按 load(编号, 条目) 取回（evidence 的 _Snapshots.analysis：按工件取、复验哈希）；没给 load、取不回的
+    不在里面。"""
     out: dict[str, dict[str, Any]] = {}
     for alias, entry in catalog.items():
-        if isinstance(entry, dict) and (result := catalog_result(entry)) is not None:
+        if not isinstance(entry, dict) or entry.get("kind") != LEDGER_KIND:
+            continue
+        result = catalog_result(entry)
+        if result is None and load is not None:
+            result = load(str(alias), entry)
+        if isinstance(result, dict):
             out[str(alias)] = dict(result)
     return out
 
@@ -791,10 +801,10 @@ def _sentence(unit: dict[str, Any], aliases: Iterable[str], results: Mapping[str
 
 
 def check_doc(doc: dict[str, Any], catalog: Mapping[str, Any], *, cited: Mapping[int, list[str]] | None = None,
-              version: int | None = None) -> list[dict[str, Any]]:
+              version: int | None = None, load: Any = None) -> list[dict[str, Any]]:
     """一份报告文档的说法违规。cited 是 {id(unit): 这句按重新解析的引用算的依据}（verify_doc 交进来），不给就用文档里
-    记的 cites。标题、代码块、表头不核。"""
-    results = results_of(catalog)
+    记的 cites；load 取回只带摘要的条目的整份结论（results_of）。标题、代码块、表头不核。"""
+    results = results_of(catalog, load)
     available = _available(results)
     out: list[dict[str, Any]] = []
     for block, unit in iter_units(doc):
@@ -825,8 +835,8 @@ def recorded(doc: Any) -> tuple[str | None, int | None] | None:
     return mode, version
 
 
-def verify(doc: Any, catalog: Mapping[str, Any], *, cited: Mapping[int, list[str]] | None = None
-           ) -> list[dict[str, Any]] | None:
+def verify(doc: Any, catalog: Mapping[str, Any], *, cited: Mapping[int, list[str]] | None = None,
+           load: Any = None) -> list[dict[str, Any]] | None:
     """复核一份文档的说法（evidence.verify_doc 调）：没记这一项的文档返回 None（不核，老文档复核结果不变）；记了的按记下
     的那一版说法表核。记了认不出的处置、版本的另记一条 bad_schema（文档可能被改过），照当前版核。"""
     found = recorded(doc)
@@ -836,7 +846,7 @@ def verify(doc: Any, catalog: Mapping[str, Any], *, cited: Mapping[int, list[str
     out: list[dict[str, Any]] = []
     if mode is None or version is None:
         out.append(_violation("bad_schema", f"报告文档记录的分析说法核对规则「{doc.get(DOC_FIELD)}」无法识别"))
-    return out + check_doc(doc, catalog, cited=cited, version=version)
+    return out + check_doc(doc, catalog, cited=cited, version=version, load=load)
 
 
 def counts(violations: Iterable[Mapping[str, Any]]) -> dict[str, int]:

@@ -11,8 +11,6 @@
 """
 from __future__ import annotations
 
-import re
-
 import pytest
 
 from app.analysis.testing import fake_result
@@ -193,6 +191,15 @@ def test_named_segments_must_be_among_the_subjects():
     assert said("下降主要来自华东，华南基本持平。", "A1", results={"A1": fake_result()}) == []
 
 
+def test_ascii_names_need_word_boundaries_but_chinese_neighbours_are_fine():
+    result = fake_result(subjects=[["AB"]])
+    result["table"]["rows"][0][0] = "AB"
+    result["table"]["rows"][1][0] = "A"
+    assert said("下降主要来自AB店。", "A1", results={"A1": result}) == []
+    assert said("下降主要来自XAB。", "A1", results={"A1": result}) == [], "XAB 不是点名 AB，也没点名别的段"
+    assert codes(said("下降主要来自A。", "A1", results={"A1": result})) == [], "一个字的名字不认"
+
+
 def test_named_segments_are_matched_across_full_and_half_width():
     result = fake_result(subjects=[["Ａ店"]])
     result["table"]["rows"][0][0] = "Ａ店"
@@ -260,7 +267,7 @@ def test_differences_check_the_verdict_and_the_order_of_the_two_groups():
 
 def test_a_structure_claim_needs_a_ratio_decomposition():
     [miss] = said("退款率上升来自结构变化。", "A1", results={"A1": fake_result()})
-    assert miss["code"] == ac.MISMATCH and "比率拆解" in miss["message"]
+    assert miss["code"] == ac.MISMATCH and "结构变化要挂变化拆解（比率）" in miss["message"]
     mix = fake_result(mode="ratio", verdict="mix_driven")
     assert said("退款率上升来自结构变化。", "A1", results={"A1": mix}) == []
 
@@ -348,22 +355,6 @@ def catalog(**analyses) -> dict:
     return out
 
 
-@pytest.fixture
-def see_a(monkeypatch):
-    """[[see:A1]] 的解析是证据接入（W1-b）的事：合进来之前这里按它的约定代为解析（编号 A{n}、目录里 kind analysis）。"""
-    original = evidence.resolve_support
-
-    def resolve(ref, catalog, *, loader=None):
-        ref = ref.strip()
-        entry = catalog.get(ref) or {}
-        if re.fullmatch(r"A\d+", ref) and entry.get("kind") == "analysis":
-            return {"ref": ref, "role": "support", "alias": ref, "kind": "analysis", "status": "resolved",
-                    "eid": entry["eid"], "locator": {}}
-        return original(ref, catalog, loader=loader)
-
-    monkeypatch.setattr(evidence, "resolve_support", resolve)
-
-
 def found(doc: dict) -> list[dict]:
     return [v for v in doc["violations"] if v["code"] in ac.CODES]
 
@@ -434,7 +425,7 @@ def test_rendered_values_name_segments_but_are_not_judgement_words():
     assert miss["code"] == ac.MISMATCH and "不是华南" in miss["message"] and miss["span"] == [2, 6]
 
 
-def test_compose_and_verify_bind_the_sentence_to_its_see_marker(see_a):
+def test_compose_and_verify_bind_the_sentence_to_its_see_marker():
     cat = catalog(A1=fake_result())
     ok = compose_doc("销售额 [[m:gmv]]，下降主要来自华东。[[see:A1]]", cat, analysis_claims="check")
     assert found(ok) == [] and verify_doc(ok, cat)["violations"] == []

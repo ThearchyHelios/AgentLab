@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -22,7 +21,6 @@ from app.core import artifact_store
 from app.db.base import SessionLocal
 from app.db.models import Run, RunEvent
 from app.engine import analysis_claims as ac
-from app.engine import evidence
 from app.engine import runner as runner_mod
 from app.engine.evidence import make_eid
 from app.engine.nodes import report as report_mod
@@ -206,7 +204,7 @@ async def test_the_writer_role_asks_for_where_changes_come_from_and_evidence_for
 
 
 # --------------------------------------------------------------------------
-# 目录里有分析结论（证据接入合进来之前，这里按它的约定把 A 条目放进目录、代为解析 [[see:A1]]）
+# 目录里有分析结论
 # --------------------------------------------------------------------------
 
 
@@ -218,7 +216,8 @@ def a_entry(alias: str, result: dict) -> dict:
 
 @pytest.fixture
 def analyses(monkeypatch):
-    """写作目录里多几条分析结论：{A 编号: 结论}。报告节点和出口复核按同一个 report_catalog 建目录，这里一处补上。"""
+    """写作目录里多几条分析结论：{A 编号: 结论}。台账里的分析结论由入口（分析卡、Agent 的分析工具）记，这里直接补进
+    目录：报告节点和出口复核按同一个 report_catalog 建目录，一处补上。"""
     added: dict[str, dict] = {}
     original = report_mod.report_catalog
 
@@ -228,16 +227,6 @@ def analyses(monkeypatch):
         return out
 
     monkeypatch.setattr(report_mod, "report_catalog", catalog)
-    resolve = evidence.resolve_support
-
-    def support(ref, catalog, *, loader=None):
-        ref = ref.strip()
-        if re.fullmatch(r"A\d+", ref) and (catalog.get(ref) or {}).get("kind") == "analysis":
-            return {"ref": ref, "role": "support", "alias": ref, "kind": "analysis", "status": "resolved",
-                    "eid": catalog[ref]["eid"], "locator": {}}
-        return resolve(ref, catalog, loader=loader)
-
-    monkeypatch.setattr(evidence, "resolve_support", support)
     return added
 
 

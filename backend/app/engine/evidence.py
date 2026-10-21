@@ -3601,10 +3601,10 @@ def verify_doc(
     if tiled and pos != len(markdown):
         violations.append(_violation("segment_mismatch", "正文末尾有一段不属于任何片段，文档可能被修改过"))
     # 分析说法核对（engine/analysis_claims）：只核记了这一项的文档，按记下的那一版说法表、这次核对的引用核。老文档不核，
-    # 统计也不多这个键
+    # 统计也不多这个键。目录条目只带摘要的（存进文档的那份）按工件取回整份结论
     from app.engine import analysis_claims as said
 
-    said_found = said.verify(doc, catalog, cited=cited_by)
+    said_found = said.verify(doc, catalog, cited=cited_by, load=lambda alias, entry: snaps.analysis(alias, entry)[0])
     if said_found is not None:
         violations.extend(said_found)
         stats["analysis_claims"] = sum(1 for v in said_found if v["code"] in said.CODES)
