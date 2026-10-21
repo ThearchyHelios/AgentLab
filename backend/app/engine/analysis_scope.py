@@ -11,6 +11,8 @@
 - **没拆**（not_decomposed）：候选维度里没拆过的。候选维度确定地从数据目录算：拆解所用查询的 SQL 里的事实表（目录标了
   fact / log；没标的、查询只读一张表时就是它）上标成属性、状态（attribute / status）、不遮罩、取值不多（码值表不超过
   CANDIDATE_MAX 个取值，或者已列全）的列，加上它关联的维度表（目录标了 dimension，或者关系是多对一）上同样的列。
+  「取值不多」只认码值表：剖析目前不记每列的取值数（码值列另有取值分布的观察、键列只核唯一），方案 §3.6 说的「剖析的
+  取值数 ≤ 50」等剖析记了每列取值数再补（第 1 波复核 R34，记为偏离）；没有码值表的属性列不进候选。
   拆解按的列对不上目录、读不到目录、认不出事实表的，not_decomposed 为 None，note 写一句为什么核对不了——不乱列
 - **检验**（tests）：这次做了几次差异检验（做成了的）；corrected：一次检验比了多对的按次数校正过，几次检验之间没有校正，
   做了不止一次时为 False（契约之外加的一项，见交付说明）
@@ -138,7 +140,7 @@ def _table_notes(tables: Mapping[str, Any], name: str) -> tuple[str, dict[str, A
 
 
 def _few_values(column: Mapping[str, Any]) -> bool:
-    """取值不多：码值表列出的取值不超过 CANDIDATE_MAX 个，或者标了已列全。"""
+    """取值不多：码值表列出的取值不超过 CANDIDATE_MAX 个，或者标了已列全。只认码值表：剖析不记每列的取值数（见模块说明）。"""
     codes = column.get("codes")
     if not isinstance(codes, Mapping) or codes.get("status") == "rejected":
         return False
