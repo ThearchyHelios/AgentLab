@@ -19,9 +19,8 @@ import app.analysis as analysis_ops
 from app.analysis import contract
 from app.core import artifact_store
 from app.core.artifact_store import canonical_json, content_hash
-from app.data.engine import engines
 from app.db.base import SessionLocal
-from app.db.models import DataSource, Run, RunEvent
+from app.db.models import Run, RunEvent
 from app.engine.runner import run_manager
 
 TOOL = "db_query__shop"
@@ -64,24 +63,15 @@ async def engine_up():
 
 
 @pytest.fixture(autouse=True)
-async def shop(tmp_path):
+async def shop(tmp_path, scratch_source):
+    """虚构零售库 shop（tests/conftest.py 的 scratch_source：同名的旧源连同数据目录、现查缓存先删掉，用完再删）。"""
     path = tmp_path / "shop.db"
     db = sqlite3.connect(path)
     db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, day TEXT, region TEXT, channel TEXT, amount INTEGER);")
     db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", _orders())
     db.commit()
     db.close()
-    async with SessionLocal() as session:
-        row = (await session.execute(select(DataSource).where(DataSource.name == "shop"))).scalar_one_or_none()
-        if row is None:
-            row = DataSource(name="shop", kind="sqlite", database=str(path), readonly=True, enabled=True)
-            session.add(row)
-        row.database, row.kind, row.enabled, row.readonly, row.options = str(path), "sqlite", True, True, {}
-        await session.commit()
-        source_id = row.id
-    await engines.invalidate(source_id)
-    yield
-    await engines.invalidate(source_id)
+    return await scratch_source("shop", path)
 
 
 def node(nid, ntype, **config):
@@ -349,3 +339,49 @@ async def test_a_ratio_between_two_regions_is_not_a_period_comparison(south_week
     assert issuance["tier"] == "degraded"
     assert issuance["gaps"] == ["指标「华东对华南的倍数」两期不可比：两边除了日期，筛选的还不一样"]
     recomputes(artifact_store.load(found["artifact"]))
+
+
+# --------------------------------------------------------------------------
+# 测试夹具：复用名叫 shop 的源，前后都删干净
+# --------------------------------------------------------------------------
+
+
+async def test_a_scratch_source_starts_clean_and_forgets_its_probes(tmp_path):
+    """分析相关的用例都建名叫 shop 的源（tests/conftest.py 的 scratch_source）：别的用例留下的数据目录、coverage 的现查缓存里
+    按同一个源 id 记下的表范围（5 分钟有效）会改掉这次的判定。sqlite_source 建的源是新的 id，同名的旧源连同数据目录、现查
+    缓存先删掉；forget_source 删源（数据目录随外键级联删除）、清掉现查缓存里它的表范围。"""
+    from app.analysis.probe import make_prober
+    from app.data import catalog as data_catalog
+    from app.data import coverage
+    from app.data.catalog import make_item
+    from app.db.models import CatalogNote, DataSource
+    from tests.fixtures.sources import forget_source, sqlite_source
+
+    path = tmp_path / "other.db"
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE orders (day TEXT, amount INTEGER); INSERT INTO orders VALUES ('2026-01-05', 1);")
+    db.close()
+
+    async def leave_traces(source_id):
+        async with SessionLocal() as session:
+            await data_catalog.write_entry(session, source_id, "orders", {"columns": {"amount": {
+                "measure": make_item("flow", "human")}}}, if_version=0, actor=None)
+            row = await session.get(DataSource, source_id)
+        probe = await make_prober({"scratch": row})("scratch", "orders", "day")
+        assert probe["max"] == "2026-01-05" and probe["basis"] == "live"
+        assert any(k[0] == source_id for k in coverage._LIVE)
+
+    async def traces(source_id):
+        async with SessionLocal() as session:
+            notes = (await session.execute(select(CatalogNote).where(CatalogNote.source_id == source_id))).scalars().all()
+            row = await session.get(DataSource, source_id)
+        return {"row": row is not None, "catalog": len(notes), "probes": sum(k[0] == source_id for k in coverage._LIVE)}
+
+    old = await sqlite_source("scratch", path)
+    await leave_traces(old)
+    new = await sqlite_source("scratch", path)
+    assert new != old and await traces(old) == {"row": False, "catalog": 0, "probes": 0}
+    assert await traces(new) == {"row": True, "catalog": 0, "probes": 0}
+    await leave_traces(new)
+    await forget_source(new)
+    assert await traces(new) == {"row": False, "catalog": 0, "probes": 0}

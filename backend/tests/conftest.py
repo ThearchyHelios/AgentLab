@@ -111,6 +111,24 @@ def pytest_collection_modifyitems(config, items) -> None:
             item.add_marker(skip)
 
 
+@pytest.fixture
+async def scratch_source():
+    """测试里建的 SQLite 数据源：source_id = await scratch_source("shop", 库文件路径, options={...})。同名的旧源先删掉（连同
+    它的数据目录、剖析和现查缓存，tests/fixtures/sources.sqlite_source），测试结束时再删一遍、清掉现查缓存（forget_source）。
+    分析相关的用例都建名叫 shop 的源：别的用例留下的数据目录、5 分钟内现查过的表范围会改掉这次的判定。"""
+    from tests.fixtures.sources import forget_source, sqlite_source
+
+    made: list[str] = []
+
+    async def make(name: str, path, **kw) -> str:
+        made.append(await sqlite_source(name, path, **kw))
+        return made[-1]
+
+    yield make
+    for source_id in made:
+        await forget_source(source_id)
+
+
 @pytest.fixture(scope="session")
 def scenic_db(tmp_path_factory) -> str:
     """合成的景区业务库（tests/fixtures/catalog/scenic.py）：50 张表、真外键与只能靠命名推断的关系并存。

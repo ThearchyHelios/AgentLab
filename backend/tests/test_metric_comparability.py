@@ -19,9 +19,8 @@ from sqlalchemy import select
 
 from app.analysis.contract import CallError
 from app.core import artifact_store
-from app.data.engine import engines
 from app.db.base import SessionLocal
-from app.db.models import DataSource, Run, RunEvent
+from app.db.models import Run, RunEvent
 from app.engine.nodes.metrics import COMPARABILITY_SKIPPED
 from app.engine.runner import run_manager
 from tests.fixtures.analysis_ops import FakeOps
@@ -41,7 +40,7 @@ async def engine_up():
 
 
 @pytest.fixture(autouse=True)
-async def shop(tmp_path):
+async def shop(tmp_path, scratch_source):
     path = tmp_path / "shop.db"
     db = sqlite3.connect(path)
     db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, day TEXT, region TEXT, store INTEGER, amount REAL, "
@@ -51,17 +50,7 @@ async def shop(tmp_path):
         (3, "2026-10-13", "华东", 1203, 450.0, 0.0), (4, "2026-10-15", "华北", 1204, 300.0, 15.0)])
     db.commit()
     db.close()
-    async with SessionLocal() as session:
-        row = (await session.execute(select(DataSource).where(DataSource.name == "shop"))).scalar_one_or_none()
-        if row is None:
-            row = DataSource(name="shop", kind="sqlite", database=str(path), readonly=True, enabled=True)
-            session.add(row)
-        row.database, row.kind, row.enabled, row.readonly, row.options = str(path), "sqlite", True, True, {}
-        await session.commit()
-        source_id = row.id
-    await engines.invalidate(source_id)
-    yield
-    await engines.invalidate(source_id)
+    return await scratch_source("shop", path)
 
 
 def node(nid, ntype, **config):

@@ -17,9 +17,8 @@ from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage
 from sqlalchemy import select
 
-from app.data.engine import engines
 from app.db.base import SessionLocal
-from app.db.models import DataSource, Run, RunEvent, Workflow, WorkflowVersion
+from app.db.models import Run, RunEvent, Workflow, WorkflowVersion
 from app.engine import analysis_claims as ac
 from app.engine import compiler
 from app.engine.nodes.io import _analysis_claims, _comparability
@@ -271,25 +270,15 @@ async def test_a_governed_formal_run_counts_the_untraced_cited_metric(client, mo
 
 
 @pytest.fixture
-async def shop(tmp_path):
+async def shop(tmp_path, scratch_source):
+    """虚构零售库 shop（tests/conftest.py 的 scratch_source：同名的旧源连同数据目录、现查缓存先删掉，测试结束时再删）。"""
     path = tmp_path / "shop.db"
     db = sqlite3.connect(path)
     db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, week TEXT, amount REAL);")
     db.executemany("INSERT INTO orders VALUES (?, ?, ?)", [(1, "2026-W37", 100.5), (2, "2026-W37", 200.0)])
     db.commit()
     db.close()
-    async with SessionLocal() as session:
-        row = (await session.execute(select(DataSource).where(DataSource.name == "shop"))).scalar_one_or_none()
-        if row is None:
-            row = DataSource(name="shop", kind="sqlite", database=str(path), readonly=True, enabled=True)
-            session.add(row)
-        else:
-            row.database, row.kind, row.enabled, row.readonly, row.options = str(path), "sqlite", True, True, {}
-        await session.commit()
-        source_id = row.id
-    await engines.invalidate(source_id)
-    yield
-    await engines.invalidate(source_id)
+    return await scratch_source("shop", path)
 
 
 async def test_a_metric_read_from_a_query_cell_is_traced(client, monkeypatch, shop):

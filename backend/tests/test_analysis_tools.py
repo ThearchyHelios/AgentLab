@@ -1,8 +1,9 @@
 """agent 分析工具（docs/design/analysis-round/00-总方案.md §3.2）：参数、方法说明、查询容器、台账、编号、下钻、次数上限、
 遮罩列、续跑。
 
-算子（app.analysis.run）还没落地：换成按请求交回假结论的替身（tests/fixtures/analysis_ops.FakeOps），断言入口交给算子的
-东西、算子交回后入口做的事。模型换成脚本（MockChatModel._decide），不调用任何模型。库是虚构的零售库 shop。
+算子（app.analysis.run）换成按请求交回假结论的替身（tests/fixtures/analysis_ops.FakeOps），断言入口交给算子的东西、算子
+交回后入口做的事；五个工具接真算子的端到端见 tests/test_analysis_e2e.py。模型换成脚本（MockChatModel._decide），不调用任何
+模型。库是虚构的零售库 shop。
 """
 from __future__ import annotations
 
@@ -18,9 +19,8 @@ from app.analysis import contract
 from app.analysis.contract import CallError
 from app.core import artifact_store
 from app.core.artifact_store import canonical_json, content_hash
-from app.data.engine import engines
 from app.db.base import SessionLocal
-from app.db.models import Artifact, DataSource, Run, RunEvent
+from app.db.models import Artifact, Run, RunEvent
 from app.engine.runner import run_manager
 from app.tools.analysis import CALL_ERROR_HEAD, REFUSED_CODE
 from app.tools.builtin.analysis import ANALYSIS_METHOD_PROMPT, ARGS, METHOD_GUIDE, NO_SCOPE
@@ -45,30 +45,20 @@ async def engine_up():
     await run_manager.shutdown()
 
 
-async def _shop(tmp_path, options=None):
+async def _shop(tmp_path, scratch_source, options=None):
+    """虚构零售库 shop（tests/conftest.py 的 scratch_source：同名的旧源连同数据目录、现查缓存先删掉，测试结束时再删）。"""
     path = tmp_path / "shop.db"
     db = sqlite3.connect(path)
     db.executescript("CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT, week TEXT, amount REAL, phone TEXT);")
     db.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", ROWS)
     db.commit()
     db.close()
-    async with SessionLocal() as session:
-        row = (await session.execute(select(DataSource).where(DataSource.name == "shop"))).scalar_one_or_none()
-        if row is None:
-            row = DataSource(name="shop", kind="sqlite", database=str(path), readonly=True, enabled=True)
-            session.add(row)
-        row.database, row.kind, row.enabled, row.readonly, row.options = str(path), "sqlite", True, True, options or {}
-        await session.commit()
-        source_id = row.id
-    await engines.invalidate(source_id)
-    return source_id
+    return await scratch_source("shop", path, options=options)
 
 
 @pytest.fixture
-async def shop(tmp_path):
-    source_id = await _shop(tmp_path)
-    yield
-    await engines.invalidate(source_id)
+async def shop(tmp_path, scratch_source):
+    return await _shop(tmp_path, scratch_source)
 
 
 class Script:
@@ -407,31 +397,25 @@ async def test_the_number_of_analyses_per_node_is_capped(monkeypatch, shop):
     assert ops.calls[0]["settings"]["max_calls"] == 1
 
 
-async def test_masked_columns_reach_the_operator(monkeypatch, tmp_path):
-    source_id = await _shop(tmp_path, {"mask_columns": ["phone"]})
-    try:
-        ops = FakeOps(monkeypatch)
-        Script(monkeypatch, [(TOOL, {"sql": MASKED_SQL}), (DECOMPOSE, {**DECOMPOSE_ARGS, "by": ["tel"]})])
-        await run_graph(agent_graph())
-        masked = ops.calls[0]["snapshots"]["Q1"]["masked"]
-        # 按 SQL 认出改了名字的遮罩列（phone AS tel）排在前面，数据源设的列名也在
-        assert masked[0] == "tel" and "phone" in masked
-    finally:
-        await engines.invalidate(source_id)
+async def test_masked_columns_reach_the_operator(monkeypatch, tmp_path, scratch_source):
+    await _shop(tmp_path, scratch_source, {"mask_columns": ["phone"]})
+    ops = FakeOps(monkeypatch)
+    Script(monkeypatch, [(TOOL, {"sql": MASKED_SQL}), (DECOMPOSE, {**DECOMPOSE_ARGS, "by": ["tel"]})])
+    await run_graph(agent_graph())
+    masked = ops.calls[0]["snapshots"]["Q1"]["masked"]
+    # 按 SQL 认出改了名字的遮罩列（phone AS tel）排在前面，数据源设的列名也在
+    assert masked[0] == "tel" and "phone" in masked
 
 
-async def test_mask_results_runs_hand_over_the_masked_snapshot(monkeypatch, tmp_path):
-    source_id = await _shop(tmp_path, {"mask_columns": ["phone"]})
-    try:
-        ops = FakeOps(monkeypatch)
-        Script(monkeypatch, [(TOOL, {"sql": MASKED_SQL}), (DECOMPOSE, {**DECOMPOSE_ARGS, "by": ["region"]})])
-        await run_graph(agent_graph(), options={"mask_results": True, "read_only_data": True})
-        snap = ops.calls[0]["snapshots"]["Q1"]
-        assert "tel" in snap["masked"]
-        tel = snap["columns"].index("tel")
-        assert {r[tel] for r in snap["rows"]} == {"已遮罩"}, "遮罩运行里算子拿到的是遮过的快照"
-    finally:
-        await engines.invalidate(source_id)
+async def test_mask_results_runs_hand_over_the_masked_snapshot(monkeypatch, tmp_path, scratch_source):
+    await _shop(tmp_path, scratch_source, {"mask_columns": ["phone"]})
+    ops = FakeOps(monkeypatch)
+    Script(monkeypatch, [(TOOL, {"sql": MASKED_SQL}), (DECOMPOSE, {**DECOMPOSE_ARGS, "by": ["region"]})])
+    await run_graph(agent_graph(), options={"mask_results": True, "read_only_data": True})
+    snap = ops.calls[0]["snapshots"]["Q1"]
+    assert "tel" in snap["masked"]
+    tel = snap["columns"].index("tel")
+    assert {r[tel] for r in snap["rows"]} == {"已遮罩"}, "遮罩运行里算子拿到的是遮过的快照"
 
 
 # --------------------------------------------------------------------------
