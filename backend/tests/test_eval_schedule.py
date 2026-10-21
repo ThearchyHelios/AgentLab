@@ -39,12 +39,7 @@ URL = "https://hooks.example.com/agentlab/eval-7c2a"
 
 
 @pytest.fixture(autouse=True)
-async def engine_up(monkeypatch):
-    # 同 test_eval_runner：同一个测试进程里别的测试建的数据源可能超过评测拍目录快照的上限（app/eval/snapshots.MAX_SOURCES），
-    # 评测会按设计在作答前就失败（「数据源超过 20 个」），止损那两条就判不出「部分完成」。这里的评测不测这个上限
-    from app.eval import snapshots
-
-    monkeypatch.setattr(snapshots, "MAX_SOURCES", 10_000)
+async def engine_up():
     await run_manager.setup()
     async with SessionLocal() as session:
         await session.execute(delete(Schedule))
