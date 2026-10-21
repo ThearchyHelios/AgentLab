@@ -470,7 +470,7 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     got = {name: json.loads(data_block(page)) for name, page in rendered.items()}
     assert set(got) == {"base", "two-reports", "metric-only", "legacy", "failed", "rejected", "continued", "degraded",
                         "missing-doc", "missing-card", "nan", "stray", "masked-card", "masked-old-doc", "masked-source",
-                        "formats", "formats-unit", "prose"}
+                        "formats", "formats-unit", "prose", "analysis"}
     for name, bundle in got.items():
         assert browser_manifest(bundle["events"]) == bundle["meta"]["manifest_hash"], name
 
@@ -557,3 +557,15 @@ def test_the_sample_pages_for_the_browser_check_are_sealed_for_real():
     # 口径卡单位带尾随空白：服务端把「元 」原样接在数后面，正文里的销售额带着那个空白
     shown = {s.get("ref"): s["text"] for s in segments(got["formats-unit"])}
     assert shown["m:gmv"] == "74,613.65元 " and shown["m:gmv|万"] == "7.46万元 "
+    # 异动周报：三份分析结论（导出时都复算一致）和两份输入快照随文件附带；文档带着系统写的分析范围，正文没引用的 A2、A3
+    # 只在范围里点名；分析工具的 tool.end 结论随文件附带了，带规范字符串
+    analysed = got["analysis"]
+    kinds = sorted((a["kind"], a.get("node_id"), "b64" in a) for a in analysed["artifacts"])
+    assert kinds == [("analysis_result", "bot", True)] * 3 + [("query", "bot", True)] * 2 + [("report_doc", "write", True)]
+    assert {a["recheck"]["status"] for a in analysed["artifacts"] if a["kind"] == "analysis_result"} == {"same"}
+    doc = json.loads(base64.b64decode(next(a["b64"] for a in analysed["artifacts"] if a["kind"] == "report_doc")))
+    scope = doc["analysis_scope"]
+    assert [[i["alias"] for i in scope[k]] for k in ("phenomena", "decomposed", "refused")] == [["A3"], ["A1"], ["A2"]]
+    assert scope["not_decomposed"] == ["渠道"] and scope["decomposed"][0]["dims"] == ["地区"]
+    assert {s["ref"] for s in segments(analysed) if s["ref"].startswith("a:")} == {"a:A1.top_share|pct"}
+    assert all("canonical" in e for e in analysed["events"] if e["type"] == "tool.end")

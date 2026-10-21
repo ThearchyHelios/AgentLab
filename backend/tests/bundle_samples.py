@@ -38,6 +38,10 @@
   原样导出照样全部通过
 - prose：同经营月报的口径卡和流水，正文是写作者自己写在引用旁边的普通文字（「运费统一[[m:…]]」「合计——[[m:…]]」
   「SKU-[[v:…]]」「共[[m:…]]家」这类）：原样导出全部通过、总览是绿的，紧挨着核对的规则不误判正常写法
+- analysis：异动周报（分析能力一轮）。Agent 在虚构零售库 shop 上查了两周的总数（Q1）和按地区两周的销售额（Q2），做了按地区的
+  变化拆解（A1，带总数核对）、波动基线（A2，两周历史不够，算不了）、两期可比性检查（A3），结论都是 app.analysis 真算的；
+  报告引用 A1 的判定语、具名的数（占比）、结果表的格，正文后面是系统写的「分析范围」（engine/analysis_scope 按虚构的数据
+  目录算出没拆的渠道）。结论和输入快照随文件附带、导出时复算过，原样导出全部通过；分析范围里的编号点得开（A2、A3 正文没引用）
 """
 from __future__ import annotations
 
@@ -313,6 +317,125 @@ def formats_bundle(*, card: dict[str, Any] = FORMATS_CARD, table: dict[str, Any]
     return build(f, events, bound)
 
 
+#: 分析样本（analysis）的两份查询：虚构零售库 shop 两周的总数（Q1）、四个地区两周的销售额（Q2）
+AN_TOTALS = {"columns": ["week", "gmv"], "column_types": {"week": "text", "gmv": "number"},
+             "rows": [["2026-W41", 2220], ["2026-W42", 2026]], "source": "shop",
+             "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week", "truncated": False,
+             "row_count": 2}
+AN_REGIONS = {"columns": ["region", "week", "gmv"], "column_types": {"region": "text", "week": "text", "gmv": "number"},
+              "rows": [["华东", "2026-W41", 820], ["华东", "2026-W42", 700], ["华北", "2026-W41", 600],
+                       ["华北", "2026-W42", 560], ["华南", "2026-W41", 700], ["华南", "2026-W42", 666],
+                       ["西南", "2026-W41", 100], ["西南", "2026-W42", 100]], "source": "shop",
+              "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+              "truncated": False, "row_count": 8}
+#: Agent 的三次分析调用（工具名、请求），照分析工具交给 app.analysis.run 的写法
+AN_CALLS = [
+    ("analysis_decompose", {"op": "decompose", "mode": "additive", "hypothesis": "下降是不是集中在某个地区",
+                            "params": {"query": "Q2", "by": ["region"], "period": "week", "base": "2026-W41",
+                                       "target": "2026-W42", "measure": "gmv", "label": "销售额",
+                                       "headline": {"base": "Q1.r0.gmv", "target": "Q1.r1.gmv"}}}),
+    ("analysis_baseline", {"op": "baseline", "mode": None, "hypothesis": "这周的下降算不算异常",
+                           "params": {"query": "Q1", "period": "week", "measure": "gmv", "label": "销售额"}}),
+    ("analysis_comparable", {"op": "comparable", "mode": None, "hypothesis": "两周能不能直接比",
+                             "params": {"query": "Q2", "period": "week", "base": "2026-W41", "target": "2026-W42",
+                                        "measure": "gmv"}}),
+]
+#: 异动周报：引用 A1 的判定语、具名的数（占比）、结果表的格；A2、A3 只在系统写的分析范围里
+AN_REPORT = ("## 异动周报\n\n[[a:A1]]。华东占总变化的 [[a:A1.top_share|pct]]，华东的变化是 [[v:A1.r0.delta]]。[[see:A1]]\n\n"
+             "各地区的变化见下表。\n\n[[table:A1 cols=region,base,target,delta rows=0-3]]")
+
+
+def _shop_notes() -> dict[str, Any]:
+    """虚构零售库 shop 的数据目录（orders 是事实表；地区、渠道是属性列，码值表列全）：分析范围按它算没拆的候选维度。"""
+    from app.data.catalog import make_item
+
+    def column(label: str, measure: str, codes: tuple[str, ...] = ()) -> dict[str, Any]:
+        out = {"label": make_item(label, "human"), "measure": make_item(measure, "human")}
+        if codes:
+            out["codes"] = make_item({c: "" for c in codes}, "profile", "verified")
+        return out
+
+    return {"orders": {"kind": make_item("fact", "human"), "columns": {
+        "region": column("地区", "attribute", ("华东", "华北", "华南", "西南")),
+        "channel": column("渠道", "attribute", ("线上", "线下")),
+        "week": column("周", "attribute"), "amount": column("实收金额", "flow")}}}
+
+
+def analysis_bundle() -> dict[str, Any]:
+    """异动周报（analysis）的页面数据：结论按两份快照真算（app.analysis.run），Agent 节点的事件照分析工具真实的写法
+    （tool.end 带结论工件和判定那一段），报告文档按写作目录真实组装，分析范围按虚构的数据目录真实算出。"""
+    import asyncio
+    from datetime import date
+
+    from app import analysis
+    from app.analysis.contract import effective_settings, ledger_entry
+    from app.engine import analysis_scope
+    from app.tools.analysis import event_view, input_snapshot
+
+    run = {**RUN, "id": "9c2e4a6b8d0f4e1a3c5b7d9f1e3a5c7b", "workflow_id": "wf-sample-anomaly", "workflow_name": "异动周报",
+           "started_at": "2026-10-19T01:00:00+00:00", "finished_at": "2026-10-19T01:01:30+00:00"}
+    graph = {"nodes": [{"id": n, "type": t, "data": {"label": label}} for n, t, label in [
+        ("start", "input", "开始"), ("bot", "agent", "问数据"), ("write", "report", "写周报"), ("out", "output", "成果")]]}
+    files: dict[str, bytes] = {}
+
+    def put(obj: Any) -> str:
+        artifact, raw = stored(obj)
+        files[artifact] = raw
+        return artifact
+
+    def load(artifact: str) -> Any:
+        raw = files.get(artifact)
+        return json.loads(raw) if raw is not None else None
+
+    queries = [(put(snap), snap) for snap in (AN_TOTALS, AN_REGIONS)]
+    # 照分析工具交给算子的写法：查询快照原样加上出处；目录事实（列的叫法、度量类型）按虚构的数据目录给，结论里记下
+    snapshots = {f"Q{i}": input_snapshot(snap, ref=f"Q{i}", artifact=sha, node_id="bot")
+                 for i, (sha, snap) in enumerate(queries, 1)}
+    context = {"today": date(2026, 10, 19), "catalogs": {"shop": _shop_notes()}}
+    ledger: list[dict[str, Any]] = [
+        {"kind": "query", "node_id": "bot", "exec": 1, "artifact": sha, "call_id": f"call_{i}", "tool": "db_query__shop",
+         "source": "shop", "columns": snap["columns"], "rows": len(snap["rows"]), "truncated": False}
+        for i, (sha, snap) in enumerate(queries)]
+    results = []
+    for n, (tool, request) in enumerate(AN_CALLS, len(queries)):
+        result = dict(asyncio.run(analysis.run(request, snapshots.get, settings=effective_settings(None), context=context)))
+        artifact = put(result)
+        results.append((tool, f"call_{n}", artifact, result))
+        ledger.append(ledger_entry(result, node_id="bot", exec_no=1, artifact=artifact, call_id=f"call_{n}"))
+    catalog = build_catalog(nodes={}, ledger=ledger, loader=load)
+    doc = compose_doc(AN_REPORT, catalog, node_id="write", run_id=run["id"], loader=load)
+    doc["analysis_scope"] = analysis_scope.build(catalog, sources={"shop": {"tables": _shop_notes(), "masked": []}},
+                                                 load=load)
+    doc_id = put(doc)
+
+    events: list[tuple[int, str, str | None, Any]] = []
+
+    def add(etype: str, node_id: str | None, data: dict[str, Any]) -> None:
+        events.append((len(events) + 1, etype, node_id, data))
+
+    add("run.started", None, {"nodes": len(graph["nodes"]), "resumed": False, "memory_scope": "default",
+                              "collection": "default", "approval_default": None, "tool_trust": "formal",
+                              "agent_limits": {}, "data_versions": None, "replay_protocol": 2})
+    add("node.started", "bot", {"node_type": "agent", "label": "问数据"})
+    for i, (sha, snap) in enumerate(queries):
+        add("tool.end", "bot", {"tool": "db_query__shop", "call_id": f"call_{i}", "duration_ms": 9, "query_artifact": sha,
+                                "preview": json.dumps({"columns": snap["columns"], "rows": snap["rows"][:2]},
+                                                      ensure_ascii=False)})
+    for k, (tool, call_id, artifact, result) in enumerate(results, 1):
+        add("tool.end", "bot", {"tool": tool, "call_id": call_id, "duration_ms": 6, "analysis_artifact": artifact,
+                                "preview": json.dumps({"analysis_artifact": artifact}), "analysis": event_view(result, f"A{k}")})
+    add("node.finished", "bot", {"duration_ms": 240, "attempt": 1, "preview": {"text": "销售额下降，主要来自华东。"},
+                                 "evidence": ledger})
+    add("llm.end", "write", {"model": "mock", "output": "（写作草稿）"})
+    add("report.checked", "write", {"doc_artifact": doc_id, "ok": True})
+    add("node.finished", "write", {"duration_ms": 20, "attempt": 1, "preview": {"text": "（报告正文）", "doc_artifact": doc_id}})
+    add("issuance", "out", {"tier": "formal", "mode": "citations"})
+    add("node.finished", "out", {"duration_ms": 2, "attempt": 1, "preview": {"周报": "（报告正文）"}})
+    add("run.finished", None, {"output": {"周报": "（报告正文）"}})
+    return build_bundle(run, events, manifest_seq=len(events), manifest_hash=manifest_hash(events), read=files.get,
+                        exported_at=EXPORTED_AT, graph=graph, source_masks={})
+
+
 def bundles() -> dict[str, dict[str, Any]]:
     """{页面名: 页面数据}"""
     out: dict[str, dict[str, Any]] = {}
@@ -368,6 +491,7 @@ def bundles() -> dict[str, dict[str, Any]]:
     out["formats"] = formats_bundle()
     out["formats-unit"] = formats_bundle(card=FORMATS_UNIT_CARD)
     out["prose"] = formats_bundle(text=PROSE)
+    out["analysis"] = analysis_bundle()
     return out
 
 
