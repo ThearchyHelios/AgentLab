@@ -9,7 +9,6 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from analysis_samples import CATALOGS, recomputed, snap
 from app import analysis
 from app.analysis.contract import effective_settings, same
 from app.analysis.probe import Book, make_prober
@@ -17,6 +16,7 @@ from app.data import introspect
 from app.data.engine import engines
 from app.db.base import SessionLocal
 from app.db.models import DataSource
+from tests.analysis_samples import CATALOGS, recomputed, snap
 
 CLOCK = "2026-10-21T09:30:00"
 #: SQLite 的 date('now') 按 UTC 算：表里的数据造到 UTC 的昨天

@@ -3,8 +3,8 @@
 probes，不现查）。"""
 from __future__ import annotations
 
-from analysis_samples import analyze, fixed_prober, snap
 from app.analysis import comparable_reasons
+from tests.analysis_samples import analyze, fixed_prober, snap
 
 WINDOW = "SELECT SUM(amount) AS gmv FROM orders WHERE order_date >= '{a}' AND order_date < '{b}'"
 RANGE = {("orders", "order_date"): ("2025-01-01", "2026-10-20")}

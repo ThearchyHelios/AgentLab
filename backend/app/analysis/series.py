@@ -111,10 +111,6 @@ def _completeness(env: Env, series: Series, item: pd.Period) -> tuple[str, str |
     return cmp.span_coverage(span, env.today, env.book)  # type: ignore[arg-type]
 
 
-def _shown_period(item: pd.Period) -> Any:
-    return item.raw
-
-
 # --------------------------------------------------------------------------
 # 波动基线
 # --------------------------------------------------------------------------

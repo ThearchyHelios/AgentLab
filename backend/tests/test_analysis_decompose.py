@@ -9,8 +9,8 @@ from fractions import Fraction
 
 import pytest
 
-from analysis_samples import analyze, call_error, fixed_prober, notes, snap
 from app.analysis.decompose import lmdi, ratio_effects
+from tests.analysis_samples import analyze, call_error, fixed_prober, notes, snap
 
 SQL = "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week"
 TYPES = {"region": "text", "week": "text", "gmv": "number"}

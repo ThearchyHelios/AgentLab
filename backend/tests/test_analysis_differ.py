@@ -7,8 +7,8 @@ from fractions import Fraction
 
 import pytest
 
-from analysis_samples import analyze, call_error, snap
 from app.analysis import stats
+from tests.analysis_samples import analyze, call_error, snap
 
 RATE_SQL = "SELECT region, SUM(refund_flag) AS refunds, COUNT(*) AS orders FROM orders GROUP BY region"
 

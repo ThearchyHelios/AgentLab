@@ -7,8 +7,8 @@ from fractions import Fraction
 
 import pytest
 
-from analysis_samples import analyze, call_error, fixed_prober, snap
 from app.analysis.series import MAD_SCALE, run_length
+from tests.analysis_samples import analyze, call_error, fixed_prober, snap
 
 SQL = "SELECT DATE(order_date, 'weekday 0', '-6 days') AS week, COUNT(*) AS orders FROM orders GROUP BY 1"
 #: 每周一的日期：最后一周是 2026-10-12（到 10-18，运行当天 10-21 之前已经过完）

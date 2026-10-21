@@ -111,6 +111,7 @@ def recompute(result: AnalysisResult, load: Callable[[str], InputSnapshot | None
     """复算：load 按 sha256 取回输入快照，load_result 按 sha256 取回 parent 那份结论。用结论里记下的 params（含运行当天、
     目录事实）、settings、probes，不现查、不读目录。取不回输入时抛 CallError（code input_missing）；方法升版后调用不再成立
     时同样抛 CallError（照 run 的说法）。和封存的那份用 contract.same 比。"""
+    from app.analysis.common import DERIVED_PARAMS
     from app.analysis.facts import Facts
     from app.analysis.inputs import _CELL, Inputs
     from app.analysis.probe import Book
@@ -149,7 +150,7 @@ def recompute(result: AnalysisResult, load: Callable[[str], InputSnapshot | None
     today = date.fromisoformat(params["today"]) if isinstance(params.get("today"), str) else None
     env = _env(op, mode, settings, Inputs(resolve, dialect), Facts(recorded=params.get("catalog") or {}),
                Book(result.get("probes") or []), today, parents, result.get("hypothesis"))
-    raw = {k: v for k, v in params.items() if k not in ("catalog", "today", "depth")}
+    raw = {k: v for k, v in params.items() if k not in DERIVED_PARAMS}
     return _compute(op, mode, raw, env)
 
 

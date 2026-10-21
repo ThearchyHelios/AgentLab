@@ -7,10 +7,10 @@ from datetime import date, timedelta
 
 import pytest
 
-from analysis_samples import CATALOGS, analyze, call_error, fixed_prober, recomputed, snap
 from app import analysis
 from app.analysis import contract as c
 from app.analysis.contract import CallError, effective_settings, same
+from tests.analysis_samples import CATALOGS, analyze, call_error, fixed_prober, recomputed, snap
 
 WEEKLY_SQL = "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week"
 WEEKLY = snap("Q2", WEEKLY_SQL, ["region", "week", "gmv"],
