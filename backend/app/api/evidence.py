@@ -4048,18 +4048,22 @@ def _scope_catalog(sealed: _Sealed, report_node: str) -> dict[str, Any]:
 
     doc.catalog 只留了正文用到的实体，给「是不是想写…」找候选不够；运行状态（checkpoint）不在封存
     范围里，也不能用。图读不出来、找不到报告节点时退回全部封存台账。
+
+    台账里的分析结论不进：候选只看表和字段，用不到结论的内容，进了目录就要把每份结论读盘、复验一遍哈希（build_catalog
+    给 A 条目装整份结论）。查询、表和字段的编号不受影响（分析结论另编 A）。
     """
     from app.engine.nodes.report import report_catalog
     from app.engine.schema import GraphSpec
 
+    entries = [e for e in sealed.entries if e.get("kind") != LEDGER_KIND]
     try:
         spec = GraphSpec.model_validate(sealed.graph)
         node = spec.node_map().get(report_node)
     except Exception:  # noqa: BLE001 - 老运行的图可能已经不合现在的格式，退回不分范围
         node = None
     if node is None:
-        return build_catalog(nodes={}, ledger=sealed.entries)
-    return report_catalog({"evidence": sealed.entries, "nodes": {}, "input": {}}, spec, node)  # type: ignore[arg-type]
+        return build_catalog(nodes={}, ledger=entries)
+    return report_catalog({"evidence": entries, "nodes": {}, "input": {}}, spec, node)  # type: ignore[arg-type]
 
 
 def _suspicious_step(seg: dict[str, Any], cite: dict[str, Any], sealed: _Sealed, report_node: str) -> dict[str, Any]:

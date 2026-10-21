@@ -287,6 +287,25 @@ async def test_a_tampered_result_is_said_and_not_shown(client):
     assert seal["hash_ok"] is False and seal["sealed"] is False and body["seal"]["covered"] is False
 
 
+def test_suspicious_name_hints_do_not_read_the_analysis_results(monkeypatch):
+    """可疑实体找「最接近的名字」时按封存的台账重建目录（_scope_catalog）：分析结论不进，不读盘、不复验哈希（候选只看表和
+    字段，用不到结论的内容）。以前每点开一个可疑的名字，就把这次运行的分析结论全读一遍。"""
+    from app.api import evidence as api
+    from app.engine import evidence as engine_evidence
+
+    read: list[str] = []
+    monkeypatch.setattr(engine_evidence, "load_artifact", lambda artifact: read.append(artifact))
+    q, a = "1" * 64, "2" * 64
+    entries = [_query_entry(SNAPSHOT, q), {"kind": "analysis", "node_id": "an", "exec": 1, "artifact": a,
+                                           "op": "decompose", "mode": "additive", "item": "drop", "inputs": [q]}]
+    graph = {**GRAPH, "edges": [{"source": "fetch", "target": "an"}, {"source": "an", "target": "write"}]}
+    sealed = api._Sealed(run_id="r", graph=graph, seal={"sealed": True, "ok": True}, events=[], entries=entries)
+    for report in ("write", "nope"):
+        catalog = api._scope_catalog(sealed, report)
+        assert "Q1" in catalog and not [e for e in catalog.values() if e.get("kind") == "analysis"]
+    assert read == []
+
+
 async def test_agent_analyses_are_marked_as_such(client):
     made = await sealed_run(TEXT, item=None, call_id="call-9")
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
