@@ -1461,6 +1461,7 @@
     const loc = isObj(cite.locator) ? cite.locator : {}
     if (cite.kind === 'metric') return T.srcMetric(own(entry, 'name') || loc.metric || cite.ref || '')
     if (cite.kind === 'cell' && own(entry, 'kind') === 'analysis' && Number.isInteger(loc.row)) {
+      // 结果表的格写列名：核对到结论之后换成结论记的列名（checkAnalysis 的 info.source），这里先照引用里的列 id 说
       return T.srcAnalysisCell(cite.alias, loc.row, String(loc.column ?? ''))
     }
     if (cite.kind === 'cell') {
@@ -1573,6 +1574,9 @@
         const [raw, column, key] = locateCell(table, loc.row, loc.column)
         info.row = loc.row
         info.column = column
+        // 出处面板写结果表记的列名（labels），不把列 id 当叫法；目录条目和文档引用里带的那份先认，没有再查这份结论
+        info.columnLabel = analysisColumnLabel(table, column)
+        info.source = T.srcAnalysisCell(cite.alias, loc.row, info.columnLabel)
         info.truth = cellValue(raw, columnKind(table, column))
         info.truthToken = tokenAt(tokensOf(art), ['table', 'rows', loc.row, key])
         if (typeof raw === 'string' && typeof info.truth === 'number') info.truthText = pyStrip(raw)
@@ -1598,6 +1602,14 @@
     if (typeof result.phrase !== 'string' || !result.phrase.trim()) return { ...info, result: FAIL, reason: T.numNoPhrase }
     info.truth = result.phrase
     return checkShown(info, seg, () => renderCell(result.phrase, null, null, 'text', 1))
+  }
+
+  /** 分析结论结果表的一格写给人看的列名：结论结果表记的 labels（「占变化的比重」），没起名字的列才写列 id。
+   *  文档里的引用只记列 id（引用就这么写），列名照随文件附带的结论认 */
+  function analysisColumnLabel(table, column) {
+    const id = String(column ?? '')
+    const labels = isObj(table.labels) ? table.labels : {}
+    return own(labels, id) ? String(labels[id]) : id
   }
 
   /** 口径卡的单位：服务端是 str(unit or "")，不是文字的本页不认 */

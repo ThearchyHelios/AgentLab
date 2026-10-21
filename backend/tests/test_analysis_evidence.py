@@ -330,6 +330,8 @@ def test_the_doc_keeps_a_summary_and_reloads_the_result_from_the_artifact():
     doc = compose_doc("[[a:A1]]，华东占 [[a:A1.top_share|pct]]。", catalog, loader=store.load)
     stored = doc["catalog"]["A1"]
     assert "result" not in stored and stored["artifact"] and stored["rows"] == 4 and stored["verdict"] == "driver"
+    # 结果表记的列名（列 id → 给人看的名字）跟着摘要走：证据面板、读屏的出处写「结果表第 1 行「变化」」
+    assert stored["labels"]["delta"] == "变化"
     # 文档里的摘要照样解析得了：结论按工件取回
     assert resolve_ref("a:A1", doc["catalog"], loader=store.load)["status"] == "resolved"
     assert verify_doc(doc, doc["catalog"], loader=store.load)["ok"]

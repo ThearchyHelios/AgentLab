@@ -940,7 +940,8 @@ await section('样本页：各种形状', async () => {
       && shareDetail.includes('与按显示规则渲染的结果一致'), shareDetail.replace(/\s+/g, ' ').slice(0, 300))
     const cell = page.locator('.doc p button.num').filter({ hasText: /^-120$/ })
     const cellDetail = await cell.count() ? await detailText(page, cell.first()) : '找不到「-120」'
-    check('analysis：结果表的格：出处写分析结论 A1 的结果表 · 第 1 行 · delta', cellDetail.includes('分析结论 A1 的结果表 · 第 1 行 · delta'),
+    // 列写结果表记的列名（「变化」），不把列 id（delta）当叫法
+    check('analysis：结果表的格：出处写分析结论 A1 的结果表 · 第 1 行 · 变化', cellDetail.includes('分析结论 A1 的结果表 · 第 1 行 · 变化'),
       cellDetail.replace(/\s+/g, ' ').slice(0, 300))
     check('analysis：结果表整表引用：表头是给人看的列名，数字列右对齐', (await page.locator('.doc table th').allTextContents()).join('、') === '地区、基期、本期、变化'
       && await page.locator('.doc td.n button.num').count() === 12, (await page.locator('.doc table th').allTextContents()).join('、'))

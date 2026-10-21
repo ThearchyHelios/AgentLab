@@ -20,6 +20,8 @@ import app.bundle
 import app.report_export
 from app.main import app as asgi
 from tests.test_analysis_bundle import bundle_of, card_bundle
+from app.core import artifact_store
+from tests.test_analysis_evidence import SNAPSHOT, analyzed
 from tests.test_analysis_evidence_api import (
     LAST_WEEK, SCOPE, TEXT, THIS_WEEK, comparability_card, ratio_run, sealed_run, seg_id,
 )
@@ -154,7 +156,8 @@ async def test_the_export_page_opens_the_analysis_steps_and_the_scope_numbers():
                  "按运行当天现算的界 date('now', '-7 days') = 2026-10-14（现查 · 2026-10-21T09:00:00）",
                  "orders.refund_date：这一列一个值都没有（现查", "orders.order_date：2025-01-01 至 2026-10-20（剖析"):
         assert text in body, text
-    assert "结果表第 1 行「delta」" in out[cell]["body"]
+    # 结果表的格写结果表记的列名（labels 的「变化」），不把列 id 当叫法
+    assert "结果表第 1 行「变化」" in out[cell]["body"]
     assert out["scope:A1"]["steps"] == opened["steps"]
 
 
@@ -169,10 +172,34 @@ async def test_the_export_page_speaks_of_the_overall_ratio_for_a_ratio_decomposi
     out = run_node(RUN_RUNTIME, RUNTIME, {"data": data, "segs": [
         {"seg": phrase, "kind": "analysis", "state": "deterministic", "text": made["result"]["phrase"]}]})
     body = out[phrase]["body"]
-    for text in ("基期整体比率", "整体比率那一格", "整体比率 0.035 与各段分子之和 ÷ 分母之和 0.035 闭合",
+    for text in ("基期整体比率", "整体比率那一格", "第 1 行「rate」 = 0.035",
+                 "整体比率 0.035 与各段分子之和 ÷ 分母之和 0.035 闭合",
                  "整体比率 0.053 与各段分子之和 ÷ 分母之和 0.053 闭合"):
         assert text in body, text
     assert "各段之和 0.0" not in body
+
+
+async def test_the_export_page_writes_the_headline_cell_the_way_the_server_rendered_it():
+    """总数那一格的值由服务端渲染（render_cell：千分位），页面照原样显示：以前照原值写「2220」，同一节里闭合核对写
+    「2,220」，一处引用里两个写法并排。"""
+    totals = {"columns": ["gmv_base", "gmv"], "column_types": {"gmv_base": "number", "gmv": "number"},
+              "rows": [[2220, 2026]], "sql": "SELECT 2220 AS gmv_base, 2026 AS gmv", "source": "shop",
+              "truncated": False}
+    t = artifact_store.content_hash(artifact_store.canonical_json(totals))
+    q = artifact_store.content_hash(artifact_store.canonical_json(SNAPSHOT))
+    result = await analyzed({"Q2": (SNAPSHOT, q), "Q5": (totals, t)}, headline=["Q5.r0.gmv_base", "Q5.r0.gmv"])
+    made = await sealed_run("[[a:A1]]。", result=result, queries=[totals])
+    async with AsyncClient(transport=ASGITransport(app=asgi), base_url="http://test") as client:
+        html = (await client.get(f"/api/runs/{made['run']}/report.html")).text
+    data = re.search(r'<script type="application/json" id="report-data">(.*?)</script>', html, re.S).group(1)
+    phrase = seg_id(made["doc"], "a:A1")
+    out = run_node(RUN_RUNTIME, RUNTIME, {"data": data, "segs": [
+        {"seg": phrase, "kind": "analysis", "state": "deterministic", "text": made["result"]["phrase"]}]})
+    body = out[phrase]["body"]
+    for text in ("总数那一格第 1 行「gmv_base」 = 2,220", "总数那一格第 1 行「gmv」 = 2,026",
+                 "总数 2,220 与各段之和 2,220 闭合"):
+        assert text in body, text
+    assert "= 2220" not in body and "= 2026" not in body
 
 
 async def test_the_bundle_page_shows_the_analysis_detail_and_the_scope():

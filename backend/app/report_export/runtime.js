@@ -468,7 +468,8 @@
     const verdict = isObj(step.verdict) ? step.verdict : null
     const cited = isObj(step.cited) ? step.cited : {}
     const citedText = cited.what === 'value' ? T.citedValue(cited.key) : cited.what === 'cell'
-      ? T.citedCell(Number(cited.row) || 0, String(cited.column ?? '')) : T.citedPhrase
+      // 结果表的格写列名（服务端照结果表记的 labels 给），不把列 id 当叫法；老接口没给列名的照旧写 id
+      ? T.citedCell(Number(cited.row) || 0, String(cited.column_label || cited.column || '')) : T.citedPhrase
     body.push(kv([
       [T.dPhrase, String(step.phrase || NONE)],
       step.criterion ? [T.dCriterion, String(step.criterion)] : null,
@@ -561,7 +562,7 @@
       step.node_id ? [T.dNode, nodeLabel(step.node_id)] : null,
       Array.isArray(step.columns) && step.columns.length ? [T.dColumnsUsed, step.columns.join('、')] : null,
       rows ? [T.dRowsUsed, rows] : null,
-      'value' in step ? [ratio ? T.dHeadlineRatio : T.dHeadline, `${step.column ? `第 ${Number(step.row) + 1} 行「${step.column}」 = ` : ''}${valueText(step.value)}`] : null,
+      'value' in step ? [ratio ? T.dHeadlineRatio : T.dHeadline, `${step.column ? `第 ${Number(step.row) + 1} 行「${step.column}」 = ` : ''}${step.value_rendered ?? valueText(step.value)}`] : null,
       closure ? [T.dClosure, closed(closure.headline, closure.total)] : null,
       step.phrase ? [T.dPhrase, String(step.phrase)] : null,
     ])]

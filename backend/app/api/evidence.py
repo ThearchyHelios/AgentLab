@@ -1067,7 +1067,10 @@ def _catalog_alias_of(catalog: dict[str, Any], artifact: Any) -> str | None:
 
 
 def _analysis_cited(cite: dict[str, Any], result: dict[str, Any] | None) -> dict[str, Any]:
-    """这一处引用的是结论的哪一项：判定语（phrase）、具名标量（value：键、原值、换算）、结果表的一格（cell：行、列、原值）。"""
+    """这一处引用的是结论的哪一项：判定语（phrase）、具名标量（value：键、原值、换算）、结果表的一格（cell：行、列、原值）。
+
+    结果表的列写给人看：column 是稳定的列 id（share、delta……，引用里就是这么写的），column_label 是结果表记的列名
+    （「占变化的比重」）；页面照原样显示 column_label，不把列 id 当叫法。"""
     locator = cite.get("locator") or {}
     if cite.get("kind") == "cell":
         row, column = locator.get("row"), locator.get("column")
@@ -1076,7 +1079,9 @@ def _analysis_cited(cite: dict[str, Any], result: dict[str, Any] | None) -> dict
         if table is not None:
             with contextlib.suppress(Exception):
                 raw, column = locate_cell(table, row, column)
-        return {"what": "cell", "row": row, "column": column, "raw": raw}
+        labels = (table or {}).get("labels") if isinstance((table or {}).get("labels"), dict) else {}
+        return {"what": "cell", "row": row, "column": column,
+                "column_label": str(labels.get(column) or column) if column is not None else None, "raw": raw}
     if locator.get("key"):
         values = (result or {}).get("values") if isinstance((result or {}).get("values"), dict) else {}
         return {"what": "value", "key": locator["key"], "raw": values.get(locator["key"]),
@@ -1108,12 +1113,13 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
     """分析结论的出处链（00-总方案 §3.3）：判定 → 方法 → 计算 → 输入 → 复算 → 封存。
 
     - 判定（analysis）：判定语、判定标准、判定码和点名的段、附带说明、算不了的原因，这一处引用的是哪一项（判定语、具名标量、
-      结果表的一格）；「在验证什么」另列，谁写的照实标：Agent 现场做的写「Agent 写的假设」
+      结果表的一格，列另写结果表记的列名 column_label）；「在验证什么」另列，谁写的照实标：Agent 现场做的写「Agent 写的假设」
       （HYPOTHESIS_NOTE），分析卡做的写「分析卡上写的『在验证什么』」（CARD_HYPOTHESIS_NOTE，模板作者写的）
     - 方法（analysis_method）：方法与版本、规范化后的参数、实际用的阈值（只列这个算子用到的）、现查的表范围（probes）
     - 计算（analysis_calc）：结果表（前 table_top_k 段，加上被引用的那一行附近）、具名的数、关键数的代入式
       （evidence.analysis_formulas）
-    - 输入（analysis_input，每份一步）：落到报告目录的哪个 Q、用了哪些列和行、headline 那一格和结论里总数的闭合核对、
+    - 输入（analysis_input，每份一步）：落到报告目录的哪个 Q、用了哪些列和行、headline 那一格（值另由服务端渲染成 value_rendered，
+      和闭合核对同一个写法）和结论里总数的闭合核对、
       下钻的上一层是哪个 A；后面接上每份输入快照的查询步骤（只认封存范围内交回过的，遮罩照查询步骤的办法）
     - 复算（analysis_recompute）：按 sha256 取回封存的输入、用同一个函数复算，和封存的逐字段比（evidence.analysis_recheck）；
       方法升过版、复算不了都照实写
@@ -1244,6 +1250,10 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
             "role_label": roles.get(role, role or "输入"), "artifact": artifact or None,
             **{k: item[k] for k in ("columns", "rows", "row", "column", "value") if k in item},
         }
+        # 那一格的值由服务端渲染（render_cell：千分位、NULL 写「—」，和闭合核对里的字同一个写法），页面照原样显示
+        if "value" in item:
+            with contextlib.suppress(RenderError):
+                step["value_rendered"] = render_cell(item.get("value"))
         if role == "parent":
             step["alias"] = _catalog_alias_of(catalog, artifact)
             parent, ok = _analysis_of(artifact)

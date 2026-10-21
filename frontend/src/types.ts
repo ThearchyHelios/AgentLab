@@ -2435,8 +2435,16 @@ export interface EvidenceAnalysisStep {
   artifact?: string | null
   eid?: string
   eid_ok?: boolean
-  /** 这一处引用的是结论的哪一项：判定语、具名的数（key）、结果表的一格（row、column） */
-  cited?: { what?: 'phrase' | 'value' | 'cell' | string; key?: string; row?: number; column?: string; raw?: unknown; conv?: string }
+  /** 这一处引用的是结论的哪一项：判定语、具名的数（key）、结果表的一格（row、column；column_label 是结果表的列名，给人看的） */
+  cited?: {
+    what?: 'phrase' | 'value' | 'cell' | string
+    key?: string
+    row?: number
+    column?: string
+    column_label?: string | null
+    raw?: unknown
+    conv?: string
+  }
   rendered?: string
   render_ok?: boolean
   hash_ok?: boolean | null
@@ -2481,6 +2489,8 @@ export interface EvidenceAnalysisStep {
   row?: number
   column?: string
   value?: string | null
+  /** 那一格的值按服务端的规则渲染出来的字（render_cell：千分位、NULL 写「—」），和闭合核对里的写法一致 */
+  value_rendered?: string
   /** 输入落到报告目录的哪个 Q */
   query?: string | null
   sealed?: boolean

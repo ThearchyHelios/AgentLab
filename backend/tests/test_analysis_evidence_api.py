@@ -176,7 +176,8 @@ async def test_named_values_and_result_cells_point_at_what_they_cite(client):
 
     cell = (await client.get(
         f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'v:A1.r0.delta')}")).json()
-    assert cell["chain"][0]["cited"] == {"what": "cell", "row": 0, "column": "delta", "raw": "-120"}
+    assert cell["chain"][0]["cited"] == {"what": "cell", "row": 0, "column": "delta", "column_label": "变化",
+                                         "raw": "-120"}
     assert cell["chain"][2]["table"]["highlight"] == {"cells": [[0, "delta"]]}
     assert cell["note"] == "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写"
 
@@ -219,7 +220,9 @@ async def test_a_result_cell_rerenders_the_way_it_was_composed(client, monkeypat
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{segment['id']}")).json()
     judged = body["chain"][0]
     assert judged["rendered"] == shown and judged["render_ok"] is True
-    assert judged["cited"] == {"what": "cell", "row": 0, "column": by, "raw": snapshot["rows"][0][0]}
+    # column_label 是结果表记的列名：维度列照输入快照里的列名（store、slot），不另起叫法
+    assert judged["cited"] == {"what": "cell", "row": 0, "column": by, "column_label": by,
+                               "raw": snapshot["rows"][0][0]}
     # 导出页的数据块是同一条链
     data = data_block((await client.get(f"/api/runs/{made['run']}/report.html")).text)
     chain = data["chains"][data["refs"][segment["id"]]]
@@ -335,6 +338,9 @@ async def test_headline_inputs_show_the_closure(client):
     assert inputs[1]["closure"] == {"mode": "additive", "total_key": "target_total", "total": "2,026",
                                     "headline": "2,026", "closed": True}
     assert [s["role_label"] for s in inputs[:2]] == ["基期总数", "本期总数"]
+    # 那一格的值服务端渲染好了（render_cell：千分位），和闭合核对里的字同一个写法；页面照原样显示
+    assert inputs[0]["value"] == "2220" and inputs[0]["value_rendered"] == "2,220"
+    assert inputs[1]["value"] == "2026" and inputs[1]["value_rendered"] == "2,026"
     assert inputs[1]["query"] == "Q2" and inputs[1]["sealed"] is True and inputs[2]["query"] == "Q1"
     assert next(s for s in body["chain"] if s["step"] == "analysis_recompute")["status"] == "same"
 

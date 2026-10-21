@@ -619,6 +619,9 @@ await section('analysis', '分析结论：判定语、具名的数、结果表�
     === JSON.stringify(['headline_base', 'headline_target', 'data']))
   check('……总数那一格和各段之和的闭合核对（服务端算好的数）', (await inputs.nth(0).innerText()).includes('总数 2,700 与各段之和 2,700 闭合')
     && await inputs.nth(0).locator('[data-ev-analysis-closure="closed"]').count() === 1)
+  // 那一格的值也由服务端渲染（千分位），和闭合核对里的数同一个写法：原来照原值写「2700」，同一节里 2,700 和 2700 并排
+  check('……那一格的值按服务端的写法显示（千分位，和闭合核对一致）', (await inputs.nth(0).innerText()).includes('第 1 行「gmv」 = 2,700')
+    && !(await inputs.nth(0).innerText()).includes('= 2700'), await inputs.nth(0).innerText())
   check('……数据：用到的列、全部行', (await inputs.nth(2).innerText()).includes('region、week、gmv') && (await inputs.nth(2).innerText()).includes('全部行'))
   check('输入快照的查询步骤接在后面，写明是 A1 的输入', await p.locator('[data-ev-input-of="A1"]').count() === 2)
   await inputs.nth(2).locator('[data-ev-goto-query="Q2"]').click()
@@ -634,9 +637,10 @@ await section('analysis', '分析结论：判定语、具名的数、结果表�
     && await p.locator('[data-ev-analysis-value="top_share"][data-ev-cited]').count() === 1)
   await box.locator('[data-seg="s7"]').click()
   await p.locator('[data-ev-analysis-cited="cell"]').waitFor({ timeout: 8000 })
-  check('结果表的格（-300）：引用的是结果表第 1 行「delta」，那一格高亮', (await p.locator('[data-ev-analysis-cited]').innerText()) === '结果表第 1 行「delta」'
+  // 列写结果表记的列名（「变化」），不把列 id（delta）当叫法
+  check('结果表的格（-300）：引用的是结果表第 1 行「变化」，那一格高亮', (await p.locator('[data-ev-analysis-cited]').innerText()) === '结果表第 1 行「变化」'
     && await p.locator('[data-ev-analysis-table] td[data-highlight="cell"]').count() === 1)
-  check('……读屏写出处：分析结论 A1 · 结果表第 1 行「delta」', (await box.locator('[data-seg="s7"]').getAttribute('aria-label') ?? '').includes('分析结论 A1 · 结果表第 1 行「delta」'))
+  check('……读屏写出处：分析结论 A1 · 结果表第 1 行「变化」', (await box.locator('[data-seg="s7"]').getAttribute('aria-label') ?? '').includes('分析结论 A1 · 结果表第 1 行「变化」'))
   check('片段接口按片段 id 取（s3、s9、s7）', ['seg:s3', 'seg:s9', 'seg:s7'].every((h) => hits.includes(h)), hits.join(','))
 
   // 分析卡的结论：谁做的写分析卡（模板定好的分析）；表格里引用结果表的格
