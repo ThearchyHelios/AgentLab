@@ -312,3 +312,40 @@ async def test_a_caliber_card_checks_two_periods_with_the_real_operator(this_wee
     assert any(p.get("table") == "orders" and p.get("basis") == "live" for p in stored["probes"])
     recomputes(stored)
     assert not [e for e in await events(row.id, "log", "card") if e.get("code") == "metric_comparability_skipped"]
+
+
+def _region_sql(region: str, start: str, end: str) -> str:
+    return f"SELECT SUM(amount) AS gmv FROM orders WHERE region = '{region}' AND day BETWEEN '{start}' AND '{end}'"
+
+
+@pytest.mark.parametrize("south_week, verdict", [
+    (("2026-05-18", "2026-05-24"), None),             # 同一周、只差地区：是两段不是两期，不查
+    (("2026-05-11", "2026-05-17"), "incomparable"),   # 日期和地区都不同：两边除了日期，筛选的还不一样
+])
+async def test_a_ratio_between_two_regions_is_not_a_period_comparison(south_week, verdict):
+    """华东对华南的倍数：两份同形 SQL 只差地区字面量，不做可比性检查，带契约的出口照常正式出具（以前判成两期不可比、降档）。
+    日期和地区都不同的照查，真算子判不可比，出口记缺口降档。"""
+    metrics = [{"id": "times", "name": "华东对华南的倍数", "decimals": 4,
+                "expression": "cell(nodes.east, 0, 'gmv') / cell(nodes.south, 0, 'gmv')"}]
+    graph = chain(node("start", "input"),
+                  node("east", "tool", tool=TOOL, args={"sql": _region_sql("华东", "2026-05-18", "2026-05-24")}),
+                  node("south", "tool", tool=TOOL, args={"sql": _region_sql("华南", *south_week)}),
+                  node("card", "metrics", caliber="周报口径", metrics=metrics),
+                  node("out", "output", fields=[{"name": "r", "value": "{{ nodes.card.text }}"}],
+                       contract={"metrics_from": ["card"], "required": ["times"]}))
+    run = await run_manager.start(graph=graph, input_payload={})
+    row = await wait(run.id)
+    assert row.status == "succeeded", row.error
+    [finished] = await events(row.id, "node.finished", "card")
+    [metric] = artifact_store.load(finished["artifact"])["metrics"]
+    issuance = row.output["_issuance"]
+    assert not [e for e in await events(row.id, "log", "card") if e.get("code") == "metric_comparability_skipped"]
+    if verdict is None:
+        assert "comparability" not in metric
+        assert issuance["tier"] == "formal" and not issuance.get("gaps") and not issuance.get("comparability")
+        return
+    found = metric["comparability"]
+    assert found["verdict"] == verdict and found["reasons"] == ["两边除了日期，筛选的还不一样"]
+    assert issuance["tier"] == "degraded"
+    assert issuance["gaps"] == ["指标「华东对华南的倍数」两期不可比：两边除了日期，筛选的还不一样"]
+    recomputes(artifact_store.load(found["artifact"]))
