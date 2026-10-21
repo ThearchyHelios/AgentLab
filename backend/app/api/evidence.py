@@ -1173,12 +1173,17 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
 
 def _analysis_calc(alias: str, result: dict[str, Any], cited: dict[str, Any], hidden: set[str]) -> dict[str, Any]:
     """计算一步：结果表（前 table_top_k 段加上被引用的那一行附近，最多 MAX_ANALYSIS_ROWS 行，高亮被引用的格）、具名的数（原值、
-    渲染出来的字）、关键数的代入式。结果表里万一有取自遮罩列的列（输入查询步骤里遮着的列名），照查询步骤写「已遮罩」。"""
+    渲染出来的字）、关键数的代入式。数和格都按结论记的格式写出来（占比、变化率是百分数，比率的变化是百分点），和正文引用
+    之后显示的字一样；结果表的空格写「—」不写 null，面板照原样显示。结果表里万一有取自遮罩列的列（输入查询步骤里遮着的
+    列名），照查询步骤写「已遮罩」。"""
     values = result.get("values") if isinstance(result.get("values"), dict) else {}
+    named = result.get("value_formats") if isinstance(result.get("value_formats"), dict) else {}
     shown_values = []
     for key, raw in values.items():
         try:
-            text = render_cell(raw)
+            # 具名的数按结论记的格式写（占比、变化率是百分数），和引用之后正文显示的字一样
+            conv = named.get(key) if isinstance(named.get(key), str) and named.get(key) else None
+            text = render_cell(raw, conv)
         except RenderError:
             text = MISSING
         shown_values.append({"key": str(key), "raw": raw, "rendered": text,
@@ -1201,13 +1206,29 @@ def _analysis_calc(alias: str, result: dict[str, Any], cited: dict[str, Any], hi
     step["table"] = {
         "columns": columns, "labels": dict(table.get("labels") or {}) if isinstance(table.get("labels"), dict) else {},
         "total_rows": len(rows), "row_index": picked,
-        "rows": [[MASKED if i in masked else v for i, v in enumerate(rows[r])] if isinstance(rows[r], list) else rows[r]
-                 for r in picked],
+        "rows": [[MASKED if i in masked else _shown_cell(v, table, columns[i]) for i, v in enumerate(rows[r])]
+                 if isinstance(rows[r], list) else rows[r] for r in picked],
         "masked": [columns[i] for i in sorted(masked)],
         "highlight": {"cells": [[row, str(cited.get("column"))]] if isinstance(row, int) else []},
         **({"window_truncated": True} if len(index) > MAX_ANALYSIS_ROWS else {}),
     }
     return step
+
+
+def _shown_cell(raw: Any, table: Mapping[str, Any], column: str) -> str:
+    """结果表的一格按结论记的格式写出来（占比、变化率是百分数，比率的变化是百分点），空格写「—」不写 null：面板照原样显示，
+    读者看到的和正文引用那一格时一样。列类型照结果表的 column_types（文本列照原样，不按值猜）；渲染不出来（不是 0 却显示成 0）
+    的照原样写。"""
+    if raw is None:
+        return MISSING
+    formats = table.get("formats") if isinstance(table.get("formats"), dict) else {}
+    types = table.get("column_types") if isinstance(table.get("column_types"), dict) else {}
+    conv = formats.get(column) if isinstance(formats.get(column), str) and formats.get(column) else None
+    kind = types.get(column) if isinstance(types.get(column), str) else None
+    try:
+        return render_cell(raw, conv, kind=kind)
+    except RenderError:
+        return str(raw)
 
 
 async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str, Any], doc: dict[str, Any],
@@ -1247,8 +1268,12 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
                     sealed=sealed.trusted and query is not None)
         if role in totals and totals[role] in values:
             with contextlib.suppress(RenderError):
-                step["closure"] = {"mode": mode, "total_key": totals[role], "total": render_cell(values[totals[role]]),
-                                   "headline": render_cell(item.get("value")), "closed": not unclosed}
+                # 整体比率那一格和对照的那一格按结论记的格式写（比率拆解里都是比率，一起写成百分数），和具名的数、正文一致
+                named = result.get("value_formats") if isinstance(result.get("value_formats"), dict) else {}
+                key = totals[role]
+                conv = named.get(key) if isinstance(named.get(key), str) and named.get(key) else None
+                step["closure"] = {"mode": mode, "total_key": key, "total": render_cell(values[key], conv),
+                                   "headline": render_cell(item.get("value"), conv), "closed": not unclosed}
         steps.append(step)
         if artifact and query is not None:
             wanted = cells.setdefault(artifact, [])
