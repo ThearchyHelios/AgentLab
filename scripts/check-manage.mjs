@@ -1135,6 +1135,87 @@ await section('设置 · 证据裁判', async () => {
   await old.close()
 })
 
+await section('设置 · 分析（判定用的阈值、次数上限：叫法同契约，整组写 analysis，值不合规不让存，服务端的报错照原话显示）', async () => {
+  // 读的是真后端补齐缺省之后的一组（有就用它），写走假的一份
+  let stored = await get('/settings')
+  if (!stored.analysis) {
+    check('服务端的设置里有 analysis 一组（分析能力一轮）', false, Object.keys(stored).join(','))
+    return
+  }
+  const saved = { ...stored.analysis }
+  let reject = null
+  const { page, sent, errors, close } = await open('/settings/prefs', {
+    handlers: [
+      [/^GET \/settings$/, (route) => json(stored)(route)],
+      [/^PUT \/settings$/, (route, { body }) => {
+        if (reject) return json({ detail: reject }, 422)(route)
+        stored = { ...stored, ...body.values }
+        return json(stored)(route)
+      }],
+    ],
+  })
+  const sec = page.locator('[data-analysis-settings]')
+  await sec.waitFor({ timeout: 8000 }).catch(() => {})
+  const py = readFileSync(new URL('../backend/app/analysis/contract.py', import.meta.url), 'utf8')
+  const labels = [...(py.match(/^LABELS: dict\[str, str\] = \{([\s\S]*?)^\}/m)?.[1] ?? '').matchAll(/"([^"]+)":\s*"([^"]+)"/g)]
+  const text = await sec.innerText().catch(() => '')
+  check('这一节在偏好设置里，十七项的叫法都是契约 LABELS 的', labels.length === 17 && labels.every(([, , label]) => text.includes(label)),
+    labels.filter(([, , label]) => !text.includes(label)).map(([, k]) => k).join('、'))
+  check('……分成四组：变化拆解、波动基线与趋势判断、差异检验、次数与层数',
+    (await sec.locator('[data-analysis-settings-group]').evaluateAll((els) => els.map((e) => e.dataset.analysisSettingsGroup))).join('、')
+      === '变化拆解、波动基线与趋势判断、差异检验、次数与层数')
+  const val = (k) => page.locator(`[data-analysis-setting="${k}"]`).inputValue()
+  check('显示的是服务端生效的值', await val('main_share') === String(saved.main_share) && await val('min_history') === String(saved.min_history)
+    && await val('max_calls') === String(saved.max_calls), `${await val('main_share')} / ${await val('min_history')} / ${await val('max_calls')}`)
+  check('……每项下面写着范围（同契约 RANGES）', text.includes('0.3 到 0.9 之间') && text.includes('4 到 104 之间的整数'))
+
+  await page.locator('[data-analysis-setting="main_share"]').fill('0.95')
+  const bar = page.locator('[data-prefs-bar]')
+  await bar.waitFor({ timeout: 3000 }).catch(() => {})
+  check('超出范围：当场说（说法同服务端），保存键不能点', (await sec.innerText()).includes('「主要来源」的占比要在 0.3 到 0.9 之间')
+    && await bar.getByRole('button', { name: '保存设置' }).isDisabled())
+  await page.locator('[data-analysis-setting="min_history"]').fill('9.5')
+  check('整数项填了小数：说要填整数', (await sec.innerText()).includes('至少几期历史要填整数'))
+  await page.locator('[data-analysis-setting="main_share"]').fill('0.6')
+  await page.locator('[data-analysis-setting="min_history"]').fill('10')
+  const barText = await bar.innerText().catch(() => '')
+  check('保存条写改了哪几项（契约的叫法）', barText.includes('有 2 项未保存') && barText.includes('「主要来源」的占比')
+    && barText.includes('至少几期历史'), barText.replace(/\s+/g, ' '))
+  await bar.getByRole('button', { name: '保存设置' }).click()
+  await page.waitForTimeout(500)
+  const put = sent.filter((x) => x.key === 'PUT /settings').at(-1)?.body?.values ?? {}
+  const a = put.analysis ?? {}
+  check('整组写 analysis（十七项都在，没改的照原值、写成数）', Object.keys(a).length === 17 && a.main_share === 0.6 && a.min_history === 10
+    && a.k_warn === saved.k_warn && a.table_top_k === saved.table_top_k, JSON.stringify(a).slice(0, 160))
+  check('……只改了分析：不碰别的组', Object.keys(put).join(',') === 'analysis', Object.keys(put).join(','))
+  check('……存完显示「已保存」', (await bar.innerText().catch(() => '')).includes('已保存'))
+
+  // 两两之间的大小交给服务端核：「明显超出」不大于「超出常规波动」时 422，原话写在保存条上，草稿留着
+  reject = '「明显超出」的倍数要大于「超出常规波动」的倍数'
+  await page.locator('[data-analysis-setting="k_alert"]').fill('1.5')
+  await bar.getByRole('button', { name: '保存设置' }).click()
+  await page.waitForTimeout(500)
+  const failed = await bar.innerText().catch(() => '')
+  check('服务端拒收：保存条照原话写为什么，草稿还在', failed.includes(reject) && await val('k_alert') === '1.5', failed.replace(/\s+/g, ' '))
+  reject = null
+  await page.locator('[data-analysis-setting="k_alert"]').fill(String(stored.analysis.k_alert))
+  check('改回原值：不再算改动', !(await bar.innerText().catch(() => '')).includes('未保存'))
+  if (SHOTS) {
+    await sec.scrollIntoViewIfNeeded()
+    await page.waitForTimeout(200)
+    await sec.screenshot({ path: `${SHOTS}/prefs-analysis-${THEME}.png` })
+  }
+  check('没有运行时报错', errors.length === 0, errors[0] ?? '')
+  await close()
+
+  // 老后端没有 analysis 这一组：不显示，也不写
+  const legacy = { ...stored }
+  delete legacy.analysis
+  const old = await open('/settings/prefs', { handlers: [[/^GET \/settings$/, (route) => json(legacy)(route)]] })
+  check('老后端没有分析设置：这一组不出现', await old.page.locator('[data-analysis-settings]').count() === 0)
+  await old.close()
+})
+
 await section('数据 · 数据库', async () => {
   // 上传的表格按来源标记认（origin），不按路径：上传库的路径随版本变
   const dbs = sources.filter((s) => s.origin !== 'upload')
