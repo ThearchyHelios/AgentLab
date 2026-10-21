@@ -353,5 +353,6 @@ def test_the_verifiable_report_renders_the_conclusion_format():
     assert out["verified"] == ""
     share = next(text for text in out["opened"].values() if "具名的数「top_share」" in text)
     assert "正文显示61.9%（与按显示规则渲染的结果一致）" in share
-    cell = next(text for text in out["opened"].values() if "结果表 · 第 1 行 · share" in text)
+    # 出处面板写结果表记的列名（「占变化的比重」），不把列 id 当叫法
+    cell = next(text for text in out["opened"].values() if "结果表 · 第 1 行 · 占变化的比重" in text)
     assert "正文显示61.9%" in cell
