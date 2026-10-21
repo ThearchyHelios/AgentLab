@@ -14,6 +14,10 @@ TYPES_EVAL = ROOT / "frontend" / "src" / "typesEval.ts"
 TERMS_EVAL = ROOT / "frontend" / "src" / "lib" / "termsEval.ts"
 #: 分析方法、模式的叫法只有这一份（termsEval 引用它，不另抄）
 TERMS_ANALYSIS = ROOT / "frontend" / "src" / "lib" / "termsAnalysis.ts"
+#: 分析卡的一项摆哪几个参数格（评测页的分析期望和分析卡用同一份）
+ANALYSIS_ITEMS = ROOT / "frontend" / "src" / "canvas" / "analysisItems.ts"
+#: 评测页题目编辑框（分析期望那一块）
+CASE_EDITOR = ROOT / "frontend" / "src" / "pages" / "evals" / "CaseEditor.tsx"
 
 _COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 
@@ -138,3 +142,32 @@ def test_analysis_expectations_follow_the_server():
     terms = _source(TERMS_EVAL)
     assert re.search(r"\n\s*op: ANALYSIS_OP_LABEL\b", terms) and re.search(r"\n\s*mode: ANALYSIS_MODE_LABEL\b", terms), \
         "评测页的分析方法、模式叫法要引用 lib/termsAnalysis 的那一份"
+
+
+def test_analysis_param_grids_follow_the_card_and_the_server():
+    """分析期望的参数格和分析卡的一项同一份（canvas/analysisItems.paramSpecs）：评测页（CaseEditor）引用它，不另抄。
+    参数名对得上服务端各参数模型（tools/builtin/analysis.param_names）；叫法只有 lib/termsAnalysis 一份
+    （ANALYSIS_TEXT.node.param / basis / grain），评测页（EVAL_TEXT.analysis.param / basis / grain）引用它。"""
+    from app.eval.judgements import VERDICT_OPS, param_names
+
+    items = _source(ANALYSIS_ITEMS)
+    grid = re.search(r"export function paramSpecs\(op: AnalysisOp.*?\n\}\n", items, re.S)
+    assert grid is not None, "analysisItems.ts 里没有 export function paramSpecs"
+    # 期次三格（period、base、target）写在上面的 PERIODS 常量里，一起算
+    periods = re.search(r"const PERIODS: ParamSpec\[\] = \[(.*?)\]\n", items, re.S)
+    assert periods is not None, "analysisItems.ts 里没有 const PERIODS"
+    grid_keys = {a or b for a, b in re.findall(r"(?:col|cols|val)\('(\w+)'\)|key: '(\w+)'",
+                                                grid.group(0) + periods.group(1))}
+    # 服务端各参数模型里期望能写的那些（去掉输入、总数核对、下钻、两份查询），格子里一个不少、一个不多
+    server = {k for op in ("decompose", *VERDICT_OPS) for k in param_names(op)}
+    assert grid_keys == server, f"格子和服务端的参数模型对不上：少 {server - grid_keys}，多 {grid_keys - server}"
+    editor = _source(CASE_EDITOR)
+    assert "paramSpecs(" in editor and "PARAM_FIELDS" not in editor, "评测页的参数格要引用分析卡的那一份（paramSpecs）"
+    terms = _source(TERMS_EVAL)
+    for table in ("param", "basis", "grain"):
+        assert re.search(rf"\n\s*{table}: ANALYSIS_TEXT\.node\.{table}\b", terms), \
+            f"评测页的 {table} 叫法要引用 lib/termsAnalysis 的那一份"
+    analysis = _source(TERMS_ANALYSIS)
+    labels = re.search(r"\n\s*param: \{(.*?)\} as Record<string, string>", analysis, re.S)
+    assert labels is not None, "termsAnalysis.ts 里没有 ANALYSIS_TEXT.node.param"
+    assert set(grid_keys) <= set(re.findall(r"(\w+): '", labels.group(1))), "参数格里有叫不出名字的参数"

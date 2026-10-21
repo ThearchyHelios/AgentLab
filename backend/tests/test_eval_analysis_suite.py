@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -33,9 +34,11 @@ async def engine_up():
 
 
 async def test_the_analysis_suite_imports_and_every_expectation_computes(tmp_path, scratch_source):
-    path = retail_trends.build(tmp_path / "trends.db", date.today())
-    sid = await scratch_source(retail_trends.SOURCE_NAME, path, schema=True)
     content = json.loads(SUITE_FILE.read_text(encoding="utf-8"))
+    # 「今天」按题集的时区取（题目里的期次按它算），不看本机时区：本机在别的时区时，跨日那几个钟头两边的今天不是同一天
+    today = datetime.now(ZoneInfo(content["suite"]["timezone"])).date()
+    path = retail_trends.build(tmp_path / "trends.db", today)
+    sid = await scratch_source(retail_trends.SOURCE_NAME, path, schema=True)
     assert {c["seq"] for c in content["cases"]} == set(WANTED)
     assert all(c["gold"]["datasource"] == retail_trends.SOURCE_NAME for c in content["cases"])
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -44,7 +47,7 @@ async def test_the_analysis_suite_imports_and_every_expectation_computes(tmp_pat
         assert res.json()["imported"] == len(WANTED) and res.json()["skipped"] == []
         suite = res.json()["suite"]
         assert all(c["gold"]["datasource_id"] == sid for c in suite["cases"])
-        monday = date.today().weekday() == 0
+        monday = today.weekday() == 0
         for case in suite["cases"]:
             assert case["trial"]["status"] == "ok", (case["seq"], case["trial"])
             trial = (await client.post(f"/api/evals/suites/{suite['id']}/cases/{case['id']}/trial")).json()["trial"]
