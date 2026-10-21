@@ -43,6 +43,8 @@ class NodeType(StrEnum):
     HUMAN = "human"  # 人工介入
     VALIDATE = "validate"  # 结构化校验 + 自动重试
     METRICS = "metrics"  # 口径卡：受控指标集，叙述层唯一合法的数字来源
+    # 分析卡：对上游查询快照做固定的几项确定性分析（拆解、基线、趋势、差异、可比性），和口径卡平级（engine/nodes/analysis.py）
+    ANALYSIS = "analysis"
     REPORT = "report"  # 报告撰写：模型只写引用标记，数字由系统从口径卡取出来渲染
     # 下面两种目前只是占位（执行器原样放行），各自的工作包补上真正的逻辑
     DUAL_CHECK = "dual_check"  # 双盲复算：另起一路独立算一遍，和原结果比对
@@ -632,6 +634,167 @@ def _check_merge(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> 
         result.add(problem, node_id=node.id, field="sql", code="merge.sql_invalid")
 
 
+#: 分析卡一项的标识：要能写进取值链（nodes.<卡>.results.<标识>），条件分支按它取判定
+ANALYSIS_ITEM_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+#: 分析卡一项里写上游节点 id 的参数：基期、本期是两份查询时各选一个（主输入写在 from，对应 agent 工具的 query）
+ANALYSIS_NODE_PARAMS = ("base_query", "target_query")
+#: 一项里写成「节点 id.r行号.列名」的格（总数 headline 的两格）
+ANALYSIS_CELL = re.compile(r"^([A-Za-z_][\w-]*)\.r(\d+)\.(.+)$")
+
+
+def analysis_refs(item: dict[str, Any]) -> list[tuple[str, str]]:
+    """分析卡一项引用的上游节点：[(这一项里的字段路径, 节点 id)]，按 from、base_query、target_query、总数两格的先后。
+    写错了的（不是字符串、格的写法不对）不在里面，由 analysis_issues 报。"""
+    params = item.get("params") if isinstance(item.get("params"), dict) else {}
+    out: list[tuple[str, str]] = []
+    if isinstance(item.get("from"), str) and item["from"].strip():
+        out.append(("from", item["from"].strip()))
+    out += [(f"params.{k}", params[k].strip()) for k in ANALYSIS_NODE_PARAMS
+            if isinstance(params.get(k), str) and params[k].strip()]
+    headline = params.get("headline")
+    for side in ("base", "target"):
+        cell = ANALYSIS_CELL.match(headline[side].strip()) \
+            if isinstance(headline, dict) and isinstance(headline.get(side), str) else None
+        if cell is not None:
+            out.append((f"params.headline.{side}", cell.group(1)))
+    return out
+
+
+def _analysis_input(spec: GraphSpec, target_id: str, upstream: set[str]) -> tuple[str, str] | None:
+    """分析卡一项的一个输入有什么问题：(级别, 半句说明)，没问题为 None。规则同合并查询：只认能稳定取到一份查询快照的
+    上游节点。调用的不是数据库查询工具的「调用工具」节点只提醒：登记里声明了表格的端点读取运行时也交回查询快照，静态看
+    不出来；交回的不是平台执行的查询，运行到这一项就失败（受管级别发布时按错误挡，engine/governance.py）。"""
+    target = spec.node_map().get(target_id)
+    if target is None:
+        return "error", f"选择的输入「{target_id}」在工作流中不存在"
+    if target.type == NodeType.AGENT:
+        return "error", (f"选择的输入「{target.title}」是 Agent：Agent 可能查询多次，无法确定分析哪一次的结果。"
+                         "请把要分析的那条查询单独放进「调用工具」节点（选择数据库查询工具），再把它选作输入；"
+                         "要 Agent 看了数再决定拆哪个维度的，给它绑分析工具")
+    if target.type not in (NodeType.TOOL, NodeType.MERGE):
+        return "error", (f"选择的输入「{target.title}」是「{type_label(target.type)}」节点，不产出查询结果。"
+                         "输入只能是调用数据库查询工具的「调用工具」节点，或「合并查询」节点")
+    if target_id not in upstream:
+        return "error", f"选择的输入「{target.title}」不在分析卡的上游：分析时它还没有运行。请把它连到分析卡之前"
+    if not _produces_query(target):
+        return "warning", (f"选择的输入「{target.title}」调用的不是数据库查询工具：运行时它交回的要是平台执行的查询结果"
+                           "才能分析，否则这一项会失败")
+    return None
+
+
+def analysis_issues(spec: GraphSpec, node: GraphNode) -> list[ValidationIssue]:
+    """分析卡的配置有什么问题（画图时的校验和执行时同一套，engine/nodes/analysis.py 执行前先过一遍，模板写错了早暴露）。
+
+    - items：至少一项；每项的标识合法、不重复；分析方法（op）、模式（mode）是契约里的；输入（from，或两份查询时的
+      base_query、target_query，总数两格落在的节点）指向上游的「调用工具」/「合并查询」节点
+    - params：只能写这种分析的参数（和 agent 工具的参数同一份定义，tools/builtin/analysis.py），不能写阈值——阈值统一
+      写在 overrides（阈值覆盖）里，按 contract.settings_problem 校验
+    - parent（下钻）：指向这张卡里排在它前面的一项变化拆解
+    """
+    from app.analysis import contract
+    from app.engine.labels import ANALYSIS_MODE_LABEL, ANALYSIS_OP_LABEL
+    from app.tools.builtin.analysis import param_names
+
+    out: list[ValidationIssue] = []
+
+    def add(message: str, field: str, code: str, level: str = "error") -> None:
+        out.append(ValidationIssue(level=level, message=message, node_id=node.id, field=field,  # type: ignore[arg-type]
+                                   code=code))
+
+    cfg = node.config
+    items = cfg.get("items")
+    if not isinstance(items, list) or not items:
+        add("「分析卡」还没有配置分析项：至少写一项，说清做什么分析、分析哪个上游查询节点的结果", "items",
+            "analysis.items_missing")
+        items = []
+    upstream = _ancestors(spec, node.id)
+    seen: dict[str, int] = {}
+    for i, item in enumerate(items):
+        at = f"items[{i}]"
+        if not isinstance(item, dict):
+            add(f"第 {i + 1} 个分析项的格式有误，需要是一个对象", at, "analysis.item_invalid")
+            continue
+        item_id = item.get("id")
+        who = f"分析项「{item_id}」" if isinstance(item_id, str) and item_id else f"第 {i + 1} 个分析项"
+        if not isinstance(item_id, str) or not ANALYSIS_ITEM_ID.match(item_id):
+            add(f"{who}的标识只能用字母、数字和下划线，且不以数字开头：下游按 nodes.{node.id}.results.<标识> 取它的判定",
+                f"{at}.id", "analysis.item_invalid")
+        elif item_id in seen:
+            add(f"有两个分析项的标识都是「{item_id}」，标识要唯一", f"{at}.id", "analysis.item_invalid")
+        else:
+            seen[item_id] = i
+        op, mode = item.get("op"), item.get("mode")
+        if op not in contract.OPS:
+            add((f"{who}的分析方法「{op}」不认识" if op not in (None, "") else f"{who}还没有选择分析方法") + "，可选："
+                + "、".join(ANALYSIS_OP_LABEL.values()), f"{at}.op", "analysis.op_invalid")
+            continue
+        modes = contract.MODES.get(op)
+        if modes and mode not in modes:
+            add(f"{who}是{ANALYSIS_OP_LABEL[op]}，要选一种模式：" + "、".join(ANALYSIS_MODE_LABEL[op].values())
+                + (f"（当前为「{mode}」）" if mode not in (None, "") else ""), f"{at}.mode", "analysis.mode_invalid")
+        elif not modes and mode not in (None, ""):
+            add(f"{who}是{ANALYSIS_OP_LABEL[op]}，没有模式可选，请去掉模式", f"{at}.mode", "analysis.mode_invalid")
+        params = item.get("params") if item.get("params") is not None else {}
+        if not isinstance(params, dict):
+            add(f"{who}的参数需要是一个对象", f"{at}.params", "analysis.params_invalid")
+            continue
+        allowed = [k for k in param_names(op) if k != "query"]
+        for key in params:
+            if key in contract.DEFAULTS:
+                add(f"{who}的参数里写了阈值「{contract.LABELS[key]}」：阈值不写在分析项里，统一写在这张卡的"
+                    f"「{field_label('overrides', NodeType.ANALYSIS)}」里", f"{at}.params.{key}", "analysis.params_invalid")
+            elif key == "query":
+                add(f"{who}要分析的查询节点写在输入里，参数里不写", f"{at}.params.{key}", "analysis.params_invalid")
+            elif key not in allowed:
+                add(f"{who}的参数里没有「{key}」，{ANALYSIS_OP_LABEL[op]}可以写：" + "、".join(allowed),
+                    f"{at}.params.{key}", "analysis.params_invalid")
+        if item.get("hypothesis") is not None and not isinstance(item.get("hypothesis"), str):
+            add(f"{who}的「在验证什么」需要是一段文字", f"{at}.hypothesis", "analysis.item_invalid")
+        both = all(isinstance(params.get(k), str) and params[k].strip() for k in ANALYSIS_NODE_PARAMS)
+        if not (isinstance(item.get("from"), str) and item["from"].strip()) and not both:
+            two = "；基期、本期是两份查询时，在参数里选上这两个查询节点" if op in ("decompose", "comparable") else ""
+            add(f"{who}还没有选择输入：选一个上游的查询节点（调用数据库查询工具的「调用工具」节点，或「合并查询」）{two}",
+                f"{at}.from", "analysis.input_invalid")
+        headline = params.get("headline")
+        if headline is not None and not (isinstance(headline, dict)
+                                         and all(isinstance(headline.get(k), str) for k in ("base", "target"))):
+            add(f"{who}的总数要写成基期、本期两格，每格写成「节点 id.r行号.列名」，行号从 0 数",
+                f"{at}.params.headline", "analysis.params_invalid")
+        elif isinstance(headline, dict):
+            for side, said in (("base", "基期"), ("target", "本期")):
+                if not ANALYSIS_CELL.match(headline[side].strip()):
+                    add(f"{who}的总数里{said}那一格要写成「节点 id.r行号.列名」（行号从 0 数），当前为「{headline[side]}」",
+                        f"{at}.params.headline.{side}", "analysis.params_invalid")
+        for field, target_id in analysis_refs(item):
+            if (found := _analysis_input(spec, target_id, upstream)) is not None:
+                add(f"{who}{found[1]}", f"{at}.{field}", "analysis.input_invalid", found[0])
+        parent = params.get("parent") if "parent" in allowed else None     # 别的分析写了下钻，上面已按多写的参数报
+        if parent is not None:
+            of = parent.get("of") if isinstance(parent, dict) else None
+            if not (isinstance(parent, dict) and isinstance(of, str) and of and isinstance(parent.get("key"), list)
+                    and parent["key"]):
+                add(f"{who}的下钻要写清是哪一项里的哪一段：上一层分析项的标识和那一段的维度值",
+                    f"{at}.params.parent", "analysis.parent_invalid")
+            elif seen.get(of, i) >= i:
+                add(f"{who}下钻的上一层「{of}」要是这张分析卡里排在它前面的一项", f"{at}.params.parent",
+                    "analysis.parent_invalid")
+            elif (items[seen[of]] or {}).get("op") != "decompose":
+                add(f"{who}下钻的上一层「{of}」不是变化拆解", f"{at}.params.parent", "analysis.parent_invalid")
+    overrides = cfg.get("overrides")
+    if overrides not in (None, {}):
+        label = field_label("overrides", NodeType.ANALYSIS)
+        if not isinstance(overrides, dict):
+            add(f"「{label}」需要是一个对象", "overrides", "analysis.overrides_invalid")
+        elif problem := contract.settings_problem(overrides):
+            add(f"「{label}」有误：{problem}", "overrides", "analysis.overrides_invalid")
+    return out
+
+
+def _check_analysis(node: GraphNode, spec: GraphSpec, result: ValidationResult) -> None:
+    for issue in analysis_issues(spec, node):
+        result.add(issue.message, level=issue.level, node_id=issue.node_id, field=issue.field, code=issue.code)
+
+
 #: 报告撰写节点的结论句策略（claims）。off：结论句不参与判档（默认，保持以前的行为）；
 #: require_citation：没挂引用的结论句计入缺口、按出具档位降档。这两档是确定性的（发布前自动修复
 #: 给人选的也只有这两档）
@@ -989,6 +1152,8 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
             _check_report_claims(node, spec, result)
         elif node.type == NodeType.MERGE:
             _check_merge(node, spec, result)
+        elif node.type == NodeType.ANALYSIS:
+            _check_analysis(node, spec, result)
         elif node.type == NodeType.CHALLENGE:
             _check_challenge(node, spec, result)
         elif node.type == NodeType.OUTPUT:

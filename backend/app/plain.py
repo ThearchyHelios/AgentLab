@@ -93,6 +93,13 @@ PLAIN: dict[str, Plain] = {
         "给口径卡供数的 Agent 没核对字段出处", "口径卡读到的仍是模型给的数。", _A, "打开按出处核对字段。"),
     "governed.caliber_model_input": Plain(
         "口径卡的数来自「模型调用」节点", "这种节点不调工具，写出的数没有出处。", _A, "改由「调用工具」节点或配好结构化输出的 Agent 取数。"),
+    # 分析卡（engine/nodes/analysis.py，docs/design/analysis-round/）
+    "governed.caliber_analysis_input": Plain(
+        "口径卡的数来自分析卡", "分析结论是叙述的依据，不是口径的原料，口径卡读到的数追不到原始数据。", _A,
+        "口径卡里按格从查询结果取数，分析结论在报告里直接引用。"),
+    "governed.analysis_input": Plain(
+        "分析卡分析的不是数据库查询的结果", "受管级别要求发布时就能确定分析的是平台执行的查询，否则结论说不清出处。", _A,
+        "把分析卡这一项的输入改选调用数据库查询工具的「调用工具」节点或「合并查询」。"),
     # ---------------------------------------------------------------- 写外部系统（engine/lint_capabilities.py）
     "action.write_in_agent": Plain(
         "Agent 的工具里有会写外部系统的能力", "写入只能放在「调用工具」节点里，先确认再发送、留生效记录。", _Y,

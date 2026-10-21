@@ -214,8 +214,9 @@ def _lint_sql(spec: GraphSpec, flag: Callable[..., None], checkers: Mapping[str,
              sql_level=check.level)
 
 
-#: validate 里和门禁 G4、G5 说同一件事的两条提示（schema.evidence_issues）
-_REPEATS = frozenset({"evidence.caliber_compute_input", "evidence.cite_fields_off"})
+#: validate 里和门禁 G4、G5 说同一件事的两条提示（schema.evidence_issues），和受管级分析卡输入那条（governed.analysis_input）
+#: 说同一件事的画布提醒（schema.analysis_issues 对调用别的工具的「调用工具」节点的那条）
+_REPEATS = frozenset({"evidence.caliber_compute_input", "evidence.cite_fields_off", "analysis.input_invalid"})
 
 
 def _not_repeated(issues: list[Any], gate: list[Any], spec: GraphSpec) -> list[Any]:
@@ -231,6 +232,7 @@ def _not_repeated(issues: list[Any], gate: list[Any], spec: GraphSpec) -> list[A
     cited = {i.node_id for i in gate if i.code == "governed.caliber_agent_cite_fields"}
     compute = {i.node_id for i in gate if i.code == "governed.caliber_compute_input"}
     covered = {("evidence.cite_fields_off", nid, "output_schema") for nid in cited}
+    covered |= {("analysis.input_invalid", i.node_id, i.field) for i in gate if i.code == "governed.analysis_input"}
     for card in spec.nodes:
         if card.type == NodeType.METRICS and compute:
             covered |= {("evidence.caliber_compute_input", card.id, f"metrics[{i}].expression")
@@ -344,7 +346,8 @@ REPORT_POLICY_ALSO: dict[str, tuple[str, ...]] = {"claims": (CLAIMS_JUDGE,)}
 JUDGE_UNLIMITED = "不设上限，费用只受句数、时长上限和每日上限约束"
 
 #: 产出本身就是证据、或者由系统确定地算出来的节点。成果字段取它们的值，不算「别的节点写的字」
-_TRACEABLE = (NodeType.REPORT, NodeType.METRICS, NodeType.INPUT, NodeType.TOOL, NodeType.RETRIEVE, NodeType.MERGE)
+_TRACEABLE = (NodeType.REPORT, NodeType.METRICS, NodeType.INPUT, NodeType.TOOL, NodeType.RETRIEVE, NodeType.MERGE,
+              NodeType.ANALYSIS)
 _WRITERS = (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR)
 #: 往对话里写消息的节点（emit_message 没关时），「最后一条消息」就是它们里最后跑的那个写的
 _EMITTERS = (*_WRITERS, NodeType.REPORT)
@@ -710,6 +713,39 @@ def _lint_evidence(spec: GraphSpec, flag: Callable[..., None], *, strict: bool) 
             flag(f"{_who(feeder)}为{to}提供数据：「模型调用」节点不调用工具，写出的数字没有出处。请改由 Agent"
                  "（配置「结构化输出 Schema」并开启「按出处核对字段」）或「调用工具」节点取数",
                  code="governed.caliber_model_input", node_id=feeder.id, hard=True)
+        elif feeder.type == NodeType.ANALYSIS:
+            # D16：分析是叙述的依据，不是口径的原料。口径卡读它的结果按「追不到原始数据」处理，这里只提示
+            flag(f"{_who(feeder)}的结果提供给了{to}：分析结论不作口径卡的输入，口径卡读到的数追不到原始数据。"
+                 "指标请在口径卡里按格从查询结果取数，分析结论在报告里直接引用",
+                 code="governed.caliber_analysis_input", node_id=feeder.id)
+
+    # 受管级的分析卡：输入要在发布时就确定是平台执行的查询（调用数据库查询工具的「调用工具」节点、合并查询）
+    if strict:
+        _lint_analysis_inputs(spec, flag)
+
+
+def _lint_analysis_inputs(spec: GraphSpec, flag: Callable[..., None]) -> None:
+    """受管级别的分析卡，每项的输入（主输入、两份查询、总数两格落在的节点）都要是调用数据库查询工具的「调用工具」节点
+    或「合并查询」。画布校验（schema.analysis_issues）对调用别的工具的「调用工具」节点只提醒（声明了表格的端点读取运行时
+    也交回查询快照，静态看不出），已发布级别照那条提醒；受管出具要发布时就能确定分析的是平台执行的查询，按错误挡，
+    画布那条同义的提醒不再列（_not_repeated）。"""
+    from app.engine.schema import _produces_query, analysis_refs
+
+    nodes = spec.node_map()
+    for card in spec.nodes:
+        if card.type != NodeType.ANALYSIS or not isinstance(card.config.get("items"), list):
+            continue
+        for i, item in enumerate(card.config["items"]):
+            if not isinstance(item, dict):
+                continue
+            for field, target_id in analysis_refs(item):
+                target = nodes.get(target_id)
+                if target is None or target.type != NodeType.TOOL or _produces_query(target):
+                    continue        # 不存在、不是查询节点的，画布校验已经按错误报了
+                flag(f"{_who(card)}的分析项「{item.get('id')}」分析的是{_who(target)}的结果，它调用的不是数据库查询工具："
+                     "受管级别要求分析卡的输入是调用数据库查询工具的「调用工具」节点或「合并查询」，发布时就能确定分析的"
+                     "是平台执行的查询。请改选这样的节点",
+                     code="governed.analysis_input", node_id=card.id, hard=True, field=f"items[{i}].{field}")
 
 
 async def unresolved_caliber_upgrades(

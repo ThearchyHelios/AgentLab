@@ -150,6 +150,8 @@ def template_refs(spec: Any, source: str, table: str, tables: Iterable[str] | No
     - Agent 节点、协作成员：绑定了 db_query__<源> → possible（每个成员各一项，带 member）。
     - 合并查询：输入（别名 → 节点）里有用到这张表的 → 取输入里最强的那一级，via 写经由哪些输入。合并的合并
       一路追到底；成环（校验会报错的图）时停下。
+    - 分析卡：各项的输入（主输入、两份查询、总数两格落在的节点）里有用到这张表的，同合并查询（目录里度量类型、业务日期
+      列改了，分析的判定可能跟着变），via 写经由哪些输入（alias 是那一项的标识）。
     """
     wanted = name_key(table)
     known = list(tables) if tables is not None else None
@@ -175,16 +177,15 @@ def template_refs(spec: Any, source: str, table: str, tables: Iterable[str] | No
     resolved: dict[str, dict[str, Any] | None] = {}
 
     def through(node_id: str, trail: frozenset[str]) -> dict[str, Any] | None:
-        """合并查询节点经由输入用到这张表的样子；用不到返回 None。"""
+        """合并查询、分析卡经由输入用到这张表的样子；用不到返回 None。"""
         if node_id in resolved:
             return resolved[node_id]
         node = by_id.get(node_id)
-        if node is None or _kind(node) != "merge" or node_id in trail:
+        if node is None or _kind(node) not in ("merge", "analysis") or node_id in trail:
             return own.get(node_id)
         via: list[dict[str, Any]] = []
         best: str | None = None
-        inputs = (node.config or {}).get("inputs")
-        for alias, target in (inputs.items() if isinstance(inputs, Mapping) else []):
+        for alias, target in _inputs_of(node):
             if not isinstance(target, str):
                 continue
             hit = own.get(target) or through(target, trail | {node_id})
@@ -198,11 +199,26 @@ def template_refs(spec: Any, source: str, table: str, tables: Iterable[str] | No
     for node in nodes:
         if node.id in own:
             out.append(own[node.id])
-        elif _kind(node) == "merge" and (hit := through(node.id, frozenset())):
+        elif _kind(node) in ("merge", "analysis") and (hit := through(node.id, frozenset())):
             out.append(hit)
     order = {n.id: i for i, n in enumerate(nodes)}
     out.sort(key=lambda r: order.get(r["node_id"], 0))
     return out
+
+
+def _inputs_of(node: Any) -> list[tuple[str, Any]]:
+    """合并查询、分析卡的输入：[(别名, 节点 id)]。合并查询是 inputs 的别名；分析卡是各项的标识（一项引用几个节点就几条，
+    schema.analysis_refs）。"""
+    config = node.config or {}
+    if _kind(node) == "merge":
+        inputs = config.get("inputs")
+        return list(inputs.items()) if isinstance(inputs, Mapping) else []
+    from app.engine.schema import analysis_refs
+
+    items = config.get("items")
+    found = [(str(item.get("id") or ""), target) for item in (items if isinstance(items, list) else [])
+             if isinstance(item, Mapping) for _, target in analysis_refs(dict(item))]
+    return list(dict.fromkeys(found))
 
 
 async def _published(session: AsyncSession) -> list[tuple[Any, Any]]:
