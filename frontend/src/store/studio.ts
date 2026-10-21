@@ -5,7 +5,8 @@ import {
 } from '@xyflow/react'
 import { api, streamCopilot, streamRun } from '../api/client'
 import { copilotReceipt, mergeNodeConfig, toolChangesOf } from '../canvas/copilotMerge'
-import { connectMergeInput } from '../canvas/mergeInputs'
+import { connectMergeInput, isQueryNode } from '../canvas/mergeInputs'
+import { connectAnalysisInput } from '../canvas/analysisItems'
 import { contentSig, isMissingEndpoint, normalizeUpgrade } from '../canvas/issues'
 import { NODE_DEFS, sourceHandles } from '../canvas/nodeDefs'
 import { toast } from '../components/ui'
@@ -1420,8 +1421,9 @@ export const useStudio = create<StudioState>((set, get) => ({
   onConnect: (conn) => {
     if (locked(get)) return
     commit(set, get, '连线')
-    // 查询节点连到合并查询：顺手把它加成合并的输入（别名取有意义的短名），和连线同一步撤销
+    // 查询节点连到合并查询：顺手把它加成合并的输入（别名取有意义的短名）；连到分析卡：还没选输入的第一项选上它。和连线同一步撤销
     const nodes = connectMergeInput(get().nodes, conn.source, conn.target)
+      ?? connectAnalysisInput(get().nodes, conn.source, conn.target, isQueryNode)
     set({
       edges: addEdge({ ...conn, type: 'flow' }, get().edges),
       ...(nodes ? { nodes } : {}),

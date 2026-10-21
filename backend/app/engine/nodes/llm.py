@@ -55,6 +55,7 @@ from app.tools.analysis import (
     SCOPE_KEY as ANALYSIS_SCOPE_KEY,
     AnalysisScope,
     call_error_text,
+    event_view,
     input_snapshot,
     is_analysis_tool,
     payload_of,
@@ -550,8 +551,11 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         query = query_entry_fields(content) if evidence_on and ok and is_platform_query(name) else None
         if query and not await snapshot_owned(query["artifact"], ctx.run.run_id, name):
             query = None
-        # 分析工具交回的结论工件：同查询快照，记进 tool.end（封存范围内），证据接口、时间线从这里认这一步的结论
+        # 分析工具交回的结论工件：同查询快照，记进 tool.end（封存范围内），证据接口、时间线从这里认这一步的结论。另带一小段
+        # 判定（event_view：编号、算子、判定码、判定语……）：preview 只是结论的前一截，判定语多半被截掉。编号和记台账时
+        # 交回模型的「【分析 An】」是同一个（_record_call 紧接着按同一个容器编），不记台账的执行没有编号
         analysis = payload_of(content) if ok and is_analysis_tool(name) else None
+        alias = scope.next_alias() if analysis and scope is not None and evidence_on else None
         ctx.emit(
             EventType.TOOL_END if ok else EventType.TOOL_ERROR,
             tool=name,
@@ -560,7 +564,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             preview=content[:2000],
             artifact=snapshot_id,
             **({"query_artifact": query["artifact"]} if query else {}),
-            **({"analysis_artifact": analysis["artifact"]} if analysis else {}),
+            **({"analysis_artifact": analysis["artifact"], "analysis": event_view(analysis["result"], alias)}
+               if analysis else {}),
             # 查询当时数据源的表结构快照：和查询快照一样落在封存范围内，证据接口从这里认它
             **({"schema_artifact": query["schema_artifact"]} if query and query.get("schema_artifact") else {}),
             # 这次查询的 SQL 检查结果单独带上：preview 截到前 2000 个字符，checks 通常在截掉的那段里

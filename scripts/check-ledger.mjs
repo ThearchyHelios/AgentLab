@@ -458,7 +458,9 @@ await section('使用者看到的入口照服务端的动作：不能出具的�
     meta: { v: 1, runId: RUN_U, runClass: 'exploratory', runStatus: 'succeeded', evidence: true } }
   const refused = { ...ISSUE, available: false, auto: false, reason: '这份口径没有被你能使用的应用固定，不能由你按口径出具，请搭建者出具' }
   delete refused.auto_reason
-  const LED = ledgerOf(RUN_U, { labels: WHOLE_LABELS, whole: WHOLE, actions: [refused, RECONCILE],
+  // 摘要只认四种标签（分析结论的数不和口径比对，服务端不给它们标签）：混进来认不出的种类，不计、不出 NaN
+  const LED = ledgerOf(RUN_U, { labels: { ...WHOLE_LABELS, s40: { kind: 'analysis' }, s42: { reason: '没有种类' } },
+    whole: WHOLE, actions: [refused, RECONCILE],
     // 出具过的是另一份口径（订单口径）：周报口径这一项还没出具过，照服务端的原因写为什么不能出具
     issued: [{ run_id: 'run-iss-u', status: 'succeeded', workflow_id: 'wf-orders', version: 1, tier: 'degraded', tier_text: '降档出具', auto: true }] })
   const reply = (method, p) => {
@@ -478,6 +480,7 @@ await section('使用者看到的入口照服务端的动作：不能出具的�
   const shown = await box.waitFor({ timeout: 12000 }).then(() => true, () => false)
   const text = shown ? (await box.innerText()).replace(/\s+/g, ' ') : ''
   check('使用者也看到摘要', text.includes('3 个数来自口径「周报口径」v2（受管）'), text)
+  check('……认不出种类的标签不计、不出 NaN', !text.includes('NaN') && !text.includes('undefined'), text)
   check('不能出具：照服务端的原因写「请搭建者出具」，不摆出具按钮', text.includes('请搭建者出具')
     && await page.locator('[data-ledger-issue-button]').count() === 0, text)
   check('能对账：照样摆对账按钮', await page.locator('[data-ledger-turn-reconcile]').count() === 1)

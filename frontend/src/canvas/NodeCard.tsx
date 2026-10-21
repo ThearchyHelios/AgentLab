@@ -21,6 +21,7 @@ import {
   CHALLENGE_TEXT, claimTally, DUAL_CHECK_TEXT, issuanceLabel, REJECTED_TEXT, reportStampText, RUN_CLASS_LABEL, UPGRADE_POLICY_LABEL,
 } from '../lib/terms'
 import { useReportStamp, type ReportStamp } from './reportStamp'
+import { analysisCardSummary } from './analysisItems'
 import { ApprovalCard } from '../run/RunPanel'
 import type { NodeState, NodeTrace } from '../run/trace'
 import { useRunClock } from '../run/useRunClock'
@@ -86,6 +87,9 @@ function summarize(type: NodeType, config: Record<string, any>): string {
       }
       return `${config.caliber || '口径'} ${config.caliber_version || 'v1'} · ${(config.metrics ?? []).length} 个指标`
     }
+    case 'analysis':
+      // 做哪几种分析：「波动基线、变化拆解（可加）」，叫法照契约（lib/termsAnalysis）
+      return analysisCardSummary(config)
     case 'report': {
       const from = Array.isArray(config.metrics_from) ? config.metrics_from.length : 0
       return `${first(config.instructions) || '未填写作要求'} · ${from ? `${from} 张口径卡` : '上游全部口径卡'}`

@@ -909,9 +909,30 @@ async def evidence_metric(run_id: str, node: str, metric: str) -> dict[str, Any]
             "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []}}
 
 
-def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
-                  ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
-    """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""
+ANALYSIS_NOT_FOUND = "evidence_analysis_not_found"
+
+
+@router.get("/{run_id}/evidence/analyses/{alias}")
+async def evidence_analysis(run_id: str, alias: str, report: str | None = None) -> dict[str, Any]:
+    """点开报告末尾系统写的「分析范围」里的一个编号（A1…）：那份分析结论的出处链（判定 → 方法 → 计算 → 输入 → 复算 →
+    封存），和点开正文里它的判定语是同一条（_scope_chain，导出页的分析范围也按它）。正文没引用的结论（排除的、算不了的）也
+    点得开。只认这份报告证据目录里的分析结论；选哪份报告、文档完不完好同片段接口（?report=<节点 id>）。"""
+    sealed = await _sealed(run_id)
+    chosen = _open_report(sealed, report)
+    doc = chosen.doc or {}
+    chain = await _scope_chain(alias, doc, sealed, chosen.node_id)
+    if chain is None:
+        raise CodedHTTPException(404, "这份报告的证据目录里没有这份分析结论", ANALYSIS_NOT_FOUND)
+    covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
+    masked = _chain_masked(chain)
+    return {"run_id": run_id, "report": {"node_id": chosen.node_id, "doc_artifact": chosen.doc_artifact}, "alias": alias,
+            "rendered": next((step.get("rendered") for step in chain if step.get("step") == LEDGER_KIND), None),
+            "chain": chain, "seal": {"sealed": sealed.sealed, "ok": sealed.seal["ok"], "covered": covered},
+            "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []}}
+
+
+def _open_report(sealed: _Sealed, wanted: str | None) -> _Report:
+    """选报告、确认文档完好。片段接口、推断来源接口、分析范围里的编号共用同一套错误码。"""
     reports = _named_reports(sealed, wanted)
     if not reports:
         raise CodedHTTPException(404, "本次运行没有封存的报告文档，没有可查看的片段", REPORT_NOT_FOUND)
@@ -920,7 +941,14 @@ def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
         raise CodedHTTPException(409, "报告文档与哈希不一致，疑似被修改，不能作为证据展示", DOC_TAMPERED)
     if chosen.doc is None:
         raise CodedHTTPException(404, "无法读取报告文档", DOC_MISSING)
-    found = find_segment(chosen.doc, segment_id)
+    return chosen
+
+
+def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
+                  ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""
+    chosen = _open_report(sealed, wanted)
+    found = find_segment(chosen.doc or {}, segment_id)
     if found is None:
         raise CodedHTTPException(404, "报告中没有这个片段", SEGMENT_NOT_FOUND)
     return chosen, found
