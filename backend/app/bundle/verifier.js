@@ -198,6 +198,8 @@
     /** cited 已经加好引号（空值写「空值（NULL）」）；expected 和引用的值写法一样时不写（文字取值） */
     numShownDiffers: (shown, cited, expected) => `正文显示「${shown}」，引用的值是${cited}`
       + (expected == null ? '' : `，按显示规则应显示为「${expected}」`),
+    /** 判定语的引用不带值（判定语就是结论里的那句话）：只点名正文显示的字和结论里的判定语，不写「引用的值是空值」 */
+    numPhraseDiffers: (shown, expected) => `正文显示「${shown}」，分析结论里的判定语是「${expected}」`,
     numShownUnknown: (why) => `无法核对显示文字：${why}`,
     shownFormat: (fmt) => `显示格式「${fmt}」无法识别`,
     shownConv: (conv) => `换算「${conv}」无法识别`,
@@ -1619,6 +1621,9 @@
     info.expected = expected
     const shown = String(seg.text ?? '')
     if (pyStrip(shown) === pyStrip(expected)) return { ...info, result: PASS, shownOk: true }
+    if (info.cite.kind === 'analysis' && !Object.prototype.hasOwnProperty.call(info.cite, 'value')) {
+      return { ...info, result: FAIL, reason: T.numPhraseDiffers(shown, expected) }
+    }
     const value = info.cite.value
     const cited = typeof value === 'number' ? numberText(value, info.citedToken) : value == null ? null : textOf(value)
     return { ...info, result: FAIL, reason: T.numShownDiffers(shown, cited == null ? T.nullValue : `「${cited}」`,
