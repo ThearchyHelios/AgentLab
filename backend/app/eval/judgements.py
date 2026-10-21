@@ -189,7 +189,8 @@ def _two_periods(snapshot: Mapping[str, Any], period: str) -> tuple[Any, Any]:
         order = sorted(range(2), key=lambda k: items[k].ordinal)
     else:
         order = sorted(range(2), key=lambda k: str(values[k]))
-    return values[order[0]], values[order[1]]
+    # 写成文字交给分析工具的参数（期次是数的也一样：算子按写出来的样子认期次列里的值）
+    return str(values[order[0]]), str(values[order[1]])
 
 
 def request_of(exp: Mapping[str, Any], variables: Mapping[str, str], snapshot: Mapping[str, Any]) -> dict[str, Any]:

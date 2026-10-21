@@ -315,3 +315,13 @@ def test_the_summary_counts_outcomes_by_kind():
     assert summary["outcomes_by_kind"] == {"contribution": {"traced": 1}, "verdict": {"wrong": 1},
                                            "scalar": {"untraced": 1}}
     assert summary["outcomes"] == {"traced": 1, "wrong": 1, "untraced": 1}
+
+
+def test_e1_follows_the_analysis_inputs_down_the_drill():
+    """逐题 E1 拿产出答案的查询：引用的是下钻那一层的分析结论时，顺着上一层的结论找到两层各自读的查询。"""
+    from app.eval.score import _query_inputs
+
+    found = {"a1": {"inputs": ["q1"]}, "a2": {"inputs": ["a1", "q2"]}}
+    assert _query_inputs(found["a2"], found, {"q1": {}, "q2": {}}) == ["q1", "q2"]
+    assert _query_inputs({"inputs": ["gone"]}, found, {"q1": {}}) == [], "取不回的输入不算"
+

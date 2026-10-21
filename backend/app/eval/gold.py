@@ -448,7 +448,7 @@ async def _analysis_value(exp: Mapping[str, Any], at: int, found: _Analyses) -> 
     try:
         request = judgements.request_of(exp, found.ctx.variables(), found.snapshot)
     except judgements.ParamsInvalid as e:
-        raise _NoValue(f"{where}的{e.message}") from None
+        raise _NoValue(f"{where}算不出期望，{e.message}") from None
     try:
         result = await analysis_ops.run(request, lambda name: inp if name == judgements.GOLD_REF else None,
                                         settings=settings, context=context, refuse_data_errors=True)
