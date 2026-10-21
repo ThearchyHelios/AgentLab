@@ -29,7 +29,7 @@ from typing import Any
 from app.analysis.contract import OP_LABELS
 from app.analysis.numbers import fixed, to_fraction
 
-#: 附带说明进判定语的先后；不在这里的（measure_unlabeled、headline_basis）只在证据面板
+#: 附带说明进判定语的先后；不在这里的（measure_unlabeled、headline_basis、partial_periods）只在证据面板
 PHRASE_ORDER = ("comparability", "simpson", "offset", "outlier_sensitive", "small_sample", "record_high", "record_low",
                 "multiple_comparisons", "weekday_effect", "small_denominator", "null_values")
 #: 判定语里最多接几条附带说明
@@ -306,6 +306,13 @@ def small_sample_mean_text(group: str, n: int, minimum: int) -> str:
 
 
 UNVERIFIED_COMPLETE = "没能核对本期的数据是否到齐（查不到表里这一列的日期范围）"
+UNKNOWN_WEEKS = "没能核对本期的数据是否到齐（期次写成「年-W周号」，认不出 SQL 是按哪种周号算的，不知道是哪几天）"
+NO_DATES = "没能核对本期的数据是否到齐（期次不是日期，不知道是哪几天）"
+
+
+def partial_periods_text(count: int) -> str:
+    """按年截断的周号算法里跨年切开的那几期（不到整周）没有算进历史。"""
+    return f"有 {count} 期不到整周（跨年被切开），没有算进历史"
 
 
 def with_caveats(main: str, caveats: Sequence[Mapping[str, str]], *, skip: Iterable[str] = ()) -> str:
@@ -501,14 +508,15 @@ CRITERION_COMPARABLE = ("只差日期、窗口一样长、是整期、星期构�
 
 
 __all__ = [
-    "CRITERION_COMPARABLE", "EMPTY_KEY", "HEADLINE_BASIS", "KEY_JOIN", "LABEL_MAX", "MEASURE_WORDS",
-    "PHRASE_CAVEATS", "PHRASE_ORDER", "UNVERIFIED_COMPLETE", "WEEKDAY_EFFECT", "amount", "band_text",
+    "CRITERION_COMPARABLE", "EMPTY_KEY", "HEADLINE_BASIS", "KEY_JOIN", "LABEL_MAX", "MEASURE_WORDS", "NO_DATES",
+    "PHRASE_CAVEATS", "PHRASE_ORDER", "UNKNOWN_WEEKS", "UNVERIFIED_COMPLETE", "WEEKDAY_EFFECT", "amount", "band_text",
     "baseline_flat_phrase", "baseline_phrase", "caveat", "change", "clean_label", "comparable_phrase",
     "criterion_additive", "criterion_baseline", "criterion_differ", "criterion_factor", "criterion_ratio",
     "criterion_trend", "current_text", "decompose_concentrated", "decompose_dispersed", "decompose_driver",
     "decompose_flat", "decompose_unclosed", "differ_pair", "differ_phrase", "dims_text", "factor_both",
     "factor_driver", "key_text", "multiple_text", "names", "no_evidence_phrase", "null_periods_text",
-    "null_segments_text", "number", "offset_text", "outlier_text", "pct", "pick_label", "points", "ratio_both",
+    "null_segments_text", "number", "offset_text", "outlier_text", "partial_periods_text", "pct", "pick_label",
+    "points", "ratio_both",
     "ratio_change", "ratio_mix", "ratio_rate", "ratio_value", "record_text", "refused", "say", "share_words",
     "simpson_text", "small_denominator_text", "small_sample_mean_text", "small_sample_rate_text", "threshold_pct",
     "trend_phrase", "unconfirmed_text", "unlabeled_text", "with_caveats",

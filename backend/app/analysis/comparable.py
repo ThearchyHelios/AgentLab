@@ -70,7 +70,8 @@ class Span:
     table: str | None = None
     column: str | None = None
     sql_window: Any = None
-    unit: str | None = None          # 这一段是不是整月、整季、整年（calendar_unit），按期次时是粒度
+    unit: str | None = None          # 这一段是不是整月、整季、整年（calendar_unit），按期次时是粒度（不是整期的为 None）
+    short: int | None = None         # 按期次的这一期不到整期时有几天（periods.short_days：跨年被切开的周）
 
 
 @dataclass
@@ -238,7 +239,9 @@ def period_span(label: str, snap: Snap, period: Any, item: pd.Period, grain: str
     """按期次分组的一份快照里的一期：这一期覆盖的日子，加上 SQL 在期次那一列上的时间条件。"""
     from app.data import coverage
 
-    span = Span(label, snap, item.start, item.end, unit=grain)
+    span = Span(label, snap, item.start, item.end, unit=grain, short=pd.short_days(item, grain))
+    if span.short:
+        span.unit = None
     found = date_source(snap.sql, period)
     if found is None:
         return span
@@ -268,10 +271,13 @@ def _range(span: Span, book: Book) -> tuple[bool, date | None, date | None, bool
 
 
 def span_coverage(span: Span, today: date, book: Book) -> tuple[str, str | None]:
-    """这一段（窗口或一期）的数据齐不齐：(pass / short / unknown, 不齐的那一句)。没过完（终点不早于运行当天：当天的数据还没
-    到齐）、SQL 的时间条件截掉了一部分、表里的数据没到（最晚早于终点）或来得晚（最早晚于起点），都算不齐。"""
+    """这一段（窗口或一期）的数据齐不齐：(pass / short / unknown, 不齐的那一句)。这一期本身不到整期（跨年被切开的周）、没过完
+    （终点不早于运行当天：当天的数据还没到齐）、SQL 的时间条件截掉了一部分、表里的数据没到（最晚早于终点）或来得晚（最早晚于
+    起点），都算不齐。"""
     if span.start is None or span.end is None:
         return "unknown", None
+    if span.short:
+        return "short", f"{span.label}只有 {span.start.isoformat()} 到 {span.end.isoformat()} 这 {span.short} 天，不是整周"
     lo, hi = span.start, span.end
     window = span.sql_window
     if window is not None:
@@ -417,18 +423,30 @@ def compare_queries(base: Snap, target: Snap, measure: str | None, facts: Facts,
 
 def compare_periods(snap: Snap, period: str, base: pd.Period, target: pd.Period, grain: str, measure: str | None,
                     facts: Facts, book: Book, today: date) -> Outcome:
-    """同一份快照里按期次分组的两期：天然同口径；窗口按期次的粒度；整期看这两期各自齐不齐。"""
+    """同一份快照里按期次分组的两期：天然同口径；窗口按期次的粒度（有一期不到整期的按实际天数比，星期构成也照算）；整期看
+    这两期各自齐不齐。期次不知道是哪几天的（序号、认不出算法的周号）窗口、整期、星期构成都核对不了。"""
     same = Check("same_query", status="pass")
     b_span = period_span("基期", snap, period, base, grain, measure, facts, book)
     t_span = period_span("本期", snap, period, target, grain, measure, facts, book)
     flow = bool(measure) and facts.measure(snap, measure)[0] == "flow"  # type: ignore[arg-type]
-    if grain == "seq":
+    whole = not (b_span.short or t_span.short)
+    if grain == "seq" or base.start is None or target.start is None:
         checks = [same, Check("window"), Check("complete"), Check("weekdays"), _data_check([("", snap)], measure)]
     else:
-        checks = [same, _window_check(b_span, t_span, flow, grouped=True),
+        checks = [same, _window_check(b_span, t_span, flow, grouped=whole),
                   _complete_check([b_span, t_span], today, book, flow),
-                  _weekday_check(b_span, t_span, grain=grain), _data_check([("", snap)], measure)]
+                  _weekday_check(b_span, t_span, grain=grain if whole else None), _data_check([("", snap)], measure)]
     return _decide(checks, b_span, t_span)
+
+
+def period_complete(snap: Snap, period: str, item: pd.Period, grain: str, measure: str | None, facts: Facts,
+                    book: Book, today: date) -> tuple[str, str | None, str | None]:
+    """按期次分组的一份快照里本期齐不齐（波动基线、趋势、单份快照的变化拆解共用）：(pass / short / unknown, 不齐的那一句,
+    核对不了时附带说明的那一句)。期次没有日期（序号）、周号认不出算法的，起止不知道，一律核对不了，不判齐。"""
+    if item.start is None:
+        return "unknown", None, ph.UNKNOWN_WEEKS if grain == "week" else ph.NO_DATES
+    status, why = span_coverage(period_span("本期", snap, period, item, grain, measure, facts, book), today, book)
+    return status, why, ph.UNVERIFIED_COMPLETE if status == "unknown" else None
 
 
 def table_of(outcome: Outcome) -> dict[str, Any]:
@@ -513,7 +531,7 @@ def comparable(raw: Mapping[str, Any], env: Any) -> Any:
                 raise CallError("period_not_found", f"期次列「{period}」里没有「{params[side]}」：{what}要写 {target.ref} "
                                                     "里有的期次值")
         env.inputs.use(target, "data", [period, *([measure] if measure else [])], rows["base"] + rows["target"])
-        parsed = pd.parse(values, grain)
+        parsed = pd.parse(values, grain, weeks=pd.week_scheme(target.sql, period, target.dialect))
         if parsed is None:
             item_b = item_t = pd.Period(None, 0, None, None)
             grain = "seq"
@@ -538,5 +556,5 @@ def _only_number(snap: Snap) -> str | None:
 
 
 __all__ = ["CHECKS", "CHECK_NAMES", "Check", "Outcome", "STATUS_NAMES", "Span", "comparable", "compare_periods",
-           "compare_queries", "period_span", "reasons", "same_query", "span_coverage", "sql_span", "table_of",
-           "values_of"]
+           "compare_queries", "period_complete", "period_span", "reasons", "same_query", "span_coverage", "sql_span",
+           "table_of", "values_of"]

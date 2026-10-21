@@ -181,3 +181,26 @@ async def test_a_masked_date_column_is_neither_used_nor_probed():
                            period("Q2", "2026-10-12", "2026-10-19", masked=["order_date"]), probe=probe, measure="gmv")
     assert probe.calls == [] and result["probes"] == []
     assert result["verdict"]["code"] == "comparable" and "窗口长度" in result["phrase"]
+
+
+async def test_one_snapshot_of_sqlite_weeks_uses_the_real_days_of_each_week():
+    # SQLite 的 strftime('%Y-W%W')：2026-W42 是 10-19 到 10-25（运行当天 10-21 还没过完），跨年的 2025-W52、2026-W00 只有 3 天、4 天
+    sql = "SELECT strftime('%Y-W%W', order_date) AS week, COUNT(*) AS orders FROM orders GROUP BY week"
+    rows = [["2025-W52", 300], ["2026-W00", 400], ["2026-W01", 700], ["2026-W41", 700], ["2026-W42", 200]]
+    s = snap("Q1", sql, ["week", "orders"], rows, types={"week": "text", "orders": "number"})
+    probe = fixed_prober({("orders", "order_date"): ("2025-01-01", "2026-10-20")})
+    now = await analyze("comparable", snaps=[s], probe=probe, query="Q1", period="week", base="2026-W41",
+                        target="2026-W42")
+    assert now["verdict"]["code"] == "incomparable"
+    assert now["phrase"] == "两期不可比：本期数据只到 2026-10-20，还差 5 天"
+    assert now["values"]["target_start"] == "2026-10-19" and now["values"]["target_end"] == "2026-10-25"
+    cut = await analyze("comparable", snaps=[s], probe=probe, query="Q1", period="week", base="2025-W52",
+                        target="2026-W00")
+    assert cut["verdict"]["code"] == "incomparable"
+    assert "两段的天数不同：3 天对 4 天" in cut["phrase"]
+    assert "本期只有 2026-01-01 到 2026-01-04 这 4 天，不是整周" in comparable_reasons(cut)
+    assert checks(cut)["星期构成"] == "提醒"
+    # 不知道方言（认不出周号算法）：窗口、整期、星期构成都核对不了，不判可比以外的结论
+    plain = snap("Q1", sql, ["week", "orders"], rows, types={"week": "text", "orders": "number"})
+    unknown = await analyze("comparable", snaps=[plain], query="Q1", period="week", base="2026-W41", target="2026-W42")
+    assert unknown["phrase"] == "两期可比，窗口长度、整期、星期构成核对不了"

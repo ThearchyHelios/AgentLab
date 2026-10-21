@@ -92,7 +92,7 @@ REASONS: tuple[str, ...] = (
 CAVEATS: tuple[str, ...] = (
     "offset", "simpson", "small_denominator", "record_high", "record_low", "weekday_effect",
     "multiple_comparisons", "outlier_sensitive", "small_sample", "measure_unlabeled", "null_values",
-    "headline_basis", "comparability",
+    "headline_basis", "comparability", "partial_periods",
 )
 
 # --------------------------------------------------------------------------
