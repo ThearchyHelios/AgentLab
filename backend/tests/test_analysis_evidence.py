@@ -530,7 +530,7 @@ def test_the_analysis_part_of_a_trimmed_catalog_takes_at_most_half_of_the_budget
     assert order == sorted(order)                            # 越往后越简
     notice = next(line for line in writer.text.split("\n") if line.startswith("注意："))
     assert f"另有 {n} 条分析结论，这一段最多占篇幅的一半：" in notice and all(w in notice for w in words), notice
-    assert "没列出的照样能引用：判定语单独写 [[a:编号]]" in notice
+    assert "没列出的也能引用：判定语单独写 [[a:编号]]" in notice
     assert writer.queries == 31 and writer.compact > 0      # 查询照样有展开的
 
 

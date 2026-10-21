@@ -4584,22 +4584,27 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
                          omitted=[e["alias"] for e in queries if tier[e["alias"]] == "brief"], empty_sources=empty)
 
 
-#: 目录有省略时，开头那句里分析结论各种样子的说法（给模型看）
-_ANALYSIS_LEVEL_WORDS = (("full", "列出了结果表的前几段"), ("compact", "没列出结果表的各段"),
-                         ("brief", "只列了判定语和具名的数（判定标准、附带说明没列）"), ("head", "只列了编号"))
+#: 目录有省略、分析结论只是结果表没列各段时，开头那句里接的说明（给模型看）
+ANALYSIS_TABLES_OMITTED_PROMPT = ("另有 {total} 条分析结论，判定和具名的数都列出了，其中 {bare} 条没列出结果表的各段"
+                                  "（要列出就单独一行写整表引用，系统照结果表生成）。")
+#: 分析结论还降到了只留判定语和具名的数、只列编号时接的说明（给模型看）：各样子各有几条（ANALYSIS_LEVEL_PROMPT_WORDS），
+#: 以及没列出的怎么引用
+ANALYSIS_TRIMMED_PROMPT = ("另有 {total} 条分析结论，这一段最多占篇幅的一半：{parts}。没列出的也能引用：判定语单独写 "
+                           "[[a:编号]]，系统照结论渲染；要列出结果表就单独一行写整表引用，系统照结果表生成；没列出的具名的数"
+                           "不要编造。")
+ANALYSIS_LEVEL_PROMPT_WORDS = (("full", "列出了结果表的前几段"), ("compact", "没列出结果表的各段"),
+                               ("brief", "只列了判定语和具名的数（判定标准、附带说明没列）"), ("head", "只列了编号"))
 
 
 def _analysis_notice(levels: Counter, total: int) -> str:
     """目录有省略时开头那句里分析结论的情况：都列全了的不说；只是结果表没列各段的照旧一句；还降到了只留判定语和具名的数、
-    只列编号的，照实写各有几条，以及没列的照样能引用。"""
+    只列编号的，照实写各有几条，以及没列出的怎么引用。"""
     if not total or levels["full"] == total:
         return ""
     if not levels["brief"] and not levels["head"]:
-        return (f"另有 {total} 条分析结论，判定和具名的数都列出了，其中 {levels['compact']} 条没列出结果表的各段"
-                "（要列出就单独一行写整表引用，系统照结果表生成）。")
-    parts = "，".join(f"{levels[level]} 条{word}" for level, word in _ANALYSIS_LEVEL_WORDS if levels[level])
-    return (f"另有 {total} 条分析结论，这一段最多占篇幅的一半：{parts}。没列出的照样能引用：判定语单独写 [[a:编号]]，"
-            "系统照结论渲染；要列出结果表就单独一行写整表引用，系统照结果表生成；没列出的具名的数不要编造。")
+        return ANALYSIS_TABLES_OMITTED_PROMPT.format(total=total, bare=levels["compact"])
+    parts = "，".join(f"{levels[level]} 条{word}" for level, word in ANALYSIS_LEVEL_PROMPT_WORDS if levels[level])
+    return ANALYSIS_TRIMMED_PROMPT.format(total=total, parts=parts)
 
 
 def catalog_prompt(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUDGET, cells_allowed: bool = True,
