@@ -522,7 +522,7 @@ export const api = {
     /** 把范围外的表加进探查范围：当场读结构，并记进探查范围的「显式列出」 */
     addToScope: (sourceId: string, tables: string[]) => post<CatalogScopeAdd>(`${catalogBase(sourceId)}/scope/add`, { tables }),
     /**
-     * 剖析任务（后台进行：逐表对业务库发只读查询，一条一条发，每张表一结束就写进目录）。剖析会对业务库发查询，默认关闭，
+     * 剖析任务（后台进行：逐表对业务库发只读查询，同时剖析几张表按设置、每张表的查询一条一条发，每张表一结束就写进目录）。剖析会对业务库发查询，默认关闭，
      * 按数据源开启。和同一个数据源的起草任务按建立顺序排队（起草在排队、进行中时剖析建成 queued、waiting_for 为 draft）
      */
     profileJobs: {

@@ -201,6 +201,10 @@ async def test_settings_are_saved_and_validated_through_datasource_update(client
     assert "每张表时长上限" in r.json()["detail"]
     r = await client.patch(f"/api/datasources/{sid}", json={"options": {PROFILE_OPTION: {"enabled": "是"}}})
     assert r.status_code == 422 and (r.json()["code"], r.json()["field"]) == ("profile_settings_invalid", "enabled")
+    r = await client.patch(f"/api/datasources/{sid}", json={"options": _on(table_concurrency=4)})
+    assert r.status_code == 422 and (r.json()["code"], r.json()["field"]) == ("profile_settings_invalid",
+                                                                              "table_concurrency")
+    assert "同时剖析的表数" in r.json()["detail"] and "1 到 3 之间的整数" in r.json()["detail"]
     r = await client.patch(f"/api/datasources/{sid}", json={"options": _on(rows=5)})
     assert r.status_code == 422 and r.json()["code"] == "profile_settings_invalid" and "field" not in r.json()
     r = await client.patch(f"/api/datasources/{sid}", json={"options": _on(table_max_queries=30, sample_size=500)})
@@ -209,7 +213,7 @@ async def test_settings_are_saved_and_validated_through_datasource_update(client
     # 设好以后就能剖析；任务里记着这次实际用的设置（快照）
     job = await _profile(client, sid, ["channels"])
     assert job["settings"] == {"enabled": True, "table_max_queries": 30, "table_max_s": 60, "query_timeout_s": 10,
-                               "sample_size": 500, "max_scan_rows": 100_000}
+                               "sample_size": 500, "max_scan_rows": 100_000, "table_concurrency": 1}
 
 
 # ---------------------------------------------------------------- 剖析的结论
@@ -524,7 +528,7 @@ async def test_second_profile_job_on_same_source_returns_409(client, make_source
     second = await _start(client, sid, ["visits"])
     assert second.status_code == 409 and second.json()["code"] == "profile_busy"
     # 说清是谁在跑、跑到哪；只点了一张表时说这张表在不在那个任务里、排第几
-    assert "正在剖析：第 1 / 2 张表" in second.json()["detail"] and "visits 在这次剖析里，排第 1 张" in second.json()["detail"]
+    assert "正在剖析：已完成 0 / 2 张表" in second.json()["detail"] and "visits 在这次剖析里，排第 1 张" in second.json()["detail"]
     other = await _start(client, sid, ["gates"])
     assert other.status_code == 409 and "gates 不在这次剖析里" in other.json()["detail"]
     active = (await client.get(f"{_url(sid)}/active")).json()["job"]

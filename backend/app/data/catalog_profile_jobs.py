@@ -8,17 +8,19 @@ data/catalog_job_runtime.py），逐表剖析（引擎在 data/catalog_profile.p
   任务、状态 skipped）、需要剖析的表（needed：从没剖析过、上次剖析没做完、剖析之后冒出了新的待核实关系，见 due_reason）、
   全部表（all）。后两种只挑表结构里、不是视图、有可剖析的项的表，有待核实关系的在前，再按使用次数、表结构顺序；挑出 0 张
   抛 ProfileNothing。剖析设置随任务记下快照，每张表的检查项按当时的目录先列一遍。同一个源同时只有一个排队或进行中的
-  剖析任务（ProfileBusy，说法里写明进行到第几张；部分唯一索引兜底）；和同源的起草任务按建立的先后排队（每个源一条队），
+  剖析任务（ProfileBusy，说法里写明做完了几张；部分唯一索引兜底）；和同源的起草任务按建立的先后排队（每个源一条队），
   起草在前时 waiting_for 是 "draft"。建任务时顺手清掉超出保留数的旧任务（prune）。
-- **在后台剖析**（manager.start）：轮到了才开始。每张表开始前重读数据源——停用了、关掉了剖析就停下，剩下的表 cancelled、
-  error 写明；遮罩按最新的设置——再逐表调 catalog_profile.profile_table（它读的是那时目录里的最新内容：起草刚提的关系也
-  核对）。检查项、正在做哪一项、查询数、发过的查询随时落库；整张表的结果和写目录在同一个事务里，停止时也不会被打断。
-- **任务级止损**（替代以前的整次总量上限）：连续 3 条查询失败、最近 10 条里 7 条超时，整个任务停下（stop_reason、error），
-  正在做的那张表写入已做完的项，后面的表 cancelled、error 带同一句原因；最近 6 条里 4 条超时时 notice 有一句提醒，好转后
-  清掉。任务最后的状态按逐表算：有 failed、partial、cancelled 的表是 partial，否则 succeeded；任务整体出错（数据源没了、
-  快照被改动、意外异常）是 failed。
-- **停止**（cancel）：排队的直接 cancelled；进行中的停掉正在等的那条查询（库那边按单条时限截止），那张表做完的项照常写进
-  目录、没做的保留旧结论，后面的表 cancelled，任务 cancelled。
+- **在后台剖析**（manager.start）：轮到了才开始。按任务里的顺序逐表调 catalog_profile.profile_table（它读的是那时目录里
+  的最新内容：起草刚提的关系也核对），同时最多剖析设置里 table_concurrency 张（缺省 1，一张做完再做下一张；每张表的查询
+  仍一条一条发），一张结束就开始下一张。每张表开始前重读数据源——停用了、关掉了剖析就不再开始新的表，正在做的做完，
+  剩下的表 cancelled、error 写明；遮罩按最新的设置。检查项、正在做哪一项、查询数、发过的查询随时落在各自那张表上；整张表
+  的结果和写目录在同一个事务里，停止时也不会被打断。
+- **任务级止损**（替代以前的整次总量上限）：连续 3 条查询失败、最近 10 条里 7 条超时（同时剖析的几张表的查询合起来算），
+  整个任务停下（stop_reason、error），正在做的几张表写入已做完的项，后面的表 cancelled、error 带同一句原因；最近 6 条里
+  4 条超时时 notice 有一句提醒，好转后清掉。任务最后的状态按逐表算：有 failed、partial、cancelled 的表是 partial，否则
+  succeeded；任务整体出错（数据源没了、快照被改动、意外异常）是 failed，同时在做的另几张表照停止收尾、原因写这一句。
+- **停止**（cancel）：排队的直接 cancelled；进行中的停掉正在等的查询（库那边按单条时限截止），正在做的几张表做完的项照常
+  写进目录、没做的保留旧结论，后面的表 cancelled，任务 cancelled。
 - **重试**（retry_tables + create_job）：新任务，只含原任务里 failed、partial、cancelled 的表（按原来的顺序），范围 selected，
   retry_of 记原任务；设置取数据源当前的。
 - **服务重启**（startup）：排队、进行中的标 interrupted，没结束的表 cancelled、error「服务重启，剖析中断」（进程没了时正在
@@ -44,6 +46,8 @@ data/catalog_job_runtime.py），逐表剖析（引擎在 data/catalog_profile.p
 """
 from __future__ import annotations
 
+import asyncio
+import collections
 import logging
 import time
 from typing import Any
@@ -94,7 +98,7 @@ def unsaved_error(why: str, done: int, rest: int) -> str:
 
 
 class ProfileBusy(Exception):
-    """这个数据源已经有排队或进行中的剖析任务。message 给人看（写明进行到第几张）。"""
+    """这个数据源已经有排队或进行中的剖析任务。message 给人看（写明做完了几张）。"""
 
 
 class ProfileFinished(Exception):
@@ -501,15 +505,15 @@ THEN_PROFILE = "再开始新的剖析"
 
 def busy_message(row: Any, brief: dict[str, Any] | None, *, table: str | None = None,
                  position: int | None = None, then: str = THEN_PROFILE) -> str:
-    """同源已有剖析任务时的说法：写明进行到第几张；从表详情点「剖析这张表」时再说这张表在不在那个任务里、排第几；最后
-    一句按调用方要做的事说（then）。"""
+    """同源已有剖析任务时的说法：写明做完了几张（同时剖析几张表时「第几张」说不清，只说做完几张）；从表详情点「剖析这张
+    表」时再说这张表在不在那个任务里、排第几；最后一句按调用方要做的事说（then）。"""
     name = getattr(row, "name", "") or ""
     if brief is None:
         text = f"数据源「{name}」正在剖析"
     elif brief["status"] == "queued":
         text = f"数据源「{name}」已有一个排队中的剖析任务（共 {brief['total']} 张表）"
     else:
-        text = f"数据源「{name}」正在剖析：第 {min(brief['done'] + 1, brief['total'])} / {brief['total']} 张表"
+        text = f"数据源「{name}」正在剖析：已完成 {brief['done']} / {brief['total']} 张表"
     if table is not None:
         text += f"，{table} 在这次剖析里，排第 {position} 张" if position else f"，{table} 不在这次剖析里"
     return text + f"。请等这次剖析结束（或先停止它）{then}"
@@ -880,6 +884,36 @@ async def startup(*, live: Any = None) -> int:
 # ==========================================================================
 
 
+def _job_error(e: BaseException) -> str:
+    """任务整体意外出错时的整句（任务、没结束的表的 error）。"""
+    from app.core.errors import describe_exception, first_line
+
+    return JOB_ERROR.format(line=first_line(e) or describe_exception(e))
+
+
+def _elapsed(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+async def _drain(tasks: Any) -> None:
+    """停掉这几个协程，等它们都结束（正在剖析的表各自收尾、把做完的项写进目录）。等的时候自己又被停止也等完，再把停止
+    往上交：不然 JobRun 收尾时这几张表还没写完，会被当成没写进目录。"""
+    tasks = list(tasks)
+    for task in tasks:
+        task.cancel()
+    stopped = False
+    while pending := [t for t in tasks if not t.done()]:
+        try:
+            await asyncio.wait(pending)
+        except asyncio.CancelledError:
+            stopped = True
+    for task in tasks:
+        if not task.cancelled():
+            task.exception()            # 取走，免得「异常没人取」的告警；要往上交的那个调用方已经拿着
+    if stopped:
+        raise asyncio.CancelledError
+
+
 class _ProfileRun(runtime.JobRun):
     """一个剖析任务在后台的一次执行（进队、停止、收尾的框架在 runtime.JobRun）。"""
 
@@ -890,9 +924,10 @@ class _ProfileRun(runtime.JobRun):
         super().__init__(job_id)
         self.actor: str | None = None
         self.cx: catalog_profile.ProfileContext | None = None
-        #: 正在剖析的那张表：seq 和开始的时刻（进度回调据此落库）
-        self._seq = -1
-        self._table_started = 0.0
+        #: 不再开始新的表（_tables）：(原因, stop_reason)。止损时 stop_reason 是 failed / slow，数据源停用、关掉了剖析时为 None
+        self._halted: tuple[str | None, str | None] | None = None
+        #: 同时剖析的另一张表让整个任务出错时（_tables），正在做的几张表停下时的说法
+        self._abort: str | None = None
         #: 开始时按此刻的目录一张表都挑不出来（_rescope）：为什么，记在任务的提醒里
         self._scope_note: str | None = None
         #: 这个任务是怎么建的（trigger_of）：取值变化的 detected_by 按它记
@@ -910,10 +945,8 @@ class _ProfileRun(runtime.JobRun):
         await self._end("failed", reason, "failed", reason)
 
     async def _crashed(self, e: Exception) -> None:
-        from app.core.errors import describe_exception, first_line
-
         logger.exception("数据剖析任务 %s 出错", self.job_id)
-        reason = JOB_ERROR.format(line=first_line(e) or describe_exception(e))
+        reason = _job_error(e)
         await self._end("failed", reason, "failed", reason)
 
     async def _end(self, job_status: str, job_error: str | None, task_status: str, task_error: str | None) -> None:
@@ -937,6 +970,8 @@ class _ProfileRun(runtime.JobRun):
             await source_changes.notify_after_job(job.source_id, self.job_id)
 
     def stop_text(self) -> str:
+        if self._abort is not None:
+            return self._abort
         return STOPPED_ERROR if self.stop_reason == "user" else INTERRUPTED_ERROR
 
     # ---------------------------------------------------------------- 主流程
@@ -971,41 +1006,82 @@ class _ProfileRun(runtime.JobRun):
             self.cx = catalog_profile.make_context(source, settings, options=options, outside=outside)
         except ValueError as e:              # 不支持的数据库类型
             raise runtime.JobFailed(str(e)) from e
-        hooks = TableHooks(progress=self._progress, query=self._queried, stop_text=self.stop_text)
-        for seq, name, regular, watched in pending:
-            # 每张表开始前重读数据源：停用了、关掉了剖析就停下；遮罩按最新的设置
-            stop = await self._write(self._recheck)
-            if stop is not None:
-                await self._write(self._halt, stop, None)
-                break
-            self._table_started = time.monotonic()
-            await self._write(self._start_table, seq)
-
-            async def recorded(session: AsyncSession, result: TableResult, seq: int = seq) -> None:
-                await self._save_table(session, seq, result)
-
-            hooks.recorded = recorded
-            self._seq = seq
-            try:
-                await catalog_profile.profile_table(self.cx, name, db=self._write, hooks=hooks, actor=self.actor,
-                                                    regular=regular, observe=watched)
-            except SnapshotTampered as e:
-                raise runtime.JobFailed(str(e)) from e
-            if self.cx.runner.stopped:
-                # 任务级止损：后面的表 cancelled，带同一句原因
-                await self._write(self._halt, self.cx.runner.error, self.cx.runner.stopped)
-                break
+        width = min(max(1, int(settings.table_concurrency)), catalog_profile.MAX_TABLE_CONCURRENCY)
+        await self._tables(pending, width)
+        if (halt := self._stopping()) is not None:
+            await self._write(self._halt, *halt)
         await self._settle()
         await self._write(self._finish)
         await self._notify()
 
-    # ---------------------------------------------------------------- 进度回调（引擎调）
+    async def _tables(self, pending: list[tuple[int, str, bool, bool]], width: int) -> None:
+        """按顺序剖析这些表，同时最多 width 张（设置 table_concurrency）：一张结束就开始下一张，开始的先后照任务里的顺序。
 
-    async def _progress(self, result: TableResult) -> None:
-        await self._write(self._save_progress, self._seq, result)
+        - 每张表开始前重读数据源：停用了、关掉了剖析就不再开始新的表；止损（cx.runner）停下时同样。正在做的几张照常做完
+          （止损时它们剩下的项记止损的原因），都结束之后由 _run 把还没开始的表记停下（_halt）。
+        - 停止、关停：正在做的几张各自收尾（做完的项写进目录），都收完再把停止往上交。
+        - 一张表让整个任务出错（快照被改动、数据源没了、记结果时写库出错）：正在做的另几张按停止收尾、说法写这个原因，
+          再把错往上交，由 JobRun 记任务失败。"""
+        queue = collections.deque(pending)
 
-    async def _queried(self, result: TableResult) -> None:
-        await self._write(self._save_queries, self._seq, result)
+        async def worker() -> None:
+            while queue and self._stopping() is None:
+                seq, name, regular, watched = queue.popleft()
+                stop = await self._write(self._recheck)
+                if stop is not None and self._halted is None:
+                    self._halted = (stop, None)
+                if self._stopping() is not None:
+                    return              # 这张没开始：还排着，由 _halt 记停下
+                await self._table(seq, name, regular, watched)
+
+        workers = [asyncio.create_task(worker(), name=f"catalog-profile-{self.job_id}-{i}")
+                   for i in range(min(width, len(pending)))]
+        if not workers:
+            return
+        try:
+            done, rest = await asyncio.wait(workers, return_when=asyncio.FIRST_EXCEPTION)
+        except asyncio.CancelledError:
+            await _drain(workers)
+            raise
+        errors = [e for w in done if not w.cancelled() and (e := w.exception()) is not None]
+        if not errors:
+            return
+        from app.cluster import fence
+
+        # 几张同时出错时按头一个说；本进程续不上租约的（Fenced）先交：那时谁都不该再写
+        failed = next((e for e in errors if isinstance(e, fence.Fenced)), errors[0])
+        if not isinstance(failed, fence.Fenced):
+            self._abort = str(failed) if isinstance(failed, runtime.JobFailed) else _job_error(failed)
+        await _drain(rest)
+        raise failed
+
+    def _stopping(self) -> tuple[str | None, str | None] | None:
+        """不再开始新的表的原因（见 _halted），先到的为准：数据源停用、关掉了剖析（_tables 里重读时记下），或者止损。"""
+        if self._halted is None and self.cx is not None and self.cx.runner.stopped:
+            self._halted = (self.cx.runner.error, self.cx.runner.stopped)
+        return self._halted
+
+    async def _table(self, seq: int, name: str, regular: bool, watched: bool) -> None:
+        """剖析一张表：检查项进度、发过的查询随时落在这张表上，整张表的结果和目录在同一个事务里写。"""
+        assert self.cx is not None
+        started = time.monotonic()
+        await self._write(self._start_table, seq)
+
+        async def progress(result: TableResult) -> None:
+            await self._write(self._save_progress, seq, result, started)
+
+        async def queried(result: TableResult) -> None:
+            await self._write(self._save_queries, seq, result, started)
+
+        async def recorded(session: AsyncSession, result: TableResult) -> None:
+            await self._save_table(session, seq, result)
+
+        hooks = TableHooks(progress=progress, query=queried, recorded=recorded, stop_text=self.stop_text)
+        try:
+            await catalog_profile.profile_table(self.cx, name, db=self._write, hooks=hooks, actor=self.actor,
+                                                regular=regular, observe=watched)
+        except SnapshotTampered as e:
+            raise runtime.JobFailed(str(e)) from e
 
     # ---------------------------------------------------------------- 库操作
 
@@ -1093,14 +1169,12 @@ class _ProfileRun(runtime.JobRun):
                               .values(status="running", started_at=utcnow(), snapshot_id=snapshot))
         await session.commit()
 
-    def _elapsed(self) -> int:
-        return int((time.monotonic() - self._table_started) * 1000)
-
-    async def _save_progress(self, session: AsyncSession, seq: int, result: TableResult) -> None:
-        """一项检查开始或结束：这张表的检查项、正在做哪一项、查询数、发过的查询、行数估算，任务的查询计数。"""
+    async def _save_progress(self, session: AsyncSession, seq: int, result: TableResult, started: float) -> None:
+        """一项检查开始或结束：这张表的检查项、正在做哪一项、查询数、发过的查询、行数估算，任务的查询计数。started 是这张
+        表开始的时刻（time.monotonic）。"""
         await session.execute(self._task(CatalogProfileTask.seq == seq, CatalogProfileTask.status == "running")
                               .values(checks=[dict(c) for c in result.checks] or None, current=result.current,
-                                      queries=result.queries, elapsed_ms=self._elapsed(),
+                                      queries=result.queries, elapsed_ms=_elapsed(started),
                                       query_log=list(result.query_log) or None,
                                       row_estimate=result.row_estimate.to_dict() if result.row_estimate else None))
         if values := self._counters():
@@ -1108,10 +1182,10 @@ class _ProfileRun(runtime.JobRun):
                                   .execution_options(synchronize_session=False))
         await session.commit()
 
-    async def _save_queries(self, session: AsyncSession, seq: int, result: TableResult) -> None:
+    async def _save_queries(self, session: AsyncSession, seq: int, result: TableResult, started: float) -> None:
         """发出一条查询之后：这张表和任务的查询计数、提醒（发过的查询本身在检查项结束时一起写）。"""
         await session.execute(self._task(CatalogProfileTask.seq == seq, CatalogProfileTask.status == "running")
-                              .values(queries=result.queries, elapsed_ms=self._elapsed()))
+                              .values(queries=result.queries, elapsed_ms=_elapsed(started)))
         if values := self._counters():
             await session.execute(update(CatalogProfileJob).where(CatalogProfileJob.id == self.job_id).values(**values)
                                   .execution_options(synchronize_session=False))

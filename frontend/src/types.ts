@@ -3446,12 +3446,14 @@ export interface CatalogImpact {
 // 数据剖析（后端 app/data/catalog_profile.py、catalog_profile_jobs.py）：对业务库发少量只读查询，核实推断的关联关系、
 // 取码值候选、提议业务日期。默认关闭，按数据源在 options.catalog_profile 里开启。
 // 剖析是服务端的后台任务（/api/datasources/{id}/catalog/profile-jobs）：逐表剖析，每张表有自己的查询次数和时长预算，
-// 每张表一结束就写进目录；查询一条一条发，可以随时停止。和同一个数据源的起草任务按建立顺序排队，一个结束了另一个才开始。
+// 每张表一结束就写进目录；同时剖析几张表按设置（缺省一张），每张表的查询一条一条发，可以随时停止。和同一个数据源的起草任务
+// 按建立顺序排队，一个结束了另一个才开始。
 // 服务重启时还没结束的任务记 interrupted，不自动续跑（由人点「重试没做完的表」）。
 // ===========================================================================
 
 /** 剖析设置里的数值项 */
-export type CatalogProfileNumberKey = 'table_max_queries' | 'table_max_s' | 'query_timeout_s' | 'sample_size' | 'max_scan_rows'
+export type CatalogProfileNumberKey =
+  'table_max_queries' | 'table_max_s' | 'query_timeout_s' | 'sample_size' | 'max_scan_rows' | 'table_concurrency'
 
 /** 一个数据源的剖析设置（服务端 ProfileSettings.to_dict）；任务里的 settings 是建任务时的快照 */
 export interface CatalogProfileSettings {
@@ -3465,6 +3467,8 @@ export interface CatalogProfileSettings {
   sample_size: number
   /** 0 表示一律不做整表统计 */
   max_scan_rows: number
+  /** 同时剖析几张表（1–3，缺省 1）；每张表的查询仍一条一条发 */
+  table_concurrency: number
 }
 
 /** 为什么需要剖析（GET /catalog 每行的 profile_due_reason） */

@@ -2991,8 +2991,9 @@ export const CATALOG_SCOPE_TEXT = {
 // 术语：
 // - 「数据剖析」：对业务库发只读查询，核实推断的关联关系（覆盖率、基数），取状态类列的码值候选，提议业务日期。
 //   动作写「剖析」，不写扫描、探测。默认关闭，按数据源开启。
-// - 剖析是后台任务：逐张表进行，每张表剖析完就写进目录；查询一条一条地发，可以随时停止。关掉对话框照常进行。
-//   目录只在整张表结束时写一次：停止、关停服务时正在做的那张来得及收尾，做完的项照常写进去；进程被杀时那张表没来得及收尾，
+// - 剖析是后台任务：逐张表进行，每张表剖析完就写进目录；同时剖析几张表按设置（缺省一张），每张表的查询一条一条地发，可以
+//   随时停止。关掉对话框照常进行。同时剖析不止一张时，说法里写明「同时剖析 N 张表」：业务库同时要应付这么多条查询。
+//   目录只在整张表结束时写一次：停止、关停服务时正在做的那几张来得及收尾，做完的项照常写进去；进程被杀时那几张没来得及收尾，
 //   这次做完的项一项都没写进去。说停下以后写进了什么，按逐表的状态照实说（cancelledNote / interruptedNote），不一律说「已写进」。
 // - 预算按表算：「每张表最多查询数」「每张表时长上限」用完只停这张表，下一张表重新计数；另有单条查询时限、核对键值数、
 //   整表统计行数上限。标签和服务端校验报错里的叫法一致（catalog_profile._NUMBER_FIELDS），保存被拒时按机读码认出是哪一项。
@@ -3008,6 +3009,7 @@ export const PROFILE_FIELD_LABEL: Record<'enabled' | CatalogProfileNumberKey, st
   query_timeout_s: '单条查询时限',
   sample_size: '核对键值数',
   max_scan_rows: '整表统计行数上限',
+  table_concurrency: '同时剖析的表数',
 }
 
 export const PROFILE_FIELD_UNIT: Record<CatalogProfileNumberKey, string> = {
@@ -3016,6 +3018,7 @@ export const PROFILE_FIELD_UNIT: Record<CatalogProfileNumberKey, string> = {
   query_timeout_s: '秒',
   sample_size: '个',
   max_scan_rows: '行',
+  table_concurrency: '张',
 }
 
 export const PROFILE_FIELD_HINT: Record<CatalogProfileNumberKey, string> = {
@@ -3024,7 +3027,12 @@ export const PROFILE_FIELD_HINT: Record<CatalogProfileNumberKey, string> = {
   query_timeout_s: '超过即中断这条查询；不超过数据源自身的查询时限，也不超过这张表剩下的时长',
   sample_size: '核对一条关联关系时，从本表取的不同键值个数：取的是数据库先给出的那些，不是随机抽样',
   max_scan_rows: '不超过此行数的表才做去重计数、最小值和最大值等整表统计',
+  table_concurrency: '大于 1 时几张表同时剖析，业务库同一时刻要应付这么多条查询，并和这个数据源上的分析共用连接；库慢、正忙时保持 1',
 }
+
+/** 查询怎么发：一次一张表时「一条一条地发」，同时剖析几张时写明张数 */
+const profilePace = (tables: number) =>
+  (tables > 1 ? `同时剖析 ${formatNumber(tables)} 张表、每张表的查询一条一条地发` : '一条一条地发')
 
 /** 表名点名：「visits」、「refunds」 */
 const quoteNames = (names: string[]) => names.map((n) => `「${n}」`).join('、')
@@ -3033,8 +3041,8 @@ export const PROFILE_TEXT = {
   // ---- 设置
   section: '数据剖析',
   enableHint: '默认关闭。开启后可在数据目录中核实推断的关联关系、取状态类列的码值候选',
-  risk: (queries: number, perTable: number, timeout: number) =>
-    `开启后，剖析会对这个数据源发出只读查询，一条一条地发，可随时停止：每张表最多 ${formatNumber(queries)} 条、`
+  risk: (queries: number, perTable: number, timeout: number, tables: number) =>
+    `开启后，剖析会对这个数据源发出只读查询，${profilePace(tables)}，可随时停止：每张表最多 ${formatNumber(queries)} 条、`
     + `${formatNumber(perTable)} 秒，单条不超过 ${formatNumber(timeout)} 秒。不读取明细行，遮罩的列不取样。`,
   range: (min: number, max: number, unit: string, def: number) =>
     `范围 ${formatNumber(min)}–${formatNumber(max)} ${unit}，默认 ${formatNumber(def)}`,
@@ -3045,8 +3053,9 @@ export const PROFILE_TEXT = {
   invalid: (n: number) => `数据剖析有 ${formatNumber(n)} 项设置不正确`,
   // ---- 数据源卡片
   chip: '数据剖析已开启',
-  chipHint: (queries: number, perTable: number, timeout: number) =>
-    `数据剖析已开启：每张表最多 ${formatNumber(queries)} 条只读查询、${formatNumber(perTable)} 秒，单条不超过 ${formatNumber(timeout)} 秒`,
+  chipHint: (queries: number, perTable: number, timeout: number, tables: number) =>
+    `数据剖析已开启：每张表最多 ${formatNumber(queries)} 条只读查询、${formatNumber(perTable)} 秒，单条不超过 ${formatNumber(timeout)} 秒`
+    + (tables > 1 ? `；同时剖析 ${formatNumber(tables)} 张表` : ''),
   open: '设置数据剖析',
   dialogTitle: (name: string) => `「${name}」的数据剖析设置`,
   dialogBody: '设置保存在数据源上，对之后新建的剖析生效；进行中的剖析按开始时的设置。',
@@ -3087,11 +3096,15 @@ export const PROFILE_TEXT = {
   budgetQuery: (secs: number) => `单条查询不超过 ${formatNumber(secs)} 秒`,
   budgetSample: (n: number) => `每条关联关系取 ${formatNumber(n)} 个不同键值核对`,
   budgetScan: (n: number) => (n > 0 ? `行数超过 ${formatNumber(n)} 的表不做整表统计` : '不做整表统计'),
-  /** 上限的估算：表数 × 每张表的上限 */
+  budgetPace: (tables: number) => (tables > 1
+    ? `同时剖析 ${formatNumber(tables)} 张表，每张表的查询一条一条地发`
+    : '一张表做完再做下一张，查询一条一条地发'),
+  /** 上限的估算：查询数是表数 × 每张表的上限；时长按同时剖析的张数分几轮，每轮按每张表的时长上限 */
   budgetTotal: (tables: number, queries: number, span: string) =>
     `这次 ${formatNumber(tables)} 张表，最多约 ${formatNumber(queries)} 条查询、${span}`,
   editSettings: '修改设置',
-  readOnly: '剖析会对业务库发只读查询，一条一条地发，可随时停止；停止时已做完的项照常写进目录，没做的保留原来的结论。',
+  readOnly: (tables: number) =>
+    `剖析会对业务库发只读查询，${profilePace(tables)}，可随时停止；停止时已做完的项照常写进目录，没做的保留原来的结论。`,
   start: '开始剖析',
   /** 同一个数据源有起草任务在排队、进行中：剖析排在它后面 */
   queue: '排队剖析',
@@ -3140,7 +3153,7 @@ export const PROFILE_TEXT = {
     slow: '后面的表没有剖析。可以在业务库不忙的时候重试没做完的表，或在剖析设置中调低单条查询时限、每张表最多查询数。',
   } as Record<string, string>,
   /**
-   * 停止、服务重启以后的说明。停下时正在剖析的那张表通常来得及收尾，做完的项照常写进目录（服务端记部分完成）；lost 是没来得
+   * 停止、服务重启以后的说明。停下时正在剖析的那几张表通常来得及收尾，做完的项照常写进目录（服务端记部分完成）；lost 是没来得
    * 及收尾的表（进程被杀、下次启动时才标中断，或停止时服务端没在跑它）：目录只在整张表结束时和它的结果一起写，所以它这次
    * 一项结论都没写进去，服务端把它记成已停止、查完的项也改记跳过。有这样的表时点名说，不能一律说「做完的项已写进数据目录」。
    * 它这次可能一项都还没查完，所以说「这次的结论没有写进目录」，不说「做完的项没写进去」。
