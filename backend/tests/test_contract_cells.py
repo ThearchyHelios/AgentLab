@@ -344,7 +344,7 @@ def cells_only(**contract):
         node("fetch", "tool", tool="db_query__shop",
              args={"sql": "SELECT SUM(amount) AS gmv, COUNT(*) AS orders FROM orders"}),
         node("write", "report", instructions="写周报", numbers="strict", on_violation="fail",
-             claims="require_citation"),
+             claims="require_citation", analysis_claims="strict"),
         node("out", "output", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}], contract=contract),
     ]
     return {"nodes": nodes, "edges": [{"source": a["id"], "target": b["id"]} for a, b in zip(nodes, nodes[1:])]}

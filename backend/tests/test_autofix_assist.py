@@ -40,7 +40,7 @@ def two_exits() -> dict:
         node("card", "metrics", "周报口径卡", caliber="周报口径", metrics=[
             {"id": "gmv", "name": "销售额", "unit": "元", "expression": "cell(nodes.fetch, 0, 'gmv')"}]),
         node("write", "report", "报告撰写", instructions="写周报",
-             numbers="strict", on_violation="fail", claims="require_citation"),
+             numbers="strict", on_violation="fail", claims="require_citation", analysis_claims="strict"),
         node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}]),
         node("raw", "output", "原始数", fields=[{"name": "数", "value": "{{ nodes.fetch }}"}]),
     ]
@@ -230,7 +230,7 @@ def guarded() -> dict:
         node("team", "supervisor", "复核团队", goal="复核", agents=[{"name": "checker", "tools": []}]),
         node("gate", "human", "人工把关", prompt="确认数字"),
         node("write", "report", "报告撰写", instructions="写周报",
-             numbers="strict", on_violation="fail", claims="require_citation"),
+             numbers="strict", on_violation="fail", claims="require_citation", analysis_claims="strict"),
         node("done", "output", "出具", fields=[{"name": "周报", "value": "{{ nodes.write.text }}"}], contract=CONTRACT),
     ]
     edges = [{"id": f"e{i}", "source": a, "target": b} for i, (a, b) in enumerate(

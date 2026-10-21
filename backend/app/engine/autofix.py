@@ -1338,9 +1338,10 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
     return reasons
 
 
-#: 报告撰写节点三项设置从严到宽的次序：没写时运行时的缺省值（on_violation 没写时探索运行按 flag）
+#: 报告撰写节点几项设置从严到宽的次序：没写时运行时的缺省值（on_violation 没写时探索运行按 flag，analysis_claims 没写是
+#: check）
 _REPORT_STRICT = {"numbers": ("strict", "strict"), "on_violation": ("fail", "flag"),
-                  "claims": ("require_citation", "off")}
+                  "claims": ("require_citation", "off"), "analysis_claims": ("strict", "check")}
 #: claims 从宽到严：off < require_citation < judge（在挂引用之外再请模型逐句裁判，不支持的按 on_unsupported
 #: 判档）。不在这里的写法不比较（validate 报 report.claims_invalid）
 _CLAIMS_ORDER = ("off", "require_citation", CLAIMS_JUDGE)

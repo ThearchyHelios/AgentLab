@@ -266,9 +266,9 @@ TEMPLATES: list[dict[str, Any]] = [
                     "expression": "cell(nodes.fetch, 0, 'refund_cnt') / cell(nodes.fetch, 0, 'order_cnt')"
                                   " if cell(nodes.fetch, 0, 'order_cnt') else None"},
                ]),
-            # 受管出具要求报告撰写节点写明最严的三项（发布门禁 G3），模板照着写，拿来就能发布成受管
+            # 受管出具要求报告撰写节点写明最严的几项（发布门禁 G3，含分析说法核对设为严格），模板照着写，拿来就能发布成受管
             _n("write", "report", "报告撰写", metrics_from=["caliber"],
-               numbers="strict", on_violation="fail", claims="require_citation",
+               numbers="strict", on_violation="fail", claims="require_citation", analysis_claims="strict",
                system="你是周报撰写人：结论先行，只写有数据支撑的判断。",
                instructions="为 {{ input.week }} 写一份简短的周报：先用一两句话总结本周，"
                             "再分点说销售额、订单、客单价和退款的变化。"),
