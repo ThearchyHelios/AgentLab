@@ -7,6 +7,8 @@ tests/test_eval_analysis_runs.py。地区、门店、数字都是虚构的。
 - 期望值：判定码归到判定类，主要来源按 top_n 取前几段；比较作答前后两次期望时不看运行当天、现查时刻、输入快照的工件。
 - 评分五种结论：引用了判定对得上的结论 → 对且可追溯；正文按说法表写对了、没引用 → 对但没引用；引用的判定对不上、正文
   写反了（常规波动说成异常、方向反了、来源说成别的段）、根本没做也没说 → 错；期望算不了 → 不能评分。
+- 可比性不进说法表：期望不可比、正文明确说了两期不能直接比的（评分自己的小词表）算对但没引用；假设、疑问、否定的不算；
+  期望可比的只能靠引用。
 """
 from __future__ import annotations
 
@@ -259,13 +261,38 @@ def test_doing_nothing_and_saying_nothing_is_wrong():
     uncited = _score(BAND, fake_result("baseline", None, "within_band"),
                      _answer(_record(fake_result("baseline", None, "within_band"), cited=()), text="上周订单数是 1,203 单。"))
     assert uncited["outcome"] == "wrong" and "但没有引用" in uncited["reason"], uncited
-    # 可比性没有对应的判断词：只能引用
+
+
+def test_saying_the_two_periods_cannot_be_compared_directly_is_untraced():
+    """可比性不进说法表（说法核对不打回谨慎的提醒），评分另认：期望不可比、正文明确说了两期不能直接比（不完整、还没过完、
+    只有几天、天数不同、口径不同、不能直接比……）的算对但没引用；假设、疑问、否定、「没法比」（差得远）不算；期望可比的
+    正文怎么写都不算，只能靠引用。"""
+    from app.engine import analysis_claims
+
     exp = {**BAND, "op": "comparable"}
-    words = _score(exp, fake_result("comparable", None, "incomparable"), _answer(text="本周还没过完，两周不能直接比。"))
-    assert words["outcome"] == "wrong"
-    cited = _score(exp, fake_result("comparable", None, "incomparable"),
-                   _answer(_record(fake_result("comparable", None, "incomparable"))))
-    assert cited["outcome"] == "traced"
+    incomparable = fake_result("comparable", None, "incomparable")
+    for text, said in (("本周还没过完，两周不能直接比。", "本周还没过完"), ("本周数据不完整，不能直接比。", "本周数据不完整"),
+                       ("两周的天数不同（7 天 vs 3 天），不宜直接比较。", "两周的天数不同（7 天 vs 3 天）"),
+                       ("统计口径有调整，前后两期不可比。", "统计口径有调整"),
+                       ("这周才过了三天，放在一起看会失真。", "这周才过了三天"),
+                       ("不能直接拿本周和上周比较。", "不能直接拿本周和上周比较")):
+        item = _score(exp, incomparable, _answer(text=text))
+        assert item["outcome"] == "untraced", (text, item)
+        assert item["found"] == {"judgement": "incomparable", "text": said}, item
+        assert analysis_claims.scan(text) == [], "说法表照旧不认这类说法：说法核对不会打回"
+    for text in ("如果口径不同，就不能直接比。", "是不是不能直接比？", "不是不能比，只是要按日均看。", "这周跟上周没法比，差远了。",
+                 "两周都过完了，可以直接比。", "订单信息不完整的有 3 单。"):
+        item = _score(exp, incomparable, _answer(text=text))
+        assert item["outcome"] == "wrong" and "没有做可比性检查" in item["reason"], (text, item)
+    # 只有说了这类话的句子留下来（和说法表认出判断词的句子一起）
+    assert [x["text"] for x in judgements.sentences_of_text("上周订单数是 1,203 单。本周还没过完，两周不能直接比。")] == \
+        ["本周还没过完，两周不能直接比。"]
+    # 期望可比：正文怎么写都不算，只能靠引用
+    comparable = fake_result("comparable", None, "comparable")
+    for text in ("两周都是完整的 7 天，可以直接比。", "本周还没过完，两周不能直接比。"):
+        assert _score(exp, comparable, _answer(text=text))["outcome"] == "wrong", text
+    assert _score(exp, comparable, _answer(_record(comparable)))["outcome"] == "traced"
+    assert _score(exp, incomparable, _answer(_record(incomparable)))["outcome"] == "traced"
 
 
 def test_an_analysis_that_cannot_be_computed_cannot_be_graded():
