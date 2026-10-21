@@ -40,3 +40,24 @@ def test_compare_aligns_analysis_items():
     assert wow["change"] == "phrase"
     # 没有分析卡的两次运行：analyses 是空的
     assert compare.compare(week("r5").side(), week("r6").side())["analyses"] == []
+
+
+def test_a_card_that_failed_half_way_lists_only_what_a_finished_execution_decided():
+    """分析卡执行到一半失败：前几项已经发了 analysis.end，后一项让卡失败（node.failed，没有 node.finished）。那次执行的判定
+    不是这次运行的结果：只认后面跟着 node.finished 的执行，失败的那次不列、也不算执行次数。"""
+    base = _with_card(week("r7"), [("wow", "within_band", "在常规波动范围内")])
+    failed = week("r8")
+    failed.add("node.started", "insight", {"node_type": "analysis"})
+    failed.add("analysis.end", "insight", {"item": "wow", "op": "baseline", "mode": None, "status": "ok",
+                                           "verdict": "outside_band", "direction": "down", "phrase": "超出常规波动范围",
+                                           "analysis_artifact": "wow-failed"})
+    failed.add("node.failed", "insight", {"error": "分析项「where」（变化拆解）：比率不能按段相加"})
+    [wow] = compare.compare(base.side(), failed.side())["analyses"]
+    assert wow["change"] == "removed" and wow["target"] is None and wow["base"]["verdict"] == "within_band"
+
+    # 失败后重来一次做完了：按做完的那次对比，执行次数只算做完的
+    _with_card(failed, [("wow", "far_outside_band", "明显超出常规波动范围")])
+    result = compare.compare(base.side(), failed.side())
+    [wow] = result["analyses"]
+    assert wow["change"] == "verdict" and wow["target"]["verdict"] == "far_outside_band"
+    assert not [n for n in result["notes"] if "执行了" in n]
