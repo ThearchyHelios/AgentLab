@@ -1983,6 +1983,14 @@
     return parts
   }
 
+  /** 方法与版本那一行：服务端在工件条目上带的叫法（method_label，和导出页同一份「变化拆解（可加） · decompose.additive@1」）
+   *  加方法 id；条目上没带叫法的只写 id */
+  function methodText(art, result) {
+    const label = art && isObj(art.a) && typeof art.a.method_label === 'string' ? art.a.method_label : ''
+    const id = String(result.method || '—')
+    return label ? `${label} · ${id}` : id
+  }
+
   /** 口径卡指标上的可比性（口径卡执行时自动做的可比性检查）：卡上记的判定和原因；那份结论随文件附带、核对通过的，再给
    *  判定标准、方法与版本、各项检查和导出时服务端的复算。没附带的照卡上的记录写，说明为什么没有更多 */
   function comparabilityBlock(c) {
@@ -2002,7 +2010,7 @@
     }
     parts.push(kv([
       result.criterion ? [T.dCriterion, String(result.criterion)] : null,
-      [T.dMethod, String(result.method || '—')],
+      [T.dMethod, methodText(art, result)],
     ]))
     const table = isObj(result.table) ? result.table : null
     const columns = table && Array.isArray(table.columns) ? table.columns.map(String) : []
@@ -2030,7 +2038,7 @@
       parts.push(kv([
         [T.dPhrase, String(result.phrase || '—')],
         result.criterion ? [T.dCriterion, String(result.criterion)] : null,
-        [T.dMethod, String(result.method || '—')],
+        [T.dMethod, methodText(art, result)],
       ]))
       const caveats = (Array.isArray(result.caveats) ? result.caveats : []).filter(isObj).map((c) => String(c.text || ''))
       if (caveats.length) parts.push(h('p', { class: 'sub' }, T.dCaveats), h('ul', { class: 'items' }, caveats.map((c) => h('li', {}, c))))

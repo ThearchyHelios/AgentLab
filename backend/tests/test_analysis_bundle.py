@@ -106,6 +106,8 @@ def test_the_analysis_and_its_input_travel_with_the_file_and_verify():
     # 导出时服务端真的复算了一遍：按封存的输入快照（这份文件里哈希对得上的原字节）重算，逐字段相同
     assert analysis_item["recheck"] == {"status": "same", "method": "decompose.additive@1",
                                         "text": "复算一致：按封存的输入重新计算，结论逐项相同"}
+    # 方法的叫法由服务端带上（和导出页同一份），核对页只显示「变化拆解（可加） · decompose.additive@1」
+    assert analysis_item["method_label"] == "变化拆解（可加）"
     [query] = [x for x in bundle["artifacts"] if x["kind"] == "query"]
     assert "b64" in query
 
@@ -259,7 +261,7 @@ def test_the_comparability_on_a_card_travels_with_the_card_and_is_chained_throug
     assert "b64" in item(bundle, card_id)
     comparability = item(bundle, found)
     assert comparability["kind"] == ARTIFACT_KIND and "b64" in comparability and comparability["node_id"] == "card"
-    assert comparability["recheck"]["status"] == "same"
+    assert comparability["recheck"]["status"] == "same" and comparability["method_label"] == "可比性检查"
     got = verdicts(bundle)
     assert all(r == "pass" for key in ("events", "manifest", "artifacts", "chain") for r in got[key]), got["why"]
     assert {w["kind"] for w in got["why"]["chain"]} >= {"metric_set", ARTIFACT_KIND, "query"}

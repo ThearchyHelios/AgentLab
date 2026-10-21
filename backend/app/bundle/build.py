@@ -63,7 +63,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from app.analysis.contract import ARTIFACT_KIND, LEDGER_KIND, NODE_TYPE as ANALYSIS_NODE, is_result
+from app.analysis.contract import ARTIFACT_KIND, LEDGER_KIND, NODE_TYPE as ANALYSIS_NODE, is_result, method_label
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.events import EventType
 from app.engine.evidence import analysis_recheck, iter_units, query_entry_fields
@@ -1161,8 +1161,9 @@ class _Artifacts:
 def _attach_analysis(artifacts: _Artifacts, store: _Store, item: dict[str, Any] | None, artifact: str,
                      owner: str | None, cited_queries: list[str], depth: int = 0) -> None:
     """随文件附带的分析结论：它的输入快照（种类 query，遮罩照常认）、下钻的上一层结论（同样附带它的输入，最多
-    _PARENT_DEPTH 层）一并列进清单，再把服务端的复算结论记在这份结论的条目上（recheck）。只给 id 的结论、被改过的
-    （哈希对不上）不顺着它去附带别的：被改过的结论说输入是哪几份，不能替它圆。"""
+    _PARENT_DEPTH 层）一并列进清单，再把服务端的复算结论记在这份结论的条目上（recheck），连同方法的叫法（method_label，
+    contract.method_label，和导出页同一份：核对页只显示，不在页面里另起一套叫法）。只给 id 的结论、被改过的（哈希对不上）
+    不顺着它去附带别的：被改过的结论说输入是哪几份，不能替它圆。"""
     if item is None or "b64" not in item or not store.intact(artifact) or "recheck" in item:
         return
     result = store.content(artifact)
@@ -1176,6 +1177,7 @@ def _attach_analysis(artifacts: _Artifacts, store: _Store, item: dict[str, Any] 
             continue
         artifacts.add(input_id, "query", owner)
         cited_queries.append(input_id)
+    item["method_label"] = method_label(result.get("op"), result.get("mode"))
     item["recheck"] = _recheck(result, store)
 
 
