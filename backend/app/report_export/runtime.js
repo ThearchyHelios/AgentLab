@@ -80,14 +80,18 @@
     unnamed: '已删除的工作流',
     // 口径卡指标上的可比性（跨两份同形查询算的环比、同比）
     dComparability: '两期可比性', comparabilityLabel: { comparable: '两期可比', conditional: '两期有条件可比', incomparable: '两期不可比' },
+    comparabilityOpen: '展开这份可比性结论（判定、方法、计算、输入、复算、封存）',
     // 分析结论：判定 → 方法 → 计算 → 输入 → 复算 → 封存
     analysis: '分析结论', dPhrase: '判定语', dCriterion: '判定标准', dSubjects: '点名的段',
     dDirection: '方向', directionLabel: { up: '上升', down: '下降' }, dCaveats: '附带说明', dReason: '算不了的原因',
     dCitedPart: '这一处引用的是', citedPhrase: '判定语', citedValue: (k) => `具名的数「${k}」`,
-    citedCell: (r, c) => `结果表第 ${r + 1} 行「${c}」`, dWho: '谁做的', originLabel: { card: '分析卡（模板定好的分析）', agent: 'Agent 现场做的分析' },
+    citedCell: (r, c) => `结果表第 ${r + 1} 行「${c}」`, dWho: '谁做的',
+    originLabel: { card: '分析卡（模板定好的分析）', agent: 'Agent 现场做的分析', metric: '口径卡执行时自动做的可比性检查' },
     dHypothesis: 'Agent 写的假设', refused: '这次分析没有做成', renderOk: '与按结论渲染的结果一致', renderBad: '与按结论渲染的结果不一致',
-    method: '方法', dMethod: '方法与版本', dParams: '参数', dSettings: '实际用的阈值', dProbes: '现查的表范围',
+    method: '方法', dMethod: '方法与版本', dParams: '参数', dSettings: '实际用的阈值', dProbes: '现查结果',
     probeBasis: { live: '现查', profile: '剖析', observed: '取值观察' },
+    probeBound: (expr, value) => `按运行当天现算的界 ${expr} = ${value}`, probeEmpty: '这一列一个值都没有',
+    probeRange: (min, max) => `${min} 至 ${max}`,
     calc: '计算', dValues: '具名的数', dFormulas: '关键数的代入式', dResultTable: '结果表',
     resultRows: (shown, total) => `列出 ${shown} 行，共 ${total} 行`,
     analysisInput: '输入', dRole: '角色', dRef: '调用里写的名字', dColumnsUsed: '用到的列', dRowsUsed: '用到的行',
@@ -95,6 +99,7 @@
     closureOk: (h, t) => `总数 ${h} 与各段之和 ${t} 闭合`, closureBad: (h, t) => `总数 ${h} 与各段之和 ${t} 对不上`,
     dParent: '下钻自', recompute: '复算', seal: '封存', inputOfAnalysis: (alias) => `分析结论 ${alias} 的输入`,
     inLedger: '封存范围内的台账记过这份分析结论', notInLedger: '封存范围内的台账里没有这份分析结论',
+    viaCard: '记在口径卡的指标集里，随卡封存（不进台账）',
   }
 
   const MASKED = '已遮罩'
@@ -235,10 +240,17 @@
       const c = step.comparability
       const why = Array.isArray(c.reasons) && c.reasons.length ? `：${c.reasons.join('；')}` : ''
       body.push(h('div', { style: 'margin-top:8px' }, kv([
-        [T.dComparability, `${T.comparabilityLabel[c.verdict] || c.phrase || NONE}${c.verdict === 'comparable' ? '' : why}`],
+        [T.dComparability,
+          `${own(T.comparabilityLabel, c.verdict) || c.phrase || NONE}${c.verdict === 'comparable' ? '' : why}`],
         c.criterion ? [T.dCriterion, String(c.criterion)] : null,
         c.artifact ? [T.dArtifact, h('code', {}, short(c.artifact))] : null,
       ])))
+      // 点得开那份可比性结论：服务端给的出处链（同分析结论的引用），收在一个可展开的块里
+      const steps = Array.isArray(c.steps) ? c.steps.filter((x) => isObj(x) && own(PARTS, x.step)) : []
+      if (steps.length) {
+        body.push(h('details', { class: 'comparability', 'data-comparability': '' },
+          h('summary', {}, T.comparabilityOpen), ...steps.map((x) => PARTS[x.step](x))))
+      }
     }
     // 双盲复算（期 4）：复核过这个指标才有
     if (isObj(step.dual_check)) {
@@ -461,7 +473,8 @@
         ? [T.dSubjects, verdict.subjects.map((s) => (Array.isArray(s) ? s.join(' · ') : String(s))).join('、')] : null,
       verdict && verdict.direction ? [T.dDirection, T.directionLabel[verdict.direction] || String(verdict.direction)] : null,
       [T.dCitedPart, citedText],
-      [T.dWho, `${T.originLabel[step.origin] || NONE}${step.node_id ? ` · ${step.label || nodeLabel(step.node_id)}` : ''}`],
+      [T.dWho, `${own(T.originLabel, step.origin) || NONE}`
+        + `${step.node_id ? ` · ${step.label || nodeLabel(step.node_id)}` : ''}`],
     ]))
     if (step.status === 'refused') body.push(waiting(`${T.refused}${step.reason ? `：${step.reason}` : ''}`))
     if (Array.isArray(step.caveats) && step.caveats.length) {
@@ -475,10 +488,21 @@
     if (step.note) body.push(waiting(step.note))
     if (typeof step.render_ok === 'boolean') body.push(muted(step.render_ok ? T.renderOk : T.renderBad))
     return h('section', { class: 'part', 'data-step': 'analysis' },
-      h('h3', {}, `${T.analysis} ${step.alias || ''} · ${step.method_label || NONE}`), h('div', { class: 'part-body' }, ...body))
+      h('h3', {}, `${[T.analysis, step.alias].filter(Boolean).join(' ')} · ${step.method_label || NONE}`),
+      h('div', { class: 'part-body' }, ...body))
   }
 
-  /** 分析结论 · 方法：方法与版本、参数、实际用的阈值、现查的表范围 */
+  /** 现查结果的一条：有 expr 的是按运行当天现算的界（CURRENT_DATE 这类在库里算出的日期），其余是一列的实际范围；现查到的
+   *  范围最早、最晚都空，是这一列一个值都没有 */
+  function probeText(p) {
+    const how = `（${own(T.probeBasis, p.basis) || p.basis || NONE}${p.at ? ` · ${p.at}` : ''}）`
+    if (typeof p.expr === 'string' && p.expr) return `${T.probeBound(p.expr, p.value || NONE)}${how}`
+    const where = `${p.table || NONE}.${p.column || NONE}`
+    const empty = p.basis === 'live' && !p.min && !p.max
+    return `${where}：${empty ? T.probeEmpty : T.probeRange(p.min || NONE, p.max || NONE)}${how}`
+  }
+
+  /** 分析结论 · 方法：方法与版本、参数、实际用的阈值、现查结果 */
   function analysisMethodPart(step) {
     const body = [kv([[T.dMethod, `${step.method_label || NONE} · ${step.method || NONE}`]])]
     if (isObj(step.params) && Object.keys(step.params).length) {
@@ -489,8 +513,7 @@
     }
     if (Array.isArray(step.probes) && step.probes.length) {
       body.push(h('p', { class: 'sub' }, T.dProbes), h('ul', { style: 'margin:4px 0 0;padding-left:1.2em;font-size:13px' },
-        step.probes.map((p) => h('li', {}, `${p.table || NONE}.${p.column || NONE}：${p.min || NONE} 至 ${p.max || NONE}`
-          + `（${T.probeBasis[p.basis] || p.basis || NONE}${p.at ? ` · ${p.at}` : ''}）`))))
+        step.probes.filter(isObj).map((p) => h('li', {}, probeText(p)))))
     }
     return h('section', { class: 'part', 'data-step': 'analysis_method' }, h('h3', {}, T.method), h('div', { class: 'part-body' }, ...body))
   }
@@ -550,7 +573,7 @@
   /** 分析结论 · 封存：台账记没记过、哈希核对 */
   function analysisSealPart(step) {
     const body = [kv([[T.dArtifact, step.artifact ? h('code', {}, short(step.artifact)) : NONE],
-      [T.seal, step.ledger ? T.inLedger : T.notInLedger]])]
+      [T.seal, step.via === 'metric_set' ? T.viaCard : step.ledger ? T.inLedger : T.notInLedger]])]
     if (step.note) body.push(waiting(step.note))
     const bits = integrity(step)
     if (bits) body.push(bits)

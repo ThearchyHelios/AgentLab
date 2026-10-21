@@ -22,6 +22,7 @@
  * 分析结论（判定语 [[a:A3]]、具名的数 [[a:A3.键]]、结果表的格 [[v:A3.r0.列]]）在 ③ ④ 里和查询快照一样核哈希、核引用链
  * （它的输入快照按「已核对的分析结论的输入」认）；⑤ 里核正文显示的判定语、数是不是结论里写的那几个字（同服务端的渲染
  * 规则）。本页不重算统计：结论随文件附带时，出处面板展示导出时服务端按封存的输入复算的结论（工件条目上的 recheck）。
+ * 口径卡指标上的可比性结论不进台账、只从卡上引用：④ 按「已核对的口径卡记着的可比性」认它，指标的数字详情里展示它。
  * 报告文档带着系统写的「分析范围」（analysis_scope）的，正文后面照它渲染，编号点得开那条结论。
  * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、检索快照这类工件标着
  * 遮罩）一律算不通过：只可能是文件被改过。报告文档的证据目录里写着取自遮罩列的指标的值时，服务端只给它的哈希
@@ -67,7 +68,8 @@
     'node.failed': '节点失败', 'node.skipped': '节点跳过', 'edge.taken': '分支走向', 'llm.start': '模型调用开始',
     'llm.end': '模型调用结束', 'llm.thinking': '模型思考', 'tool.start': '工具调用', 'tool.end': '工具返回',
     'tool.error': '工具出错', 'tool.gated': '门控判定', 'retrieve.end': '知识检索', 'memory.end': '记忆读写',
-    'merge.end': '合并查询', 'sandbox.start': '沙箱开始', 'sandbox.end': '沙箱结束', 'agent.step.start': 'Agent 步骤开始',
+    'merge.end': '合并查询', 'analysis.end': '分析卡的一项',
+    'sandbox.start': '沙箱开始', 'sandbox.end': '沙箱结束', 'agent.step.start': 'Agent 步骤开始',
     'agent.step.end': 'Agent 步骤结束', 'agent.route.start': '调度决策开始', 'agent.route.end': '调度决策结束',
     'human.requested': '请求人工审批', 'human.resolved': '人工审批结果', 'approval.inquiry': '审批质询',
     'issuance': '出具判定', 'caliber.upgrade': '口径卡升版处置', 'catalog.drift': '数据目录变化',
@@ -259,6 +261,11 @@
     recheckBy: '导出时服务端按封存的输入复算的结论；本页只核哈希，不在浏览器里重算统计',
     recheckNone: '导出时没有复算（结论未随文件附带）',
     analysisInput: (role, alias) => `${role}${alias ? ` · ${alias}` : ''}`,
+    // 分析结论输入的角色（analysis.contract.AnalysisInput.role），同证据面板的叫法
+    roleLabel: { data: '数据', base: '基期', target: '本期', headline_base: '基期总数', headline_target: '本期总数',
+      parent: '上一层拆解' },
+    dComparability: '两期可比性', comparabilityLabel: { comparable: '两期可比', conditional: '两期有条件可比', incomparable: '两期不可比' },
+    dJudged: '判定', dChecks: '各项检查', comparabilityNotAttached: '可比性结论未随文件附带（见核对明细 ③ ④），这里按口径卡的记录展示',
     scopeTitle: '分析范围', scopeNote: '这一段由系统按这次运行的分析结论写成，写作者改不了；点开编号看判定语、判定标准、输入和复算。',
     scopeMissing: '没拆', scopeAll: '候选维度都拆过了', scopeUnknown: '候选维度核对不了', scopeTests: '检验',
     scopeTestsText: (n) => `这次做了 ${n} 次差异检验`, scopeParent: (alias) => `下钻自 ${alias}`, scopeDims: (dims) => `按${dims}`,
@@ -1378,6 +1385,13 @@
           }
         }
       }
+      // 指标上的可比性结论不进台账、只从卡上引用（卡记着它的 sha256）：已核对的卡记着的，同卡的输入一样认
+      for (const metric of Array.isArray(item.json.metrics) ? item.json.metrics : []) {
+        const c = isObj(metric) && isObj(metric.comparability) ? metric.comparability : null
+        if (c && typeof c.artifact === 'string' && c.artifact) {
+          push(byCard, c.artifact, { card: item, metric: metric.id })
+        }
+      }
     }
     // 已核对的分析结论记着的输入 → 输入快照、下钻的上一层结论。同口径卡：结论本身核过哈希，它记的输入和文档的证据目录
     // 同一个分量；没核对过的（哈希对不上）不认
@@ -1958,11 +1972,48 @@
       }
       parts.push(kv([[T.dRecompute, metric.recompute_ok == null ? T.recomputeNone
         : metric.recompute_ok ? T.recomputeOk : T.recomputeBad]]))
+      if (isObj(metric.comparability)) parts.push(...comparabilityBlock(metric.comparability))
     }
     const snap = number.snapshot
     if (snap) parts.push(...snapshotBlock(snap, number.row, number.column,
       view.out.artifacts.find((a) => a.a.id === number.artifact)))
     if (number.analysis || number.kind === 'analysis') parts.push(...analysisBlock(number))
+    return parts
+  }
+
+  /** 口径卡指标上的可比性（口径卡执行时自动做的可比性检查）：卡上记的判定和原因；那份结论随文件附带、核对通过的，再给
+   *  判定标准、方法与版本、各项检查和导出时服务端的复算。没附带的照卡上的记录写，说明为什么没有更多 */
+  function comparabilityBlock(c) {
+    const why = Array.isArray(c.reasons) && c.reasons.length ? `：${c.reasons.map(String).join('；')}` : ''
+    const label = own(T.comparabilityLabel, c.verdict) || String(c.phrase || '—')
+    const artifact = typeof c.artifact === 'string' && c.artifact ? c.artifact : null
+    const art = artifact ? view.out.arts.get(artifact) : null
+    const ok = art && art.result === PASS && view.out.chained && view.out.chained.has(artifact)
+    const result = ok && isObj(art.json) ? art.json : null
+    const parts = [h('p', { class: 'sub' }, T.dComparability), kv([
+      [T.dJudged, `${label}${c.verdict === 'comparable' ? '' : why}`],
+      artifact ? [T.dArtifact, [h('code', {}, short(artifact)), artifactState(artifact)]] : null,
+    ])]
+    if (!result) {
+      if (artifact) parts.push(h('p', { class: 'note' }, T.comparabilityNotAttached))
+      return parts
+    }
+    parts.push(kv([
+      result.criterion ? [T.dCriterion, String(result.criterion)] : null,
+      [T.dMethod, String(result.method || '—')],
+    ]))
+    const table = isObj(result.table) ? result.table : null
+    const columns = table && Array.isArray(table.columns) ? table.columns.map(String) : []
+    const labels = table && isObj(table.labels) ? table.labels : {}
+    if (columns.length && Array.isArray(table.rows) && table.rows.length) {
+      parts.push(h('p', { class: 'sub' }, T.dChecks), h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, columns.map((col) => h('th', {}, String(own(labels, col) || col))))),
+        h('tbody', {}, table.rows.filter(Array.isArray).map((row) => h('tr', {},
+          columns.map((_, i) => h('td', {}, row[i] == null ? '—' : textOf(row[i])))))))))
+    }
+    const recheck = isObj(art.a.recheck) ? art.a.recheck : null
+    parts.push(kv([[T.dRecheck, recheck
+      ? [String(recheck.text || '—'), h('span', { class: 'muted' }, `（${T.recheckBy}）`)] : T.recheckNone]]))
     return parts
   }
 
@@ -1987,7 +2038,8 @@
       const inputs = (Array.isArray(result.inputs) ? result.inputs : []).filter((i) => isObj(i) && typeof i.artifact === 'string')
       if (inputs.length) {
         parts.push(h('p', { class: 'sub' }, T.dAnalysisInputs), h('ul', { class: 'items' }, inputs.map((i) => h('li', {},
-          h('span', { class: 'what' }, [T.analysisInput(String(i.role || ''), view.out.queryAliases.get(i.artifact)), ' ',
+          h('span', { class: 'what' }, [T.analysisInput(own(T.roleLabel, i.role) || String(i.role || ''),
+            view.out.queryAliases.get(i.artifact)), ' ',
             h('code', {}, short(i.artifact))]), artifactState(i.artifact)))))
       }
     }

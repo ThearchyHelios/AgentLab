@@ -19,8 +19,8 @@ from httpx import ASGITransport, AsyncClient
 import app.bundle
 import app.report_export
 from app.main import app as asgi
-from tests.test_analysis_bundle import bundle_of
-from tests.test_analysis_evidence_api import SCOPE, TEXT, sealed_run, seg_id
+from tests.test_analysis_bundle import bundle_of, card_bundle
+from tests.test_analysis_evidence_api import LAST_WEEK, SCOPE, TEXT, THIS_WEEK, comparability_card, sealed_run, seg_id
 
 NODE = shutil.which("node")
 pytestmark = pytest.mark.skipif(NODE is None, reason="没有 node，无法执行页面上的脚本")
@@ -129,15 +129,27 @@ async def test_the_export_page_opens_the_analysis_steps_and_the_scope_numbers():
     segs = [{"seg": phrase, "kind": "analysis", "state": "deterministic", "text": made["result"]["phrase"]},
             {"seg": cell, "kind": "number", "state": "deterministic", "text": "-120"},
             {"seg": "scope:A1", "kind": "analysis", "state": "deterministic", "text": "A1"}]
-    out = run_node(RUN_RUNTIME, RUNTIME, {"data": json.loads(json.dumps(data)), "segs": segs})
+    # 现查结果的三种写法：按运行当天现算的界、一列一个值都没有、表的范围（结论里的 probes 原样交给页面）
+    parsed = json.loads(data)
+    method = next(s for s in parsed["chains"][parsed["refs"][phrase]] if s["step"] == "analysis_method")
+    method["probes"] = [
+        {"source": "shop", "expr": "date('now', '-7 days')", "value": "2026-10-14", "basis": "live",
+         "at": "2026-10-21T09:00:00"},
+        {"source": "shop", "table": "orders", "column": "refund_date", "min": None, "max": None, "basis": "live",
+         "at": "2026-10-21T09:00:00"},
+        {"source": "shop", "table": "orders", "column": "order_date", "min": "2025-01-01", "max": "2026-10-20",
+         "basis": "profile", "at": "2026-10-21T09:00:00"}]
+    out = run_node(RUN_RUNTIME, RUNTIME, {"data": json.dumps(parsed, ensure_ascii=False), "segs": segs})
     opened = out[phrase]
     assert opened["steps"] == ["analysis", "analysis_method", "analysis_calc", "analysis_input", "query",
                                "analysis_recompute", "analysis_seal"]
     assert opened["title"].startswith("判定「销售额下降")
     body = opened["body"]
-    for text in ("判定标准一段占总变化一半以上算主要来源", "Agent 写的假设地区拖累", "实际用的阈值", "「主要来源」的占比",
-                 "华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷ -194 = 61.9%", "结果表（列出 4 行，共 4 行）",
-                 "复算失败：系统里还没有这种分析的复算实现", "封存范围内的台账记过这份分析结论"):
+    for text in ("判定标准一段占总变化的一半以上算主要来源", "Agent 写的假设华东拖累", "实际用的阈值", "「主要来源」的占比",
+                 "华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷ （-194） = 61.9%", "结果表（列出 4 行，共 4 行）",
+                 "复算一致：按封存的输入重新计算，结论逐项相同", "封存范围内的台账记过这份分析结论",
+                 "按运行当天现算的界 date('now', '-7 days') = 2026-10-14（现查 · 2026-10-21T09:00:00）",
+                 "orders.refund_date：这一列一个值都没有（现查", "orders.order_date：2025-01-01 至 2026-10-20（剖析"):
         assert text in body, text
     assert "结果表第 1 行「delta」" in out[cell]["body"]
     assert out["scope:A1"]["steps"] == opened["steps"]
@@ -151,10 +163,40 @@ async def test_the_bundle_page_shows_the_analysis_detail_and_the_scope():
     assert scope.startswith("分析范围") and "现象A1：销售额下降" in scope and "拆过A1（按地区）：主要来自华东" in scope
     assert "没拆渠道" in scope and "这次做了 2 次差异检验" in scope
     phrase = next(text for text in out["opened"].values() if "出处分析结论 A1 的判定语" in text)
-    assert "核对结果✓ 通过" in phrase and "分析结论里的值「销售额下降 194 万" in phrase
-    assert "判定语销售额下降 194 万" in phrase and "方法与版本decompose.additive@1" in phrase
-    assert "复算失败：系统里还没有这种分析的复算实现（导出时服务端按封存的输入复算的结论；本页只核哈希" in phrase
+    assert "核对结果✓ 通过" in phrase and "分析结论里的值「销售额下降 194（-8.7%）" in phrase
+    assert "判定语销售额下降 194（-8.7%）" in phrase and "方法与版本decompose.additive@1" in phrase
+    assert "输入数据 · Q1" in phrase                       # 输入的角色写叫法，不写 data
+    assert "复算一致：按封存的输入重新计算，结论逐项相同（导出时服务端按封存的输入复算的结论；本页只核哈希" in phrase
     value = next(text for text in out["opened"].values() if "具名的数「top_share」" in text)
-    assert "引用的值0.6186" in value and "正文显示61.9%（与按显示规则渲染的结果一致）" in value
+    assert "引用的值0.618556701031" in value and "正文显示61.9%（与按显示规则渲染的结果一致）" in value
     scope_item = next(text for key, text in out["opened"].items() if key.endswith("|scope:A1"))
     assert "核对结果✓ 通过" in scope_item and "正文显示" not in scope_item
+
+
+async def test_the_export_page_opens_the_comparability_on_a_metric():
+    """口径卡指标上的可比性：指标那一步里写判定，点得开那份可比性结论（同分析结论的几步，收在一个可展开的块里）。"""
+    card, result = await comparability_card()
+    made = await sealed_run("环比 [[m:wow]]。", card=card, queries=[LAST_WEEK, THIS_WEEK])
+    async with AsyncClient(transport=ASGITransport(app=asgi), base_url="http://test") as client:
+        html = (await client.get(f"/api/runs/{made['run']}/report.html")).text
+    data = re.search(r'<script type="application/json" id="report-data">(.*?)</script>', html, re.S).group(1)
+    wow = seg_id(made["doc"], "m:wow")
+    out = run_node(RUN_RUNTIME, RUNTIME, {"data": data, "segs": [
+        {"seg": wow, "kind": "number", "state": "deterministic", "text": "-0.0874"}]})
+    opened = out[wow]
+    assert opened["steps"][:1] == ["metric"]
+    assert opened["steps"][opened["steps"].index("analysis"):] [:3] == ["analysis", "analysis_method", "analysis_calc"]
+    for text in ("两期可比性", "展开这份可比性结论", "可比性检查", "口径卡执行时自动做的可比性检查", result["phrase"],
+                 "同口径", "复算一致：按封存的输入重新计算，结论逐项相同", "记在口径卡的指标集里，随卡封存（不进台账）"):
+        assert text in opened["body"], text
+
+
+def test_the_bundle_page_shows_the_comparability_in_the_metric_detail():
+    bundle, _, _, _ = card_bundle()
+    out = run_node(RUN_VERIFIER, VERIFIER, {"data": json.dumps(bundle), "seal": bundle["meta"]["manifest_hash"]})
+    assert out["verified"] == ""
+    [detail] = out["opened"].values()
+    for text in ("两期可比性", "判定两期可比", "判定标准只差日期", "方法与版本comparable@1", "各项检查", "同口径",
+                 "复算一致：按封存的输入重新计算，结论逐项相同（导出时服务端按封存的输入复算的结论"):
+        assert text in detail, text
+

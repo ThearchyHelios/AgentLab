@@ -1,13 +1,14 @@
 """分析结论进证据链（第 1 波 W1-b）：证据接口、审计、报告导出。
 
 运行是直接落库的虚构封存运行（虚构零售库 shop）：一次查询（Q1）、一份按地区拆的分析结论（A1，分析卡或 Agent 做的），
-报告引用判定语、具名标量、结果表的格。算子第 1 波还没落地，复算按 monkeypatch 换。
+报告引用判定语、具名标量、结果表的格。结论用 app.analysis 真算（tests.test_analysis_evidence.analyzed），出处链里的复算是
+真的 recompute：按 sha256 取回封存的输入快照、下钻的上一层结论，逐字段比。只有要它出错、升版的几处用 monkeypatch。
 
 - 证据图：A1 条目带算子、判定；「派生自」的边 A1 → Q1
 - 片段接口：判定 → 方法 → 计算 → 输入（接查询步骤）→ 复算 → 封存；Agent 写的假设标出来；复算不了照实写，不让接口出错
 - 审计：分析判定、分析结论的叫法；分析说法核对的违规单列一行
 - 报告导出：数据块里有分析结论那几步；文档带「分析范围」的，正文后面渲染、编号点得开
-- 指标步骤带可比性
+- 指标步骤带可比性：口径卡指标上的可比性结论（不进台账）照卡上记的 sha256 取回，点得开（判定 → … → 复算 → 封存）
 """
 from __future__ import annotations
 
@@ -16,21 +17,22 @@ import io
 import json
 import re
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app import analysis
+from app.analysis import contract
 from app.analysis.contract import ARTIFACT_KIND, ledger_entry
-from app.analysis.testing import fake_result
 from app.core import artifact_store
 from app.core.artifact_store import manifest_hash
 from app.db.base import SessionLocal
 from app.db.models import Run, RunEvent
 from app.engine.evidence import build_catalog, compose_doc, iter_segments
 from app.main import app
-from tests.test_analysis_evidence import SNAPSHOT
+from tests.test_analysis_evidence import CHANNELS, SNAPSHOT, analyzed
 
 GRAPH = {"nodes": [{"id": n, "type": t, "data": {"label": label}} for n, t, label in [
     ("fetch", "tool", "按地区取数"), ("an", "agent", "分析"), ("card", "metrics", "周报口径"),
@@ -43,28 +45,38 @@ async def client():
         yield c
 
 
+def _query_entry(content: dict[str, Any], artifact: str) -> dict[str, Any]:
+    return {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": artifact, "tool": "db_query__shop",
+            "source": "shop", "columns": content["columns"], "rows": len(content["rows"]), "truncated": False}
+
+
 async def sealed_run(text: str, *, item: str | None = "drop", call_id: str | None = None,
                      result: dict[str, Any] | None = None, doc_extra: dict[str, Any] | None = None,
-                     card: dict[str, Any] | None = None) -> dict[str, Any]:
-    """落一次封存好的运行：查询快照、分析结论、（可选）口径卡、报告文档都按真实的工件写，事件按 runner 的算法封存。"""
+                     card: dict[str, Any] | None = None, queries: Sequence[dict[str, Any]] = (),
+                     parents: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+    """落一次封存好的运行：查询快照（SNAPSHOT，再加 queries）、分析结论（parents 在前，result 在后；result 缺省按 SNAPSHOT
+    真算一份按地区拆的可加拆解）、（可选）口径卡、报告文档都按真实的工件写，事件按 runner 的算法封存。"""
     run_id = uuid.uuid4().hex
     q = await artifact_store.put_json(SNAPSHOT, kind="query_snapshot", run_id=run_id, node_id="fetch")
-    res = result or fake_result(inputs=[{"ref": "Q2", "artifact": q, "role": "data",
-                                         "columns": ["region", "week", "gmv"], "rows": "all"}])
+    more = [await artifact_store.put_json(c, kind="query_snapshot", run_id=run_id, node_id="fetch") for c in queries]
+    res = result or await analyzed({"Q2": (SNAPSHOT, q)})
+    qentries = [_query_entry(SNAPSHOT, q), *(_query_entry(c, a) for c, a in zip(queries, more))]
+    aentries = []
+    for i, parent in enumerate(parents):
+        found = await artifact_store.put_json(parent, kind=ARTIFACT_KIND, run_id=run_id, node_id="an")
+        aentries.append(ledger_entry(parent, node_id="an", exec_no=1, artifact=found, item=f"up{i}"))
     a = await artifact_store.put_json(res, kind=ARTIFACT_KIND, run_id=run_id, node_id="an")
-    qentry = {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": q, "tool": "db_query__shop",
-              "source": "shop", "columns": SNAPSHOT["columns"], "rows": len(SNAPSHOT["rows"]), "truncated": False}
-    aentry = ledger_entry(res, node_id="an", exec_no=1, artifact=a, item=item, call_id=call_id)
+    aentries.append(ledger_entry(res, node_id="an", exec_no=1, artifact=a, item=item, call_id=call_id))
     nodes: dict[str, Any] = {}
     events: list[tuple[int, str, str | None, dict[str, Any]]] = [
-        (1, "run.started", None, {"input": {}}), (2, "node.finished", "fetch", {"evidence": [qentry]}),
-        (3, "node.finished", "an", {"evidence": [aentry]})]
+        (1, "run.started", None, {"input": {}}), (2, "node.finished", "fetch", {"evidence": qentries}),
+        (3, "node.finished", "an", {"evidence": aentries})]
     if card is not None:
         card_id = await artifact_store.put_json(card, kind="metric_set", run_id=run_id, node_id="card")
         nodes["card"] = {**card, "artifact": card_id}
         events.append((4, "node.finished", "card", {"evidence": [{"kind": "metric_set", "node_id": "card",
                                                                  "exec": 1, "artifact": card_id}]}))
-    catalog = build_catalog(nodes=nodes, ledger=[qentry, aentry])
+    catalog = build_catalog(nodes=nodes, ledger=[*qentries, *aentries])
     doc = compose_doc(text, catalog, node_id="write", run_id=run_id)
     doc.update(doc_extra or {})
     doc_id = await artifact_store.put_json(doc, kind="report_doc", run_id=run_id, node_id="write")
@@ -78,7 +90,7 @@ async def sealed_run(text: str, *, item: str | None = "drop", call_id: str | Non
         for s, etype, node, data in events:
             session.add(RunEvent(run_id=run_id, seq=s, type=etype, node_id=node, ts=float(s), data=data))
         await session.commit()
-    return {"run": run_id, "doc": doc, "query": q, "analysis": a, "result": res}
+    return {"run": run_id, "doc": doc, "query": q, "analysis": a, "result": res, "queries": more}
 
 
 def seg_id(doc: dict[str, Any], ref: str) -> str:
@@ -118,11 +130,13 @@ async def test_the_phrase_opens_judgment_method_calculation_inputs_recompute_and
     assert [s["step"] for s in chain] == ["analysis", "analysis_method", "analysis_calc", "analysis_input", "query",
                                          "analysis_recompute", "analysis_seal"]
     judged, method, calc, given, query, again, seal = chain
-    assert judged["phrase"] == made["result"]["phrase"] and judged["criterion"] == "一段占总变化一半以上算主要来源"
+    assert judged["phrase"] == made["result"]["phrase"] == "销售额下降 194（-8.7%），主要来自华东（-120，占 61.9%）"
+    assert judged["criterion"].startswith("一段占总变化的一半以上算主要来源")
     assert judged["verdict"] == {"code": "driver", "subjects": [["华东"]], "direction": "down"}
     assert judged["cited"] == {"what": "phrase"} and judged["render_ok"] is True and judged["eid_ok"] is True
     assert judged["origin"] == "card" and judged["item"] == "drop" and judged["label"] == "分析"
-    assert judged["hypothesis"] == "地区拖累" and judged["hypothesis_note"].startswith("Agent 写的假设")
+    assert judged["hypothesis"] == "华东拖累" and judged["hypothesis_note"].startswith("Agent 写的假设")
+    assert {c["code"] for c in judged["caveats"]} == {"measure_unlabeled", "headline_basis"}
     assert method["method"] == "decompose.additive@1" and method["method_label"] == "变化拆解（可加）"
     assert {s["key"]: s["label"] for s in method["settings"]}["main_share"] == "「主要来源」的占比"
     assert {s["key"] for s in method["settings"]} >= {"main_share", "concentration", "table_top_k"}
@@ -130,28 +144,30 @@ async def test_the_phrase_opens_judgment_method_calculation_inputs_recompute_and
     assert calc["table"]["columns"][0] == "region" and calc["table"]["labels"]["share"] == "占变化的比重"
     assert calc["table"]["total_rows"] == 4 and calc["table"]["rows"][0][:2] == ["华东", "820"]
     assert {f["label"]: f["text"] for f in calc["formulas"]}["占比"] == \
-        "华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷ -194 = 61.9%"
+        "华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷ （-194） = 61.9%"
     assert given == {"step": "analysis_input", "of": "A1", "ref": "Q2", "role": "data", "role_label": "数据",
                      "artifact": made["query"], "columns": ["region", "week", "gmv"], "rows": "all", "query": "Q1",
                      "node_id": "fetch", "sealed": True}
     assert query["alias"] == "Q1" and query["input_of"] == "A1" and query["total_rows"] == 8
     assert query["highlight"]["cols"] == ["region", "week", "gmv"]
-    assert again["status"] == "failed" and again["text"] == "复算失败：系统里还没有这种分析的复算实现"
+    # 真的复算：按 sha256 取回封存的输入快照，逐字段和封存的比
+    assert again == {"step": "analysis_recompute", "alias": "A1", "status": "same", "method": "decompose.additive@1",
+                     "text": "复算一致：按封存的输入重新计算，结论逐项相同"}
     assert seal["sealed"] is True and seal["ledger"] is True and seal["hash_ok"] is True
     assert body["seal"]["covered"] is True
     assert body["note"].startswith("判定语由系统按平台的方法算出判定")
     assert body["segment"]["kind"] == "analysis"
 
 
-async def test_named_values_and_result_cells_point_at_what_they_cite(client, monkeypatch):
-    monkeypatch.setattr(analysis, "recompute", lambda result, load, *, load_result=None: dict(result))
+async def test_named_values_and_result_cells_point_at_what_they_cite(client):
     made = await sealed_run(TEXT)
     value = (await client.get(
         f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1.top_share|pct')}")).json()
-    assert value["chain"][0]["cited"] == {"what": "value", "key": "top_share", "raw": "0.6186", "conv": "pct"}
+    assert value["chain"][0]["cited"] == {"what": "value", "key": "top_share", "raw": "0.618556701031", "conv": "pct"}
+    assert value["segment"]["text"] == "61.9%" and value["chain"][0]["render_ok"] is True
     calc = value["chain"][2]
     assert next(v for v in calc["values"] if v["key"] == "top_share") == {
-        "key": "top_share", "raw": "0.6186", "rendered": "0.6186", "cited": True}
+        "key": "top_share", "raw": "0.618556701031", "rendered": "0.618556701", "cited": True}
     assert value["chain"][-2]["text"] == "复算一致：按封存的输入重新计算，结论逐项相同"
     assert value["note"] == "这个数取自分析结论的具名的数，由系统按固定规则显示，未经模型转写"
 
@@ -163,20 +179,41 @@ async def test_named_values_and_result_cells_point_at_what_they_cite(client, mon
 
 
 async def test_the_recompute_gets_the_sealed_inputs_by_hash(client, monkeypatch):
+    """复算的 load 交工件原内容（不加出处、不改列的类型），只认封存范围内交回过的查询；别的一律当取不回。"""
     seen: dict[str, Any] = {}
+    real = analysis.recompute
 
     def recompute(result, load, *, load_result=None):
         seen["input"] = load(result["inputs"][0]["artifact"])
         seen["missing"] = load("0" * 64)
-        return {**result, "method": "decompose.additive@2"}
+        return real(result, load, load_result=load_result)
 
     monkeypatch.setattr(analysis, "recompute", recompute)
     made = await sealed_run(TEXT)
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
     again = next(s for s in body["chain"] if s["step"] == "analysis_recompute")
-    assert again["text"] == "运行时用的是 decompose.additive@1，现在是 decompose.additive@2，复算结果不同"
-    assert seen["input"]["rows"] == SNAPSHOT["rows"] and seen["input"]["node_id"] == "fetch"
-    assert seen["missing"] is None
+    assert again["status"] == "same" and seen["input"] == SNAPSHOT and seen["missing"] is None
+
+
+async def test_an_input_outside_the_sealed_scope_is_not_recomputed_from(client):
+    """结论记着的输入快照不是这次运行交回过的（台账里没有）：复算照实说取不回，不去工件库里捞。"""
+    stray = {**SNAPSHOT, "sql": SNAPSHOT["sql"] + " -- 另一次"}
+    s_id = await artifact_store.put_json(stray, kind="query_snapshot")
+    made = await sealed_run(TEXT, result=await analyzed({"Q2": (stray, s_id)}))
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
+    again = next(s for s in body["chain"] if s["step"] == "analysis_recompute")
+    assert again["status"] == "failed" and again["text"] == "复算失败：取不回 Q2 的查询快照"
+    given = next(s for s in body["chain"] if s["step"] == "analysis_input")
+    assert given["sealed"] is False and given["query"] is None
+
+
+async def test_an_upgraded_method_names_both_versions(client, monkeypatch):
+    made = await sealed_run(TEXT)
+    monkeypatch.setitem(contract.METHODS, ("decompose", "additive"), "decompose.additive@2")
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
+    again = next(s for s in body["chain"] if s["step"] == "analysis_recompute")
+    assert again["method"] == "decompose.additive@1" and again["method_now"] == "decompose.additive@2"
+    assert again["text"] == "运行时用的是 decompose.additive@1，现在是 decompose.additive@2，复算结果相同"
 
 
 async def test_recompute_errors_do_not_break_the_panel(client, monkeypatch):
@@ -194,7 +231,8 @@ async def test_recompute_errors_do_not_break_the_panel(client, monkeypatch):
 async def test_a_tampered_result_is_said_and_not_shown(client):
     # 工件按内容寻址：改的是这一次独有的那份结论（别的测试的结论内容相同、是同一个文件）
     q = await artifact_store.put_json(SNAPSHOT, kind="query_snapshot")
-    own = fake_result(inputs=[{"ref": "Q2", "artifact": q, "role": "data"}], criterion=f"只给这一次：{uuid.uuid4().hex}")
+    own = await analyzed({"Q2": (SNAPSHOT, q)}, hypothesis=f"只给这一次：{uuid.uuid4().hex}")
+    assert own["hypothesis"].startswith("只给这一次：")
     made = await sealed_run(TEXT, result=own)
     path = artifact_store._path_of(made["analysis"])
     path.write_text(path.read_text("utf-8").replace("华东", "华南"), "utf-8")
@@ -210,27 +248,97 @@ async def test_agent_analyses_are_marked_as_such(client):
     assert body["chain"][0]["origin"] == "agent" and body["chain"][0]["call_id"] == "call-9"
 
 
-async def test_headline_inputs_show_the_closure_and_drill_downs_the_parent(client):
-    base = fake_result()
-    made = await sealed_run(TEXT)
-    q, a = made["query"], made["analysis"]
-    child = fake_result(inputs=[{"ref": "Q2", "artifact": q, "role": "data", "columns": ["region", "gmv"],
-                                 "rows": [0, 1]},
-                                {"ref": "Q2.r1.gmv", "artifact": q, "role": "headline_target", "row": 1,
-                                 "column": "gmv", "value": "2026"},
-                                {"ref": "A3", "artifact": a, "role": "parent"}],
-                        values={**base["values"], "target_total": "2026"})
-    drilled = await sealed_run("[[a:A1]]。", result=child)
-    body = (await client.get(f"/api/runs/{drilled['run']}/evidence/segments/{seg_id(drilled['doc'], 'a:A1')}")).json()
+async def test_headline_inputs_show_the_closure(client):
+    """给了总数（headline）的拆解：两格各是一份输入，和结论里的总数闭合；复算照样按 sha256 取回两份快照。"""
+    totals = {"columns": ["gmv_base", "gmv"], "column_types": {"gmv_base": "number", "gmv": "number"},
+              "rows": [[2220, 2026]], "sql": "SELECT 2220 AS gmv_base, 2026 AS gmv", "source": "shop",
+              "truncated": False}
+    t = artifact_store.content_hash(artifact_store.canonical_json(totals))
+    q = artifact_store.content_hash(artifact_store.canonical_json(SNAPSHOT))
+    result = await analyzed({"Q2": (SNAPSHOT, q), "Q5": (totals, t)}, headline=["Q5.r0.gmv_base", "Q5.r0.gmv"])
+    made = await sealed_run("[[a:A1]]。", result=result, queries=[totals])
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
     inputs = [s for s in body["chain"] if s["step"] == "analysis_input"]
-    assert [s["role"] for s in inputs] == ["data", "headline_target", "parent"]
+    assert [s["role"] for s in inputs] == ["headline_base", "headline_target", "data"]
+    assert inputs[0]["closure"] == {"total_key": "base_total", "total": "2,220", "headline": "2,220", "closed": True}
     assert inputs[1]["closure"] == {"total_key": "target_total", "total": "2,026", "headline": "2,026", "closed": True}
-    assert inputs[2]["phrase"] == base["phrase"] and inputs[2]["role_label"] == "上一层拆解"
-    query = next(s for s in body["chain"] if s["step"] == "query")
-    assert [0, "region"] in query["highlight"]["cells"] and [1, "gmv"] in query["highlight"]["cells"]
+    assert inputs[1]["query"] == "Q2" and inputs[1]["sealed"] is True and inputs[2]["query"] == "Q1"
+    assert next(s for s in body["chain"] if s["step"] == "analysis_recompute")["status"] == "same"
 
 
-async def test_the_metric_step_shows_the_comparability(client):
+async def test_a_drill_down_points_at_its_parent_and_recomputes_from_it(client):
+    """下钻（华东按渠道再拆）：输入里有上一层结论（parent），落到报告目录的 A1；复算按 sha256 取回台账记过的上一层。"""
+    q = artifact_store.content_hash(artifact_store.canonical_json(SNAPSHOT))
+    c = artifact_store.content_hash(artifact_store.canonical_json(CHANNELS))
+    top = await analyzed({"Q2": (SNAPSHOT, q)})
+    child = await analyzed({"Q3": (CHANNELS, c)}, parents={"A1": top}, query="Q3", by=["channel"],
+                           parent={"of": "A1", "key": ["华东"]})
+    made = await sealed_run("[[a:A2]]。", result=child, parents=[top], queries=[CHANNELS])
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A2')}")).json()
+    inputs = [s for s in body["chain"] if s["step"] == "analysis_input"]
+    assert [s["role"] for s in inputs] == ["parent", "data"]
+    assert inputs[0]["alias"] == "A1" and inputs[0]["phrase"] == top["phrase"] and inputs[0]["sealed"] is True
+    assert inputs[0]["role_label"] == "上一层拆解" and inputs[1]["query"] == "Q2"
+    again = next(s for s in body["chain"] if s["step"] == "analysis_recompute")
+    assert again["status"] == "same", again
+    graph = (await client.get(f"/api/runs/{made['run']}/evidence")).json()
+    edges = {(e["from"], e["to"], e["rel"]) for e in graph["edges"]}
+    assert {("A2", "A1", "derived_from"), ("A2", "Q2", "derived_from"), ("A1", "Q1", "derived_from")} <= edges
+
+
+#: 本周、上周两份同形查询（只差日期）：口径卡跨这两份算环比时自动做可比性检查
+WINDOW = "SELECT SUM(gmv) AS gmv FROM orders WHERE order_date >= '{a}' AND order_date < '{b}'"
+LAST_WEEK = {"columns": ["gmv"], "column_types": {"gmv": "number"}, "rows": [[2220]],
+             "sql": WINDOW.format(a="2026-10-05", b="2026-10-12"), "source": "shop", "truncated": False}
+THIS_WEEK = {**LAST_WEEK, "rows": [[2026]], "sql": WINDOW.format(a="2026-10-12", b="2026-10-19")}
+
+
+async def comparability_card() -> tuple[dict[str, Any], dict[str, Any]]:
+    """一张跨两周算环比的口径卡，指标上记着口径卡执行时自动做的可比性检查（结论落成工件，不进台账）：(卡, 可比性结论)。"""
+    last = artifact_store.content_hash(artifact_store.canonical_json(LAST_WEEK))
+    this = artifact_store.content_hash(artifact_store.canonical_json(THIS_WEEK))
+    result = await analyzed({"fetch·base": (LAST_WEEK, last), "fetch·target": (THIS_WEEK, this)},
+                            {"op": "comparable", "mode": None, "params": {}},
+                            base_query="fetch·base", target_query="fetch·target")
+    found = await artifact_store.put_json(result, kind=ARTIFACT_KIND, node_id="card")
+    verdict = result["verdict"]["code"]
+    card = {"kind": "metric_set", "caliber": "周报口径", "caliber_version": "v1", "metrics": [
+        {"id": "wow", "name": "环比", "value": -0.0874, "unit": "",
+         "expression": "cell(nodes.fetch, 0, 'gmv') / cell(nodes.fetch, 0, 'gmv') - 1",
+         "substituted": "2026 / 2220 - 1", "recompute_ok": True,
+         "inputs": [{"path": "cell(nodes.fetch, 0, 'gmv')", "value": 2026, "node_id": "fetch", "via": "tool_cell",
+                     "artifact": this, "locator": {"row": 0, "column": "gmv"}},
+                    {"path": "cell(nodes.fetch, 0, 'gmv')", "value": 2220, "node_id": "fetch", "via": "tool_cell",
+                     "artifact": last, "locator": {"row": 0, "column": "gmv"}}],
+         "comparability": {"artifact": found, "verdict": verdict, "phrase": result["phrase"], "reasons": []}}]}
+    return card, result
+
+
+async def test_the_metric_step_opens_the_comparability_result(client):
+    """可比性结论不进台账、只从口径卡的指标集里引用：照卡上记的 sha256 取回，随卡封存；点得开它的整条出处链，复算是真的。"""
+    card, result = await comparability_card()
+    made = await sealed_run("环比 [[m:wow]]。", card=card, queries=[LAST_WEEK, THIS_WEEK])
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'm:wow')}")).json()
+    view = body["chain"][0]["comparability"]
+    assert view["verdict"] == result["verdict"]["code"] and view["phrase"] == result["phrase"]
+    assert view["sealed"] is True and view["hash_ok"] is True and view["method"] == "comparable@1"
+    steps = view["steps"]
+    assert [s["step"] for s in steps] == ["analysis", "analysis_method", "analysis_calc", "analysis_input",
+                                          "analysis_input", "analysis_recompute", "analysis_seal"]
+    judged, method, calc, base, target, again, seal = steps
+    assert judged["origin"] == "metric" and judged["cited"] == {"what": "phrase"} and judged["render_ok"] is True
+    assert judged["method_label"] == "可比性检查" and judged["node_id"] == "card"
+    assert [r[0] for r in calc["table"]["rows"]] == ["同口径", "窗口长度", "整期", "星期构成", "数据问题"]
+    assert (base["role"], target["role"]) == ("base", "target")
+    assert base["query"] == "Q2" and target["query"] == "Q3" and base["sealed"] is True
+    assert again["status"] == "same" and again["text"] == "复算一致：按封存的输入重新计算，结论逐项相同"
+    assert seal["via"] == "metric_set" and seal["ledger"] is False and seal["sealed"] is True
+    assert seal["note"].startswith("这份可比性结论不进台账")
+    # 两份输入快照的查询步骤在指标链里（指标的输入就是这两份），可比性的链里不再给
+    assert [s["step"] for s in body["chain"]].count("query") == 2 and "query" not in [s["step"] for s in steps]
+
+
+async def test_a_card_without_the_comparability_artifact_says_only_what_it_recorded(client):
     card = {"kind": "metric_set", "caliber": "周报口径", "caliber_version": "v1", "metrics": [
         {"id": "wow", "name": "环比", "value": -0.087, "unit": "", "expression": "1", "inputs": [],
          "comparability": {"artifact": "", "verdict": "incomparable", "phrase": "两期不可比：本期只有 3 天数据",
@@ -240,6 +348,15 @@ async def test_the_metric_step_shows_the_comparability(client):
     assert body["chain"][0]["comparability"] == {
         "verdict": "incomparable", "phrase": "两期不可比：本期只有 3 天数据", "reasons": ["本期只有 3 天数据"],
         "artifact": None, "hash_ok": None, "sealed": False}
+
+
+async def test_the_app_metric_endpoint_opens_the_comparability_too(client):
+    card, _ = await comparability_card()
+    made = await sealed_run("环比 [[m:wow]]。", card=card, queries=[LAST_WEEK, THIS_WEEK])
+    body = (await client.get(f"/api/runs/{made['run']}/evidence/metrics/card/wow")).json()
+    view = body["chain"][0]["comparability"]
+    assert view["sealed"] is True and view["steps"][-2]["status"] == "same"
+    assert [s["query"] for s in view["steps"] if s["step"] == "analysis_input"] == [None, None]
 
 
 # --------------------------------------------------------------------------
@@ -286,7 +403,7 @@ def test_audit_labels_cover_the_new_violation_codes():
 # --------------------------------------------------------------------------
 
 SCOPE = {"analysis_scope": {
-    "phenomena": [{"alias": "A1", "op": "decompose", "phrase": "销售额下降 194 万（-8.7%），主要来自华东（-120 万，占 62%）"}],
+    "phenomena": [{"alias": "A1", "op": "decompose", "phrase": "销售额下降 194（-8.7%），主要来自华东（-120，占 61.9%）"}],
     "decomposed": [{"alias": "A1", "op": "decompose", "mode": "additive", "dims": ["地区"], "verdict": "driver",
                     "phrase": "主要来自华东"}],
     "excluded": [], "refused": [{"alias": "A1", "op": "baseline", "reason": "历史只有 5 期，至少要 8 期"}],

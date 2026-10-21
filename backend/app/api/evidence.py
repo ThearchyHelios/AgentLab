@@ -113,7 +113,6 @@ from app.engine.evidence import (
     RenderError,
     analysis_card,
     analysis_formulas,
-    analysis_input_snapshot,
     analysis_recheck,
     build_catalog,
     closest_entities,
@@ -987,6 +986,11 @@ HYPOTHESIS_NOTE = "Agent 写的假设：说明这次在验证什么，不是分�
 UNSEALED_ANALYSIS = "这份分析结论不属于封存范围内的任何事件（封存前的台账里没有它），不能作为证据展示"
 TAMPERED_ANALYSIS = "分析结论与哈希不一致，疑似被修改，不展示其中的判定和数"
 MISSING_ANALYSIS = "无法读取分析结论"
+#: 口径卡指标上的可比性结论不进台账（00-总方案 §3.4）：它记在封存过的口径卡指标集里，卡上记着它的 sha256，属于封存链的
+#: 延伸（同推演认 value_artifact）。指标那一步没封存的，这份结论也不算封存
+COMPARABILITY_CHAINED = ("这份可比性结论不进台账：口径卡执行时自动做的，记在封存过的口径卡指标集里（卡上记着它的 sha256），"
+                         "随卡一起封存")
+UNSEALED_COMPARABILITY = "这份可比性结论记在口径卡上，可这张卡的指标集不在封存范围内，不能作为证据展示"
 #: 每个算子用到的阈值（细案 01 §10「用在」一栏）：方法一步只列这几个，判定标准照它们写
 _OP_SETTINGS: dict[str, tuple[str, ...]] = {
     "decompose": ("main_share", "concentration", "offset_ratio", "flat_pct", "min_denominator", "max_drill_depth",
@@ -1051,7 +1055,8 @@ def _analysis_rendered(cite: dict[str, Any], result: dict[str, Any]) -> str | No
 
 
 async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any], doc: dict[str, Any],
-                          sealed: _Sealed, masks: _Masks) -> list[dict[str, Any]]:
+                          sealed: _Sealed, masks: _Masks, *, chained: bool | None = None,
+                          queries: bool = True) -> list[dict[str, Any]]:
     """分析结论的出处链（00-总方案 §3.3）：判定 → 方法 → 计算 → 输入 → 复算 → 封存。
 
     - 判定（analysis）：判定语、判定标准、判定码和点名的段、附带说明、算不了的原因，这一处引用的是哪一项（判定语、具名标量、
@@ -1064,19 +1069,24 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
     - 复算（analysis_recompute）：按 sha256 取回封存的输入、用同一个函数复算，和封存的逐字段比（evidence.analysis_recheck）；
       方法升过版、复算不了都照实写
     - 封存（analysis_seal）：这件工件是不是封存范围内的台账记过的、哈希复验通过
-    结论取不回、哈希不符的只给判定和封存两步，照实说为什么。"""
+    结论取不回、哈希不符的只给判定和封存两步，照实说为什么。
+
+    口径卡指标上的可比性结论（_comparability_view）不进台账：chained 是那个指标的一步封存了没有（卡上记着这份结论的 sha256，
+    属于封存链的延伸），封存一步照它认；谁做的写口径卡（origin metric）。queries 为假时不接输入快照的查询步骤（可比性的
+    两份输入就是指标输入的那两份，指标链里已经有了）。"""
     catalog = doc.get("catalog") or {}
     alias = str(cite.get("alias") or entry.get("alias") or "")
     artifact = str(entry.get("artifact") or "")
     result, hash_ok = _analysis_of(artifact)
     info = sealed.analyses.get(artifact)
-    in_ledger = sealed.trusted and (str(entry.get("node_id") or ""), artifact) in sealed.ledger
+    in_ledger = sealed.trusted and (str(entry.get("node_id") or ""), artifact) in sealed.ledger \
+        if chained is None else sealed.trusted and chained
     eid = make_eid(LEDGER_KIND, artifact or None, {})
     rendered = _analysis_rendered(cite, result) if result is not None else None
     judged: dict[str, Any] = {
         "step": "analysis", "alias": alias, "op": entry.get("op"), "mode": entry.get("mode"),
         "method_label": method_label(entry.get("op"), entry.get("mode")),
-        "origin": "card" if analysis_card(entry) else "agent",
+        "origin": "metric" if chained is not None else "card" if analysis_card(entry) else "agent",
         **{k: entry[k] for k in ("item", "call_id") if entry.get(k)},
         "node_id": entry.get("node_id"), "label": _node_label(sealed, entry.get("node_id")) or None,
         "artifact": artifact or None, "eid": entry.get("eid"), "eid_ok": entry.get("eid") == eid,
@@ -1086,7 +1096,10 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
     seal = {"step": "analysis_seal", "alias": alias, "node_id": entry.get("node_id"), "artifact": artifact or None,
             "ledger": info is not None, "hash_ok": hash_ok, "eid_ok": judged["eid_ok"],
             "sealed": in_ledger and hash_ok is True and judged["eid_ok"]}
-    if info is None:
+    if chained is not None:
+        # 封存的路子是口径卡的指标集（卡上记着这份结论的 sha256），不是台账
+        seal.update(via="metric_set", note=COMPARABILITY_CHAINED if chained else UNSEALED_COMPARABILITY)
+    elif info is None:
         seal["note"] = UNSEALED_ANALYSIS
     if result is None:
         judged["note"] = TAMPERED_ANALYSIS if hash_ok is False else MISSING_ANALYSIS
@@ -1106,12 +1119,12 @@ async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict
                      for k in _OP_SETTINGS.get(str(result.get("op")), ()) if k in settings],
         "probes": [p for p in result.get("probes") or [] if isinstance(p, dict)],
     }
-    inputs, queries = await _analysis_inputs(alias, result, catalog, doc, sealed, masks)
-    hidden = {str(c).lower() for q in queries for c in q.get("masked") or []}
+    inputs, steps = await _analysis_inputs(alias, result, catalog, doc, sealed, masks, queries=queries)
+    hidden = {str(c).lower() for q in steps for c in q.get("masked") or []}
     calc = _analysis_calc(alias, result, judged["cited"], hidden)
     again = await _analysis_recheck(result, sealed)
     recheck = {"step": "analysis_recompute", "alias": alias, **again}
-    return [judged, method, calc, *inputs, *queries, recheck, seal]
+    return [judged, method, calc, *inputs, *steps, recheck, seal]
 
 
 def _analysis_calc(alias: str, result: dict[str, Any], cited: dict[str, Any], hidden: set[str]) -> dict[str, Any]:
@@ -1154,10 +1167,11 @@ def _analysis_calc(alias: str, result: dict[str, Any], cited: dict[str, Any], hi
 
 
 async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str, Any], doc: dict[str, Any],
-                           sealed: _Sealed, masks: _Masks) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                           sealed: _Sealed, masks: _Masks, *, queries: bool = True
+                           ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """输入：每份一步（analysis_input），再给每份输入快照一个查询步骤（_query_steps，高亮用到的列；整份用到的给前
-    MAX_WINDOW_ROWS 行）。headline 的那一格另核对和结论里的总数闭不闭合（照实写判定是不是 unclosed，不在这里重算容差）；
-    下钻的上一层落到报告目录的哪个 A。"""
+    MAX_WINDOW_ROWS 行；queries 为假时不给）。headline 的那一格另核对和结论里的总数闭不闭合（照实写判定是不是
+    unclosed，不在这里重算容差）；下钻的上一层落到报告目录的哪个 A。"""
     values = result.get("values") if isinstance(result.get("values"), dict) else {}
     verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else {}
     unclosed = verdict.get("code") == "unclosed"
@@ -1198,37 +1212,35 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
                 rows = list(range(MAX_WINDOW_ROWS)) if picked == "all" else \
                     [r for r in picked if isinstance(r, int)][:MAX_WINDOW_ROWS] if isinstance(picked, list) else []
                 wanted.extend((r, column) for r in rows)
-    queries: list[dict[str, Any]] = []
-    for artifact, picked in cells.items():
+    found: list[dict[str, Any]] = []
+    for artifact, picked in cells.items() if queries else ():
         snap, _ = masks.fetch(artifact)
         total = len(snap["rows"]) if isinstance(snap, dict) and isinstance(snap.get("rows"), list) else 0
         picked = list(dict.fromkeys((r, c) for r, c in picked if not isinstance(r, int) or r < total))
         for sub in await _query_steps(artifact, picked, doc, sealed, masks):
-            queries.append({**sub, "input_of": alias})
-    return steps, queries
+            found.append({**sub, "input_of": alias})
+    return steps, found
 
 
 async def _analysis_recheck(result: dict[str, Any], sealed: _Sealed) -> dict[str, Any]:
-    """复算：按 sha256 取回封存范围内的输入快照（evidence.analysis_input_snapshot）和下钻的上一层结论，在线程里复算、比较
-    （evidence.analysis_recheck）。不在封存范围内的输入一律当取不回来。"""
-    snapshots: dict[str, Any] = {}
-    parents: dict[str, Any] = {}
-    for item in result.get("inputs") or []:
-        artifact = str((item or {}).get("artifact") or "") if isinstance(item, dict) else ""
-        if not artifact or artifact in snapshots or artifact in parents:
-            continue
-        if item.get("role") == "parent":
-            parents[artifact] = _analysis_of(artifact)[0] if artifact in sealed.analyses else None
-            continue
-        info = sealed.queries.get(artifact)
-        content, ok = _fetch(artifact) if info is not None else (None, None)
-        snapshots[artifact] = analysis_input_snapshot(content, artifact, ref=item.get("ref"),
-                                                      node_id=(info or {}).get("node_id")) if ok is True else None
+    """复算（evidence.analysis_recheck）：输入快照交工件原内容，下钻的上一层交那份结论，都按 sha256 取回、复验哈希，在线程里
+    复算、比较。只认封存范围内的——输入快照要是这次运行交回过的查询（sealed.queries），上一层要是台账记过的分析结论；
+    不在范围内、哈希对不上的一律当取不回（复算照实说取不回哪一份）。"""
+    snapshots = {str(i["artifact"]) for i in result.get("inputs") or []
+                 if isinstance(i, dict) and i.get("artifact") and i.get("role") != "parent"}
+    parents = {str(i["artifact"]) for i in result.get("inputs") or []
+               if isinstance(i, dict) and i.get("artifact") and i.get("role") == "parent"}
 
-    def run() -> dict[str, Any]:
-        return analysis_recheck(result, snapshots.get, load_result=parents.get)
+    def load(artifact: str) -> Any:
+        if artifact not in snapshots or artifact not in sealed.queries:
+            return None
+        content, ok = _fetch(artifact)
+        return content if ok is True else None
 
-    return await asyncio.to_thread(run)
+    def load_result(artifact: str) -> Any:
+        return _analysis_of(artifact)[0] if artifact in parents and artifact in sealed.analyses else None
+
+    return await asyncio.to_thread(analysis_recheck, result, load, load_result=load_result)
 
 
 def _missing_input(cite: dict[str, Any], entry: dict[str, Any]) -> bool:
@@ -1288,7 +1300,9 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     # 跨两份同形查询算的环比、同比：口径卡执行时自动做的可比性检查（analysis.contract.MetricComparability），点得开那份
     # 可比性结论（artifact）。没做过检查的指标没有这个键
     if isinstance((metric or {}).get("comparability"), dict):
-        step["comparability"] = _comparability_view(metric["comparability"], sealed, chained=step["sealed"])
+        step["comparability"] = await _comparability_view(
+            metric["comparability"], sealed, masks, chained=step["sealed"], node_id=str(entry.get("node_id") or ""),
+            doc=doc)
     card_node = str(entry.get("node_id") or "")
     if metric is not None and metric.get("inputs"):
         # 输入追没追到原始数据（engine/lineage.py）：和「有出处」（确定性复算一致）是两件事，面板分开说。追不到的照实说
@@ -1329,23 +1343,33 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     return [step, *inputs, *upstream, *queries]
 
 
-def _comparability_view(comparability: dict[str, Any], sealed: _Sealed, *, chained: bool) -> dict[str, Any]:
+async def _comparability_view(comparability: dict[str, Any], sealed: _Sealed, masks: _Masks, *, chained: bool,
+                              node_id: str, doc: dict[str, Any]) -> dict[str, Any]:
     """指标步骤里的可比性：判定（comparable / conditional / incomparable）、判定语、原因（一句一个），连同那份可比性结论的
-    工件：取回、复验哈希，带上它的判定标准、方法和现查的表范围（点得开）。sealed：哈希复验通过，而且它记在封存过的口径卡
-    指标集里（chained：指标步骤本身封存了；内容寻址，卡上记着它的 sha256）或者封存范围内的台账里。"""
+    工件：取回、复验哈希，带上它的判定标准、方法和现查结果，再给一条点得开的出处链（steps：判定 → 方法 → 计算 → 输入 →
+    复算 → 封存，同分析结论的引用，_analysis_chain；两份输入快照的查询步骤指标链里已经有了，不再给）。
+
+    这份结论不进台账，只从口径卡的指标集里引用：sealed 认的是哈希复验通过，而且记着它的指标集封存了（chained：指标步骤
+    本身封存了；内容寻址，卡上记着它的 sha256——同推演认 value_artifact），或者它恰好也在封存范围内的台账里。"""
     artifact = str(comparability.get("artifact") or "")
     result, hash_ok = _analysis_of(artifact)
+    scoped = sealed.trusted and bool(artifact) and (chained or artifact in sealed.analyses)
     view: dict[str, Any] = {
         "verdict": comparability.get("verdict"), "phrase": comparability.get("phrase"),
         "reasons": [str(r) for r in comparability.get("reasons") or [] if r], "artifact": artifact or None,
-        "hash_ok": hash_ok,
-        "sealed": sealed.trusted and hash_ok is True and (chained or artifact in sealed.analyses),
+        "hash_ok": hash_ok, "sealed": scoped and hash_ok is True,
     }
     if result is not None:
         view.update(method=result.get("method"), criterion=result.get("criterion"),
                     caveats=[{k: c.get(k) for k in ("code", "text")} for c in result.get("caveats") or []
                              if isinstance(c, dict)],
                     probes=[p for p in result.get("probes") or [] if isinstance(p, dict)])
+    if artifact:
+        entry = {"kind": LEDGER_KIND, "artifact": artifact, "node_id": node_id, "op": "comparable", "mode": None,
+                 "eid": make_eid(LEDGER_KIND, artifact, {})}
+        cite = {"kind": LEDGER_KIND, "alias": None, "locator": {}, "status": "resolved"}
+        view["steps"] = await _analysis_chain({"text": str(comparability.get("phrase") or "")}, cite, entry, doc,
+                                              sealed, masks, chained=scoped, queries=False)
     return view
 
 

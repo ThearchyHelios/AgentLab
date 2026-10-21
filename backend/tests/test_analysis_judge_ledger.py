@@ -97,3 +97,21 @@ def test_a_report_citing_only_analyses_has_nothing_to_label():
     assert ledger_labels.label_doc(doc, {}, {}, lambda _: None) == {}
     assert ledger_labels.referenced_columns([doc], lambda _: None) == {}
     assert ledger_labels.whole_of({}, {})["reason"] == "报告里没有可标口径的数"
+
+
+def test_the_judge_and_the_writer_see_the_comparability_of_a_metric():
+    """口径卡指标上的可比性（口径卡执行时自动做的检查）：裁判的摘录里原样给判定语；写作目录没记原因的照判定语写，不重复判定。"""
+    from app.core.artifact_store import canonical_json, content_hash
+    from app.engine.evidence import writer_catalog
+
+    card = {"kind": "metric_set", "caliber": "周报", "caliber_version": "v1", "metrics": [
+        {"id": "wow", "name": "环比", "value": -0.087, "unit": "", "expression": "1", "inputs": [],
+         "comparability": {"artifact": "d" * 64, "verdict": "incomparable", "phrase": "两期不可比：本期只有 3 天数据",
+                           "reasons": []}}]}
+    sha = content_hash(canonical_json(card))
+    catalog = build_catalog(nodes={"card": {**card, "artifact": sha}}, ledger=[])
+    assert "环比 = -0.087（两期不可比：本期只有 3 天数据。这个比较不能当结论" in writer_catalog(catalog).text
+    doc = compose_doc("环比 [[m:wow]]，需求走弱。", catalog)
+    request = judging.prepare(doc, catalog, loader={sha: card}.get)
+    [excerpt] = request.excerpts.values()
+    assert "两期可比性（系统检查）：两期不可比：本期只有 3 天数据" in excerpt

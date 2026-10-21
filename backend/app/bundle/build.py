@@ -27,6 +27,9 @@
   下钻的上一层结论；任一份输入快照只给 id（证明不了没碰遮罩列）的，结论本身也只给 id——结果表里的维度值取自输入快照，
   这份文件宁可多挡。浏览器只核哈希、核判定语和数是不是结论里写的那些，不在页面里重算统计：结论随文件附带时，服务端在
   导出时按封存的输入复算一遍（engine/evidence.analysis_recheck），结果记在这份工件的条目上（recheck），页面照它展示。
+  口径卡指标上的可比性结论（口径卡执行时自动做的，不进台账、只从卡上引用）随附带的卡一起附上，规则同上，引用链（④）
+  按「已核对的口径卡记着的可比性」认它。分析工具的 tool.end（预览里是结论的前一截）、分析卡一项的 analysis.end（带着
+  判定语）和结论本身同一个认法：结论随文件附带得了才带规范字符串。
 - 报告文档带着系统写的「分析范围」（analysis_scope）的，页面在正文后面照它渲染，编号点得开那条结论。
 - 封存之后追加的事件（按需裁判、审批质询这类批注）单列：类型、序号、内容摘要，不进清单。
 
@@ -63,7 +66,7 @@ from urllib.parse import quote
 from app.analysis.contract import ARTIFACT_KIND, LEDGER_KIND, NODE_TYPE as ANALYSIS_NODE, is_result
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.events import EventType
-from app.engine.evidence import analysis_input_snapshot, analysis_recheck, iter_units, query_entry_fields
+from app.engine.evidence import analysis_recheck, iter_units, query_entry_fields
 from app.engine.lineage import in_scope, scoped_id
 from app.engine.masking import OPAQUE_SQL, SYSTEM_SCHEMAS, indirect_reads
 from app.engine.merge_query import MERGE_SOURCE
@@ -93,6 +96,8 @@ _SHOWN_EVENTS = frozenset({EventType.RUN_STARTED, EventType.REPORT_CHECKED, Even
 _CITED_KINDS = {"metric": "metric_set", "query": "query", LEDGER_KIND: ARTIFACT_KIND}
 #: 下钻的上一层结论最多跟几层（同分析设置里下钻层数的上限）
 _PARENT_DEPTH = 6
+#: 分析卡里一项做完的事件（core/events.EventType.ANALYSIS_END）：带着那一项的判定、判定语和结论工件（analysis_artifact）
+_ANALYSIS_END = "analysis.end"
 
 #: 没挂在工作流上的运行（画布、问数据当场搭的）：老数据叫「临时图」，新的叫「未保存的工作流」，也可能是空的。
 #: 和前端 lib/terms.ts 的 runName 同一个规则
@@ -1066,6 +1071,17 @@ def _analysis_inputs(result: Any) -> list[tuple[str, str]]:
     return list(out.items())
 
 
+def _card_comparability(card: Any) -> list[str]:
+    """口径卡指标上记着的可比性结论（contract.MetricComparability 的 artifact），按先后、去重。这份结论不进台账，只从卡上
+    引用：卡随文件附带时一并附上，引用链（④）按「已核对的口径卡记着的可比性」认它。"""
+    out: list[str] = []
+    for metric in (card.get("metrics") or []) if isinstance(card, dict) else []:
+        found = metric.get("comparability") if isinstance(metric, dict) else None
+        if isinstance(found, dict) and isinstance(found.get("artifact"), str) and found["artifact"]:
+            out.append(found["artifact"])
+    return list(dict.fromkeys(out))
+
+
 def _card_input_queries(card: Any) -> list[tuple[str, str | None]]:
     """口径卡记着的输入引用的查询快照：(工件 id, 输入来自的节点)，按先后、按工件去重。
 
@@ -1169,7 +1185,7 @@ def _recheck(result: dict[str, Any], store: _Store) -> dict[str, Any]:
     """导出时服务端按封存的输入把这份分析结论复算一遍（engine/evidence.analysis_recheck，和证据面板同一个函数）：输入快照、
     上一层结论只认这份文件里哈希对得上的原字节。页面照这个结果写「导出时服务端的复算」，不在浏览器里重算统计。"""
     def load(artifact: str) -> Any:
-        return analysis_input_snapshot(store.content(artifact), artifact) if store.intact(artifact) else None
+        return store.content(artifact) if store.intact(artifact) else None
 
     def load_result(artifact: str) -> Any:
         content = store.content(artifact) if store.intact(artifact) else None
@@ -1209,8 +1225,22 @@ def _shows_content(etype: str, node_id: str | None, data: Any, node_types: Mappi
     if etype == EventType.TOOL_END:
         # 查询类：把查询快照的 id 和运行记录连起来。预览里是查询结果的前一截，数据源带遮罩的只给哈希
         artifact = data.get("query_artifact") if isinstance(data, dict) else None
-        return isinstance(artifact, str) and bool(artifact) and not store.masked(artifact)
+        if isinstance(artifact, str) and artifact:
+            return not store.masked(artifact)
+        # 分析工具：预览里是结论的前一截（判定语、具名的数、结果表），和结论本身同一个认法
+        found = data.get("analysis_artifact") if isinstance(data, dict) else None
+        return isinstance(found, str) and bool(found) and _result_shown(found, store)
+    if etype == _ANALYSIS_END:
+        # 分析卡的一项：带着判定、判定语，结论随文件附带得了（输入没碰遮罩列）才带
+        found = data.get("analysis_artifact") if isinstance(data, dict) else None
+        return isinstance(found, str) and bool(found) and _result_shown(found, store)
     return False
+
+
+def _result_shown(artifact: str, store: _Store) -> bool:
+    """一份分析结论的内容能不能出现在页面上（事件里带着它的判定语、预览）：文件在、认得出是分析结论、输入都没碰遮罩列
+    （_Store.analysis_masked）。和这份结论随文件附带时同一个认法。"""
+    return store.raw(artifact) is not None and not store.analysis_masked(artifact)
 
 
 def _card_shown(data: Any, store: _Store, masked_run: bool, events: Sequence[tuple[int, str, str | None, Any]],
@@ -1248,7 +1278,7 @@ def _analysis_shown(data: Any, store: _Store) -> bool:
     results = [str(e["artifact"]) for e in data.get("evidence") or []
                if isinstance(e, dict) and e.get("kind") == LEDGER_KIND and isinstance(e.get("artifact"), str)
                and e["artifact"]]
-    return bool(results) and all(store.raw(a) is not None and not store.analysis_masked(a) for a in results)
+    return bool(results) and all(_result_shown(a, store) for a in results)
 
 
 def _masked_cards(doc: dict[str, Any]) -> set[str]:
@@ -1420,6 +1450,11 @@ def build_bundle(
             if kind == "metric_set" and item is not None and "b64" in item and store.intact(artifact):
                 for query, query_owner in _card_input_queries(store.content(artifact)):
                     artifacts.add(query, "query", query_owner)
+                # 指标上的可比性结论（口径卡执行时自动做的，不进台账、只从卡上引用）同样附上：它的输入快照、服务端的复算
+                # 跟着它（_attach_analysis），输入带遮罩的照旧只给 id
+                for found in _card_comparability(store.content(artifact)):
+                    _attach_analysis(artifacts, store, artifacts.add(found, ARTIFACT_KIND, owner), found, owner,
+                                     cited_queries)
 
     masked_run = _masked_run(sealed, store, cited_queries, source_masks or {})
     shown_events = []

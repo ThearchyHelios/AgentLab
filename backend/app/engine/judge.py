@@ -575,6 +575,10 @@ def _metric_excerpt(alias: str, entry: dict[str, Any], fetch: _Fetch, catalog: d
         if metric.get("expression"):
             lines.append(f"原式：{_clean(str(metric['expression']))}")
         lines.extend(_metric_inputs(metric, fetch, catalog, masked, mask))
+        comparability = metric.get("comparability")
+        if isinstance(comparability, dict) and str(comparability.get("phrase") or "").strip():
+            # 跨两份同形查询算的环比、同比：口径卡执行时自动做的可比性检查（判定语是系统写的，原样给）
+            lines.append(f"两期可比性（系统检查）：{_clean(str(comparability['phrase']))}")
     return "\n".join(lines)
 
 

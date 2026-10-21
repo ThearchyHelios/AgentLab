@@ -8,23 +8,27 @@
 - 写作目录的「分析结论」一段：判定语、判定标准、具名的数、结果表前 table_top_k 段、附带说明、算不了的原因、来自哪几个 Q，
   放不下时结果表的各段排在查询的行前面补
 - 分析结论的输入查询上的 SQL 检查问题随 A 条目出现；口径卡指标上的可比性照实写进写作目录
-- 复算（analysis_recheck）、代入式（analysis_formulas）
+- 复算（analysis_recheck）、代入式（analysis_formulas）：用 app.analysis 真算的结论（run 交的输入照分析入口的写法，复算交
+  工件原内容），也用 fake_result 测目录和引用的写法
 """
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from typing import Any
 
 import pytest
 
 from app import analysis
-from app.analysis.contract import CallError, ledger_entry
+from app.analysis import contract
+from app.analysis.contract import CallError, effective_settings, ledger_entry
 from app.analysis.testing import fake_result
 from app.core.artifact_store import canonical_json, content_hash
 from app.engine.evidence import (
     ANALYSIS_CELLS_REASON,
     StreamRenderer,
     analysis_formulas,
-    analysis_input_snapshot,
     analysis_recheck,
     build_catalog,
     compose_doc,
@@ -56,6 +60,59 @@ class Store(dict):
 
     def load(self, artifact: str) -> Any:
         return self.get(artifact)
+
+
+#: 运行当天（服务端时区）：真算的结论记进 params.today，复算按它
+TODAY = date(2026, 10, 21)
+#: 按 SNAPSHOT 真算一份按地区拆的可加拆解
+REQUEST: dict[str, Any] = {
+    "op": "decompose", "mode": "additive", "hypothesis": "华东拖累",
+    "params": {"query": "Q2", "by": ["region"], "period": "week", "base": "W41", "target": "W42", "measure": "gmv",
+               "label": "销售额"}}
+#: 华东按渠道再拆一层（下钻）：两个渠道之和 820 → 700，和 A1 里华东那一段闭合
+CHANNELS: dict[str, Any] = {
+    "columns": ["channel", "week", "gmv"], "column_types": {"channel": "text", "week": "text", "gmv": "number"},
+    "rows": [["线上", "W41", 500], ["线上", "W42", 410], ["线下", "W41", 320], ["线下", "W42", 290]],
+    "sql": "SELECT channel, week, SUM(gmv) AS gmv FROM orders WHERE region = '华东' GROUP BY channel, week",
+    "source": "shop", "truncated": False, "row_count": 4,
+}
+
+
+def input_snapshot(content: dict[str, Any], *, ref: str, artifact: str, node_id: str = "fetch") -> dict[str, Any]:
+    """照分析入口（tools/analysis.input_snapshot）的写法交给 run：列的类型按列序写成列表，加上出处，遮罩列留空。复算交的是
+    工件原内容（类型是 {列: 类型}）：两边算出来要逐字段相同。"""
+    types = content.get("column_types") or {}
+    return {**content, "ref": ref, "artifact": artifact, "node_id": node_id,
+            "column_types": [types.get(c) for c in content["columns"]], "masked": []}
+
+
+async def analyzed(snapshots: dict[str, tuple[dict[str, Any], str]], request: dict[str, Any] | None = None, *,
+                   parents: dict[str, Any] | None = None, hypothesis: str | None = None,
+                   **params: Any) -> dict[str, Any]:
+    """app.analysis.run 真算一份结论。snapshots：{调用里写的名字: (快照内容, 工件 id)}；params 盖在请求的参数上，hypothesis
+    换掉请求里 agent 写的假设（不进复算的比较，用来让一份结论的内容独一份）。"""
+    request = request or REQUEST
+    by_ref = {ref: input_snapshot(content, ref=ref, artifact=sha) for ref, (content, sha) in snapshots.items()}
+    asked = {**request, "params": {**request["params"], **params}}
+    if hypothesis is not None:
+        asked["hypothesis"] = hypothesis
+    return dict(await analysis.run(asked, by_ref.get, settings=effective_settings(None), context={"today": TODAY},
+                                   parents=(parents or {}).get))
+
+
+def run_sync(coro: Any) -> Any:
+    """在同步的地方等一个协程：没有正在跑的事件循环就直接 asyncio.run，协程测试里调用（已经在循环里）换一个线程跑。"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def real_result(q: str, snapshot: dict[str, Any] | None = None, **params: Any) -> dict[str, Any]:
+    """同步的 analyzed：按 SNAPSHOT（工件 q）真算 REQUEST。"""
+    return run_sync(analyzed({"Q2": (snapshot or SNAPSHOT, q)}, **params))
 
 
 def setup(*, item: str | None = "drop", call_id: str | None = None, result: dict[str, Any] | None = None,
@@ -451,69 +508,137 @@ def test_sql_check_problems_of_the_input_queries_follow_the_analysis():
 # --------------------------------------------------------------------------
 
 
-def test_recheck_says_plainly_when_the_operators_are_not_there_yet():
-    store, ledger, q, a = setup()
-    out = analysis_recheck(store[a], lambda sha: analysis_input_snapshot(store.get(sha), sha))
-    assert out == {"status": "failed", "method": "decompose.additive@1",
-                   "text": "复算失败：系统里还没有这种分析的复算实现"}
-
-
-def test_recheck_compares_field_by_field_and_names_the_method_versions(monkeypatch):
-    store, _, q, a = setup()
-    sealed = store[a]
-    seen: list[Any] = []
-
-    def same(result, load, *, load_result=None):
-        seen.append(load(q))
-        return {**result, "hypothesis": "复算时没有假设"}
-
-    monkeypatch.setattr(analysis, "recompute", same)
-    out = analysis_recheck(sealed, lambda sha: analysis_input_snapshot(store.get(sha), sha, ref="Q2", node_id="fetch"))
-    assert out == {"status": "same", "method": "decompose.additive@1", "text": "复算一致：按封存的输入重新计算，结论逐项相同"}
-    assert seen[0]["rows"] == SNAPSHOT["rows"] and seen[0]["masked"] == [] and seen[0]["node_id"] == "fetch"
-
-    monkeypatch.setattr(analysis, "recompute", lambda r, load, *, load_result=None: {**r, "phrase": "别的判定"})
-    assert analysis_recheck(sealed, store.get)["text"] == "复算不一致：判定语和封存的不同"
-
-    monkeypatch.setattr(analysis, "recompute",
-                        lambda r, load, *, load_result=None: {**r, "method": "decompose.additive@2"})
+def test_recheck_with_the_real_operators_says_a_sealed_result_holds():
+    """真算的结论按封存的输入复算（load 交工件原内容），逐字段相同；agent 写的假设不比。"""
+    store = Store()
+    q = store.put(SNAPSHOT)
+    sealed = real_result(q)
+    assert sealed["phrase"] == "销售额下降 194（-8.7%），主要来自华东（-120，占 61.9%）"
     out = analysis_recheck(sealed, store.get)
-    assert out["status"] == "different" and out["method_now"] == "decompose.additive@2"
+    assert out == {"status": "same", "method": "decompose.additive@1", "text": "复算一致：按封存的输入重新计算，结论逐项相同"}
+    assert analysis_recheck({**sealed, "hypothesis": "别的假设"}, store.get)["status"] == "same"
+
+
+def test_recheck_follows_the_parent_of_a_drill_down_by_hash():
+    store = Store()
+    q, c = store.put(SNAPSHOT), store.put(CHANNELS)
+    top = real_result(q)
+    a = store.put(top)
+    child = asyncio.run(analyzed({"Q3": (CHANNELS, c)}, parents={"A1": top}, query="Q3", by=["channel"],
+                                 parent={"of": "A1", "key": ["华东"]}))
+    assert [i["role"] for i in child["inputs"]] == ["parent", "data"] and child["inputs"][0]["artifact"] == a
+    assert analysis_recheck(child, store.get, load_result=store.get)["status"] == "same"
+    # 上一层取不回：照实说取不回哪一份，不说两遍「复算」
+    out = analysis_recheck(child, store.get, load_result=lambda sha: None)
+    assert out == {"status": "failed", "method": "decompose.additive@1", "text": "复算失败：取不回上一层的分析结论 A1"}
+
+
+def test_recheck_says_what_differs_and_what_is_missing():
+    store = Store()
+    q = store.put(SNAPSHOT)
+    sealed = real_result(q)
+    # 封存的那份和按输入算出来的不一样（判定语被改过、哈希也就是另一份）：点名哪几项不同
+    out = analysis_recheck({**sealed, "phrase": "销售额下降，主要来自华南"}, store.get)
+    assert out["status"] == "different" and out["fields"] == ["phrase"]
+    assert out["text"] == "复算不一致：判定语和封存的不同"
+    # 输入快照取不回（不在封存范围、哈希对不上的调用方都交 None）
+    out = analysis_recheck(sealed, lambda sha: None)
+    assert out == {"status": "failed", "method": "decompose.additive@1", "text": "复算失败：取不回 Q2 的查询快照"}
+    # 输入快照换了一份（同一个 sha256 交回了别的内容）：复算照样算，结果和封存的不同
+    other = {**SNAPSHOT, "rows": [["华东", "W41", 820], ["华东", "W42", 650], *SNAPSHOT["rows"][2:]]}
+    assert analysis_recheck(sealed, lambda sha: other)["status"] == "different"
+
+
+def test_recheck_names_both_versions_when_the_method_was_upgraded(monkeypatch):
+    store = Store()
+    q = store.put(SNAPSHOT)
+    sealed = real_result(q)
+    monkeypatch.setitem(contract.METHODS, ("decompose", "additive"), "decompose.additive@2")
+    out = analysis_recheck(sealed, store.get)
+    assert out == {"status": "same", "method": "decompose.additive@1", "method_now": "decompose.additive@2",
+                   "text": "运行时用的是 decompose.additive@1，现在是 decompose.additive@2，复算结果相同"}
+    out = analysis_recheck({**sealed, "phrase": "别的判定"}, store.get)
+    assert out["status"] == "different" and out["fields"] == ["phrase"]
     assert out["text"] == "运行时用的是 decompose.additive@1，现在是 decompose.additive@2，复算结果不同"
 
-    def refuse(r, load, *, load_result=None):
-        raise CallError("missing_column", "Q2 里没有列「gmv」")
+    def refuse(result, load, *, load_result=None):
+        raise CallError("unknown_mode", "变化拆解要写模式：additive / ratio / factor")
 
     monkeypatch.setattr(analysis, "recompute", refuse)
-    assert analysis_recheck(sealed, store.get)["text"] == "复算失败：Q2 里没有列「gmv」"
+    out = analysis_recheck(sealed, store.get)
+    assert out["status"] == "failed" and out["method_now"] == "decompose.additive@2"
+    assert out["text"] == ("运行时用的是 decompose.additive@1，现在是 decompose.additive@2：现在的方法按封存的输入复算不了"
+                           "（变化拆解要写模式：additive / ratio / factor）")
 
-    def broken(r, load, *, load_result=None):
-        raise RuntimeError("输入快照取不回来")
+
+def test_recheck_errors_are_said_plainly(monkeypatch):
+    store = Store()
+    q = store.put(SNAPSHOT)
+    sealed = real_result(q)
+    seen: list[Any] = []
+
+    def broken(result, load, *, load_result=None):
+        seen.append(load(q))
+        raise ZeroDivisionError("division by zero")
 
     monkeypatch.setattr(analysis, "recompute", broken)
-    assert analysis_recheck(sealed, store.get)["text"] == "复算失败：输入快照取不回来"
-
-
-def test_input_snapshots_for_recompute_keep_the_masks_of_the_query_time():
-    snap = analysis_input_snapshot({**SNAPSHOT, "mask_columns": ["Phone", "email"]}, "a" * 64, ref="Q1")
-    assert snap["masked"] == ["email", "phone"] and snap["artifact"] == "a" * 64 and snap["ref"] == "Q1"
-    assert analysis_input_snapshot({"columns": []}, "a" * 64) is None
+    out = analysis_recheck(sealed, store.get)
+    assert out["status"] == "failed" and out["text"].startswith("复算失败：") and seen == [SNAPSHOT]
+    monkeypatch.setattr(analysis, "recompute", lambda result, load, *, load_result=None: None)
+    assert analysis_recheck(sealed, store.get)["text"] == "复算失败：复算没有交回结论"
 
 
 def test_formulas_substitute_the_key_numbers():
-    formulas = {f["label"]: f["text"] for f in analysis_formulas(fake_result())}
+    store = Store()
+    q = store.put(SNAPSHOT)
+    formulas = {f["label"]: f["text"] for f in analysis_formulas(real_result(q))}
     assert formulas == {
         "总变化": "总变化 = 本期合计 − 基期合计 = 2,026 − 2,220 = -194",
         "变化率": "变化率 = 总变化 ÷ 基期合计 = -194 ÷ 2,220 = -8.7%",
-        "占比": "华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷ -194 = 61.9%",
+        "占比": "华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷ （-194） = 61.9%",
     }
-    baseline = fake_result("baseline", verdict="outside_band", values={
-        "x": "-0.087", "median": "-0.004", "band_lo": "-0.061", "band_hi": "0.053", "z": "-2.9", "n_history": "12"})
-    texts = [f["text"] for f in analysis_formulas(baseline)]
-    assert texts == ["常规波动范围 = 中位数 ± 2 倍稳健标准差 = -0.061 至 0.053（中位数 -0.004，过去 12 期）",
-                     "稳健 z = （本期 − 中位数）÷ 稳健标准差 = （-0.087 − -0.004）÷ 稳健标准差 = -2.9"]
     assert analysis_formulas(fake_result(status="refused", reason_code="history_short")) == []
     assert analysis_formulas(fake_result(values={})) == []
+
+
+def test_formulas_for_factor_ratio_and_baseline():
+    store = Store()
+    factor_snap = {"columns": ["week", "gmv", "orders", "aov"],
+                   "rows": [["W41", 1000, 10, 100], ["W42", 1320, 12, 110]],
+                   "sql": "SELECT week, SUM(amount) AS gmv, COUNT(*) AS orders, ROUND(AVG(amount), 2) AS aov "
+                          "FROM orders GROUP BY week", "source": "shop", "truncated": False}
+    factor = asyncio.run(analyzed({"Q1": (factor_snap, store.put(factor_snap))},
+                                  {"op": "decompose", "mode": "factor", "params": {}}, query="Q1", period="week",
+                                  base="W41", target="W42", product="gmv", factors=["orders", "aov"], label="销售额"))
+    texts = {f["label"]: f["text"] for f in analysis_formulas(factor)}
+    assert texts["总变化"] == "总变化 = 本期合计 − 基期合计 = 1,320 − 1,000 = 320"
+    assert texts["占比"].startswith("orders的占比 = orders的贡献 ÷ 总变化 = 210.1449167") and texts["占比"].endswith(" = 65.7%")
+
+    ratio_snap = {"columns": ["channel", "week", "refunds", "orders"],
+                  "rows": [["线上", "W41", 50, 1000], ["线上", "W42", 80, 1000], ["线下", "W41", 20, 1000],
+                           ["线下", "W42", 26, 1000]],
+                  "sql": "SELECT channel, week, SUM(refund_flag) AS refunds, COUNT(*) AS orders FROM orders "
+                         "GROUP BY 1, 2", "source": "shop", "truncated": False}
+    ratio = asyncio.run(analyzed({"Q1": (ratio_snap, store.put(ratio_snap))},
+                                 {"op": "decompose", "mode": "ratio", "params": {}}, query="Q1", by="channel",
+                                 period="week", base="W41", target="W42", numerator="refunds", denominator="orders",
+                                 label="退款率"))
+    assert [f["text"] for f in analysis_formulas(ratio)] == [
+        "结构效应占比 = 结构效应合计 ÷ 比率的变化 = 0 ÷ 0.018 = 0.0%",
+        "自身效应占比 = 自身效应合计 ÷ 比率的变化 = 0.018 ÷ 0.018 = 100.0%"]
+
+    weeks = [f"2026-{m:02d}-{d:02d}" for m, d in ((6, 8), (6, 15), (6, 22), (6, 29), (7, 6), (7, 13), (7, 20), (7, 27),
+                                                 (8, 3), (8, 10))]
+    series = {"columns": ["week", "orders"], "column_types": {"week": "text", "orders": "number"},
+              "rows": [[w, v] for w, v in zip(weeks, [100, 102, 98, 101, 99, 103, 100, 97, 102, 130])],
+              "sql": "SELECT week, COUNT(*) AS orders FROM orders GROUP BY 1", "source": "shop", "truncated": False}
+    baseline = asyncio.run(analyzed({"Q1": (series, store.put(series))}, {"op": "baseline", "mode": None, "params": {}},
+                                    query="Q1", period="week", measure="orders", label="订单数"))
+    assert baseline["params"]["basis"] == "change" and baseline["status"] == "ok"
+    band, z = [f["text"] for f in analysis_formulas(baseline)]
+    assert band == "常规波动范围 = 中位数 ± 2 倍稳健标准差 = -9.0% 至 9.0%（中位数 0.01%，过去 8 期）"
+    assert z == "稳健 z = （本期 − 中位数）÷ 稳健标准差 = （27.5% − 0.01%）÷ 稳健标准差 = 6.1072657902"
+    assert analysis_recheck(baseline, store.get)["status"] == "same"
 
 
 # --------------------------------------------------------------------------

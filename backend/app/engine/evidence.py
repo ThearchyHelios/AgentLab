@@ -4255,8 +4255,11 @@ def _comparability_note(entry: dict[str, Any]) -> str:
     comparability = entry.get("comparability")
     if not isinstance(comparability, dict):
         return ""
-    reasons = "；".join(str(r) for r in comparability.get("reasons") or [] if r) \
-        or str(comparability.get("phrase") or "")
+    reasons = "；".join(str(r) for r in comparability.get("reasons") or [] if r)
+    if not reasons:
+        # 没记原因的照判定语写（「两期不可比：原因；原因」），开头的判定不重复
+        phrase = str(comparability.get("phrase") or "")
+        reasons = phrase.split("：", 1)[1].strip() if "：" in phrase else ""
     if comparability.get("verdict") == "incomparable":
         return f"（两期不可比：{reasons or '原因见证据面板'}。这个比较不能当结论，引用时须如实说明两期不可比）"
     if comparability.get("verdict") == "conditional":
@@ -4650,59 +4653,61 @@ def describe_violations(violations: list[dict[str, Any]], *, limit: int = 20) ->
 #: 复算不一致时点名哪几项不同的叫法（analysis.contract.AnalysisResult 的字段）
 _RESULT_FIELDS = {
     "op": "算子", "mode": "模式", "method": "方法版本", "params": "参数", "settings": "阈值", "inputs": "输入",
-    "probes": "现查的表范围", "status": "算成没算成", "reason_code": "算不了的原因", "reason": "算不了的原因",
+    "probes": "现查结果", "status": "算成没算成", "reason_code": "算不了的原因", "reason": "算不了的原因",
     "table": "结果表", "values": "具名的数", "verdict": "判定", "criterion": "判定标准", "phrase": "判定语",
     "caveats": "附带说明",
 }
-#: 复算抛 NotImplementedError：这一版系统里还没有这种分析的算子
-RECHECK_MISSING = "系统里还没有这种分析的复算实现"
+#: app.analysis.recompute 取不回输入（CallError 的 code input_missing）时那句以「复算」开头（复算取不回 Q2 的查询快照）：
+#: 接在「复算失败：」后面时去掉，不说两遍
+_RECHECK_HEAD = "复算"
 
 
-def analysis_input_snapshot(content: Any, artifact: str, *, ref: str | None = None,
-                            node_id: str | None = None) -> dict[str, Any] | None:
-    """一份查询快照的内容 → 复算要的输入快照（analysis.contract.InputSnapshot：数据源查询工具的 to_payload 加上出处）。
-    不能当维度、度量的列（masked）按快照里记下的、查询当时的遮罩：复算按运行当时的条件重算；现在设的遮罩只管展示。
-    不是查询快照（没有 rows）的返回 None。"""
-    if not isinstance(content, dict) or not isinstance(content.get("rows"), list):
-        return None
-    return {"ref": str(ref or ""), "artifact": str(artifact), "node_id": str(node_id or ""),
-            "source": content.get("source"), "sql": str(content.get("sql") or ""),
-            "columns": [str(c) for c in content.get("columns") or []],
-            "column_types": content.get("column_types") if isinstance(content.get("column_types"), dict) else {},
-            "rows": content["rows"], "truncated": bool(content.get("truncated")),
-            "masked": sorted(_mask_names(content.get("mask_columns")))}
+def _recheck_reason(error: Any) -> str:
+    text = str(getattr(error, "message", "") or "").strip() or "原因未知"
+    if getattr(error, "code", None) == "input_missing" and text.startswith(_RECHECK_HEAD) \
+            and len(text) > len(_RECHECK_HEAD):
+        return text[len(_RECHECK_HEAD):].lstrip()
+    return text
 
 
 def analysis_recheck(result: dict[str, Any], load: Callable[[str], Any], *,
                      load_result: Callable[[str], Any] | None = None) -> dict[str, Any]:
-    """把一份封存的分析结论按它记下的输入复算一遍（app.analysis.recompute：按 sha256 取回输入快照，按结论里记下的参数、
-    阈值和现查结果算，不再现查），和封存的逐字段比（contract.same，agent 写的假设不比）。
+    """把一份封存的分析结论按它记下的输入复算一遍，和封存的逐字段比（contract.same，agent 写的假设不比）。
+
+    复算就是 app.analysis.recompute：load 按 sha256 交回查询快照工件的原内容，load_result 交回下钻的上一层结论的原内容，
+    取不回（不在封存范围内、哈希对不上）的交 None；算子按结论里记下的参数、阈值、现查结果算，不再现查、不读目录。
 
     交回 {status, text, method, method_now?, fields?}：status 是 same（一致）/ different（不一致）/ failed（复算不了）；
-    text 是给人看的一句，证据面板、报告导出、可验证报告照它写。方法升过版的照实写运行时用的是哪一版、现在是哪一版，
-    复算结果同不同。复算抛异常（算子还没有、输入取不回、调用的写法现在不认）不往外抛，照实写「复算失败：原因」。"""
+    text 是给人看的一句，证据面板、报告导出、可验证报告照它写。fields 是和封存的不同的那几项（结论的字段名）。
+
+    方法升过版（结论里记的 method 和现在的 contract.METHODS[(op, mode)] 不同）时 method_now 是现在的那一版：复算成立的照实写
+    复算结果同不同（方法版本那一项本来就不同，不算进去），现在的方法按封存的输入不成立（recompute 抛 CallError）的写明原因。
+    复算出错（输入取不回、调用的写法现在不认、出了意外）不往外抛，照实写「复算失败：原因」。"""
     from app import analysis
-    from app.analysis.contract import NOT_RECOMPUTED, CallError, same
+    from app.analysis.contract import METHODS, NOT_RECOMPUTED, CallError, same
     from app.core.errors import describe_exception
 
     method = str(result.get("method") or "")
+    now = METHODS.get((result.get("op"), result.get("mode")))
+    upgraded = isinstance(now, str) and now != method
+    out: dict[str, Any] = {"method": method, **({"method_now": now} if upgraded else {})}
+    head = f"运行时用的是 {method}，现在是 {now}" if upgraded else ""
     try:
         again = analysis.recompute(result, load, load_result=load_result)  # type: ignore[arg-type]
-    except NotImplementedError:
-        return {"status": "failed", "method": method, "text": f"复算失败：{RECHECK_MISSING}"}
     except CallError as e:
-        return {"status": "failed", "method": method, "text": f"复算失败：{e.message}"}
+        why = _recheck_reason(e)
+        text = f"{head}：现在的方法按封存的输入复算不了（{why}）" if upgraded else f"复算失败：{why}"
+        return {"status": "failed", **out, "text": text}
     except Exception as e:  # noqa: BLE001 - 复算出了意外：照实说复算不了，不能让证据面板、导出跟着出错
-        return {"status": "failed", "method": method, "text": f"复算失败：{describe_exception(e)}"}
+        return {"status": "failed", **out, "text": f"复算失败：{describe_exception(e)}"}
     if not isinstance(again, dict):
-        return {"status": "failed", "method": method, "text": "复算失败：复算没有交回结论"}
-    ok = same(result, again)
-    fields = sorted(k for k in set(result) | set(again) if k not in NOT_RECOMPUTED and result.get(k) != again.get(k))
-    out: dict[str, Any] = {"status": "same" if ok else "different", "method": method}
-    now = str(again.get("method") or "")
-    if now != method:
-        out["method_now"] = now
-        out["text"] = f"运行时用的是 {method}，现在是 {now}，复算结果{'相同' if ok else '不同'}"
+        return {"status": "failed", **out, "text": "复算失败：复算没有交回结论"}
+    ok = same({**result, "method": now} if upgraded else result, again)
+    skip = NOT_RECOMPUTED | ({"method"} if upgraded else set())
+    fields = sorted(k for k in set(result) | set(again) if k not in skip and result.get(k) != again.get(k))
+    out["status"] = "same" if ok else "different"
+    if upgraded:
+        out["text"] = f"{head}，复算结果{'相同' if ok else '不同'}"
     elif ok:
         out["text"] = "复算一致：按封存的输入重新计算，结论逐项相同"
     else:
@@ -4713,31 +4718,56 @@ def analysis_recheck(result: dict[str, Any], load: Callable[[str], Any], *,
     return out
 
 
-def _decompose_row(result: dict[str, Any]) -> list[Any] | None:
-    """变化拆解的结果表里判定点名的那一段（verdict.subjects 的第一段，按维度列 params.by 对），对不上就取第一行（结果表
-    按变化的绝对值从大到小排）。"""
+#: 变化拆解结果表里不是「段」的那几列（细案 01 §2：可加、乘积两种模式的数列和说明列）
+_DECOMPOSE_NUMBERS = ("base", "target", "delta", "pct", "share", "contrib", "flag")
+
+
+def _decompose_row(result: dict[str, Any]) -> tuple[str, list[Any]] | None:
+    """变化拆解的结果表里判定点名的那一段：(这一段的叫法, 那一行)。段按维度列（params.by；乘积模式是 factor 一列）对
+    verdict.subjects 的第一项，对不上就取第一行（结果表按变化的绝对值从大到小排）。叫法是维度值用「·」连起来。"""
     table = result.get("table") if isinstance(result.get("table"), dict) else {}
     rows = [r for r in table.get("rows") or [] if isinstance(r, list)]
     columns = [str(c) for c in table.get("columns") or []]
     if not rows:
         return None
-    subjects = ((result.get("verdict") or {}).get("subjects") or []) if isinstance(result.get("verdict"), dict) else []
-    by = (result.get("params") or {}).get("by") if isinstance(result.get("params"), dict) else None
+    params = result.get("params") if isinstance(result.get("params"), dict) else {}
+    by = ["factor"] if result.get("mode") == "factor" else params.get("by")
     by = [str(b) for b in (by if isinstance(by, list) else [by] if by else []) if str(b) in columns]
-    if subjects and by and isinstance(subjects[0], list):
+    if not by:
+        by = [c for c in columns if c not in _DECOMPOSE_NUMBERS][:1]
+    at = [columns.index(b) for b in by]
+    verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else {}
+    subjects = verdict.get("subjects") or []
+    picked = rows[0]
+    if subjects and at and isinstance(subjects[0], list):
         wanted = [str(v) for v in subjects[0]]
-        for row in rows:
-            if [str(row[columns.index(b)]) for b in by if columns.index(b) < len(row)] == wanted:
-                return row
-    return rows[0]
+        picked = next((row for row in rows if [str(row[i]) for i in at if i < len(row)] == wanted), rows[0])
+    name = "·".join(str(picked[i]) for i in at if i < len(picked) and picked[i] is not None)
+    return name or "这一段", picked
+
+
+def _paren(text: str) -> str:
+    """代入式里减号、除号后面的负数加括号：「30.0% − （-1.0%）」。"""
+    return f"（{text}）" if text.startswith("-") else text
 
 
 def analysis_formulas(result: dict[str, Any]) -> list[dict[str, str]]:
     """出处链「计算」一步里关键数的代入式：[{label, text}]，数照单元格的规则渲染（系统写的，不是模型写的）。只给拿结论里
-    记下的数就写得出来的几条——变化拆解的总变化、变化率、主要来源的占比，比率拆解的结构效应、自身效应占比，波动基线的
-    常规波动范围和稳健 z；缺了哪个数、渲染不出来的那条不给。比如「华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷ -194 = 61.9%」。"""
+    记下的数就写得出来的几条：
+
+    - 变化拆解（可加、乘积）：总变化、变化率、点名那一段（因子）的占比——「华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷
+      （-194） = 61.9%」，乘积模式按那个因子的贡献
+    - 变化拆解（比率）：结构效应、自身效应各占比率变化的多少
+    - 波动基线：常规波动范围、稳健 z（按变化率比的，几个数按百分比写）
+
+    量按单元格的规则写（千分位，小数照值本来的样子）；百分比同判定语的写法（app.analysis.phrases.pct：一位小数，不是 0 的值
+    写出来成了 0.0% 的多给小数位）。缺了哪个数、渲染不出来的那条不给，不编。趋势、差异检验、可比性检查的数在结果表和具名的数
+    里，不另写代入式。"""
+    from app.analysis.phrases import pct
+
     values = result.get("values") if isinstance(result.get("values"), dict) else {}
     settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
+    params = result.get("params") if isinstance(result.get("params"), dict) else {}
     op, mode = result.get("op"), result.get("mode")
     out: list[dict[str, str]] = []
 
@@ -4747,34 +4777,38 @@ def analysis_formulas(result: dict[str, Any]) -> list[dict[str, str]]:
         except (KeyError, IndexError, ValueError, TypeError, RenderError):
             pass                                        # 缺一个数、渲染不出来：这条不给，不编
 
+    def cell(raw: Any, conv: str | None = None) -> str:
+        return pct(raw, signed=False) if conv == "pct" else render_cell(raw)
+
     if result.get("status") != "ok":
         return out
-    if op == "decompose" and mode == "additive":
-        add("总变化", lambda: f"总变化 = 本期合计 − 基期合计 = {render_cell(values['target_total'])} − "
-                           f"{render_cell(values['base_total'])} = {render_cell(values['delta_total'])}")
-        add("变化率", lambda: f"变化率 = 总变化 ÷ 基期合计 = {render_cell(values['delta_total'])} ÷ "
-                           f"{render_cell(values['base_total'])} = {render_cell(values['pct_total'], 'pct')}")
-        table = result.get("table") or {}
+    if op == "decompose" and mode in ("additive", "factor"):
+        add("总变化", lambda: f"总变化 = 本期合计 − 基期合计 = {cell(values['target_total'])} − "
+                           f"{_paren(cell(values['base_total']))} = {cell(values['delta_total'])}")
+        add("变化率", lambda: f"变化率 = 总变化 ÷ 基期合计 = {cell(values['delta_total'])} ÷ "
+                           f"{_paren(cell(values['base_total']))} = {cell(values['pct_total'], 'pct')}")
+        table = result.get("table") if isinstance(result.get("table"), dict) else {}
         columns = [str(c) for c in table.get("columns") or []]
-        row = _decompose_row(result)
-        if row is not None and {"delta", "share"} <= set(columns):
-            by = [c for c in columns if c not in ("base", "target", "delta", "pct", "share", "flag")]
-            name = " · ".join(str(row[columns.index(c)]) for c in by if columns.index(c) < len(row)) or "这一段"
-            add("占比", lambda: f"{name}的占比 = {name}的变化 ÷ 总变化 = "
-                              f"{render_cell(row[columns.index('delta')])} ÷ {render_cell(values['delta_total'])} = "
-                              f"{render_cell(row[columns.index('share')], 'pct')}")
+        part = "contrib" if mode == "factor" else "delta"
+        found = _decompose_row(result)
+        if found is not None and {part, "share"} <= set(columns):
+            name, row = found
+            word = "贡献" if mode == "factor" else "变化"
+            add("占比", lambda: f"{name}的占比 = {name}的{word} ÷ 总变化 = {cell(row[columns.index(part)])} ÷ "
+                              f"{_paren(cell(values['delta_total']))} = {cell(row[columns.index('share')], 'pct')}")
     elif op == "decompose" and mode == "ratio":
         for part, label in (("mix", "结构效应"), ("rate", "自身效应")):
             add(f"{label}占比", lambda part=part, label=label: (
-                f"{label}占比 = {label}合计 ÷ 整体的变化 = {render_cell(values[f'{part}_total'])} ÷ "
-                f"{render_cell(values['delta'])} = {render_cell(values[f'{part}_share'], 'pct')}"))
+                f"{label}占比 = {label}合计 ÷ 比率的变化 = {cell(values[f'{part}_total'])} ÷ "
+                f"{_paren(cell(values['delta']))} = {cell(values[f'{part}_share'], 'pct')}"))
     elif op == "baseline":
+        conv = "pct" if params.get("basis") == "change" else None
         add("常规波动范围", lambda: (
-            f"常规波动范围 = 中位数 ± {settings['k_warn']:g} 倍稳健标准差 = {render_cell(values['band_lo'])} 至 "
-            f"{render_cell(values['band_hi'])}（中位数 {render_cell(values['median'])}，"
-            f"过去 {render_cell(values['n_history'])} 期）"))
-        add("稳健 z", lambda: f"稳健 z = （本期 − 中位数）÷ 稳健标准差 = （{render_cell(values['x'])} − "
-                             f"{render_cell(values['median'])}）÷ 稳健标准差 = {render_cell(values['z'])}")
+            f"常规波动范围 = 中位数 ± {settings['k_warn']:g} 倍稳健标准差 = {cell(values['band_lo'], conv)} 至 "
+            f"{cell(values['band_hi'], conv)}（中位数 {cell(values['median'], conv)}，"
+            f"过去 {cell(values['n_history'])} 期）"))
+        add("稳健 z", lambda: f"稳健 z = （本期 − 中位数）÷ 稳健标准差 = （{cell(values['x'], conv)} − "
+                             f"{_paren(cell(values['median'], conv))}）÷ 稳健标准差 = {cell(values['z'])}")
     return out
 
 
