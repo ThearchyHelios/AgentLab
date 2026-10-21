@@ -230,7 +230,7 @@ async def analysis_baseline(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
 @register(
     name=contract.TOOL_NAMES["trend"],
     category=CATEGORY,
-    description="趋势：判断一条按期次排的序列是在持续上升、持续下降，还是没有明显趋势（只是一次波动）。",
+    description="趋势判断：判断一条按期次排的序列是在持续上升、持续下降，还是没有明显趋势（只是一次波动）。",
     args_schema=TrendArgs,
     guide=METHOD_GUIDE,
 )

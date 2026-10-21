@@ -156,6 +156,8 @@ def test_the_five_tools_take_no_thresholds_and_share_one_method():
         props = spec.args_schema.model_json_schema()["properties"]
         assert not set(props) & set(contract.DEFAULTS), f"{name} 的参数里有阈值：{set(props) & set(contract.DEFAULTS)}"
         assert spec.args_schema is ARGS[op] and spec.category == "分析" and spec.description
+        # 说明开头是契约里这种分析的叫法（「趋势判断：……」），助手的工具清单、证据面板、评测写的是同一种说法
+        assert spec.description.startswith(f"{contract.OP_LABELS[op]}："), spec.description[:12]
         assert spec.guide is METHOD_GUIDE and not spec.dangerous and not spec.writes_state
         # 不查库：能力登记、出处链都不把它的结果当查询快照
         assert not is_platform_query(name)
