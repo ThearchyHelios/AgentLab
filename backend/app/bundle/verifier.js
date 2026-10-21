@@ -269,6 +269,8 @@
     scopeTitle: '分析范围', scopeNote: '这一段由系统按这次运行的分析结论写成，写作者改不了；点开编号看判定语、判定标准、输入和复算。',
     scopeMissing: '没拆', scopeAll: '候选维度都拆过了', scopeUnknown: '候选维度核对不了', scopeTests: '检验',
     scopeTestsText: (n) => `这次做了 ${n} 次差异检验`, scopeParent: (alias) => `下钻自 ${alias}`, scopeDims: (dims) => `按${dims}`,
+    // 「检验」后面接的校正说明（ScopeBlock.corrected），同导出页（report_export/build.py 的 SCOPE_CORRECTED）
+    scopeCorrected: '（一次里比了几对的已按次数校正）', scopeUncorrected: '，几次检验之间没有按次数校正',
     dSql: 'SQL', dRow: (row) => `快照第 ${row + 1} 行`,
     nullValue: '空值（NULL）',
     appendedNote: '这些事件追加在封存之后，不在封存范围内，不参与清单核对，也不能当作证据。',
@@ -2048,7 +2050,7 @@
     return parts
   }
 
-  /** 报告文档里系统写的「分析范围」：现象、拆过（下钻按链缩进）、排除、算不了、没拆、检验了几次。编号点得开那条结论 */
+  /** 报告文档里系统写的「分析范围」：现象、拆过（下钻按链缩进）、排除、算不了、没拆、检验了几次、校正过没有。编号点得开那条结论 */
   function renderScope(doc, report) {
     const scope = isObj(doc.analysis_scope) ? doc.analysis_scope : null
     if (!scope) return null
@@ -2073,7 +2075,10 @@
     } else if (Object.prototype.hasOwnProperty.call(scope, 'not_decomposed')) {
       rows.push(h('dt', {}, T.scopeMissing), h('dd', {}, String(scope.note || T.scopeUnknown)))
     }
-    if (Number.isInteger(scope.tests) && scope.tests > 0) rows.push(h('dt', {}, T.scopeTests), h('dd', {}, T.scopeTestsText(scope.tests)))
+    if (Number.isInteger(scope.tests) && scope.tests > 0) {
+      const corrected = scope.corrected === true ? T.scopeCorrected : scope.corrected === false ? T.scopeUncorrected : ''
+      rows.push(h('dt', {}, T.scopeTests), h('dd', {}, T.scopeTestsText(scope.tests) + corrected))
+    }
     if (!rows.length) return null
     return h('section', { class: 'scope', 'data-scope': '' }, h('h4', {}, T.scopeTitle), h('p', { class: 'note' }, T.scopeNote),
       h('dl', { class: 'kv' }, rows))

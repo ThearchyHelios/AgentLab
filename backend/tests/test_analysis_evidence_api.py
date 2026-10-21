@@ -407,7 +407,7 @@ SCOPE = {"analysis_scope": {
     "decomposed": [{"alias": "A1", "op": "decompose", "mode": "additive", "dims": ["地区"], "verdict": "driver",
                     "phrase": "主要来自华东"}],
     "excluded": [], "refused": [{"alias": "A1", "op": "baseline", "reason": "历史只有 5 期，至少要 8 期"}],
-    "not_decomposed": ["渠道"], "tests": 2}}
+    "not_decomposed": ["渠道"], "tests": 2, "corrected": False}}
 
 
 def data_block(html: str) -> dict[str, Any]:
@@ -427,7 +427,8 @@ async def test_the_html_export_carries_the_analysis_chain_and_the_scope(client):
     assert data["notes"][phrase].startswith("判定语由系统按平台的方法算出判定")
     # 分析范围：正文后面渲染，编号点得开、和点开判定语是同一条链
     assert '<section class="scope"' in html and "<dt>现象</dt>" in html and "<dt>拆过</dt>" in html
-    assert "<dt>算不了</dt>" in html and "<dd>渠道</dd>" in html and "这次做了 2 次差异检验" in html
+    assert "<dt>算不了</dt>" in html and "<dd>渠道</dd>" in html
+    assert "这次做了 2 次差异检验，几次检验之间没有按次数校正" in html
     assert 'data-seg="scope:A1"' in html and "（按地区）" in html
     assert data["refs"]["scope:A1"] == data["refs"][phrase]
     assert f'data-seg="{phrase}"' in html and 'data-kind="analysis"' in html

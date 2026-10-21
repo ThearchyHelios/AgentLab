@@ -298,6 +298,9 @@ def render_body(doc: Mapping[str, Any]) -> str:
 #: 「分析范围」各组的叫法（00-总方案 §3.6），按这个顺序写
 SCOPE_TITLES = (("phenomena", "现象"), ("decomposed", "拆过"), ("excluded", "排除"), ("refused", "算不了"))
 SCOPE_NOTE = "这一段由系统按这次运行的分析结论写成，写作者改不了；点开编号看判定标准、计算、输入和复算。"
+#: 「检验」那一项后面接的校正说明（analysis.contract.ScopeBlock.corrected）：只做了一次的，一次里比了几对的已按次数校正；
+#: 做了不止一次的，几次之间没有校正。和可验证报告的核对页（bundle/verifier.js 的 scopeCorrected）同一种说法
+SCOPE_CORRECTED = {True: "（一次里比了几对的已按次数校正）", False: "，几次检验之间没有按次数校正"}
 #: 分析范围里一个编号的片段键（api/evidence.SCOPE_REF 同一个写法）：点开时按它找出处链
 _SCOPE_REF = "scope:{alias}"
 
@@ -319,7 +322,7 @@ def _scope_item(item: Mapping[str, Any], *, depth: int = 0) -> str:
 
 def render_scope(doc: Mapping[str, Any]) -> str:
     """报告文档里系统写的「分析范围」（analysis.contract.ScopeBlock）：现象、拆过（下钻按链缩进）、排除、算不了、没拆、
-    检验了几次。文档没有这个字段（老文档、这次没有分析结论、报告节点关了这一段）时是空串，页面一个字都不多。"""
+    检验了几次、校正过没有。文档没有这个字段（老文档、这次没有分析结论、报告节点关了这一段）时是空串，页面一个字都不多。"""
     scope = doc.get("analysis_scope")
     if not isinstance(scope, Mapping):
         return ""
@@ -343,7 +346,9 @@ def render_scope(doc: Mapping[str, Any]) -> str:
         rows.append(f"<dt>没拆</dt><dd>{_esc(scope.get('note') or '候选维度核对不了')}</dd>")
     tests = scope.get("tests")
     if isinstance(tests, int) and not isinstance(tests, bool) and tests > 0:
-        rows.append(f"<dt>检验</dt><dd>这次做了 {tests} 次差异检验</dd>")
+        corrected = scope.get("corrected")
+        note = SCOPE_CORRECTED.get(corrected, "") if isinstance(corrected, bool) else ""
+        rows.append(f"<dt>检验</dt><dd>这次做了 {tests} 次差异检验{note}</dd>")
     if not rows:
         return ""
     return (f'<section class="scope" aria-labelledby="scope-title"><h3 id="scope-title">分析范围</h3>'

@@ -161,7 +161,7 @@ async def test_the_bundle_page_shows_the_analysis_detail_and_the_scope():
     assert out["verified"] == ""
     [scope] = out["scope"]
     assert scope.startswith("分析范围") and "现象A1：销售额下降" in scope and "拆过A1（按地区）：主要来自华东" in scope
-    assert "没拆渠道" in scope and "这次做了 2 次差异检验" in scope
+    assert "没拆渠道" in scope and "这次做了 2 次差异检验，几次检验之间没有按次数校正" in scope
     phrase = next(text for text in out["opened"].values() if "出处分析结论 A1 的判定语" in text)
     assert "核对结果✓ 通过" in phrase and "分析结论里的值「销售额下降 194（-8.7%）" in phrase
     assert "判定语销售额下降 194（-8.7%）" in phrase and "方法与版本decompose.additive@1" in phrase
