@@ -10,7 +10,7 @@ English | [Simplified Chinese](README.zh-CN.md)
 
 ## Why use it
 
-- **Numbers you can check**: all arithmetic happens in SQL and in caliber cards (controlled metric sets), and the narrative layer has no right to create numbers. The report-writer node writes only citation markers, the system fills in the numbers from snapshots, and every number opens all the way to the cell in the query result it came from.
+- **Numbers you can check**: all arithmetic happens in SQL and in caliber cards (controlled metric sets), and the narrative layer has no right to create numbers. The report-writer node writes only citation markers, the system fills in the numbers from snapshots, and every number opens all the way to the cell in the query result it came from. Judgments such as "mainly from East" or "outside the usual fluctuation" are likewise computed by the system with fixed methods and written as verdict phrases, and the report only cites them.
 - **Constrained orchestration**: the engine is compiled, so at run time the model can't change the graph structure; its freedom is confined to the inside of agent nodes and to branch decisions. Fully dynamic multi-agent collaboration stays in the exploration layer.
 - **Pinned, reproducible versions**: formal runs accept only published immutable versions (pinned by graph hash). The complete evidence of every execution goes into a content-addressed artifact store and is sealed, and one click verifies that nothing was altered.
 - **Human control**: approvals, joint sign-off, time limits, and Reject exits; nothing is ever approved automatically, and a process restart loses no state.
@@ -20,7 +20,7 @@ English | [Simplified Chinese](README.zh-CN.md)
 
 **Orchestration and runs**
 
-- Canvas: 18 node types, drag and connect; live node highlighting, streaming output, and a timeline track at run time → [Workflows](docs/en/workflows.md)
+- Canvas: 19 node types, drag and connect; live node highlighting, streaming output, and a timeline track at run time → [Workflows](docs/en/workflows.md)
 - Copilot: generate or rewrite a whole graph from one sentence; it looks up schemas on demand and checks its work before delivering → [Copilot](docs/en/ask-data.md#copilot)
 - Human-in-the-loop: approvals, joint sign-off, time limits, Reject exits → [Human nodes](docs/en/workflows.md#human-nodes)
 - Agent guardrails: repeated calls, spending, and context each have a guard; the step count is only a backstop → [Guardrails](docs/en/workflows.md#guardrails)
@@ -41,6 +41,7 @@ English | [Simplified Chinese](README.zh-CN.md)
 **Evidence and issuance**
 
 - Clickable evidence: numbers, table and field names, and verbatim knowledge-base quotes all open to their provenance → [Evidence and Issuance](docs/en/evidence.md)
+- Analytical judgments: change decomposition, fluctuation baselines, trends, difference tests, and comparability checks are computed by the system, which also writes the verdict phrases; reports cite them, and judgment words are checked sentence by sentence → [Analysis](docs/en/analysis.md)
 - Three-tier issuance: caliber cards plus issuance contracts, checked by value or by citation → [Issuance contracts](docs/en/evidence.md#issuance-contracts-and-tiers)
 - Sealing and exports: one-click seal verification; self-contained report exports and verifiable reports → [Exports](docs/en/evidence.md#exports)
 - Review suite: double-blind recomputation, adversarial review, approval inquiry, the what-if sandbox, run comparison → [Review suite](docs/en/evidence.md#the-review-suite)
@@ -71,7 +72,7 @@ conda env create -f environment.yml   # first time: create the agentlab environm
 ./scripts/dev.sh                      # after that: one command starts the frontend and backend
 ```
 
-Open http://localhost:5273 . You can try everything without an API key: the built-in Mock provider runs the whole orchestration path end to end; to connect a real model, see [Model access](docs/en/configuration.md#model-access). The 9 built-in templates run as they are.
+Open http://localhost:5273 . You can try everything without an API key: the built-in Mock provider runs the whole orchestration path end to end; to connect a real model, see [Model access](docs/en/configuration.md#model-access). The 11 built-in templates run as they are.
 
 **Login is off by default**: anyone on the same network who can open the page can use every feature. Turn on login before multiple people use it; see [Login modes](docs/en/identity-and-security.md#login-modes). For more startup options, see [Development](docs/en/development.md#start).
 
@@ -90,6 +91,7 @@ See [Deployment](docs/en/deployment.md) and [deploy/README.md](deploy/README.md)
 | [Ask Data and Copilot](docs/en/ask-data.md) | What happens after you ask, output review, record retention, how Copilot builds graphs and looks things up |
 | [Workflows](docs/en/workflows.md) | The canvas, node types, passing data, human nodes and rejection, agent guardrails, subworkflows, publishing and gates, runs and resuming |
 | [Evidence and Issuance](docs/en/evidence.md) | Caliber cards, issuance contracts and tiers, citation markers, claim sentences, no data in the queried range, sealing and verification, report exports and verifiable reports, the review suite |
+| [Analysis](docs/en/analysis.md) | The five analyses and their criteria, when an analysis can't be done, analysis tools for agents and analysis cards, how to cite, the analysis claim check, the analysis scope, settings and limits |
 | [Data Sources and Spreadsheet Import](docs/en/data-sources.md) | Connecting databases, read-only guarantees, uploading spreadsheets and recipes, accumulating by period, cross-database merges, masked columns |
 | [Data Catalog](docs/en/data-catalog.md) | What the catalog records, drafting and review, export and import, data profiling, SQL checks, introspection scope for large databases, schema and value changes |
 | [Tools, MCP, and the Capability Registry](docs/en/tools.md) | Kinds of tools, approval levels, capability governance, limits on write capabilities, registered endpoints, network rules |

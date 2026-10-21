@@ -40,7 +40,7 @@ When motion is turned off at the system level (`prefers-reduced-motion`), the li
 
 ### Built-in templates
 
-There are 9 built-in templates, from Minimal Q&A to Traceable Weekly Report. They run as they are and also serve as executable documentation of how each kind of node is used.
+There are 11 built-in templates, from Minimal Q&A to Anomaly Analysis (Traceable). They run as they are and also serve as executable documentation of how each kind of node is used. Templates 9, Traceable Weekly Report, and 11, Anomaly Analysis (Traceable), can be published at the governed level as they are: the first demonstrates caliber cards and issuance by citation; the second demonstrates the analysis card, which takes two queries, judges whether this week's change is within the usual fluctuation and which region it mainly came from, and leaves the report to cite only the verdict phrases (see [Analysis](analysis.md#analysis-cards)).
 
 ## Node types
 
@@ -51,9 +51,9 @@ There are 9 built-in templates, from Minimal Q&A to Traceable Weekly Report. The
 | Execution | `tool` `code` `merge` | Call a tool directly / execute code in the sandbox / merge the results of several queries (aligned by key across databases) |
 | Control | `branch` `loop` `subgraph` | Conditional or semantic branch / iteration and conditional loop / nested workflow |
 | Context | `memory` `retrieve` `transform` | Long-term memory read/write / knowledge retrieval / data shaping |
-| Gatekeeping | `human` `validate` `metrics` | Human-in-the-loop / Schema validation and automatic rework / caliber card |
+| Gatekeeping | `human` `validate` `metrics` `analysis` | Human-in-the-loop / Schema validation and automatic rework / caliber card / analysis card (a fixed set of deterministic analyses on upstream query results) |
 
-The `output` node validates structured output against a JSON Schema; when the output doesn't conform, the errors go back to the model for automatic rework. For `metrics` (caliber card) and `report` (report writer), see [Evidence and Issuance](evidence.md); for `merge` (merge query), see [Data Sources](data-sources.md#cross-database-merge).
+The `output` node validates structured output against a JSON Schema; when the output doesn't conform, the errors go back to the model for automatic rework. For `metrics` (caliber card) and `report` (report writer), see [Evidence and Issuance](evidence.md); for `analysis` (analysis card), see [Analysis](analysis.md#analysis-cards); for `merge` (merge query), see [Data Sources](data-sources.md#cross-database-merge).
 
 ## Passing data between nodes
 
@@ -125,7 +125,7 @@ Approvals, supplementary input, draft editing, action confirmations, code and to
 
 ## Agent nodes
 
-An `agent` node is a model loop with tools. An allowlist on the node decides which tools it can use (see [Tools](tools.md)). An agent with `output_schema` can turn on `cite_fields`, so each field records which cell of which query it came from (see [Evidence and Issuance](evidence.md#the-data-retrieval-chain)).
+An `agent` node is a model loop with tools. An allowlist on the node decides which tools it can use (see [Tools](tools.md)). An agent with `output_schema` can turn on `cite_fields`, so each field records which cell of which query it came from (see [Evidence and Issuance](evidence.md#the-data-retrieval-chain)). An agent that queries data can also be given the analysis tools: breaking down changes and judging anomalies and trends is computed by the platform with fixed methods and thresholds, the system writes the verdict phrases, and reports cite them (see [Analysis tools for agents](analysis.md#analysis-tools-for-agents)).
 
 ### Guardrails
 
@@ -186,7 +186,7 @@ On top of the governance check, the governed level adds evidence gates. They loo
 
 - **G1** At an exit with a contract, the text in output fields may come only from report-writer nodes.
 - **G2** Model-written text doesn't bypass the report-writer node to flow straight into the exit.
-- **G3** The report-writer node sets `numbers: strict`, `on_violation: fail`, and `claims: require_citation` (or `judge`, with a budget).
+- **G3** The report-writer node sets `numbers: strict`, `on_violation: fail`, `claims: require_citation` (or `judge`, with a budget), and `analysis_claims: strict` (the analysis claim check set to strict; see [Analysis claim check](analysis.md#analysis-claim-check)).
 - **G4** Caliber card inputs don't come from sandbox code in the compute role.
 - **G5** Agents that feed a caliber card have `output_schema` set and `cite_fields` turned on.
 

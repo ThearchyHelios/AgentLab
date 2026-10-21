@@ -338,6 +338,64 @@ TEMPLATES: list[dict[str, Any]] = [
         ],
         "edges": [_e("start", "review"), _e("review", "approved", "approved"), _e("review", "rejected", "rejected")],
     },
+    {
+        # 分析能力一轮（docs/design/analysis-round/00-总方案.md §3.7）：模板定骨架——分析卡固定做哪几项分析写在图里，判定由
+        # 系统按平台的方法和阈值算、系统写判定语，报告撰写节点只引用。照模板 ⑨ 的写法，拿来就能按受管级别发布
+        "name": "⑪ 异动分析（可追溯）",
+        "description": "周销售额的异动分析，每个判断都可追溯：两个「调用工具」节点取数（整体按周、按地区两周），分析卡固定做"
+        "两项分析——这一周的变化在不在常规波动范围内、变化主要来自哪个地区（拆开后各段之和和总数核对闭合），报告撰写节点只引用"
+        "判定语和数，判断词逐句核对。使用前请接入名为 shop 的数据源（含 orders 表的 order_date、region、amount 列），或上传"
+        "同名表格。SQL 按 SQLite 的写法，按周汇总时期次取每周第一天（周一）的日期；接别的库时换成那个库的写法。报告撰写节点已按"
+        "受管级别设置核对规则。",
+        "tags": ["分析", "出具", "周报", "证据"],
+        "nodes": [
+            _n("start", "input", "周期", fields=[
+                {"name": "week", "default": "2026-10-12", "description": "本周的第一天（周一）"},
+                {"name": "prev_week", "default": "2026-10-05", "description": "上周的第一天（周一）"}]),
+            # 期次在 SQL 里由日期列算出来（每周第一天的日期）：分析卡据此认出每一期覆盖哪几天，本期过没过完核对得了。
+            # 倒序排：第 0 行是本周、第 1 行是上周，变化拆解按这两格核对闭合
+            _n("weekly", "tool", "整体按周（26 周）", tool="db_query__shop", args={"sql": (
+                "SELECT date(order_date, '-6 days', 'weekday 1') AS \"周\", SUM(amount) AS \"销售额\"\n"
+                "FROM orders\n"
+                "WHERE order_date >= date('{{ input.week }}', '-175 days')"
+                " AND order_date < date('{{ input.week }}', '+7 days')\n"
+                "GROUP BY date(order_date, '-6 days', 'weekday 1')\n"
+                "ORDER BY \"周\" DESC")}),
+            _n("by_region", "tool", "按地区两周", tool="db_query__shop", args={"sql": (
+                "SELECT region AS \"地区\", date(order_date, '-6 days', 'weekday 1') AS \"周\", SUM(amount) AS \"销售额\"\n"
+                "FROM orders\n"
+                "WHERE order_date >= '{{ input.prev_week }}' AND order_date < date('{{ input.week }}', '+7 days')\n"
+                "GROUP BY region, date(order_date, '-6 days', 'weekday 1')\n"
+                "ORDER BY \"地区\", \"周\"")}),
+            # 阈值不写在图里：取设置里的分析一组（发起时快照）；要固定阈值时在这张卡上写「阈值覆盖」
+            _n("check", "analysis", "异动分析卡", items=[
+                {"id": "wow", "op": "baseline", "from": "weekly",
+                 "params": {"period": "周", "measure": "销售额", "target": "{{ input.week }}", "grain": "week",
+                            "label": "销售额"},
+                 "hypothesis": "本周销售额的变化在不在常规波动范围内"},
+                {"id": "where", "op": "decompose", "mode": "additive", "from": "by_region",
+                 "params": {"by": ["地区"], "period": "周", "base": "{{ input.prev_week }}", "target": "{{ input.week }}",
+                            "measure": "销售额", "headline": {"base": "weekly.r1.销售额", "target": "weekly.r0.销售额"},
+                            "label": "销售额"},
+                 "hypothesis": "本周销售额的变化主要来自哪个地区"},
+            ]),
+            # 受管出具要求报告撰写节点写明最严的几项（发布门禁 G3，含分析说法核对设为严格），模板照着写
+            _n("write", "report", "报告撰写", numbers="strict", on_violation="fail", claims="require_citation",
+               analysis_claims="strict",
+               system="你是经营分析撰写人：结论先行，判断照分析结论写，只写有数据支撑的内容。",
+               instructions="为 {{ input.week }} 开始的这一周写一份销售额异动分析：先用一句话说本周销售额和上周比变了多少，"
+                            "再按分析卡的两项结论说这个变化在不在常规波动范围内、主要来自哪个地区，最后用一张表列出各地区的"
+                            "变化。判断照分析结论写、直接引用判定语，没有分析结论的判断不下；有一项没有做成的，照实写原因。"),
+            # 图里没有口径卡：报告直接引用查询和分析结论的格，契约开「单元格引用」（受管级别要写明）
+            _n("done", "output", "出具",
+               fields=[{"name": "异动分析", "value": "{{ nodes.write.text }}"}],
+               contract={"report_from": "write", "cells": True, "strict": True}),
+        ],
+        "edges": [
+            _e("start", "weekly"), _e("weekly", "by_region"), _e("by_region", "check"),
+            _e("check", "write"), _e("write", "done"),
+        ],
+    },
 ]
 
 

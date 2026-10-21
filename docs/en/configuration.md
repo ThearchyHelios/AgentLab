@@ -67,7 +67,7 @@ For the app database, checkpoint database, connection pool, PgBouncer, and multi
 | Location | Contents |
 |---|---|
 | Settings → Model Access | Providers and keys |
-| Settings → Preferences | Run defaults (default memory scope, default knowledge base, require approval for dangerous tools by default); the evidence judge (judge model and limits); verification (verification model, the switches and limits for double-blind recomputation, adversarial review, and approval inquiry, and the daily spending cap; see [The review suite](evidence.md#the-review-suite)); evaluation concurrency, per-question time limit, and per-evaluation and daily spending; run concurrency (admins); the caliber ledger (automatic issuance by caliber and its daily cap, the caliber matching time limit, the recall limit `ledger.recall_limit`; see [Caliber ledger](evaluation-and-ledger.md#caliber-ledger)); drafting model; apps (the daily cap on on-demand runs per app, letting users create personal apps, allowing share links); interface theme |
+| Settings → Preferences | Run defaults (default memory scope, default knowledge base, require approval for dangerous tools by default); the evidence judge (judge model and limits); verification (verification model, the switches and limits for double-blind recomputation, adversarial review, and approval inquiry, and the daily spending cap; see [The review suite](evidence.md#the-review-suite)); evaluation concurrency, per-question time limit, and per-evaluation and daily spending; analysis (the thresholds used for verdicts, how many analyses an agent may run per execution, the drill-down depth, how many segments are listed; see [Analysis settings](#analysis-settings)); run concurrency (admins); the caliber ledger (automatic issuance by caliber and its daily cap, the caliber matching time limit, the recall limit `ledger.recall_limit`; see [Caliber ledger](evaluation-and-ledger.md#caliber-ledger)); drafting model; apps (the daily cap on on-demand runs per app, letting users create personal apps, allowing share links); interface theme |
 | Settings → General | Public URL |
 | Settings → Runtime Environment | Sandbox candidates and their availability, the current choice and its reason; current values such as time limits |
 | Settings → Identity | Login mode; enabling Ask Data for users |
@@ -76,6 +76,30 @@ For the app database, checkpoint database, connection pool, PgBouncer, and multi
 | Settings → Audit | Audit records |
 
 Other settings: `notify.digest_at` (the time of the daily task digest), and the agent token budget, spending budget, and step count.
+
+### Analysis settings
+
+The Analysis section under Settings → Preferences governs how change decomposition, the fluctuation baseline, the trend test, and the difference test judge, and how many analyses an agent may run (see [Analysis](analysis.md)). It is snapshotted into a run when the run starts, and resuming or continuing uses the same snapshot; an analysis card can carry threshold overrides, and agents can't change any of it.
+
+| Setting | Default | Range | What it does |
+|---|---|---|---|
+| Main-source share | 0.5 | 0.3–0.9 | A segment (a factor, an effect) accounting for this share of the total change is the main source |
+| Concentration share | 0.8 | 0.5–0.99 | The top few segments together accounting for this share count as concentrated; can't be below the main-source share |
+| Offset ratio | 0.25 | 0.05–1 | When the segments moving the other way add up to more than this share of the total change, a caveat says they offset each other |
+| Flat threshold | 0.005 | 0–0.1 | A total change below this share of the base counts as essentially flat |
+| Outside-fluctuation multiple | 2 | 1–5 | Fluctuation baseline: this many robust standard deviations from the historical median counts as outside the usual fluctuation |
+| Far-outside multiple | 3 | 1.5–8 | This many counts as far outside; must be greater than the outside-fluctuation multiple |
+| Minimum history periods | 8 | 4–104 | With less history than this, the fluctuation baseline can't be done |
+| Maximum history periods | 52 | 8–260 | The fluctuation baseline and the trend test use at most this many periods; can't be below the minimum |
+| Minimum trend periods | 6 | 4–104 | The trend test needs at least this many periods |
+| Trend significance level | 0.05 | 0.001–0.2 | Rising or falling is judged only when p is below this |
+| Difference-test significance level | 0.05 | 0.001–0.2 | A corrected p below this means the difference holds up |
+| Minimum sample size for means | 30 | 2–10000 | When a group has fewer samples in a comparison of means, a caveat says the sample is small |
+| Minimum expected frequency for rates | 5 | 1–50 | When a cell's expected frequency is below this, Fisher's exact test is used |
+| Minimum denominator for ratio breakdowns | 30 | 1–100000 | Segments with a smaller denominator are marked small and left out of the Simpson's paradox judgment |
+| Maximum analyses per agent execution | 12 | 1–50 | Once used up, further analysis tool calls from the agent are told the analyses are used up |
+| Maximum drill-down depth | 3 | 1–6 | How many levels a change decomposition can drill down |
+| Segments listed | 10 | 3–30 | How many segments of a result table the writing catalog and the reply to the agent list |
 
 ## Sandbox backend
 

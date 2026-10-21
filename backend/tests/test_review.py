@@ -494,7 +494,8 @@ def test_analysis_signals_are_registered_as_gaps_that_only_need_a_note():
     assert [(s.kind, s.severity) for s in signals] == [
         ("report_analysis_claims", rv.DEGRADED), ("analysis_refused", rv.DEGRADED),
         ("metric_comparability_skipped", rv.DEGRADED)]
-    assert {s.kind for s in signals} == rv.NOTE_ONLY
+    # NOTE_ONLY 另有一种不是日志代码的：分析调用写错了一直没改对（analysis_call_failed，见 tests/test_review_analysis.py）
+    assert {s.kind for s in signals} == rv.NOTE_ONLY - {rv.ANALYSIS_CALL_FAILED}
     assert not rv.should_retry(signals) and not rv.NOTE_ONLY & (rv.RETRYABLE | rv.REBUILD)
 
 

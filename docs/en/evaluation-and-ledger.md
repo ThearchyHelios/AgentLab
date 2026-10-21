@@ -16,13 +16,18 @@ Each question in a test suite is a question plus an expected answer. The expecta
 - A metric of a published caliber.
 - A query identified from an Ask Data run.
 - "No data", or a clarifying question back.
+- The main source of a change (contribution): an expected SQL statement plus the parameters of one change decomposition. The mode is additive, ratio, or factor, the parameter names are the same as the analysis tools', and you also set how many top segments to name (1–10, default 1); the expectation is the computed main source and direction.
+- A verdict: an expected SQL statement plus parameters for a fluctuation baseline, a trend test, a difference test (with its mode), or a comparability check; the expectation is the computed class of verdict: usual fluctuation or outside it; rising, falling, or no clear trend; a difference that holds up or not enough to conclude; comparable or not comparable (see [The five analyses](analysis.md#the-five-analyses)).
 
 Rules:
 
-- Numeric values may not be typed in by hand.
+- Numeric values may not be typed in by hand. Nor may the segments, directions, and verdicts in contribution and verdict expectations: they are computed on the snapshot of the expected SQL with the same analyses the answer uses, once before and once after the answer.
+- The parameters of contribution and verdict expectations include no input (the input is the expected SQL's result), no totals, no drill-down, and no thresholds; text parameters may use the schedule variables `{{ schedule.* }}`. When the expected SQL returns only two periods, the base and current periods can be left out: the earlier one is the base. Caliber questions and questions that expect a clarifying question back can't have these two kinds.
+- Thresholds come from the analysis settings snapshotted when the evaluation starts: computing expectations and every arm's answers use the same snapshot, which is recorded in the evaluation's fingerprint ("analysis settings"). An expectation that can't be computed (not enough history, an incomplete current period, and so on) makes that item ungradable, with the reason stated.
 - Text key points are judged by the judge, listed separately, and not counted toward accuracy.
 - After a caliber version bump, questions that use it show a notice at the top. Each question takes one of three options: switch to pinning the new version, compute one expectation for each of the old and new versions, or archive the old question and create a new one. Until then, the question is skipped in evaluations.
 - Test suites can be imported and exported.
+- The repository includes a fictional retail database and a test suite for analytical questions: in the `backend` directory, run `python -m tests.fixtures.acceptance.retail_trends <database file> [--today YYYY-MM-DD]` to generate 26 weeks of orders up to yesterday (with a fixed random seed), register it as a read-only data source named `retail_trends`, then import `tests/fixtures/eval/analysis_suite.json` (eight questions, one for each planted effect).
 
 ### Run an evaluation
 
@@ -42,7 +47,16 @@ Rules:
 - **Comparison**: against the previous evaluation or a baseline, with per-question transitions and attribution.
 - **A/B paired table**: exact McNemar test; display only, not a gate.
 
-Evaluation runs are left out of usage statistics. The scoring rules are at version 2; old evaluations can be re-scored under the new rules from the evaluation details (reading only the sealed records, without calling models).
+Contribution and verdict expectations are scored like this:
+
+- **Correct and traceable**: the answer cites an analysis conclusion whose verdict matches (the same analysis; for a main source, it names the expected segments with the same direction). If the sentence citing it says the opposite, it is wrong.
+- **Correct but uncited**: no matching conclusion is cited, but the body states it correctly by the lexicon (the same judgment words and binding rules; see [Analysis claim check](analysis.md#analysis-claim-check)). Comparability has no judgment words, so only a citation counts.
+- **Wrong**: the cited conclusion's verdict doesn't match, the body says the opposite (calling a usual fluctuation unusual, rising falling, or naming another segment as the main source), the analysis was done but not stated, or it wasn't done at all.
+- **Ungradable**: the expectation can't be computed.
+
+The system-written Analysis Scope doesn't count as a citation by the answer. When an answer cites analysis conclusions, the per-question E1 compares their input queries.
+
+Evaluation runs are left out of usage statistics. The scoring rules are at version 3 (which adds contribution and verdict expectations); old evaluations can be re-scored under the new rules from the evaluation details (reading only the sealed records, without calling models). Copilot's prompt fingerprint includes the analysis method and the writer's analysis rules, so a comparison with the previous evaluation flags "Prompt changed" when they change.
 
 ### Scheduled evaluations
 
@@ -68,6 +82,7 @@ After an exploratory run is sealed, the system compares the answer with publishe
 - Judging is number by number: when a report cites several columns of one query (for example sales, order count, first and last day), each number is compared on its own column against the caliber's metric column, and extra queried columns don't affect it. This applies only when removing the other columns wouldn't change the number; queries with DISTINCT, truncation after sorting by another column, or extra grouping columns are still compared as a whole.
 - When a multi-row query has no `ORDER BY`, citing one of its cells doesn't count as "from a caliber", and recall and reconciliation mark it "Row order undefined".
 - An answer is issued automatically only when every number in it that comes from data is proven to come from the same caliber.
+- Numbers in analysis conclusions (shares, changes, fluctuation ranges) are derived from query results, so they aren't compared or labeled with a caliber and aren't counted in the summary line.
 
 When writing a caliber's data-fetch SQL, it is best not to round (`ROUND(SUM(x), 2)`) or wrap values in `COALESCE(…, 0)`. Leave rounding and defaults to the caliber card's decimal places and display settings; otherwise Ask Data queries written without rounding will never be recognized as equivalent (and where they differ is stated plainly).
 

@@ -6,9 +6,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from app.analysis.contract import OP_LABELS, TOOL_NAMES
 from app.core.events import EventType
 from app.engine.issuance import extract_numbers, trace_numbers
 from app.engine.toolcalls import leaked_markup
+from app.tools.analysis import CALL_ERROR_HEAD, REFUSED_CODE
 
 # --------------------------------------------------------------------------
 # 跑完之后的复核层。
@@ -145,11 +147,15 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 分析能力一轮（00-总方案 §3.7）：只写说明、不自动重来（NOTE_ONLY）。答案照常交付，缺口照实说一句就够了：
     # 报告里判断词没挂对分析结论、原因没有依据，重写后仍有（check 标在报告里，strict 另记出具缺口）
     "report_analysis_claims": ("report_analysis_claims", DEGRADED),
-    # 一份分析算不了（历史不够、本期不完整、截断……）：算不了本身是一条结论，写作者照实写原因
-    "analysis_refused": ("analysis_refused", DEGRADED),
+    # 一份分析算不了（历史不够、本期不完整、截断……）：算不了本身是一条结论，写作者照实写原因。一次运行里几次算不了的
+    # 并成一条「有 n 次分析没做成」（_analysis_signal），不一次一条
+    REFUSED_CODE: (REFUSED_CODE, DEGRADED),
     # 口径卡上用到两次查询的指标没做成可比性检查（探查失败、算不了）：指标照常算，两期能不能直接比要人自己核对
     "metric_comparability_skipped": ("metric_comparability_skipped", DEGRADED),
 }
+#: 分析调用写错了、后来同一个分析工具一次都没做成（tool.error 带 call_error，见 scan）：这几次分析没做成，同 analysis_refused
+#: 是缺口不是断裂。它不是日志代码，是 scan 从工具事件里认出来的信号种类
+ANALYSIS_CALL_FAILED = "analysis_call_failed"
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。
 # 工具参数错了、步数不够、图没校验过，都属于改一下再来一遍就行的。
@@ -160,7 +166,9 @@ REBUILD = {"query_no_data", "metric_no_data"}
 
 #: 只写说明、不自动重来的信号（00-总方案 §3.7）：都是缺口（DEGRADED）、不进 RETRYABLE / REBUILD。一次运行的信号全是
 #: 这几种时复核不叫模型，说明就照信号原话写（review）：答案照常、报告里已经标出，叫一次模型只是把同一句话换个说法
-NOTE_ONLY = frozenset({"report_analysis_claims", "analysis_refused", "metric_comparability_skipped"})
+NOTE_ONLY = frozenset({"report_analysis_claims", REFUSED_CODE, "metric_comparability_skipped", ANALYSIS_CALL_FAILED})
+#: 「有 n 次分析没做成」那条信号里最多点名几次，其余写「……」
+_ANALYSIS_SHOWN = 3
 
 #: 串行工具模式下塞给未执行调用的占位说明。它漏到用户面前当过答案，
 #: 所以复核要认得出来。从 nodes.llm 导入会绕成循环，这里按内容识别。
@@ -229,12 +237,25 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
     finals = _final_checks(rows)
     #: 报过的节点失败 (节点 id, 原话)：子工作流节点跟着子图里那一步失败时认得出是同一件事
     failures: list[tuple[str, str]] = []
-    for e in rows:
+    #: 没做成的分析：算不了的（analysis_refused 日志）、调用写错了一直没改对的（带 call_error 的 tool.error）。各并成一条信号，
+    #: 排在第一次出现的位置（slots：信号种类 → (那时信号清单有多长, 第几条事件)）
+    refused: list[tuple[str, Mapping[str, Any]]] = []
+    unfixed: list[tuple[str, Mapping[str, Any]]] = []
+    slots: dict[str, tuple[int, int]] = {}
+    for seq, e in enumerate(rows):
         etype = str(_event_field(e, "type", ""))
         data = _event_field(e, "data") or {}
         node_id = _event_field(e, "node_id") or ""
 
-        if etype == EventType.TOOL_ERROR:
+        if etype == EventType.TOOL_ERROR and data.get("call_error"):
+            # 分析调用写错了（contract.CallError：列不存在、比率当可加、这次执行的分析次数用完……）：不记结论，原话交回 Agent
+            # 照着改。后来同一个分析工具做成了，那是它改对了，不是缺口；一直没做成的，那几次分析没做成——缺口不是断裂，
+            # 只写说明、不重来（NOTE_ONLY）：重来一遍，Agent 照样可能不做这项分析
+            if str(data.get("tool") or "") not in recovered:
+                slots.setdefault(ANALYSIS_CALL_FAILED, (len(signals), seq))
+                unfixed.append((str(node_id), data))
+
+        elif etype == EventType.TOOL_ERROR:
             tool = str(data.get("tool") or "工具")
             err = str(data.get("error") or "").strip()[:200]
             if tool in recovered:
@@ -274,6 +295,10 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
                 q = str(data.get("query") or "").strip()[:60]
                 add("retrieve_empty", f"知识库里没有检索到与「{q}」相关的内容", BROKEN)
 
+        elif etype == EventType.LOG and data.get("level") == "warn" and data.get("code") == REFUSED_CODE:
+            slots.setdefault(REFUSED_CODE, (len(signals), seq))
+            refused.append((str(node_id), data))
+
         elif etype == EventType.LOG and data.get("level") == "warn":
             message = str(data.get("message") or "").strip()
             code = str(data.get("code") or "")
@@ -285,6 +310,12 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             reason = data.get("reason")
             if message:
                 add(kind, message[:300], severity, reason if isinstance(reason, str) and reason else None)
+
+    # 先插靠后的那条（位置一样时先插后出现的），靠前那条的位置就不受影响
+    for kind in sorted(slots, key=lambda k: slots[k], reverse=True):
+        items = refused if kind == REFUSED_CODE else unfixed
+        signals.insert(slots[kind][0], Signal(kind, _analysis_signal(kind, items, titles), DEGRADED))
+        kinds.add(kind)
 
     text = answer_text(output)
     if not text:
@@ -305,6 +336,48 @@ def _step_name(node_id: str, titles: Mapping[str, str]) -> str:
         return titles.get(node_id) or node_id
     parts = node_id.split("/")
     return " › ".join(titles.get("/".join(parts[:i + 1])) or parts[i] for i in range(len(parts)))
+
+
+#: 分析工具名 → 算子（contract.TOOL_NAMES 反过来）：说「波动基线没有做成」，不写工具名
+_TOOL_OPS = {name: op for op, name in TOOL_NAMES.items()}
+
+
+def _analysis_who(node_id: str, data: Mapping[str, Any], titles: Mapping[str, str]) -> str | None:
+    """没做成的那次分析是谁做的、哪一种：「「周报分析」的分析项「wow」（波动基线）」「「数据查询」的变化拆解」「「分析团队」的
+    成员「取数员」的趋势判断」。认不出是哪一种分析（老运行、事件里没带）为 None。"""
+    op = data.get("op") if data.get("op") in OP_LABELS else _TOOL_OPS.get(str(data.get("tool") or ""))
+    if op is None:
+        return None
+    where = f"「{_step_name(node_id, titles)}」" if node_id else ""
+    if data.get("item"):
+        return f"{where}的分析项「{data['item']}」（{OP_LABELS[op]}）"
+    member = f"的成员「{data['agent']}」" if data.get("agent") else ""
+    return f"{where}{member}的{OP_LABELS[op]}" if where or member else OP_LABELS[op]
+
+
+def _analysis_why(kind: str, data: Mapping[str, Any]) -> str:
+    """没做成的原因：算不了的照结论里的原因；调用写错的照交回 Agent 的那句（去掉「分析调用有误，没有记成结论：」的开头）。"""
+    if kind == REFUSED_CODE:
+        return str(data.get("reason") or "").strip() or "原因未知"
+    error = str(data.get("error") or "").strip()
+    return (error[len(CALL_ERROR_HEAD):] if error.startswith(CALL_ERROR_HEAD) else error).strip() or "原因未知"
+
+
+def _analysis_signal(kind: str, items: list[tuple[str, Mapping[str, Any]]], titles: Mapping[str, str]) -> str:
+    """一次运行里没做成的分析并成的那一句：一次时照实说哪一项、为什么；几次时先说「有 n 次分析没做成」，再点名前几次。
+    认不出是哪一种分析的（老运行的事件）照日志原话。复核模型、只写说明的复核都照这一句说。"""
+    told: list[tuple[str | None, str, str]] = []
+    for node_id, data in items:
+        told.append((_analysis_who(node_id, data, titles), _analysis_why(kind, data),
+                     str(data.get("message") or data.get("error") or "").strip()))
+    verb = "没有做成" if kind == REFUSED_CODE else "的调用写错了、一直没改对，没有做成"
+    if len(told) == 1:
+        who, why, raw = told[0]
+        return (f"{who}{verb}：{why}" if who else raw or f"有 1 次分析没有做成：{why}")[:300]
+    head = f"有 {len(told)} 次分析没做成" if kind == REFUSED_CODE else f"有 {len(told)} 次分析调用写错了、一直没改对，没有做成"
+    named = "；".join(f"{who}：{why}" if who else raw or why for who, why, raw in told[:_ANALYSIS_SHOWN])
+    more = "；……" if len(told) > _ANALYSIS_SHOWN else ""
+    return f"{head}。{named}{more}"[:300]
 
 
 #: 报告节点「改过一次」的信号：按同一个节点最后一次 report.checked 的结果定档（最终通过的不是缺口）

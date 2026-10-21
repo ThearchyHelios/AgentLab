@@ -153,7 +153,8 @@ class ChatDriver(TurnDriver):
         from app.api.copilot import GenerateIn
 
         return GenerateIn(instruction=instruction, base_graph=base_graph, intent="answer",
-                          conversation_id=self.execution.conversation_id, datasource_ids=self.datasource_ids or None)
+                          conversation_id=self.execution.conversation_id, datasource_ids=self.datasource_ids or None,
+                          question=self.question)
 
     async def on_op(self, op: dict[str, Any]) -> None:
         kind = op.get("op")

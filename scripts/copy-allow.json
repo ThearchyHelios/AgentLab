@@ -56,6 +56,12 @@
       "reason": "模板里「写代码」节点的系统提示（写给模型），print(json.dumps(...)) 是代码示例，半角括号和省略号是 Python 语法"
     },
     {
+      "file": "backend/app/seed.py",
+      "text": "AS \"周\"",
+      "rule": "半角标点",
+      "reason": "模板 ⑪「异动分析（可追溯）」两个取数节点的 SQL：结果列按节点手册的规矩起中文别名、SQLite 的写法加双引号（AS \"周\"），引号和逗号是 SQL 语法；中文列名让分析卡的判定语写「分散在各地区」、报告的表头读得懂"
+    },
+    {
       "file": "backend/app/api/copilot.py",
       "text": "报告按 [[i:字段名]]",
       "rule": "半角标点",
