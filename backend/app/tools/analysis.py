@@ -86,9 +86,13 @@ class AnalysisScope:
     def add_query(self, alias: str, snapshot: InputSnapshot) -> None:
         self.queries[alias] = snapshot
 
+    def next_alias(self) -> str:
+        """下一份结论在本节点的编号：工具执行完、记台账之前，tool.end 先按它写上这份结论的编号（event_view）。"""
+        return f"{contract.CATALOG_PREFIX}{len(self.results) + 1}"
+
     def add_result(self, result: AnalysisResult, artifact: str) -> str:
         """记一份结论，返回它在本节点的编号（A1、A2……，按记下的先后）。"""
-        alias = f"{contract.CATALOG_PREFIX}{len(self.results) + 1}"
+        alias = self.next_alias()
         self.results[alias] = result
         self.artifacts[alias] = artifact
         return alias
@@ -363,6 +367,17 @@ def reply_text(alias: str, result: AnalysisResult) -> str:
     return REPLY_HEAD.format(alias=alias) + "\n" + json.dumps(body, ensure_ascii=False, default=str)
 
 
+def event_view(result: AnalysisResult, alias: str | None = None) -> dict[str, Any]:
+    """分析工具的 tool.end 上带的那一小段（tool.end 的 analysis）：编号、算子、模式、状态、判定码、方向、判定语、算不了的原因码。
+    preview 只是结论 JSON 的前一截（截到 2000 个字符），判定语多半在截掉的那段里；时间线照这一段显示，不从 preview 里拼。
+    编号是这份结论在本节点的编号（「【分析 An】」那个，AnalysisScope.next_alias），不记台账的执行里没有编号，为 None。
+    判定语是系统渲染的（遮罩列不当维度、度量，里面没有遮罩值）；Agent 写的假设不带。"""
+    verdict = result.get("verdict") or {}
+    return {"alias": alias, "op": result.get("op"), "mode": result.get("mode"), "status": result.get("status"),
+            "verdict": verdict.get("code"), "direction": verdict.get("direction"), "phrase": result.get("phrase") or "",
+            "reason_code": result.get("reason_code")}
+
+
 def hypothesis_of(value: Any) -> str | None:
     """agent（或模板作者）写的「这次在验证什么」：去掉首尾空白、截到 HYPOTHESIS_MAX 字；空的为 None。"""
     text = str(value or "").strip()
@@ -371,6 +386,6 @@ def hypothesis_of(value: Any) -> str | None:
 
 __all__ = [
     "ANALYSIS_TOOLS", "CALL_ERROR_HEAD", "REFUSED_CODE", "REPLY_HEAD", "SCOPE_KEY", "AnalysisScope", "call_error_text", "context_of",
-    "hypothesis_of", "input_snapshot", "is_analysis_tool", "masked_of", "payload_of", "prepare", "reply_text",
+    "event_view", "hypothesis_of", "input_snapshot", "is_analysis_tool", "masked_of", "payload_of", "prepare", "reply_text",
     "run_snapshot", "scope_of", "settings_of", "store", "tool_context",
 ]

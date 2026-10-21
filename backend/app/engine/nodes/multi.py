@@ -38,6 +38,7 @@ from app.tools.analysis import (
     SCOPE_KEY as ANALYSIS_SCOPE_KEY,
     AnalysisScope,
     call_error_text,
+    event_view,
     input_snapshot,
     is_analysis_tool,
     payload_of,
@@ -461,7 +462,9 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                          agent=name, call_id=cid, preview=content[:1500],
                          duration_ms=int((time.perf_counter() - started) * 1000), **failure,
                          **({"checks": checks} if checks else {}),
-                         **({"analysis_artifact": analysis["artifact"]} if analysis else {}))
+                         # 判定的那一小段同 Agent 节点（event_view）；编号是成员自己的分析容器里的，紧接着 _numbered 按它编
+                         **({"analysis_artifact": analysis["artifact"],
+                             "analysis": event_view(analysis["result"], scope.next_alias())} if analysis else {}))
                 if analysis is not None and analysis["result"].get("status") == "refused":
                     ctx.emit(EventType.LOG, level="warn", code=ANALYSIS_REFUSED, agent=name, call_id=cid, tool=tname,
                              reason_code=analysis["result"].get("reason_code"),
