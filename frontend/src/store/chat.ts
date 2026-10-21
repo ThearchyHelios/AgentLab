@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { ANALYSIS_TEXT, analysisMethodLabel, analysisToolOp } from '../lib/termsAnalysis'
 import { ApiError, api, streamRun } from '../api/client'
 import { streamChatTurn, type ChatTurnEvent, type ChatTurnStart } from '../api/chatTurns'
 import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
@@ -1649,9 +1650,12 @@ function watch(flow: Flow, runId: string, after = 0): () => void {
     switch (event.type) {
       case 'tool.start': {
         const tool = String(d.tool ?? '')
+        // 分析工具写算子的叫法（契约的叫法，lib/termsAnalysis），不写 analysis_decompose
+        const op = analysisToolOp(tool)
         patch((t) => (t.phase !== 'running' ? {} : {
           status: tool.startsWith('db_query') ? '正在查询数据…'
             : tool.startsWith('db_schema') ? '正在读取数据结构…'
+            : op ? ANALYSIS_TEXT.step.running(analysisMethodLabel(op, d.args?.mode))
             : tool ? `正在调用 ${tool}…` : '正在运行…',
         }))
         break

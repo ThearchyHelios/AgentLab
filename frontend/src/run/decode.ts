@@ -15,6 +15,7 @@ import { catalogPatchOf, patchBeforeText, patchValueText, patchWhere } from './c
 import { LEDGER_FEEDBACK_TEXT, RECALL_TEXT } from '../lib/termsRecall'
 import { claimCountsOf, isJudged, statsTally } from '../lib/evidence'
 import { isSqlCheckCode, sortSqlChecks, sqlCheckOf, sqlChecksOf, sqlCheckWhere, sqlRuleLabel } from '../lib/sqlcheck'
+import { ANALYSIS_TEXT, analysisMethodLabel, analysisToolOp } from '../lib/termsAnalysis'
 
 // 泳道数据画布也要用（supervisor 节点要展开成协作矩阵），所以类型放在
 // types.ts 里；这里再导出一遍，老引用不用改
@@ -80,6 +81,7 @@ export type StepKind =
   | 'llm'       // 模型调用
   | 'query'     // 数据库查询
   | 'schema'    // 看表结构
+  | 'analysis'  // 分析：Agent 的分析工具、分析卡的一项
   | 'tool'      // 其他工具
   | 'code'      // 沙箱代码
   | 'branch'    // 分支走向
@@ -163,6 +165,8 @@ export interface Step {
   tier?: string
   /** 合并查询那一行（merge.end）：合并了哪几个输入、几条警告。SQL 在 detail，预览在 result */
   merge?: MergeStep
+  /** 分析那一行（Agent 分析工具的 tool.start / tool.end、分析卡一项的 analysis.end）：算子、判定语、编号。参数在 detail */
+  analysis?: AnalysisStep
   /** 对照数据目录的 SQL 检查结果：查询那一行（tool.end.checks）、指标所依据的查询没通过检查那一行（log.checks） */
   checks?: SqlCheckItem[]
   /** fix 要去的不是这一行所在的节点（指标的问题出在来源查询节点的 SQL 上）：去哪个节点、落到哪一栏 */
@@ -179,6 +183,25 @@ export interface MergeStepInput {
   label?: string
   rows?: number
   source?: string
+}
+
+/**
+ * 分析的一步：判定语、编号、算不了的原因码都是服务端给的（tool.end 的 analysis，tools/analysis.event_view；分析卡的 analysis.end），
+ * 界面只排版。写错的调用（tool.error 带 call_error）没有判定，callError 是服务端的代码
+ */
+export interface AnalysisStep {
+  op?: string
+  mode?: string | null
+  /** Agent 工具的结论在本节点的编号（A1）；分析卡的一项用 item */
+  alias?: string | null
+  item?: string
+  status?: string
+  verdict?: string | null
+  phrase?: string
+  reasonCode?: string | null
+  callError?: string
+  /** Agent 写的「这次在验证什么」（调用参数里的 hypothesis） */
+  hypothesis?: string
 }
 
 export interface MergeStep {
@@ -889,6 +912,35 @@ function explainLog(code: string | undefined, message: string, d: Record<string,
         next: MASKED_CELL_TEXT.next,
       }
     }
+    case 'report_analysis_claims': {
+      // 判断词没挂对分析结论、原因没有依据，重写后仍有（report.py）：读结构化字段 count、texts，不从原话里认。check 照常产出、
+      // 只标注；strict 另记了出具缺口（原话里说了，详情里有）
+      const n = typeof d.count === 'number' && d.count > 0 ? d.count : undefined
+      const texts = strs(d.texts)
+      return {
+        title: ANALYSIS_TEXT.log.claims(n, d.mode === 'strict'),
+        sub: texts.length ? texts.map((t) => `「${t}」`).join('、') : undefined,
+        next: ANALYSIS_TEXT.issuance.claimsNext,
+      }
+    }
+    case 'analysis_refused': {
+      // 分析那一行不在（老事件）时才走到这里：照结构化字段写哪一种分析没有做成、原因
+      const tool = analysisToolOp(d.tool)
+      const op = typeof d.op === 'string' ? d.op : tool
+      return {
+        title: ANALYSIS_TEXT.log.refused(analysisMethodLabel(op), str(d.item)),
+        sub: str(d.reason),
+        next: ANALYSIS_TEXT.step.refusedNext,
+      }
+    }
+    case 'metric_comparability_skipped': {
+      // 口径卡的环比、同比用到两份同形查询，可比性检查没做成（metrics.py）：指标照常算，两期能不能直接比要自己核对
+      return {
+        title: ANALYSIS_TEXT.log.comparabilitySkipped(str(d.metric_name) ?? str(d.metric) ?? ''),
+        sub: str(d.reason),
+        next: ANALYSIS_TEXT.log.comparabilitySkippedNext,
+      }
+    }
     case 'report_catalog_trimmed': {
       // 写作目录超出篇幅（report.py _trimmed_message）。读结构化字段（queries、omitted、nodes），不从原话里认
       const total = typeof d.queries === 'number' ? d.queries : undefined
@@ -1318,9 +1370,46 @@ function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
     return { ...base, kind: 'schema', title: clip(`查看 ${tables.length} 张表的字段：${head}…`),
              detail: tables.join('\n') }
   }
+  const op = analysisToolOp(tool)
+  if (op) {
+    // Agent 的分析工具：标题写算子的叫法（契约的叫法），不写 analysis_decompose；参数里没填的不列。判定语、编号等 tool.end
+    const shown = Object.fromEntries(Object.entries(args ?? {}).filter(([k, v]) => v != null && k !== 'hypothesis'))
+    const hypothesis = typeof args?.hypothesis === 'string' && args.hypothesis.trim() ? args.hypothesis.trim() : undefined
+    return {
+      ...base, kind: 'analysis', title: analysisMethodLabel(op, args?.mode),
+      detail: Object.keys(shown).length ? JSON.stringify(shown, null, 2) : undefined,
+      analysis: { op, ...(args?.mode ? { mode: String(args.mode) } : {}), ...(hypothesis ? { hypothesis } : {}) },
+    }
+  }
   const argText = Object.keys(args ?? {}).length
     ? JSON.stringify(args, null, 2) : ''
   return { ...base, kind: 'tool', title: clip(`调用 ${tool}`), detail: argText || undefined }
+}
+
+/**
+ * tool.end 的 analysis（tools/analysis.event_view）折进分析那一行：标题接上编号，副标题是判定语（算不了的就是「…没有做成：原因」，
+ * 服务端写好的）；算不了的用提醒色。老服务端没有这一段：preview 只是结论的前一截，判定语多半被截掉，只照参数写叫法，不从里面拼
+ */
+function settleAnalysis(step: Step, d: Record<string, any>): void {
+  const view = d.analysis && typeof d.analysis === 'object' ? d.analysis as Record<string, any> : null
+  const info: AnalysisStep = { ...(step.analysis ?? {}) }
+  if (view) {
+    if (typeof view.op === 'string') info.op = view.op
+    if (view.mode != null) info.mode = String(view.mode)
+    if (typeof view.alias === 'string' && view.alias) info.alias = view.alias
+    if (typeof view.status === 'string') info.status = view.status
+    if (typeof view.verdict === 'string') info.verdict = view.verdict
+    if (typeof view.phrase === 'string' && view.phrase) info.phrase = view.phrase
+    if (typeof view.reason_code === 'string') info.reasonCode = view.reason_code
+  }
+  step.analysis = info
+  step.title = ANALYSIS_TEXT.step.title(analysisMethodLabel(info.op, info.mode), info.alias)
+  if (info.phrase) step.sub = step.sub ? `${info.phrase} · ${step.sub}` : info.phrase
+  if (info.status === 'refused') {
+    step.level = 'warn'
+    step.next = ANALYSIS_TEXT.step.refusedNext
+  }
+  if (typeof d.analysis_artifact === 'string' && d.analysis_artifact) step.artifact = d.analysis_artifact
 }
 
 /** 低于这个毫秒数的节点不参与并行分组：瞬时节点谁跟谁都"重叠"，是噪音不是信息 */
@@ -1739,6 +1828,11 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
   const escalated = new Map<string, { step: Step; tool: string; reason: string }[]>()
   /** node_id → 起止时刻。用来事后认出"哪几个节点是同时跑的" */
   const spans = new Map<string, { start: number; end: number; ms: number }>()
+  /**
+   * 分析那一行（Agent 工具按 call_id，分析卡按节点 + 项）：紧跟着的那条「没有做成」的提醒（log analysis_refused）说的是同一件事，
+   * 那一行已经写了判定语（「…没有做成：原因」），不再另起一行
+   */
+  const analysisSteps = new Map<string, Step>()
 
   /** 协作团队的状态只有一个来源：reduceTeam。画布那边调的是同一个函数 */
   const trackTeam = (event: RunEvent): void => {
@@ -2216,7 +2310,24 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
             step.sub = step.sub ? `${step.sub} · ${counts}` : counts
             if (n('error') || n('warning')) step.level = 'warn'
           }
-          if (step.kind === 'query' || step.kind === 'schema' || failed) {
+          if (step.kind === 'analysis') {
+            // 分析：成了的照 tool.end 的 analysis 写判定语和编号（结论工件在 analysis_artifact，preview 是结论 JSON 的前一截，
+            // 不摆出来）。写错的调用（call_error）和别的工具报错一样算这一次没成，但它没有记成结论、原话交回了 Agent，Agent 会
+            // 照着改了再调：副标题说清没记成结论，下一步写在行下面，原话在展开区
+            if (failed) {
+              const why = String(d.error ?? preview)
+              step.sub = d.call_error ? ANALYSIS_TEXT.step.callError : step.sub
+              step.result = why
+              if (d.call_error) {
+                step.analysis = { ...(step.analysis ?? {}), callError: String(d.call_error) }
+                step.next = ANALYSIS_TEXT.step.callErrorNext
+              }
+            } else {
+              settleAnalysis(step, d)
+              analysisSteps.set(key, step)
+            }
+            step.meta = dur(step.ms)
+          } else if (step.kind === 'query' || step.kind === 'schema' || failed) {
             // 查询保留 SQL 作为 detail，结果另挂；失败时结果就是错误原因
             step.detail = failed ? `${step.detail ?? ''}\n\n${preview}`.trim() : step.detail
             step.result = preview
@@ -2720,6 +2831,12 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
             break
           }
         }
+        if (d.code === 'analysis_refused') {
+          // 一份分析没有做成：分析那一行已经写了「…没有做成：原因」，同一件事不再另起一行。找不到那一行（老事件）才照下面说
+          const key = typeof d.call_id === 'string' && d.call_id ? `call:${d.call_id}`
+            : `${nodeId ?? '_'}:item:${String(d.item ?? '')}`
+          if (analysisSteps.has(key)) break
+        }
         // 双盲复算、反方审稿的日志按 code 和结构化字段解读：info 的也上时间线，没有原话的老日志照样说得出来。
         // 后端标了 warn / error 的照它的来，explainLog 认为该提醒的（有缺口、有推翻）也用提醒色
         if (typeof d.code === 'string' && VERIFY_LOG_CODES.has(d.code)) {
@@ -2860,6 +2977,31 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           level: count ? undefined : 'warn',
           title: count ? `召回 ${count} 条相关记忆` : '未召回相关记忆',
         }, nodeId)
+        break
+      }
+
+      case 'analysis.end': {
+        // 分析卡的一项做完了（engine/nodes/analysis.py）：标题写算子的叫法和这一项的标识，副标题是判定语（服务端写好的，算不了
+        // 的是「…没有做成：原因」）。结论工件可以点开
+        const item = typeof d.item === 'string' ? d.item : ''
+        const info: AnalysisStep = {
+          ...(typeof d.op === 'string' ? { op: d.op } : {}), ...(d.mode != null ? { mode: String(d.mode) } : {}),
+          ...(item ? { item } : {}), ...(typeof d.status === 'string' ? { status: d.status } : {}),
+          ...(typeof d.verdict === 'string' ? { verdict: d.verdict } : {}),
+          ...(typeof d.phrase === 'string' && d.phrase ? { phrase: d.phrase } : {}),
+          ...(typeof d.reason_code === 'string' ? { reasonCode: d.reason_code } : {}),
+        }
+        const refused = d.status === 'refused'
+        const row: Step = {
+          id: `an-${seq}`, seq, kind: 'analysis', nodeId, status: 'done',
+          title: ANALYSIS_TEXT.step.title(analysisMethodLabel(d.op, d.mode), item),
+          ...(info.phrase ? { sub: info.phrase } : {}),
+          ...(refused ? { level: 'warn' as const, next: ANALYSIS_TEXT.step.refusedNext } : {}),
+          ...(typeof d.analysis_artifact === 'string' && d.analysis_artifact ? { artifact: d.analysis_artifact } : {}),
+          analysis: info,
+        }
+        analysisSteps.set(`${nodeId ?? '_'}:item:${item}`, row)
+        push(row, nodeId)
         break
       }
 

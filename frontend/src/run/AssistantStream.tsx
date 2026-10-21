@@ -4,7 +4,7 @@ import {
 } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  AlertCircle, AlertTriangle, ArrowDown, Brain, ChevronRight, CircleCheck, CircleDot, CornerDownRight,
+  AlertCircle, AlertTriangle, ArrowDown, Brain, ChartColumnStacked, ChevronRight, CircleCheck, CircleDot, CornerDownRight,
   Database, Download, ExternalLink, FileCode, FileDown, GitBranch, Hand, Info, ListChecks, Play, Settings2,
   Scale, ShieldCheck, Sparkles, Table2, Terminal, UserX, Users, Wrench, XCircle,
 } from 'lucide-react'
@@ -20,6 +20,7 @@ import {
   nodeTypeLabel,
 } from '../lib/terms'
 import { SqlCheckList } from './SqlChecks'
+import { ANALYSIS_TEXT } from '../lib/termsAnalysis'
 import {
   ISSUANCE_HINT, childrenByExec, compactSteps, parseQueryResult, progressOf, splitIssuanceGaps, spread, teamVerdictOf,
   type Exec, type FixKind, type ResultTable as Table, type Step, type StepKind, type TeamMemberEx,
@@ -28,7 +29,9 @@ import {
 import { CODE_COLUMN, CopyChip, LEADING_ZERO, Markdown, type MarkSpec } from './Markdown'
 import { ClaimTally, EvidenceField, type EvidenceDocHandle } from './EvidenceDoc'
 import { EVIDENCE_STATE, claimProblems, docTally, evidenceFields, issuanceMarks, type EvidenceTally } from '../lib/evidence'
-import type { EvidenceDocData, IssuanceSqlCheck } from '../types'
+import type {
+  EvidenceDocData, IssuanceAnalysisClaims, IssuanceComparability, IssuanceSqlCheck, IssuanceUntraced,
+} from '../types'
 import { useRunClock } from './useRunClock'
 import { CatalogPatchCard } from './CatalogPatchCard'
 import type { CatalogPatch } from './catalogPatch'
@@ -131,7 +134,7 @@ export interface StreamTurn {
 }
 
 const ICONS: Record<StepKind, typeof Wrench> = {
-  node: CircleDot, think: Brain, llm: Sparkles, query: Database, schema: Table2,
+  node: CircleDot, think: Brain, llm: Sparkles, query: Database, schema: Table2, analysis: ChartColumnStacked,
   tool: Wrench, code: Terminal, branch: GitBranch, human: Hand,
   issuance: FileCode, note: CircleDot, error: XCircle, lifecycle: CircleCheck,
 }
@@ -1011,6 +1014,11 @@ const REVEAL_TRIES = 4
 const notable = (s: Step): boolean =>
   s.status === 'failed' || s.status === 'running' || s.status === 'waiting' || s.status === 'rejected'
   || s.level === 'error' || s.level === 'warn'
+/**
+ * 折起来时也留着的：上面那些，加上分析的那几行——判定语就是这一步查出来的结论（变化来自哪里、算不算异常），收进「前面的 N 条」
+ * 就看不到 Agent 是怎么下的判断。它们不算出了问题（分轮的警示标记只看 notable）
+ */
+const kept = (s: Step): boolean => notable(s) || s.kind === 'analysis'
 
 function StepList({ steps, depth, turnMs, fold = false }: {
   steps: Step[]; depth: number; turnMs?: number
@@ -1025,7 +1033,7 @@ function StepList({ steps, depth, turnMs, fold = false }: {
   // 问题的一律留着。反过来只画前 20 条的话，长运行跑到后面，正在跑的那一步反而
   // 被收进「展开其余」里看不见
   const keep = fold && rows.length > 6 ? 3 : rows.length > LIST_CAP ? LIST_HEAD : 0
-  const shown = !all && keep ? rows.filter((s, i) => notable(s) || i >= rows.length - keep) : rows
+  const shown = !all && keep ? rows.filter((s, i) => kept(s) || i >= rows.length - keep) : rows
   const hidden = rows.length - shown.length
   // 画布上点名要看的节点正好收在前面那一截里：先展开，上面的定位下一帧就找得到它
   useLayoutEffect(() => {
@@ -1086,7 +1094,8 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
   const [open, setOpen] = useState(false)
   const Icon = ICONS[step.kind] ?? CircleDot
   const result = step.result
-  const expandable = !!(step.detail || result || step.raw || step.artifact || step.checks?.length)
+  const expandable = !!(step.detail || result || step.raw || step.artifact || step.checks?.length
+    || step.analysis?.phrase || step.analysis?.hypothesis)
   const table = result ? parseQueryResult(result) : null
   const status = step.status ?? 'done'
   // 失败的节点：收着的时候就说为什么（和轮次顶上的报错同一份 lib/explain），展开再看原因、
@@ -1136,6 +1145,7 @@ function StepLine({ step, depth, turnMs }: { step: Step; depth: number; turnMs?:
       data-node-id={step.nodeId}
       data-step-status={failed ? 'failed' : status}
       data-step-code={step.code}
+      data-step-kind={step.kind}
       aria-busy={running || undefined}
     >
       <button
@@ -1539,8 +1549,26 @@ function StepDetail({ step, table, explained }: {
           </ul>
         </div>
       )}
+      {step.analysis && (step.analysis.phrase || step.analysis.hypothesis) && (
+        // 分析：判定语（服务端写好的一句，收着时副标题可能被截断）、Agent 写的假设（只在这里和证据面板显示，不是结论）
+        <dl className="space-y-0.5 text-2xs leading-relaxed" data-step-analysis={step.analysis.alias ?? step.analysis.item ?? ''}>
+          {step.analysis.phrase && (
+            <div className="flex gap-1.5">
+              <dt className="shrink-0 text-faint">{ANALYSIS_TEXT.step.phrase}</dt>
+              <dd className="min-w-0 text-fg [overflow-wrap:anywhere]" data-step-analysis-phrase="">{step.analysis.phrase}</dd>
+            </div>
+          )}
+          {step.analysis.hypothesis && (
+            <div className="flex gap-1.5">
+              <dt className="shrink-0 text-faint">{step.analysis.item ? ANALYSIS_TEXT.step.itemHypothesis : ANALYSIS_TEXT.step.hypothesis}</dt>
+              <dd className="min-w-0 text-dim [overflow-wrap:anywhere]" data-step-analysis-hypothesis="">{step.analysis.hypothesis}</dd>
+            </div>
+          )}
+        </dl>
+      )}
       {detail && (
         <div className="group/detail relative">
+          {step.kind === 'analysis' && <div className="mb-0.5 text-2xs text-dim">{ANALYSIS_TEXT.step.args}</div>}
           {step.kind === 'query' && (
             <div className="mb-0.5 flex items-center gap-2 text-2xs text-dim">
               <span className={step.merge ? undefined : 'mono'}>{step.merge ? MERGE_TEXT.sql : 'SQL'}</span>
@@ -2363,6 +2391,75 @@ export function IssuanceSqlChecks({ tier, checks }: { tier: string; checks: Issu
 }
 
 /**
+ * 出具声明里分析能力一轮的三项（engine/nodes/io.py），都只在有的时候带：
+ * - analysis_claims：分析说法核对，strict 或有违规时有——几处、记没记缺口（strict 记缺口、check 只标注）、前几处的原话
+ * - comparability：报告引用的指标里两期有条件可比、不可比的，判定语和原因（不可比的另记了缺口，在其余缺口里）
+ * - untraced：报告引用的指标里输入没追到原始数据的，追到哪个节点为止（受管级别的正式运行记缺口）
+ * 说法都是服务端写好的（违规的原话、判定语、原因），这里只排版；颜色跟着档位，同 IssuanceSqlChecks
+ */
+export function IssuanceAnalysis({ tier, claims, comparability, untraced }: {
+  tier: string; claims?: IssuanceAnalysisClaims | null; comparability?: IssuanceComparability[]; untraced?: IssuanceUntraced | null
+}) {
+  const I = ANALYSIS_TEXT.issuance
+  const tone = tier === 'withheld' ? 'var(--st-failed)' : 'var(--st-waiting)'
+  const violations = (claims?.violations ?? []).filter((v) => v && typeof v === 'object')
+  const count = typeof claims?.count === 'number' ? claims.count : violations.length
+  const metrics = (untraced?.metrics ?? []).filter((m) => m && typeof m === 'object')
+  if (!(claims && (count > 0 || claims.counted)) && !comparability?.length && !metrics.length) return null
+  const box = { borderColor: `color-mix(in srgb, ${tone} 45%, var(--border))`, background: `color-mix(in srgb, ${tone} 6%, transparent)` }
+  return (
+    <>
+      {claims && (count > 0 || claims.counted) && (
+        <div className="mt-1.5 rounded border px-2 py-1.5 text-2xs leading-relaxed" style={box}
+             data-issuance-analysis-claims={claims.counted ? 'counted' : 'flagged'}>
+          <div className="flex items-center gap-1 font-medium" style={{ color: tone }}>
+            <AlertTriangle size={11} aria-hidden /> {count > 0 ? I.claimsTitle(count, !!claims.counted) : I.claimsStrictClean}
+          </div>
+          {violations.length > 0 && (
+            <ul className="mt-0.5 space-y-0.5">
+              {violations.map((v, i) => (
+                <li key={`${v.code}:${v.segment ?? i}`} className="[overflow-wrap:anywhere]" data-issuance-analysis-claim={v.code}>
+                  {v.text && <span className="font-medium text-fg">「{v.text}」</span>}
+                  <span className="text-dim">（{ANALYSIS_TEXT.claim.label[v.code] ?? v.code}）</span>
+                  {v.message && <span className="text-fg">：{v.message}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {count > 0 && <div className="mt-0.5 text-dim">{I.claimsNext}</div>}
+        </div>
+      )}
+      {!!comparability?.length && (
+        <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: tone }} data-issuance-comparability={comparability.length}>
+          <div className="font-medium">{I.comparabilityTitle}</div>
+          <ul className="mt-0.5 space-y-0.5 pl-2 [overflow-wrap:anywhere]">
+            {comparability.map((c, i) => (
+              <li key={`${c.metric ?? ''}:${i}`} data-issuance-comparability-item={c.verdict ?? ''}>
+                · {I.comparabilityItem(c.name || c.metric || '', c.phrase || ANALYSIS_TEXT.evidence.comparabilityLabel[c.verdict ?? ''] || '')}
+                {!!c.reasons?.length && <span className="text-dim">（{c.reasons.join('；')}）</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {metrics.length > 0 && (
+        <div className="mt-1.5 text-2xs leading-relaxed" style={{ color: tone }} data-issuance-untraced={untraced?.counted ? 'counted' : 'flagged'}>
+          <div className="font-medium">{I.untracedTitle(!!untraced?.counted)}</div>
+          <ul className="mt-0.5 space-y-0.5 pl-2 [overflow-wrap:anywhere]">
+            {metrics.map((m, i) => (
+              <li key={`${m.metric ?? ''}:${i}`}>
+                · {I.untracedItem(m.name || m.metric || '', (m.stops ?? []).map((st) => EVIDENCE_TEXT.originStop(st.path ?? '',
+                  EVIDENCE_TEXT.originNode(st.label || st.node_id || '', st.type ? nodeTypeLabel(st.type) : ''))))}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </>
+  )
+}
+
+/**
  * 出具横幅里双盲复算、反方审稿报上来的一组缺口：failed「核查未通过」、unfinished「核查未完成」。排在「校验未全部完成」
  * 上面，样子和它一样（同一种提醒色、小标题加圆点列表），一条都没有时不画
  */
@@ -2495,6 +2592,9 @@ export function IssuanceBanner({ issuance, runClass, evidence }: {
       )}
 
       {!!sqlChecks.length && <IssuanceSqlChecks tier={tier} checks={sqlChecks} />}
+      <IssuanceAnalysis tier={tier} claims={issuance?.analysis_claims}
+                        comparability={Array.isArray(issuance?.comparability) ? issuance.comparability : undefined}
+                        untraced={issuance?.untraced} />
       <IssuanceGaps kind="failed" title={DUAL_CHECK_TEXT.verifyGaps.failed} gaps={verifyFailed} />
       <IssuanceGaps kind="unfinished" title={DUAL_CHECK_TEXT.verifyGaps.unfinished} gaps={verifyUnfinished} />
       {!!gaps.length && (

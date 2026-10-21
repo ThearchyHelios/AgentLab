@@ -112,6 +112,68 @@ await section('知识检索', async () => {
   check('未知事件的类型名不上标题和副标题', !unknown.some((x) => x.title.includes('brand.new') || x.sub?.includes('brand.new')))
 })
 
+await section('分析：Agent 的分析工具、分析卡的每一项', async () => {
+  // 真跑出来的两次运行（fixtures.analysis_agent / analysis_card：后端测试库里的虚构零售库 shop，模型换成脚本）。Agent 查两次库、
+  // 写错一次变化拆解（列不存在）、做变化拆解、波动基线（两周历史不够，算不了）、可比性检查；分析卡两项。判定语、编号都是服务端
+  // 给的（tool.end 的 analysis、analysis.end），preview 只是结论 JSON 的前一截，不拿来拼
+  const all = flatten(mod.decodeRun(fixtures.analysis_agent, { status: 'succeeded' }))
+  const rows = all.filter((s) => s.kind === 'analysis')
+  check('四次分析调用各一行（kind analysis），挂在 Agent 节点下', rows.length === 4 && rows.every((s) => s.nodeId === 'bot'),
+    rows.map((s) => s.title).join(' | '))
+  const [wrong, decompose, baseline, comparable] = rows
+  check('标题写算子的叫法（契约），不写 analysis_decompose', rows.every((s) => !s.title.includes('analysis_')) && wrong?.title === '变化拆解（可加）',
+    wrong?.title)
+  check('写错的调用：这一次没成、副标题说没有记成结论，下一步写 Agent 会照着改', wrong?.status === 'failed'
+    && wrong.sub === '调用有误，没有记成结论' && !!wrong.next?.includes('Agent 会按这条说明改正参数'), `${wrong?.status} ${wrong?.sub}`)
+  check('……服务端的原话留在展开区，调用错误的代码记在这一行', !!wrong?.result?.includes('Q2 里没有「sales」这一列')
+    && wrong.analysis?.callError === 'unknown_column', wrong?.result)
+  check('做成的：标题接上本节点的编号（A1，和交回模型的「【分析 A1】」同一个）', decompose?.title === '变化拆解（可加） · A1', decompose?.title)
+  check('……副标题是服务端渲染的判定语', decompose?.sub === '销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）', decompose?.sub)
+  check('……结论工件可下钻，Agent 写的假设另记、不进参数', !!decompose?.artifact && decompose.analysis?.hypothesis === '下降是不是集中在某个地区'
+    && !decompose.detail?.includes('hypothesis') && !decompose.detail?.includes('null'), decompose?.detail?.slice(0, 80))
+  check('……preview（结论 JSON 的前一截）不摆出来', !decompose?.result, decompose?.result?.slice(0, 40))
+  check('算不了的：一条结论（不是失败），提醒色，判定语就是「…没有做成：原因」', baseline?.status === 'done' && baseline.level === 'warn'
+    && baseline.title === '波动基线 · A2' && baseline.sub === '波动基线没有做成：只有 0 期历史，至少要 8 期', `${baseline?.title} ${baseline?.sub}`)
+  check('……下一步说能照实写原因、不能据此下判断', !!baseline?.next?.includes('算不了也是一条结论'))
+  check('……紧跟着的「没有做成」提醒折进这一行，不另起一行', !all.some((s) => s.code === 'analysis_refused'),
+    all.filter((s) => s.code === 'analysis_refused').map((s) => s.title).join(' | '))
+  check('可比性检查也有编号和判定语', comparable?.title === '可比性检查 · A3' && !!comparable.sub?.startsWith('两期可比'), comparable?.title)
+  check('分析那几行是正常的子步骤：不当成运行出错（运行照样完成）', all.some((s) => s.kind === 'lifecycle' && s.title === '完成'))
+  const claims = all.find((s) => s.code === 'report_analysis_claims')
+  check('报告的分析说法重写后仍有：说成人话（几处、已在报告中标注），副标题点名判断词', claims?.title === '报告有 3 处分析说法未通过核对，已在报告中标注'
+    && claims.sub === '「主要来自」、「异常」、「由于」' && !!claims.next?.includes('判断要挂对应的分析结论'), `${claims?.title} ${claims?.sub}`)
+
+  // 老服务端：tool.end 没有 analysis 那一小段。只照参数写叫法，不编号、不从 preview 里拼判定语
+  const legacy = fixtures.analysis_agent.map((e) => (e.type === 'tool.end' && e.data?.analysis
+    ? { ...e, data: Object.fromEntries(Object.entries(e.data).filter(([k]) => k !== 'analysis')) } : e))
+  const old = flatten(mod.decodeRun(legacy, { status: 'succeeded' })).filter((s) => s.kind === 'analysis')
+  check('老服务端：照参数写叫法，没有编号和判定语，也不摆 preview', old[1]?.title === '变化拆解（可加）' && !old[1].sub && !old[1].result,
+    `${old[1]?.title} ${old[1]?.sub ?? ''}`)
+  // 老事件里「没有做成」的提醒找不到那一行时照结构化字段说
+  const lone = flatten(mod.decodeRun([
+    { seq: 1, type: 'node.started', node_id: 'bot', ts: 1, data: { node_type: 'agent', label: '问数据' } },
+    { seq: 2, type: 'log', node_id: 'bot', ts: 2, data: { level: 'warn', code: 'analysis_refused', tool: 'analysis_trend', call_id: 'x9',
+      reason_code: 'history_short', reason: '只有 3 期历史，至少要 6 期', message: 'analysis_trend 没有做成：只有 3 期历史，至少要 6 期' } },
+  ])).find((s) => s.code === 'analysis_refused')
+  check('……那一行不在时：照结构化字段说哪一种分析没有做成、原因', lone?.title === '趋势判断没有做成' && lone.sub === '只有 3 期历史，至少要 6 期',
+    `${lone?.title} ${lone?.sub}`)
+
+  // 分析卡：每项一行（analysis.end），标题写算子的叫法和这一项的标识
+  const card = flatten(mod.decodeRun(fixtures.analysis_card, { status: 'succeeded' }))
+  const items = card.filter((s) => s.kind === 'analysis')
+  check('分析卡的两项各一行，挂在分析卡下', items.length === 2 && items.every((s) => s.nodeId === 'card'), items.map((s) => s.title).join(' | '))
+  check('……标题写叫法和标识，副标题是判定语', items[0]?.title === '波动基线 · wow' && items[1]?.title === '变化拆解（可加） · where'
+    && items[1].sub === '销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）', items.map((s) => `${s.title}：${s.sub}`).join(' | '))
+  check('……算不了的那一项提醒色，结论工件可下钻', items[0]?.level === 'warn' && !!items[0].artifact && !!items[1]?.artifact)
+  check('……analysis.end 不再落成「未识别的事件」，紧跟着的提醒也不另起一行', !card.some((s) => s.title === '未识别的事件')
+    && !card.some((s) => s.code === 'analysis_refused'))
+
+  // 协作成员的分析：编号是成员自己的，副标题接着写是谁调用的
+  const team = flatten(mod.decodeRun(synthetic.analysisTeamRun(), { status: 'succeeded' })).filter((s) => s.kind === 'analysis')
+  check('协作成员调分析工具：编号是成员自己的，副标题写判定语和谁调用的', team[0]?.title === '变化拆解（可加） · A1'
+    && team[0].sub === `${synthetic.TEAM_PHRASE} · 分析员 调用` && team[1]?.title === '波动基线 · A2', team.map((s) => `${s.title}：${s.sub}`).join(' | '))
+})
+
 await section('合并查询', async () => {
   // merge.end 是合并查询节点做完的那一条：哪几个输入、合并 SQL、几行。和查询同一类（kind query），
   // 合并 SQL 进详情、预览进结果、工件可下钻；警告的原文由紧跟着的 log 各占一行，这一行只说有几条

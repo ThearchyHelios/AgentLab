@@ -25,7 +25,10 @@ const check = (name, cond, detail = '') => {
  * 一节一节地跑：某一节里元素找不到、等待超时，只记成这一节失败，接着跑下一节，
  * 不让一处卡住把后面的检查一起吞掉。各节自己开页面
  */
+// STREAM_ONLY=分析,出具横幅 只跑段名里含这些字的段（逗号分隔），改一处时不用整本跑；check-all 不会把它传下来
+const ONLY = (process.env.STREAM_ONLY ?? '').split(',').filter(Boolean)
 async function section(name, fn) {
+  if (ONLY.length && !ONLY.some((k) => name.includes(k))) return
   console.log(`\n=== ${name} ===`)
   try {
     await fn()
@@ -733,6 +736,84 @@ await section('合并查询：输入、合并 SQL、结果预览，警告各占�
   const overflow = await narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   check('窄栏展开合并那一行：输入清单、合并 SQL、预览都不撑出横向滚动', overflow <= 0, `${overflow}px`)
   await narrow.page.close()
+})
+
+await section('分析：Agent 的分析工具、分析卡的每一项一行，判定语在副标题，展开看判定语、假设和参数；算不了、调用有误照实说', async () => {
+  // 用例 analysis（dev/fixtures/analysis.tsx）：两轮真跑出来的事件（fixtures.json 的 analysis_agent、analysis_card）
+  const { page, errors } = await open('syn=analysis', { w: 1100, h: 1000, name: 'analysis' })
+  const rows = page.locator('[data-step-kind="analysis"]')
+  await rows.first().waitFor({ timeout: 8000 }).catch(() => {})
+  // 没成的那一行图标位上是失败的标记（同别的步骤），其余五行是分析的图标
+  check('六行分析（Agent 四次调用、分析卡两项），没成的那行之外都是分析的图标', await rows.count() === 6
+    && await page.locator('[data-step-kind="analysis"]:not([data-step-status="failed"]) svg.lucide-chart-column-stacked').count() === 5,
+    String(await rows.count()))
+  const line = async (i) => (await rows.nth(i).innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('做成的一行：标题写算子的叫法和编号，副标题是判定语', (await line(1)).includes('变化拆解（可加） · A1')
+    && (await line(1)).includes('主要来自华东（-300，占 88.2%）'), await line(1))
+  check('……标题里不出现工具名 analysis_decompose', !(await page.locator('[data-turn]').first().innerText()).includes('analysis_decompose'))
+  await rows.nth(1).locator('button').first().click()
+  await page.waitForTimeout(200)
+  const open1 = rows.nth(1)
+  check('展开：判定语完整写出、Agent 写的假设另列', (await open1.locator('[data-step-analysis-phrase]').innerText().catch(() => ''))
+    .startsWith('销售额下降 340') && (await open1.locator('[data-step-analysis-hypothesis]').innerText().catch(() => '')) === '下降是不是集中在某个地区')
+  check('……参数（没填的不列）、结论工件可点开', (await open1.innerText()).includes('参数') && !(await open1.innerText()).includes('null')
+    && await open1.getByText(/查看完整证据/).count() === 1)
+  const wrong = rows.nth(0)
+  check('调用有误：这一次没成，副标题写没有记成结论，下一步写在行下面', (await wrong.getAttribute('data-step-status')) === 'failed'
+    && (await line(0)).includes('调用有误，没有记成结论')
+    && (await wrong.locator('[data-step-next]').innerText().catch(() => '')).includes('Agent 会按这条说明改正参数'), await line(0))
+  await wrong.locator('button').first().click()
+  await page.waitForTimeout(150)
+  check('……展开看服务端的原话', (await wrong.innerText()).includes('Q2 里没有「sales」这一列'))
+  const refused = rows.nth(2)
+  check('算不了：提醒色（不是失败），判定语就是原因，下一步说照实写原因', (await refused.getAttribute('data-step-status')) === 'done'
+    && (await line(2)).includes('波动基线没有做成：只有 0 期历史，至少要 8 期')
+    && (await refused.locator('[data-step-next]').innerText().catch(() => '')).includes('算不了也是一条结论'), await line(2))
+  const card = await line(5)
+  check('分析卡的一项：标题写叫法和这一项的标识，副标题是判定语', card.includes('变化拆解（可加） · where') && card.includes('主要来自华东'), card)
+  const body = await page.locator('body').innerText()
+  check('没有「未识别的事件」，「没有做成」的提醒不另起一行', !body.includes('未识别的事件') && !body.includes('analysis_baseline 没有做成'))
+  check('报告的分析说法：一行说几处、已标注，下一步写怎么改', body.includes('报告有 3 处分析说法未通过核对，已在报告中标注'))
+  const banner = page.locator('[data-issuance-banner]').first()
+  const claims = (await banner.locator('[data-issuance-analysis-claims]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('出具横幅：check 的分析说法单列一块，写不影响档位，三处各一条（种类的叫法同审计）', claims.includes('3 处分析说法未通过核对（已标注，不影响出具档位）')
+    && claims.includes('「主要来自」') && claims.includes('判断与分析结论不符') && claims.includes('因果说法没有依据'), claims)
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await page.close()
+
+  const narrow = await open('syn=analysis&dense=1', { w: 380, h: 900 })
+  await narrow.page.locator('[data-step-kind="analysis"] button').nth(1).click()
+  await narrow.page.waitForTimeout(200)
+  const overflow = await narrow.page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('窄栏展开分析那一行：判定语、参数都不撑出横向滚动', overflow <= 0, `${overflow}px`)
+  await narrow.page.close()
+
+  const team = await open('syn=analysis-team', { w: 1100, h: 900 })
+  const tl = (await team.page.locator('[data-step-kind="analysis"]').first().innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('协作成员的分析：编号是成员自己的，副标题接着写是谁调用的', tl.includes('变化拆解（可加） · A1') && tl.includes('分析员 调用'), tl)
+  await team.page.close()
+})
+
+await section('出具横幅：分析说法（strict 记缺口）、指标的两期可比性、追不到原始数据的指标各列一块', async () => {
+  for (const [w, label] of [[1100, '宽栏'], [390, '390px']]) {
+    const { page, errors } = await open('syn=analysis-issued', { w, h: 900, name: w === 1100 ? 'analysis-issued' : undefined })
+    const banner = page.locator('[data-issuance-banner=degraded]')
+    await banner.waitFor({ timeout: 8000 }).catch(() => {})
+    const claims = (await banner.locator('[data-issuance-analysis-claims="counted"]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check(`${label}：strict 的分析说法写「已计入出具缺口」，原话照服务端`, claims.includes('1 处分析说法未通过核对，已计入出具缺口')
+      && claims.includes('「主要来自华南」与所挂的分析结论 A1 对不上'), claims)
+    const comp = (await banner.locator('[data-issuance-comparability]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check(`${label}：指标的两期可比性一条一个，判定语和原因照服务端`, comp.includes('指标的两期可比性')
+      && comp.includes('指标「环比」：两期不可比') && comp.includes('指标「月环比」：两期有条件可比')
+      && await banner.locator('[data-issuance-comparability-item]').count() === 2, comp)
+    const untraced = (await banner.locator('[data-issuance-untraced="counted"]').innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check(`${label}：追不到原始数据的指标写追到哪为止、已计入缺口`, untraced.includes('报告引用的指标未追到原始数据（已计入出具缺口）')
+      && untraced.includes('指标「客单价」') && untraced.includes('vars.aov 的出处追到「estimate」为止'), untraced)
+    const over = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    check(`${label}：页面不横向溢出`, over <= 0, `${over}px`)
+    check(`${label}：没有运行时报错`, errors.length === 0, errors.join(' | '))
+    await page.close()
+  }
 })
 
 await section('并行查询各配各的；查询的 SQL 检查；指标的问题指到来源查询的 SQL（A1、B2）', async () => {

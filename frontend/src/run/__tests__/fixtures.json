@@ -2345,5 +2345,1743 @@
     "duration_ms": 3021
    }
   }
+ ],
+ "analysis_agent": [
+  {
+   "seq": 1,
+   "type": "run.started",
+   "node_id": null,
+   "ts": 1792575316.530459,
+   "data": {
+    "nodes": 4,
+    "resumed": false,
+    "memory_scope": "default",
+    "collection": "default",
+    "approval_default": "dangerous",
+    "tool_trust": {},
+    "agent_limits": {
+     "max_steps": 100,
+     "budget_tokens": 2000000,
+     "budget_usd": null
+    },
+    "data_versions": {},
+    "replay_protocol": 2
+   }
+  },
+  {
+   "seq": 2,
+   "type": "node.started",
+   "node_id": "start",
+   "ts": 1792575316.537408,
+   "data": {
+    "node_type": "input",
+    "label": "开始"
+   }
+  },
+  {
+   "seq": 3,
+   "type": "node.finished",
+   "node_id": "start",
+   "ts": 1792575316.540537,
+   "data": {
+    "duration_ms": 0,
+    "attempt": 1,
+    "preview": {},
+    "vars": null,
+    "artifact": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+   }
+  },
+  {
+   "seq": 4,
+   "type": "node.started",
+   "node_id": "bot",
+   "ts": 1792575316.542985,
+   "data": {
+    "node_type": "agent",
+    "label": "问数据"
+   }
+  },
+  {
+   "seq": 5,
+   "type": "llm.start",
+   "node_id": "bot",
+   "ts": 1792575316.5529542,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 2
+   }
+  },
+  {
+   "seq": 6,
+   "type": "llm.end",
+   "node_id": "bot",
+   "ts": 1792575316.5666728,
+   "data": {
+    "agent": "问数据",
+    "model": "mock-fast",
+    "duration_ms": 13,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 7,
+   "type": "tool.start",
+   "node_id": "bot",
+   "ts": 1792575316.5674748,
+   "data": {
+    "tool": "db_query__shop",
+    "args": {
+     "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week",
+     "limit": null
+    },
+    "call_id": "call_0",
+    "timeout_s": 30
+   }
+  },
+  {
+   "seq": 8,
+   "type": "tool.end",
+   "node_id": "bot",
+   "ts": 1792575316.602459,
+   "data": {
+    "tool": "db_query__shop",
+    "call_id": "call_0",
+    "duration_ms": 33,
+    "preview": "{\"columns\": [\"week\", \"gmv\"], \"rows\": [[\"2026-W41\", 2700], [\"2026-W42\", 2360]], \"row_count\": 2, \"truncated\": false, \"elapsed_ms\": 2, \"sql\": \"SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week\", \"column_types\": {\"week\": \"text\", \"gmv\": \"number\"}, \"source\": \"shop\", \"schema_artifact\": \"ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798\", \"artifact\": \"6d7d2de72015d30aa4b988218eda7f72037609596e66167ec498ed070cce8986\"}",
+    "artifact": "4ba2dd6cee87055cef129eeca72a3f85f5d8ecb93dce642f8c8a4776e3c5e163",
+    "query_artifact": "6d7d2de72015d30aa4b988218eda7f72037609596e66167ec498ed070cce8986",
+    "schema_artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798"
+   }
+  },
+  {
+   "seq": 9,
+   "type": "llm.start",
+   "node_id": "bot",
+   "ts": 1792575316.603271,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 4
+   }
+  },
+  {
+   "seq": 10,
+   "type": "llm.end",
+   "node_id": "bot",
+   "ts": 1792575316.6166248,
+   "data": {
+    "agent": "问数据",
+    "model": "mock-fast",
+    "duration_ms": 13,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 11,
+   "type": "tool.start",
+   "node_id": "bot",
+   "ts": 1792575316.617507,
+   "data": {
+    "tool": "db_query__shop",
+    "args": {
+     "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week",
+     "limit": null
+    },
+    "call_id": "call_1",
+    "timeout_s": 30
+   }
+  },
+  {
+   "seq": 12,
+   "type": "tool.end",
+   "node_id": "bot",
+   "ts": 1792575316.624993,
+   "data": {
+    "tool": "db_query__shop",
+    "call_id": "call_1",
+    "duration_ms": 6,
+    "preview": "{\"columns\": [\"region\", \"week\", \"gmv\"], \"rows\": [[\"华东\", \"2026-W41\", 1000], [\"华东\", \"2026-W42\", 700], [\"华北\", \"2026-W41\", 600], [\"华北\", \"2026-W42\", 590], [\"华南\", \"2026-W41\", 800], [\"华南\", \"2026-W42\", 780], [\"西南\", \"2026-W41\", 300], [\"西南\", \"2026-W42\", 290]], \"row_count\": 8, \"truncated\": false, \"elapsed_ms\": 1, \"sql\": \"SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week\", \"column_types\": {\"region\": \"text\", \"week\": \"text\", \"gmv\": \"number\"}, \"source\": \"shop\", \"schema_artifact\": \"ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798\", \"artifact\": \"759aa3ca28ccc362bb2189b3b43d46ee568501aba01a45a2dc7ccf8c84778197\"}",
+    "artifact": "c11982ecfb3c9fc19cbdc7f8130ce0c074a333fca494fd970f9cb7435e4297e2",
+    "query_artifact": "759aa3ca28ccc362bb2189b3b43d46ee568501aba01a45a2dc7ccf8c84778197",
+    "schema_artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798"
+   }
+  },
+  {
+   "seq": 13,
+   "type": "llm.start",
+   "node_id": "bot",
+   "ts": 1792575316.625649,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 6
+   }
+  },
+  {
+   "seq": 14,
+   "type": "llm.end",
+   "node_id": "bot",
+   "ts": 1792575316.6383832,
+   "data": {
+    "agent": "问数据",
+    "model": "mock-fast",
+    "duration_ms": 12,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 15,
+   "type": "tool.start",
+   "node_id": "bot",
+   "ts": 1792575316.639947,
+   "data": {
+    "tool": "analysis_decompose",
+    "args": {
+     "mode": "additive",
+     "query": "Q2",
+     "base_query": null,
+     "target_query": null,
+     "by": [
+      "region"
+     ],
+     "period": "week",
+     "base": "2026-W41",
+     "target": "2026-W42",
+     "measure": "sales",
+     "numerator": null,
+     "denominator": null,
+     "product": null,
+     "factors": null,
+     "headline": {
+      "base": "Q1.r0.gmv",
+      "target": "Q1.r1.gmv"
+     },
+     "parent": null,
+     "label": "销售额",
+     "hypothesis": "下降是不是集中在某个地区"
+    },
+    "call_id": "call_2"
+   }
+  },
+  {
+   "seq": 16,
+   "type": "tool.error",
+   "node_id": "bot",
+   "ts": 1792575316.653215,
+   "data": {
+    "tool": "analysis_decompose",
+    "call_id": "call_2",
+    "duration_ms": 13,
+    "preview": "分析调用有误，没有记成结论：Q2 里没有「sales」这一列，度量列要写它的列名：Q2 的列有 region、week、gmv",
+    "artifact": null,
+    "error": "分析调用有误，没有记成结论：Q2 里没有「sales」这一列，度量列要写它的列名：Q2 的列有 region、week、gmv",
+    "call_error": "unknown_column"
+   }
+  },
+  {
+   "seq": 17,
+   "type": "llm.start",
+   "node_id": "bot",
+   "ts": 1792575316.653908,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 8
+   }
+  },
+  {
+   "seq": 18,
+   "type": "llm.end",
+   "node_id": "bot",
+   "ts": 1792575316.667318,
+   "data": {
+    "agent": "问数据",
+    "model": "mock-fast",
+    "duration_ms": 13,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 19,
+   "type": "tool.start",
+   "node_id": "bot",
+   "ts": 1792575316.668731,
+   "data": {
+    "tool": "analysis_decompose",
+    "args": {
+     "mode": "additive",
+     "query": "Q2",
+     "base_query": null,
+     "target_query": null,
+     "by": [
+      "region"
+     ],
+     "period": "week",
+     "base": "2026-W41",
+     "target": "2026-W42",
+     "measure": "gmv",
+     "numerator": null,
+     "denominator": null,
+     "product": null,
+     "factors": null,
+     "headline": {
+      "base": "Q1.r0.gmv",
+      "target": "Q1.r1.gmv"
+     },
+     "parent": null,
+     "label": "销售额",
+     "hypothesis": "下降是不是集中在某个地区"
+    },
+    "call_id": "call_3"
+   }
+  },
+  {
+   "seq": 20,
+   "type": "tool.end",
+   "node_id": "bot",
+   "ts": 1792575316.677173,
+   "data": {
+    "tool": "analysis_decompose",
+    "call_id": "call_3",
+    "duration_ms": 7,
+    "preview": "{\n  \"analysis_artifact\": \"48c5c45acda230f871d3708465c46a027be10e3aabee0c5d99f07c6d7b697080\",\n  \"result\": {\n    \"op\": \"decompose\",\n    \"mode\": \"additive\",\n    \"method\": \"decompose.additive@1\",\n    \"params\": {\n      \"query\": \"Q2\",\n      \"by\": [\n        \"region\"\n      ],\n      \"measure\": \"gmv\",\n      \"period\": \"week\",\n      \"base\": \"2026-W41\",\n      \"target\": \"2026-W42\",\n      \"label\": \"销售额\",\n      \"headline\": {\n        \"base\": \"Q1.r0.gmv\",\n        \"target\": \"Q1.r1.gmv\"\n      },\n      \"today\": \"2026-10-21\",\n      \"catalog\": {\n        \"labels\": {\n          \"region\": \"地区\",\n          \"week\": \"周\"\n        },\n        \"measures\": {\n          \"gmv\": \"flow\"\n        }\n      }\n    },\n    \"settings\": {\n      \"main_share\": 0.5,\n      \"concentration\": 0.8,\n      \"offset_ratio\": 0.25,\n      \"flat_pct\": 0.005,\n      \"table_top_k\": 10\n    },\n    \"inputs\": [\n      {\n        \"ref\": \"Q1.r0.gmv\",\n        \"artifact\": \"6d7d2de72015d30aa4b988218eda7f72037609596e66167ec498ed070cce8986\",\n        \"dialect\": \"sqlite\",\n        \"role\": \"headline_base\",\n        \"row\": 0,\n        \"column\": \"gmv\",\n        \"value\": \"2700\"\n      },\n      {\n        \"ref\": \"Q1.r1.gmv\",\n        \"artifact\": \"6d7d2de72015d30aa4b988218eda7f72037609596e66167ec498ed070cce8986\",\n        \"dialect\": \"sqlite\",\n        \"role\": \"headline_target\",\n        \"row\": 1,\n        \"column\": \"gmv\",\n        \"value\": \"2360\"\n      },\n      {\n        \"ref\": \"Q2\",\n        \"artifact\": \"759aa3ca28ccc362bb2189b3b43d46ee568501aba01a45a2dc7ccf8c84778197\",\n        \"dialect\": \"sqlite\",\n        \"role\": \"data\",\n        \"columns\": [\n          \"region\",\n          \"week\",\n          \"gmv\"\n        ],\n        \"rows\": \"all\"\n      }\n    ],\n    \"probes\": [],\n    \"status\": \"ok\",\n    \"reason_code\": null,\n    \"reason\": null,\n    \"table\": {\n      \"columns\": [\n        \"region\",\n        \"base\",\n        \"target\",\n        \"delta\",\n        \"pct\",\n        \"share\",\n        \"flag\"\n      ],\n      \"labels\": {\n        \"region\": \"地区\",\n        \"base\": \"基期\",\n        \"target\": \"本期\",\n ",
+    "artifact": "d562e02e555caa13a64dfbd4360f0f5163c59dadfdc22b01ee01f190ad0264c3",
+    "analysis_artifact": "48c5c45acda230f871d3708465c46a027be10e3aabee0c5d99f07c6d7b697080",
+    "analysis": {
+     "alias": "A1",
+     "op": "decompose",
+     "mode": "additive",
+     "status": "ok",
+     "verdict": "driver",
+     "direction": "down",
+     "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+     "reason_code": null
+    }
+   }
+  },
+  {
+   "seq": 21,
+   "type": "llm.start",
+   "node_id": "bot",
+   "ts": 1792575316.677779,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 10
+   }
+  },
+  {
+   "seq": 22,
+   "type": "llm.end",
+   "node_id": "bot",
+   "ts": 1792575316.6906571,
+   "data": {
+    "agent": "问数据",
+    "model": "mock-fast",
+    "duration_ms": 12,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 23,
+   "type": "tool.start",
+   "node_id": "bot",
+   "ts": 1792575316.6916301,
+   "data": {
+    "tool": "analysis_baseline",
+    "args": {
+     "query": "Q1",
+     "period": "week",
+     "measure": "gmv",
+     "target": null,
+     "basis": null,
+     "grain": null,
+     "lag": null,
+     "label": "销售额",
+     "hypothesis": "这周的下降算不算异常"
+    },
+    "call_id": "call_4"
+   }
+  },
+  {
+   "seq": 24,
+   "type": "tool.end",
+   "node_id": "bot",
+   "ts": 1792575316.697757,
+   "data": {
+    "tool": "analysis_baseline",
+    "call_id": "call_4",
+    "duration_ms": 4,
+    "preview": "{\n  \"analysis_artifact\": \"4b0485e22a271391e03d721d94619246836cf01f3c4abba59d09f60965f6b4f8\",\n  \"result\": {\n    \"op\": \"baseline\",\n    \"mode\": null,\n    \"method\": \"baseline.robust@1\",\n    \"params\": {\n      \"query\": \"Q1\",\n      \"period\": \"week\",\n      \"measure\": \"gmv\",\n      \"label\": \"销售额\",\n      \"grain\": \"week\",\n      \"basis\": \"change\",\n      \"lag\": 1,\n      \"target\": \"2026-W42\",\n      \"today\": \"2026-10-21\"\n    },\n    \"settings\": {\n      \"k_warn\": 2.0,\n      \"k_alert\": 3.0,\n      \"min_history\": 8,\n      \"max_history\": 52\n    },\n    \"inputs\": [\n      {\n        \"ref\": \"Q1\",\n        \"artifact\": \"6d7d2de72015d30aa4b988218eda7f72037609596e66167ec498ed070cce8986\",\n        \"dialect\": \"sqlite\",\n        \"role\": \"data\",\n        \"columns\": [\n          \"week\",\n          \"gmv\"\n        ],\n        \"rows\": \"all\"\n      }\n    ],\n    \"probes\": [],\n    \"status\": \"refused\",\n    \"reason_code\": \"history_short\",\n    \"reason\": \"只有 0 期历史，至少要 8 期\",\n    \"table\": null,\n    \"values\": {},\n    \"verdict\": null,\n    \"criterion\": \"本期和过去最多 52 期的中位数比，差不到 2 倍稳健标准差（1.4826 倍的中位绝对偏差）算常规波动，2 到 3 倍算超出，3 倍以上算明显超出；历史至少要 8 期\",\n    \"phrase\": \"波动基线没有做成：只有 0 期历史，至少要 8 期\",\n    \"caveats\": [],\n    \"hypothesis\": \"这周的下降算不算异常\"\n  }\n}",
+    "artifact": "ff2ab7e48295401cd539e353ea92fa9de1f163a5cc21d8a4d55f2c7971df2c4b",
+    "analysis_artifact": "4b0485e22a271391e03d721d94619246836cf01f3c4abba59d09f60965f6b4f8",
+    "analysis": {
+     "alias": "A2",
+     "op": "baseline",
+     "mode": null,
+     "status": "refused",
+     "verdict": null,
+     "direction": null,
+     "phrase": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+     "reason_code": "history_short"
+    }
+   }
+  },
+  {
+   "seq": 25,
+   "type": "log",
+   "node_id": "bot",
+   "ts": 1792575316.6977642,
+   "data": {
+    "level": "warn",
+    "code": "analysis_refused",
+    "call_id": "call_4",
+    "tool": "analysis_baseline",
+    "reason_code": "history_short",
+    "reason": "只有 0 期历史，至少要 8 期",
+    "message": "analysis_baseline 没有做成：只有 0 期历史，至少要 8 期"
+   }
+  },
+  {
+   "seq": 26,
+   "type": "llm.start",
+   "node_id": "bot",
+   "ts": 1792575316.698328,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 12
+   }
+  },
+  {
+   "seq": 27,
+   "type": "llm.end",
+   "node_id": "bot",
+   "ts": 1792575316.7115679,
+   "data": {
+    "agent": "问数据",
+    "model": "mock-fast",
+    "duration_ms": 13,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 28,
+   "type": "tool.start",
+   "node_id": "bot",
+   "ts": 1792575316.712502,
+   "data": {
+    "tool": "analysis_comparable",
+    "args": {
+     "base_query": null,
+     "target_query": null,
+     "query": "Q2",
+     "period": "week",
+     "base": "2026-W41",
+     "target": "2026-W42",
+     "measure": "gmv",
+     "grain": null,
+     "hypothesis": "两周能不能直接比"
+    },
+    "call_id": "call_5"
+   }
+  },
+  {
+   "seq": 29,
+   "type": "tool.end",
+   "node_id": "bot",
+   "ts": 1792575316.718932,
+   "data": {
+    "tool": "analysis_comparable",
+    "call_id": "call_5",
+    "duration_ms": 5,
+    "preview": "{\n  \"analysis_artifact\": \"df64b05fa94b6d975de8941f3e7e3c950a0c23ae15ef0d99416e984f1378ca71\",\n  \"result\": {\n    \"op\": \"comparable\",\n    \"mode\": null,\n    \"method\": \"comparable@1\",\n    \"params\": {\n      \"query\": \"Q2\",\n      \"measure\": \"gmv\",\n      \"today\": \"2026-10-21\",\n      \"period\": \"week\",\n      \"base\": \"2026-W41\",\n      \"target\": \"2026-W42\",\n      \"grain\": \"week\",\n      \"catalog\": {\n        \"measures\": {\n          \"gmv\": \"flow\"\n        }\n      }\n    },\n    \"settings\": {},\n    \"inputs\": [\n      {\n        \"ref\": \"Q2\",\n        \"artifact\": \"759aa3ca28ccc362bb2189b3b43d46ee568501aba01a45a2dc7ccf8c84778197\",\n        \"dialect\": \"sqlite\",\n        \"role\": \"data\",\n        \"columns\": [\n          \"week\",\n          \"gmv\"\n        ],\n        \"rows\": \"all\"\n      }\n    ],\n    \"probes\": [],\n    \"status\": \"ok\",\n    \"reason_code\": null,\n    \"reason\": null,\n    \"table\": {\n      \"columns\": [\n        \"check\",\n        \"status\",\n        \"base\",\n        \"target\",\n        \"note\"\n      ],\n      \"labels\": {\n        \"check\": \"检查项\",\n        \"status\": \"结果\",\n        \"base\": \"基期\",\n        \"target\": \"本期\",\n        \"note\": \"说明\"\n      },\n      \"rows\": [\n        [\n          \"同口径\",\n          \"通过\",\n          null,\n          null,\n          null\n        ],\n        [\n          \"窗口长度\",\n          \"核对不了\",\n          null,\n          null,\n          null\n        ],\n        [\n          \"整期\",\n          \"核对不了\",\n          null,\n          null,\n          null\n        ],\n        [\n          \"星期构成\",\n          \"核对不了\",\n          null,\n          null,\n          null\n        ],\n        [\n          \"数据问题\",\n          \"通过\",\n          null,\n          null,\n          null\n        ]\n      ],\n      \"column_types\": {\n        \"check\": \"text\",\n        \"status\": \"text\",\n        \"base\": \"text\",\n        \"target\": \"text\",\n        \"note\": \"text\"\n      }\n    },\n    \"values\": {\n      \"same_query\": \"pass\",\n      \"window\": \"unknown\",\n      \"complete\": \"unknown\",\n      \"weekdays\": \"unknown\",\n      \"data\": \"pass\"\n    },\n    \"verdict\": {\n     ",
+    "artifact": "d6c6f67a96074b43081c2610cf6b20b279745459cac0c47053485f9ab02f27a3",
+    "analysis_artifact": "df64b05fa94b6d975de8941f3e7e3c950a0c23ae15ef0d99416e984f1378ca71",
+    "analysis": {
+     "alias": "A3",
+     "op": "comparable",
+     "mode": null,
+     "status": "ok",
+     "verdict": "comparable",
+     "direction": null,
+     "phrase": "两期可比，窗口长度、整期、星期构成核对不了",
+     "reason_code": null
+    }
+   }
+  },
+  {
+   "seq": 30,
+   "type": "llm.start",
+   "node_id": "bot",
+   "ts": 1792575316.719539,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 14
+   }
+  },
+  {
+   "seq": 34,
+   "type": "llm.end",
+   "node_id": "bot",
+   "ts": 1792575316.758961,
+   "data": {
+    "agent": "问数据",
+    "model": "mock-fast",
+    "duration_ms": 39,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 35,
+   "type": "node.finished",
+   "node_id": "bot",
+   "ts": 1792575316.762788,
+   "data": {
+    "duration_ms": 216,
+    "attempt": 1,
+    "preview": {
+     "text": "销售额下降，主要来自华东。",
+     "steps": 6,
+     "tool_calls": "[6 项]",
+     "model": "mock-fast"
+    },
+    "vars": null,
+    "artifact": "4127f4b0f4080188121d2a5a85f1d578bb84f10756ebfc12bfeaee1109533fb3",
+    "evidence": [
+     {
+      "kind": "tool",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "4ba2dd6cee87055cef129eeca72a3f85f5d8ecb93dce642f8c8a4776e3c5e163",
+      "call_id": "call_0",
+      "tool": "db_query__shop"
+     },
+     {
+      "kind": "query",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "6d7d2de72015d30aa4b988218eda7f72037609596e66167ec498ed070cce8986",
+      "via": "4ba2dd6cee87055cef129eeca72a3f85f5d8ecb93dce642f8c8a4776e3c5e163",
+      "call_id": "call_0",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": 2,
+      "truncated": false,
+      "schema_artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798",
+      "tables": [
+       "orders"
+      ]
+     },
+     {
+      "kind": "schema",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798",
+      "source": "shop",
+      "schema": null,
+      "synced_at": "2026-10-21T09:35:16.507439+00:00",
+      "tables": {
+       "orders": [
+        "id",
+        "week",
+        "region",
+        "channel",
+        "amount"
+       ]
+      }
+     },
+     {
+      "kind": "tool",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "c11982ecfb3c9fc19cbdc7f8130ce0c074a333fca494fd970f9cb7435e4297e2",
+      "call_id": "call_1",
+      "tool": "db_query__shop"
+     },
+     {
+      "kind": "query",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "759aa3ca28ccc362bb2189b3b43d46ee568501aba01a45a2dc7ccf8c84778197",
+      "via": "c11982ecfb3c9fc19cbdc7f8130ce0c074a333fca494fd970f9cb7435e4297e2",
+      "call_id": "call_1",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": 8,
+      "truncated": false,
+      "schema_artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798",
+      "tables": [
+       "orders"
+      ]
+     },
+     {
+      "kind": "tool",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "d562e02e555caa13a64dfbd4360f0f5163c59dadfdc22b01ee01f190ad0264c3",
+      "call_id": "call_3",
+      "tool": "analysis_decompose"
+     },
+     {
+      "kind": "analysis",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "48c5c45acda230f871d3708465c46a027be10e3aabee0c5d99f07c6d7b697080",
+      "op": "decompose",
+      "mode": "additive",
+      "status": "ok",
+      "verdict": "driver",
+      "inputs": [
+       "6d7d2de72015d30aa4b988218eda7f72037609596e66167ec498ed070cce8986",
+       "759aa3ca28ccc362bb2189b3b43d46ee568501aba01a45a2dc7ccf8c84778197"
+      ],
+      "call_id": "call_3"
+     },
+     {
+      "kind": "tool",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "ff2ab7e48295401cd539e353ea92fa9de1f163a5cc21d8a4d55f2c7971df2c4b",
+      "call_id": "call_4",
+      "tool": "analysis_baseline"
+     },
+     {
+      "kind": "analysis",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "4b0485e22a271391e03d721d94619246836cf01f3c4abba59d09f60965f6b4f8",
+      "op": "baseline",
+      "mode": null,
+      "status": "refused",
+      "verdict": null,
+      "inputs": [
+       "6d7d2de72015d30aa4b988218eda7f72037609596e66167ec498ed070cce8986"
+      ],
+      "call_id": "call_4"
+     },
+     {
+      "kind": "tool",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "d6c6f67a96074b43081c2610cf6b20b279745459cac0c47053485f9ab02f27a3",
+      "call_id": "call_5",
+      "tool": "analysis_comparable"
+     },
+     {
+      "kind": "analysis",
+      "node_id": "bot",
+      "exec": 1,
+      "artifact": "df64b05fa94b6d975de8941f3e7e3c950a0c23ae15ef0d99416e984f1378ca71",
+      "op": "comparable",
+      "mode": null,
+      "status": "ok",
+      "verdict": "comparable",
+      "inputs": [
+       "759aa3ca28ccc362bb2189b3b43d46ee568501aba01a45a2dc7ccf8c84778197"
+      ],
+      "call_id": "call_5"
+     }
+    ]
+   }
+  },
+  {
+   "seq": 36,
+   "type": "node.started",
+   "node_id": "write",
+   "ts": 1792575316.764642,
+   "data": {
+    "node_type": "report",
+    "label": "写周报"
+   }
+  },
+  {
+   "seq": 37,
+   "type": "llm.start",
+   "node_id": "write",
+   "ts": 1792575316.77295,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 2
+   }
+  },
+  {
+   "seq": 53,
+   "type": "llm.end",
+   "node_id": "write",
+   "ts": 1792575317.0741818,
+   "data": {
+    "model": "mock-fast",
+    "duration_ms": 301,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 54,
+   "type": "log",
+   "node_id": "write",
+   "ts": 1792575317.081996,
+   "data": {
+    "level": "warn",
+    "code": "report_repair",
+    "count": 3,
+    "attempt": 1,
+    "message": "报告有 3 处未通过核对（「主要来自」、「异常」、「由于」），已要求模型重写（第 1 次）"
+   }
+  },
+  {
+   "seq": 55,
+   "type": "llm.start",
+   "node_id": "write",
+   "ts": 1792575317.0820322,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 4
+   }
+  },
+  {
+   "seq": 71,
+   "type": "llm.end",
+   "node_id": "write",
+   "ts": 1792575317.384913,
+   "data": {
+    "model": "mock-fast",
+    "duration_ms": 302,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 72,
+   "type": "log",
+   "node_id": "write",
+   "ts": 1792575317.386705,
+   "data": {
+    "level": "warn",
+    "code": "report_analysis_claims",
+    "count": 3,
+    "mode": "check",
+    "texts": [
+     "主要来自",
+     "异常",
+     "由于"
+    ],
+    "counts": {
+     "analysis_claim_mismatch": 1,
+     "analysis_claim_uncited": 1,
+     "causal_unsupported": 1
+    },
+    "message": "报告有 3 处分析说法未通过核对（1 处判断没挂分析结论、1 处与所挂结论的判定对不上、1 处原因没有依据：「主要来自」、「异常」、「由于」），已要求模型重写 1 次仍未改掉：判断要挂对应的分析结论并照判定写，原因要有知识库原话或运行输入作依据。报告照常产出，这几处已标注"
+   }
+  },
+  {
+   "seq": 73,
+   "type": "report.checked",
+   "node_id": "write",
+   "ts": 1792575317.3917599,
+   "data": {
+    "doc_artifact": "2900eaf87e6747cdaf22193d2bb23645dd0295b968a7e8d1d509eef5e703424e",
+    "ok": false,
+    "stats": {
+     "units": 6,
+     "segments": 17,
+     "claims": 5,
+     "connective": 0,
+     "headings": 1,
+     "numbers": 2,
+     "numbers_cited": 2,
+     "values": 1,
+     "entities": 0,
+     "quotes": 0,
+     "uncited_numbers": 0,
+     "unresolved": 0,
+     "unknown_entities": 0,
+     "unverified_entities": 0,
+     "see": 2,
+     "uncited_claims": 2,
+     "violations": 3,
+     "analysis_claims": 3
+    },
+    "violations": [
+     {
+      "code": "analysis_claim_mismatch",
+      "message": "「主要来自华南」与所挂的分析结论 A1 对不上：判定的主要来源是华东，不是华南",
+      "for_model": "A1 判的主要来源是华东，不是华南，不能写「主要来自华南」：照判定改写（或者直接引用判定 [[a:A1]]），或者删掉这个判断",
+      "text": "主要来自",
+      "span": [
+       80,
+       84
+      ],
+      "context": "其中下降主要来自华南。",
+      "unit": "u3",
+      "segment": "s12",
+      "claim": "source",
+      "op": "decompose",
+      "analyses": [
+       "A1"
+      ]
+     },
+     {
+      "code": "analysis_claim_uncited",
+      "message": "「异常」是分析判断，这句没有挂波动基线的分析结论，系统无法核对",
+      "for_model": "这次没有波动基线的结论，不能写「异常」：只写本期的数和变化，不说「异常」「大幅」「显著下降」「激增」「历史新高」「正常波动」这类判断",
+      "text": "异常",
+      "span": [
+       94,
+       96
+      ],
+      "context": "销售额出现异常下降。",
+      "unit": "u4",
+      "segment": "s14",
+      "claim": "anomaly",
+      "op": "baseline",
+      "analyses": []
+     },
+     {
+      "code": "causal_unsupported",
+      "message": "「由于促销结束」是原因判断，这句没有知识库原话或运行输入作依据，也没有写成推测",
+      "for_model": "「由于促销结束」没有依据：数据只能说明变化来自哪里；要写原因，引用知识库原话，或写成「可能与…有关，待核实」",
+      "text": "由于",
+      "span": [
+       101,
+       103
+      ],
+      "context": "由于促销结束，订单有所减少。",
+      "unit": "u5",
+      "segment": "s16",
+      "claim": "causal",
+      "analyses": []
+     }
+    ],
+    "repairs": 1,
+    "on_violation": "flag",
+    "failed": false,
+    "claims": "off",
+    "analysis_claims": "check"
+   }
+  },
+  {
+   "seq": 74,
+   "type": "node.finished",
+   "node_id": "write",
+   "ts": 1792575317.394996,
+   "data": {
+    "duration_ms": 627,
+    "attempt": 1,
+    "preview": {
+     "text": "## 本周销售\n\n销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。\n\n华东的变化为 -300，占总变化的 88.2%。\n\n其中下降主要来自华南。\n\n销售额出现异常下降。\n\n由于促销结束，订单有所减少。",
+     "doc_artifact": "2900eaf87e6747cdaf22193d2bb23645dd0295b968a7e8d1d509eef5e703424e",
+     "stats": "{'units': 6, 'segments': 17, 'claims': 5, 'connective': 0, 'headings': 1, 'numbers': 2, 'numbers_cited': 2, 'values': 1, 'entities': 0, 'quotes': 0, 'uncited_numbers': 0, 'unresolved': 0, 'unknown_entities': 0, 'unverified_entities': 0, 'see': 2, 'uncited_claims': 2, 'violations': 3, 'analysis_claim",
+     "violations": "[3 项]",
+     "repairs": 1,
+     "model": "mock-fast",
+     "duration_ms": 618,
+     "claims": "off",
+     "analysis_claims": "check"
+    },
+    "vars": null,
+    "artifact": "a6be6ade4c77f66fe371cc37481b5614669c6d316e7eacce8da2f8bd27cae322"
+   }
+  },
+  {
+   "seq": 75,
+   "type": "node.started",
+   "node_id": "out",
+   "ts": 1792575317.3989398,
+   "data": {
+    "node_type": "output",
+    "label": "成果"
+   }
+  },
+  {
+   "seq": 76,
+   "type": "issuance",
+   "node_id": "out",
+   "ts": 1792575317.403617,
+   "data": {
+    "mode": "citations",
+    "tier": "formal",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "2900eaf87e6747cdaf22193d2bb23645dd0295b968a7e8d1d509eef5e703424e"
+    },
+    "missing_required": [],
+    "missing_expected": [],
+    "unmatched": 0,
+    "unresolved": 0,
+    "calibers": [],
+    "gaps": [],
+    "metrics_checked": 0,
+    "matched_numbers": 2,
+    "matched": [
+     {
+      "token": "-300",
+      "metric": null,
+      "cell": "A1.r0.delta",
+      "segment": "s7",
+      "unit": "u2",
+      "start": 57,
+      "end": 61,
+      "span": [
+       57,
+       61
+      ],
+      "eid": "ev:cell:e7da2983c6f7f72e"
+     },
+     {
+      "token": "88.2%",
+      "metric": null,
+      "analysis": "A1.top_share",
+      "segment": "s9",
+      "unit": "u2",
+      "start": 68,
+      "end": 73,
+      "span": [
+       68,
+       73
+      ],
+      "eid": "ev:analysis:4635e418a366d261"
+     }
+    ],
+    "analysis_claims": {
+     "mode": "check",
+     "count": 3,
+     "counted": false
+    }
+   }
+  },
+  {
+   "seq": 77,
+   "type": "node.finished",
+   "node_id": "out",
+   "ts": 1792575317.406689,
+   "data": {
+    "duration_ms": 4,
+    "attempt": 1,
+    "preview": {
+     "周报": "## 本周销售\n\n销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。\n\n华东的变化为 -300，占总变化的 88.2%。\n\n其中下降主要来自华南。\n\n销售额出现异常下降。\n\n由于促销结束，订单有所减少。",
+     "_issuance": "{'mode': 'citations', 'tier': 'formal', 'report': {'node_id': 'write', 'doc_artifact': '2900eaf87e6747cdaf22193d2bb23645dd0295b968a7e8d1d509eef5e703424e'}, 'calibers': [], 'metrics_checked': 0, 'missing_required': [], 'missing_expected': [], 'unmatched_numbers': [], 'unresolved': [], 'matched_number",
+     "_evidence": "{'report_node': 'write', 'doc_artifact': '2900eaf87e6747cdaf22193d2bb23645dd0295b968a7e8d1d509eef5e703424e', 'fields': ['周报']}"
+    },
+    "vars": null,
+    "artifact": "5d880be77a88e1dfb186b24248477baa7206698cf8a98f66780320c3da72d40d"
+   }
+  },
+  {
+   "seq": 78,
+   "type": "run.finished",
+   "node_id": null,
+   "ts": 1792575317.4112582,
+   "data": {
+    "output": {
+     "周报": "## 本周销售\n\n销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。\n\n华东的变化为 -300，占总变化的 88.2%。\n\n其中下降主要来自华南。\n\n销售额出现异常下降。\n\n由于促销结束，订单有所减少。",
+     "_issuance": {
+      "mode": "citations",
+      "tier": "formal",
+      "report": {
+       "node_id": "write",
+       "doc_artifact": "2900eaf87e6747cdaf22193d2bb23645dd0295b968a7e8d1d509eef5e703424e"
+      },
+      "calibers": [],
+      "metrics_checked": 0,
+      "missing_required": [],
+      "missing_expected": [],
+      "unmatched_numbers": [],
+      "unresolved": [],
+      "matched_numbers": 2,
+      "matched": [
+       {
+        "token": "-300",
+        "metric": null,
+        "cell": "A1.r0.delta",
+        "segment": "s7",
+        "unit": "u2",
+        "start": 57,
+        "end": 61,
+        "span": [
+         57,
+         61
+        ],
+        "eid": "ev:cell:e7da2983c6f7f72e"
+       },
+       {
+        "token": "88.2%",
+        "metric": null,
+        "analysis": "A1.top_share",
+        "segment": "s9",
+        "unit": "u2",
+        "start": 68,
+        "end": 73,
+        "span": [
+         68,
+         73
+        ],
+        "eid": "ev:analysis:4635e418a366d261"
+       }
+      ],
+      "stats": {
+       "units": 6,
+       "segments": 17,
+       "claims": 5,
+       "connective": 0,
+       "headings": 1,
+       "numbers": 2,
+       "numbers_cited": 2,
+       "values": 1,
+       "entities": 0,
+       "quotes": 0,
+       "uncited_numbers": 0,
+       "unresolved": 0,
+       "unknown_entities": 0,
+       "unverified_entities": 0,
+       "see": 2,
+       "uncited_claims": 2,
+       "violations": 3,
+       "analysis_claims": 3
+      },
+      "gaps": [],
+      "declared_at": "2026-10-21T09:35:17.403605+00:00",
+      "analysis_claims": {
+       "mode": "check",
+       "count": 3,
+       "counts": {
+        "analysis_claim_mismatch": 1,
+        "analysis_claim_uncited": 1,
+        "causal_unsupported": 1
+       },
+       "counted": false,
+       "violations": [
+        {
+         "code": "analysis_claim_mismatch",
+         "text": "主要来自",
+         "claim": "source",
+         "op": "decompose",
+         "analyses": [
+          "A1"
+         ],
+         "unit": "u3",
+         "segment": "s12",
+         "span": [
+          80,
+          84
+         ],
+         "message": "「主要来自华南」与所挂的分析结论 A1 对不上：判定的主要来源是华东，不是华南",
+         "context": "其中下降主要来自华南。"
+        },
+        {
+         "code": "analysis_claim_uncited",
+         "text": "异常",
+         "claim": "anomaly",
+         "op": "baseline",
+         "unit": "u4",
+         "segment": "s14",
+         "span": [
+          94,
+          96
+         ],
+         "message": "「异常」是分析判断，这句没有挂波动基线的分析结论，系统无法核对",
+         "context": "销售额出现异常下降。"
+        },
+        {
+         "code": "causal_unsupported",
+         "text": "由于",
+         "claim": "causal",
+         "unit": "u5",
+         "segment": "s16",
+         "span": [
+          101,
+          103
+         ],
+         "message": "「由于促销结束」是原因判断，这句没有知识库原话或运行输入作依据，也没有写成推测",
+         "context": "由于促销结束，订单有所减少。"
+        }
+       ]
+      }
+     },
+     "_evidence": {
+      "report_node": "write",
+      "doc_artifact": "2900eaf87e6747cdaf22193d2bb23645dd0295b968a7e8d1d509eef5e703424e",
+      "fields": [
+       "周报"
+      ]
+     }
+    },
+    "usage": {
+     "input_tokens": 0,
+     "output_tokens": 0,
+     "cost_usd": 0.0,
+     "calls": 9,
+     "total_tokens": 0,
+     "duration_ms": 880,
+     "wall_ms": 880,
+     "active_ms": 880,
+     "wait_ms": 0
+    },
+    "duration_ms": 880,
+    "timing": {
+     "wall_ms": 880,
+     "active_ms": 880,
+     "wait_ms": 0
+    }
+   }
+  }
+ ],
+ "analysis_card": [
+  {
+   "seq": 1,
+   "type": "run.started",
+   "node_id": null,
+   "ts": 1792575317.4952881,
+   "data": {
+    "nodes": 6,
+    "resumed": false,
+    "memory_scope": "default",
+    "collection": "default",
+    "approval_default": "dangerous",
+    "tool_trust": {},
+    "agent_limits": {
+     "max_steps": 100,
+     "budget_tokens": 2000000,
+     "budget_usd": null
+    },
+    "data_versions": {},
+    "replay_protocol": 2
+   }
+  },
+  {
+   "seq": 2,
+   "type": "node.started",
+   "node_id": "start",
+   "ts": 1792575317.498976,
+   "data": {
+    "node_type": "input",
+    "label": "开始"
+   }
+  },
+  {
+   "seq": 3,
+   "type": "node.finished",
+   "node_id": "start",
+   "ts": 1792575317.5020092,
+   "data": {
+    "duration_ms": 0,
+    "attempt": 1,
+    "preview": {},
+    "vars": null,
+    "artifact": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+   }
+  },
+  {
+   "seq": 4,
+   "type": "node.started",
+   "node_id": "weekly",
+   "ts": 1792575317.503374,
+   "data": {
+    "node_type": "tool",
+    "label": "整体周销售"
+   }
+  },
+  {
+   "seq": 5,
+   "type": "tool.start",
+   "node_id": "weekly",
+   "ts": 1792575317.5079098,
+   "data": {
+    "tool": "db_query__shop",
+    "args": {
+     "sql": "SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week"
+    },
+    "timeout_s": 30
+   }
+  },
+  {
+   "seq": 6,
+   "type": "tool.end",
+   "node_id": "weekly",
+   "ts": 1792575317.51713,
+   "data": {
+    "tool": "db_query__shop",
+    "duration_ms": 8,
+    "preview": "\"{\\\"columns\\\": [\\\"week\\\", \\\"gmv\\\"], \\\"rows\\\": [[\\\"2026-W41\\\", 2700], [\\\"2026-W42\\\", 2360]], \\\"row_count\\\": 2, \\\"truncated\\\": false, \\\"elapsed_ms\\\": 0, \\\"sql\\\": \\\"SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week\\\", \\\"column_types\\\": {\\\"week\\\": \\\"text\\\", \\\"gmv\\\": \\\"number\\\"}, \\\"source\\\": \\\"shop\\\", \\\"schema_artifact\\\": \\\"ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798\\\", \\\"artifact\\\": \\\"31a628af2a85f342af70b2e57f969b44d7b34d68b18c50f8bb0e4c19b3236b74\\\"}\"",
+    "artifact": "eb62632a3737cfe8c376cfb310f58e26676f427a4e1ce5475921f079cf7948cd",
+    "query_artifact": "31a628af2a85f342af70b2e57f969b44d7b34d68b18c50f8bb0e4c19b3236b74",
+    "schema_artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798"
+   }
+  },
+  {
+   "seq": 7,
+   "type": "node.finished",
+   "node_id": "weekly",
+   "ts": 1792575317.52002,
+   "data": {
+    "duration_ms": 13,
+    "attempt": 1,
+    "preview": "{\"columns\": [\"week\", \"gmv\"], \"rows\": [[\"2026-W41\", 2700], [\"2026-W42\", 2360]], \"row_count\": 2, \"truncated\": false, \"elapsed_ms\": 0, \"sql\": \"SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week\", \"column_types\": {\"week\": \"text\", \"gmv\": \"number\"}, \"source\": \"shop\", \"schema_artifact\": \"ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798\", \"artifact\": \"31a628af2a85f342af70b2e57f969b44d7b34d68b18c50f8bb0e4c19b3236b74\"}",
+    "vars": null,
+    "artifact": "059dcb5e6fd20c9a07a76778f538125bfa6718917f7ea8c1956328f3d24353a0",
+    "evidence": [
+     {
+      "kind": "tool",
+      "node_id": "weekly",
+      "exec": 1,
+      "artifact": "eb62632a3737cfe8c376cfb310f58e26676f427a4e1ce5475921f079cf7948cd",
+      "tool": "db_query__shop"
+     },
+     {
+      "kind": "query",
+      "node_id": "weekly",
+      "exec": 1,
+      "artifact": "31a628af2a85f342af70b2e57f969b44d7b34d68b18c50f8bb0e4c19b3236b74",
+      "via": "eb62632a3737cfe8c376cfb310f58e26676f427a4e1ce5475921f079cf7948cd",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "columns": [
+       "week",
+       "gmv"
+      ],
+      "rows": 2,
+      "truncated": false,
+      "schema_artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798",
+      "tables": [
+       "orders"
+      ]
+     },
+     {
+      "kind": "schema",
+      "node_id": "weekly",
+      "exec": 1,
+      "artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798",
+      "source": "shop",
+      "schema": null,
+      "synced_at": "2026-10-21T09:35:16.507439+00:00",
+      "tables": {
+       "orders": [
+        "id",
+        "week",
+        "region",
+        "channel",
+        "amount"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  {
+   "seq": 8,
+   "type": "node.started",
+   "node_id": "by_region",
+   "ts": 1792575317.5215209,
+   "data": {
+    "node_type": "tool",
+    "label": "按地区两周"
+   }
+  },
+  {
+   "seq": 9,
+   "type": "tool.start",
+   "node_id": "by_region",
+   "ts": 1792575317.5252402,
+   "data": {
+    "tool": "db_query__shop",
+    "args": {
+     "sql": "SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week"
+    },
+    "timeout_s": 30
+   }
+  },
+  {
+   "seq": 10,
+   "type": "tool.end",
+   "node_id": "by_region",
+   "ts": 1792575317.533291,
+   "data": {
+    "tool": "db_query__shop",
+    "duration_ms": 6,
+    "preview": "\"{\\\"columns\\\": [\\\"region\\\", \\\"week\\\", \\\"gmv\\\"], \\\"rows\\\": [[\\\"华东\\\", \\\"2026-W41\\\", 1000], [\\\"华东\\\", \\\"2026-W42\\\", 700], [\\\"华北\\\", \\\"2026-W41\\\", 600], [\\\"华北\\\", \\\"2026-W42\\\", 590], [\\\"华南\\\", \\\"2026-W41\\\", 800], [\\\"华南\\\", \\\"2026-W42\\\", 780], [\\\"西南\\\", \\\"2026-W41\\\", 300], [\\\"西南\\\", \\\"2026-W42\\\", 290]], \\\"row_count\\\": 8, \\\"truncated\\\": false, \\\"elapsed_ms\\\": 0, \\\"sql\\\": \\\"SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week\\\", \\\"column_types\\\": {\\\"region\\\": \\\"text\\\", \\\"week\\\": \\\"text\\\", \\\"gmv\\\": \\\"number\\\"}, \\\"source\\\": \\\"shop\\\", \\\"schema_artifact\\\": \\\"ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798\\\", \\\"artifact\\\": \\\"b5845b34a6bce0a295517cd02f66e4a3d528095b6d07a12f4d6365bdd98bb5ff\\\"}\"",
+    "artifact": "255818dbbd6be5205b13bb7f06c20793e552f69e467aa35d882efab62a4f402a",
+    "query_artifact": "b5845b34a6bce0a295517cd02f66e4a3d528095b6d07a12f4d6365bdd98bb5ff",
+    "schema_artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798"
+   }
+  },
+  {
+   "seq": 11,
+   "type": "node.finished",
+   "node_id": "by_region",
+   "ts": 1792575317.5362089,
+   "data": {
+    "duration_ms": 11,
+    "attempt": 1,
+    "preview": "{\"columns\": [\"region\", \"week\", \"gmv\"], \"rows\": [[\"华东\", \"2026-W41\", 1000], [\"华东\", \"2026-W42\", 700], [\"华北\", \"2026-W41\", 600], [\"华北\", \"2026-W42\", 590], [\"华南\", \"2026-W41\", 800], [\"华南\", \"2026-W42\", 780], [\"西南\", \"2026-W41\", 300], [\"西南\", \"2026-W42\", 290]], \"row_count\": 8, \"truncated\": false, \"elapsed_ms\": 0, \"sql\": \"SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week\", \"column_types\": {\"region\": \"text\", \"week\": \"text\", \"gmv\": \"number\"}, \"source\": \"shop\", \"schema_artifact\": \"ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798\", \"artifact\": \"b5845b34a6bce0a295517cd02f66e4a3d528095b6d07a12f4d6365bdd98bb5ff\"}",
+    "vars": null,
+    "artifact": "80544d17183649dcb84cbd5d163d815c408ef76dc9d1959bae3f6246cd5e537a",
+    "evidence": [
+     {
+      "kind": "tool",
+      "node_id": "by_region",
+      "exec": 1,
+      "artifact": "255818dbbd6be5205b13bb7f06c20793e552f69e467aa35d882efab62a4f402a",
+      "tool": "db_query__shop"
+     },
+     {
+      "kind": "query",
+      "node_id": "by_region",
+      "exec": 1,
+      "artifact": "b5845b34a6bce0a295517cd02f66e4a3d528095b6d07a12f4d6365bdd98bb5ff",
+      "via": "255818dbbd6be5205b13bb7f06c20793e552f69e467aa35d882efab62a4f402a",
+      "tool": "db_query__shop",
+      "source": "shop",
+      "columns": [
+       "region",
+       "week",
+       "gmv"
+      ],
+      "rows": 8,
+      "truncated": false,
+      "schema_artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798",
+      "tables": [
+       "orders"
+      ]
+     },
+     {
+      "kind": "schema",
+      "node_id": "by_region",
+      "exec": 1,
+      "artifact": "ce24a5dda58f88652b13df77a3685c7f03303c8b472d60da5d8b15c0768bc798",
+      "source": "shop",
+      "schema": null,
+      "synced_at": "2026-10-21T09:35:16.507439+00:00",
+      "tables": {
+       "orders": [
+        "id",
+        "week",
+        "region",
+        "channel",
+        "amount"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  {
+   "seq": 12,
+   "type": "node.started",
+   "node_id": "card",
+   "ts": 1792575317.5375721,
+   "data": {
+    "node_type": "analysis",
+    "label": "异动分析"
+   }
+  },
+  {
+   "seq": 13,
+   "type": "analysis.end",
+   "node_id": "card",
+   "ts": 1792575317.542814,
+   "data": {
+    "item": "wow",
+    "op": "baseline",
+    "mode": null,
+    "status": "refused",
+    "verdict": null,
+    "direction": null,
+    "phrase": "波动基线没有做成：只有 0 期历史，至少要 8 期",
+    "reason_code": "history_short",
+    "analysis_artifact": "3277903271e6852f3fbf580f2be28e4320e16bb078e5a4bd8769b053e1619949"
+   }
+  },
+  {
+   "seq": 14,
+   "type": "log",
+   "node_id": "card",
+   "ts": 1792575317.54282,
+   "data": {
+    "level": "warn",
+    "code": "analysis_refused",
+    "item": "wow",
+    "op": "baseline",
+    "reason_code": "history_short",
+    "reason": "只有 0 期历史，至少要 8 期",
+    "message": "「异动分析」的分析项「wow」（波动基线）没有做成：只有 0 期历史，至少要 8 期"
+   }
+  },
+  {
+   "seq": 15,
+   "type": "analysis.end",
+   "node_id": "card",
+   "ts": 1792575317.5491688,
+   "data": {
+    "item": "where",
+    "op": "decompose",
+    "mode": "additive",
+    "status": "ok",
+    "verdict": "driver",
+    "direction": "down",
+    "phrase": "销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）",
+    "reason_code": null,
+    "analysis_artifact": "4fb1b7444d9ac6a74c7f2f157295f99bb9f2b28aae5891acf8d61253cdc254ba"
+   }
+  },
+  {
+   "seq": 16,
+   "type": "node.finished",
+   "node_id": "card",
+   "ts": 1792575317.5521338,
+   "data": {
+    "duration_ms": 11,
+    "attempt": 1,
+    "preview": {
+     "results": "{'wow': {'status': 'refused', 'verdict': None, 'direction': None, 'values': {}, 'phrase': '波动基线没有做成：只有 0 期历史，至少要 8 期', 'artifact': '3277903271e6852f3fbf580f2be28e4320e16bb078e5a4bd8769b053e1619949'}, 'where': {'status': 'ok', 'verdict': 'driver', 'direction': 'down', 'values': {'base_total': '2700',"
+    },
+    "vars": null,
+    "artifact": "fcdb2facae2309e7a7313781d4c6e07f36aafacdeb0269f4c3e0243cb6b409e8",
+    "evidence": [
+     {
+      "kind": "analysis",
+      "node_id": "card",
+      "exec": 1,
+      "artifact": "3277903271e6852f3fbf580f2be28e4320e16bb078e5a4bd8769b053e1619949",
+      "op": "baseline",
+      "mode": null,
+      "status": "refused",
+      "verdict": null,
+      "inputs": [
+       "31a628af2a85f342af70b2e57f969b44d7b34d68b18c50f8bb0e4c19b3236b74"
+      ],
+      "item": "wow"
+     },
+     {
+      "kind": "analysis",
+      "node_id": "card",
+      "exec": 1,
+      "artifact": "4fb1b7444d9ac6a74c7f2f157295f99bb9f2b28aae5891acf8d61253cdc254ba",
+      "op": "decompose",
+      "mode": "additive",
+      "status": "ok",
+      "verdict": "driver",
+      "inputs": [
+       "31a628af2a85f342af70b2e57f969b44d7b34d68b18c50f8bb0e4c19b3236b74",
+       "b5845b34a6bce0a295517cd02f66e4a3d528095b6d07a12f4d6365bdd98bb5ff"
+      ],
+      "item": "where"
+     }
+    ]
+   }
+  },
+  {
+   "seq": 17,
+   "type": "node.started",
+   "node_id": "write",
+   "ts": 1792575317.553416,
+   "data": {
+    "node_type": "report",
+    "label": "写周报"
+   }
+  },
+  {
+   "seq": 18,
+   "type": "llm.start",
+   "node_id": "write",
+   "ts": 1792575317.558388,
+   "data": {
+    "model": "mock-fast",
+    "message_count": 2
+   }
+  },
+  {
+   "seq": 33,
+   "type": "llm.end",
+   "node_id": "write",
+   "ts": 1792575317.8187468,
+   "data": {
+    "model": "mock-fast",
+    "duration_ms": 260,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0.0,
+    "calls": 1
+   }
+  },
+  {
+   "seq": 34,
+   "type": "report.checked",
+   "node_id": "write",
+   "ts": 1792575317.835585,
+   "data": {
+    "doc_artifact": "b1423149805a736ca08c5453589fb4c55f4ae2c28cb55abc1e848b03f02e4141",
+    "ok": true,
+    "stats": {
+     "units": 8,
+     "segments": 20,
+     "claims": 4,
+     "connective": 3,
+     "headings": 1,
+     "numbers": 2,
+     "numbers_cited": 2,
+     "values": 2,
+     "entities": 0,
+     "quotes": 0,
+     "uncited_numbers": 0,
+     "unresolved": 0,
+     "unknown_entities": 0,
+     "unverified_entities": 0,
+     "see": 1,
+     "uncited_claims": 0,
+     "violations": 0,
+     "analysis_claims": 0
+    },
+    "violations": [],
+    "repairs": 0,
+    "on_violation": "flag",
+    "failed": false,
+    "claims": "off",
+    "analysis_claims": "check"
+   }
+  },
+  {
+   "seq": 35,
+   "type": "node.finished",
+   "node_id": "write",
+   "ts": 1792575317.843646,
+   "data": {
+    "duration_ms": 282,
+    "attempt": 1,
+    "preview": {
+     "text": "## 本周销售\n\n销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。\n\n波动基线没有做成：只有 0 期历史，至少要 8 期\n\n华东的变化为 -300。\n\n| 地区 | 变化 |\n|---|---|\n| 华东 | -300 |",
+     "doc_artifact": "b1423149805a736ca08c5453589fb4c55f4ae2c28cb55abc1e848b03f02e4141",
+     "stats": "{'units': 8, 'segments': 20, 'claims': 4, 'connective': 3, 'headings': 1, 'numbers': 2, 'numbers_cited': 2, 'values': 2, 'entities': 0, 'quotes': 0, 'uncited_numbers': 0, 'unresolved': 0, 'unknown_entities': 0, 'unverified_entities': 0, 'see': 1, 'uncited_claims': 0, 'violations': 0, 'analysis_claim",
+     "violations": "[0 项]",
+     "repairs": 0,
+     "model": "mock-fast",
+     "duration_ms": 277,
+     "claims": "off",
+     "analysis_claims": "check"
+    },
+    "vars": null,
+    "artifact": "03d21262332629b6da0c67b04a78c4063db146aed1632a5fe08dbfd312d3e010"
+   }
+  },
+  {
+   "seq": 36,
+   "type": "node.started",
+   "node_id": "out",
+   "ts": 1792575317.8485398,
+   "data": {
+    "node_type": "output",
+    "label": "成果"
+   }
+  },
+  {
+   "seq": 37,
+   "type": "issuance",
+   "node_id": "out",
+   "ts": 1792575317.853754,
+   "data": {
+    "mode": "citations",
+    "tier": "formal",
+    "report": {
+     "node_id": "write",
+     "doc_artifact": "b1423149805a736ca08c5453589fb4c55f4ae2c28cb55abc1e848b03f02e4141"
+    },
+    "missing_required": [],
+    "missing_expected": [],
+    "unmatched": 0,
+    "unresolved": 0,
+    "calibers": [],
+    "gaps": [],
+    "metrics_checked": 0,
+    "matched_numbers": 2,
+    "matched": [
+     {
+      "token": "-300",
+      "metric": null,
+      "cell": "A2.r0.delta",
+      "segment": "s9",
+      "unit": "u3",
+      "start": 84,
+      "end": 88,
+      "span": [
+       84,
+       88
+      ],
+      "eid": "ev:cell:2de5050ac8c418ad"
+     },
+     {
+      "token": "-300",
+      "metric": null,
+      "cell": "A2.r0.delta",
+      "segment": "s18",
+      "unit": "u7",
+      "start": 120,
+      "end": 124,
+      "span": [
+       120,
+       124
+      ],
+      "eid": "ev:cell:2de5050ac8c418ad"
+     }
+    ]
+   }
+  },
+  {
+   "seq": 38,
+   "type": "node.finished",
+   "node_id": "out",
+   "ts": 1792575317.855974,
+   "data": {
+    "duration_ms": 5,
+    "attempt": 1,
+    "preview": {
+     "周报": "## 本周销售\n\n销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。\n\n波动基线没有做成：只有 0 期历史，至少要 8 期\n\n华东的变化为 -300。\n\n| 地区 | 变化 |\n|---|---|\n| 华东 | -300 |",
+     "_issuance": "{'mode': 'citations', 'tier': 'formal', 'report': {'node_id': 'write', 'doc_artifact': 'b1423149805a736ca08c5453589fb4c55f4ae2c28cb55abc1e848b03f02e4141'}, 'calibers': [], 'metrics_checked': 0, 'missing_required': [], 'missing_expected': [], 'unmatched_numbers': [], 'unresolved': [], 'matched_number",
+     "_evidence": "{'report_node': 'write', 'doc_artifact': 'b1423149805a736ca08c5453589fb4c55f4ae2c28cb55abc1e848b03f02e4141', 'fields': ['周报']}"
+    },
+    "vars": null,
+    "artifact": "dbef2e5818f9f16e9eca03b538b34904ca4531525f11204f49201f0911c47128"
+   }
+  },
+  {
+   "seq": 39,
+   "type": "run.finished",
+   "node_id": null,
+   "ts": 1792575317.862838,
+   "data": {
+    "output": {
+     "周报": "## 本周销售\n\n销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）。\n\n波动基线没有做成：只有 0 期历史，至少要 8 期\n\n华东的变化为 -300。\n\n| 地区 | 变化 |\n|---|---|\n| 华东 | -300 |",
+     "_issuance": {
+      "mode": "citations",
+      "tier": "formal",
+      "report": {
+       "node_id": "write",
+       "doc_artifact": "b1423149805a736ca08c5453589fb4c55f4ae2c28cb55abc1e848b03f02e4141"
+      },
+      "calibers": [],
+      "metrics_checked": 0,
+      "missing_required": [],
+      "missing_expected": [],
+      "unmatched_numbers": [],
+      "unresolved": [],
+      "matched_numbers": 2,
+      "matched": [
+       {
+        "token": "-300",
+        "metric": null,
+        "cell": "A2.r0.delta",
+        "segment": "s9",
+        "unit": "u3",
+        "start": 84,
+        "end": 88,
+        "span": [
+         84,
+         88
+        ],
+        "eid": "ev:cell:2de5050ac8c418ad"
+       },
+       {
+        "token": "-300",
+        "metric": null,
+        "cell": "A2.r0.delta",
+        "segment": "s18",
+        "unit": "u7",
+        "start": 120,
+        "end": 124,
+        "span": [
+         120,
+         124
+        ],
+        "eid": "ev:cell:2de5050ac8c418ad"
+       }
+      ],
+      "stats": {
+       "units": 8,
+       "segments": 20,
+       "claims": 4,
+       "connective": 3,
+       "headings": 1,
+       "numbers": 2,
+       "numbers_cited": 2,
+       "values": 2,
+       "entities": 0,
+       "quotes": 0,
+       "uncited_numbers": 0,
+       "unresolved": 0,
+       "unknown_entities": 0,
+       "unverified_entities": 0,
+       "see": 1,
+       "uncited_claims": 0,
+       "violations": 0,
+       "analysis_claims": 0
+      },
+      "gaps": [],
+      "declared_at": "2026-10-21T09:35:17.853734+00:00"
+     },
+     "_evidence": {
+      "report_node": "write",
+      "doc_artifact": "b1423149805a736ca08c5453589fb4c55f4ae2c28cb55abc1e848b03f02e4141",
+      "fields": [
+       "周报"
+      ]
+     }
+    },
+    "usage": {
+     "input_tokens": 0,
+     "output_tokens": 0,
+     "total_tokens": 0,
+     "cost_usd": 0.0,
+     "calls": 1,
+     "duration_ms": 366,
+     "wall_ms": 366,
+     "active_ms": 366,
+     "wait_ms": 0
+    },
+    "duration_ms": 366,
+    "timing": {
+     "wall_ms": 366,
+     "active_ms": 366,
+     "wait_ms": 0
+    }
+   }
+  }
  ]
 }
