@@ -19,6 +19,10 @@ def test_settings_problems_are_spoken_with_labels_not_keys():
     assert c.settings_problem({"main_share": True}) == "「主要来源」的占比要填数字"
     assert c.settings_problem({"main_share": 0.95}) == "「主要来源」的占比要在 0.3 到 0.9 之间"
     assert c.settings_problem({"max_history": 8, "min_history": 9}) == "最多用几期历史不能小于至少几期历史"
+    # 「主要」要的占比比「集中」的合计还高：一段占 60% 会判成分散，判定语却说「没有哪一段占到 90%」
+    assert c.settings_problem({"main_share": 0.9, "concentration": 0.5}) == "「集中」的合计占比不能小于「主要来源」的占比"
+    assert c.settings_problem({"main_share": 0.85}) == "「集中」的合计占比不能小于「主要来源」的占比"   # 缺省的 0.8 补齐了比
+    assert c.settings_problem({"main_share": 0.8}) is None and c.settings_problem({"concentration": 0.5}) is None
     assert c.settings_problem({"nope": 1}) == "不认识的分析设置：nope"
 
 

@@ -167,7 +167,8 @@ LABELS: dict[str, str] = {
 
 def settings_problem(values: Mapping[str, Any]) -> str | None:
     """一组分析设置（或分析卡上的覆盖）哪里不对：不认识的键、类型不对、超出范围、k_alert 不大于 k_warn、
-    max_history 小于 min_history。都对返回 None。说法给人看。"""
+    max_history 小于 min_history、concentration 小于 main_share（一段占了「主要」那么多还够不上「集中」，判定语会说「没有哪一段
+    占到」一个比它小的数）。没写的项按缺省补齐了比。都对返回 None。说法给人看（键的叫法取 LABELS）。"""
     for key, value in values.items():
         if key not in RANGES:
             return f"不认识的分析设置：{key}"
@@ -184,6 +185,8 @@ def settings_problem(values: Mapping[str, Any]) -> str | None:
         return f"{LABELS['k_alert']}要大于{LABELS['k_warn']}"
     if merged["max_history"] < merged["min_history"]:
         return f"{LABELS['max_history']}不能小于{LABELS['min_history']}"
+    if merged["concentration"] < merged["main_share"]:
+        return f"{LABELS['concentration']}不能小于{LABELS['main_share']}"
     return None
 
 

@@ -69,6 +69,7 @@ def test_the_group_is_the_contract():
     broken = {"main_share": "一半", "max_calls": 3.5, "k_warn": 4, "k_alert": 3.5, "min_history": 20, "max_history": 10,
               "table_top_k": 5, "trend_alpha": True}
     assert analysis_values(broken) == {**contract.DEFAULTS, "table_top_k": 5}
+    assert analysis_values({"main_share": 0.9, "concentration": 0.5}) == contract.DEFAULTS
     # 浮点的项存成浮点：发起时的快照、结论里记的阈值一个写法
     assert analysis_values({"k_warn": 3, "k_alert": 4})["k_warn"] == 3.0
     assert isinstance(analysis_values({"k_warn": 3, "k_alert": 4})["k_alert"], float)
@@ -81,6 +82,8 @@ def test_the_group_is_the_contract():
     ({"max_calls": 2.5}, f"{contract.LABELS['max_calls']}要填整数"),
     ({"k_warn": 3.5}, f"{contract.LABELS['k_alert']}要大于{contract.LABELS['k_warn']}"),
     ({"min_history": 60}, f"{contract.LABELS['max_history']}不能小于{contract.LABELS['min_history']}"),
+    ({"main_share": 0.9, "concentration": 0.5},
+     f"{contract.LABELS['concentration']}不能小于{contract.LABELS['main_share']}"),
 ])
 def test_problems_are_said_with_labels(value, why):
     assert why in (analysis_problem(value) or "")
