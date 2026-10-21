@@ -26,11 +26,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from fractions import Fraction
 from typing import Any
 
+from app.analysis.contract import OP_LABELS
 from app.analysis.numbers import fixed, to_fraction
 
-#: 算子的叫法：「算不了」的判定语、报错都用它
-OP_NAMES = {"decompose": "变化拆解", "baseline": "波动基线", "trend": "趋势判断", "differ": "差异检验",
-            "comparable": "可比性检查"}
 #: 附带说明进判定语的先后；不在这里的（measure_unlabeled、headline_basis）只在证据面板
 PHRASE_ORDER = ("comparability", "simpson", "offset", "outlier_sensitive", "small_sample", "record_high", "record_low",
                 "multiple_comparisons", "weekday_effect", "small_denominator", "null_values")
@@ -322,7 +320,7 @@ def with_caveats(main: str, caveats: Sequence[Mapping[str, str]], *, skip: Itera
 
 def refused(op: str, reason: str) -> str:
     """算不了的判定语：{算子的叫法}没有做成：{原因}。"""
-    return f"{OP_NAMES[op]}没有做成：{reason}"
+    return f"{OP_LABELS[op]}没有做成：{reason}"
 
 
 # --------------------------------------------------------------------------
@@ -503,7 +501,7 @@ CRITERION_COMPARABLE = ("只差日期、窗口一样长、是整期、星期构�
 
 
 __all__ = [
-    "CRITERION_COMPARABLE", "EMPTY_KEY", "HEADLINE_BASIS", "KEY_JOIN", "LABEL_MAX", "MEASURE_WORDS", "OP_NAMES",
+    "CRITERION_COMPARABLE", "EMPTY_KEY", "HEADLINE_BASIS", "KEY_JOIN", "LABEL_MAX", "MEASURE_WORDS",
     "PHRASE_CAVEATS", "PHRASE_ORDER", "UNVERIFIED_COMPLETE", "WEEKDAY_EFFECT", "amount", "band_text",
     "baseline_flat_phrase", "baseline_phrase", "caveat", "change", "clean_label", "comparable_phrase",
     "criterion_additive", "criterion_baseline", "criterion_differ", "criterion_factor", "criterion_ratio",

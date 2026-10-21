@@ -53,9 +53,10 @@ METHODS: dict[tuple[str, str | None], str] = {
 }
 #: agent 分析工具的名字（tools/builtin 里注册），一个算子一个工具：参数各自聚焦，模型少写错
 TOOL_NAMES: dict[str, str] = {op: f"analysis_{op}" for op in OPS}
-#: 算子、模式给人看的叫法：证据面板、写作目录、审计、导出、可验证报告、裁判摘录都用它（method_label 拼成一句）
+#: 算子、模式给人看的叫法，只有这一份：证据面板、写作目录、审计、导出、可验证报告、裁判摘录、分析卡的校验与表单
+#: （engine/labels 的 ANALYSIS_OP_LABEL / ANALYSIS_MODE_LABEL 引用这里）、「{叫法}没有做成」的判定语都用它（method_label 拼成一句）
 OP_LABELS: dict[str, str] = {
-    "decompose": "变化拆解", "baseline": "波动基线", "trend": "趋势", "differ": "差异检验", "comparable": "可比性检查",
+    "decompose": "变化拆解", "baseline": "波动基线", "trend": "趋势判断", "differ": "差异检验", "comparable": "可比性检查",
 }
 MODE_LABELS: dict[str, str] = {
     "additive": "可加", "ratio": "比率", "factor": "乘积", "rate": "比率", "mean": "均值", "rows": "逐行明细",
@@ -154,7 +155,7 @@ LABELS: dict[str, str] = {
     "min_n": "均值比较的最小样本数",
     "min_expected": "比率比较的最小期望频数",
     "min_denominator": "比率拆解的最小分母",
-    "max_calls": "一次运行最多分析几次",
+    "max_calls": "Agent 每次执行最多分析几次",
     "max_drill_depth": "最多下钻几层",
     "table_top_k": "列出前几段",
 }
@@ -303,7 +304,8 @@ class AnalysisResult(TypedDict, total=False):
 
 class CallError(Exception):
     """调用错误（细案 01 §8.1）：列不存在、列被遮罩、角色和目录度量类型冲突、同一键同一期多行、期次不在列里、乘积
-    不闭合、parent 不对、下钻超深、本运行分析次数用完。不记结论，message 交回 agent（一种说法，告诉它怎么改）。"""
+    不闭合、parent 不对、下钻超深、这个 Agent 这次执行的分析次数用完（max_calls 按每个 Agent 每次执行计）。不记结论，message
+    交回 agent（一种说法，告诉它怎么改）。"""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)

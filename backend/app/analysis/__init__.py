@@ -24,8 +24,8 @@ from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from typing import Any
 
-from app.analysis.contract import (MODES, OPS, AnalysisRequest, AnalysisResult, CallError, Context, InputSnapshot,
-                                   effective_settings)
+from app.analysis.contract import (MODES, OP_LABELS, OPS, AnalysisRequest, AnalysisResult, CallError, Context,
+                                   InputSnapshot, effective_settings)
 
 #: 按调用里写的名字取回输入快照；没有这个名字返回 None
 Resolver = Callable[[str], InputSnapshot | None]
@@ -34,17 +34,15 @@ ParentResolver = Callable[[str], AnalysisResult | None]
 
 
 def _op_mode(request: Mapping[str, Any]) -> tuple[str, str | None]:
-    from app.analysis.phrases import OP_NAMES
-
     op = request.get("op")
     if op not in OPS:
-        raise CallError("unknown_op", f"不认识的分析：{op}。能做的有{'、'.join(OP_NAMES[o] for o in OPS)}")
+        raise CallError("unknown_op", f"不认识的分析：{op}。能做的有{'、'.join(OP_LABELS[o] for o in OPS)}")
     modes = MODES.get(op)
     mode = request.get("mode")
     if modes is None:
         return op, None
     if mode not in modes:
-        raise CallError("unknown_mode", f"{OP_NAMES[op]}要写模式：{' / '.join(modes)}")
+        raise CallError("unknown_mode", f"{OP_LABELS[op]}要写模式：{' / '.join(modes)}")
     return op, mode
 
 
@@ -156,9 +154,10 @@ def recompute(result: AnalysisResult, load: Callable[[str], InputSnapshot | None
 
 
 def exhausted(settings: Mapping[str, Any]) -> CallError:
-    """本运行分析次数用完（max_calls）的调用错误：入口数着次数，到了上限交回它，不再算。"""
+    """分析次数用完（max_calls）的调用错误：上限按每个 Agent 每次执行计，入口（本节点的分析容器）数着次数，到了上限交回它，
+    不再算。"""
     limit = int(effective_settings(settings)["max_calls"])
-    return CallError("max_calls", f"这次运行的分析次数已经用完（最多 {limit} 次）：用已有的分析结论写，不再新做分析")
+    return CallError("max_calls", f"这个 Agent 这次执行最多做 {limit} 次分析，已经用完：用已有的分析结论写，不再新做分析")
 
 
 def make_prober(*args: Any, **kwargs: Any) -> Any:

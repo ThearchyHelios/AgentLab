@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.analysis.contract import MODE_LABELS, MODES, OP_LABELS
+
 #: 节点类型的叫法，和前端 lib/terms.ts 的 NODE_TYPE_LABEL 一致
 TYPE_LABEL: dict[str, str] = {
     "input": "输入", "output": "成果", "llm": "模型调用", "agent": "Agent",
@@ -106,13 +108,10 @@ _FIELD_BY_TYPE: dict[str, dict[str, str]] = {
     "challenge": CHALLENGE_LABEL,
 }
 
-#: 分析卡一项里的分析方法、模式的叫法（app/analysis/contract.py 的 OPS、MODES；前端分析卡的表单照这一份）
-ANALYSIS_OP_LABEL: dict[str, str] = {"decompose": "变化拆解", "baseline": "波动基线", "trend": "趋势",
-                                     "differ": "差异检验", "comparable": "可比性检查"}
-ANALYSIS_MODE_LABEL: dict[str, dict[str, str]] = {
-    "decompose": {"additive": "可加（按维度算贡献）", "ratio": "比率（拆结构与自身）", "factor": "乘积（拆因子）"},
-    "differ": {"rate": "比率", "mean": "均值", "rows": "逐行的值"},
-}
+#: 分析卡一项里的分析方法、模式的叫法：只引用 app/analysis/contract.py 的 OP_LABELS / MODE_LABELS（按 MODES 分到各算子），
+#: 不另写一份；前端分析卡的表单照这一份
+ANALYSIS_OP_LABEL: dict[str, str] = OP_LABELS
+ANALYSIS_MODE_LABEL: dict[str, dict[str, str]] = {op: {m: MODE_LABELS[m] for m in modes} for op, modes in MODES.items()}
 
 #: 出具契约里的键（canvas/issues.ts 的 CONTRACT_KEYS、SUB_KEYS）
 CONTRACT_KEY_LABEL: dict[str, str] = {
