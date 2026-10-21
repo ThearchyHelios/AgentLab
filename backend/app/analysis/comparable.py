@@ -435,9 +435,11 @@ def table_of(outcome: Outcome) -> dict[str, Any]:
     """检查表（结论的 table）：检查项、结果、基期、本期、说明。"""
     rows = [[CHECK_NAMES[c.id], STATUS_NAMES[c.status], c.base, c.target, "；".join(c.reasons) or None]
             for c in outcome.checks]
-    return {"columns": ["check", "status", "base", "target", "note"],
+    columns = ["check", "status", "base", "target", "note"]
+    return {"columns": columns,
             "labels": {"check": "检查项", "status": "结果", "base": "基期", "target": "本期", "note": "说明"},
-            "rows": rows}
+            "rows": rows,
+            "column_types": dict.fromkeys(columns, "text")}
 
 
 def values_of(outcome: Outcome) -> dict[str, Any]:

@@ -56,6 +56,7 @@ async def test_level_basis_with_hand_computed_median_and_mad():
     assert result["params"]["grain"] == "seq" and result["params"]["lag"] == 1
     assert result["settings"] == {"k_warn": 2.0, "k_alert": 3.0, "min_history": 8, "max_history": 52}
     assert result["table"]["rows"][-1][-1] == "本期"
+    assert result["table"]["column_types"] == {"week": "text", "value": "number", "change": "number", "role": "text"}
 
 
 async def test_change_basis_within_outside_and_far_outside():
@@ -167,6 +168,7 @@ async def test_rising_and_falling_trends_with_run_length():
     assert rising["phrase"].startswith("过去 12 周线上销售额呈上升趋势（每周约 +")
     assert "，已连续 11 周上升" in rising["phrase"]
     assert rising["settings"] == {"trend_min_points": 6, "trend_alpha": 0.05, "max_history": 52}
+    assert rising["table"]["column_types"] == {"week": "text", "value": "number", "change": "number"}
     falling = await trend(weeks([200, 196, 197, 190, 185, 186, 180, 181, 175, 170]))
     assert falling["verdict"]["code"] == "falling"
     assert falling["values"]["run_length"] == "2" and "已连续" not in falling["phrase"]

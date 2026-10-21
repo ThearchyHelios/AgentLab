@@ -35,6 +35,7 @@ async def test_two_weeks_that_differ_only_in_dates_are_comparable():
     assert result["params"]["today"] == "2026-10-21" and result["params"]["measure"] == "gmv"
     assert [p["column"] for p in result["probes"]] == ["order_date"]
     assert result["table"]["columns"] == ["check", "status", "base", "target", "note"]
+    assert result["table"]["column_types"] == dict.fromkeys(result["table"]["columns"], "text")
 
 
 async def test_other_literals_differing_mean_two_segments_not_two_periods():

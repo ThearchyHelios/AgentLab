@@ -29,7 +29,7 @@ from app.analysis import comparable as cmp
 from app.analysis import periods as pd
 from app.analysis import phrases as ph
 from app.analysis import stats
-from app.analysis.common import Env, build, column_label, label_for, need, refuse, sign_word, today_param
+from app.analysis.common import Env, build, column_label, column_types, label_for, need, refuse, sign_word, today_param
 from app.analysis.contract import CallError
 from app.analysis.inputs import Snap, same_value
 from app.analysis.numbers import canon, to_fraction
@@ -198,10 +198,13 @@ def baseline(raw: Mapping[str, Any], env: Env) -> Any:
         main = ph.baseline_phrase(code, series.label, current, n, unit, ph.band_text(lo, hi, basis=basis))
     rows = [[p.raw, canon(lv), canon(h) if basis == "change" else None, "历史"] for p, h, lv in history]
     rows.append([target.raw, canon(x_level), canon(x) if basis == "change" else None, "本期"])
-    table = {"columns": [series.period, "value", "change", "role"],
+    columns = [series.period, "value", "change", "role"]
+    table = {"columns": columns,
              "labels": {series.period: column_label(env, series.snap, series.period), "value": series.label,
                         "change": "变化率", "role": "说明"},
-             "rows": rows}
+             "rows": rows,
+             "column_types": column_types(columns, dims={series.period: series.snap.kind(series.period)},
+                                          texts=("role",))}
     values = {"x": canon(x), "value": canon(x_level), "median": canon(m), "band_lo": canon(lo), "band_hi": canon(hi),
               "z": canon(z) if z is not None else None, "rank": str(stats.rank_desc(x, hv)), "n_history": str(n),
               "hist_min": canon(min(hv)), "hist_max": canon(max(hv))}
@@ -285,10 +288,12 @@ def trend(raw: Mapping[str, Any], env: Env) -> Any:
     main = ph.trend_phrase(code, series.label, n, unit, per, slope_text,
                            (run, direction) if run >= 3 and direction else None)  # type: ignore[arg-type]
     rows = [[p_.raw, canon(v), canon(v - tail[i - 1][1]) if i else None] for i, (p_, v) in enumerate(tail)]
-    table = {"columns": [series.period, "value", "change"],
+    columns = [series.period, "value", "change"]
+    table = {"columns": columns,
              "labels": {series.period: column_label(env, series.snap, series.period), "value": series.label,
                         "change": "比上一期"},
-             "rows": rows}
+             "rows": rows,
+             "column_types": column_types(columns, dims={series.period: series.snap.kind(series.period)})}
     values = {"slope": canon(slope), "rel_slope": canon(rel) if rel is not None else None, "p": canon(mk.p),
               "s": str(mk.s), "n": str(n), "run_length": str(run), "run_direction": direction}
     verdict = {"code": code, "subjects": [], "direction": "up" if code == "rising" else "down" if code == "falling"

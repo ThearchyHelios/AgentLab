@@ -26,7 +26,8 @@ from typing import Any
 
 from app.analysis import comparable as cmp
 from app.analysis import phrases as ph
-from app.analysis.common import Env, build, closes, column_label, label_for, need, refuse, sign_word, today_param
+from app.analysis.common import (Env, build, closes, column_label, column_types, label_for, need, refuse, sign_word,
+                                 today_param)
 from app.analysis.contract import CallError
 from app.analysis.inputs import Snap, as_list, hashable, same_value
 from app.analysis.numbers import canon, to_fraction
@@ -390,10 +391,12 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
         d = deltas[x.key]
         rows.append([*x.key, canon(x.base), canon(x.target), canon(d), canon(d / x.base) if x.base != 0 else None,
                      canon(shares[x.key]) if shares else None, "、".join(x.flags) or None])
-    table = {"columns": [*by, *_FIXED_ADDITIVE],
+    columns = [*by, *_FIXED_ADDITIVE]
+    table = {"columns": columns,
              "labels": {**dict(zip(by, dims)), "base": "基期", "target": "本期", "delta": "变化", "pct": "变化率",
                         "share": "占变化的比重", "flag": "说明"},
-             "rows": rows}
+             "rows": rows,
+             "column_types": column_types(columns, dims={c: side_t.snap.kind(c) for c in by}, texts=("flag",))}
     values: dict[str, Any] = {
         "base_total": canon(B), "target_total": canon(T), "delta_total": canon(delta),
         "pct_total": canon(delta / abs(B)) if B != 0 else None, "top_key": ph.key_text(top.key),
@@ -472,7 +475,7 @@ def ratio(raw: Mapping[str, Any], env: Env) -> Any:
                               ph.say(ph.key_text(x.key), f"{when}的", den_label, "为 0 而", num_label,
                                      "不为 0，比率拆不了"), criterion=criterion)
     return _ratio_result(env, params, used, segs, by, dims, label, num_label, den_label, heads, parent_row, outcome,
-                         criterion)
+                         criterion, target_snap=ts)
 
 
 def ratio_effects(segs: Sequence[tuple[Fraction, Fraction, Fraction, Fraction]]
@@ -501,7 +504,7 @@ def ratio_effects(segs: Sequence[tuple[Fraction, Fraction, Fraction, Fraction]]
 def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[Segment], by: list[str],
                   dims: list[str], label: str, num_label: str, den_label: str,
                   heads: Mapping[str, tuple[Fraction, Any]], parent_row: Mapping[str, Any] | None,
-                  outcome: cmp.Outcome | None, criterion: str) -> Any:
+                  outcome: cmp.Outcome | None, criterion: str, *, target_snap: Snap) -> Any:
     main_share, flat_pct = env.threshold("main_share"), env.threshold("flat_pct")
     min_den = env.threshold("min_denominator")
     live = [x for x in segs if x.base[1] != 0 or x.target[1] != 0]
@@ -589,12 +592,14 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
     for x in dropped:
         rows.append([*x.key, canon(x.base[0]), canon(x.target[0]), "0", "0", None, None, None, None, None, None, None,
                      "两期分母都为 0，不计入"])
-    table = {"columns": [*by, *_FIXED_RATIO],
+    columns = [*by, *_FIXED_RATIO]
+    table = {"columns": columns,
              "labels": {**dict(zip(by, dims)), "n_base": ph.say("基期", num_label), "n_target": ph.say("本期", num_label),
                         "d_base": ph.say("基期", den_label), "d_target": ph.say("本期", den_label),
                         "w_base": "基期权重", "w_target": "本期权重", "r_base": "基期比率", "r_target": "本期比率",
                         "mix": "结构效应", "rate": "自身效应", "total": "合计影响", "flag": "说明"},
-             "rows": rows}
+             "rows": rows,
+             "column_types": column_types(columns, dims={c: target_snap.kind(c) for c in by}, texts=("flag",))}
     values: dict[str, Any] = {
         "r_base_total": canon(R), "r_target_total": canon(R2), "delta": canon(delta), "mix_total": canon(mix_total),
         "rate_total": canon(rate_total), "mix_share": canon(mix_share), "rate_share": canon(rate_share),
@@ -717,10 +722,12 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
         b, t = cells["base"][i + 1][0], cells["target"][i + 1][0]
         rows.append([names[i], canon(b), canon(t), canon((t - b) / b), canon(contrib[i]),
                      canon(shares[i]) if shares[i] is not None else None])
-    table = {"columns": ["factor", "base", "target", "pct", "contrib", "share"],
+    columns = ["factor", "base", "target", "pct", "contrib", "share"]
+    table = {"columns": columns,
              "labels": {"factor": "因子", "base": "基期", "target": "本期", "pct": "变化率", "contrib": "贡献",
                         "share": "占变化的比重"},
-             "rows": rows}
+             "rows": rows,
+             "column_types": column_types(columns, texts=("factor",))}
     values = {"base_total": canon(M), "target_total": canon(M2), "delta_total": canon(delta),
               "pct_total": canon(delta / abs(M)), "top_key": names[top],
               "top_share": canon(shares[top]) if shares[top] is not None else None}
@@ -729,4 +736,5 @@ def factor(raw: Mapping[str, Any], env: Env) -> Any:
                  phrase=ph.with_caveats(main, caveats), caveats=caveats)
 
 
-__all__ = ["HEADLINE_SHAPE", "PARENT_SHAPE", "SAME_QUERY", "SIMPSON_SHARE", "additive", "factor", "lmdi", "ratio", "ratio_effects"]
+__all__ = ["HEADLINE_SHAPE", "PARENT_SHAPE", "SAME_QUERY", "SIMPSON_SHARE", "additive", "factor", "lmdi", "ratio",
+           "ratio_effects"]
