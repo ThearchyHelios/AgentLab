@@ -28,7 +28,7 @@ from typing import Any
 
 from app.analysis import phrases as ph
 from app.analysis import stats
-from app.analysis.common import Env, build, column_label, label_for, need, refuse, sign_word
+from app.analysis.common import Env, build, column_label, column_types, label_for, need, refuse, sign_word
 from app.analysis.contract import CallError
 from app.analysis.inputs import Snap, as_list, hashable, same_value
 from app.analysis.numbers import canon, to_fraction
@@ -181,7 +181,7 @@ def differ(raw: Mapping[str, Any], env: Env) -> Any:
     pairs = _pairs(raw, params, groups, mode, dim_label, by_period, group_col)  # type: ignore[arg-type]
     env.inputs.use(snap, "data", [group_col, *cols.values()],
                    sorted({r for p in pairs for g in (p.a, p.b) for r in g.rows}))
-    return _decide(env, params, used, pairs, mode, label, criterion)  # type: ignore[arg-type]
+    return _decide(env, params, used, pairs, mode, label, criterion, kind=snap.kind(group_col))  # type: ignore[arg-type]
 
 
 def _groups(snap: Snap, group_col: str, cols: Mapping[str, str], mode: str, by_period: bool,
@@ -274,7 +274,7 @@ def _pairs(raw: Mapping[str, Any], params: dict[str, Any], groups: dict[Any, Gro
 
 
 def _decide(env: Env, params: dict[str, Any], used: list[str], pairs: list[Pair], mode: str, label: str,
-            criterion: str) -> Any:
+            criterion: str, *, kind: str | None) -> Any:
     alpha = env.threshold("differ_alpha")
     min_expected = env.threshold("min_expected") if mode == "rate" else Fraction(0)
     for pair in pairs:
@@ -324,12 +324,16 @@ def _decide(env: Env, params: dict[str, Any], used: list[str], pairs: list[Pair]
         rows.append([p.a.name, p.b.name, canon(p.a_value), canon(p.b_value), canon(p.diff),
                      canon(p.ci[0]) if p.ci else None, canon(p.ci[1]) if p.ci else None, str(p.a.n), str(p.b.n),
                      TESTS.get(p.test or "") or None, canon(p.p), canon(p.p_adj), "、".join(flags) or None])
-    table = {"columns": ["a", "b", "a_value", "b_value", "diff", "ci_lo", "ci_hi", "a_n", "b_n", "test", "p", "p_adj",
-                         "flag"],
+    columns = ["a", "b", "a_value", "b_value", "diff", "ci_lo", "ci_hi", "a_n", "b_n", "test", "p", "p_adj", "flag"]
+    # 组、对照组照分组列（期次列）在快照里的类型；和「其余各组合计」比时对照组那一列有一格是叫法，写 text
+    rest = any(p.b.key == ("__rest__",) for p in pairs)
+    table = {"columns": columns,
              "labels": {"a": "组", "b": "对照组", "a_value": f"组的{value_name}", "b_value": f"对照组的{value_name}",
                         "diff": "差", "ci_lo": "差的区间下限", "ci_hi": "差的区间上限", "a_n": "组的样本量",
                         "b_n": "对照组的样本量", "test": "检验", "p": "p 值", "p_adj": "校正后的 p 值", "flag": "说明"},
-             "rows": rows}
+             "rows": rows,
+             "column_types": column_types(columns, dims={"a": kind, "b": "text" if rest else kind},
+                                          texts=("test", "flag"))}
     shown = head if head is not None else pairs[0]
     values = {"a": canon(shown.a_value), "b": canon(shown.b_value), "diff": canon(shown.diff),
               "ci_lo": canon(shown.ci[0]) if shown.ci else None, "ci_hi": canon(shown.ci[1]) if shown.ci else None,

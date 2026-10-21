@@ -512,6 +512,6 @@ __all__ = [
     "factor_driver", "key_text", "multiple_text", "names", "no_evidence_phrase", "null_periods_text",
     "null_segments_text", "number", "offset_text", "outlier_text", "pct", "pick_label", "points", "ratio_both",
     "ratio_change", "ratio_mix", "ratio_rate", "ratio_value", "record_text", "refused", "say", "share_words",
-    "simpson_text", "small_denominator_text", "threshold_pct", "small_sample_mean_text", "small_sample_rate_text", "trend_phrase",
-    "unconfirmed_text", "unlabeled_text", "with_caveats",
+    "simpson_text", "small_denominator_text", "small_sample_mean_text", "small_sample_rate_text", "threshold_pct",
+    "trend_phrase", "unconfirmed_text", "unlabeled_text", "with_caveats",
 ]

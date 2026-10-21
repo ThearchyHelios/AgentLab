@@ -47,6 +47,8 @@ async def test_a_driver_is_named_with_its_share_and_the_whole_shape_is_filled():
     table = result["table"]
     assert table["columns"] == ["region", "base", "target", "delta", "pct", "share", "flag"]
     assert table["labels"]["region"] == "地区" and table["labels"]["share"] == "占变化的比重"
+    assert table["column_types"] == {"region": "text", "base": "number", "target": "number", "delta": "number",
+                                     "pct": "number", "share": "number", "flag": "text"}
     assert [r[0] for r in table["rows"]] == ["华东", "华北", "华南", "西南"]          # 按变化的绝对值从大到小
     assert result["settings"] == {"main_share": 0.5, "concentration": 0.8, "offset_ratio": 0.25, "flat_pct": 0.005,
                                   "table_top_k": 10}
@@ -418,3 +420,31 @@ async def test_the_same_query_cannot_be_both_periods():
     assert error.code == "same_query"
     error = await call_error("comparable", snaps=[weekly()], base_query="Q2", target_query="Q2")
     assert error.code == "same_query"
+
+
+async def test_dimension_columns_keep_the_type_recorded_at_query_time():
+    """文本型的码值（门店编码 "1203"）在结果表里仍是 text，渲染时不会写成「1,203」；查询时没记类型的维度列不写。"""
+    sql = "SELECT store_code, week, SUM(amount) AS gmv FROM orders GROUP BY 1, 2"
+    rows = [["1203", "W1", 500], ["1203", "W2", 300], ["0871", "W1", 200], ["0871", "W2", 260]]
+    typed = snap("Q2", sql, ["store_code", "week", "gmv"], rows,
+                 types={"store_code": "text", "week": "text", "gmv": "number"})
+    result = await analyze("decompose", "additive", snaps=[typed], query="Q2", by="store_code", period="week",
+                           base="W1", target="W2", measure="gmv")
+    assert result["table"]["column_types"]["store_code"] == "text"
+    assert [r[0] for r in result["table"]["rows"]] == ["1203", "0871"]
+    untyped = snap("Q2", sql, ["store_code", "week", "gmv"], rows)
+    result = await analyze("decompose", "additive", snaps=[untyped], query="Q2", by="store_code", period="week",
+                           base="W1", target="W2", measure="gmv")
+    assert "store_code" not in result["table"]["column_types"]
+    assert result["table"]["column_types"]["delta"] == "number"
+    listed = snap("Q2", sql, ["store_code", "week", "gmv"], rows, types=None, column_types=["text", "text", "number"])
+    result = await analyze("decompose", "additive", snaps=[listed], query="Q2", by="store_code", period="week",
+                           base="W1", target="W2", measure="gmv")
+    assert result["table"]["column_types"]["store_code"] == "text"          # 按列序的列表也认
+    ratio_result = await ratio([["线上", "W41", 50, 1000], ["线上", "W42", 80, 1000], ["线下", "W41", 20, 1000],
+                                ["线下", "W42", 26, 1000]])
+    ratio_types = ratio_result["table"]["column_types"]
+    assert ratio_types["flag"] == "text" and ratio_types["mix"] == "number" and "channel" not in ratio_types
+    factor_result = await factor([["W41", "1000", 100, "10"], ["W42", "1320", 120, "11"]])
+    assert factor_result["table"]["column_types"] == {"factor": "text", "base": "number", "target": "number",
+                                                       "pct": "number", "contrib": "number", "share": "number"}

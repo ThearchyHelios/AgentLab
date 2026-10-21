@@ -57,7 +57,10 @@ def _assert_shape(result):
         assert all(isinstance(s, list) and all(isinstance(x, str) for x in s) for s in result["verdict"]["subjects"])
         assert result["verdict"]["direction"] in (None, "up", "down")
         table = result["table"]
-        assert set(table) == {"columns", "labels", "rows"} and set(table["labels"]) == set(table["columns"])
+        assert set(table) == {"columns", "labels", "rows", "column_types"}
+        assert set(table["labels"]) == set(table["columns"]) and set(table["column_types"]) <= set(table["columns"])
+        assert list(table["column_types"]) == [c for c in table["columns"] if c in table["column_types"]]
+        assert set(table["column_types"].values()) <= {"number", "text", "date", "datetime", "time", "boolean"}
         assert all(len(r) == len(table["columns"]) for r in table["rows"])
     assert all(v is None or isinstance(v, str) for v in result["values"].values())
     assert all(set(cv) == {"code", "text"} and cv["code"] in c.CAVEATS for cv in result["caveats"])

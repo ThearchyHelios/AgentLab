@@ -128,9 +128,24 @@ def closes(total: Fraction, cell: Fraction, raw: Any) -> bool:
     return scale != 0 and gap <= scale * Fraction(1, 10 ** 9)
 
 
+def column_types(columns: Sequence[str], *, dims: Mapping[str, str | None] | None = None,
+                 texts: Sequence[str] = ()) -> dict[str, str]:
+    """结果表各列的类型（ResultTable.column_types，按列的先后）：dims 里的列照给的类型（维度列照输入快照里那一列查询时记下的
+    类型，没记的为 None、不写，同快照「拿不准的列不在里面」）；texts 里的是文字列（说明、叫法）写 text；其余都是数值列写
+    number（格子是十进制字符串）。"""
+    out: dict[str, str] = {}
+    for column in columns:
+        if dims is not None and column in dims:
+            if dims[column]:
+                out[column] = dims[column]  # type: ignore[assignment]
+        else:
+            out[column] = "text" if column in texts else "number"
+    return out
+
+
 def sign_word(value: Fraction | float | int) -> str | None:
     return "up" if value > 0 else "down" if value < 0 else None
 
 
-__all__ = ["DERIVED_PARAMS", "Env", "build", "closes", "column_label", "label_for", "need", "refuse", "sign_word",
-           "today_param", "written_places"]
+__all__ = ["DERIVED_PARAMS", "Env", "build", "closes", "column_label", "column_types", "label_for", "need", "refuse",
+           "sign_word", "today_param", "written_places"]

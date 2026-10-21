@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import date
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 # --------------------------------------------------------------------------
 # 名字（一种说法：别处一律引用这里，不另写字面量）
@@ -184,7 +184,9 @@ class InputSnapshot(TypedDict, total=False):
     source: str               # 数据源名
     sql: str
     columns: list[str]
-    column_types: list[str | None]
+    # 查询时记下的列类型（number / text / date / datetime / time / boolean，拿不准的列不在里面）。tools 的 to_payload 给的是
+    # {列: 类型}（data/engine.QueryResult.column_types）；按列序排的列表也认（analysis/inputs.Snap.kind 两种都读）
+    column_types: dict[str, str] | list[str | None]
     rows: list[list[Any]]
     truncated: bool
     masked: list[str]         # 不能当维度、度量的列（遮罩列、按 SQL 认出改了名字的遮罩列），比较时不分大小写
@@ -244,6 +246,9 @@ class ResultTable(TypedDict):
     columns: list[str]        # 稳定的列 id（维度列照输入的列名，其余是 base、target、delta、share……）
     labels: dict[str, str]    # 列 id → 给人看的列名（基期、本期、变化、占变化的比重……）
     rows: list[list[Any]]     # 数一律十进制字符串或 None，维度值照原样
+    # 列 id → 类型（写法同查询快照的 column_types；第 1 波 W1-a 加，可选）：维度列照输入快照里那一列查询时记下的类型
+    # （文本型的码值 "1203" 才不会被渲染成「1,203」；输入没记类型的不写），数值列 number，说明、叫法这类文字列 text
+    column_types: NotRequired[dict[str, str]]
 
 
 class AnalysisRequest(TypedDict, total=False):

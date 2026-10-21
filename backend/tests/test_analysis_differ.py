@@ -53,6 +53,9 @@ async def test_several_groups_each_against_the_rest_with_holm():
     table = result["table"]
     assert [r[0] for r in table["rows"]] == ["西南", "华东", "华南", "华北"]
     assert table["rows"][0][1] == "其余各地区"
+    # 对照组那一列有「其余各地区」这样的叫法：写 text；没记类型的分组列（组那一列）不写
+    assert table["column_types"]["b"] == "text" and "a" not in table["column_types"]
+    assert table["column_types"]["p"] == "number" and table["column_types"]["test"] == "text"
     raw = [Fraction(r[10]) for r in table["rows"]]
     adjusted = [Fraction(r[11]) for r in table["rows"]]
     assert all(a >= p for a, p in zip(adjusted, raw))

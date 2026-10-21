@@ -52,7 +52,8 @@ def _compute(op: str, mode: str | None, raw: Mapping[str, Any], env: Any) -> Ana
     from app.analysis import comparable, decompose, differ, series
 
     if op == "decompose":
-        return {"additive": decompose.additive, "ratio": decompose.ratio, "factor": decompose.factor}[mode](raw, env)  # type: ignore[index]
+        modes = {"additive": decompose.additive, "ratio": decompose.ratio, "factor": decompose.factor}
+        return modes[mode](raw, env)  # type: ignore[index]
     if op == "baseline":
         return series.baseline(raw, env)
     if op == "trend":
