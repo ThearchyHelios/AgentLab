@@ -59,6 +59,8 @@ FIELD_LABEL: dict[str, str] = {
     "instructions": "写作要求", "metrics_from": "指标来自", "numbers": "未引用的数字",
     "on_violation": "重写后仍有违规时", "max_repairs": "最多重写次数", "claims": "未附依据的结论句",
     "judge": "结论句裁判", "entities": "表名、字段名",
+    # 分析能力一轮：判断词要挂对应的分析结论（engine/analysis_claims）、文档末尾系统写的分析范围（engine/analysis_scope）
+    "analysis_claims": "分析说法核对", "analysis_scope": "分析范围",
     # 口径卡
     "caliber_from": "口径卡来源", "caliber": "口径名称", "caliber_version": "口径版本",
     "metrics": "指标定义", "on_missing": "缺输入时",
@@ -123,6 +125,8 @@ _OPTION_LABEL: dict[str, dict[str, str]] = {
     "on_violation": {"flag": "正常产出，并标注违规之处", "fail": "判为失败"},
     "claims": {"off": "不参与出具判档", "require_citation": "计入缺口", "judge": "计入缺口并由模型逐句判断"},
     "entities": {"link": "核对", "off": "不核对"},
+    "analysis_claims": {"off": "不核对", "check": "重写一次后标出", "strict": "重写后仍有的计入缺口"},
+    "analysis_scope": {"auto": "有分析结论时附上", "off": "不附"},
     "evidence_role": {"source": "取数", "compute": "计算"},
     "on_uncited": {"ignore": "仅标注，不计入缺口", "degrade": "计入缺口、出具降档", "withhold": "不予出具"},
     "on_unsupported": {"degrade": "出具降档", "withhold": "不予出具"},

@@ -29,6 +29,16 @@
   不重复调用、不重复计费。写作调用不进 checkpoint，接着跑时会重写一稿——所以判定带着输入指纹，
   对不上这一稿的不用
 
+分析能力一轮（docs/design/analysis-round/00-总方案.md §3.5–3.6）：判定和数字一样由系统渲染，写作者只引用。
+
+- 分析说法核对 analysis_claims：「主要来自」「异常」「持续上升」这类判断词要挂对应的分析结论、判定对得上，因果词要有
+  知识库原话或运行输入作依据（engine/analysis_claims，确定的词表 + 绑定，不调模型）。check（缺省，问数据也是它）交回写作者
+  重写一次（同句中的 [[see:]] 那一类，不按 max_repairs 反复），仍有的标在报告里、不影响档位；strict 按 max_repairs 重写，
+  仍有的写进产出的 issuance_gaps，带契约的出口降档（受管级别要求 strict，门禁 G3）；off 不核。说法违规都不让节点失败：
+  不挡生成。文档顶层记下处置和说法表版本，出口复核照它独立再核一遍
+- 分析范围 analysis_scope：这次有分析结论、取值 auto（缺省）时，文档里另记系统写的「分析范围」（现象、拆过、排除、没拆、
+  检验，engine/analysis_scope），不进正文、不过裸数字和说法核对
+
 出口契约复核（io.py）用 report_catalog 按同一套参数重建目录、独立重算，不信这里的自查。
 """
 from __future__ import annotations
@@ -47,6 +57,7 @@ from langgraph.func import task
 from app.core.errors import describe_exception, not_configured
 from app.core.events import EventType
 from app.db.base import SessionLocal
+from app.engine import analysis_claims as said
 from app.engine import judge as judging
 from app.engine.context import NodeContext, NodeError
 from app.engine.labels import field_label, option_label
@@ -73,6 +84,9 @@ from app.engine.evidence import (
 )
 from app.engine.nodes.llm import _invoke_streaming, _model_spec, _report_call
 from app.engine.schema import (
+    ANALYSIS_CLAIMS_DEFAULT,
+    ANALYSIS_CLAIMS_VALUES,
+    ANALYSIS_SCOPE_VALUES,
     CLAIMS_JUDGE,
     CLAIMS_VALUES,
     JUDGE_ON_UNSUPPORTED,
@@ -80,6 +94,8 @@ from app.engine.schema import (
     GraphSpec,
     NodeType,
     _ancestors,
+    analysis_claims_problem,
+    analysis_scope_problem,
     claims_problem,
     judge_problems,
 )
@@ -101,11 +117,14 @@ SOFT = frozenset({"unknown_entity", "unverified_entity"})
 #: 写作目录有省略时的缺失断言（「没有查到」「数据缺失」：写作者没看全证据，结论依据不足，但数字和出处都核对过）。
 #: 只剩这几类时不按 max_repairs 反复重写：重写一次没改掉，再写也多半一样，留在核对结果里标注
 REWRITE_ONLY = frozenset({"inline_see", "absence_claim"})
+#: 分析说法的违规（判断词没挂对分析结论、因果没有依据）：都不让节点失败。check 和 REWRITE_ONLY 一样只重写一次、仍有的
+#: 标注；strict 按 max_repairs 重写，仍有的写进出具缺口（_again、run_report 收尾）
+ANALYSIS = said.CODES
 #: 重写一次就是多一次整篇的模型调用，写不对的模型多给几次也大多写不对
 MAX_REPAIRS = 3
 
 ROLE = ("你是报告撰写人。报告里的每个数字都由系统从证据里取出来、按口径卡的格式渲染；"
-        "你负责挑重点、组织结构、说清变化和原因。")
+        "你负责挑重点、组织结构、说清变化；有分析结论时说清变化来自哪里；原因只按证据写。")
 
 MARKUP_NUDGE = ("你上一条回复把工具调用写成了文字。报告撰写不调用任何工具：能用的数据都在上面的"
                 "证据目录里，直接用引用标记写报告正文。")
@@ -360,6 +379,19 @@ def report_claims(spec: GraphSpec, node: GraphNode) -> str:
     return value if isinstance(value, str) and value in CLAIMS else "off"
 
 
+def report_analysis_claims(spec: GraphSpec, node: GraphNode) -> str:
+    """报告节点的分析说法核对：off / check / strict，没写是 check。写错的值画布校验就拦了，执行时节点也会报错，这里只把
+    认不出的当缺省。"""
+    value = _setting(spec, node, "analysis_claims", ANALYSIS_CLAIMS_DEFAULT)
+    return value if isinstance(value, str) and value in ANALYSIS_CLAIMS_VALUES else ANALYSIS_CLAIMS_DEFAULT
+
+
+def report_analysis_scope(spec: GraphSpec, node: GraphNode) -> str:
+    """报告节点的分析范围：auto（缺省，这次有分析结论时写）/ off。"""
+    value = _setting(spec, node, "analysis_scope", "auto")
+    return value if isinstance(value, str) and value in ANALYSIS_SCOPE_VALUES else "auto"
+
+
 def report_judge(spec: GraphSpec, node: GraphNode) -> dict[str, Any]:
     """claims: judge 的子配置：节点上的 judge（没写取图级 defaults），写了的键原样保留——上限写 null 就是
     不限，没写的键运行时取设置里的默认（judge.report_budget）。rewrite_once、on_unsupported 补上缺省
@@ -550,6 +582,8 @@ def _options(ctx: NodeContext) -> tuple[str, int]:
     entities = ctx.cfg("entities", "link") or "link"
     if entities not in ENTITIES:
         raise NodeError(ctx.node.id, _only("entities", ENTITIES, entities))
+    if problem := analysis_claims_problem(ctx.cfg("analysis_claims")) or analysis_scope_problem(ctx.cfg("analysis_scope")):
+        raise NodeError(ctx.node.id, problem)
     raw = ctx.cfg("max_repairs", 1)
     try:
         repairs = int(raw)
@@ -582,8 +616,16 @@ def _blocking(violations: list[dict[str, Any]], numbers: str) -> list[dict[str, 
 
 
 def _fatal(blocking: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """要判失败的违规：重写之后还在的、不属于 REWRITE_ONLY 的。"""
-    return [v for v in blocking if v.get("code") not in REWRITE_ONLY]
+    """要判失败的违规：重写之后还在的、不属于 REWRITE_ONLY 的。分析说法的违规不判失败（不挡生成）：check 只标注，
+    strict 记进出具缺口。"""
+    return [v for v in blocking if v.get("code") not in REWRITE_ONLY and v.get("code") not in ANALYSIS]
+
+
+def _again(blocking: list[dict[str, Any]], analysis: str) -> list[dict[str, Any]]:
+    """值得按 max_repairs 反复重写的违规：要判失败的那些，加上 strict 下的分析说法违规。只剩别的（REWRITE_ONLY、check 下
+    的说法违规）时重写一次就停。"""
+    return [v for v in blocking if v.get("code") not in REWRITE_ONLY
+            and (v.get("code") not in ANALYSIS or analysis == "strict")]
 
 
 def _fail_advice(fatal: list[dict[str, Any]]) -> str:
@@ -635,6 +677,8 @@ def _repair_request(violations: list[dict[str, Any]], failed_rule: str | None = 
         f"{describe_violations(violations)}\n\n"
         "请重写整篇报告：所有数字都用引用标记写，只引用证据目录里有的指标和输入；"
         + (f"{failed_rule}" if failed_rule else "")
+        # 判断词没挂对分析结论、原因没有依据：怎么改在上面每一条里写了，这里再说一句总的
+        + (said.ANALYSIS_REPAIR_PROMPT if any(v.get("code") in ANALYSIS for v in violations) else "")
         + "不要解释改了什么，只输出新的报告正文。"
     )
 
@@ -645,11 +689,15 @@ def run_today() -> date:
 
 
 def _messages(ctx: NodeContext, state: GraphState, writer: WriterCatalog, claims: str = "off",
-              failed: str | None = None) -> list[BaseMessage]:
+              failed: str | None = None, analysis: str | None = None) -> list[BaseMessage]:
+    """analysis 是这次要核分析说法时（check / strict）拼在写作规则后面的那一段（analysis_claims.rules_prompt：目录里有
+    分析结论和没有时各一种说法），不核时为 None、写作规则和以前一字不差。"""
     system = ctx.render_str(ctx.cfg("system", ""), state)
     instructions = ctx.render_str(ctx.cfg("instructions", ""), state).strip() \
         or "根据下面的证据写一份简洁的报告，先总后分。"
     rules = f"{MARKER_RULES}\n{SEE_AND_CODE_RULES}\n{UNIT_RULE}\n{period_rule(run_today())}"
+    if analysis:
+        rules = f"{rules}\n{analysis}"
     if writer.guarded:
         # 写作者看不全证据（目录有省略、有来源的结构化结论为空）：「没有查到」这类结论没有依据
         rules = f"{rules}\n{ABSENCE_RULE}"
@@ -770,6 +818,15 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     # 结论句策略只对升级后发起的运行生效：升级前的运行（图里也不会有 claims）事件、产出一个字不加
     evidence_on = ledger_enabled(ctx.run)
     claims = report_claims(spec, ctx.node) if evidence_on else "off"
+    # 分析说法核对、分析范围同样只对升级后发起的运行生效：升级前的运行写作规则、文档、产出一个字不加
+    analysis = report_analysis_claims(spec, ctx.node) if evidence_on else "off"
+    scope = None
+    if evidence_on and report_analysis_scope(spec, ctx.node) == "auto" and said.results_of(catalog):
+        # 这次有分析结论：按写作目录里的结论和数据目录算一次「分析范围」，每一稿的文档都带着它（不进正文）
+        from app.data import catalog_view
+        from app.engine.analysis_scope import scope_of
+
+        scope = await scope_of(catalog, catalog_view.of_run(ctx.run))
     if evidence_on:
         # 升级前发起的运行没有查询条目，单元格无从谈起，也就不多查这一次
         from app.engine.governance import governed_formal
@@ -795,7 +852,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                          + "：已告诉写作模型照实说没有查到，不为它们写引用",
                  failed=len(failed), any_query=any_query)
     messages = _messages(ctx, state, writer, claims,
-                         _failed_section(failed, any_query=any_query) if failed else None)
+                         _failed_section(failed, any_query=any_query) if failed else None,
+                         said.rules_prompt(catalog) if analysis in said.MODES else None)
     started = time.perf_counter()
     spent: list[dict[str, Any]] = []
     nudged = False
@@ -829,16 +887,21 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # （_MaskedCells）：只读正文里引用到的那几份快照
         # 文档记这次运行里的节点 id（子工作流里的报告是「子工作流节点 id/…」）：和它的 report.checked 事件、产出工件同一个
         # id。证据接口、可验证报告、质询都拿文档上的 id 和事件上的比，对不上就判「疑似被修改」
-        return await masked(compose_doc(_unfenced(raw), catalog, node_id=ctx.run.global_id(ctx.node.id),
-                                        run_id=ctx.run.run_id,
-                                        allow_numbers=allow, cells_allowed=cells, entities=entities,
-                                        absence=writer.trimmed))
+        # 分析说法按 analysis 核（check / strict 时文档记下这一项，off 不记不核）；分析范围是系统写的，每一稿都带同一份
+        doc = await masked(compose_doc(_unfenced(raw), catalog, node_id=ctx.run.global_id(ctx.node.id),
+                                       run_id=ctx.run.run_id,
+                                       allow_numbers=allow, cells_allowed=cells, entities=entities,
+                                       absence=writer.trimmed,
+                                       analysis_claims=analysis if analysis in said.MODES else None))
+        if scope is not None:
+            doc["analysis_scope"] = scope
+        return doc
 
     response, raw = await draft(messages)
     doc = await compose(raw)
     repairs = 0
     while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs \
-            and not (repairs and not _fatal(blocking)):
+            and not (repairs and not _again(blocking, analysis)):
         repairs += 1
         ctx.emit(EventType.LOG, level="warn", code="report_repair", count=len(blocking), attempt=repairs,
                  message=f"报告有 {len(blocking)} 处未通过核对（{_named(blocking)}），"
@@ -885,11 +948,27 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                  columns=list(dict.fromkeys(str(v["column"]) for v in hits if v.get("column"))),
                  message=f"{gaps[0]}。报告照常产出，这几处已标注，已记为缺口。"
                          f"请在报告撰写节点的指令中去掉对{_masked_targets(hits)}的引用")
+    analysis_gap = None
+    if (left := [v for v in doc["violations"] if v.get("code") in ANALYSIS]) \
+            and not (_fatal(blocking) and on_violation == "fail"):
+        # 重写之后还在：报告照常产出（不挡生成），这几处标在报告里；strict 另在产出里写一条缺口，成果节点设了出具契约、报告在
+        # 它上游时照单收下、降档（io._upstream_issuance_gaps；引用模式的出口自己再核一遍，见 io._analysis_claims）
+        tried = f"已要求模型重写 {repairs} 次仍未改掉" if repairs else "未要求重写"
+        what = said.summary(left)
+        if analysis == "strict":
+            analysis_gap = f"报告有 {len(left)} 处分析说法未通过核对（{what}：{_named(left)}），{tried}"
+            gaps.append(analysis_gap)
+        ctx.emit(EventType.LOG, level="warn", code="report_analysis_claims", count=len(left), mode=analysis,
+                 texts=list(dict.fromkeys(str(v.get("text") or "") for v in left)), counts=said.counts(left),
+                 message=f"报告有 {len(left)} 处分析说法未通过核对（{what}：{_named(left)}），{tried}："
+                         "判断要挂对应的分析结论并照判定写，原因要有知识库原话或运行输入作依据。报告照常产出，这几处已标注"
+                         + ("，已记为缺口" if analysis_gap else ""))
     doc_artifact = await _store(doc, ctx)
     ctx.emit(EventType.REPORT_CHECKED, doc_artifact=doc_artifact, ok=not doc["violations"],
              stats=doc["stats"], violations=doc["violations"][:20], repairs=repairs,
              on_violation=on_violation, failed=bool(_fatal(blocking)) and on_violation == "fail",
              **({"claims": claims} if evidence_on else {}),
+             **({"analysis_claims": analysis} if evidence_on else {}),
              **({"judge": judgement} if judgement is not None else {}))
     if (fatal := _fatal(blocking)) and on_violation == "fail":
         blocking = fatal
@@ -912,9 +991,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "model": model_id,
         "duration_ms": int((time.perf_counter() - started) * 1000),
         **({"claims": claims} if evidence_on else {}),
+        # 分析说法核对的处置：出口按它和文档里记的那一项判 strict 要不要记缺口（升级前的运行没有这个键）
+        **({"analysis_claims": analysis} if evidence_on else {}),
         **({"judge": judgement} if judgement is not None else {}),
         # 出口契约照单收下的缺口（只在有的时候带这个键：别的报告产出和以前一字不差）
         **({"issuance_gaps": gaps} if gaps else {}),
+        # 其中分析说法那一条：引用模式的出口自己复核过这份文档时以复核的为准，不再重复收这一条（io._analysis_claims）
+        **({"analysis_gap": analysis_gap} if analysis_gap else {}),
         # 写成「已遮罩」的指标：出口契约复核按它重建目录（report_catalog）。同上，只在有的时候带
         **({"masked_metrics": withheld} if withheld else {}),
     }

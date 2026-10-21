@@ -122,7 +122,8 @@ async def events(run_id: str, etype: str, node_id: str | None = None) -> list[Ru
 async def report_run(monkeypatch, text=WRITE) -> tuple[Run, dict]:
     script(monkeypatch, text)
     row = await finish(chain(node("start", "input"), node("fetch", "tool", tool=TOOL, args={"sql": SQL}),
-                             node("write", "report", instructions="写一句", max_repairs=0),
+                             # 「增长主要来自新客」没有分析结论可挂：分析说法核对关掉，审计表只看原有的几类
+                             node("write", "report", instructions="写一句", max_repairs=0, analysis_claims="off"),
                              node("out", "output", fields=[{"name": "r", "value": "{{ nodes.write.text }}"}])))
     assert row.status == "succeeded", row.error
     [checked] = await events(row.id, "report.checked", "write")
