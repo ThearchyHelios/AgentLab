@@ -266,6 +266,61 @@ async def test_the_scope_is_written_only_when_there_are_conclusions(monkeypatch,
 
 
 # --------------------------------------------------------------------------
+# 上游的可引用来源认分析结论（00-总方案 D10）
+# --------------------------------------------------------------------------
+
+
+def card_entry(alias: str) -> dict:
+    """分析卡做的结论（台账条目带 item、不带 call_id）。"""
+    return {**a_entry(alias, fake_result()), "item": "drop", "node_id": "card"}
+
+
+def agent_entry(alias: str) -> dict:
+    """Agent 的分析工具现场做的结论（带 call_id）。"""
+    return {**a_entry(alias, fake_result()), "call_id": "call-1", "node_id": "ask"}
+
+
+@pytest.mark.parametrize("cells", [True, False])
+def test_conclusions_from_an_analysis_card_are_citable_evidence(cells):
+    """「证据来自」只选了分析卡：分析卡的结论总能引用（判定语、具名的数），不报「上游没有可引用的来源」；受管级别的正式
+    出具没开「单元格引用」时也不报「只有查询结果」。"""
+    assert report_mod._no_evidence({"A1": card_entry("A1")}, cells) is None
+    assert report_mod._no_evidence({"Q1": {"kind": "query"}, "A1": card_entry("A1")}, cells) is None
+
+
+def test_conclusions_from_an_agent_follow_the_cells_rule():
+    catalog = {"Q1": {"kind": "query"}, "A1": agent_entry("A1")}
+    assert report_mod._no_evidence(catalog, True) is None
+    warning = report_mod._no_evidence(catalog, False)
+    assert warning and "只有查询结果和 Agent 现场做的分析" in warning and "无法引用单元格和这些分析结论" in warning
+    plain = report_mod._no_evidence({"Q1": {"kind": "query"}}, False)
+    assert plain and "只有查询结果，没有口径卡指标" in plain and "Agent" not in plain
+
+
+def test_nothing_citable_names_analysis_conclusions_too():
+    warning = report_mod._no_evidence({}, True)
+    assert warning and all(kind in warning for kind in ("口径卡指标", "查询结果", "知识库检索", "运行输入", "分析结论"))
+
+
+# --------------------------------------------------------------------------
+# 判断词不改一句话算不算结论：已发布版本的档位不变
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("extra", ["整体运行平稳，未见异常。", "下面是主要渠道的表现。", "促销期间活动效果显著。"])
+async def test_judgement_words_do_not_turn_connective_sentences_into_uncited_claims(monkeypatch, extra):
+    """已发布的受管版本（结论句要挂依据、出口带契约）：没有数字、没有引用的话照旧是连接性的话，不因为带了「主要」「异常」
+    「显著」就算没挂依据的结论、记缺口降档（判断词只给裁判排送判的先后，judge._JUDGEMENT）。"""
+    graph = weekly(numbers="strict", on_violation="flag", claims="require_citation")
+    graph["nodes"][-1]["data"]["config"]["contract"] = {
+        "report_from": "write", "metrics_from": ["caliber"], "required": ["gmv"], "strict": True}
+    script(monkeypatch, f"{PLAIN}\n\n{extra}")
+    issuance = (await finish(graph)).output["_issuance"]
+    assert issuance["tier"] == "formal" and issuance["gaps"] == []
+    assert issuance["claims"] == {"policy": "require_citation", "uncited_claims": 0, "uncited": []}
+
+
+# --------------------------------------------------------------------------
 # 取值写错
 # --------------------------------------------------------------------------
 

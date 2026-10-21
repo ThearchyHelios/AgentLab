@@ -54,6 +54,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.func import task
 
+from app.analysis.contract import LEDGER_KIND
 from app.core.errors import describe_exception, not_configured
 from app.core.events import EventType
 from app.db.base import SessionLocal
@@ -73,6 +74,7 @@ from app.engine.evidence import (
     UNIT_RULE,
     StreamRenderer,
     WriterCatalog,
+    analysis_card,
     build_catalog,
     catalog_budget,
     compose_doc,
@@ -434,19 +436,23 @@ def report_cells_allowed(spec: GraphSpec, node: GraphNode, *, governed: bool) ->
 
 
 #: 目录里能被报告引用的几种来源（沙箱代码节点的登记只为说清为什么不能引用，不算）
-_CITABLE = {"metric": "口径卡指标", "query": "查询结果", "retrieval": "知识库检索", "input": "运行输入"}
+_CITABLE = {"metric": "口径卡指标", "query": "查询结果", "retrieval": "知识库检索", "input": "运行输入",
+            LEDGER_KIND: "分析结论"}
 
 
 def _no_evidence(catalog: dict[str, Any], cells: bool) -> str | None:
-    """目录里没有可引用的来源时给一句话，说清缺的是哪种；有就返回 None。"""
+    """目录里没有可引用的来源时给一句话，说清缺的是哪种；有就返回 None。分析结论按 00-总方案 D10 认：分析卡做的总能引用
+    （判定语、具名的数），Agent 现场做的和它查的格同一个规矩——受管级别的正式出具没开「单元格引用」时引用不了。"""
     kinds = {entry.get("kind") for entry in catalog.values()}
     if not kinds & set(_CITABLE):
         return ("报告撰写节点的上游没有可引用的来源（" + "、".join(_CITABLE.values()) + "都没有），"
                 f"报告中的数字都会被判为没有出处。请在它前面接入取数节点或口径卡，或检查「{field_label('metrics_from')}」")
-    if not cells and not kinds & {"metric", "input"}:
-        # 只有查询和检索：单元格引用不了，检索片段本来就只能当依据，一个数都没处引
-        return (f"报告撰写节点的上游只有查询结果，没有口径卡指标，而{CELLS_REASON}，当前无法引用单元格，"
-                "报告中的数字都会被判为没有出处。请在出具契约中开启「单元格引用」，或把要写的数字登记到口径卡")
+    if not cells and not kinds & {"metric", "input"} and not any(analysis_card(e) for e in catalog.values()):
+        # 只有查询、检索和 Agent 现场做的分析：单元格和这些分析结论引用不了，检索片段本来就只能当依据，一个数都没处引
+        agent = LEDGER_KIND in kinds
+        return (f"报告撰写节点的上游只有查询结果{'和 Agent 现场做的分析' if agent else ''}，没有口径卡指标，而{CELLS_REASON}，"
+                f"当前无法引用单元格{'和这些分析结论' if agent else ''}，报告中的数字都会被判为没有出处。"
+                "请在出具契约中开启「单元格引用」，或把要写的数字登记到口径卡")
     return None
 
 

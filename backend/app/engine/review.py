@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -141,6 +142,13 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 缺口降档），是缺口不是断裂；但换一张有这段数据的表再建一次大概率就好，所以能给出重来的指示（REBUILD）
     "query_no_data": ("query_no_data", DEGRADED),
     "metric_no_data": ("metric_no_data", DEGRADED),
+    # 分析能力一轮（00-总方案 §3.7）：只写说明、不自动重来（NOTE_ONLY）。答案照常交付，缺口照实说一句就够了：
+    # 报告里判断词没挂对分析结论、原因没有依据，重写后仍有（check 标在报告里，strict 另记出具缺口）
+    "report_analysis_claims": ("report_analysis_claims", DEGRADED),
+    # 一份分析算不了（历史不够、本期不完整、截断……）：算不了本身是一条结论，写作者照实写原因
+    "analysis_refused": ("analysis_refused", DEGRADED),
+    # 口径卡上用到两次查询的指标没做成可比性检查（探查失败、算不了）：指标照常算，两期能不能直接比要人自己核对
+    "metric_comparability_skipped": ("metric_comparability_skipped", DEGRADED),
 }
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。
@@ -149,6 +157,10 @@ RETRYABLE = {"step_limit", "tool_error", "empty_completion", "node_failed"}
 #: 是缺口（DEGRADED）、却值得重建一次的信号：查询区间里这张表没有数据——图选错了表，换一张有这段数据的表大概率就好。
 #: 答案照常交付，复核照样可以给出「按复核重来」的指示（should_retry、chat/turn.retry_after_review 都认）
 REBUILD = {"query_no_data", "metric_no_data"}
+
+#: 只写说明、不自动重来的信号（00-总方案 §3.7）：都是缺口（DEGRADED）、不进 RETRYABLE / REBUILD。一次运行的信号全是
+#: 这几种时复核不叫模型，说明就照信号原话写（review）：答案照常、报告里已经标出，叫一次模型只是把同一句话换个说法
+NOTE_ONLY = frozenset({"report_analysis_claims", "analysis_refused", "metric_comparability_skipped"})
 
 #: 串行工具模式下塞给未执行调用的占位说明。它漏到用户面前当过答案，
 #: 所以复核要认得出来。从 nodes.llm 导入会绕成循环，这里按内容识别。
@@ -297,6 +309,8 @@ def _step_name(node_id: str, titles: Mapping[str, str]) -> str:
 
 #: 报告节点「改过一次」的信号：按同一个节点最后一次 report.checked 的结果定档（最终通过的不是缺口）
 _SETTLED_BY_REPORT = ("report_repair", "report_rewrite")
+#: report.checked 最多带几条违规（报告节点截到前 20 条）：带满了的，后面可能还有，不当作只剩标注
+_CHECKED_CAP = 20
 #: 证据不支持的几种判定（engine/judge 的 CONTRADICTED 加证据不足）：最终还剩这些，改写就没有改好
 _UNSUPPORTED = ("contradicted", "unsupported", "insufficient")
 
@@ -311,20 +325,38 @@ def _final_checks(rows: list[Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _annotations(final: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    """最后一次核对里剩下的违规都是只重写一次、留在报告里标注的那几类时，返回它们（没剩违规是空列表）；还有别的违规返回
+    None。标注的是：缺失断言（absence_claim，另发 report_absence_claim）、check 下的分析说法（engine/analysis_claims，另发
+    report_analysis_claims）——各有自己的信号说清楚，「改过一次」是不是改好了不看它们。strict 下的分析说法是出具缺口，
+    不算标注。"""
+    from app.engine.analysis_claims import CODES as ANALYSIS_CODES
+
+    left = [v for v in final.get("violations") or [] if isinstance(v, Mapping)]
+    marked = {"absence_claim", *(ANALYSIS_CODES if final.get("analysis_claims") == "check" else ())}
+    if final.get("ok") is True and not left:
+        return []
+    if not left or len(left) >= _CHECKED_CAP or any(v.get("code") not in marked for v in left):
+        return None
+    return left
+
+
 def _settled(code: str, final: Mapping[str, Any] | None) -> bool:
-    """「改过一次」之后最终是不是好了：report_repair 看最后一次核对有没有违规（ok、violations 为空）；report_rewrite
-    看最后的裁判摘要里还有没有证据不支持的句子。找不到最终结果（老运行、节点失败没写出 report.checked）的当没好。"""
+    """「改过一次」之后最终是不是好了：report_repair 看最后一次核对有没有违规（ok、violations 为空），只剩标注
+    （_annotations）的也算好了；report_rewrite 看最后的裁判摘要里还有没有证据不支持的句子。找不到最终结果（老运行、
+    节点失败没写出 report.checked）的当没好。"""
     if not final:
         return False
     if code == "report_repair":
-        return final.get("ok") is True and not final.get("violations")
+        return _annotations(final) is not None
     counts = ((final.get("judge") or {}).get("counts") or {}) if isinstance(final.get("judge"), dict) else {}
     return bool(counts) and not any(int(counts.get(k) or 0) for k in _UNSUPPORTED)
 
 
 def notes(events: Iterable[Any]) -> list[str]:
     """不是异常、但复核模型被别的信号叫起来时该知道的事（review_prompt 的「已经处理好的」）：报告首稿没过核对、重写后
-    已全部通过；裁判认为证据不支持的句子改写后都有了依据。只说处理好了的，没好的照旧是信号（scan）。"""
+    已全部通过（只剩标注的照实说剩下几处，那几处各有自己的信号）；裁判认为证据不支持的句子改写后都有了依据。只说处理好
+    了的，没好的照旧是信号（scan）。"""
     rows = list(events)
     finals = _final_checks(rows)
     titles: dict[str, str] = {}
@@ -349,7 +381,14 @@ def notes(events: Iterable[Any]) -> list[str]:
         if code == "report_repair":
             head = f"首稿有 {count} 处没过核对" if isinstance(count, int) and count > 0 else "首稿没过核对"
             again = f"重写 {times[(node_id, code)]} 次后" if times[(node_id, code)] > 1 else "重写后"
-            out.append(f"{name}{head}，{again}已全部通过")
+            left = _annotations(finals.get(node_id) or {}) or []
+            if not left:
+                out.append(f"{name}{head}，{again}已全部通过")
+            elif isinstance(count, int) and count > len(left):
+                said = {"absence_claim": "缺失断言"}
+                kinds = Counter(said.get(str(v.get("code")), "分析说法") for v in left)
+                rest = "、".join(f"{n} 处{kind}" for kind, n in kinds.items())
+                out.append(f"{name}{head}，{again}只剩已标出的 {rest}")
         else:
             head = f"有 {count} 句结论裁判认为证据不支持" if isinstance(count, int) and count > 0 \
                 else "有几句结论裁判认为证据不支持"
@@ -486,6 +525,9 @@ async def review(
     fallback_note = "；".join(s.detail for s in signals if s.severity == BROKEN) or "；".join(
         s.detail for s in signals
     )
+    if signals and all(s.kind in NOTE_ONLY for s in signals):
+        # 只写说明、不自动重来（NOTE_ONLY）：不叫模型，照信号原话说明
+        return ReviewResult(verdict="annotated", note=fallback_note, retry=False, signals=signals, severity=severity)
 
     messages = [("system", REVIEW_SYSTEM),
                 ("human", review_prompt(question, answer, signals, locked=locked, settled=settled))]

@@ -43,7 +43,7 @@ def codes(found: list[dict]) -> list[str]:
 
 @pytest.mark.parametrize("text, claim", [
     ("下降主要来自华东。", "source"), ("增长主要由线上贡献。", "source"), ("下降集中在华东、华北。", "source"),
-    ("绝大部分来自线下。", "source"), ("华东拖累了整体。", "source"), ("线上带动了增长。", "source"),
+    ("增长绝大部分来自线下。", "source"), ("华东拖累了整体。", "source"), ("线上带动了增长。", "source"),
     ("华东贡献最大。", "source"), ("下降主要是华东下滑造成的。", "source"),
     ("变化分散在各地区。", "dispersed"), ("各地区都在下降。", "dispersed"), ("各渠道普遍下滑。", "dispersed"),
     ("全面下降。", "dispersed"),
@@ -53,7 +53,7 @@ def codes(found: list[dict]) -> list[str]:
     ("销售额明显偏离往常。", "anomaly"), ("超出过去 12 周的常规波动范围。", "anomaly"),
     ("销售额明显高于正常水平。", "anomaly"), ("波动剧烈。", "anomaly"),
     ("本周创历史新高。", "record"), ("销售额创新高。", "record"), ("前所未有。", "record"),
-    ("在常规波动范围内。", "normal"), ("属于正常波动。", "normal"), ("并不异常。", "normal"),
+    ("在常规波动范围内。", "normal"), ("属于正常波动。", "normal"), ("这一降幅并不异常。", "normal"),
     ("线上销售额持续上升。", "trend"), ("呈上升趋势。", "trend"), ("一路走低。", "trend"), ("稳步增长。", "trend"),
     ("连续三周下降。", "trend"), ("连续下滑。", "trend"),
     ("没有明显的上升或下降趋势。", "no_trend"), ("上升趋势不明显。", "no_trend"), ("基本平稳。", "no_trend"),
@@ -138,13 +138,13 @@ def test_dafu_needs_a_baseline_outside_the_band_in_the_same_direction():
 
 
 @pytest.mark.parametrize("text, claim", [
-    ("并未出现明显异常。", "normal"),           # 否定隔着「出现明显」
-    ("本周没有出现异常。", "normal"),
+    ("订单数并未出现明显异常。", "normal"),     # 否定隔着「出现明显」
+    ("本周销售额没有出现异常。", "normal"),
     ("不在正常范围内。", "anomaly"),
     ("不属于正常波动。", "anomaly"),
     ("没有显著高于华东。", "no_diff"),
-    ("并非主要来自华东。", "source_not"),
-    ("并不分散。", "source"),
+    ("下降并非主要来自华东。", "source_not"),
+    ("下降并不分散。", "source"),
     ("没有持续上升。", "no_trend"),
 ])
 def test_a_negation_flips_to_the_opposite_class(text, claim):
@@ -196,8 +196,10 @@ def test_ascii_names_need_word_boundaries_but_chinese_neighbours_are_fine():
     result["table"]["rows"][0][0] = "AB"
     result["table"]["rows"][1][0] = "A"
     assert said("下降主要来自AB店。", "A1", results={"A1": result}) == []
-    assert said("下降主要来自XAB。", "A1", results={"A1": result}) == [], "XAB 不是点名 AB，也没点名别的段"
-    assert codes(said("下降主要来自A。", "A1", results={"A1": result})) == [], "一个字的名字不认"
+    # XAB 不是点名 AB、一个字的名字不认：都当没点名哪一段，说的来源不是拆解里的段
+    [miss] = said("下降主要来自XAB。", "A1", results={"A1": result})
+    assert miss["code"] == ac.MISMATCH and "不是这份拆解里的段" in miss["message"]
+    assert codes(said("下降主要来自A。", "A1", results={"A1": result})) == [ac.MISMATCH]
 
 
 def test_named_segments_are_matched_across_full_and_half_width():
@@ -252,6 +254,29 @@ def test_trends_check_the_direction_and_runs_check_the_length():
     flat = fake_result("trend", None, "no_trend", direction=None)
     assert said("没有明显的上升或下降趋势。", "A1", results={"A1": flat}) == []
     assert codes(said("线上销售额持续上升。", "A1", results={"A1": flat})) == [ac.MISMATCH]
+
+
+def test_runs_follow_the_run_direction_and_the_number_of_periods_they_claim():
+    """「连续 N 期上升」按趋势结论记的末尾连续同向核（run_direction、run_length）：方向一致、期数不少于 N（没写 N 的至少
+    3 期），不看整体的趋势判定——判定语在方向相反时写「但最近已连续 N 期上升」。"""
+    rising = fake_result("trend", None, "rising", direction="up", values={"run_length": "4", "run_direction": "up"})
+    assert said("线上销售额已连续 4 周上升。", "A1", results={"A1": rising}) == []
+    [miss] = said("线上销售额持续增长，已连续 5 周上升。", "A1", results={"A1": rising})
+    assert miss["code"] == ac.MISMATCH and miss["claim"] == "trend" and "只有 4 期，不够说连续 5 期" in miss["message"]
+    # 整体下降、最近连续上升：「连续上升」对得上，「持续上升」对不上
+    turned = fake_result("trend", None, "falling", direction="down", values={"run_length": "4", "run_direction": "up"})
+    assert said("订单数最近已连续四周上升。", "A1", results={"A1": turned}) == []
+    assert codes(said("订单数已连续三周下降。", "A1", results={"A1": turned})) == [ac.MISMATCH]
+    assert codes(said("订单数持续上升。", "A1", results={"A1": turned})) == [ac.MISMATCH]
+    # 没有明显趋势、末尾连续下降：也能说连续
+    flat = fake_result("trend", None, "no_trend", direction=None, values={"run_length": "3", "run_direction": "down"})
+    assert said("订单数三连降。", "A1", results={"A1": flat}) == []
+    assert codes(said("订单数四连降。", "A1", results={"A1": flat})) == [ac.MISMATCH]
+    assert codes(said("订单数三连涨。", "A1", results={"A1": flat})) == [ac.MISMATCH]
+    # 没记 run_direction 的老结论按整体的趋势方向
+    old = fake_result("trend", None, "rising", direction="up", values={"run_length": "3"})
+    assert said("订单数连续上升。", "A1", results={"A1": old}) == []
+    assert codes(said("订单数连续下降。", "A1", results={"A1": old})) == [ac.MISMATCH]
 
 
 def test_differences_check_the_verdict_and_the_order_of_the_two_groups():
@@ -330,9 +355,63 @@ def test_a_cause_outside_the_decomposition_needs_its_own_evidence():
     {"text": "由于促销结束导致下降。", "inputs": True},
     {"text": "由于数据只到 10 月 16 日，本周不完整。"},
     {"text": "由于样本少，差异不能下结论。"},
+    {"text": "以上是本周下降的主要原因。"},          # 原因只是指代：列出原因的那几句各自核
+    {"text": "下降的原因主要是："},
 ])
 def test_guesses_quotes_inputs_and_data_caveats_are_not_unsupported_causes(sentence):
     assert ac.check_sentence(ac.Sentence(**sentence), {}) == []
+
+
+@pytest.mark.parametrize("text, found", [
+    ("下降主要由于促销结束。", [(ac.CAUSAL, "causal")]),                     # 「主要由」不吃掉「由于」
+    ("华东下降主要由于促销结束。", [(ac.CAUSAL, "causal")]),                 # 原因在「由于」后面，前面的华东不算
+    ("促销结束导致华东下降。", [(ac.CAUSAL, "causal")]),                     # 原因在「导致」前面
+    ("华东受促销结束影响下降。", [(ac.CAUSAL, "causal")]),                   # 原因在「受…影响」中间
+    ("下降主要由促销结束造成。", [(ac.MISMATCH, "source"), (ac.CAUSAL, "causal")]),
+    ("下降主要来自线上渠道。", [(ac.MISMATCH, "source")]),                   # 说的来源不是拆解（按地区）里的段
+    ("下降主要来自新客流失。", [(ac.MISMATCH, "source")]),
+    ("华东下降主要来自线上渠道。", [(ac.MISMATCH, "source")]),               # 「主要来自」看后面
+    ("下降主要由华东造成。", []),
+    ("华东是本周下降的主要原因。", []),                                     # 原因点名的是段：按来源核
+    ("下降的主要原因是华东门店客流减少。", []),
+    ("华南是本周下降的主要原因。", [(ac.MISMATCH, "source")]),
+    ("下降主要源于华东。", []),
+    ("华东下滑，拖累了整体。", []),                                         # 拖累看整个分句，没点名的按主要来源
+])
+def test_sources_and_causes_attached_to_a_decomposition(text, found):
+    """挂了按地区拆解、判「主要来自华东」的结论（复核 R4）：原因按因果词的那一边认；说的来源得是拆解里的段。"""
+    assert [(v["code"], v["claim"]) for v in said(text, "A1", results={"A1": fake_result()})] == found
+
+
+def test_a_source_needs_no_name_when_the_clause_quotes_the_phrase_or_says_structure():
+    driver = fake_result()
+    phrase = ac.Sentence(text="下降主要来自以下地区：\x00\x00\x00\x00。", analyses=["A1"], phrases=[(11, 15, "A1")])
+    assert ac.check_sentence(phrase, {"A1": driver}) == []
+    elsewhere = ac.Sentence(text="\x00\x00\x00\x00，下降主要来自这一地区。", analyses=["A1"], phrases=[(0, 4, "A1")])
+    assert codes(ac.check_sentence(elsewhere, {"A1": driver})) == [ac.MISMATCH], "判定语在别的分句"
+    mix = fake_result(mode="ratio", verdict="mix_driven", subjects=[["华东"]])
+    assert said("退款率上升主要来自结构变化。", "A1", results={"A1": mix}) == []
+    rate = fake_result(mode="ratio", verdict="rate_driven", subjects=[["华东"]])
+    assert said("退款率上升主要来自各段自身的变化。", "A1", results={"A1": rate}) == []
+    assert [v["claim"] for v in said("退款率上升主要来自结构变化。", "A1", results={"A1": rate})] == ["source", "mix"]
+
+
+def test_before_side_sources_look_back_to_the_nearest_named_clause():
+    driver = fake_result()
+    assert said("华东门店表现最弱，贡献最大。", "A1", results={"A1": driver}) == []
+    assert said("华南基本持平，华东贡献最大。", "A1", results={"A1": driver}) == [], "最近的分句点了名就不再往前找"
+    assert codes(said("新客贡献最大。", "A1", results={"A1": driver})) == [ac.MISMATCH]
+
+
+@pytest.mark.parametrize("text, results, found", [
+    ("下降主要由华东造成。", {}, [ac.UNCITED]),                              # 没有拆解可比：并进来源
+    ("下降主要由华东造成。", {"A2": fake_result()}, [ac.UNCITED]),           # 华东是目录里拆解的段：并进来源
+    ("下降主要由促销结束造成。", {"A2": fake_result()}, [ac.UNCITED, ac.CAUSAL]),
+    ("下降主要由促销结束造成。", {}, [ac.UNCITED]),
+])
+def test_without_a_decomposition_attached_a_cause_merges_into_the_source_only_when_it_could_be_one(text, results,
+                                                                                                    found):
+    assert codes(said(text, results=results)) == found
 
 
 # --------------------------------------------------------------------------
@@ -413,6 +492,19 @@ def test_system_rendered_phrases_quotes_headings_and_code_are_not_scanned():
     assert codes(ac.check_doc(doc, catalog())) == [ac.UNCITED]
 
 
+def test_table_cells_written_by_the_writer_are_not_checked():
+    """表格的格不核（表头、正文都不核）：一格是一个值不是一句话，状态列的「异常」、说明列的「主要来自线上」不是判断
+    （judge.claim_priority 也不送表格的格）。表格外的段落、列表照核。"""
+    raw = ("本周销售额 [[m:gmv]]。[[see:m:gmv]]\n\n| 门店 | 状态 | 说明 |\n|---|---|---|\n| 甲店 | 异常 | 主要来自线上 |\n"
+           "| 乙店 | 正常 | 持续增长 |\n\n```\n异常订单激增\n```\n\n## 主要来自华东的下降\n\n- 华东拖累明显\n")
+    doc = compose_doc(raw, catalog(), analysis_claims="check")
+    tables = {u["id"] for b in doc["blocks"] if b["type"] == "table" for u in b["units"]}
+    assert len(tables) == 9, "表格切成了一格一格"
+    [v] = found(doc)
+    assert v["code"] == ac.UNCITED and v["text"] == "拖累" and v["unit"] not in tables
+    assert [v["text"] for v in found(verify_doc(doc, catalog()))] == ["拖累"]
+
+
 def test_rendered_values_name_segments_but_are_not_judgement_words():
     # [[v:…]] 渲染出来的「华东」能点名，渲染出来的「异常」不是写作者下的判断
     doc = {"markdown": "", "blocks": [{"type": "paragraph", "units": [{"id": "u0", "kind": "claim", "cites": ["A1"],
@@ -438,6 +530,24 @@ def test_compose_and_verify_bind_the_sentence_to_its_see_marker():
     assert [v["code"] for v in verify_doc(tampered, cat)["violations"]] == [ac.UNCITED]
 
 
+@pytest.mark.parametrize("raw, want", [
+    ("销售额 [[m:gmv]]，下降主要来自线上渠道。[[see:A1]]", [(ac.MISMATCH, "主要来自")]),
+    ("销售额 [[m:gmv]]，下降主要来自新客流失。[[see:A1]]", [(ac.MISMATCH, "主要来自")]),
+    ("销售额 [[m:gmv]]，下降主要由于促销结束。[[see:A1]]", [(ac.CAUSAL, "由于")]),
+    ("销售额 [[m:gmv]]，下降主要由促销结束造成。[[see:A1]]", [(ac.MISMATCH, "主要由"), (ac.CAUSAL, "造成")]),
+    ("销售额 [[m:gmv]]，下降主要来自华东。[[see:A1]]", []),
+    ("销售额 [[m:gmv]]，下降主要来自 [[v:A1.r0.region]]。[[see:A1]]", []),
+    ("销售额 [[m:gmv]]，下降主要来自以下地区：[[a:A1]]。", []),
+    ("[[a:A1]]，下降主要来自这一地区。", [(ac.MISMATCH, "主要来自")]),
+])
+def test_strict_documents_close_the_source_and_cause_loopholes(raw, want):
+    """复核 R4 的几个口子（strict 下挂一份按地区拆解、判「主要来自华东」的 A1）：经组装和复核都核出来。"""
+    cat = catalog(A1=fake_result())
+    doc = compose_doc(raw, cat, analysis_claims="strict")
+    assert [(v["code"], v["text"]) for v in found(doc)] == want
+    assert [(v["code"], v["text"]) for v in found(verify_doc(doc, cat))] == want
+
+
 def test_inputs_and_quotes_in_the_same_sentence_support_a_cause():
     doc = compose_doc("由于本周有 [[i:promo]] 活动，销售额 [[m:gmv]]。[[see:m:gmv]]", catalog(), analysis_claims="check")
     assert found(doc) == []
@@ -454,12 +564,18 @@ def test_the_prompt_rules_depend_on_whether_there_are_conclusions():
     assert "[[a:A1]]" in ac.ANALYSIS_RULES_PROMPT
 
 
-def test_judgement_words_make_a_sentence_a_claim_for_the_judge():
+def test_judgement_words_rank_claims_for_the_judge_but_do_not_make_sentences_claims():
+    """判断词只管裁判送判的先后（judge._JUDGEMENT）：一句话算不算结论仍按原来的方向词、因果词（evidence._DIRECTIONAL），
+    结论句策略要求挂依据、出具缺口照它数——扩了就改了已发布版本的档位。"""
     from app.engine.judge import claim_priority
 
-    doc = compose_doc("华东异常。\n\n下面主要看三个方面。\n\n建议持续关注。\n\n近 8 周的趋势图如下：", catalog())
+    doc = compose_doc("华东异常。\n\n华东异常，退款 12 单。\n\n下面是主要渠道的表现。\n\n促销期间活动效果显著。\n\n"
+                      "整体运行平稳，未见异常。\n\n建议持续关注。\n\n近 8 周的趋势图如下：\n\n华东退款 12 单。", catalog())
     kinds = {doc["markdown"][slice(*u["span"])]: (u["kind"], claim_priority(u, b, doc["markdown"]))
              for b, u in evidence.iter_units(doc)}
-    assert kinds["华东异常。"] == ("claim", 2)
-    assert kinds["下面主要看三个方面。"][0] == "connective" and kinds["建议持续关注。"][0] == "connective"
-    assert kinds["近 8 周的趋势图如下："][0] == "connective", "引出图表的话不算判断"
+    for text in ("华东异常。", "下面是主要渠道的表现。", "促销期间活动效果显著。", "整体运行平稳，未见异常。", "建议持续关注。",
+                 "近 8 周的趋势图如下："):
+        assert kinds[text] == ("connective", None), text
+    assert doc["stats"]["uncited_claims"] == 2, "只有两句带数字的算结论"
+    assert kinds["华东异常，退款 12 单。"] == ("claim", 2), "结论句里的判断词让裁判先判它"
+    assert kinds["华东退款 12 单。"] == ("claim", 3)
