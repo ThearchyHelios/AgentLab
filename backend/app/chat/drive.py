@@ -123,13 +123,16 @@ class TurnDriver:
 
     def __init__(self, question: str, *, datasource_ids: list[str],
                  on_phase: Callable[[str], Awaitable[None]] | None = None,
-                 provider: str | None = None, model: str | None = None) -> None:
+                 provider: str | None = None, model: str | None = None, analysis_tools: bool = True) -> None:
         self.question = question
         self.datasource_ids = list(datasource_ids)
         self.on_phase = on_phase
         #: 助手模型（生成、复核都用它）：评测按变体覆盖，问数据用设置里的
         self.provider = provider
         self.model = model
+        #: 这一轮给不给助手分析工具：透传给 api/copilot.answer_ops 的 analysis_tools。只给评测的「分析工具开、关」对照用
+        #: （eval/answer.Driver 按变体设），问数据页不暴露这个开关，一直是真
+        self.analysis_tools = analysis_tools
         self.turn = Turn()
         self.terminal: dict[str, Any] | None = None
         self.refusal: Exception | None = None
@@ -200,7 +203,7 @@ class TurnDriver:
         payload = self.generate_in(instruction, base_graph)
         ops: list[dict[str, Any]] = []
         try:
-            async for op in answer_ops(payload, catalog_view=self.catalog_view()):
+            async for op in answer_ops(payload, catalog_view=self.catalog_view(), analysis_tools=self.analysis_tools):
                 await self.on_op(op)
                 if op.get("op") in ("thinking", "heartbeat"):
                     continue

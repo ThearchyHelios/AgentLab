@@ -76,7 +76,7 @@ def _scope_note(rows: list[Any], scoped: bool) -> str:
             "db_schema__ 工具；前几轮用过别的库，这一轮也不要沿用")
 
 
-def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None) -> str:
+def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None, analysis_tools: bool = True) -> str:
     """给助手看的工具清单。
 
     all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
@@ -86,11 +86,14 @@ def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None) ->
     不列表名（look 文档 D3）：以前每个库列前 12 个表名，和这一轮要做什么无关，闲聊也带着；表数写一句，字段要用时 look。
 
     builtins 给了的话内置工具只列这几个：使用者的问数据（_CHAT_USER_PROMPT）只能用只读的那几个，列出来用不了的工具，
-    模型照样会绑。
+    模型照样会绑。analysis_tools 为假（评测「关掉分析工具」那一臂，answer_ops）时不列五个分析工具。
     """
+    from app.tools.analysis import ANALYSIS_TOOLS
+
     lines = [
         f"- {name}（{spec.category}）：{spec.description}"
-        for name, spec in sorted(all_specs().items()) if builtins is None or name in builtins
+        for name, spec in sorted(all_specs().items())
+        if (builtins is None or name in builtins) and (analysis_tools or name not in ANALYSIS_TOOLS)
     ]
 
     from app.data import introspect as _introspect
@@ -391,6 +394,26 @@ skip_if。这些字段按受限的 Python 表达式求值，变量直接写路�
 - 一个节点连出多条普通边 = 并行执行，多条边汇入同一节点 = 等待汇聚
 """
 
+#: 节点手册里只讲分析能力的几段：(从这一行起, 到这一行之前)。评测「关掉分析工具」那一臂（answer_ops 的 analysis_tools 为假）
+#: 不给这几段——agent 段里「分析类问题绑分析工具」那一条、分析卡一整条、搭图规则第 7 条：助手不知道有分析工具和分析卡，
+#: 也不会被教着去用。报告段里分析结论的引用写法、分析说法核对照留（报告节点照样会核判断词）
+_ANALYSIS_PROMPT_SPANS = (
+    ("  **问题问的是为什么、怎么变了", "  **默认不要写 max_steps"),
+    ("- analysis：分析卡。", "- dual_check："),
+    ("7. 问题问为什么、怎么变了", "\n模型字段"),
+)
+
+
+def node_reference(*, analysis_tools: bool = True) -> str:
+    """给助手的节点手册。analysis_tools 为假时去掉只讲分析能力的那几段（_ANALYSIS_PROMPT_SPANS）。"""
+    if analysis_tools:
+        return NODE_REFERENCE
+    text = NODE_REFERENCE
+    for start, end in _ANALYSIS_PROMPT_SPANS:
+        i = text.index(start)
+        text = text[:i] + text[text.index(end, i):]
+    return text
+
 
 class GenerateIn(BaseModel):
     instruction: str = Field(min_length=1, description="用自然语言描述想要的工作流")
@@ -415,8 +438,21 @@ def _question_of(payload: GenerateIn) -> str | None:
     return (payload.question or "").strip() or payload.instruction
 
 
-def _user_message(payload: GenerateIn, *, patch: bool) -> str:
-    """把用户说的话包成给模型的请求。
+#: 问数据的包装里「分析类问题」那一条形状（00-总方案 §3.7）：问原因、来源、异常、趋势、差异的，判定由平台的分析工具算、系统写
+#: 判定语，报告引用它。问题意图另由自查按 app/analysis/intent 的词表再核一遍：分析类问题而查库的 agent 没绑分析工具时交回改一轮
+ANALYSIS_SHAPE_PROMPT = (
+    "- 问的是为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、正常吗、波动、趋势、是不是真的更高这类分析问题时，搭 "
+    "input → agent → report → output：agent 绑 db_query__、db_schema__ 和五个分析工具（analysis_comparable、"
+    "analysis_baseline、analysis_trend、analysis_decompose、analysis_differ），prompt 里写清要回答的问题、比哪两期"
+    "（问题没说就比上一个整期），不用教分析方法（平台会注入）、不写阈值；report 的 instructions 写「回答：{{ input.question }}。"
+    "按分析结论写，判断直接引用判定语；没有分析结论的判断不下，原因没有依据的写成待核实的推测」（可以附上 "
+    "{{ nodes.agent的id.text }} 当分析思路）：数引用 agent 查过的单元格，判定引用它做过的分析结论。analysis_claims "
+    "用默认，不要关\n"
+)
+
+
+def _user_message(payload: GenerateIn, *, patch: bool, analysis_tools: bool = True) -> str:
+    """把用户说的话包成给模型的请求。analysis_tools 为假（评测「关掉分析工具」那一臂）时不给分析类问题那一条形状。
 
     两个入口的语义完全不同，包法必须跟着变：
 
@@ -452,16 +488,9 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "「回答：{{ input.question }}」（可以附上 {{ nodes.agent的id.text }} 当分析思路），数用 [[v:Q1.r0.列名]] "
             "直接引用 agent 查过的单元格，不必经过口径卡；要比率、增幅再在 agent 和 report 之间加口径卡，agent 配 "
             "output_schema + cite_fields，口径卡读 vars.<assign_to>.字段。出口字段写 {{ nodes.report的id.text }}\n"
-            # 分析能力一轮（00-总方案 §3.7）：问原因、来源、异常、趋势、差异的，判定由平台的分析工具算、系统写判定语，报告引用它。
-            # 问题意图由自查按 app/analysis/intent 的词表再核一遍：分析类问题而查库的 agent 没绑分析工具时交回改一轮
-            "- 问的是为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、正常吗、波动、趋势、是不是真的更高这类分析问题时，搭 "
-            "input → agent → report → output：agent 绑 db_query__、db_schema__ 和五个分析工具（analysis_comparable、"
-            "analysis_baseline、analysis_trend、analysis_decompose、analysis_differ），prompt 里写清要回答的问题、比哪两期"
-            "（问题没说就比上一个整期），不用教分析方法（平台会注入）、不写阈值；report 的 instructions 写「回答：{{ input.question }}。"
-            "按分析结论写，判断直接引用判定语；没有分析结论的判断不下，原因没有依据的写成待核实的推测」（可以附上 "
-            "{{ nodes.agent的id.text }} 当分析思路）：数引用 agent 查过的单元格，判定引用它做过的分析结论。analysis_claims "
-            "用默认，不要关\n"
-            "- 只问表结构、清单（有哪些表、有哪些字段、列出名单）的，不加 report，agent → output 就行\n"
+            # 分析类问题那一条形状（ANALYSIS_SHAPE_PROMPT）：评测「关掉分析工具」那一臂不给
+            + (ANALYSIS_SHAPE_PROMPT if analysis_tools else "")
+            + "- 只问表结构、清单（有哪些表、有哪些字段、列出名单）的，不加 report，agent → output 就行\n"
             # 三期起报告会核对写出来的表名、字段名：instructions 里让它「列出用到的表」时，编出来的名字会被标出来
             "- report 提到表名、字段名时写 [[t:表名]] / [[c:表名.字段名]]（英文名也可以放进反引号，中文名不行："
             "反引号里的中文名不核对），只写 agent 真查过的名字，"
@@ -879,16 +908,18 @@ GRAPH_SCHEMA: dict[str, Any] = {
 
 
 def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, looks: Any, *,
-                  chat_user: bool = False) -> str:
+                  chat_user: bool = False, analysis_tools: bool = True) -> str:
     """画布、问数据（流式和非流式）共用的 system：节点手册、工具清单、数据源概览、结构要求、输出协议、查看的用法。
     这一份一直用到自查修正结束（接着写、修正轮都不换），模型前后看到的是同一套说法。
 
-    chat_user：开登录后 user 角色的问数据（D-c）。内置工具只列只读的那几个，结构要求后面再加一段使用者的约束。"""
+    chat_user：开登录后 user 角色的问数据（D-c）。内置工具只列只读的那几个，结构要求后面再加一段使用者的约束。
+    analysis_tools 为假（评测「关掉分析工具」那一臂）：节点手册去掉只讲分析能力的几段，工具清单不列分析工具。"""
     from app.auth.chat_policy import CHAT_BUILTIN_TOOLS
 
+    catalog = _tool_catalog(sources, builtins=CHAT_BUILTIN_TOOLS if chat_user else None, analysis_tools=analysis_tools)
     return (
         "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, builtins=CHAT_BUILTIN_TOOLS if chat_user else None)}"
+        f"{node_reference(analysis_tools=analysis_tools)}\n\n可用工具：\n{catalog}"
         f"{datasources}{_scope_note(sources, scope is not None)}\n\n"
         "结构要求：\n"
         "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
@@ -940,7 +971,41 @@ def _chat_user_issues(nodes: dict[str, dict[str, Any]], edges: list[dict[str, An
                           "去掉不允许的节点、工具和记忆范围 / 知识库配置"}]
 
 
-def _graph_request(payload: GenerateIn) -> str:
+#: 关掉分析工具时（answer_ops 的 analysis_tools 为假）图里还绑着分析工具的那条问题的 code
+ANALYSIS_TOOLS_OFF = "analysis_tools_off"
+
+
+def _analysis_off_issues(nodes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """评测「关掉分析工具」那一臂：这一轮的工具清单里没有分析工具，图里照样绑了的（Agent、协作成员、调用工具节点）按
+    「绑定的工具不存在」挡（同 engine/launch 发起前那一道的说法），交回模型去掉；改不好就不运行。一个节点一条。"""
+    from app.tools.analysis import ANALYSIS_TOOLS
+
+    out: list[dict[str, Any]] = []
+    for nid, node in nodes.items():
+        cfg = ((node or {}).get("data") or {}).get("config") or {}
+        ntype = (node or {}).get("type")
+        if ntype == NodeType.TOOL:
+            names = [cfg.get("tool")]
+        elif ntype == NodeType.AGENT:
+            names = list(cfg.get("tools") or [])
+        elif ntype == NodeType.SUPERVISOR:
+            names = [t for m in cfg.get("agents") or [] if isinstance(m, dict) for t in m.get("tools") or []]
+        else:
+            continue
+        bound = list(dict.fromkeys(n.strip() for n in names if isinstance(n, str) and n.strip() in ANALYSIS_TOOLS))
+        if not bound:
+            continue
+        title = str(((node or {}).get("data") or {}).get("label") or "").strip() or nid
+        field = "tool" if ntype == NodeType.TOOL else "agents" if ntype == NodeType.SUPERVISOR else "tools"
+        out.append({"level": "error", "node_id": nid, "edge_id": None, "field": field, "code": ANALYSIS_TOOLS_OFF,
+                    "message": f"绑定的工具不存在：「{title}」绑定的 {'、'.join(bound)}。这一轮没有分析工具可用，请在节点中去掉它们",
+                    "for_model": f"「{nid}」绑定的 {'、'.join(bound)} 不在这一轮的工具清单里，这一轮没有分析工具可用：从它的"
+                                 "工具里去掉这几个，只用上面列出的工具（db_query__、db_schema__ 照留）；数据要怎么比、怎么拆，"
+                                 "写进查询"})
+    return out
+
+
+def _graph_request(payload: GenerateIn, *, analysis_tools: bool = True) -> str:
     """这一轮的请求：改现有图时附上原图、只要改动操作；新建时按入口包好（_user_message）。"""
     if payload.base_graph and payload.base_graph.get("nodes"):
         return (
@@ -948,7 +1013,7 @@ def _graph_request(payload: GenerateIn) -> str:
             f"{json.dumps(_slim(payload.base_graph), ensure_ascii=False, indent=2)}\n\n"
             f"请按下面的要求修改它（只输出改动操作）：\n{payload.instruction}"
         )
-    return _user_message(payload, patch=False)
+    return _user_message(payload, patch=False, analysis_tools=analysis_tools)
 
 
 def _start_graph(payload: GenerateIn) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
@@ -1211,11 +1276,13 @@ def _blocking_issues(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], scope: set[str] | None = None,
     *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
     level: str | None = None, defaults: dict[str, Any] | None = None,
-    checkers: dict[str, Any] | None = None, chat_user: bool = False,
+    checkers: dict[str, Any] | None = None, chat_user: bool = False, analysis_tools: bool = True,
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
 
     chat_user：图要以开登录后 user 角色的身份在问数据里发起（D-c），使用者不能用的节点、工具、配置也挡（_chat_user_issues）。
+
+    analysis_tools 为假（评测「关掉分析工具」那一臂）：图里还绑着分析工具的也挡（_analysis_off_issues）。
 
     限定了数据源时，用了范围外的库也算：用户点了「只查这个库」，拿别的库的数
     回答他，比跑不起来更糟——答案看起来是对的。
@@ -1245,7 +1312,8 @@ def _blocking_issues(
     out = ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
            + [i for i in authored if i["level"] == "error"]
-           + (_chat_user_issues(nodes, edges) if chat_user else []))
+           + (_chat_user_issues(nodes, edges) if chat_user else [])
+           + ([] if analysis_tools else _analysis_off_issues(nodes)))
     if level:
         from app.engine.governance import lint_for_publish
 
@@ -1740,7 +1808,7 @@ async def generate_stream(payload: GenerateIn):
     )
 
 
-async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
+async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_tools: bool = True):
     """生成过程：按需求起草、按需查看、自查修正、排版校验，逐条交出操作（op dict）。问数据页（经 SSE）和评测（直接迭代）
     走的是这同一条路（细案 01 做法 2）。
 
@@ -1751,6 +1819,10 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
     开流前的准备（取数据源、读目录检查器、取助手模型、拼历史、组查看服务）用自己的短会话，在交出第一条操作之前做完：
     拒绝在这里抛 HTTPException（调用方没迭代到第一条就知道）。catalog_view 是这一轮读哪一份数据目录（data/catalog_view.py：
     查看的表详情、自查的 SQL 检查器都按它），不给是当前目录。
+
+    analysis_tools 为假是评测「关掉分析工具」那一臂（分析工具开、关对照，chat/drive.TurnDriver 的 analysis_tools 透传过来）：
+    工具清单不列五个分析工具，节点手册、问数据的包装里只讲分析能力的那几段不给，问题意图那条自查不提；图里照样绑了分析工具
+    的按「绑定的工具不存在」挡（_analysis_off_issues）。缺省为真，和以前一字不差。
 
     final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、fail 判失败），问数据页照它走。最后多交一条 usage
     （providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
@@ -1783,7 +1855,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         except ProviderNotConfigured as e:
             raise HTTPException(400, _unconfigured(e)) from e
 
-        human = _with_history(_graph_request(payload), await _history_section(session, payload.conversation_id))
+        human = _with_history(_graph_request(payload, analysis_tools=analysis_tools),
+                              await _history_section(session, payload.conversation_id))
         # 兜底用：模型只发了改动操作时，把它们重放到这张图上
         prev_graph = await _previous_graph(session, payload.conversation_id)
         # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
@@ -1797,12 +1870,14 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
             payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view, kinds=kinds)
     # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
-    system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user)
+    system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user,
+                           analysis_tools=analysis_tools)
     applier = GraphApplier(nodes, edges, composer=copilot_context.composer(looks))
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, looks=looks, started=started,
                      checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,
-                                          chat_user=chat_user, question=_question_of(payload)))
+                                          chat_user=chat_user, question=_question_of(payload),
+                                          analysis_tools=analysis_tools))
 
     async def steps():
         yield {"op": "model", "model": model_id}
@@ -1869,7 +1944,7 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         async for op in _with_heartbeat(gen.repair(), phase="repairing"):
             yield op
         remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers,
-                                     chat_user=chat_user)
+                                     chat_user=chat_user, analysis_tools=analysis_tools)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
@@ -1905,6 +1980,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
             issues += [i for i in authored if i["code"] in CHECK_CODES]
             # 使用者发起不了的图（D-c）：自查没改好的照实列出，界面据此不运行、说清原因
             issues += _chat_user_issues(nodes, edges) if chat_user else []
+            # 关掉分析工具的那一臂里还绑着分析工具的（自查没改好）：同上，照实列出，不运行
+            issues += [] if analysis_tools else _analysis_off_issues(nodes)
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [

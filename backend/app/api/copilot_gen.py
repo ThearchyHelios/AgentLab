@@ -709,13 +709,15 @@ class GraphChecker:
     known 给了（升级证据）：只把这一轮冒出来的问题交回去（图上原来就有的不归这一轮管），一个修改都没落地时不修。
 
     question 给了（问数据：用户问的那句话）：问题是分析类（app/analysis/intent）、查库的 Agent 却没绑分析工具时另提一条
-    （analysis_gaps），同 coverage 只交回模型改一轮。
+    （analysis_gaps），同 coverage 只交回模型改一轮。analysis_tools 为假（评测「关掉分析工具」那一臂）时这一条不提，图里
+    还绑着分析工具的按挡路的问题算（copilot._analysis_off_issues）。
     """
 
     def __init__(self, applier: GraphApplier, *, scope: set[str] | None = None, sources: list[Any] | None = None,
                  baseline: list[dict[str, Any]] | None = None, level: str | None = None,
                  defaults: dict[str, Any] | None = None, checkers: dict[str, Any] | None = None,
-                 known: set[Any] | None = None, chat_user: bool = False, question: str | None = None) -> None:
+                 known: set[Any] | None = None, chat_user: bool = False, question: str | None = None,
+                 analysis_tools: bool = True) -> None:
         from app.analysis.intent import analysis_intent
 
         self.applier = applier
@@ -733,8 +735,10 @@ class GraphChecker:
         self._coverage_cache: Any = None
         #: 这类问题已经交回模型改过一轮：之后不再挡（修正后仍在的留在检查结果里当提醒，由模型在说明里照实告诉用户）
         self._coverage_given = False
-        #: 用户问题的分析意图（问为什么、怎么变了、是否异常、趋势……），不是分析类问题为 None
-        self.intent = analysis_intent(question) if question else None
+        #: 这一轮给不给分析工具（评测「关掉分析工具」那一臂为假）
+        self.analysis_tools = analysis_tools
+        #: 用户问题的分析意图（问为什么、怎么变了、是否异常、趋势……），不是分析类问题、或者这一轮没有分析工具时为 None
+        self.intent = analysis_intent(question) if question and analysis_tools else None
         #: 「分析类问题、Agent 没绑分析工具」已经交回模型改过一轮：之后不再挡，同 _coverage_given
         self._analysis_given = False
 
@@ -743,7 +747,7 @@ class GraphChecker:
 
         return _blocking_issues(self.applier.nodes, self.applier.edges, self.scope, sources=self.sources,
                                 baseline=self.baseline, level=self.level, defaults=self.defaults,
-                                checkers=self.checkers, chat_user=self.chat_user)
+                                checkers=self.checkers, chat_user=self.chat_user, analysis_tools=self.analysis_tools)
 
     async def issues(self) -> list[dict[str, Any]]:
         errors = self.blocking()

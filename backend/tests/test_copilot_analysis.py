@@ -1,6 +1,8 @@
 """助手搭图认分析能力（00-总方案 §3.7）：节点手册教分析卡和分析工具、报告的分析结论引用写法；问数据的包装多一种「分析类
 问题」的形状；自查时问题是分析类（app/analysis/intent）、查库的 Agent 却没绑分析工具，交回模型改一轮（只挡一轮，照 coverage
-的样板），改过一轮仍在的不挡运行、留作提醒；报告的上游只有分析卡也算有可引用的来源。
+的样板），改过一轮仍在的不挡运行、留作提醒；报告的上游只有分析卡也算有可引用的来源。评测「分析工具开、关」对照的「关」那一臂
+（answer_ops 的 analysis_tools、chat/drive.TurnDriver 的同名属性）：工具清单、节点手册、问数据的包装里都没有分析，图里绑了
+也按「绑定的工具不存在」挡，别的和开着时一样。
 
 手册里举的引用标记交给真正的解析器，确认写法和系统认的是同一套（同 tests/test_copilot_entity_guide.py）。问法、节点、
 表都是虚构的零售场景。
@@ -14,7 +16,8 @@ import pytest
 from langchain_core.messages import AIMessageChunk
 
 from app.analysis import contract
-from app.api.copilot import _ASSIST_RULES, NODE_REFERENCE, GenerateIn, _evidence_source, _question_of, _user_message
+from app.api.copilot import (_ASSIST_RULES, ANALYSIS_SHAPE_PROMPT, ANALYSIS_TOOLS_OFF, NODE_REFERENCE, GenerateIn,
+                             _evidence_source, _question_of, _tool_catalog, _user_message, node_reference)
 from app.api.copilot_gen import ANALYSIS_TOOLS_MISSING, GraphApplier, GraphChecker
 from app.engine.evidence import _CELL_REF, _ROW_REF, SUPPORTED_KINDS, parse_markers
 from app.engine.schema import ANALYSIS_CLAIMS_VALUES, ANALYSIS_SCOPE_VALUES, GraphNode, NodeType
@@ -246,3 +249,112 @@ async def test_a_retry_reads_the_original_question(client, monkeypatch):  # noqa
     assert not [op for op in got if op["op"] == "check" and op["status"] == "repairing"]
     [final] = [op for op in got if op["op"] == "final"]
     assert not [i for i in final["issues"] if i["code"] == ANALYSIS_TOOLS_MISSING]
+
+
+# --------------------------------------------------------------------------
+# 关掉分析工具（评测「分析工具开、关」对照的「关」那一臂：answer_ops 的 analysis_tools、TurnDriver 的同名属性）
+# --------------------------------------------------------------------------
+
+
+def test_the_catalog_and_the_manual_leave_analysis_out_when_switched_off():
+    assert all(f"- {name}（" in _tool_catalog([]) for name in TOOLS)
+    off = _tool_catalog([], analysis_tools=False)
+    assert not [line for line in off.splitlines() if line.startswith("- analysis_")]
+    assert off == "\n".join(line for line in _tool_catalog([]).splitlines() if not line.startswith("- analysis_"))
+    assert node_reference() is NODE_REFERENCE
+    manual = node_reference(analysis_tools=False)
+    assert not any(name in manual for name in TOOLS)
+    # 去掉的是 agent 段里「分析类问题绑分析工具」那一条、分析卡一整条、搭图规则第 7 条；报告段的引用写法、受管规则照留
+    assert "- analysis：" not in manual and "\n7. " not in manual and "**问题问的是为什么" not in manual
+    # 别的段落一字不少：只去掉那三段
+    for kept in ("  **默认不要写 max_steps", "- dual_check：", "\n模型字段", "- report：", "[[a:A1]]", "analysis_claims"):
+        assert kept in manual, kept
+    request = GenerateIn(instruction="上周销售额为什么下降", intent="answer")
+    on, off_text = _user_message(request, patch=False), _user_message(request, patch=False, analysis_tools=False)
+    assert ANALYSIS_SHAPE_PROMPT in on and ANALYSIS_SHAPE_PROMPT not in off_text
+    assert on.replace(ANALYSIS_SHAPE_PROMPT, "") == off_text
+
+
+def _recording(first: list[dict], fix: list[dict], seen: list[list[tuple[str, str]]]):
+    class Recording:
+        async def astream(self, messages):
+            seen.append(list(messages))
+            human = next(text for role, text in messages if role == "human")
+            for op in (fix if "上线前自查" in human else first):
+                yield AIMessageChunk(content=json.dumps(op, ensure_ascii=False) + "\n")
+
+    return Recording()
+
+
+async def _ops_of(question: str, *, analysis_tools: bool) -> list[dict]:
+    from app.api.copilot import answer_ops
+
+    return [op async for op in answer_ops(GenerateIn(instruction=question, intent="answer"),
+                                          analysis_tools=analysis_tools)
+            if op.get("op") not in ("heartbeat", "usage")]
+
+
+async def test_switched_off_the_copilot_sees_no_analysis_and_bound_tools_are_blocked(monkeypatch):
+    seen: list[list[tuple[str, str]]] = []
+    fix = [{"op": "update_node", "id": "bot", "config": {"tools": ["db_query__shop", "db_schema__shop"]}},
+           {"op": "done", "explanation": "去掉了分析工具"}]
+    _use(monkeypatch, _recording(_ops(["db_query__shop", "db_schema__shop", "analysis_decompose"]), fix, seen))
+    got = await _ops_of("上周销售额为什么下降", analysis_tools=False)
+    system = seen[0][0][1]
+    assert seen[0][0][0] == "system" and not any(name in system for name in TOOLS)
+    assert ANALYSIS_TOOLS_MISSING not in json.dumps(got, ensure_ascii=False), "问题意图那条自查不提"
+    [repairing] = [op for op in got if op["op"] == "check" and op["status"] == "repairing"]
+    [issue] = [i for i in repairing["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
+    assert issue["node_id"] == "bot" and issue["message"].startswith("绑定的工具不存在：「bot」绑定的 analysis_decompose")
+    [final] = [op for op in got if op["op"] == "final"]
+    assert final["next"] == "run" and not [i for i in final["issues"] if i["code"] == ANALYSIS_TOOLS_OFF]
+
+    # 改不好：照实列出、不运行
+    seen.clear()
+    _use(monkeypatch, _recording(_ops(["db_query__shop", "analysis_decompose"]), [{"op": "done", "explanation": "x"}],
+                                 seen))
+    got = await _ops_of("上周销售额为什么下降", analysis_tools=False)
+    [final] = [op for op in got if op["op"] == "final"]
+    assert final["next"] == "fail" and [i["level"] for i in final["issues"] if i["code"] == ANALYSIS_TOOLS_OFF] == ["error"]
+
+
+async def test_switched_on_bound_analysis_tools_are_fine(monkeypatch):
+    """缺省开着：绑了分析工具不挡，和以前一样直接运行。"""
+    seen: list[list[tuple[str, str]]] = []
+    _use(monkeypatch, _recording(_ops(["db_query__shop", "db_schema__shop", *TOOLS]), [], seen))
+    got = await _ops_of("上周销售额为什么下降", analysis_tools=True)
+    assert all(name in seen[0][0][1] for name in TOOLS)
+    assert not [op for op in got if op["op"] == "check" and op["status"] == "repairing"]
+    [final] = [op for op in got if op["op"] == "final"]
+    assert final["next"] == "run"
+
+
+async def test_other_turns_go_the_same_either_way(monkeypatch):
+    """没碰分析工具的一轮（不是分析类问题、图里没绑分析工具）：开、关两臂交出的操作逐条一样，差的只是给助手看的那几段。"""
+    runs = {}
+    for flag in (True, False):
+        seen: list[list[tuple[str, str]]] = []
+        _use(monkeypatch, _recording(_ops(["db_query__shop", "db_schema__shop"]), [], seen))
+        runs[flag] = (await _ops_of("上周销售额是多少", analysis_tools=flag), seen[0])
+    assert runs[True][0] == runs[False][0]
+    (_, system_on), (_, human_on) = runs[True][1]
+    (_, system_off), (_, human_off) = runs[False][1]
+    assert human_on.replace(ANALYSIS_SHAPE_PROMPT, "") == human_off and system_on != system_off
+
+
+async def test_the_turn_driver_passes_the_switch_through(monkeypatch):
+    import app.api.copilot as copilot
+    from app.chat.drive import TurnDriver
+
+    calls: list[dict] = []
+
+    async def fake_ops(payload, **kwargs):
+        calls.append({"question": payload.question, **kwargs})
+        yield {"op": "reply", "text": "上一轮已经查过了。"}
+
+    monkeypatch.setattr(copilot, "answer_ops", fake_ops)
+    assert TurnDriver("上周销售额为什么下降", datasource_ids=[]).analysis_tools is True
+    driver = TurnDriver("上周销售额为什么下降", datasource_ids=[], analysis_tools=False)
+    ops, refused = await driver._generate("上周销售额为什么下降", None)
+    assert refused is None and ops == [{"op": "reply", "text": "上一轮已经查过了。"}]
+    assert calls == [{"question": "上周销售额为什么下降", "catalog_view": None, "analysis_tools": False}]
