@@ -53,6 +53,26 @@ METHODS: dict[tuple[str, str | None], str] = {
 }
 #: agent 分析工具的名字（tools/builtin 里注册），一个算子一个工具：参数各自聚焦，模型少写错
 TOOL_NAMES: dict[str, str] = {op: f"analysis_{op}" for op in OPS}
+#: 算子、模式给人看的叫法：证据面板、写作目录、审计、导出、可验证报告、裁判摘录都用它（method_label 拼成一句）
+OP_LABELS: dict[str, str] = {
+    "decompose": "变化拆解", "baseline": "波动基线", "trend": "趋势", "differ": "差异检验", "comparable": "可比性检查",
+}
+MODE_LABELS: dict[str, str] = {
+    "additive": "可加", "ratio": "比率", "factor": "乘积", "rate": "比率", "mean": "均值", "rows": "逐行明细",
+}
+
+
+def method_label(op: Any, mode: Any = None) -> str:
+    """「变化拆解（可加）」「波动基线」。认不出的算子、模式原样写出来，不编叫法。"""
+    name = OP_LABELS.get(str(op or ""), str(op or ""))
+    return f"{name}（{MODE_LABELS.get(str(mode), str(mode))}）" if mode else name
+
+
+def is_result(content: Any) -> bool:
+    """一件工件的内容是不是分析结论：按形状认（op 是五个算子之一、method 是文字、inputs 是列表）。证据接入取回 ARTIFACT_KIND
+    的工件、SQL 问题顺着输入往下找、可验证报告认嵌进来的工件，都按这一个函数认。"""
+    return isinstance(content, Mapping) and content.get("op") in OPS and isinstance(content.get("method"), str) \
+        and isinstance(content.get("inputs"), list)
 
 #: 每个算子可能给出的判定（细案 01 §2–§6）
 VERDICTS: dict[str, tuple[str, ...]] = {
@@ -374,8 +394,8 @@ def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
 
 __all__ = [
     "ARTIFACT_KIND", "CATALOG_PREFIX", "CAVEATS", "DEFAULTS", "LABELS", "LEDGER_KIND", "MARKER_KIND", "METHODS", "MODES",
-    "NODE_TYPE", "NOT_RECOMPUTED", "OPS", "RANGES", "REASONS", "SETTINGS_KEY", "TOOL_NAMES", "VERDICTS",
-    "AnalysisInput", "AnalysisRequest", "AnalysisResult", "CallError", "Caveat", "Context", "InputSnapshot",
+    "MODE_LABELS", "NODE_TYPE", "NOT_RECOMPUTED", "OPS", "OP_LABELS", "RANGES", "REASONS", "SETTINGS_KEY", "TOOL_NAMES",
+    "VERDICTS", "AnalysisInput", "AnalysisRequest", "AnalysisResult", "CallError", "Caveat", "Context", "InputSnapshot",
     "MetricComparability", "Probe", "Prober", "ResultTable", "ScopeBlock", "ScopeItem", "Verdict", "catalog_result",
-    "effective_settings", "ledger_entry", "same", "settings_problem",
+    "effective_settings", "is_result", "ledger_entry", "method_label", "same", "settings_problem",
 ]
