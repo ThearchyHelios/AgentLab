@@ -1,7 +1,8 @@
 """问题意图（app/analysis/intent.py）：一句问题是不是分析类问题，给助手搭问数据的图时自查用。
 
 只收明确的问法、宁可漏判：漏判只是少一条自查提醒，误判要让助手多改一轮。所以反例和正例一样多——问一个字段（退款原因）、
-问业务状态（异常订单）、问服务（系统正常吗）、筛选（波动超过 10%）、问时长（持续几天）都不算。问法都是虚构的零售场景。
+问业务状态（异常订单）、问服务（系统正常吗）、问构成（谁贡献最大、哪个门店销售额最多）、问这批数据本身（今天的数据正常
+吗）、筛选（波动超过 10%）、问时长（持续几天）都不算。问法都是虚构的零售场景。
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ POSITIVE = [
     ("这周和上周比，销售额怎么变了", "source"),
     ("上周各渠道的销售额有什么变化", "source"),
     ("哪个地区拖累了整体销售额", "source"),
-    ("谁贡献最大", "source"),
+    ("哪个地区对销售额下降贡献最大", "source"),
     ("增长主要来自哪个地区", "source"),
     ("各地区对销售额增长的贡献是多少", "source"),
     ("销售额增长的驱动因素有哪些", "source"),
@@ -70,6 +71,15 @@ NEGATIVE = [
     "退款原因有哪些",
     "按取消原因统计上周的订单数",
     "订单主要来自哪些渠道",
+    # 问构成（哪个最多）：同句没有变化的说法，不算来源
+    "谁贡献最大",
+    "哪个门店贡献的销售额最多",
+    "哪个门店贡献最大",
+    # 「数据」当主语：问的是这批数据本身，不是那一项的数变没变
+    "数据是否正常",
+    "今天的数据正常吗",
+    "上周的数据有没有异常",
+    "数据有没有异常",
     "有多少异常订单",
     "有没有异常记录",
     "列出状态为异常的订单",
@@ -109,7 +119,7 @@ def test_other_questions_are_left_alone(question):
 
 
 def test_the_lexicon_is_versioned_and_every_kind_has_a_label():
-    assert INTENT_VERSION == 1
+    assert INTENT_VERSION == 2
     assert {kind for _, kind in POSITIVE} == set(KINDS)
     found = analysis_intent("上周销售额为什么下降了")
     assert isinstance(found, Intent) and found.version == INTENT_VERSION and found.label == "原因"

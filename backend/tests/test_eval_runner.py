@@ -534,6 +534,30 @@ async def test_the_estimate_says_it_cannot_price_instead_of_zero():
     assert got["total_usd"] == 0.0 and not got.get("at_least") and not got.get("unpriced_calls"), "目录价是 0 的才是真不花钱"
 
 
+def test_the_prompt_fingerprint_covers_the_intent_lexicon_and_the_self_check_sentence(monkeypatch):
+    """提示词指纹认得出「问题意图词表变了」和「自查交回模型的那一句变了」：改词表要升 INTENT_VERSION，改那句话它自己
+    就带在里面。两者任一变了，两次评测比的时候标「提示词变了」。"""
+    from app.analysis import intent
+    from app.api import copilot_gen
+
+    before = runner.prompt_fingerprint()
+    assert before == runner.prompt_fingerprint(), "同一份提示词指纹一样"
+    monkeypatch.setattr(intent, "INTENT_VERSION", intent.INTENT_VERSION + 1)
+    assert runner.prompt_fingerprint() != before, "词表升版本要认得出"
+    monkeypatch.undo()
+
+    real = copilot_gen.analysis_gaps_fix
+    monkeypatch.setattr(copilot_gen, "analysis_gaps_fix",
+                        lambda **kw: real(**kw).replace("按「分析类问题」的形状改", "换一种形状改"))
+    assert runner.prompt_fingerprint() != before, "自查那句话变了要认得出"
+    monkeypatch.undo()
+
+    # 那句话里写着两条东西：分析类问题的形状、以及不改这一处时在说明里讲清为什么
+    said = copilot_gen.analysis_gaps_fix(asked="问题问的是原因（「为什么下降」）", nid="bot")
+    assert said.startswith("问题问的是原因（「为什么下降」）。按「分析类问题」的形状改：给查库的 agent「bot」的 tools 加上")
+    assert "analysis_decompose" in said and "done 的 explanation" in said
+
+
 def test_the_judge_role_keeps_its_unpriced_calls():
     """按角色的用量里裁判那一份以前只有金额和次数：裁判模型不在价格目录里时写成 $0。"""
     usage = runner.judge_usage({"claims": {"cost_usd": 0.0, "calls": 2, "priced": False},

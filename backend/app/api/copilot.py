@@ -404,14 +404,33 @@ _ANALYSIS_PROMPT_SPANS = (
 )
 
 
+#: 关掉分析工具时节点手册里另外改写的几处：(原文, 换成)。报告段里提到分析结论的来处、分析结论的引用写法、分析说法核对和分析
+#: 范围两个配置，受管规则里分析卡和分析工具的那两句——关的那一臂没有分析结论，也不让助手知道有分析卡、分析工具
+_ANALYSIS_PROMPT_EDITS = (
+    ("K2…）、\n  分析结论（agent 调分析工具、分析卡做的，按先后编成 A1、A2…）和运行输入", "K2…）\n  和运行输入"),
+    ("  claims, analysis_claims, analysis_scope, entities, assign_to}", "  claims, entities, assign_to}"),
+    ('  analysis_claims: "strict"、\n', ""),
+    ("。分析卡的输入要是\n  调用 db_query__ 的 tool 节点或 merge；分析卡的结论总能引用，agent 用分析工具现场做的分析和它查的格同一个规矩"
+     "（契约\n  写 cells: true 才引用得了）", "。"),
+)
+#: 同上，整段去掉的：(从这一行起, 到这一行之前)
+_ANALYSIS_PROMPT_CUTS = (
+    ("  - 分析结论：[[a:A1]]", "  - 涉及码值"),
+    ("  analysis_claims 是分析说法核对", "  entities 默认 link"),
+)
+
+
 def node_reference(*, analysis_tools: bool = True) -> str:
-    """给助手的节点手册。analysis_tools 为假时去掉只讲分析能力的那几段（_ANALYSIS_PROMPT_SPANS）。"""
+    """给助手的节点手册。analysis_tools 为假时去掉讲分析能力的那几段（_ANALYSIS_PROMPT_SPANS、_ANALYSIS_PROMPT_CUTS），
+    改写顺带提到它的几句（_ANALYSIS_PROMPT_EDITS）：手册里不再出现分析卡、分析工具和分析相关的配置键。"""
     if analysis_tools:
         return NODE_REFERENCE
     text = NODE_REFERENCE
-    for start, end in _ANALYSIS_PROMPT_SPANS:
+    for start, end in (*_ANALYSIS_PROMPT_SPANS, *_ANALYSIS_PROMPT_CUTS):
         i = text.index(start)
         text = text[:i] + text[text.index(end, i):]
+    for old, new in _ANALYSIS_PROMPT_EDITS:
+        text = text.replace(old, new, 1)
     return text
 
 
@@ -971,19 +990,62 @@ def _chat_user_issues(nodes: dict[str, dict[str, Any]], edges: list[dict[str, An
                           "去掉不允许的节点、工具和记忆范围 / 知识库配置"}]
 
 
-#: 关掉分析工具时（answer_ops 的 analysis_tools 为假）图里还绑着分析工具的那条问题的 code
+#: 关掉分析工具时（answer_ops 的 analysis_tools 为假）图里还用着分析能力的那条问题的 code
 ANALYSIS_TOOLS_OFF = "analysis_tools_off"
+#: 那条问题交回模型的改法（几种节点共用的后半句）
+_OFF_FIX = "这一轮没有分析能力可用：数据要怎么比、怎么拆，写进查询，报告直接引用查询结果"
 
 
-def _analysis_off_issues(nodes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """评测「关掉分析工具」那一臂：这一轮的工具清单里没有分析工具，图里照样绑了的（Agent、协作成员、调用工具节点）按
-    「绑定的工具不存在」挡（同 engine/launch 发起前那一道的说法），交回模型去掉；改不好就不运行。一个节点一条。"""
+async def analysis_off_subgraphs(nodes: dict[str, dict[str, Any]]) -> set[str]:
+    """评测「关掉分析工具」那一臂：图里哪些子工作流节点（照运行时的取法：固定了版本的读那一版，没固定的读现在的图，
+    一层层往下）用了分析能力——有分析卡，或者有绑了分析工具的 Agent、协作成员（engine/launch 快照分析设置时的同一个认法）。
+    读不到、不成形的不算（子工作流节点运行时自己会报）。"""
+    from app.db.base import SessionLocal
+    from app.engine.launch import _analyzes, _any_graph
+
+    out: set[str] = set()
+    subs = [(nid, n) for nid, n in nodes.items() if (n or {}).get("type") == NodeType.SUBGRAPH]
+    if not subs:
+        return out
+    async with SessionLocal() as session:
+        for nid, node in subs:
+            try:
+                spec = GraphSpec.model_validate({"nodes": [node], "edges": []})
+            except Exception:  # noqa: BLE001 - 节点本身不成形，校验另报
+                continue
+            if await _any_graph(session, spec, _analyzes):
+                out.add(nid)
+    return out
+
+
+def _analysis_off_issues(nodes: dict[str, dict[str, Any]], subgraphs: set[str] | frozenset[str] = frozenset()
+                         ) -> list[dict[str, Any]]:
+    """评测「关掉分析工具」那一臂：这一轮的工具清单、节点手册里都没有分析能力，图里照样用了的挡回去改（改不好就不运行），
+    一个节点一条，说法照「绑定的工具不存在」那一套（engine/launch 发起前那一道）：
+    - Agent、协作成员、调用工具节点绑了分析工具：绑定的工具不存在，去掉它们
+    - 分析卡：这次不能用分析卡，去掉它，连线接回去
+    - 子工作流里用了分析能力（subgraphs：analysis_off_subgraphs 算好的节点 id）：这次不能用这个子工作流"""
     from app.tools.analysis import ANALYSIS_TOOLS
 
     out: list[dict[str, Any]] = []
     for nid, node in nodes.items():
         cfg = ((node or {}).get("data") or {}).get("config") or {}
         ntype = (node or {}).get("type")
+        title = str(((node or {}).get("data") or {}).get("label") or "").strip() or nid
+        if ntype == NodeType.ANALYSIS:
+            out.append({"level": "error", "node_id": nid, "edge_id": None, "field": None, "code": ANALYSIS_TOOLS_OFF,
+                        "message": f"这次不能用分析卡：「{title}」是分析卡，这一轮没有分析能力可用，请去掉它",
+                        "for_model": f"「{nid}」是 analysis 节点，这一轮不能用：用 remove_node 去掉它，再把它上游的节点直接"
+                                     f"连到它下游；{_OFF_FIX}"})
+            continue
+        if ntype == NodeType.SUBGRAPH:
+            if nid in subgraphs:
+                out.append({"level": "error", "node_id": nid, "edge_id": None, "field": "workflow_id",
+                            "code": ANALYSIS_TOOLS_OFF,
+                            "message": f"这次不能用这个子工作流：「{title}」嵌套的工作流里有分析卡或分析工具，这一轮没有分析能力可用",
+                            "for_model": f"「{nid}」嵌套的工作流里有分析卡或分析工具，这一轮不能用：去掉这个 subgraph 节点，"
+                                         f"取数直接用 tool 节点或 agent 查；{_OFF_FIX}"})
+            continue
         if ntype == NodeType.TOOL:
             names = [cfg.get("tool")]
         elif ntype == NodeType.AGENT:
@@ -995,13 +1057,11 @@ def _analysis_off_issues(nodes: dict[str, dict[str, Any]]) -> list[dict[str, Any
         bound = list(dict.fromkeys(n.strip() for n in names if isinstance(n, str) and n.strip() in ANALYSIS_TOOLS))
         if not bound:
             continue
-        title = str(((node or {}).get("data") or {}).get("label") or "").strip() or nid
         field = "tool" if ntype == NodeType.TOOL else "agents" if ntype == NodeType.SUPERVISOR else "tools"
         out.append({"level": "error", "node_id": nid, "edge_id": None, "field": field, "code": ANALYSIS_TOOLS_OFF,
                     "message": f"绑定的工具不存在：「{title}」绑定的 {'、'.join(bound)}。这一轮没有分析工具可用，请在节点中去掉它们",
-                    "for_model": f"「{nid}」绑定的 {'、'.join(bound)} 不在这一轮的工具清单里，这一轮没有分析工具可用：从它的"
-                                 "工具里去掉这几个，只用上面列出的工具（db_query__、db_schema__ 照留）；数据要怎么比、怎么拆，"
-                                 "写进查询"})
+                    "for_model": f"「{nid}」绑定的 {'、'.join(bound)} 不在这一轮的工具清单里：从它的工具里去掉这几个，只用上面"
+                                 f"列出的工具（db_query__、db_schema__ 照留）；{_OFF_FIX}"})
     return out
 
 
@@ -1277,12 +1337,14 @@ def _blocking_issues(
     *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
     level: str | None = None, defaults: dict[str, Any] | None = None,
     checkers: dict[str, Any] | None = None, chat_user: bool = False, analysis_tools: bool = True,
+    off_subgraphs: set[str] | frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
 
     chat_user：图要以开登录后 user 角色的身份在问数据里发起（D-c），使用者不能用的节点、工具、配置也挡（_chat_user_issues）。
 
-    analysis_tools 为假（评测「关掉分析工具」那一臂）：图里还绑着分析工具的也挡（_analysis_off_issues）。
+    analysis_tools 为假（评测「关掉分析工具」那一臂）：图里还用着分析能力的也挡（_analysis_off_issues：绑了分析工具、分析卡，
+    off_subgraphs 里那几个用了分析能力的子工作流节点，由调用方先用 analysis_off_subgraphs 读好）。
 
     限定了数据源时，用了范围外的库也算：用户点了「只查这个库」，拿别的库的数
     回答他，比跑不起来更糟——答案看起来是对的。
@@ -1313,7 +1375,7 @@ def _blocking_issues(
            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
            + [i for i in authored if i["level"] == "error"]
            + (_chat_user_issues(nodes, edges) if chat_user else [])
-           + ([] if analysis_tools else _analysis_off_issues(nodes)))
+           + ([] if analysis_tools else _analysis_off_issues(nodes, off_subgraphs)))
     if level:
         from app.engine.governance import lint_for_publish
 
@@ -1822,7 +1884,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
 
     analysis_tools 为假是评测「关掉分析工具」那一臂（分析工具开、关对照，chat/drive.TurnDriver 的 analysis_tools 透传过来）：
     工具清单不列五个分析工具，节点手册、问数据的包装里只讲分析能力的那几段不给，问题意图那条自查不提；图里照样绑了分析工具
-    的按「绑定的工具不存在」挡（_analysis_off_issues）。缺省为真，和以前一字不差。
+    的、有分析卡的、嵌套的子工作流里用了分析能力的，照「绑定的工具不存在」那一套挡回去改（_analysis_off_issues）。缺省为真，
+    和以前一字不差。
 
     final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、fail 判失败），问数据页照它走。最后多交一条 usage
     （providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
@@ -1943,8 +2006,9 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
         async for op in _with_heartbeat(gen.repair(), phase="repairing"):
             yield op
+        off_subgraphs = set() if analysis_tools else await analysis_off_subgraphs(nodes)
         remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers,
-                                     chat_user=chat_user, analysis_tools=analysis_tools)
+                                     chat_user=chat_user, analysis_tools=analysis_tools, off_subgraphs=off_subgraphs)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
@@ -1981,7 +2045,7 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
             # 使用者发起不了的图（D-c）：自查没改好的照实列出，界面据此不运行、说清原因
             issues += _chat_user_issues(nodes, edges) if chat_user else []
             # 关掉分析工具的那一臂里还绑着分析工具的（自查没改好）：同上，照实列出，不运行
-            issues += [] if analysis_tools else _analysis_off_issues(nodes)
+            issues += [] if analysis_tools else _analysis_off_issues(nodes, off_subgraphs)
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [

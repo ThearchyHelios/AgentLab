@@ -343,21 +343,24 @@ def plain_graph() -> dict:
 
 
 class SwitchCopilot:
-    """助手剧本：给的工具清单里有分析工具（开着的那一臂）就搭「查库 → 分析卡 → 报告」，没有（关掉的那一臂）就搭「查库 →
-    报告」——照给它看的用。systems 记下每次建图收到的 system。"""
+    """助手剧本：两臂都先照「查库 → 分析卡 → 报告」搭——关掉分析工具的那一臂靠真代码（answer_ops 的自查）挡回去，
+    替身不替它判断。自查交回来时（只有关的那一臂会有）去掉分析卡、把查库直接接到报告。systems 记下每次建图收到的 system。"""
 
     def __init__(self) -> None:
         self.systems: list[str] = []
 
     async def astream(self, messages):
         if "上线前自查" in messages[1][1]:
-            yield _line({"op": "done"})
+            yield _line({"op": "remove_node", "id": "card"})
+            yield _line({"op": "add_edge", "edge": {"source": "q", "target": "write"}})
+            # 这一臂没有分析结论可引：报告只按查询结果写（报告撰写的剧本认这个记号，见 use_writers）
+            yield _line({"op": "update_node", "id": "write", "config": {"instructions": f"{PLAIN_MARK}上周的周报"}})
+            yield _line({"op": "done", "explanation": "这一轮没有分析工具，去掉分析卡"})
             return
         role, system = messages[0]
         assert role == "system"
         self.systems.append(system)
-        graph = answer_graph() if "analysis_decompose" in system else plain_graph()
-        for line in _graph_lines(graph, "看上周销售额"):
+        for line in _graph_lines(answer_graph(), "看上周销售额"):
             yield line
 
 

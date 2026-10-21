@@ -737,6 +737,8 @@ class GraphChecker:
         self._coverage_given = False
         #: 这一轮给不给分析工具（评测「关掉分析工具」那一臂为假）
         self.analysis_tools = analysis_tools
+        #: 关掉分析工具时，用了分析能力的子工作流节点（issues 每次先读好）
+        self._off_subgraphs: set[str] = set()
         #: 用户问题的分析意图（问为什么、怎么变了、是否异常、趋势……），不是分析类问题、或者这一轮没有分析工具时为 None
         self.intent = analysis_intent(question) if question and analysis_tools else None
         #: 「分析类问题、Agent 没绑分析工具」已经交回模型改过一轮：之后不再挡，同 _coverage_given
@@ -747,9 +749,15 @@ class GraphChecker:
 
         return _blocking_issues(self.applier.nodes, self.applier.edges, self.scope, sources=self.sources,
                                 baseline=self.baseline, level=self.level, defaults=self.defaults,
-                                checkers=self.checkers, chat_user=self.chat_user, analysis_tools=self.analysis_tools)
+                                checkers=self.checkers, chat_user=self.chat_user, analysis_tools=self.analysis_tools,
+                                off_subgraphs=self._off_subgraphs)
 
     async def issues(self) -> list[dict[str, Any]]:
+        if not self.analysis_tools:
+            # 关掉分析工具的那一臂：嵌套的子工作流里用没用分析能力要读库，先读好，blocking 照它挡
+            from app.api.copilot import analysis_off_subgraphs
+
+            self._off_subgraphs = await analysis_off_subgraphs(self.applier.nodes)
         errors = self.blocking()
         refused = _refused_issues(self.applier)
         if self.known is None:
@@ -836,14 +844,24 @@ class GraphChecker:
             return []
         nid, title = querying
         asked = f"问题问的是{self.intent.label}（「{self.intent.text}」）"
-        names = "、".join(TOOL_NAMES[op] for op in ANALYSIS_TOOL_ORDER)
         return [{"level": level, "node_id": nid, "edge_id": None, "field": "tools", "code": ANALYSIS_TOOLS_MISSING,
                  "message": f"{asked}，查库的「{title}」没有绑定分析工具：变化从哪来、是否异常、是不是趋势只能由模型自己判断，"
                             "报告里的这类判断没有分析结论可依据",
-                 "for_model": f"{asked}。按「分析类问题」的形状改：给查库的 agent「{nid}」的 tools 加上 {names}"
-                              "（db_query__、db_schema__ 照留），平台会把分析方法注入它的 system，prompt 里写清要回答的问题、"
-                              "比哪两期就行；report 的 instructions 让它按分析结论写、判断直接引用判定语。问的其实不是原因、"
-                              "异常、趋势这类、确实用不上分析的，不改这一处，在 done 的 explanation 里说一句为什么"}]
+                 "for_model": analysis_gaps_fix(asked=asked, nid=nid)}]
+
+
+def analysis_gaps_fix(*, asked: str = "问题问的是变化从哪来（「把上周销售额的变化拆开」）", nid: str = "查库的 agent",
+                      names: str | None = None) -> str:
+    """「分析类问题、查库的 Agent 没绑分析工具」交回模型的那一句（analysis_gaps 的 for_model）。缺省的一套只是拿去算
+    提示词指纹（app/eval/runner.py 的 prompt_fingerprint）：改了这句话，评测比两次时就标「提示词变了」。"""
+    if names is None:
+        from app.analysis.contract import TOOL_NAMES
+
+        names = "、".join(TOOL_NAMES[op] for op in ANALYSIS_TOOL_ORDER)
+    return (f"{asked}。按「分析类问题」的形状改：给查库的 agent「{nid}」的 tools 加上 {names}"
+            "（db_query__、db_schema__ 照留），平台会把分析方法注入它的 system，prompt 里写清要回答的问题、"
+            "比哪两期就行；report 的 instructions 让它按分析结论写、判断直接引用判定语。问的其实不是原因、"
+            "异常、趋势这类、确实用不上分析的，不改这一处，在 done 的 explanation 里说一句为什么")
 
 
 #: 自查时一条 SQL 的覆盖检查最多花多少秒（data/coverage.py）：搭图要等它，比查询时的 BUDGET_S 短
