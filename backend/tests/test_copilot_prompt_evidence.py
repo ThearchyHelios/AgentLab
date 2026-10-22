@@ -202,7 +202,7 @@ def ask_report_graph() -> dict:
             g("start", "input", "问题"),
             g("ask", "agent", "查数", tools=["db_query__shop"], prompt="查活跃用户数和用户总数", approval="dangerous"),
             g("report", "report", "写答案", instructions="回答：{{ input.question }}", numbers="strict",
-              on_violation="fail", claims="require_citation"),
+              on_violation="fail", claims="require_citation", analysis_claims="strict"),
             g("out", "output", "输出答案", fields=[{"name": "answer", "value": "{{ nodes.report.text }}"}]),
         ],
         "edges": [{"id": f"e{i}", "source": a, "target": b}

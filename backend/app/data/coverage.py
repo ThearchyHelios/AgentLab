@@ -447,9 +447,14 @@ async def _fallback(flt: _Filter, facts: Facts) -> _Range | None:
         found = await facts(flt.table_name)
     except Exception:  # noqa: BLE001
         return None
+    return _facts_range(found, flt.column_name)
+
+
+def _facts_range(found: Any, column: str) -> _Range | None:
+    """剖析事实（last_facts 的一项）里这一列的范围：先剖析的 date_ranges，再取值观察的最新日期。"""
     if not isinstance(found, Mapping):
         return None
-    wanted = name_key(flt.column_name)
+    wanted = name_key(column)
     for item in found.get("date_ranges") or []:
         if isinstance(item, Mapping) and name_key(str(item.get("column") or "")) == wanted:
             lo, hi = _as_day(item.get("min")), _as_day(item.get("max"))
@@ -806,5 +811,88 @@ def no_data_of(snapshot: Any, column: Any) -> dict[str, Any] | None:
     return None
 
 
-__all__ = ["BUDGET_S", "Cache", "NO_DATA_SHORT", "PROBE_TIMEOUT_S", "Window", "filters", "narrowed", "no_data_of",
-           "result_gaps", "sql_gaps", "zero_columns"]
+# ==========================================================================
+# 给分析的可比性检查用的几个小函数（app/analysis/comparable.py、probe.py：窗口长度、整期）。读法、写法、探查都和上面同一套，
+# 只是把中间结果交出去：分析结论要把现查的范围、在库里算出的界记下来，复算时用记下的值
+# ==========================================================================
+
+
+def parse_sql(sql: Any, read: str | None) -> Any:
+    """一条查询解析成语法树（同覆盖检查：太长、带模板占位、不止一条、不是查询的为 None）。"""
+    return _parse(sql, read)
+
+
+def as_day(value: Any, kind: str | None = None) -> _Day | None:
+    """一个值归一成日期（DATE / DATETIME、'YYYY-MM-DD'、'YYYYMMDD'、8 位整数）；认不出为 None。"""
+    return _as_day(value, kind)
+
+
+def literal_bound(node: Any) -> tuple[bool, _Day | None]:
+    """时间条件的一个界：(是不是字面量, 字面量归一成的日期)。不是字面量的是按运行当天现算的，要在库里算。"""
+    return (True, _literal_day(node)) if _is_literal(node) else (False, None)
+
+
+def window_of(conds: list[tuple[str, Any, bool]], days: Mapping[int, _Day | None]) -> Window | None:
+    """几个条件合成一段区间（同 _window：下界取最晚、上界取最早，「>」「<」的界不带时刻时按天挪一天）。days 是
+    {id(界的节点): 日期}。不核对列和界的写法比不比得起来：分析结论里表的范围只记了日期。"""
+    return _window(conds, days, _Range(None, None, "none"), None)
+
+
+def _range_out(data: _Range | None) -> dict[str, Any] | None:
+    if data is None:
+        return None
+    return {"min": data.low.day.isoformat() if data.low else None,
+            "max": data.high.day.isoformat() if data.high else None,
+            "basis": data.basis, "at": data.day, "empty": data.empty}
+
+
+def facts_range(found: Any, column: str) -> dict[str, Any] | None:
+    """剖析事实（catalog_profile_jobs.last_facts 的一项）里这一列的范围，形状同 column_range；没有为 None。"""
+    return _range_out(_facts_range(found, column))
+
+
+async def column_range(source: Any, table: str, column: str, *, facts: Facts | None = None,
+                       cache: Cache | None = None) -> dict[str, Any] | None:
+    """这一列在这张表里的实际范围：现查 MIN / MAX（只读守卫、PROBE_TIMEOUT_S 秒、同一张表 LIVE_TTL_S 秒内不重查），查不成
+    退回剖析、取值观察（facts）。{min, max, basis, at, empty}：min / max 是 ISO 日期（不知道的那一头为 None），basis 是 live /
+    profile / observed，at 是剖析、观察的日期（现查为 None），表里这一列一个值都没有时 empty 为真。都没有为 None。从不抛异常。"""
+    from sqlglot import exp
+
+    try:
+        parts = [p for p in str(table).split(".") if p]
+        node = exp.Table(this=exp.to_identifier(parts[-1]),
+                         **({"db": exp.to_identifier(parts[-2])} if len(parts) > 1 else {}))
+        flt = _Filter((), node, str(table), exp.column(str(column)), str(column))
+        return _range_out(await _range(source, flt, _read(getattr(source, "kind", None)), cache or Cache(), facts))
+    except Exception:  # noqa: BLE001 - 探查失败就当不知道
+        logger.info("可比性检查的范围探查没有成功（数据源 %s）", getattr(source, "name", ""), exc_info=True)
+        return None
+
+
+async def bound_values(source: Any, texts: list[str]) -> list[Any] | None:
+    """按运行当天现算的几个界（SQL 表达式，按这个数据源的方言写）在库里算出来：一条 SELECT 界1, 界2 …（Oracle 加 FROM
+    DUAL），走只读守卫和 PROBE_TIMEOUT_S。交回各个值（日期、时刻按 ISO 写，其余照库里交回的）；查不成为 None。从不抛异常。"""
+    if not texts:
+        return []
+    read = _read(getattr(source, "kind", None))
+    try:
+        found = await _probe(source, _select_sql([f"{t} AS b{i}" for i, t in enumerate(texts)], read))
+    except Exception:  # noqa: BLE001
+        return None
+    if found is None:
+        return None
+    values = list(found[0]) + [None] * len(texts)
+    out: list[Any] = []
+    for value in values[:len(texts)]:
+        if isinstance(value, datetime):
+            out.append(value.isoformat(sep=" ", timespec="seconds"))
+        elif isinstance(value, date):
+            out.append(value.isoformat())
+        else:
+            out.append(value)
+    return out
+
+
+__all__ = ["BUDGET_S", "Cache", "NO_DATA_SHORT", "PROBE_TIMEOUT_S", "Window", "as_day", "bound_values", "column_range",
+           "facts_range", "filters", "literal_bound", "narrowed", "no_data_of", "parse_sql", "result_gaps", "sql_gaps",
+           "window_of", "zero_columns"]

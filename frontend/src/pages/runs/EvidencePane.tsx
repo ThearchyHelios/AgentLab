@@ -13,8 +13,9 @@ import {
 } from '../../lib/evidence'
 import { formatNumber } from '../../lib/format'
 import { EVIDENCE_AUDIT_TEXT as T, UPGRADE_TEXT } from '../../lib/terms'
+import { ANALYSIS_TEXT } from '../../lib/termsAnalysis'
 import { IssuanceBanner } from '../../run/AssistantStream'
-import { EvidenceDoc, type EvidenceDocHandle } from '../../run/EvidenceDoc'
+import { EvidenceDoc, claimMarksOf, type EvidenceDocHandle } from '../../run/EvidenceDoc'
 import { EvidenceGuessView } from '../../run/EvidenceGuess'
 import { ReportInquiry, inquiryOpen, locateIn, useInquiryAccess } from '../../run/Inquiry'
 import { Markdown, inlineStyles } from '../../run/Markdown'
@@ -119,7 +120,8 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
   // 只收有状态的片段，和 EvidenceDoc 能打开的是同一批：违规行指着的文字片段（粗体、链接里的可疑名字）、
   // 结构片段（列表序号 100. 里的数字）在正文里没有能点的地方，画成按钮就是点了没反应。
   // 结论句的行（证据相矛盾、证据不足……）打开的是这一句的句末徽标（`报告:claim:句子`）：句子有判定（封存的、
-  // 证据图里封存后追加的）才有徽标
+  // 证据图里封存后追加的）才有徽标。分析说法违规（判断词未挂分析结论……）落在的那段文字没有状态，正文里也点得开
+  //（claimMarksOf，和 EvidenceDoc 画波浪线的是同一批）
   const openable = useMemo(() => {
     const keys = new Set<string>()
     for (const r of reports) {
@@ -129,6 +131,7 @@ export function EvidencePane({ run, output, labelOf, refreshKey }: {
         for (const seg of u.segments ?? []) if (segmentState(seg)) keys.add(`${r.node_id}:${seg.id}`)
         if (verdictState(unitVerdict(u, late))) keys.add(`${r.node_id}:claim:${u.id}`)
       }
+      if (doc) for (const id of claimMarksOf(doc).keys()) keys.add(`${r.node_id}:${id}`)
     }
     return keys
   }, [reports, docOf, graph])
@@ -619,7 +622,8 @@ function AuditLine({ row, current, openable, multiReport, labelOf, onOpen, onFoc
   const meta = EVIDENCE_STATE[row.state]
   const text = plain(row.text)
   const sentence = plain(row.sentence)
-  const label = `${text}，${meta.label}${row.source ? `：${row.source}` : ''}`
+  const claimIssue = row.kind === 'violation' && row.issue ? ANALYSIS_TEXT.claim.label[row.issue] : undefined
+  const label = `${text}，${claimIssue ?? meta.label}${row.source ? `：${row.source}` : ''}`
   const common = {
     tabIndex: current ? 0 : -1, 'data-audit-focus': row.key, onFocus, onKeyDown: onKey,
     className: clsx('mono max-w-full truncate rounded-sm text-left outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[color:var(--accent)]',
@@ -638,8 +642,11 @@ function AuditLine({ row, current, openable, multiReport, labelOf, onOpen, onFoc
           <span {...common} className={clsx(common.className, 'block')} title={text}>{text}</span>
         )}
       </td>
-      <td className="px-2 py-1.5" style={{ color: meta.color }}>
-        {meta.glyph && <span aria-hidden className="mr-0.5">{meta.glyph}</span>}{meta.label}
+      <td className="px-2 py-1.5" style={{ color: meta.color }} data-audit-issue={row.issue ?? ''}>
+        {/* 说法违规（判断词未挂分析结论……）：写它自己的叫法，不写「无证据」——说的不是数字没有出处 */}
+        {claimIssue
+          ? <>{meta.glyph && <span aria-hidden className="mr-0.5">{meta.glyph}</span>}{claimIssue}</>
+          : <>{meta.glyph && <span aria-hidden className="mr-0.5">{meta.glyph}</span>}{meta.label}</>}
       </td>
       <td className="px-2 py-1.5">
         <span className="block text-dim [overflow-wrap:anywhere]" data-audit-source="">{row.source || '—'}</span>

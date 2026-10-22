@@ -47,6 +47,13 @@ def describe_version(version: Any, *, workflow_name: str) -> str:
                          else f"口径卡{title}，{caliber}，指标转抄自别处的口径卡")
             lines += [f"- {node_id}.{m['id']} {m.get('name') or ''}{('（' + m['unit'] + '）') if m.get('unit') else ''}"
                       for m in metrics]
+        elif node["type"] == "analysis":
+            from app.engine.labels import ANALYSIS_OP_LABEL
+
+            items = [i for i in cfg.get("items") or [] if isinstance(i, dict) and i.get("id")]
+            lines.append(f"分析卡{title}，分析项 {len(items)} 个：" if items else f"分析卡{title}，还没有分析项")
+            lines += [f"- {node_id}.results.{i['id']} {ANALYSIS_OP_LABEL.get(str(i.get('op')), str(i.get('op') or ''))}"
+                      for i in items]
         elif node["type"] == "report":
             lines.append(f"报告撰写{title}")
         elif node["type"] in ("tool", "merge"):

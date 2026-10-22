@@ -51,9 +51,9 @@ LEVELS = ("published", "governed")
 _LLM_ONLY = ("prompt", "system", "skills", "use_history", "output_schema")
 #: 新的报告撰写节点照搬过去的模型配置（R3 从 agent 带过去的只有 provider、model：温度、上限是查数用的）
 _MODEL_KEYS = ("provider", "model")
-#: 报告的指令里照搬了这几类节点的文字，就要提醒：报告撰写自己会收集它们的证据
+#: 报告的指令里照搬了这几类节点的文字，就要提醒：报告撰写自己会收集它们的证据（分析卡的结论进台账，写作目录编成 A{n}）
 _EVIDENCE_TYPES = (NodeType.METRICS, NodeType.TOOL, NodeType.AGENT, NodeType.RETRIEVE, NodeType.CODE,
-                   NodeType.SUBGRAPH, NodeType.MERGE)
+                   NodeType.SUBGRAPH, NodeType.MERGE, NodeType.ANALYSIS)
 #: 写整段文字的节点：出具契约的 narrative 拼了其中几个的文字，就说不准该换哪一个
 _WRITER_TYPES = (NodeType.LLM, NodeType.AGENT)
 _QUESTION = re.compile(r"(?<![\w.])input\s*\.\s*question(?![\w-])")

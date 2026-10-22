@@ -19,7 +19,7 @@ from app.engine.governance import lint_for_publish, publish_issues
 from app.engine.judge import JUDGE_DEFAULTS
 from app.engine.schema import GraphSpec, validate_graph
 
-STRICT = {"numbers": "strict", "on_violation": "fail", "claims": "require_citation"}
+STRICT = {"numbers": "strict", "on_violation": "fail", "claims": "require_citation", "analysis_claims": "strict"}
 JUDGED = {**STRICT, "claims": "judge", "judge": {"max_cost_usd": 0.05}}
 BUDGET = "governed.judge_budget"
 
@@ -98,7 +98,7 @@ def test_the_budget_follows_the_same_config_rule_as_run_time():
                       defaults={"judge": {"max_cost_usd": 0.02}})
     assert [i.field for i in by_code(graph, BUDGET)] == ["judge.max_cost_usd"]
     # claims 本身也可以来自图级 defaults
-    graph = traceable(report={"numbers": "strict", "on_violation": "fail"},
+    graph = traceable(report={"numbers": "strict", "on_violation": "fail", "analysis_claims": "strict"},
                       defaults={"claims": "judge", "judge": {"max_cost_usd": None}})
     assert by_code(graph, BUDGET) == [] and by_code(graph, "governed.report_policy") == []
 

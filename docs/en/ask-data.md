@@ -25,6 +25,17 @@ A turn covers: Copilot builds the graph, the run starts, the result is reviewed,
 - When Copilot returns only thinking and no operations, the turn is retried once automatically.
 - The cost of each turn includes the model calls for Copilot's graph building, table selection, and review.
 
+## Analytical questions
+
+When the question asks why, how something changed, what dragged it down, what contributed most, whether something is unusual, how much it fluctuates, whether it keeps rising, or whether one is really higher than the other, the agent that queries data in the graph Copilot builds is also given the five analysis tools (see [Analysis](analysis.md)):
+
+- The agent first settles which two periods to compare from the question (the previous whole period when the question doesn't say), then follows the platform's built-in analysis method: comparability check, putting the period back into its history, breaking down by dimension, and drilling down one level once the main source is found. The platform computes the verdicts with fixed methods and thresholds; the agent decides only what to compute.
+- The report is written from the analysis conclusions, citing the system-written verdict phrases directly for its judgments. When the writer writes judgment words such as "mainly from" or "unusual" itself, the system checks each sentence: sentences that don't cite a matching analysis conclusion go back for one rewrite, and what remains is marked in the answer without affecting the issuance tier (see [Analysis claim check](analysis.md#analysis-claim-check)).
+- At the end of an answer that uses analysis conclusions, the system appends an Analysis Scope section: what was broken down, what was ruled out, which candidate dimensions weren't broken down, and what couldn't be done (see [Analysis scope](analysis.md#analysis-scope)).
+- A breakdown shows only where a change came from, not why: causes in an answer need a verbatim knowledge-base quote as their basis, or else they are written as conjectures to be verified.
+- During its self-check, Copilot recognizes analytical questions with a fixed lexicon that collects only explicit phrasings. When the question is analytical but the agent that queries data has no analysis tools, the problem goes back to Copilot for one round of fixes; if the tools are still missing after that round, the graph runs as usual with a warning.
+- When an analysis couldn't be done (not enough history, the current period isn't over, and so on), or judgment words still don't cite a matching conclusion after the rewrite, the review only writes a note and doesn't start over automatically (see [Output review](#output-review)).
+
 ## Output review
 
 After a run ends, rules scan the event stream first, and a model review runs only when they find an anomaly. The review may restructure the answer, but it **must not introduce numbers that aren't in the original answer**.
@@ -32,10 +43,11 @@ After a run ends, rules scan the event stream first, and a model review runs onl
 - Ask Data for users (the user role) is reviewed too.
 - When a step fails inside a subworkflow, automatic review reports it only once.
 - Continue Run in Ask Data is limited to builders and above.
+- The gaps from analysis (some analyses couldn't be done, an analysis call was wrong and never fixed, judgment words still failed the check after the rewrite, the two periods of a caliber card metric couldn't be checked for comparability) only get a note and never trigger an automatic redo. When a run has only these, the review calls no model and writes the note from their wording as is.
 
 ## Calibers in an answer
 
-A caliber is the agreed definition of how a metric is fetched and computed. It lives in a caliber card, with a name and a version. After an answer is sealed, the system compares every number in it with the published calibers in the background and labels each number with a caliber; each turn gets a one-line summary. When the whole answer is equivalent to a governed caliber, the system automatically starts a formal run by that caliber. See [Evaluation and the Caliber Ledger](evaluation-and-ledger.md#caliber-ledger).
+A caliber is the agreed definition of how a metric is fetched and computed. It lives in a caliber card, with a name and a version. After an answer is sealed, the system compares every number in it with the published calibers in the background and labels each number with a caliber; each turn gets a one-line summary. When the whole answer is equivalent to a governed caliber, the system automatically starts a formal run by that caliber. Numbers in analysis conclusions (shares, changes, fluctuation ranges) are derived from query results, so they aren't compared with calibers, get no caliber label, and aren't counted in the summary line. See [Evaluation and the Caliber Ledger](evaluation-and-ledger.md#caliber-ledger).
 
 ## From an answer to a workflow or an app
 
@@ -60,6 +72,7 @@ Copilot generates or rewrites a whole graph from one sentence and lays it out au
 
 - When it edits a graph, it outputs only the change operations instead of rewriting the whole graph.
 - Before delivering, it checks its work with the same rules the runtime uses. Problems that would make the run fail go back to it to fix first; if they can't be fixed, nothing runs automatically.
+- In Ask Data, the self-check also looks at the question itself: when the question is analytical but the agent that queries data has no analysis tools, it gets one round of reminders (see [Analytical questions](#analytical-questions)).
 - While building graphs, it records facts worth remembering in long-term memory.
 
 ### Looking on demand

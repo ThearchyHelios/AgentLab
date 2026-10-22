@@ -76,7 +76,7 @@ def _scope_note(rows: list[Any], scoped: bool) -> str:
             "db_schema__ 工具；前几轮用过别的库，这一轮也不要沿用")
 
 
-def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None) -> str:
+def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None, analysis_tools: bool = True) -> str:
     """给助手看的工具清单。
 
     all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
@@ -86,11 +86,14 @@ def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None) ->
     不列表名（look 文档 D3）：以前每个库列前 12 个表名，和这一轮要做什么无关，闲聊也带着；表数写一句，字段要用时 look。
 
     builtins 给了的话内置工具只列这几个：使用者的问数据（_CHAT_USER_PROMPT）只能用只读的那几个，列出来用不了的工具，
-    模型照样会绑。
+    模型照样会绑。analysis_tools 为假（评测「关掉分析工具」那一臂，answer_ops）时不列五个分析工具。
     """
+    from app.tools.analysis import ANALYSIS_TOOLS
+
     lines = [
         f"- {name}（{spec.category}）：{spec.description}"
-        for name, spec in sorted(all_specs().items()) if builtins is None or name in builtins
+        for name, spec in sorted(all_specs().items())
+        if (builtins is None or name in builtins) and (analysis_tools or name not in ANALYSIS_TOOLS)
     ]
 
     from app.data import introspect as _introspect
@@ -137,6 +140,12 @@ NODE_REFERENCE = """\
   加标识符引号：MySQL / MariaDB 用反引号（AS `月份`），PostgreSQL、Oracle、SQLite 用双引号（AS "月份"），不要用
   单引号（那是字符串）。只给最外层 SELECT 的结果列起别名，WHERE、JOIN、GROUP BY 里照旧写原列名；Oracle 旧版本
   的标识符最长 30 字节，别名不超过 10 个字
+  **问题问的是为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、波动、趋势、是不是真的更高这类分析问题时**，查库的 agent
+  除了 db_query__ / db_schema__ 再绑上五个分析工具（analysis_comparable、analysis_baseline、analysis_trend、
+  analysis_decompose、analysis_differ）：变化从哪来、算不算异常、是不是持续在变、差异站不站得住由平台按固定的方法和阈值算，
+  判定语由系统写好，报告引用它；agent 只决定算什么（比哪两期、拆哪个维度、往哪一段下钻）。绑了任一个，平台就把分析方法
+  注入 agent 的 system，prompt 里不用再教方法，也不要写阈值。分析工具只分析这个 agent 自己查过的结果，所以只绑给同时绑了
+  db_query__ 的 agent；不能放进 tool 节点（模板里每次都要做的固定分析用 analysis 分析卡）
   **默认不要写 max_steps、budget_tokens、budget_usd**。平台用的是护栏而不是固定步数：
   步数只是很高的兜底（跟随设置，默认 100），重复调用、连续几步没有新信息、预算用完、
   上下文快满时，它会按查到的部分收尾。写死一个小数字（见过 8）会让它查完表结构就没额度回答了。
@@ -215,6 +224,21 @@ NODE_REFERENCE = """\
   写 2 只剩「2%」，0.004 这样的小比率还会显示不出来、报告引用不了。on_missing 默认 fail（缺输入整张卡失败）；写 null 则缺输入的指标记为空值，交给出具契约判档
   取 tool 节点查库的结果用 cell(nodes.取数节点id, 行, '列名')（行号从 0 数，列按列名）：cell() 直接认查询工具
   交回的结果，出处精确到快照里的那一格，不用再接 transform 解析。取 agent 的字段写 vars.<agent 的 assign_to>.字段
+- analysis：分析卡。对上游查询节点的结果固定做几项确定性分析，和口径卡平级：用于模板里每次都要做的分析（周报的异动：
+  这周的变化在不在常规波动范围内、主要来自哪个地区）。问数据里要看了数才知道拆哪个维度的不用它，给查库的 agent 绑分析工具。
+  config: {items:[{id, op, mode, from, params, hypothesis}], overrides, assign_to}
+  · op：decompose（变化拆解，mode 选 additive 可加 / ratio 比率 / factor 乘积）、baseline（波动基线）、trend（趋势）、
+    differ（差异检验，mode 选 rate / mean / rows）、comparable（可比性检查）；hypothesis 一句话写这一项在验证什么
+  · from 是要分析的上游查询节点 id：只能是调用 db_query__ 的 tool 节点或 merge 节点，而且连在分析卡之前；agent 不能当
+    输入（它可能查了好几次）。基期、本期是两份查询时不写 from，在 params 里写 base_query、target_query 两个节点 id
+  · params 和同名分析工具的参数一样（period、measure、by、base、target、headline……，不写 query），可以用 {{ input.x }}
+    按运行输入选期次；headline 的两格写成「节点id.r行号.列名」（行号从 0 数，如 weekly.r0.销售额）；下钻的 parent 写
+    {"of": 前面一项的 id, "key": [那一段的维度值]}。params 里不写阈值：阈值来自设置，模板要固定阈值时写在 overrides
+    （键同设置里分析一组的键，如 k_warn、main_share）
+  · 产出 nodes.<id>.results.<项 id> = {status, verdict, direction, values, phrase}：下游 branch 可以按判定分支，如
+    nodes.check.results.wow.verdict in ['outside_band', 'far_outside_band'] 时转人工。报告引用它的结论（见 report 里分析
+    结论的写法）；不要把结果交给口径卡：口径卡读分析卡的结果追不到原始数据。一项算不了（历史不够、本期没过完）不让卡
+    失败，那一项照实记成算不了
 - dual_check：双盲复算。正式出具前，口径卡上输入来自查询的指标另起一个看不到原 SQL 的只读 agent 独立写 SQL 再算一遍：
   一致就放行；不一致时停下来，审批卡并排列出两边的 SQL、差异说明和两个值，由人逐个指标选采用原流程、采用盲算还是
   两边都不对。选盲算或都不对的计入缺口、出具降档；两边只差一个方面（业务日期按哪一列、有效记录条件、去重）时，选择
@@ -228,10 +252,11 @@ NODE_REFERENCE = """\
   出具降档）/ fail（审核人没采用原流程的结果就判为失败）；enabled 不写跟随设置里的开关，true / false 强制开关。
   不要给它配 retries：它的失败是确定的，重试只会把盲算再做一遍、再请审核人选一次（画布校验会报错）
 - report：报告撰写（带引用）。config: {instructions, system, metrics_from:[口径卡id], numbers, on_violation, max_repairs,
-  claims, entities, assign_to}
+  claims, analysis_claims, analysis_scope, entities, assign_to}
   **凡是给人看的、带数字的报告、分析、结论，都用 report，不要用 llm**。它自动收集上游的口径卡指标、查询结果
-  （tool 节点和 agent 查过的库、merge 的合并结果，按查询先后编成 Q1、Q2…）、查库当时的表结构、知识库检索（按先后编成 K1、K2…）
-  和运行输入，模型只能写引用标记，数值由系统从证据里取出来渲染；模型自己写的数字会被打回重写：
+  （tool 节点和 agent 查过的库、merge 的合并结果，按查询先后编成 Q1、Q2…）、查库当时的表结构、知识库检索（按先后编成 K1、K2…）、
+  分析结论（agent 调分析工具、分析卡做的，按先后编成 A1、A2…）和运行输入，模型只能写引用标记，数值由系统从证据里取出来渲染；
+  模型自己写的数字会被打回重写：
   - [[m:指标id]]：口径卡指标。比率、增幅、占比、差值这类派生计算只能先在口径卡里登记再引用。渲染出来自带单位（口径卡里的
     unit，「8条」），instructions 里不要写成「覆盖 [[m:line_count]] 条产线」这样后面再跟一个单位，写「覆盖 [[m:line_count]] 产线」
   - [[v:Q1.r0.列名]]：第 1 次查询结果里第 0 行那一列的原值（行号从 0 数）
@@ -244,6 +269,12 @@ NODE_REFERENCE = """\
     没有出处；只是拿检索当依据时写 [[see:K1]]。要引原话，在 report 前面接 retrieve 节点
   - 句末的 [[see:m:指标id,Q1,K1]]：这句结论的依据，不显示，所以只能放在句末；instructions 里不要写「以 [[see:…]] 为依据」
     「根据 [[see:…]]」这样把它当成句子成分的示例，模型照着写会留下「以 为依据」这样的断句
+  - 分析结论：[[a:A1]] 渲染成 A1 的判定语（系统按判定写好的一句，连同里面的数）；[[a:A1.top_share|pct]] 是它的一个具名的数
+    （换算后缀同 [[m:]]）；[[v:A1.r0.share]]、[[table:A1 cols=地区,delta,share rows=0-4]] 取它的结果表；句末的 [[see:A1]]
+    把它当这句的依据。「主要来自」「集中在」「拖累」「异常」「大幅」「持续上升」「趋势」「显著高于」这类判断只能照分析结论的
+    判定写、挂它当依据（最好直接引用判定语），没有对应的分析结论就只陈述数字和变化；拆解只说明变化来自哪里、说明不了为什么，
+    写原因要有知识库原话或运行输入作依据，否则写成待核实的推测。这些规矩系统会告诉写作者，instructions 里写「按分析结论写、
+    判断引用判定语」就够了，不要替它把判断写好
   - 涉及码值（状态、类型这类用数字编码的取值）时，instructions 里让模型写它的含义（「作废记录」），不要写码值本身：
     码值是没有出处的数字，会被数字核对打回重写
   metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail；
@@ -260,6 +291,10 @@ NODE_REFERENCE = """\
   不写 judge 的预算（judge 整个不写，金额、句数、时长上限都取设置里的默认）：正式运行在节点里自动判，探索运行由读的人
   点开哪句判哪句，不在节点里花钱；报告要交给人工审批的，探索运行也在节点里判。用户明确说不要核对结论句的不加；只回答一个问题、一次查询的不必加。要按受管级别
   发布的模板不适用这条默认，按下面受管级别的规则写预算
+  analysis_claims 是分析说法核对：check（默认）判断词没挂对分析结论、原因没有依据的句子交回写作者重写一次，仍有的标在
+  报告里，不影响出具档位；strict 按 max_repairs 重写，仍有的计入出具缺口、出具降档；off 不核。只能往严里改
+  （off < check < strict），不要为了少重写一次写成 off。analysis_scope：auto（默认：用到分析结论时，系统在报告末尾附一段
+  「分析范围」，写明拆过什么、排除了什么、哪些候选维度没拆）/ off，一般不写
   entities 默认 link
   （核对表名、字段名），报告里根本不提表名时才写 off
 - output 的出具契约：config.contract = {report_from: 报告节点id, metrics_from:[口径卡id],
@@ -268,10 +303,13 @@ NODE_REFERENCE = """\
   （[[v:]] / [[table:]]）的，契约里写 cells: true，否则这些引用按解析不了算；只引单元格、图里没有口径卡的
   （问数据的典型图），契约不写 metrics_from，也不写 required / expected
   要按受管级别发布的模板（发布前检查不过就发不出去）：报告节点写明 numbers: "strict"、on_violation: "fail"、
+  analysis_claims: "strict"、
   claims: "require_citation"（或者更严的 claims: "judge"，这时 judge 里必须写 judge.max_cost_usd——写一个金额，或者
   写 null 表示不限，预算要用户定，拿不准就问；只有受管级别要这样，普通草稿里默认开的 judge 不写预算、不为预算问人）；契约用 report_from（受管级别不收 narrative），成果字段只取报告节点的正文；给口径卡
   供数的 agent 配 output_schema 和 cite_fields: true，code 节点喂口径卡的必须是真取数（evidence_role: "source"），
-  否则把计算写进口径卡；llm、agent、协作团队写的文字不能绕过报告节点直接进出口，llm 也不能喂口径卡
+  否则把计算写进口径卡；llm、agent、协作团队写的文字不能绕过报告节点直接进出口，llm 也不能喂口径卡。分析卡的输入要是
+  调用 db_query__ 的 tool 节点或 merge；分析卡的结论总能引用，agent 用分析工具现场做的分析和它查的格同一个规矩（契约
+  写 cells: true 才引用得了）
 - challenge：反方审稿。报告写完后挑出几句关键结论（挂了依据的、带比较或因果的优先），每句派一个只读 agent 站在反方
   自己写查询找反例，逐句判经受住、被削弱、被推翻或无法判断，理由引用它自己查到的数据；不改报告。
   config: {report, max_claims, max_queries, timeout_s, provider, model, on_refuted, enabled}
@@ -299,6 +337,9 @@ NODE_REFERENCE = """\
    把它当成上周来写。想让报告说清数据最新到哪天，另取一列 MAX(日期) AS 数据最新日期。
    写按周期取数的 SQL 前先看表的日期范围（look 结果里的剖析、取值观察）：只有一天的数据、或者最新日期早于要查的区间的表，
    不能用来算这段时间（查出来全是 0）——换有历史的表；没有这样的表，就在说明里照实告诉用户这段时间没有数据
+7. 问题问为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、波动、趋势、是不是真的更高这类分析问题时，查库的 agent 绑上
+   分析工具（判定由平台算，报告引用判定语）；模板里每次都要做的固定分析（周报的异动）用分析卡：取数 → 分析卡 → report → output。
+   分析卡的结果不进口径卡，报告直接引用
 
 模型字段（llm / agent / supervisor / report 的 config.model）：
 - **不要填**。留空表示跟随当前供应商的默认模型，这几乎总是对的。
@@ -353,6 +394,45 @@ skip_if。这些字段按受限的 Python 表达式求值，变量直接写路�
 - 一个节点连出多条普通边 = 并行执行，多条边汇入同一节点 = 等待汇聚
 """
 
+#: 节点手册里只讲分析能力的几段：(从这一行起, 到这一行之前)。评测「关掉分析工具」那一臂（answer_ops 的 analysis_tools 为假）
+#: 不给这几段——agent 段里「分析类问题绑分析工具」那一条、分析卡一整条、搭图规则第 7 条：助手不知道有分析工具和分析卡，
+#: 也不会被教着去用。报告段里分析结论的引用写法、分析说法核对照留（报告节点照样会核判断词）
+_ANALYSIS_PROMPT_SPANS = (
+    ("  **问题问的是为什么、怎么变了", "  **默认不要写 max_steps"),
+    ("- analysis：分析卡。", "- dual_check："),
+    ("7. 问题问为什么、怎么变了", "\n模型字段"),
+)
+
+
+#: 关掉分析工具时节点手册里另外改写的几处：(原文, 换成)。报告段里提到分析结论的来处、分析结论的引用写法、分析说法核对和分析
+#: 范围两个配置，受管规则里分析卡和分析工具的那两句——关的那一臂没有分析结论，也不让助手知道有分析卡、分析工具
+_ANALYSIS_PROMPT_EDITS = (
+    ("K2…）、\n  分析结论（agent 调分析工具、分析卡做的，按先后编成 A1、A2…）和运行输入", "K2…）\n  和运行输入"),
+    ("  claims, analysis_claims, analysis_scope, entities, assign_to}", "  claims, entities, assign_to}"),
+    ('  analysis_claims: "strict"、\n', ""),
+    ("。分析卡的输入要是\n  调用 db_query__ 的 tool 节点或 merge；分析卡的结论总能引用，agent 用分析工具现场做的分析和它查的格同一个规矩"
+     "（契约\n  写 cells: true 才引用得了）", "。"),
+)
+#: 同上，整段去掉的：(从这一行起, 到这一行之前)
+_ANALYSIS_PROMPT_CUTS = (
+    ("  - 分析结论：[[a:A1]]", "  - 涉及码值"),
+    ("  analysis_claims 是分析说法核对", "  entities 默认 link"),
+)
+
+
+def node_reference(*, analysis_tools: bool = True) -> str:
+    """给助手的节点手册。analysis_tools 为假时去掉讲分析能力的那几段（_ANALYSIS_PROMPT_SPANS、_ANALYSIS_PROMPT_CUTS），
+    改写顺带提到它的几句（_ANALYSIS_PROMPT_EDITS）：手册里不再出现分析卡、分析工具和分析相关的配置键。"""
+    if analysis_tools:
+        return NODE_REFERENCE
+    text = NODE_REFERENCE
+    for start, end in (*_ANALYSIS_PROMPT_SPANS, *_ANALYSIS_PROMPT_CUTS):
+        i = text.index(start)
+        text = text[:i] + text[text.index(end, i):]
+    for old, new in _ANALYSIS_PROMPT_EDITS:
+        text = text.replace(old, new, 1)
+    return text
+
 
 class GenerateIn(BaseModel):
     instruction: str = Field(min_length=1, description="用自然语言描述想要的工作流")
@@ -365,10 +445,33 @@ class GenerateIn(BaseModel):
     conversation_id: str | None = None
     #: 这一轮只查这几个数据源（id 或名字）。不传或空表示不限
     datasource_ids: list[str] | None = None
+    #: 问数据里用户原本问的那句话。自动重来、重试本轮时 instruction 是带着原因的那段话（「上一次运行没有成功：…」），
+    #: 自查按问题判分析意图（app/analysis/intent）时用这一句；不传就用 instruction
+    question: str | None = None
 
 
-def _user_message(payload: GenerateIn, *, patch: bool) -> str:
-    """把用户说的话包成给模型的请求。
+def _question_of(payload: GenerateIn) -> str | None:
+    """自查判分析意图用的那句问题：只在问数据（intent answer）里有，画布上用户说的是一个流程，不是问题。"""
+    if payload.intent != "answer":
+        return None
+    return (payload.question or "").strip() or payload.instruction
+
+
+#: 问数据的包装里「分析类问题」那一条形状（00-总方案 §3.7）：问原因、来源、异常、趋势、差异的，判定由平台的分析工具算、系统写
+#: 判定语，报告引用它。问题意图另由自查按 app/analysis/intent 的词表再核一遍：分析类问题而查库的 agent 没绑分析工具时交回改一轮
+ANALYSIS_SHAPE_PROMPT = (
+    "- 问的是为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、正常吗、波动、趋势、是不是真的更高这类分析问题时，搭 "
+    "input → agent → report → output：agent 绑 db_query__、db_schema__ 和五个分析工具（analysis_comparable、"
+    "analysis_baseline、analysis_trend、analysis_decompose、analysis_differ），prompt 里写清要回答的问题、比哪两期"
+    "（问题没说就比上一个整期），不用教分析方法（平台会注入）、不写阈值；report 的 instructions 写「回答：{{ input.question }}。"
+    "按分析结论写，判断直接引用判定语；没有分析结论的判断不下，原因没有依据的写成待核实的推测」（可以附上 "
+    "{{ nodes.agent的id.text }} 当分析思路）：数引用 agent 查过的单元格，判定引用它做过的分析结论。analysis_claims "
+    "用默认，不要关\n"
+)
+
+
+def _user_message(payload: GenerateIn, *, patch: bool, analysis_tools: bool = True) -> str:
+    """把用户说的话包成给模型的请求。analysis_tools 为假（评测「关掉分析工具」那一臂）时不给分析类问题那一条形状。
 
     两个入口的语义完全不同，包法必须跟着变：
 
@@ -404,7 +507,9 @@ def _user_message(payload: GenerateIn, *, patch: bool) -> str:
             "「回答：{{ input.question }}」（可以附上 {{ nodes.agent的id.text }} 当分析思路），数用 [[v:Q1.r0.列名]] "
             "直接引用 agent 查过的单元格，不必经过口径卡；要比率、增幅再在 agent 和 report 之间加口径卡，agent 配 "
             "output_schema + cite_fields，口径卡读 vars.<assign_to>.字段。出口字段写 {{ nodes.report的id.text }}\n"
-            "- 只问表结构、清单（有哪些表、有哪些字段、列出名单）的，不加 report，agent → output 就行\n"
+            # 分析类问题那一条形状（ANALYSIS_SHAPE_PROMPT）：评测「关掉分析工具」那一臂不给
+            + (ANALYSIS_SHAPE_PROMPT if analysis_tools else "")
+            + "- 只问表结构、清单（有哪些表、有哪些字段、列出名单）的，不加 report，agent → output 就行\n"
             # 三期起报告会核对写出来的表名、字段名：instructions 里让它「列出用到的表」时，编出来的名字会被标出来
             "- report 提到表名、字段名时写 [[t:表名]] / [[c:表名.字段名]]（英文名也可以放进反引号，中文名不行："
             "反引号里的中文名不核对），只写 agent 真查过的名字，"
@@ -822,16 +927,18 @@ GRAPH_SCHEMA: dict[str, Any] = {
 
 
 def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, looks: Any, *,
-                  chat_user: bool = False) -> str:
+                  chat_user: bool = False, analysis_tools: bool = True) -> str:
     """画布、问数据（流式和非流式）共用的 system：节点手册、工具清单、数据源概览、结构要求、输出协议、查看的用法。
     这一份一直用到自查修正结束（接着写、修正轮都不换），模型前后看到的是同一套说法。
 
-    chat_user：开登录后 user 角色的问数据（D-c）。内置工具只列只读的那几个，结构要求后面再加一段使用者的约束。"""
+    chat_user：开登录后 user 角色的问数据（D-c）。内置工具只列只读的那几个，结构要求后面再加一段使用者的约束。
+    analysis_tools 为假（评测「关掉分析工具」那一臂）：节点手册去掉只讲分析能力的几段，工具清单不列分析工具。"""
     from app.auth.chat_policy import CHAT_BUILTIN_TOOLS
 
+    catalog = _tool_catalog(sources, builtins=CHAT_BUILTIN_TOOLS if chat_user else None, analysis_tools=analysis_tools)
     return (
         "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
-        f"{NODE_REFERENCE}\n\n可用工具：\n{_tool_catalog(sources, builtins=CHAT_BUILTIN_TOOLS if chat_user else None)}"
+        f"{node_reference(analysis_tools=analysis_tools)}\n\n可用工具：\n{catalog}"
         f"{datasources}{_scope_note(sources, scope is not None)}\n\n"
         "结构要求：\n"
         "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
@@ -883,7 +990,82 @@ def _chat_user_issues(nodes: dict[str, dict[str, Any]], edges: list[dict[str, An
                           "去掉不允许的节点、工具和记忆范围 / 知识库配置"}]
 
 
-def _graph_request(payload: GenerateIn) -> str:
+#: 关掉分析工具时（answer_ops 的 analysis_tools 为假）图里还用着分析能力的那条问题的 code
+ANALYSIS_TOOLS_OFF = "analysis_tools_off"
+#: 那条问题交回模型的改法（几种节点共用的后半句）
+_OFF_FIX = "这一轮没有分析能力可用：数据要怎么比、怎么拆，写进查询，报告直接引用查询结果"
+
+
+async def analysis_off_subgraphs(nodes: dict[str, dict[str, Any]]) -> set[str]:
+    """评测「关掉分析工具」那一臂：图里哪些子工作流节点（照运行时的取法：固定了版本的读那一版，没固定的读现在的图，
+    一层层往下）用了分析能力——有分析卡，或者有绑了分析工具的 Agent、协作成员（engine/launch 快照分析设置时的同一个认法）。
+    读不到、不成形的不算（子工作流节点运行时自己会报）。"""
+    from app.db.base import SessionLocal
+    from app.engine.launch import _analyzes, _any_graph
+
+    out: set[str] = set()
+    subs = [(nid, n) for nid, n in nodes.items() if (n or {}).get("type") == NodeType.SUBGRAPH]
+    if not subs:
+        return out
+    async with SessionLocal() as session:
+        for nid, node in subs:
+            try:
+                spec = GraphSpec.model_validate({"nodes": [node], "edges": []})
+            except Exception:  # noqa: BLE001 - 节点本身不成形，校验另报
+                continue
+            if await _any_graph(session, spec, _analyzes):
+                out.add(nid)
+    return out
+
+
+def _analysis_off_issues(nodes: dict[str, dict[str, Any]], subgraphs: set[str] | frozenset[str] = frozenset()
+                         ) -> list[dict[str, Any]]:
+    """评测「关掉分析工具」那一臂：这一轮的工具清单、节点手册里都没有分析能力，图里照样用了的挡回去改（改不好就不运行），
+    一个节点一条，说法照「绑定的工具不存在」那一套（engine/launch 发起前那一道）：
+    - Agent、协作成员、调用工具节点绑了分析工具：绑定的工具不存在，去掉它们
+    - 分析卡：这次不能用分析卡，去掉它，连线接回去
+    - 子工作流里用了分析能力（subgraphs：analysis_off_subgraphs 算好的节点 id）：这次不能用这个子工作流"""
+    from app.tools.analysis import ANALYSIS_TOOLS
+
+    out: list[dict[str, Any]] = []
+    for nid, node in nodes.items():
+        cfg = ((node or {}).get("data") or {}).get("config") or {}
+        ntype = (node or {}).get("type")
+        title = str(((node or {}).get("data") or {}).get("label") or "").strip() or nid
+        if ntype == NodeType.ANALYSIS:
+            out.append({"level": "error", "node_id": nid, "edge_id": None, "field": None, "code": ANALYSIS_TOOLS_OFF,
+                        "message": f"这次不能用分析卡：「{title}」是分析卡，这一轮没有分析能力可用，请去掉它",
+                        "for_model": f"「{nid}」是 analysis 节点，这一轮不能用：用 remove_node 去掉它，再把它上游的节点直接"
+                                     f"连到它下游；{_OFF_FIX}"})
+            continue
+        if ntype == NodeType.SUBGRAPH:
+            if nid in subgraphs:
+                out.append({"level": "error", "node_id": nid, "edge_id": None, "field": "workflow_id",
+                            "code": ANALYSIS_TOOLS_OFF,
+                            "message": f"这次不能用这个子工作流：「{title}」嵌套的工作流里有分析卡或分析工具，这一轮没有分析能力可用",
+                            "for_model": f"「{nid}」嵌套的工作流里有分析卡或分析工具，这一轮不能用：去掉这个 subgraph 节点，"
+                                         f"取数直接用 tool 节点或 agent 查；{_OFF_FIX}"})
+            continue
+        if ntype == NodeType.TOOL:
+            names = [cfg.get("tool")]
+        elif ntype == NodeType.AGENT:
+            names = list(cfg.get("tools") or [])
+        elif ntype == NodeType.SUPERVISOR:
+            names = [t for m in cfg.get("agents") or [] if isinstance(m, dict) for t in m.get("tools") or []]
+        else:
+            continue
+        bound = list(dict.fromkeys(n.strip() for n in names if isinstance(n, str) and n.strip() in ANALYSIS_TOOLS))
+        if not bound:
+            continue
+        field = "tool" if ntype == NodeType.TOOL else "agents" if ntype == NodeType.SUPERVISOR else "tools"
+        out.append({"level": "error", "node_id": nid, "edge_id": None, "field": field, "code": ANALYSIS_TOOLS_OFF,
+                    "message": f"绑定的工具不存在：「{title}」绑定的 {'、'.join(bound)}。这一轮没有分析工具可用，请在节点中去掉它们",
+                    "for_model": f"「{nid}」绑定的 {'、'.join(bound)} 不在这一轮的工具清单里：从它的工具里去掉这几个，只用上面"
+                                 f"列出的工具（db_query__、db_schema__ 照留）；{_OFF_FIX}"})
+    return out
+
+
+def _graph_request(payload: GenerateIn, *, analysis_tools: bool = True) -> str:
     """这一轮的请求：改现有图时附上原图、只要改动操作；新建时按入口包好（_user_message）。"""
     if payload.base_graph and payload.base_graph.get("nodes"):
         return (
@@ -891,7 +1073,7 @@ def _graph_request(payload: GenerateIn) -> str:
             f"{json.dumps(_slim(payload.base_graph), ensure_ascii=False, indent=2)}\n\n"
             f"请按下面的要求修改它（只输出改动操作）：\n{payload.instruction}"
         )
-    return _user_message(payload, patch=False)
+    return _user_message(payload, patch=False, analysis_tools=analysis_tools)
 
 
 def _start_graph(payload: GenerateIn) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
@@ -932,7 +1114,8 @@ async def generate(
     baseline = copy.deepcopy((payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
     applier = GraphApplier(nodes, edges, patches=False)
     gen = Generation(model, system=system, applier=applier, looks=looks,
-                     checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers))
+                     checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,
+                                          question=_question_of(payload)))
     human = _with_history(_graph_request(payload), await _history_section(session, payload.conversation_id))
     try:
         async for _op in gen.draft(human):
@@ -956,6 +1139,7 @@ async def generate(
     async for _op in gen.repair():
         pass
     covered = await gen.checker.coverage(level="warning") if isinstance(gen.checker, GraphChecker) else []
+    covered += gen.checker.analysis_gaps(level="warning") if isinstance(gen.checker, GraphChecker) else []
 
     try:
         spec = GraphSpec.model_validate({"nodes": list(nodes.values()), "edges": edges})
@@ -1152,11 +1336,15 @@ def _blocking_issues(
     nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], scope: set[str] | None = None,
     *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
     level: str | None = None, defaults: dict[str, Any] | None = None,
-    checkers: dict[str, Any] | None = None, chat_user: bool = False,
+    checkers: dict[str, Any] | None = None, chat_user: bool = False, analysis_tools: bool = True,
+    off_subgraphs: set[str] | frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
 
     chat_user：图要以开登录后 user 角色的身份在问数据里发起（D-c），使用者不能用的节点、工具、配置也挡（_chat_user_issues）。
+
+    analysis_tools 为假（评测「关掉分析工具」那一臂）：图里还用着分析能力的也挡（_analysis_off_issues：绑了分析工具、分析卡，
+    off_subgraphs 里那几个用了分析能力的子工作流节点，由调用方先用 analysis_off_subgraphs 读好）。
 
     限定了数据源时，用了范围外的库也算：用户点了「只查这个库」，拿别的库的数
     回答他，比跑不起来更糟——答案看起来是对的。
@@ -1186,7 +1374,8 @@ def _blocking_issues(
     out = ([i.model_dump() for i in validate_graph(spec).issues if i.level == "error"]
            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
            + [i for i in authored if i["level"] == "error"]
-           + (_chat_user_issues(nodes, edges) if chat_user else []))
+           + (_chat_user_issues(nodes, edges) if chat_user else [])
+           + ([] if analysis_tools else _analysis_off_issues(nodes, off_subgraphs)))
     if level:
         from app.engine.governance import lint_for_publish
 
@@ -1237,9 +1426,9 @@ def _numeric_input(field: Any) -> bool:
 
 
 def _evidence_source(node: Any) -> bool:
-    """报告撰写能从这个节点拿到可引用的证据：口径卡、调用工具、配了工具的 agent、知识检索，以及声明了数值字段的
-    入口（运行输入进证据目录，报告用 [[i:字段]] 引用）。子工作流、协作团队里面是什么看不见，一律算有——这条会把图
-    打回去让模型改，宁可漏判不可误判。
+    """报告撰写能从这个节点拿到可引用的证据：口径卡、分析卡（结论总能引用，判定语、具名的数、结果表，00-总方案 D10）、
+    调用工具、配了工具的 agent、知识检索，以及声明了数值字段的入口（运行输入进证据目录，报告用 [[i:字段]] 引用）。
+    子工作流、协作团队里面是什么看不见，一律算有——这条会把图打回去让模型改，宁可漏判不可误判。
 
     入口只声明了文字字段的（问题、主题）不算：报告能照引的只有问题本身，要写的数照样没有出处。画布上的入口字段
     不写类型，没写默认值的字段看不出是不是数，也不算——提示里说明了怎么声明（写数值默认值）。"""
@@ -1248,8 +1437,8 @@ def _evidence_source(node: Any) -> bool:
     if node.type == NodeType.INPUT:
         fields = node.config.get("fields")
         return isinstance(fields, list) and any(_numeric_input(f) for f in fields)
-    return node.type in (NodeType.METRICS, NodeType.TOOL, NodeType.MERGE, NodeType.RETRIEVE, NodeType.SUBGRAPH,
-                         NodeType.SUPERVISOR)
+    return node.type in (NodeType.METRICS, NodeType.ANALYSIS, NodeType.TOOL, NodeType.MERGE, NodeType.RETRIEVE,
+                         NodeType.SUBGRAPH, NodeType.SUPERVISOR)
 
 
 def _unsourced_reports(spec: GraphSpec, changed: set[str]) -> list[dict[str, Any]]:
@@ -1681,7 +1870,7 @@ async def generate_stream(payload: GenerateIn):
     )
 
 
-async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
+async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_tools: bool = True):
     """生成过程：按需求起草、按需查看、自查修正、排版校验，逐条交出操作（op dict）。问数据页（经 SSE）和评测（直接迭代）
     走的是这同一条路（细案 01 做法 2）。
 
@@ -1692,6 +1881,11 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
     开流前的准备（取数据源、读目录检查器、取助手模型、拼历史、组查看服务）用自己的短会话，在交出第一条操作之前做完：
     拒绝在这里抛 HTTPException（调用方没迭代到第一条就知道）。catalog_view 是这一轮读哪一份数据目录（data/catalog_view.py：
     查看的表详情、自查的 SQL 检查器都按它），不给是当前目录。
+
+    analysis_tools 为假是评测「关掉分析工具」那一臂（分析工具开、关对照，chat/drive.TurnDriver 的 analysis_tools 透传过来）：
+    工具清单不列五个分析工具，节点手册、问数据的包装里只讲分析能力的那几段不给，问题意图那条自查不提；图里照样绑了分析工具
+    的、有分析卡的、嵌套的子工作流里用了分析能力的，照「绑定的工具不存在」那一套挡回去改（_analysis_off_issues）。缺省为真，
+    和以前一字不差。
 
     final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、fail 判失败），问数据页照它走。最后多交一条 usage
     （providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
@@ -1724,7 +1918,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         except ProviderNotConfigured as e:
             raise HTTPException(400, _unconfigured(e)) from e
 
-        human = _with_history(_graph_request(payload), await _history_section(session, payload.conversation_id))
+        human = _with_history(_graph_request(payload, analysis_tools=analysis_tools),
+                              await _history_section(session, payload.conversation_id))
         # 兜底用：模型只发了改动操作时，把它们重放到这张图上
         prev_graph = await _previous_graph(session, payload.conversation_id)
         # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
@@ -1738,12 +1933,14 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
             payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view, kinds=kinds)
     # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
-    system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user)
+    system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user,
+                           analysis_tools=analysis_tools)
     applier = GraphApplier(nodes, edges, composer=copilot_context.composer(looks))
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, looks=looks, started=started,
                      checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,
-                                          chat_user=chat_user))
+                                          chat_user=chat_user, question=_question_of(payload),
+                                          analysis_tools=analysis_tools))
 
     async def steps():
         yield {"op": "model", "model": model_id}
@@ -1809,8 +2006,9 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         # 循环 / 分支条件里套了 {{ }}），前面的步骤白跑，报错还停在半路
         async for op in _with_heartbeat(gen.repair(), phase="repairing"):
             yield op
+        off_subgraphs = set() if analysis_tools else await analysis_off_subgraphs(nodes)
         remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers,
-                                     chat_user=chat_user)
+                                     chat_user=chat_user, analysis_tools=analysis_tools, off_subgraphs=off_subgraphs)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
@@ -1818,6 +2016,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
         # 工具节点写死的 SQL 查的区间里表里没有数据（data/coverage.py）：自查时交回模型改过一轮，仍在的不挡运行，留在检查
         # 结果里当提醒（模型照要求在说明里告诉用户）
         warnings += await gen.checker.coverage(level="warning") if isinstance(gen.checker, GraphChecker) else []
+        # 分析类问题、查库的 Agent 没绑分析工具：同上，交回模型改过一轮仍在的不挡运行，留作提醒
+        warnings += gen.checker.analysis_gaps(level="warning") if isinstance(gen.checker, GraphChecker) else []
         # 建完要不要跑，由模型在 done.run 里表态；问了用户的不跑：要等他回答
         autorun = applier.autorun and gen.asked is None
         if remaining:
@@ -1844,6 +2044,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None):
             issues += [i for i in authored if i["code"] in CHECK_CODES]
             # 使用者发起不了的图（D-c）：自查没改好的照实列出，界面据此不运行、说清原因
             issues += _chat_user_issues(nodes, edges) if chat_user else []
+            # 关掉分析工具的那一臂里还绑着分析工具的（自查没改好）：同上，照实列出，不运行
+            issues += [] if analysis_tools else _analysis_off_issues(nodes, off_subgraphs)
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [
@@ -1893,8 +2095,9 @@ _NO_LOWERING = """\
   不删掉或清空出具契约，不删 required 里的指标，不把 strict 改成 false，不往 allow_numbers 里加数，不替人打开 cells；
   审批策略只能往严里改（每次调用都审批 > 仅危险工具需要审批 > 全部自动放行），不放宽、不删掉，更不改成 never；
   不取消子工作流钉住的版本；发布级别不是你能改的。结构要动（比如换掉协作团队），输出 question 说明怎么拆，不要自己动手；
-  报告撰写节点的 numbers、on_violation、claims 只能往严里改（numbers: strict、on_violation: fail、
-  claims: require_citation），不放宽、不删掉；claims 从宽到严是 off < require_citation < judge，已经是 judge 的不改回
+  报告撰写节点的 numbers、on_violation、claims、analysis_claims 只能往严里改（numbers: strict、on_violation: fail、
+  claims: require_citation、analysis_claims: strict），不放宽、不删掉；analysis_claims 从宽到严是 off < check < strict，
+  已经是 strict 的不改回 check；claims 从宽到严是 off < require_citation < judge，已经是 judge 的不改回
   require_citation；judge 缺预算（judge.max_cost_usd）时输出 question 问写多少、还是写 null 不限，不替人定；
   judge.on_unsupported 是 withhold 的不改回 degrade、不删掉；update_node 会把 judge 整个换掉，补预算时把原来的
   judge（包括从全图默认继承来的）整份带上，只加 max_cost_usd；契约里的 claims 也一样；

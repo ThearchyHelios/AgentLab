@@ -18,7 +18,7 @@ from app.engine.governance import publish_issues
 from app.engine.schema import GraphSpec
 from app.main import app
 
-STRICT = {"numbers": "strict", "on_violation": "fail", "claims": "require_citation"}
+STRICT = {"numbers": "strict", "on_violation": "fail", "claims": "require_citation", "analysis_claims": "strict"}
 SCHEMA = {"type": "object", "properties": {"gmv": {"type": "number"}}}
 
 
@@ -88,20 +88,21 @@ def test_report_policy_is_filled_in_with_one_auto_fix():
     fix = plan(graph)[fid]
     assert fix["kind"] == "auto" and fix["node_id"] == "write"
     assert fix["preview"]["after"] == STRICT and fix["preview"]["before"] == {
-        "numbers": "off", "on_violation": None, "claims": None}
+        "numbers": "off", "on_violation": None, "claims": None, "analysis_claims": None}
     out = apply_fixes(graph, [fid], level="governed")
     assert out["applied"] == [fid] and out["rejected"] == [] and out["ok"] is True
     assert {k: config(out["graph"], "write")[k] for k in STRICT} == STRICT
     assert config(out["graph"], "write")["instructions"] == "写周报"          # 别的配置原样留着
     assert [(c["field"], c["before"], c["after"]) for c in out["changes"]] == [
-        ("numbers", "off", "strict"), ("on_violation", None, "fail"), ("claims", None, "require_citation")]
+        ("numbers", "off", "strict"), ("on_violation", None, "fail"), ("claims", None, "require_citation"),
+        ("analysis_claims", None, "strict")]
     assert out["ops"] == [{"op": "update_node", "id": "write", "config": STRICT}]
     # 坐标、视口这些前端的东西原样留着
     assert find(out["graph"], "write")["position"] == {"x": 10, "y": 20} and out["graph"]["viewport"]["zoom"] == 1
 
 
 def test_only_the_missing_settings_are_written():
-    graph = traceable(report={"numbers": "strict", "claims": "require_citation"})
+    graph = traceable(report={"numbers": "strict", "claims": "require_citation", "analysis_claims": "strict"})
     fix = plan(graph)["governed.report_policy:write"]
     assert fix["preview"] == {"field": "on_violation", "before": None, "after": "fail"}
     out = apply_fixes(graph, [fix["id"]], level="governed")

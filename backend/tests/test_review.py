@@ -476,3 +476,98 @@ def test_a_rewrite_counts_by_the_final_judgement():
                      judge={"counts": {"supported": 2, "contradicted": 1, "insufficient": 0}})]
     assert rv.scan(good, OK_OUTPUT) == [] and rv.notes(good) == ["报告「写周报」有 1 句结论裁判认为证据不支持，改写后都有了依据"]
     assert [s.kind for s in rv.scan(bad, OK_OUTPUT)] == ["report_rewrite"] and rv.notes(bad) == []
+
+
+# --------------------------------------------------------------------------
+# 分析能力一轮的信号：只写说明、不自动重来（00-总方案 §3.7）
+# --------------------------------------------------------------------------
+
+#: check 下判断词重写一次后仍没挂对分析结论：报告照常产出，标在报告里
+CLAIMS_LEFT = "报告有 1 处分析说法未通过核对（1 处判断没挂分析结论：「主要来自」），已要求模型重写 1 次仍未改掉：…这几处已标注"
+REFUSED = "「周报分析」的波动基线没有做成：历史只有 5 期，至少要 8 期"
+SKIPPED = "指标「销售额环比」用到的两次查询没做成可比性检查：探查超时。指标照常计算，两期能不能直接比请自行核对"
+
+
+def test_analysis_signals_are_registered_as_gaps_that_only_need_a_note():
+    signals = rv.scan([warn(CLAIMS_LEFT, "report_analysis_claims"), warn(REFUSED, "analysis_refused"),
+                       warn(SKIPPED, "metric_comparability_skipped")], OK_OUTPUT)
+    assert [(s.kind, s.severity) for s in signals] == [
+        ("report_analysis_claims", rv.DEGRADED), ("analysis_refused", rv.DEGRADED),
+        ("metric_comparability_skipped", rv.DEGRADED)]
+    # NOTE_ONLY 另有一种不是日志代码的：分析调用写错了一直没改对（analysis_call_failed，见 tests/test_review_analysis.py）
+    assert {s.kind for s in signals} == rv.NOTE_ONLY - {rv.ANALYSIS_CALL_FAILED}
+    assert not rv.should_retry(signals) and not rv.NOTE_ONLY & (rv.RETRYABLE | rv.REBUILD)
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_only_note_only_signals_is_annotated_without_calling_the_model():
+    model = FakeModel(AssertionError("不该叫模型"))
+    signals = rv.scan([warn(CLAIMS_LEFT, "report_analysis_claims"), warn(REFUSED, "analysis_refused")], OK_OUTPUT)
+    result = await rv.review(model, question="q", answer="答案", signals=signals, locked=True)
+    assert model.calls == 0
+    assert result.verdict == "annotated" and result.retry is False and result.severity == rv.DEGRADED
+    assert result.note == f"{CLAIMS_LEFT}；{REFUSED}" and result.answer is None
+    # 和别的信号一起出现时照常叫模型
+    mixed = [*signals, rv.Signal("tool_error", "工具 x 调用失败", rv.BROKEN)]
+    model = FakeModel({"note": "取数失败了一次。", "answer": "", "retry": True})
+    assert (await rv.review(model, question="q", answer="答案", signals=mixed)).note == "取数失败了一次。"
+    assert model.calls == 1
+
+
+def _left_after_rewrite(mode: str, violations: list[dict], count: int = 2) -> list[dict]:
+    return [
+        ev(EventType.NODE_STARTED, node_id="write", label="写周报"),
+        ev(EventType.LOG, node_id="write", level="warn", code="report_repair", count=count, attempt=1,
+           message=f"报告有 {count} 处未通过核对（「12」、「主要来自」），已要求模型重写（第 1 次）"),
+        ev(EventType.REPORT_CHECKED, node_id="write", ok=not violations, violations=violations, repairs=1,
+           analysis_claims=mode),
+    ]
+
+
+CLAIM = {"code": "analysis_claim_uncited", "text": "主要来自", "message": "「主要来自」是分析判断"}
+
+
+def test_check_mode_leftovers_do_not_make_the_rewrite_count_as_failed():
+    """check 下重写一次后仍有的说法违规是标注（同缺失断言，各有自己的信号）：「改过一次」算改好了，不再另报 report_repair；
+    复核被叫起来时照实说剩下的是哪几处。"""
+    rows = [*_left_after_rewrite("check", [CLAIM]), warn(CLAIMS_LEFT, "report_analysis_claims")]
+    assert [s.kind for s in rv.scan(rows, OK_OUTPUT)] == ["report_analysis_claims"]
+    assert rv.notes(rows) == ["报告「写周报」首稿有 2 处没过核对，重写后只剩已标出的 1 处分析说法"]
+    # 一处都没改掉：不说「改好了」，剩下的由它自己的信号说
+    assert rv.notes(_left_after_rewrite("check", [CLAIM], count=1)) == []
+
+
+def test_absence_claim_leftovers_are_annotations_too():
+    absent = {"code": "absence_claim", "text": "没有查到", "message": "缺失断言"}
+    rows = _left_after_rewrite("check", [absent, CLAIM], count=3)
+    assert rv.scan(rows, OK_OUTPUT) == []
+    assert rv.notes(rows) == ["报告「写周报」首稿有 3 处没过核对，重写后只剩已标出的 1 处缺失断言、1 处分析说法"]
+
+
+@pytest.mark.parametrize("mode, violations", [
+    ("strict", [CLAIM]),                                                    # strict 下是出具缺口，不是标注
+    ("check", [CLAIM, {"code": "uncited_number", "text": "12"}]),           # 还有别的违规
+    ("off", [CLAIM]),
+    ("check", [CLAIM] * 20),                                                # 带满了 20 条：后面可能还有
+])
+def test_other_leftovers_still_count_as_a_failed_rewrite(mode, violations):
+    rows = _left_after_rewrite(mode, violations)
+    assert [s.kind for s in rv.scan(rows, OK_OUTPUT)] == ["report_repair"] and rv.notes(rows) == []
+
+
+@pytest.mark.asyncio
+async def test_review_endpoint_does_not_call_the_model_for_a_check_mode_leftover(client, monkeypatch):
+    model = FakeModel(AssertionError("不该叫模型"))
+
+    async def fake_model(*a, **k):
+        return model, "fake"
+
+    monkeypatch.setattr("app.api.copilot.get_chat_model", fake_model)
+    output = {"周报": "周报：销售额 45,678.5元，下降主要来自华东。",
+              "_evidence": {"report_node": "write", "doc_artifact": "a" * 64, "fields": ["周报"]}}
+    run_id = await _make_run(client, output, [*_left_after_rewrite("check", [CLAIM]),
+                                              warn(CLAIMS_LEFT, "report_analysis_claims")])
+    body = (await client.post("/api/copilot/review", json={"run_id": run_id, "question": "q"})).json()
+    assert model.calls == 0
+    assert body["verdict"] == "annotated" and body["note"] == CLAIMS_LEFT and body["retry_instruction"] is None
+    assert [s["kind"] for s in body["signals"]] == ["report_analysis_claims"]

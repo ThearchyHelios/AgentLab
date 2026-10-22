@@ -386,7 +386,9 @@ async def test_export_then_import_matches_sources_by_name(client, source):
 
 async def test_the_retail_sample_suite_trials_on_the_retail_database(client, tmp_path):
     """仓库里附的零售样例题集：在虚构零售库上导入，每道题都试算通过，期望和直接查库一样，陷阱按口径算。"""
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    # 「今天」按题集的时区取（题目里的期次按它算），不看本机时区：本机在别的时区时，跨日那几个钟头两边的今天不是同一天
+    content = json.loads(SUITE_FILE.read_text(encoding="utf-8"))
+    today = datetime.now(ZoneInfo(content["suite"]["timezone"])).date()
     path = retail.build(tmp_path / "retail.db", today)
     await drop_source(name=retail.SOURCE_NAME)
     async with SessionLocal() as session:
@@ -398,7 +400,6 @@ async def test_the_retail_sample_suite_trials_on_the_retail_database(client, tmp
         await session.commit()
         sid = row.id
     try:
-        content = json.loads(SUITE_FILE.read_text(encoding="utf-8"))
         res = await client.post("/api/evals/suites/import", json={"content": content}, headers=ACTOR)
         assert res.status_code == 201, res.text
         assert res.json()["imported"] == 6 and res.json()["skipped"] == []
@@ -430,9 +431,11 @@ async def test_the_retail_sample_suite_trials_on_the_retail_database(client, tmp
         # 陷阱确实埋着：按下单日、含退款算出来的都不一样
         assert paid not in (by_order_date, with_refunds)
         refunds = await trial(2)
-        assert (refunds["refund_orders"]["value"], refunds["refund_amount"]["value"]) == one(
-            f"SELECT COUNT(*), ROUND(SUM(amount), 2) FROM orders WHERE status = 'refunded' AND paid_date BETWEEN "
-            f"'{start}' AND '{end}'")
+        # 金额两边都按两位小数比：SQLite 的 ROUND(SUM(amount), 2) 出来的是浮点（6448.19 存成 6448.1900000000005），
+        # 和试算交回的金额逐字比会随数据变而挂
+        orders, amount = one(f"SELECT COUNT(*), ROUND(SUM(amount), 2) FROM orders WHERE status = 'refunded' "
+                             f"AND paid_date BETWEEN '{start}' AND '{end}'")
+        assert (refunds["refund_orders"]["value"], round(refunds["refund_amount"]["value"], 2)) == (orders, amount)
         assert refunds["refund_orders"]["value"] > 0
         cancelled = await trial(3)
         assert cancelled["cancelled"]["value"] == one(

@@ -1,4 +1,4 @@
-"""评测的变体：这一次用哪几个模型、读哪一份目录、重复几次（细案 01 做法 9、12；评测-D5、D10）。
+"""评测的变体：这一次用哪几个模型、读哪一份目录、给不给分析工具、重复几次（细案 01 做法 9、12；评测-D5、D10）。
 
 变体原样存进 EvalRun.variant（发起时规范化过），实际解析出的模型 id 另存 resolved_models。几项：
 
@@ -11,13 +11,18 @@
 - catalog {mode, snapshot}：读哪一份目录（评测-D5）——live 当前目录、reviewed 只用已核实和已确认的项、off 关目录、snapshot
   指定一份目录快照（EvalCatalogSnapshot 的 id，影子起草的或拍好的）。live、reviewed 在开评时都拍一份当前目录的快照，按
   快照读：评测一跑几十分钟，期间起草、剖析照常改目录，也不影响这次的可比性（做法 9「不占数据源的队」）。
+- analysis {tools}：分析工具开不开（on 开、off 关，缺省开）。关的那一臂助手建图时看不到分析工具和分析卡（工具清单不列、
+  节点手册和问数据的包装里只讲分析能力的那几段不给，图里照样绑了分析工具的挡回去改；api/copilot.answer_ops 的
+  analysis_tools，经 chat/drive.TurnDriver 透传）。工作流题不建图，按钉住的那一版跑，不受这一项影响。
 - repeats：每题重复几次（1–5）。定时跑 1 次，对照缺省 3 次（评测-D10）。
 - label：这一臂叫什么（A/B 时给人看，「当前目录」「关目录」……）。
 
-**同一变体**（和上一次比时挑基准用，做法 12）：助手、写作两项实际解析出的模型、目录的 mode（指定快照的连同快照 id）；
-重复次数、裁判开不开不算——它们不改变答案本身。variant_key 是它的指纹。
+**同一变体**（和上一次比时挑基准用，做法 12）：助手、写作两项实际解析出的模型、目录的 mode（指定快照的连同快照 id）、
+分析工具开不开；重复次数、裁判开不开不算——它们不改变答案本身。variant_key 是它的指纹（分析工具开着时和加这一项之前
+一字不差：以前的评测照样认得出是同一变体）。
 
 **目录贡献对照**（做法 12）：一组预设的 A/B——当前目录 vs 关，可以再加第三臂「只用已核实和已确认的项」（catalog_preset）。
+**分析工具贡献对照**：一组预设的 A/B——分析工具开 vs 关（analysis_tools_preset），量出分析工具帮了多少。
 """
 from __future__ import annotations
 
@@ -37,6 +42,9 @@ VARIANT_UNAVAILABLE = "eval_variant_unavailable"
 
 CATALOG_MODES = ("live", "reviewed", "off", "snapshot")
 CATALOG_LABEL = {"live": "当前目录", "reviewed": "只用已核实和已确认的项", "off": "关目录", "snapshot": "目录快照"}
+#: 分析工具开、关（变体的 analysis.tools）
+ANALYSIS_TOOLS = ("on", "off")
+ANALYSIS_TOOLS_LABEL = {"on": "开", "off": "关"}
 REPEATS_MAX = 5
 #: 定时跑 1 次，A/B 对照缺省 3 次（评测-D10）
 SCHEDULE_REPEATS = 1
@@ -44,7 +52,7 @@ PAIR_REPEATS = 3
 #: 一次 A/B 最多几臂（目录贡献对照最多三臂）
 ARMS_MAX = 3
 LABEL_MAX = 40
-_KEYS = ("assistant", "writer", "judge", "catalog", "repeats", "label")
+_KEYS = ("assistant", "writer", "judge", "catalog", "analysis", "repeats", "label")
 
 
 def _invalid(message: str, field_name: str) -> CaseInvalid:
@@ -92,6 +100,10 @@ def normalize_variant(raw: Any, *, judge_default: bool = False, repeats_default:
         raise _invalid("只有目录选「目录快照」时才指定快照", "variant.catalog.snapshot")
     else:
         snapshot = None
+    analysis = {} if raw.get("analysis") is None else raw["analysis"]
+    if not isinstance(analysis, Mapping) or set(analysis) - {"tools"} \
+            or analysis.get("tools", "on") not in ANALYSIS_TOOLS:
+        raise _invalid(f"变体的分析工具需要是 {{tools}}，tools 只能是 {'、'.join(ANALYSIS_TOOLS)}（开、关）", "variant.analysis")
     repeats = raw.get("repeats", repeats_default)
     if isinstance(repeats, bool) or not isinstance(repeats, int) or not 1 <= repeats <= REPEATS_MAX:
         raise _invalid(f"每题重复的次数需要是 1 到 {REPEATS_MAX} 的整数", "variant.repeats")
@@ -100,8 +112,14 @@ def normalize_variant(raw: Any, *, judge_default: bool = False, repeats_default:
         raise _invalid("这一臂的名字需要是文字", "variant.label")
     return {"assistant": _model_pair(raw.get("assistant"), "助手模型", "variant.assistant"),
             "writer": _model_pair(raw.get("writer"), "写作模型", "variant.writer"),
-            "judge": judge, "catalog": {"mode": catalog["mode"], "snapshot": snapshot}, "repeats": repeats,
+            "judge": judge, "catalog": {"mode": catalog["mode"], "snapshot": snapshot},
+            "analysis": {"tools": analysis.get("tools", "on")}, "repeats": repeats,
             "label": (label or "").strip()[:LABEL_MAX] or None}
+
+
+def analysis_tools(variant: Mapping[str, Any]) -> str:
+    """这一臂的分析工具开不开：on / off。加这一项之前的变体（存着的老评测）没有它，按开。"""
+    return "off" if (variant.get("analysis") or {}).get("tools") == "off" else "on"
 
 
 def catalog_preset(base: Mapping[str, Any], *, reviewed: bool = False) -> list[dict[str, Any]]:
@@ -111,6 +129,12 @@ def catalog_preset(base: Mapping[str, Any], *, reviewed: bool = False) -> list[d
         arms.insert(1, ("reviewed", CATALOG_LABEL["reviewed"]))
     return [{**copy.deepcopy(dict(base)), "catalog": {"mode": mode, "snapshot": None}, "label": label}
             for mode, label in arms]
+
+
+def analysis_tools_preset(base: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """「分析工具的贡献」预设对照：分析工具开 vs 关。模型、目录、裁判、重复次数照 base。"""
+    return [{**copy.deepcopy(dict(base)), "analysis": {"tools": tools}, "label": f"分析工具{ANALYSIS_TOOLS_LABEL[tools]}"}
+            for tools in ANALYSIS_TOOLS]
 
 
 def arm_name(variant: Mapping[str, Any], index: int) -> str:
@@ -188,26 +212,31 @@ async def snapshot_artifact(session: AsyncSession, variant: Mapping[str, Any]) -
 
 
 def variant_key(variant: Mapping[str, Any], models: Mapping[str, Any]) -> str:
-    """「同一变体」的指纹：助手、写作实际解析出的模型，目录的 mode（指定快照的连同快照 id）。"""
+    """「同一变体」的指纹：助手、写作实际解析出的模型，目录的 mode（指定快照的连同快照 id），分析工具开不开。分析工具
+    开着时不写进去：和加这一项之前算出来的一样，以前的评测照样是同一变体（挑基准、趋势线不断）。"""
     from app.core.artifact_store import canonical_json, content_hash
 
     catalog = variant.get("catalog") or {}
     body = {"assistant": models.get("assistant"), "writer": models.get("writer"), "catalog": catalog.get("mode"),
             "snapshot": catalog.get("snapshot") if catalog.get("mode") == "snapshot" else None}
+    if analysis_tools(variant) == "off":
+        body["analysis_tools"] = "off"
     return content_hash(canonical_json(body))[:16]
 
 
 def describe(variant: Mapping[str, Any], models: Mapping[str, Any] | None = None) -> str:
-    """给人看的一句：「助手 x · 写作 y · 当前目录 · 裁判关 · 每题 1 次」。"""
+    """给人看的一句：「助手 x · 写作 y · 当前目录 · 分析工具开 · 结论裁判关 · 每题 1 次」。"""
     models = models or {}
     catalog = variant.get("catalog") or {}
     parts = [f"助手 {models.get('assistant') or (variant.get('assistant') or {}).get('model') or '缺省'}",
              f"写作 {models.get('writer') or (variant.get('writer') or {}).get('model') or '各节点自己的'}",
              CATALOG_LABEL.get(catalog.get("mode") or "live", "当前目录"),
+             f"分析工具{ANALYSIS_TOOLS_LABEL[analysis_tools(variant)]}",
              f"结论裁判{'开' if variant.get('judge') else '关'}", f"每题 {variant.get('repeats') or 1} 次"]
     return " · ".join(parts)
 
 
-__all__ = ["ARMS_MAX", "CATALOG_LABEL", "CATALOG_MODES", "PAIR_REPEATS", "REPEATS_MAX", "Resolved", "SCHEDULE_REPEATS",
-           "VARIANT_INVALID", "VARIANT_UNAVAILABLE", "arm_name", "catalog_preset", "describe", "normalize_variant",
-           "resolve_models", "snapshot_artifact", "variant_key", "view_of"]
+__all__ = ["ANALYSIS_TOOLS", "ANALYSIS_TOOLS_LABEL", "ARMS_MAX", "CATALOG_LABEL", "CATALOG_MODES", "PAIR_REPEATS",
+           "REPEATS_MAX", "Resolved", "SCHEDULE_REPEATS", "VARIANT_INVALID", "VARIANT_UNAVAILABLE", "analysis_tools",
+           "analysis_tools_preset", "arm_name", "catalog_preset", "describe", "normalize_variant", "resolve_models",
+           "snapshot_artifact", "variant_key", "view_of"]

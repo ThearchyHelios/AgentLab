@@ -4,7 +4,9 @@
 执行脚本后，带出处的数字、无证据的数字、可疑的表名字段名都点得开——面板里是网页上证据面板同一个拼法的
 出处链（api/evidence._chain）：指标步骤（口径卡、口径与版本、原式、代入式、输入、复算、双盲复算）、
 输入步骤（值取自哪个节点、哪次查询的哪一格）、查询步骤（SQL、被引用的行、遮罩列、SQL 检查），
-以及运行输入、表名字段名、引文各自的步骤。封存状态照网页上的样子逐项标明（已封存 / 工件哈希核对）。
+以及运行输入、表名字段名、引文各自的步骤；分析结论（判定语、具名的数、结果表的格）点开是判定 → 方法 → 计算 → 输入 →
+复算 → 封存。封存状态照网页上的样子逐项标明（已封存 / 工件哈希核对）。报告文档带着系统写的「分析范围」
+（analysis_scope）时，正文后面另渲染这一段，编号点得开同一条出处链；没有这个字段的文档一个字都不多。
 
 这份文件不是核对件：口径、出处和封存状态都是导出那一刻系统里的记录，拿去和系统对照要用封存哈希
 （可验证报告，app/bundle）。页面页脚写明这一点。
@@ -77,7 +79,7 @@ _STATE_CLASS = {
     "deterministic": "ok", "none": "na", "suspect": "bad", "unverified": "bad",
     "unjudged": "na", "candidate": "na",
 }
-_KIND_LABEL = {"number": "数字", "value": "取值", "entity": "名称", "quote": "引文"}
+_KIND_LABEL = {"number": "数字", "value": "取值", "entity": "名称", "quote": "引文", "analysis": "判定"}
 
 
 def _esc(text: Any) -> str:
@@ -293,6 +295,66 @@ def render_body(doc: Mapping[str, Any]) -> str:
     return f'<div class="doc">{"".join(_render_block(b) for b in blocks)}</div>'
 
 
+#: 「分析范围」各组的叫法（00-总方案 §3.6），按这个顺序写
+SCOPE_TITLES = (("phenomena", "现象"), ("decomposed", "拆过"), ("excluded", "排除"), ("refused", "算不了"))
+SCOPE_NOTE = "这一段由系统按这次运行的分析结论写成，写作者改不了；点开编号看判定标准、计算、输入和复算。"
+#: 「检验」那一项后面接的校正说明（analysis.contract.ScopeBlock.corrected）：只做了一次的，一次里比了几对的已按次数校正；
+#: 做了不止一次的，几次之间没有校正。和可验证报告的核对页（bundle/verifier.js 的 scopeCorrected）同一种说法
+SCOPE_CORRECTED = {True: "（一次里比了几对的已按次数校正）", False: "，几次检验之间没有按次数校正"}
+#: 分析范围里一个编号的片段键（api/evidence.SCOPE_REF 同一个写法）：点开时按它找出处链
+_SCOPE_REF = "scope:{alias}"
+
+
+def _scope_item(item: Mapping[str, Any], *, depth: int = 0) -> str:
+    """分析范围里的一条：编号（按钮，点开出处链）、维度、下钻自哪一条、判定语或算不了的原因。"""
+    alias = str(item.get("alias") or "")
+    title = f"分析结论 {_esc(alias)}：点开查看出处"
+    button = (f'<button type="button" class="num num-ok" data-seg="{_esc(_SCOPE_REF.format(alias=alias))}"'
+              f' data-state="deterministic" data-kind="analysis" title="{title}">'
+              f"{_esc(alias)}</button>") if alias else ""
+    dims = [str(d) for d in item.get("dims") or [] if d]
+    bits = ([f"按{'、'.join(dims)}"] if dims else []) + ([f"下钻自 {item['parent']}"] if item.get("parent") else [])
+    lead = f"（{'，'.join(_esc(b) for b in bits)}）" if bits else ""
+    said = item.get("reason") if item.get("reason") and not item.get("phrase") else item.get("phrase")
+    margin = f' style="margin-left:{depth * 14}px"' if depth else ""
+    return f"<li{margin}>{button}{lead}{'：' if said else ''}{_esc(said or '')}</li>"
+
+
+def render_scope(doc: Mapping[str, Any]) -> str:
+    """报告文档里系统写的「分析范围」（analysis.contract.ScopeBlock）：现象、拆过（下钻按链缩进）、排除、算不了、没拆、
+    检验了几次、校正过没有。文档没有这个字段（老文档、这次没有分析结论、报告节点关了这一段）时是空串，页面一个字都不多。"""
+    scope = doc.get("analysis_scope")
+    if not isinstance(scope, Mapping):
+        return ""
+    rows: list[str] = []
+    for key, title in SCOPE_TITLES:
+        items = [i for i in scope.get(key) or [] if isinstance(i, Mapping)]
+        if not items:
+            continue
+        depth: dict[str, int] = {}
+        lines = []
+        for item in items:
+            level = depth.get(str(item.get("parent") or ""), -1) + 1 if item.get("parent") else 0
+            depth[str(item.get("alias") or "")] = level
+            lines.append(_scope_item(item, depth=level))
+        rows.append(f"<dt>{title}</dt><dd><ul>{''.join(lines)}</ul></dd>")
+    missing = scope.get("not_decomposed")
+    if isinstance(missing, list):
+        names = "、".join(_esc(n) for n in missing if n)
+        rows.append(f"<dt>没拆</dt><dd>{names or '候选维度都拆过了'}</dd>")
+    elif "not_decomposed" in scope:
+        rows.append(f"<dt>没拆</dt><dd>{_esc(scope.get('note') or '候选维度核对不了')}</dd>")
+    tests = scope.get("tests")
+    if isinstance(tests, int) and not isinstance(tests, bool) and tests > 0:
+        corrected = scope.get("corrected")
+        note = SCOPE_CORRECTED.get(corrected, "") if isinstance(corrected, bool) else ""
+        rows.append(f"<dt>检验</dt><dd>这次做了 {tests} 次差异检验{note}</dd>")
+    if not rows:
+        return ""
+    return (f'<section class="scope" aria-labelledby="scope-title"><h3 id="scope-title">分析范围</h3>'
+            f'<p class="muted">{SCOPE_NOTE}</p><dl class="scope-list">{"".join(rows)}</dl></section>')
+
+
 # --------------------------------------------------------------------------
 # 数据块和页面
 # --------------------------------------------------------------------------
@@ -390,7 +452,7 @@ def render_html(data: Mapping[str, Any], doc: Mapping[str, Any]) -> str:
         "NAME": _esc(name),
         "SEAL": seal_text,
         "RUN": _esc(str(meta.get("run_id") or "")),
-        "BODY": render_body(doc),
+        "BODY": render_body(doc) + render_scope(doc),
         "CSP": f"'sha256-{digest}'",
         "DATA": _json_text(data),
         "SCRIPT": script,

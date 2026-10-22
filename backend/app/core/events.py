@@ -51,6 +51,9 @@ class EventType(StrEnum):
     # 合并查询做完了：哪几个输入（别名、节点、行数、数据源）、哪条合并 SQL、得到几行、有哪些警告。
     # 运行详情据此展示这一步；完整结果在 query_artifact 指向的查询快照里
     MERGE_END = "merge.end"
+    # 分析卡里的一项做完了（engine/nodes/analysis.py）：哪一项、什么分析、状态、判定、判定语、结论工件（analysis_artifact）。
+    # 运行详情据此展示这一步，运行对比按项对齐两次的判定；整份结论在工件里。agent 分析工具的结论记在 tool.end 上
+    ANALYSIS_END = "analysis.end"
     SANDBOX_START = "sandbox.start"
     SANDBOX_END = "sandbox.end"
 

@@ -6,6 +6,7 @@ import { RUN_COMPARE_TEXT } from '../../lib/terms'
 import type { RunComparison } from '../../types'
 import { useCandidates, useComparison, useDefaultBase, useRunRecord } from './compare/data'
 import { comparePath, type CompareVia } from './compare/entry'
+import { Analyses } from './compare/Analyses'
 import { Metrics } from './compare/Metrics'
 import { compareErrorKind, isGone } from './compare/model'
 import { CompareError, type CompareErrorContext } from './compare/parts'
@@ -124,6 +125,7 @@ function Comparison({ data }: { data: RunComparison }) {
       <Summary summary={data.summary} filter={filter} onFilter={setFilter} />
       <NotesSection notes={data.notes ?? []} />
       <Metrics metrics={data.metrics ?? []} filter={filter} onClearFilter={() => setFilter(null)} />
+      <Analyses analyses={data.analyses} />
       <Queries queries={data.queries ?? []} />
       <TemplateSection template={data.template} />
     </>

@@ -22,7 +22,9 @@
 //   判定、服务端缺文件、裸 NaN、别的运行的文档、口径卡有输入取自遮罩列（卡的节点完成事件只给哈希）、同一张卡配上证据
 //   目录里写着号码的老文档（文档只给哈希、页面写明原因）、设了遮罩的数据源上按地区汇总的查询、每种显示
 //   格式各引用一处的经营月报、单位带尾随空白的经营月报、引用旁边是写作者自己写的普通文字的经营月报（「统一」「——」
-//   「SKU-」「共…家」，原样导出全绿）），逐份断言各项结果和原因文案；有一项无法核对的样本页总览是中性的，不是绿的；
+//   「SKU-」「共…家」，原样导出全绿）、带分析结论和系统写的分析范围的异动周报（判定语、具名的数、结果表的格，范围里的
+//   编号点得开）），逐份断言各项结果和原因文案；有一项无法核对的样本页总览是中性的，不是绿的；异动周报上只改判定语、具名的数
+//   的显示并重算全部哈希，各自变红并点名；
 //   经营月报上只改文字取值、数字、换算成万的口径卡引用的显示文字并重算全部哈希，各自变红并点名；核对过的字不动、改它
 //   旁边的（链接地址藏起数字、整段改成分隔线、文字片段冒用数字的 id；数字前面补一位数、加负号（半角、数学减号、负号
 //   前面是汉字的）、后面接「0 万」，隔着显示时不占位置的控制字符补一位数，这几种变红并点名「正文里紧挨着这个数的字改变了
@@ -611,7 +613,7 @@ await section('样本页：各种形状', async () => {
     check('生成样本页（tests/bundle_samples.py）', false, String(e?.message ?? e))
     return
   }
-  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 18, Object.keys(samples).join('、'))
+  check('生成样本页（tests/bundle_samples.py）', Object.keys(samples).length === 19, Object.keys(samples).join('、'))
 
   await sample('base', async (s, page) => {
     check('base：有无法核对的项，总览是中性的「可核对的项全部通过，另有 N 项无法核对」，不是绿色的通过', neutral(s),
@@ -904,6 +906,59 @@ await section('样本页：各种形状', async () => {
     check('prose：17 个数字和取值都显示成可点的数字、都通过', s.numberStates.pass === 17 && s.numbers === 17,
       JSON.stringify(s.numberStates))
   })
+  // 异动周报（分析能力一轮）：Agent 的三份分析结论（按地区的变化拆解、算不了的波动基线、两期可比性检查）和两份输入快照
+  // 随文件附带、导出时服务端复算过；报告引用拆解的判定语、具名的数、结果表的格（连同一整张结果表），正文后面是系统写的
+  // 「分析范围」。页面只核哈希、核判定语和数是不是结论里写的那几个字，不在浏览器里重算统计
+  await sample('analysis', async (s, page) => {
+    check('analysis：总览「全部通过」，没有一项无法核对', s.overall === 'pass' && s.text === '全部通过'
+      && !s.items.some((i) => i.result !== 'pass'), `${s.overall}：${s.text}；${describe(s)}`)
+    const kinds = s.items.filter((i) => i.check === 'artifacts').map((i) => i.text)
+    check('analysis：③ 三份分析结论、两份输入快照、报告文档都随文件附带、通过',
+      kinds.filter((t) => t.includes('分析结论')).length === 3 && kinds.filter((t) => t.includes('查询快照')).length === 2
+        && kinds.some((t) => t.includes('报告文档')), kinds.join(' | '))
+    check('analysis：④ 输入快照按「已核对的分析结论的输入」认', hasItem(s, 'chain', 'pass', '分析结论（A1）的输入')
+      && hasItem(s, 'chain', 'pass', '分析结论（A2）的输入'), s.items.filter((i) => i.check === 'chain').map((i) => i.text).join(' | '))
+    check('analysis：⑤ 分开数数字、取值、判定语', s.sums.numbers.includes('判定语 1 个'), s.sums.numbers)
+    const phrase = page.locator('.doc button.num[data-kind="analysis"]')
+    check('analysis：判定语是一个可点的数，读屏读作「判定语 …，通过」', await phrase.count() === 1
+      && (await phrase.getAttribute('aria-label') ?? '').startsWith('判定语 销售额下降 194（-8.7%），主要来自华东（-120，占 61.9%），通过'),
+      await phrase.getAttribute('aria-label'))
+    const detail = await detailText(page, phrase)
+    check('analysis：点开判定语：判定语、判定标准、方法与版本（服务端带的叫法）', detail.includes('判定语')
+      && detail.includes('一段占总变化的一半以上算主要来源') && detail.includes('变化拆解（可加） · decompose.additive@1'),
+      detail.replace(/\s+/g, ' ').slice(0, 300))
+    // 这三份分析都是 Agent 现场做的（台账条目带 call_id）：那一句照旧标「Agent 写的假设」
+    check('analysis：……附带说明、Agent 写的假设', detail.includes('附带说明') && detail.includes('Agent 写的假设')
+      && !detail.includes('分析卡上写的『在验证什么』') && detail.includes('下降是不是集中在某个地区'), detail.replace(/\s+/g, ' ').slice(0, 400))
+    check('analysis：……输入（角色、编号、各自的核对状态）', ['基期总数 · Q1', '本期总数 · Q1', '数据 · Q2'].every((t) => detail.includes(t)),
+      detail.replace(/\s+/g, ' ').slice(0, 500))
+    check('analysis：……复算写导出时服务端复算的结论、本页不重算统计', detail.includes('复算一致：按封存的输入重新计算，结论逐项相同')
+      && detail.includes('本页只核哈希，不在浏览器里重算统计'), detail.replace(/\s+/g, ' ').slice(-300))
+    const share = page.locator('.doc p button.num').filter({ hasText: /^61\.9%$/ })
+    const shareDetail = await share.count() ? await detailText(page, share.first()) : '找不到「61.9%」'
+    check('analysis：具名的数（占比）：出处写分析结论 A1 的具名的数「top_share」，和结论里记的值一致', shareDetail.includes('分析结论 A1 的具名的数「top_share」')
+      && shareDetail.includes('与按显示规则渲染的结果一致'), shareDetail.replace(/\s+/g, ' ').slice(0, 300))
+    const cell = page.locator('.doc p button.num').filter({ hasText: /^-120$/ })
+    const cellDetail = await cell.count() ? await detailText(page, cell.first()) : '找不到「-120」'
+    // 列写结果表记的列名（「变化」），不把列 id（delta）当叫法
+    check('analysis：结果表的格：出处写分析结论 A1 的结果表 · 第 1 行 · 变化', cellDetail.includes('分析结论 A1 的结果表 · 第 1 行 · 变化'),
+      cellDetail.replace(/\s+/g, ' ').slice(0, 300))
+    check('analysis：结果表整表引用：表头是给人看的列名，数字列右对齐', (await page.locator('.doc table th').allTextContents()).join('、') === '地区、基期、本期、变化'
+      && await page.locator('.doc td.n button.num').count() === 12, (await page.locator('.doc table th').allTextContents()).join('、'))
+
+    const scope = page.locator('[data-scope]')
+    const st = (await scope.innerText().catch(() => '')).replace(/\s+/g, ' ')
+    check('analysis：正文后面是系统写的「分析范围」：现象 A3、拆过 A1（按地区）、算不了 A2、没拆的渠道', st.includes('分析范围')
+      && st.includes('写作者改不了') && /现象 A3/.test(st) && /拆过 A1（按地区）/.test(st) && /算不了 A2/.test(st) && /没拆 渠道/.test(st), st)
+    const a2 = scope.locator('button.num').filter({ hasText: /^A2$/ })
+    const a2Detail = await a2.count() ? await detailText(page, a2.first()) : '找不到 A2'
+    check('analysis：点范围里的 A2（正文没引用）：随文件附带，看得到算不了的判定语和复算', a2Detail.includes('波动基线没有做成：只有 0 期历史，至少要 8 期')
+      && a2Detail.includes('复算一致'), a2Detail.replace(/\s+/g, ' ').slice(0, 300))
+    check('analysis：……范围里的编号不核「正文显示」', !a2Detail.includes('正文显示'), a2Detail.replace(/\s+/g, ' ').slice(0, 300))
+  })
+  await sample('analysis', async (s) => {
+    check('analysis：390 宽不横向溢出', s.overflow <= 0, `${s.overflow}px`)
+  }, { width: 390 })
 
   // 不执行脚本（附件预览、快速查看）：封存哈希、运行 ID、工作流名照样看得到，状态写「尚未核对」，不是一直「正在核对」
   {
@@ -987,7 +1042,7 @@ await section('样本页：篡改', async () => {
     data.artifacts.push({ id: card.id.replace(/^./, (c) => (c === '0' ? '1' : '0')), kind: 'retrieval', masked: true })
     return '多一份标着遮罩的检索快照'
   }, (s) => [...turnsRed('artifacts')(s),
-    ['原因写明', hasItem(s, 'artifacts', 'fail', '只有查询快照、口径卡和报告文档会因遮罩不随文件附带')]])
+    ['原因写明', hasItem(s, 'artifacts', 'fail', '只有查询快照、口径卡、分析结论和报告文档会因遮罩不随文件附带')]])
   // 遮罩卡在服务端被改过时，服务端照样只给 id、另标 mismatch（tests/test_bundle_masked_cards.py 守着服务端这一边）：
   // 不能因为不嵌内容就和正常的遮罩卡一样「可核对的项全部通过」
   await tamper(samples['masked-card'], '遮罩卡标成服务端的文件与 id 不一致', (data) => {
@@ -1083,6 +1138,29 @@ await section('样本页：篡改', async () => {
     ...turnsRed('numbers', ['events', 'manifest', 'artifacts', 'chain', 'meta'])(s),
     ['报告徽标不通过', s.reports[0]?.result === 'fail' && s.reports[0].parts.includes('不通过 1'), JSON.stringify(s.reports[0])],
   ], { seal: true })
+  // 分析结论：只改正文显示的判定语、具名的数（引用不动、重算全部哈希），⑤ 里只有那一项不通过，原因点名正文显示的字
+  for (const [label, ref, change] of [['判定语', 'a:A1', (t) => t.replace('华东', '华南')], ['具名的数', 'a:A1.top_share|pct', () => '71.9%']]) {
+    await tamper(samples.analysis, `分析结论的${label}的显示并重算全部哈希`, (data) => rewriteDoc(data, (doc) => {
+      const seg = doc.blocks.flatMap((b) => b.units).flatMap((u) => u.segments).find((x) => x.ref === ref)
+      if (!seg) return null
+      const text = change(seg.text)
+      doc.markdown = doc.markdown.replace(seg.text, text)
+      seg.text = text
+      seg.cite.rendered = text
+      return { what: `片段 ${seg.id}（${ref}）`, seg }
+    }), (s, forged) => {
+      const failed = s.items.filter((i) => i.check === 'numbers' && i.result === 'fail' && !i.folded)
+      return [
+        ...turnsRed('numbers', ['events', 'manifest', 'artifacts', 'chain'])(s),
+        ['⑤ 里只有这一项不通过', failed.length === 1, `${failed.length} 项`],
+        ['原因点名正文显示的字', failed[0]?.text.includes(`正文显示「${forged.seg.text}」`), failed[0]?.text ?? '没有不通过的项'],
+        ...(ref === 'a:A1' ? [['判定语另写结论里的判定语，不写「引用的值是空值」', failed[0]?.text.includes('分析结论里的判定语是「销售额下降 194（-8.7%），主要来自华东')
+          && !failed[0]?.text.includes('空值'), failed[0]?.text ?? '']] : []),
+        ['正文里那一处标成不通过', s.failedButtons.length === 1 && s.failedButtons[0].includes(`${forged.seg.text}，不通过`),
+          s.failedButtons.join(' | ')],
+      ]
+    }, { seal: true })
+  }
   // 只改显示文字、引用值不动、重算全部哈希（验收里的 T4、T5）：经营月报上改文字取值、千分位加货币单位的数字、换算成万的
   // 口径卡引用，各自只有那一项不通过。原因点名正文显示的字和引用的值，数字另写按显示规则应显示的字
   const shownForgeries = [

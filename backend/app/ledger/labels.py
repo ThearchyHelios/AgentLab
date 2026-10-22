@@ -20,6 +20,9 @@
 整题（whole_of）：主报告里所有带标签的数都来自同一口径的同一版、绑定一致，就记 equivalent，并写出还缺的入口字段（口径入口
 节点声明了、这次的绑定里没有的；required 且没有缺省值的另列）。
 
+分析结论里的数（[[a:A3]]、[[a:A3.键]]、[[v:A3.r0.列]]、整表 [[table:A3]] 展开的格）不标：它们是从查询快照派生出来的，
+不是口径（docs/design/analysis-round/00-总方案.md D11），不和口径比对、不进整题判断的计数，也不算成「没比对」。
+
 这里只是纯函数：标签在比对时算好、存进比对工件（ledger/match.py）；接口读的时候按这次运行查到过的遮罩值遮一遍（view_label）：
 绑定的值是遮罩值的不给值，差异条目里的 SQL 片段走证据面板同一套遮罩（api/evidence._Shown）。
 """
@@ -27,6 +30,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from typing import Any
+
+from app.analysis.contract import LEDGER_KIND
 
 #: 标签的四种、认法的两种
 KINDS = ("caliber", "related", "reasoning", "unknown")
@@ -259,6 +264,8 @@ def referenced_columns(docs: list[Mapping[str, Any]],
                 if cite.get("status") != "resolved":
                     continue
                 entry = catalog.get(cite.get("alias")) if isinstance(catalog.get(cite.get("alias")), dict) else {}
+                if entry.get("kind") == LEDGER_KIND:
+                    continue                    # 分析结论的结果表不是查询，不比对
                 locator = cite.get("locator") if isinstance(cite.get("locator"), dict) else {}
                 artifact = str(entry.get("artifact") or "")
                 if cite.get("kind") == "cell" and artifact and isinstance(locator.get("column"), str):
@@ -375,7 +382,7 @@ def label_doc(doc: Mapping[str, Any], queries: Mapping[str, Mapping[str, Any]],
               calibers: Mapping[str, Mapping[str, Any]],
               load_card: Callable[[str], Mapping[str, Any] | None]) -> dict[str, dict[str, Any]]:
     """一份报告文档里每个数的标签：{片段 id: 标签}。只标引用解析了的数字、取值片段（单元格、指标）；运行输入、表名、引文、
-    没有引用的数不标。"""
+    没有引用的数不标，分析结论里的数（具名标量、结果表的格）也不标（D11：派生的数，不是口径）。"""
     from app.engine.evidence import iter_units
 
     catalog = doc.get("catalog") if isinstance(doc.get("catalog"), dict) else {}
@@ -389,6 +396,8 @@ def label_doc(doc: Mapping[str, Any], queries: Mapping[str, Mapping[str, Any]],
             if cite.get("status") != "resolved":
                 continue
             entry = catalog.get(cite.get("alias")) if isinstance(catalog.get(cite.get("alias")), dict) else {}
+            if entry.get("kind") == LEDGER_KIND:
+                continue
             locator = cite.get("locator") if isinstance(cite.get("locator"), dict) else {}
             artifact = str(entry.get("artifact") or "")
             if cite.get("kind") == "cell" and artifact:

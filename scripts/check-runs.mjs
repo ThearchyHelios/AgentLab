@@ -2244,6 +2244,63 @@ await section('证据页签：裁判拆档——证据相矛盾、证据不足�
   }
 })
 
+await section('证据页签：分析说法违规的审计行写种类的叫法；工件页签认得分析结论（分析能力一轮）', async () => {
+  // 夹具是后端真跑的（evidence-analysis.json 的 agent：Agent 做了变化拆解、波动基线（算不了）、可比性检查，报告有三处说法违规）。
+  // 审计行由 api/evidence.py 给出：说法违规列在「无证据」一组，issue 是 analysis_claim_mismatch 这几种
+  const fxa = JSON.parse(readFileSync(new URL('../frontend/src/run/__tests__/evidence-analysis.json', import.meta.url), 'utf8'))
+  const a = fxa.agent
+  const EV_A = 'fake0evanalysis00000000000000'
+  const output = { 周报: a.doc.markdown, _evidence: { report_node: 'write', doc_artifact: a.doc_artifact, fields: ['周报'] }, _issuance: a.issuance }
+  evFakes(EV_A, { output, graph: a.graph, audit: a.audit })
+  fakes.set(`GET /api/artifacts/${a.doc_artifact}`, () => ({ status: 200, json: { id: a.doc_artifact, content: a.doc } }))
+  const results = Object.values(a.doc.catalog).filter((e) => e?.kind === 'analysis')
+  const at = new Date(Date.now() - 7198e3).toISOString()
+  fakes.set(`GET /api/runs/${EV_A}/artifacts`, () => ({ status: 200, json: results.map((e) => ({ id: e.artifact, kind: 'analysis_result',
+    node_id: 'fetch', size: 1800, meta: { op: a.analyses[e.alias].chain[0].op, status: a.analyses[e.alias].chain[0].status }, created_at: at })) }))
+  try {
+    await openEvidence(EV_A)
+    await page.locator('[data-audit-table]').waitFor({ timeout: 5000 }).catch(() => {})
+    const rows = await page.locator('[data-audit-table] tr[data-audit-row]').evaluateAll((els) => els.map((e) => ({
+      issue: e.querySelector('[data-audit-issue]')?.getAttribute('data-audit-issue') ?? '', state: e.children[1]?.textContent ?? '',
+      label: e.querySelector('[data-audit-focus]')?.getAttribute('aria-label') ?? '' })))
+    const claimed = rows.filter((r) => r.issue.startsWith('analysis_claim') || r.issue === 'causal_unsupported')
+    check('审计表：三条说法违规各一行，状态写种类的叫法（同正文、面板），字形照「无证据」那一组，不写「无证据」',
+      JSON.stringify(claimed.map((r) => r.state)) === '["?判断与分析结论不符","?判断词未挂分析结论","?因果说法没有依据"]', JSON.stringify(rows.map((r) => r.state)))
+    check('……三行都点得开（正文里那段文字画着波浪线、点得开），读屏写种类', claimed.length === 3
+      && claimed.every((r) => r.label.includes('，') && !r.label.includes('无证据')), JSON.stringify(claimed.map((r) => r.label)))
+    check('……别的无证据行照旧写「无证据」（没挂依据的两句结论）', rows.filter((r) => !r.issue && r.state === '?无证据').length === 2,
+      JSON.stringify(rows.map((r) => `${r.issue}:${r.state}`)))
+    // 第 2 波 S1 起报告多引了变化率、比重两格、一处没写换算的具名的数、整表展开的 8 格：有出处那一组的行数照夹具里
+    // 审计的「有出处」一组数（不再写死 3）
+    const cited = a.audit.groups.find((g) => g.key === 'cited')?.count ?? 0
+    check('……有出处那一组：判定语、具名的数、结果表的各格，行数和审计的一致', cited > 3
+      && rows.filter((r) => r.state.includes('有出处')).length === cited, `${cited} / ${JSON.stringify(rows.map((r) => r.state))}`)
+    await page.route(new RegExp(`/api/runs/${EV_A}/evidence/segments/`), (r) => {
+      const sid = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop())
+      return a.segments[sid] ? r.fulfill({ json: a.segments[sid] }) : r.fulfill({ status: 404, json: { detail: '没有这个片段' } })
+    })
+    await page.locator('[data-audit-table] [data-audit-open="s12"]').click()
+    const dock = page.locator('[data-evidence-dock] [data-evidence-panel]')
+    await dock.locator('[data-ev-claim-flags]').waitFor({ timeout: 5000 }).catch(() => {})
+    check('点说法违规那一行：右边打开那段文字，写种类和服务端的原话', (await dock.locator('[data-ev-claim-flag="analysis_claim_mismatch"]').innerText()
+      .catch(() => '')).includes('与所挂的分析结论 A1 对不上'))
+    await page.keyboard.press('Escape')
+
+    await page.goto(`${WEB}/runs/${EV_A}?view=artifacts`, { waitUntil: 'networkidle' })
+    await page.locator('[data-run-artifacts] [data-artifact-id]').first().waitFor({ timeout: 5000 }).catch(() => {})
+    const shown = await page.locator('[data-run-artifacts] [data-artifact-id]').evaluateAll((els) => els.map((e) => ({
+      kind: e.querySelector('[data-artifact-kind-label]')?.textContent ?? '', about: e.querySelector('[data-artifact-about]')?.textContent ?? '',
+      group: e.getAttribute('data-artifact-class') })))
+    check('工件页签：分析结论写种类的叫法、哪一种分析，算不了的写「没有做成」，归在证据快照一组',
+      JSON.stringify(shown) === JSON.stringify([{ kind: '分析结论', about: '变化拆解', group: 'evidence' },
+        { kind: '分析结论', about: '波动基线（没有做成）', group: 'evidence' }, { kind: '分析结论', about: '可比性检查', group: 'evidence' }]),
+      JSON.stringify(shown))
+  } finally {
+    for (const k of [...fakes.keys()]) if (k.includes(EV_A) || k.includes(a.doc_artifact)) fakes.delete(k)
+    await page.unroute(new RegExp(`/api/runs/${EV_A}/evidence/segments/`)).catch(() => {})
+  }
+})
+
 await section('证据页签：没有报告的运行照实说明（none / 旧运行猜测 / 老后端）', async () => {
   evFakes(EV_LEGACY, { output: fxe.legacy.output, graph: fxe.legacy.graph, audit: fxe.legacy.audit, report: false })
   await openEvidence(EV_LEGACY)

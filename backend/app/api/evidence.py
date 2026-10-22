@@ -9,6 +9,7 @@
 - 运行输入：入口节点 node.finished 事件里的 node_output 工件
 - 表结构快照：tool.end 事件里的 schema_artifact，或者 node.finished.evidence 里的 schema 条目
 - 检索快照：retrieve.end 事件里的 artifact，或者 node.finished.evidence 里的 retrieval 条目
+- 分析结论：node.finished.evidence 里的 analysis 条目（Agent 分析工具、分析卡记的），它的输入快照照查询快照认
 
 artifacts 表可以事后插行，run.output 是可以改写的一列，封存之后追加的事件不在
 核对范围里——这三样都不当来源。解析数字层的链：口径卡指标 → 它的输入 → 查询快照里
@@ -70,6 +71,7 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select, update
 from sqlalchemy.exc import StatementError
 
+from app.analysis.contract import CATALOG_PREFIX, LABELS as ANALYSIS_LABELS, LEDGER_KIND, is_result, method_label
 from app.api.coded import CodedHTTPException
 from app.core.artifact_store import load
 from app.core.events import EventType
@@ -100,8 +102,9 @@ from app.data.provenance_types import (
 from app.data.table_versions import SnapshotManifestMismatch, SnapshotMissing
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, RunEvent, Workflow
-from app.engine import direct_select, recompute
+from app.engine import analysis_claims, direct_select, recompute
 from app.engine.evidence import (
+    CELL_DISPLAY,
     ENTITY_KINDS,
     GUESS_NOTE,
     GUESS_SCHEMA,
@@ -109,8 +112,12 @@ from app.engine.evidence import (
     UNKNOWN_ENTITY_REASON,
     UNVERIFIED_ENTITY_REASON,
     RenderError,
+    analysis_card,
+    analysis_formulas,
+    analysis_recheck,
     build_catalog,
     closest_entities,
+    doc_cell_display,
     find_segment,
     guess_sources,
     input_eid,
@@ -119,7 +126,9 @@ from app.engine.evidence import (
     make_eid,
     normalize_quote,
     query_entry_fields,
+    render_cell,
     render_metric,
+    resolve_ref,
     schema_column,
     schema_table,
     sql_tables,
@@ -127,6 +136,7 @@ from app.engine.evidence import (
     uncited_claims,
     withhold_metrics,
 )
+from app.engine.expressions import locate_cell
 from app.engine.judge import FIELDS_MAX, SETTLED, UNSUPPORTED, VERDICTS, candidates, outdated
 from app.engine.lineage import untraced
 from app.engine.merge_query import MERGE_SOURCE, trace_cell
@@ -196,6 +206,8 @@ class _Sealed:
     schemas: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 封存范围内交回过的检索快照：工件 id → {node_id, source}
     retrievals: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 封存范围内台账里记过的分析结论：工件 id → {node_id, exec, call_id / item, inputs}
+    analyses: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 封存时记下的清单哈希（没封存的是 None）：旧答案的猜测按 (run_id, 它) 缓存
     manifest_hash: str | None = None
     #: 运行记录上的 manifest_seq 原值（老运行是 None）：按需裁判追加判定前核对封存没换过
@@ -212,6 +224,9 @@ class _Sealed:
     #: 节点 id → node.started 上记的名字、类型。子工作流里的节点（「子工作流节点 id/…」）不在这次运行的图上，名字从这里取
     labels: dict[str, str] = field(default_factory=dict)
     types: dict[str, str] = field(default_factory=dict)
+    #: 这一次请求里复算过的分析结论：结论工件 id → 复算的结论（_analysis_recheck）。导出页里同一份结论被判定语、具名的数、
+    #: 整表的每一格、分析范围各引一处，各接一条链，复算只做一次。只活在这一次请求里：下一次请求重新取、重新验
+    rechecks: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def sealed(self) -> bool:
@@ -304,6 +319,10 @@ async def _sealed(run_id: str) -> _Sealed:
                     out.schemas[artifact] = {"node_id": node_id, "source": entry.get("source")}
                 elif entry.get("kind") == "retrieval":
                     out.retrievals[artifact] = {"node_id": node_id, "source": entry.get("source")}
+                elif entry.get("kind") == LEDGER_KIND:
+                    out.analyses.setdefault(artifact, {
+                        "node_id": node_id, **{k: entry[k] for k in ("exec", "call_id", "item", "inputs")
+                                               if entry.get(k) is not None}})
     return out
 
 
@@ -517,6 +536,14 @@ def _graph_of(report: _Report, sealed: _Sealed, inputs: dict[str, Any]) -> tuple
                           "report": report.node_id}
                          for source in _merge_inputs(entry.get("artifact"))
                          if (target := _query_alias(catalog, source.get("artifact"))))
+        elif entry.get("kind") == LEDGER_KIND:
+            # 分析结论：哪种分析、算成没有、判定码、谁做的（分析卡的那一项 / Agent 的那次调用）；连向它的输入（「派生自」：
+            # 输入快照的 Q…，下钻的上一层 A…），图上看得出 A3 是从 Q2 算出来的
+            item.update({k: entry[k] for k in ("op", "mode", "status", "verdict", "item", "call_id")
+                         if entry.get(k) is not None})
+            edges.extend({"from": alias, "to": target, "rel": "derived_from", "report": report.node_id}
+                         for target in dict.fromkeys(_catalog_alias_of(catalog, a) for a in entry.get("inputs") or [])
+                         if target and target != alias)
         elif entry.get("kind") in ENTITY_KINDS:
             # 表和字段：叫什么、出现在哪几次查询里、来历（表结构快照 / SQL / 结果列）各自封存了没有
             item.update({k: entry[k] for k in ("name", "table", "tables", "qualified", "source") if entry.get(k)})
@@ -882,9 +909,30 @@ async def evidence_metric(run_id: str, node: str, metric: str) -> dict[str, Any]
             "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []}}
 
 
-def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
-                  ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
-    """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""
+ANALYSIS_NOT_FOUND = "evidence_analysis_not_found"
+
+
+@router.get("/{run_id}/evidence/analyses/{alias}")
+async def evidence_analysis(run_id: str, alias: str, report: str | None = None) -> dict[str, Any]:
+    """点开报告末尾系统写的「分析范围」里的一个编号（A1…）：那份分析结论的出处链（判定 → 方法 → 计算 → 输入 → 复算 →
+    封存），和点开正文里它的判定语是同一条（_scope_chain，导出页的分析范围也按它）。正文没引用的结论（排除的、算不了的）也
+    点得开。只认这份报告证据目录里的分析结论；选哪份报告、文档完不完好同片段接口（?report=<节点 id>）。"""
+    sealed = await _sealed(run_id)
+    chosen = _open_report(sealed, report)
+    doc = chosen.doc or {}
+    chain = await _scope_chain(alias, doc, sealed, chosen.node_id)
+    if chain is None:
+        raise CodedHTTPException(404, "这份报告的证据目录里没有这份分析结论", ANALYSIS_NOT_FOUND)
+    covered = sealed.trusted and all(step.get("sealed") for step in chain if "sealed" in step)
+    masked = _chain_masked(chain)
+    return {"run_id": run_id, "report": {"node_id": chosen.node_id, "doc_artifact": chosen.doc_artifact}, "alias": alias,
+            "rendered": next((step.get("rendered") for step in chain if step.get("step") == LEDGER_KIND), None),
+            "chain": chain, "seal": {"sealed": sealed.sealed, "ok": sealed.seal["ok"], "covered": covered},
+            "redacted": {"columns": masked, "note": MASK_NOTE} if masked else {"columns": []}}
+
+
+def _open_report(sealed: _Sealed, wanted: str | None) -> _Report:
+    """选报告、确认文档完好。片段接口、推断来源接口、分析范围里的编号共用同一套错误码。"""
     reports = _named_reports(sealed, wanted)
     if not reports:
         raise CodedHTTPException(404, "本次运行没有封存的报告文档，没有可查看的片段", REPORT_NOT_FOUND)
@@ -893,7 +941,14 @@ def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
         raise CodedHTTPException(409, "报告文档与哈希不一致，疑似被修改，不能作为证据展示", DOC_TAMPERED)
     if chosen.doc is None:
         raise CodedHTTPException(404, "无法读取报告文档", DOC_MISSING)
-    found = find_segment(chosen.doc, segment_id)
+    return chosen
+
+
+def _open_segment(sealed: _Sealed, wanted: str | None, segment_id: str
+                  ) -> tuple[_Report, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    """选报告、确认文档完好、找到片段：(报告, (块, 句子, 片段))。片段接口和推断来源接口共用同一套错误码。"""
+    chosen = _open_report(sealed, wanted)
+    found = find_segment(chosen.doc or {}, segment_id)
     if found is None:
         raise CodedHTTPException(404, "报告中没有这个片段", SEGMENT_NOT_FOUND)
     return chosen, found
@@ -934,6 +989,9 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
                                    entry, doc, sealed, masks)
     if seg.get("state") != "deterministic" or cite.get("status") != "resolved":
         return []
+    if cite.get("kind") == LEDGER_KIND or (cite.get("kind") == "cell" and entry.get("kind") == LEDGER_KIND):
+        # 分析结论：判定语、具名标量、结果表的一格都接同一条链（判定 → 方法 → 计算 → 输入 → 复算 → 封存）
+        return await _analysis_chain(seg, cite, entry, doc, sealed, masks)
     if cite.get("kind") == "cell":
         locator = cite.get("locator") or {}
         # 只有直接引用的单元格才可能推断来源（P4-SPEC 2.8.2）。指标链里的查询步骤不带：指标片段的推断来源只会
@@ -951,6 +1009,340 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
     if cite.get("kind") != "metric":
         return []
     return await _metric_chain(seg, cite, entry, doc, sealed, masks)
+
+
+# --------------------------------------------------------------------------
+# 分析结论的出处链
+# --------------------------------------------------------------------------
+
+#: 「在验证什么」（hypothesis）旁边那句：它不是结论，只在证据面板显示（细案 01 §7.3）。谁写的照实说：Agent 现场做的
+#: （台账条目带 call_id）写「Agent 写的假设」，分析卡做的（带 item）是模板作者写的，写「分析卡上写的『在验证什么』」
+HYPOTHESIS_LABEL = "Agent 写的假设"
+HYPOTHESIS_NOTE = f"{HYPOTHESIS_LABEL}：说明这次在验证什么，不是分析结论，也不进报告正文"
+CARD_HYPOTHESIS_LABEL = "分析卡上写的『在验证什么』"
+CARD_HYPOTHESIS_NOTE = f"{CARD_HYPOTHESIS_LABEL}：模板作者写的那一句，不是分析结论，也不进报告正文"
+UNSEALED_ANALYSIS = "这份分析结论不属于封存范围内的任何事件（封存前的台账里没有它），不能作为证据展示"
+TAMPERED_ANALYSIS = "分析结论与哈希不一致，疑似被修改，不展示其中的判定和数"
+MISSING_ANALYSIS = "无法读取分析结论"
+#: 口径卡指标上的可比性结论不进台账（00-总方案 §3.4）：它记在封存过的口径卡指标集里，卡上记着它的 sha256，属于封存链的
+#: 延伸（同推演认 value_artifact）。指标那一步没封存的，这份结论也不算封存
+COMPARABILITY_CHAINED = ("这份可比性结论不进台账：口径卡执行时自动做的，记在封存过的口径卡指标集里（卡上记着它的 sha256），"
+                         "随卡一起封存")
+UNSEALED_COMPARABILITY = "这份可比性结论记在口径卡上，可这张卡的指标集不在封存范围内，不能作为证据展示"
+#: 每个算子用到的阈值（细案 01 §10「用在」一栏）：方法一步只列这几个，判定标准照它们写
+_OP_SETTINGS: dict[str, tuple[str, ...]] = {
+    "decompose": ("main_share", "concentration", "offset_ratio", "flat_pct", "min_denominator", "max_drill_depth",
+                  "table_top_k"),
+    "baseline": ("k_warn", "k_alert", "min_history", "max_history"),
+    "trend": ("trend_min_points", "trend_alpha", "min_history", "max_history"),
+    "differ": ("differ_alpha", "min_n", "min_expected"),
+    "comparable": (),
+}
+#: 输入的角色（analysis.contract.AnalysisInput.role）给人看的叫法；比率拆解的 headline 是整体比率，不是总数
+_INPUT_ROLES = {"data": "数据", "base": "基期", "target": "本期", "headline_base": "基期总数",
+                "headline_target": "本期总数", "parent": "上一层拆解"}
+_RATIO_ROLES = {"headline_base": "基期整体比率", "headline_target": "本期整体比率"}
+#: 闭合核对：headline 的那一格对着结论里的哪个数（细案 01 §2.1、§2.2）。可加拆解对各段之和（base_total / target_total），
+#: 比率拆解对整体比率，即各段分子之和 ÷ 分母之和（r_base_total / r_target_total）
+_HEADLINE_TOTALS = {
+    "additive": {"headline_base": "base_total", "headline_target": "target_total"},
+    "ratio": {"headline_base": "r_base_total", "headline_target": "r_target_total"},
+}
+#: 计算一步最多给结果表的几行（前 table_top_k 段，加上被引用的那一行前后各 WINDOW 行）
+MAX_ANALYSIS_ROWS = MAX_WINDOW_ROWS
+
+
+def _analysis_of(artifact: str) -> tuple[dict[str, Any] | None, bool | None]:
+    """取回一份分析结论：(结论, hash_ok)。哈希对不上的 (None, False)，取不回来的 (None, None)，内容不是分析结论的 (None, None)。"""
+    content, ok = _fetch(artifact) if artifact else (None, None)
+    return (content, ok) if ok is True and is_result(content) else (None, False if ok is False else None)
+
+
+def _catalog_alias_of(catalog: dict[str, Any], artifact: Any) -> str | None:
+    """这份工件在报告目录里的编号：查询快照是 Q…，分析结论是 A…。"""
+    if not artifact:
+        return None
+    return next((alias for alias, e in catalog.items()
+                 if isinstance(e, dict) and e.get("kind") in ("query", LEDGER_KIND) and e.get("artifact") == artifact), None)
+
+
+def _analysis_cited(cite: dict[str, Any], result: dict[str, Any] | None) -> dict[str, Any]:
+    """这一处引用的是结论的哪一项：判定语（phrase）、具名标量（value：键、原值、换算）、结果表的一格（cell：行、列、原值）。
+
+    结果表的列写给人看：column 是稳定的列 id（share、delta……，引用里就是这么写的），column_label 是结果表记的列名
+    （「占变化的比重」）；页面照原样显示 column_label，不把列 id 当叫法。"""
+    locator = cite.get("locator") or {}
+    if cite.get("kind") == "cell":
+        row, column = locator.get("row"), locator.get("column")
+        raw = None
+        table = (result or {}).get("table") if isinstance((result or {}).get("table"), dict) else None
+        if table is not None:
+            with contextlib.suppress(Exception):
+                raw, column = locate_cell(table, row, column)
+        labels = (table or {}).get("labels") if isinstance((table or {}).get("labels"), dict) else {}
+        return {"what": "cell", "row": row, "column": column,
+                "column_label": str(labels.get(column) or column) if column is not None else None, "raw": raw}
+    if locator.get("key"):
+        values = (result or {}).get("values") if isinstance((result or {}).get("values"), dict) else {}
+        return {"what": "value", "key": locator["key"], "raw": values.get(locator["key"]),
+                **({"conv": cite["conv"]} if cite.get("conv") else {})}
+    return {"what": "phrase"}
+
+
+def _analysis_rendered(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any], result: dict[str, Any],
+                       doc: dict[str, Any]) -> str | None:
+    """按封存的结论把这一处引用重新解析一遍，交回渲染出来的字（渲染不出来是 None）。和组装、出口复核同一个函数
+    （evidence.resolve_ref，按文档记下的那一版单元格显示规则）：判定语按文本格，具名标量按单元格的规则，结果表的格照结果表
+    记的列类型（文本码值 "1203" 不加千分位）、显示规则（ISO 日期时间的 T 换成空格）、标识列不分千位。片段上没记引用的
+    （口径卡指标上的可比性、分析范围里的编号）按判定语渲染。"""
+    ref = seg.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        phrase = result.get("phrase")
+        try:
+            return render_cell(phrase, kind="text") if isinstance(phrase, str) else None
+        except RenderError:
+            return None
+    alias = str(cite.get("alias") or entry.get("alias") or "")
+    again = resolve_ref(ref, {alias: {**entry, "result": result}}, display=doc_cell_display(doc) or CELL_DISPLAY)
+    return again.get("rendered") if again.get("status") == "resolved" else None
+
+
+async def _analysis_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any], doc: dict[str, Any],
+                          sealed: _Sealed, masks: _Masks, *, chained: bool | None = None,
+                          queries: bool = True) -> list[dict[str, Any]]:
+    """分析结论的出处链（00-总方案 §3.3）：判定 → 方法 → 计算 → 输入 → 复算 → 封存。
+
+    - 判定（analysis）：判定语、判定标准、判定码和点名的段、附带说明、算不了的原因，这一处引用的是哪一项（判定语、具名标量、
+      结果表的一格，列另写结果表记的列名 column_label）；「在验证什么」另列，谁写的照实标：Agent 现场做的写「Agent 写的假设」
+      （HYPOTHESIS_NOTE），分析卡做的写「分析卡上写的『在验证什么』」（CARD_HYPOTHESIS_NOTE，模板作者写的）
+    - 方法（analysis_method）：方法与版本、规范化后的参数、实际用的阈值（只列这个算子用到的）、现查的表范围（probes）
+    - 计算（analysis_calc）：结果表（前 table_top_k 段，加上被引用的那一行附近）、具名的数、关键数的代入式
+      （evidence.analysis_formulas）
+    - 输入（analysis_input，每份一步）：落到报告目录的哪个 Q、用了哪些列和行、headline 那一格（值另由服务端渲染成 value_rendered，
+      和闭合核对同一个写法）和结论里总数的闭合核对、
+      下钻的上一层是哪个 A；后面接上每份输入快照的查询步骤（只认封存范围内交回过的，遮罩照查询步骤的办法）
+    - 复算（analysis_recompute）：按 sha256 取回封存的输入、用同一个函数复算，和封存的逐字段比（evidence.analysis_recheck）；
+      方法升过版、复算不了都照实写
+    - 封存（analysis_seal）：这件工件是不是封存范围内的台账记过的、哈希复验通过
+    结论取不回、哈希不符的只给判定和封存两步，照实说为什么。
+
+    口径卡指标上的可比性结论（_comparability_view）不进台账：chained 是那个指标的一步封存了没有（卡上记着这份结论的 sha256，
+    属于封存链的延伸），封存一步照它认；谁做的写口径卡（origin metric）。queries 为假时不接输入快照的查询步骤（可比性的
+    两份输入就是指标输入的那两份，指标链里已经有了）。"""
+    catalog = doc.get("catalog") or {}
+    alias = str(cite.get("alias") or entry.get("alias") or "")
+    artifact = str(entry.get("artifact") or "")
+    result, hash_ok = _analysis_of(artifact)
+    info = sealed.analyses.get(artifact)
+    in_ledger = sealed.trusted and (str(entry.get("node_id") or ""), artifact) in sealed.ledger \
+        if chained is None else sealed.trusted and chained
+    eid = make_eid(LEDGER_KIND, artifact or None, {})
+    rendered = _analysis_rendered(seg, cite, entry, result, doc) if result is not None else None
+    judged: dict[str, Any] = {
+        "step": "analysis", "alias": alias, "op": entry.get("op"), "mode": entry.get("mode"),
+        "method_label": method_label(entry.get("op"), entry.get("mode")),
+        "origin": "metric" if chained is not None else "card" if analysis_card(entry) else "agent",
+        **{k: entry[k] for k in ("item", "call_id") if entry.get(k)},
+        "node_id": entry.get("node_id"), "label": _node_label(sealed, entry.get("node_id")) or None,
+        "artifact": artifact or None, "eid": entry.get("eid"), "eid_ok": entry.get("eid") == eid,
+        "cited": _analysis_cited(cite, result), "rendered": seg.get("text"),
+        "render_ok": rendered is not None and rendered == seg.get("text"), "hash_ok": hash_ok,
+    }
+    seal = {"step": "analysis_seal", "alias": alias, "node_id": entry.get("node_id"), "artifact": artifact or None,
+            "ledger": info is not None, "hash_ok": hash_ok, "eid_ok": judged["eid_ok"],
+            "sealed": in_ledger and hash_ok is True and judged["eid_ok"]}
+    if chained is not None:
+        # 封存的路子是口径卡的指标集（卡上记着这份结论的 sha256），不是台账
+        seal.update(via="metric_set", note=COMPARABILITY_CHAINED if chained else UNSEALED_COMPARABILITY)
+    elif info is None:
+        seal["note"] = UNSEALED_ANALYSIS
+    if result is None:
+        judged["note"] = TAMPERED_ANALYSIS if hash_ok is False else MISSING_ANALYSIS
+        return [judged, seal]
+    verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else None
+    judged.update(
+        status=result.get("status"), reason_code=result.get("reason_code"), reason=result.get("reason"),
+        phrase=result.get("phrase"), criterion=result.get("criterion"), verdict=verdict,
+        caveats=[{k: c.get(k) for k in ("code", "text")} for c in result.get("caveats") or [] if isinstance(c, dict)])
+    if isinstance(result.get("hypothesis"), str) and result["hypothesis"].strip():
+        # 谁写的照实说：分析卡（台账条目带 item）是模板作者写的，Agent 工具（带 call_id）是现场写的
+        card = judged["origin"] == "card"
+        judged.update(hypothesis=result["hypothesis"],
+                      hypothesis_label=CARD_HYPOTHESIS_LABEL if card else HYPOTHESIS_LABEL,
+                      hypothesis_note=CARD_HYPOTHESIS_NOTE if card else HYPOTHESIS_NOTE)
+    settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
+    method = {
+        "step": "analysis_method", "alias": alias, "method": result.get("method"),
+        "method_label": judged["method_label"], "params": result.get("params") or {},
+        "settings": [{"key": k, "label": ANALYSIS_LABELS.get(k, k), "value": settings[k]}
+                     for k in _OP_SETTINGS.get(str(result.get("op")), ()) if k in settings],
+        "probes": [p for p in result.get("probes") or [] if isinstance(p, dict)],
+    }
+    inputs, steps = await _analysis_inputs(alias, result, catalog, doc, sealed, masks, queries=queries)
+    hidden = {str(c).lower() for q in steps for c in q.get("masked") or []}
+    calc = _analysis_calc(alias, result, judged["cited"], hidden)
+    again = await _analysis_recheck(result, sealed, artifact)
+    recheck = {"step": "analysis_recompute", "alias": alias, **again}
+    return [judged, method, calc, *inputs, *steps, recheck, seal]
+
+
+def _analysis_calc(alias: str, result: dict[str, Any], cited: dict[str, Any], hidden: set[str]) -> dict[str, Any]:
+    """计算一步：结果表（前 table_top_k 段加上被引用的那一行附近，最多 MAX_ANALYSIS_ROWS 行，高亮被引用的格）、具名的数（原值、
+    渲染出来的字）、关键数的代入式。数和格都按结论记的格式写出来（占比、变化率是百分数，比率的变化是百分点），和正文引用
+    之后显示的字一样；结果表的空格写「—」不写 null，面板照原样显示。结果表里万一有取自遮罩列的列（输入查询步骤里遮着的
+    列名），照查询步骤写「已遮罩」。"""
+    values = result.get("values") if isinstance(result.get("values"), dict) else {}
+    named = result.get("value_formats") if isinstance(result.get("value_formats"), dict) else {}
+    shown_values = []
+    for key, raw in values.items():
+        try:
+            # 具名的数按结论记的格式写（占比、变化率是百分数），和引用之后正文显示的字一样
+            conv = named.get(key) if isinstance(named.get(key), str) and named.get(key) else None
+            text = render_cell(raw, conv)
+        except RenderError:
+            text = MISSING
+        shown_values.append({"key": str(key), "raw": raw, "rendered": text,
+                             **({"cited": True} if cited.get("what") == "value" and cited.get("key") == key else {})})
+    step: dict[str, Any] = {"step": "analysis_calc", "alias": alias, "values": shown_values,
+                            "formulas": analysis_formulas(result)}
+    table = result.get("table") if isinstance(result.get("table"), dict) else None
+    if table is None or not isinstance(table.get("rows"), list):
+        return step
+    columns = [str(c) for c in table.get("columns") or []]
+    rows = table["rows"]
+    settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
+    top = settings.get("table_top_k") if isinstance(settings.get("table_top_k"), int) else 10
+    index = set(range(min(top, len(rows))))
+    row = cited.get("row") if cited.get("what") == "cell" else None
+    if isinstance(row, int):
+        index |= {i for i in range(row - WINDOW, row + WINDOW + 1) if 0 <= i < len(rows)}
+    picked = sorted(index)[:MAX_ANALYSIS_ROWS]
+    masked = {i for i, c in enumerate(columns) if c.lower() in hidden}
+    step["table"] = {
+        "columns": columns, "labels": dict(table.get("labels") or {}) if isinstance(table.get("labels"), dict) else {},
+        "total_rows": len(rows), "row_index": picked,
+        "rows": [[MASKED if i in masked else _shown_cell(v, table, columns[i]) for i, v in enumerate(rows[r])]
+                 if isinstance(rows[r], list) else rows[r] for r in picked],
+        "masked": [columns[i] for i in sorted(masked)],
+        "highlight": {"cells": [[row, str(cited.get("column"))]] if isinstance(row, int) else []},
+        **({"window_truncated": True} if len(index) > MAX_ANALYSIS_ROWS else {}),
+    }
+    return step
+
+
+def _shown_cell(raw: Any, table: Mapping[str, Any], column: str) -> str:
+    """结果表的一格按结论记的格式写出来（占比、变化率是百分数，比率的变化是百分点），空格写「—」不写 null：面板照原样显示，
+    读者看到的和正文引用那一格时一样。列类型照结果表的 column_types（文本列照原样，不按值猜）；渲染不出来（不是 0 却显示成 0）
+    的照原样写。"""
+    if raw is None:
+        return MISSING
+    formats = table.get("formats") if isinstance(table.get("formats"), dict) else {}
+    types = table.get("column_types") if isinstance(table.get("column_types"), dict) else {}
+    conv = formats.get(column) if isinstance(formats.get(column), str) and formats.get(column) else None
+    kind = types.get(column) if isinstance(types.get(column), str) else None
+    try:
+        return render_cell(raw, conv, kind=kind)
+    except RenderError:
+        return str(raw)
+
+
+async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str, Any], doc: dict[str, Any],
+                           sealed: _Sealed, masks: _Masks, *, queries: bool = True
+                           ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """输入：每份一步（analysis_input），再给每份输入快照一个查询步骤（_query_steps，高亮用到的列；整份用到的给前
+    MAX_WINDOW_ROWS 行；queries 为假时不给）。headline 的那一格另核对和结论里的数闭不闭合（_HEADLINE_TOTALS：可加拆解是
+    各段之和，比率拆解是整体比率；closure.mode 写明是哪一种，照实写判定是不是 unclosed，不在这里重算容差）；下钻的上一层
+    落到报告目录的哪个 A。"""
+    values = result.get("values") if isinstance(result.get("values"), dict) else {}
+    verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else {}
+    unclosed = verdict.get("code") == "unclosed"
+    mode = str(result.get("mode") or "")
+    totals = _HEADLINE_TOTALS.get(mode, {}) if result.get("op") == "decompose" else {}
+    roles = {**_INPUT_ROLES, **(_RATIO_ROLES if mode == "ratio" else {})}
+    steps: list[dict[str, Any]] = []
+    cells: dict[str, list[tuple[Any, Any]]] = {}
+    for item in result.get("inputs") or []:
+        if not isinstance(item, dict):
+            continue
+        artifact = str(item.get("artifact") or "")
+        role = str(item.get("role") or "")
+        step: dict[str, Any] = {
+            "step": "analysis_input", "of": alias, "ref": item.get("ref"), "role": role,
+            "role_label": roles.get(role, role or "输入"), "artifact": artifact or None,
+            **{k: item[k] for k in ("columns", "rows", "row", "column", "value") if k in item},
+        }
+        # 那一格的值由服务端渲染（render_cell：千分位、NULL 写「—」，和闭合核对里的字同一个写法），页面照原样显示
+        if "value" in item:
+            with contextlib.suppress(RenderError):
+                step["value_rendered"] = render_cell(item.get("value"))
+        if role == "parent":
+            step["alias"] = _catalog_alias_of(catalog, artifact)
+            parent, ok = _analysis_of(artifact)
+            step.update(sealed=sealed.trusted and artifact in sealed.analyses, hash_ok=ok,
+                        **({"phrase": parent.get("phrase")} if parent else {}))
+            steps.append(step)
+            continue
+        query = sealed.queries.get(artifact)
+        step.update(query=_catalog_alias_of(catalog, artifact), node_id=(query or {}).get("node_id"),
+                    sealed=sealed.trusted and query is not None)
+        if role in totals and totals[role] in values:
+            with contextlib.suppress(RenderError):
+                # 整体比率那一格和对照的那一格按结论记的格式写（比率拆解里都是比率，一起写成百分数），和具名的数、正文一致
+                named = result.get("value_formats") if isinstance(result.get("value_formats"), dict) else {}
+                key = totals[role]
+                conv = named.get(key) if isinstance(named.get(key), str) and named.get(key) else None
+                step["closure"] = {"mode": mode, "total_key": key, "total": render_cell(values[key], conv),
+                                   "headline": render_cell(item.get("value"), conv), "closed": not unclosed}
+        steps.append(step)
+        if artifact and query is not None:
+            wanted = cells.setdefault(artifact, [])
+            if isinstance(item.get("row"), int) and item.get("column"):
+                wanted.append((item["row"], item["column"]))
+            for column in item.get("columns") or []:
+                picked = item.get("rows")
+                rows = list(range(MAX_WINDOW_ROWS)) if picked == "all" else \
+                    [r for r in picked if isinstance(r, int)][:MAX_WINDOW_ROWS] if isinstance(picked, list) else []
+                wanted.extend((r, column) for r in rows)
+    found: list[dict[str, Any]] = []
+    for artifact, picked in cells.items() if queries else ():
+        snap, _ = masks.fetch(artifact)
+        total = len(snap["rows"]) if isinstance(snap, dict) and isinstance(snap.get("rows"), list) else 0
+        picked = list(dict.fromkeys((r, c) for r, c in picked if not isinstance(r, int) or r < total))
+        for sub in await _query_steps(artifact, picked, doc, sealed, masks):
+            found.append({**sub, "input_of": alias})
+    return steps, found
+
+
+async def _analysis_recheck(result: dict[str, Any], sealed: _Sealed, artifact: str | None = None) -> dict[str, Any]:
+    """复算（evidence.analysis_recheck）：输入快照交工件原内容，下钻的上一层交那份结论，都按 sha256 取回、复验哈希，在线程里
+    复算、比较。只认封存范围内的——输入快照要是这次运行交回过的查询（sealed.queries），上一层要是台账记过的分析结论；
+    不在范围内、哈希对不上的一律当取不回（复算照实说取不回哪一份）。
+
+    artifact 是这份结论的工件 id（内容寻址）：一次请求里同一份结论只复算一次，结果记在 sealed.rechecks。"""
+    if artifact and artifact in sealed.rechecks:
+        return dict(sealed.rechecks[artifact])
+    again = await _recheck_now(result, sealed)
+    if artifact:
+        sealed.rechecks[artifact] = again
+    return dict(again)
+
+
+async def _recheck_now(result: dict[str, Any], sealed: _Sealed) -> dict[str, Any]:
+    snapshots = {str(i["artifact"]) for i in result.get("inputs") or []
+                 if isinstance(i, dict) and i.get("artifact") and i.get("role") != "parent"}
+    parents = {str(i["artifact"]) for i in result.get("inputs") or []
+               if isinstance(i, dict) and i.get("artifact") and i.get("role") == "parent"}
+
+    def load(artifact: str) -> Any:
+        if artifact not in snapshots or artifact not in sealed.queries:
+            return None
+        content, ok = _fetch(artifact)
+        return content if ok is True else None
+
+    def load_result(artifact: str) -> Any:
+        return _analysis_of(artifact)[0] if artifact in parents and artifact in sealed.analyses else None
+
+    return await asyncio.to_thread(analysis_recheck, result, load, load_result=load_result)
 
 
 def _missing_input(cite: dict[str, Any], entry: dict[str, Any]) -> bool:
@@ -1007,6 +1399,12 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
     # 期 4：这个指标做没做过双盲复算、结果如何。没有双盲复算复核过这份指标集时没有这个键，老运行一字不差
     if checked := _dual_check_of(sealed, str(entry.get("node_id") or ""), artifact, metric_id, metric):
         step["dual_check"] = checked
+    # 跨两份同形查询算的环比、同比：口径卡执行时自动做的可比性检查（analysis.contract.MetricComparability），点得开那份
+    # 可比性结论（artifact）。没做过检查的指标没有这个键
+    if isinstance((metric or {}).get("comparability"), dict):
+        step["comparability"] = await _comparability_view(
+            metric["comparability"], sealed, masks, chained=step["sealed"], node_id=str(entry.get("node_id") or ""),
+            doc=doc)
     card_node = str(entry.get("node_id") or "")
     if metric is not None and metric.get("inputs"):
         # 输入追没追到原始数据（engine/lineage.py）：和「有出处」（确定性复算一致）是两件事，面板分开说。追不到的照实说
@@ -1045,6 +1443,36 @@ async def _metric_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[s
         step["value"] = word or MASKED
     queries = [s for a, cells in wanted.items() for s in await _query_steps(a, cells, doc, sealed, masks)]
     return [step, *inputs, *upstream, *queries]
+
+
+async def _comparability_view(comparability: dict[str, Any], sealed: _Sealed, masks: _Masks, *, chained: bool,
+                              node_id: str, doc: dict[str, Any]) -> dict[str, Any]:
+    """指标步骤里的可比性：判定（comparable / conditional / incomparable）、判定语、原因（一句一个），连同那份可比性结论的
+    工件：取回、复验哈希，带上它的判定标准、方法和现查结果，再给一条点得开的出处链（steps：判定 → 方法 → 计算 → 输入 →
+    复算 → 封存，同分析结论的引用，_analysis_chain；两份输入快照的查询步骤指标链里已经有了，不再给）。
+
+    这份结论不进台账，只从口径卡的指标集里引用：sealed 认的是哈希复验通过，而且记着它的指标集封存了（chained：指标步骤
+    本身封存了；内容寻址，卡上记着它的 sha256——同推演认 value_artifact），或者它恰好也在封存范围内的台账里。"""
+    artifact = str(comparability.get("artifact") or "")
+    result, hash_ok = _analysis_of(artifact)
+    scoped = sealed.trusted and bool(artifact) and (chained or artifact in sealed.analyses)
+    view: dict[str, Any] = {
+        "verdict": comparability.get("verdict"), "phrase": comparability.get("phrase"),
+        "reasons": [str(r) for r in comparability.get("reasons") or [] if r], "artifact": artifact or None,
+        "hash_ok": hash_ok, "sealed": scoped and hash_ok is True,
+    }
+    if result is not None:
+        view.update(method=result.get("method"), criterion=result.get("criterion"),
+                    caveats=[{k: c.get(k) for k in ("code", "text")} for c in result.get("caveats") or []
+                             if isinstance(c, dict)],
+                    probes=[p for p in result.get("probes") or [] if isinstance(p, dict)])
+    if artifact:
+        entry = {"kind": LEDGER_KIND, "artifact": artifact, "node_id": node_id, "op": "comparable", "mode": None,
+                 "eid": make_eid(LEDGER_KIND, artifact, {})}
+        cite = {"kind": LEDGER_KIND, "alias": None, "locator": {}, "status": "resolved"}
+        view["steps"] = await _analysis_chain({"text": str(comparability.get("phrase") or "")}, cite, entry, doc,
+                                              sealed, masks, chained=scoped, queries=False)
+    return view
 
 
 async def _upstream_steps(metric: dict[str, Any], sealed: _Sealed, masks: "_Masks", catalog: dict[str, Any],
@@ -2905,16 +3333,53 @@ async def evidence_provenance(run_id: str, segment_id: str, report: str | None =
 
 
 def _export_cite_key(seg: dict[str, Any]) -> tuple | None:
-    """数字 / 取值片段的引用键：同一处引用（同一个指标、同一格、同样的换算）共用一条出处链。
-    别的片段（表名、引文）的链跟着片段走，不归并。"""
-    if seg.get("kind") not in ("number", "value"):
+    """数字 / 取值 / 判定语片段的引用键：同一处引用（同一个指标、同一格、同一条分析结论的同一项、同样的换算）共用一条
+    出处链。别的片段（表名、引文）的链跟着片段走，不归并。具名标量的键另接在后面：没有它的引用键和以前一模一样。"""
+    if seg.get("kind") not in ("number", "value", LEDGER_KIND):
         return None
     cite = seg.get("cite")
     if not isinstance(cite, dict):
         return None
     loc = cite.get("locator") if isinstance(cite.get("locator"), dict) else {}
-    return (cite.get("kind"), cite.get("alias"), cite.get("status"), cite.get("conv"),
-            loc.get("metric"), loc.get("row"), loc.get("column"), loc.get("field"), seg.get("issue"))
+    key = (cite.get("kind"), cite.get("alias"), cite.get("status"), cite.get("conv"),
+           loc.get("metric"), loc.get("row"), loc.get("column"), loc.get("field"), seg.get("issue"))
+    return (*key, loc["key"]) if loc.get("key") else key
+
+
+#: 报告文档里系统写的「分析范围」（analysis.contract.ScopeBlock）：导出页、可验证报告按它渲染，编号点得开。各组的键
+SCOPE_GROUPS = ("phenomena", "decomposed", "excluded", "refused")
+#: 分析范围里一个编号在导出页数据块里的片段键：refs、notes 按它找出处链（不和片段 id s0、s1… 撞）
+SCOPE_REF = "scope:{alias}"
+
+
+def scope_aliases(doc: dict[str, Any]) -> list[str]:
+    """报告文档的「分析范围」里点名的分析结论编号，按出现的先后、去重。没有这一段的文档是空列表。"""
+    scope = doc.get("analysis_scope") if isinstance(doc.get("analysis_scope"), dict) else None
+    if scope is None:
+        return []
+    out = [str(item["alias"]) for group in SCOPE_GROUPS for item in scope.get(group) or []
+           if isinstance(item, dict) and isinstance(item.get("alias"), str) and item["alias"]]
+    return list(dict.fromkeys(out))
+
+
+def _scope_cite_key(alias: str) -> tuple:
+    """分析范围里一个编号的引用键：和正文里引用判定语（[[a:A1]]）的片段同一个键（_export_cite_key），共用一条链。"""
+    return (LEDGER_KIND, alias, "resolved", None, None, None, None, None, None)
+
+
+async def _scope_chain(alias: str, doc: dict[str, Any], sealed: _Sealed, report_node: str) -> list[dict[str, Any]] | None:
+    """分析范围里一个编号的出处链（和点开正文里的判定语同一条 _chain，按那条结论的判定语认）。目录里没有的编号为 None
+    （文档里写着、目录里却没有，只能是文档有问题，范围那一项点不开）。"""
+    catalog = doc.get("catalog") if isinstance(doc.get("catalog"), dict) else {}
+    entry = catalog.get(alias)
+    if not isinstance(entry, dict) or entry.get("kind") != LEDGER_KIND:
+        return None
+    result, _ = _analysis_of(str(entry.get("artifact") or ""))
+    seg = {"id": SCOPE_REF.format(alias=alias), "kind": LEDGER_KIND, "state": "deterministic",
+           "text": render_cell(result.get("phrase"), kind="text") if result and result.get("phrase") else alias,
+           "cite": {"alias": alias, "kind": LEDGER_KIND, "status": "resolved", "locator": {},
+                    "eid": entry.get("eid")}}
+    return await _chain(seg, doc, sealed, report_node)
 
 
 async def _export_withheld(sealed: _Sealed, doc: dict[str, Any]) -> frozenset[str]:
@@ -3022,6 +3487,17 @@ async def export_report_html(run_id: str, report: str | None = None) -> Response
             refs[sid] = str(ck)
             if key is not None:
                 memo[key] = str(ck)
+    # 系统写的「分析范围」：每个编号点得开，链和点开正文里的判定语是同一条（引用键相同的共用：正文已经引了判定语的，
+    # 不再建一遍）
+    for alias in scope_aliases(doc):
+        ck = _scope_cite_key(alias)
+        if ck not in memo:
+            chain = await _scope_chain(alias, doc, sealed, chosen.node_id)
+            if chain is None:
+                continue
+            memo[ck] = str(ck)
+            chains[str(ck)] = chain
+        refs[SCOPE_REF.format(alias=alias)] = memo[ck]
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if run is None:      # 两次读之间被删掉了
@@ -3644,18 +4120,22 @@ def _scope_catalog(sealed: _Sealed, report_node: str) -> dict[str, Any]:
 
     doc.catalog 只留了正文用到的实体，给「是不是想写…」找候选不够；运行状态（checkpoint）不在封存
     范围里，也不能用。图读不出来、找不到报告节点时退回全部封存台账。
+
+    台账里的分析结论不进：候选只看表和字段，用不到结论的内容，进了目录就要把每份结论读盘、复验一遍哈希（build_catalog
+    给 A 条目装整份结论）。查询、表和字段的编号不受影响（分析结论另编 A）。
     """
     from app.engine.nodes.report import report_catalog
     from app.engine.schema import GraphSpec
 
+    entries = [e for e in sealed.entries if e.get("kind") != LEDGER_KIND]
     try:
         spec = GraphSpec.model_validate(sealed.graph)
         node = spec.node_map().get(report_node)
     except Exception:  # noqa: BLE001 - 老运行的图可能已经不合现在的格式，退回不分范围
         node = None
     if node is None:
-        return build_catalog(nodes={}, ledger=sealed.entries)
-    return report_catalog({"evidence": sealed.entries, "nodes": {}, "input": {}}, spec, node)  # type: ignore[arg-type]
+        return build_catalog(nodes={}, ledger=entries)
+    return report_catalog({"evidence": entries, "nodes": {}, "input": {}}, spec, node)  # type: ignore[arg-type]
 
 
 def _suspicious_step(seg: dict[str, Any], cite: dict[str, Any], sealed: _Sealed, report_node: str) -> dict[str, Any]:
@@ -3739,6 +4219,14 @@ def _note(seg: dict[str, Any], unit: dict[str, Any]) -> str:
                 "仅核对它存在且本次用到，不核对其业务含义")
     if seg.get("state") == "deterministic" and seg.get("kind") == "quote":
         return "这段原话在知识库检索命中的片段中逐字出现（空白归一化后比对），已由系统核对"
+    if seg.get("state") == "deterministic" and cite.get("kind") == LEDGER_KIND:
+        if (cite.get("locator") or {}).get("key"):
+            return "这个数取自分析结论的具名的数，由系统按固定规则显示，未经模型转写"
+        return ("判定语由系统按平台的方法算出判定、按模板写成，未经模型转写；判定标准、计算过程、输入和复算见出处链。"
+                "判定只说明变化来自哪里，不说明原因")
+    if seg.get("state") == "deterministic" and cite.get("kind") == "cell" \
+            and str(cite.get("alias") or "").startswith(CATALOG_PREFIX):
+        return "该值由系统从分析结论的结果表中取出、按固定规则显示，未经模型转写"
     if seg.get("state") == "deterministic" and cite.get("kind") == "cell":
         return "该值由系统从查询快照中取出、按固定规则显示，未经模型转写"
     if seg.get("state") == "deterministic":
@@ -3994,21 +4482,30 @@ async def _judge_loader(doc: dict[str, Any], catalog: dict[str, Any], units: lis
     read = loader or load
     masks = _Masks()
     shown: dict[str, Any] = {}
+    wanted: list[tuple[str, Any]] = []
     for alias in dict.fromkeys(a for c in candidates(doc, units) for a in c.aliases):
         entry = catalog.get(alias)
-        if not isinstance(entry, dict) or entry.get("kind") != "query" or not entry.get("artifact"):
+        if not isinstance(entry, dict) or not entry.get("artifact"):
             continue
-        artifact = str(entry["artifact"])
+        if entry.get("kind") == "query":
+            wanted.append((str(entry["artifact"]), entry.get("source")))
+        elif entry.get("kind") == LEDGER_KIND:
+            # 分析结论的摘录给它输入查询的 SQL：输入快照同样逐份遮（结论本身不经这里，摘录照它自己的办法取）
+            with contextlib.suppress(Exception):
+                result = read(str(entry["artifact"]))
+                wanted.extend((str(i["artifact"]), None) for i in (result or {}).get("inputs") or []
+                              if isinstance(i, dict) and i.get("artifact") and i.get("role") != "parent")
+    for artifact, source in wanted:
         if artifact in shown:
             continue
         try:
             snap = read(artifact)
         except Exception:  # noqa: BLE001 - 读不出来、不在封存范围里：摘录本来就不给它，交给 prepare 照它的办法处理
             continue
-        if not isinstance(snap, dict):
+        if not isinstance(snap, dict) or not isinstance(snap.get("rows"), list):
             continue
         recorded = _mask_names(snap.get("mask_columns"))
-        sure = set((await masks.sets(artifact, entry.get("source") or snap.get("source"), snap)).sure)
+        sure = set((await masks.sets(artifact, source or snap.get("source"), snap)).sure)
         shown[artifact] = {**snap, "mask_columns": sorted(recorded | sure)} if sure - recorded else snap
 
     def reader(artifact: str) -> Any:
@@ -4262,8 +4759,11 @@ GROUPS = (("cited", "有出处"), ("none", "无证据"), ("suspicious", "可疑�
 _INTEGRITY = frozenset({"bad_schema", "segment_mismatch", "structural_text", "render_mismatch", "eid_mismatch",
                         "state_mismatch"})
 #: 落在已经列出的片段上也单列一行的违规：文档对不上的，和引用了遮罩列的格子的（masked_cell：引用的那一格落在的正是一个
-#: 「有出处」的单元格片段，不单列的话审计表、导出的 CSV 里只有一行普通的「有出处」）
-_LISTED_ALWAYS = _INTEGRITY | {"masked_cell"}
+#: 「有出处」的单元格片段，不单列的话审计表、导出的 CSV 里只有一行普通的「有出处」）；分析说法核对的三种（判断词没挂分析
+#: 结论、判断和结论对不上、因果说法没有依据，engine/analysis_claims.py）：句子里的判定语、数照样是「有出处」的片段，说法本身
+#: 有问题要单独看得到
+ANALYSIS_CLAIM_CODES = analysis_claims.CODES
+_LISTED_ALWAYS = _INTEGRITY | {"masked_cell"} | ANALYSIS_CLAIM_CODES
 UNCITED_CLAIM = "这句结论没有附依据（既没有引用，也没有注明依据）"
 UNCITED_CLAIM_COUNTED = "这句结论没有附依据。本报告要求结论句附依据，出具时计入缺口"
 UNCITED_CLAIM_WITHHELD = "这句结论没有附依据，按出具契约不予出具"
@@ -4297,15 +4797,17 @@ SEAL_NONE = "未封存：运行尚未结束，或正停在人工审批"
 _CSV_LABELS: dict[str, dict[Any, str]] = {
     "group": dict(GROUPS),
     "kind": {"number": "数字", "value": "值", "entity": "表名、字段名", "quote": "引文", "claim": "结论句",
-             "violation": "违规"},
+             "violation": "违规", LEDGER_KIND: "分析判定"},
     "state": {"deterministic": "有出处", "none": "无证据", "candidate": "候选"},
     "issue": {"uncited_number": "没有出处的数字", "unresolved_ref": "引用无法解析", "unknown_entity": "疑似不存在的名称",
               "unverified_entity": "无法核实", "uncited_claim": "结论句未附依据", "no_candidate": "未找到候选",
               "contradicted_claim": "证据相矛盾", "insufficient_claim": "证据不足", "unsupported_claim": "证据不支持",
-              "masked_cell": "引用了遮罩列",
+              "masked_cell": "引用了遮罩列", "inline_see": "依据写在句子中间", "absence_claim": "缺失断言",
+              "analysis_claim_uncited": "判断词未挂分析结论", "analysis_claim_mismatch": "判断与分析结论不符",
+              "causal_unsupported": "因果说法没有依据",
               **{code: "文档不一致" for code in _INTEGRITY}},
     "evidence_kind": {"metric": "口径卡指标", "cell": "查询单元格", "input": "运行输入", "table": "表", "column": "字段",
-                      "quote": "知识库原话", "query": "查询结果"},
+                      "quote": "知识库原话", "query": "查询结果", LEDGER_KIND: "分析结论"},
     "sealed": {True: "是", False: "否", None: "—"},
 }
 #: 电子表格会把以这些字符开头的格子当公式算：报告、答案里的字来自模型，照原样写进去就能被人利用
@@ -4507,10 +5009,20 @@ def _segment_row(group: str, report: _Report, field_name: str | None, seg: dict[
     if group != "cited":
         return row
     kind = cite.get("kind")
-    if kind == "cell":
+    if kind == "cell" and entry.get("kind") == LEDGER_KIND:
+        # 分析结论结果表里的一格：证据种类记分析结论，封存按台账认（结论不是查询快照）
+        row.update(evidence=_cell_name(alias, cite.get("locator") or {}), evidence_kind=LEDGER_KIND,
+                   artifact=entry.get("artifact"), node_id=entry.get("node_id"),
+                   sealed=_entry_sealed(sealed, entry, inputs))
+    elif kind == "cell":
         artifact = str(entry.get("artifact") or "")
         row.update(evidence=_cell_name(alias, cite.get("locator") or {}), artifact=artifact or None,
                    node_id=entry.get("node_id"), sealed=sealed.trusted and artifact in sealed.queries)
+    elif kind == LEDGER_KIND:
+        # 判定语写结论的叫法（「变化拆解（可加） · 判定语」），具名标量写到键（A3.top_share）
+        key = (cite.get("locator") or {}).get("key")
+        row.update(evidence=f"{alias}.{key}" if key else entry.get("label") or alias, artifact=entry.get("artifact"),
+                   node_id=entry.get("node_id"), sealed=_entry_sealed(sealed, entry, inputs) if entry else False)
     elif kind == "quote":
         source = cite.get("source") or {}
         artifact = str(source.get("artifact") or entry.get("artifact") or "")

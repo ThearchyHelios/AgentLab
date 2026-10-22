@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterator
 from pydantic import BaseModel
 
 from app.engine.governance import (
+    _POLICY_PROBLEMS,
     JUDGE_UNLIMITED,
     REPORT_POLICY,
     REPORT_POLICY_ALSO,
@@ -32,6 +33,7 @@ from app.engine.governance import (
 )
 from app.engine.labels import CHOICE_LABEL, contract_label, field_label, option_label, q
 from app.engine.schema import (
+    ANALYSIS_CLAIMS_VALUES,
     CLAIMS_JUDGE,
     JUDGE_ON_UNSUPPORTED,
     REPORT_CLAIMS,
@@ -39,7 +41,6 @@ from app.engine.schema import (
     GraphSpec,
     NodeType,
     _ancestors,
-    claims_problem,
 )
 
 #: 被选中的修复按这个顺序应用：先补契约骨架，再补契约里的各项，最后是节点上的开关。
@@ -50,7 +51,7 @@ _ORDER = (
     "contract.report_from_missing", "contract.report_from_invalid", "governed.report_from_required",
     "governed.exit_text_source", "report.metrics_from_invalid",
     "contract.required_missing", "contract.cells_undeclared", "contract.strict_off", "contract.claims_ignored", "report.claims_invalid",
-    "governed.report_policy", "governed.judge_budget",
+    "report.analysis_claims_invalid", "governed.report_policy", "governed.judge_budget",
     "governed.caliber_agent_cite_fields", "governed.caliber_compute_input", "governed.agent_approval_never",
     "governed.default_approval_never", "governed.subgraph_unpinned", "governed.supervisor", "contract.not_object",
     "governed.text_bypass", "governed.caliber_agent_schema", "governed.caliber_model_input",
@@ -239,8 +240,9 @@ def _plan_exit_fields(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) 
 
 
 def _plan_report_policy(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
-    """G3：报告撰写节点写明最严的三项。答案唯一，只往严里改；写了不认识的 claims 由 claims_invalid 管。
-    已经写了更严的写法（claims: judge）的不动——改回 require_citation 就是替人放宽了。"""
+    """G3：报告撰写节点写明最严的几项。答案唯一，只往严里改；写了不认识的 claims、analysis_claims 不在这里改，由校验的
+    claims_invalid、analysis_claims_invalid 管（门禁 G3 同样跳过它们、交给校验报）。已经写了更严的写法（claims: judge）
+    的不动——改回 require_citation 就是替人放宽了。"""
     if node is None:
         return None
     writes: dict[str, Any] = {}
@@ -250,7 +252,7 @@ def _plan_report_policy(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None
         effective = ctx.spec.defaults.get(key) if value in (None, "") else value
         if effective in (want, *REPORT_POLICY_ALSO.get(key, ())):
             continue
-        if not (key == "claims" and claims_problem(effective)):
+        if not ((invalid := _POLICY_PROBLEMS.get(key)) and invalid(effective)):
             writes[key], before[key] = want, copy.deepcopy(value)
     if not writes:
         return None
@@ -275,6 +277,21 @@ def _plan_claims(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> di
     hints = {"off": "结论句未附依据也不影响出具档位", "require_citation": "未附依据的结论句计入缺口"}
     options = [{"value": v, "label": CHOICE_LABEL["claims"][v], "hint": hints[v]} for v in REPORT_CLAIMS]
     return _choice(f"选择「{node.title}」的「{field_label('claims')}」如何处理", "claims", options)
+
+
+def _plan_analysis_claims(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
+    """analysis_claims 写了不认识的值，照 claims 的做法（_plan_claims）：受管级别改成 strict，门禁 G3 只认它，答案唯一；
+    别的级别三档都行，要人选，不给建议。"""
+    if node is None:
+        return None
+    before = node.config.get("analysis_claims")
+    if ctx.level == "governed":
+        return _auto(f"将「{node.title}」的「{field_label('analysis_claims')}」改为「{option_label('analysis_claims', 'strict')}」："
+                     "受管级别出具要求判断词没挂对分析结论的句子重写后仍有的计入缺口", "analysis_claims", before, "strict")
+    hints = {"off": "不核对报告里的判断词", "check": "判断词没挂对分析结论的句子交回重写一次，仍有的在报告里标出，不影响出具档位",
+             "strict": "重写后仍有的计入缺口，出具按档位降档"}
+    options = [{"value": v, "label": option_label("analysis_claims", v), "hint": hints[v]} for v in ANALYSIS_CLAIMS_VALUES]
+    return _choice(f"选择「{node.title}」的「{field_label('analysis_claims')}」如何处理", "analysis_claims", options)
 
 
 def _plan_judge_budget(ctx: _Ctx, issue: dict[str, Any], node: GraphNode | None) -> dict[str, Any] | None:
@@ -718,6 +735,7 @@ _PLANNERS: dict[str, Callable[[_Ctx, dict[str, Any], GraphNode | None], dict[str
     "governed.text_bypass": _plan_text_bypass,
     "governed.report_policy": _plan_report_policy,
     "report.claims_invalid": _plan_claims,
+    "report.analysis_claims_invalid": _plan_analysis_claims,
     "governed.judge_budget": _plan_judge_budget,
     "contract.cells_undeclared": _plan_cells_undeclared,
     "governed.caliber_compute_input": _plan_compute_input,
@@ -1338,9 +1356,10 @@ def forbidden_changes(before: dict[str, Any], after: dict[str, Any],
     return reasons
 
 
-#: 报告撰写节点三项设置从严到宽的次序：没写时运行时的缺省值（on_violation 没写时探索运行按 flag）
+#: 报告撰写节点几项设置从严到宽的次序：没写时运行时的缺省值（on_violation 没写时探索运行按 flag，analysis_claims 没写是
+#: check）
 _REPORT_STRICT = {"numbers": ("strict", "strict"), "on_violation": ("fail", "flag"),
-                  "claims": ("require_citation", "off")}
+                  "claims": ("require_citation", "off"), "analysis_claims": ("strict", "check")}
 #: claims 从宽到严：off < require_citation < judge（在挂引用之外再请模型逐句裁判，不支持的按 on_unsupported
 #: 判档）。不在这里的写法不比较（validate 报 report.claims_invalid）
 _CLAIMS_ORDER = ("off", "require_citation", CLAIMS_JUDGE)

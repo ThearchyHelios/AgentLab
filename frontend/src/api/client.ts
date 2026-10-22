@@ -857,6 +857,14 @@ export const api = {
         `/runs/${encodeURIComponent(runId)}/evidence/segments/${encodeURIComponent(segmentId)}${qs({ report: opts?.report })}`,
         opts),
     /**
+     * 报告末尾「分析范围」里的一个编号（A1）：那份分析结论的出处链，和点开正文里它的判定语同一条。正文没引用的结论也点得开；
+     * 证据目录里没有这份结论 404。report 同片段接口
+     */
+    analysis: (runId: string, alias: string, opts?: RequestOptions & { report?: string }) =>
+      get<{ report?: { node_id?: string; doc_artifact?: string }; alias?: string; rendered?: string | null
+            chain?: EvidenceSegmentDetail['chain']; seal?: EvidenceSegmentDetail['seal']; redacted?: EvidenceSegmentDetail['redacted'] }>(
+        `/runs/${encodeURIComponent(runId)}/evidence/analyses/${encodeURIComponent(alias)}${qs({ report: opts?.report })}`, opts),
+    /**
      * 审计表：每个有状态的片段按状态分组（有出处 / 无证据 / 可疑实体 / 旧运行猜测），附上封存核对的结果。
      * groups 只要这几组（none、suspicious…）
      */

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analysis import contract as analysis_contract
 from app.api import health
 from app.api.coded import PUBLIC_URL_ENV_LOCKED, CodedHTTPException
 from app.core import public_url
@@ -873,6 +874,60 @@ async def eval_settings(session: AsyncSession) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# 分析：判定用的阈值和次数上限（docs/design/analysis-round/01-算子与判定.md §10）。键、缺省、取值范围、叫法、校验都在
+# app/analysis/contract.py 一处：设置页、发起时的快照（run.options["analysis"]，engine/launch.py）、分析卡上的覆盖按同一张表。
+# agent 改不了这些：分析工具的参数里没有阈值。搭建者只读，管理员写（整个设置接口的规矩）
+# --------------------------------------------------------------------------
+
+#: 设置里 analysis 这一组（contract.SETTINGS_KEY）
+ANALYSIS_GROUP = analysis_contract.SETTINGS_KEY
+#: 每一项的叫法（设置页、报错都用它，句子里不裸写键名）
+ANALYSIS_SETTING_LABEL = analysis_contract.LABELS
+
+
+def analysis_problem(value: Any) -> str | None:
+    """设置页写进来的 analysis 这一组有什么问题（不认识的键、类型、范围、两两之间的大小），没问题返回 None。写进来的这一组
+    整个替换存着的（同别的组），缺的项按缺省，所以两两之间的大小也按缺省补齐了比。"""
+    if not isinstance(value, dict):
+        return f"「分析」设置格式有误，需要是一个对象，当前为「{value}」"
+    for key in value:
+        if key not in analysis_contract.DEFAULTS:
+            return (f"「分析」设置中不支持「{key}」，可设置的项："
+                    + "、".join(f"「{ANALYSIS_SETTING_LABEL[k]}」" for k in analysis_contract.DEFAULTS))
+    return analysis_contract.settings_problem(value)
+
+
+def _analysis_item_ok(key: str, value: Any) -> bool:
+    """一项本身对不对（类型、范围），不看和别的项的大小：存着的一组逐项认，两两之间的另看。"""
+    kind, low, high = analysis_contract.RANGES[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (kind is int and not isinstance(value, int)):
+        return False
+    return low <= value <= high
+
+
+def analysis_values(stored: Any) -> dict[str, Any]:
+    """库里存的（或刚写进来的）analysis 一组 → 补齐缺省；存坏了的项按缺省。两两之间的大小对不上的（「明显超出」不大于
+    「超出常规波动」、最多用几期历史小于至少几期、「集中」的合计占比小于「主要来源」的占比）那一对都按缺省：只换掉一项，可能
+    换出另一种对不上。"""
+    stored = stored if isinstance(stored, dict) else {}
+    out = dict(analysis_contract.DEFAULTS)
+    for key in analysis_contract.DEFAULTS:
+        if key in stored and _analysis_item_ok(key, stored[key]):
+            out[key] = float(stored[key]) if analysis_contract.RANGES[key][0] is float else stored[key]
+    for pair in (("k_warn", "k_alert"), ("min_history", "max_history"), ("main_share", "concentration")):
+        if analysis_contract.settings_problem({k: out[k] for k in pair}) is not None:
+            out.update({k: analysis_contract.DEFAULTS[k] for k in pair})
+    return out
+
+
+async def analysis_settings(session: AsyncSession) -> dict[str, Any]:
+    """设置里的 analysis 一组，没存过的补缺省。发起运行时快照这一份（engine/launch.py），没有快照的运行由分析工具、分析卡、
+    口径卡的可比性检查现读（app/tools/analysis.py）。"""
+    row = await session.get(Setting, ANALYSIS_GROUP)
+    return analysis_values(row.value if row else None)
+
+
+# --------------------------------------------------------------------------
 # 邮件服务（notify/mail.py，04 细案 B2）：只有管理员能改（整个设置接口的改动都要管理员），口令加密存、读的时候只说配没配
 # --------------------------------------------------------------------------
 
@@ -954,6 +1009,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     LEDGER_GROUP: ledger_values(None),
     # 评测：预算的全站缺省（题集上可以改）、保留几次明细、结论裁判的缺省开关
     EVAL_GROUP: eval_values(None),
+    # 分析：判定用的阈值、Agent 每次执行最多分析几次、最多下钻几层（app/analysis/contract.py）
+    ANALYSIS_GROUP: analysis_values(None),
     # 邮件服务（SMTP）：通知渠道的邮件格式用它发信。缺省关
     MAIL_GROUP: _mail_public(None),
     # 运行并发（app/cluster/slots.py）：全站同时运行的上限，交互、应用、定时、系统四类各自的上限和优先级。多进程时几个进程合起来算
@@ -1024,6 +1081,7 @@ async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str
     merged[APPS_GROUP] = apps_values(stored.get(APPS_GROUP))
     merged[LEDGER_GROUP] = ledger_values(stored.get(LEDGER_GROUP))
     merged[EVAL_GROUP] = eval_values(stored.get(EVAL_GROUP))
+    merged[ANALYSIS_GROUP] = analysis_values(stored.get(ANALYSIS_GROUP))
     merged[CONCURRENCY_GROUP] = concurrency_values(stored.get(CONCURRENCY_GROUP))
     # 口令不回（password 恒为 null），只说配没配（password_set）
     merged[MAIL_GROUP] = _mail_public(stored.get(MAIL_GROUP))
@@ -1136,6 +1194,10 @@ async def put_settings(
         if problem := eval_problem(payload.values[EVAL_GROUP]):
             raise HTTPException(422, problem)
         payload.values[EVAL_GROUP] = eval_values(payload.values[EVAL_GROUP])
+    if ANALYSIS_GROUP in payload.values:
+        if problem := analysis_problem(payload.values[ANALYSIS_GROUP]):
+            raise HTTPException(422, problem)
+        payload.values[ANALYSIS_GROUP] = analysis_values(payload.values[ANALYSIS_GROUP])
     if CONCURRENCY_GROUP in payload.values:
         from app.cluster import slots
 

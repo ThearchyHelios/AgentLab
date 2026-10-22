@@ -8,6 +8,8 @@
 - answer.py：无头地走一遍问数据页那一轮（answer_ops → chat/turn 的决定 → 运行 → 复核 → 要的话重来一次）；
 - runner.py：后台评测（并发、预算、止损、停止、只重试没做完的、重启标中断）；
 - score.py、judging.py、rescore.py：评分（五种结论、维度配对、逐题 E1）、结论裁判和文字要点（模型判断，单列）、按新规则重评；
+- judgements.py：分析期望（贡献、判定）：在期望 SQL 的结果上用平台的分析方法算期望的判定，答案里的分析结论和正文的判断词按
+  同一套判定类、同一张说法表比（docs/design/analysis-round/00-总方案.md §3.8）；
 - stats.py、compare.py：总表与区间、和上一次比、A/B 配对表与精确 McNemar；
 - cleanup.py：按保留规则清理明细、回收工件；scheduled.py：题集的定时。
 

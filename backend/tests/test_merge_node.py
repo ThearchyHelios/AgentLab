@@ -267,7 +267,8 @@ def test_publish_checks_treat_the_merge_as_traceable_evidence():
     graph = store_graph()
     for n in graph["nodes"]:
         if n["id"] == "write":
-            n["data"]["config"].update(numbers="strict", on_violation="fail", claims="require_citation")
+            n["data"]["config"].update(numbers="strict", on_violation="fail", claims="require_citation",
+                                        analysis_claims="strict")
         if n["id"] == "out":
             n["data"]["config"]["contract"] = {"report_from": "write", "metrics_from": ["card"],
                                                "required": ["conversion"], "strict": True}

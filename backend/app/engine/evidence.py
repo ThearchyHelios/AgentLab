@@ -17,7 +17,15 @@
     [[i:<输入字段>]]                运行输入
     [[t:<表>]] / [[c:<表>.<列>]]    实体：表 / 字段，显示名字本身（反引号里写的已知名字也会自动链接）
     [[q:K<n>|<逐字引文>]]           引文：必须在那次检索命中的片段里逐字出现，显示引文本身
+    [[a:A<n>]]                     分析结论的判定语：系统按模板渲染好的一整句（判定由平台的算子算出，写作者只引用）
+    [[a:A<n>.<键>|万]]              分析结论的具名标量（values 里的一项），换算同 m:
+    [[v:A<n>.r<行>.<列>]]           分析结论结果表里的一格；[[table:A<n> …]] 整表，表头写结果表的列名
     [[see:<ref>,<ref>…]]           依据：挂在句末，不渲染
+
+分析结论（docs/design/analysis-round/）在台账里是 kind analysis 的条目，写作目录编号 A1…（和 Q、K 同一套按台账先后
+编号的规则，只收报告祖先里的）。目录条目带着从工件取回、复验过哈希的整份结论（result，app/analysis/contract.catalog_result
+读它）；存进报告文档的目录只留摘要，整份结论按工件取回。受管级别的正式出具里，agent 现场做的分析（条目带 call_id）和
+agent 查的格同一个规矩：出具契约没开「单元格引用」就和直接引用单元格一样解析不了；分析卡做的（带 item）总能引用。
 
 实体只在这次运行冻结了表结构（schema_snapshot）时才核对：目录里没有表和字段条目的，
 t / c 仍按一期判为解析不了（「这种引用在后续版本支持」），反引号里的名字也不查；报告节点
@@ -54,6 +62,7 @@ from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any, Literal, TypedDict
 
+from app.analysis.contract import CATALOG_PREFIX, LEDGER_KIND, MARKER_KIND, catalog_result, is_result, method_label
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
 from app.data.names import FILLERS, name_key
@@ -82,11 +91,15 @@ ENTITY_SYNTAXES = frozenset({1, 2})
 #:   「没有第 N 行」重新解析得了，会被当成文档被改过（render_mismatch）。另外标识列（编码、编号、分组键，见
 #:   cell_format.plain_columns）的数不分千位：编码 1203 不写成「1,203」。真有格子因此改了写法的文档记 cell_display: 3，
 #:   引用上记 plain: true（离线核对页解析不了 SQL，照它渲染）
+#: - 4：引用分析结论的结果表一格、具名的数时没写换算的，按结论给这一列 / 这个数记的格式渲染（占比、变化率按百分数，
+#:   比率的变化按百分点：0.62 显示成 62.0%，不再照原样写 0.618556701），实际用的换算记在引用上（conv，导出页和可验证报告
+#:   照它渲染）。3 版及以前组装的文档里的引用照当年原样显示，复核按记下的版本，不因此判对不上
 #: 新组装的文档里真有格子因为显示规则改了写法时才记 cell_display（参与内容哈希），记的是渲染得出这些格子的最低一版
-#: （只有日期时间被改写的记 2：标识列没有因此改写法的，3 版的整表截行不改格子的写法），没有的文档和以前一字不差。复核必须按
-#: 文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过（render_mismatch）
-CELL_DISPLAY = 3
-CELL_DISPLAYS = frozenset({1, 2, 3})
+#: （只有日期时间被改写的记 2：标识列没有因此改写法的，3 版的整表截行不改格子的写法，引用分析结论时本来就有换算的记 1）；没有的
+#: 文档和以前一字不差。复核必须按文档生成时的那一版：老文档存的是带 T 的字，拿新规则重新渲染对不上，会被当成文档被改过
+#: （render_mismatch）
+CELL_DISPLAY = 4
+CELL_DISPLAYS = frozenset({1, 2, 3, 4})
 _ISO_DATETIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)$")
 
 
@@ -98,13 +111,21 @@ _ISO_DATETIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2}(?:\.\d+)
 class EvidenceEntry(TypedDict, total=False):
     """台账条目：state["evidence"] 里的一行，同时写进 node.finished.evidence。"""
 
-    kind: Literal["query", "metric_set", "retrieval", "tool", "node_output", "schema"]
+    kind: Literal["query", "metric_set", "retrieval", "tool", "node_output", "schema", "analysis"]
     node_id: str
     exec: int                 # 这个节点第几次执行（循环里会有多次），从 1 数
     artifact: str             # 被引用的那件工件
     via: str                  # 外层包装的工件（query_snapshot 外面的 tool_snapshot）
-    call_id: str
+    call_id: str              # agent 工具记下的那次调用（查询、分析）
     tool: str
+    #: analysis 专有（app/analysis/contract.ledger_entry）：算子、模式、算成没算成（ok / refused）、判定码、输入快照的
+    #: sha256（去重、保序）；分析卡来的另记那一项的 id（item），agent 工具来的记 call_id
+    op: str
+    mode: str | None
+    status: str
+    verdict: str | None
+    inputs: list[str]
+    item: str
     source: str
     columns: list[str]
     rows: int
@@ -126,12 +147,12 @@ class Citation(TypedDict, total=False):
     alias: str                # 目录里的键：m:gmv、i:week、Q4、t:orders、K1
     locator: dict[str, Any]
     eid: str
-    kind: str                 # metric / input / query / cell / table / column / quote
+    kind: str                 # metric / input / query / cell / table / column / quote / analysis
     role: Literal["value", "entity", "quote", "support"]
     status: Literal["resolved", "unresolved", "mismatch"]
     reason: str               # unresolved 时为什么
     unknown: bool             # 实体：本次运行哪里都没有这个名字（可疑实体，不是写法错了）
-    conv: str                 # 换算：万 / 亿 / pct / int / .N
+    conv: str                 # 换算：万 / 亿 / pct / pp / int / .N（没写换算、按分析结论记的格式渲染的也照记，导出、可验证报告照它渲染）
     value: Any
     rendered: str
     source: dict[str, Any]    # 引文：原文所在的检索快照、文档、片段
@@ -139,7 +160,8 @@ class Citation(TypedDict, total=False):
 
 class Segment(TypedDict, total=False):
     id: str
-    kind: Literal["text", "number", "value", "entity", "quote", "structural"]
+    #: analysis：[[a:A3]] 渲染出的判定语（一整句，系统按模板写的）；[[a:A3.键]] 的具名标量照数字、取值算
+    kind: Literal["text", "number", "value", "entity", "quote", "structural", "analysis"]
     text: str
     span: list[int]           # [start, end)，在 doc.markdown 里的码点偏移
     ref: str                  # 带前缀的原始引用：m:gmv、i:week、t:orders
@@ -555,6 +577,11 @@ MISSING = "—"
 
 _CONV_SCALE = {"万": Decimal(10) ** 4, "亿": Decimal(10) ** 8}
 _CONV_PLACES = re.compile(r"^\.([0-6])$")
+#: 比率的变化按百分点写（0.012 →「+1.2 个百分点」，-0.003 →「-0.3 个百分点」）：分析结论的结果表、具名的数里的换算，
+#: 算子记成 pp（analysis.contract.CONV_POINTS）。正数带「+」（和 pct 一样），不是 0 的值写出来成了 0.0 的多给小数位
+#: （最多 4 位），不写假的 0
+_CONV_POINTS = "pp"
+_POINTS_SUFFIX = " 个百分点"
 #: 小数位最多写到多少。负数是取整到十位、百位……（round(x, -2) 的意思）
 MAX_PLACES = 100
 #: 整数部分最多多少位。浮点数到头也就 309 位，再大的整数按规则一位位写出来没有意义
@@ -630,7 +657,7 @@ def render_number(
     - decimals：固定小数位；不写就按值本来的样子（整数不带小数点）
     - 单位直接接在数字后面：45,678.5元、8.7%
     - conv 是报告里写的换算：万 / 亿（保留两位、去尾零，单位接在后面：4.57万元）、
-      pct（比率 ×100 加 %）、int（取整）、.N（N 位小数）
+      pct（比率 ×100 加 %）、pp（比率的变化 ×100 写成「+1.2 个百分点」）、int（取整）、.N（N 位小数）
 
     值是 None 显示「—」。文本值原样（压成一行），不能换算。
 
@@ -678,13 +705,30 @@ def _render_numeric(d: Decimal, *, unit: str, decimals: int | None, fmt: str, co
             raise RenderError("该指标本身是百分数（单位为 %），不能再换算为 pct")
         places = max(decimals - 2, 0) if decimals is not None else 1
         return _digits(_ctx(d).multiply(d, 100), places, group=group, zero=rounded) + "%"
+    if conv == _CONV_POINTS:
+        # 比率的变化按百分点写：一位小数、正数带「+」（0 不带）；不是 0 的值写出来成了 0.0 的多给小数位（最多 4 位），
+        # 不写假的 0。说法照 phrases.points / ratio_change 里已有的百分点写法，只是表格里的数没有「上升 / 下降」可依，
+        # 正负靠符号
+        if "%" in unit or "％" in unit:
+            raise RenderError("该指标本身是百分数（单位为 %），不能再换算为 pp")
+        points = _ctx(d).multiply(d, 100)
+        if points.is_zero():
+            return _digits(points, 1, group=group) + _POINTS_SUFFIX
+        zero = f"{shown} 按 |pp 显示为 0，精度不够：请去掉换算，或改用 |.N 多保留几位小数"
+        for places in range(1, 5):
+            exp = -(places)
+            if points.quantize(Decimal(1).scaleb(exp), context=_ctx(points, places)).is_zero():
+                continue
+            out = _digits(points, places, group=group, zero=zero)
+            return ("+" + out if not out.startswith("-") else out) + _POINTS_SUFFIX
+        raise RenderError(zero)
 
     if conv == "int":
         places: int | None = 0
     elif conv and (m := _CONV_PLACES.match(conv)):
         places = int(m.group(1))
     elif conv:
-        raise RenderError(f"无法识别的换算 |{conv}，只支持 万 / 亿 / pct / int / .N（N 为 0–6）")
+        raise RenderError(f"无法识别的换算 |{conv}，只支持 万 / 亿 / pct / pp / int / .N（N 为 0–6）")
     else:
         rounded = (f"{shown} 按口径卡的小数位（{decimals}）显示为 0，精度不够：请在口径卡中增加小数位"
                    if decimals is not None else
@@ -745,7 +789,7 @@ _MARKER_GUARD = rf"(?=[^\[\]\n]{{0,{MARKER_MAX - 4}}}\]\])"
 #: [[kind:body]]。body 里不许有方括号和换行——这样一个没闭合的 [[ 最多吞到行尾
 MARKER_RE = re.compile(
     r"\[\[" + _MARKER_GUARD + r"[ \t]*(?P<kind>[A-Za-z]+)[ \t]*:(?P<body>[^\[\]\n]*?)\]\]")
-SUPPORTED_KINDS = frozenset({"m", "i", "see", "v", "table", "t", "c", "q"})
+SUPPORTED_KINDS = frozenset({"m", "i", "see", "v", "table", "t", "c", "q", MARKER_KIND})
 #: 三期起没有「以后才支持」的标记了；留着这个名字给老代码 import
 LATER_KINDS: frozenset[str] = frozenset()
 #: 这次运行没冻结表结构（没查过库、升级前的运行）时，t / c 仍按一期判为解析不了，原因是这一句
@@ -759,6 +803,9 @@ PHASE_TWO_REASON = "这份报告生成于系统升级前，当时不解析这类
 CODE_REASON = "沙箱代码计算出的数字不能直接引用，需先登记到口径卡"
 #: 受管级别的正式出具，契约里没写 "cells": true 时复核按这个原因拒掉单元格引用
 CELLS_REASON = "受管级别出具需要在出具契约中开启「单元格引用」"
+#: 受管级别的正式出具、契约里没开「单元格引用」时，Agent 现场做的分析（台账条目带 call_id）和它查的格同一个规矩：判定语、
+#: 具名标量、结果表一律解析不了（依据 [[see:A1]] 照样可以写）。分析卡做的（带 item）是模板定好的，总能引用
+ANALYSIS_CELLS_REASON = "受管级别出具中，Agent 现场做的分析和它查到的单元格同一个规矩：需要在出具契约中开启「单元格引用」"
 #: 节点字段引用：给人看的原因，和交回写作者改写时的指令（_Reason 的 fix）
 NODE_FIELD_REASON = "不支持引用节点字段：数字需来自查询单元格或口径卡指标"
 NODE_FIELD_FIX = "节点字段引用在后续版本支持：数要从查询单元格 [[v:Q1.r0.列]] 或口径卡指标 [[m:…]] 来"
@@ -864,14 +911,17 @@ def build_catalog(
     inputs: dict[str, Any] | None = None,
     metrics_from: list[str] | str | None = None,
     allowed: set[str] | frozenset[str] | list[str] | None = None,
+    loader: Loader | None = None,
 ) -> dict[str, dict[str, Any]]:
     """从证据台账、节点产出、运行输入建目录。
 
     - nodes：state["nodes"]，口径卡的指标值从这里取（和台账里的工件是同一份内容）
-    - ledger：state["evidence"]，决定顺序、提供工件 id；查询、检索按台账顺序编 Q1… / K1…
+    - ledger：state["evidence"]，决定顺序、提供工件 id；查询、检索、分析结论按台账顺序编 Q1… / K1… / A1…
     - metrics_from：只收这几张口径卡；不传（None、空列表、空字符串）就收全部——和
       validate_graph 的理解一致，那边空列表就是「所有上游口径卡」
     - allowed：只收这些节点的证据（报告节点传它的祖先），不传不限
+    - loader：取分析结论工件的函数（缺省 artifact_store.load，取回时复验哈希）。A 条目照 analysis.contract.catalog_result
+      的约定带着整份结论（result）；取不回、哈希不符、形状不对的不带 result，另记 unreadable（为什么），引用它时照实说
 
     同一个指标 id 出现在两张卡里时不登记 m:<id>，只登记 m:<卡的节点 id>.<id>——
     按先来后到默认给一个，正是旧契约错配的那种错。
@@ -932,9 +982,13 @@ def build_catalog(
                 # 只在有问题时有这两个键
                 **({"no_data": True, "no_data_reason": metric.get("no_data_reason") or ""}
                    if metric.get("no_data") else {}),
+                # 跨两份同形查询算的环比、同比，口径卡执行时自动做的可比性检查（analysis.contract.MetricComparability）：
+                # 写作目录照实写有条件可比、不可比的原因，证据面板的指标步骤展示它。没做过检查的指标没有这个键
+                **({"comparability": metric["comparability"]} if isinstance(metric.get("comparability"), dict) else {}),
             }
 
-    queries = retrievals = 0
+    queries = retrievals = analyses = 0
+    snaps: _Snapshots | None = None                    # 取分析结论的工件用，有 A 条目才建
     schemas: list[dict[str, Any]] = []
     shaped: list[tuple[dict[str, Any], str]] = []      # 带表结构快照的查询条目和它的全局编号
     for entry in entries:
@@ -953,6 +1007,12 @@ def build_catalog(
                 **{k: entry[k] for k in ("node_id", "exec", "artifact", "code_sha", "role", "language") if k in entry},
                 "label": f"沙箱代码 {node_id}（{option_label('evidence_role', entry.get('role') or 'compute')}）",
             }
+            continue
+        if entry.get("kind") == LEDGER_KIND:
+            analyses += 1
+            alias = f"{CATALOG_PREFIX}{analyses}"
+            snaps = snaps or _Snapshots(loader)
+            catalog[alias] = _analysis_entry(entry, alias, snaps)
             continue
         if entry.get("kind") == "query":
             queries += 1
@@ -987,6 +1047,48 @@ def build_catalog(
             "locator": locator, "value": value, "rendered": rendered, "label": f"{key} = {rendered}",
         }
     return catalog
+
+
+#: A 条目从台账条目照抄的键（app/analysis/contract.ledger_entry 的形状）
+_ANALYSIS_KEYS = ("node_id", "exec", "artifact", "call_id", "item", "op", "mode", "status", "verdict", "inputs")
+
+
+def _analysis_entry(entry: dict[str, Any], alias: str, snaps: _Snapshots) -> dict[str, Any]:
+    """台账里的一条分析结论 → 写作目录的 A 条目：照抄台账的键，带上从工件取回、复验过哈希的整份结论（result，
+    analysis.contract.catalog_result 读它）。取不回、哈希不符、形状不对的不带 result，记 unreadable（以编号开头的一句，引用
+    它时照实说）。rows 是结果表的行数：依据 [[see:A1.r3]] 按它核对，存进报告文档的摘要里也留着；labels 是结果表记的列名
+    （列 id → 给人看的名字）：证据面板、读屏的出处写「结果表第 1 行「占变化的比重」」，不把列 id 当叫法。"""
+    out: dict[str, Any] = {"alias": alias, "kind": LEDGER_KIND, "eid": make_eid(LEDGER_KIND, entry.get("artifact"), {}),
+                           "locator": {}, **{k: entry[k] for k in _ANALYSIS_KEYS if k in entry}}
+    result, why = snaps.analysis(alias, {"artifact": entry.get("artifact")})
+    if result is None:
+        out["unreadable"] = why
+    else:
+        out["result"] = result
+        table = result.get("table")
+        if isinstance(table, dict):
+            if isinstance(table.get("rows"), list):
+                out["rows"] = len(table["rows"])
+            if isinstance(table.get("labels"), dict) and table["labels"]:
+                out["labels"] = {str(k): str(v) for k, v in table["labels"].items()}
+    phrase = _clean(str((result or {}).get("phrase") or ""))
+    name = method_label(out.get("op"), out.get("mode"))
+    out["label"] = f"{name} · {phrase}" if phrase else name
+    return out
+
+
+def analysis_card(entry: dict[str, Any] | None) -> bool:
+    """这条分析结论是不是分析卡做的（台账条目带 item、不带 call_id）：模板定好的分析总能引用（00-总方案 D10）。agent 工具
+    现场做的（带 call_id）在受管级别的正式出具里和 agent 查的格同一个规矩（cells_allowed）。"""
+    return isinstance(entry, dict) and bool(entry.get("item")) and not entry.get("call_id")
+
+
+def stored_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """存进报告文档的目录条目：分析结论只留摘要（编号、种类、判定码、工件、输入、行数……），不带整份结论（result）——它在
+    工件里，取回时复验哈希；别的条目原样。"""
+    if entry.get("kind") == LEDGER_KIND and "result" in entry:
+        return {k: v for k, v in entry.items() if k != "result"}
+    return entry
 
 
 def withhold_metrics(catalog: dict[str, Any], aliases: Iterable[str], word: str) -> dict[str, Any]:
@@ -1376,6 +1478,40 @@ class _Snapshots:
             why = "的快照里没有表格数据"
         return (None, f"{alias} {why}") if why else (content, None)
 
+    def analysis(self, alias: str, entry: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+        """分析结论：(整份结论, 取不到的原因，以 alias 开头)。写作目录的条目带着 result（build_catalog 取回、复验过哈希的，
+        analysis.contract.catalog_result）就用它；存进报告文档的目录只留摘要，按工件取回、复验哈希。build_catalog 当时就没取回
+        来的（条目记着 unreadable）照它说，不再取一遍。"""
+        result = catalog_result(entry)
+        if result is not None:
+            return result, None
+        if entry.get("unreadable"):
+            return None, str(entry["unreadable"])
+        content, why = self._fetch(entry.get("artifact"), "分析结论")
+        if why is None and not is_result(content):
+            why = "的工件不是分析结论"
+        return (None, f"{alias} {why}") if why else (content, None)
+
+    def table(self, alias: str, entry: dict[str, Any]) -> tuple[Any, str | None]:
+        """按单元格、整表取的那张表：(表, 取不到的原因)。查询结果是查询快照本身；分析结论是它的结果表（形状同查询快照：
+        columns 是稳定的列 id，另带 labels 给人看的列名，整表的表头写它）。结果表另记了列类型（column_types）、各列的换算
+        （formats，占比、变化率这类以比率存的列）的照着渲染，没记的按值认（同老快照）。"""
+        if entry.get("kind") != LEDGER_KIND:
+            return self.get(alias, entry.get("artifact"))
+        result, why = self.analysis(alias, entry)
+        if why:
+            return None, why
+        table = result.get("table") if isinstance(result, dict) else None
+        if not isinstance(table, dict) or not isinstance(table.get("rows"), list):
+            return None, f"{alias} 没有结果表" + ("（这次分析没有做成）" if result.get("status") == "refused" else "")
+        labels = table.get("labels")
+        types = table.get("column_types")
+        formats = table.get("formats")
+        return {"columns": [str(c) for c in table.get("columns") or []], "rows": table["rows"],
+                "labels": {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
+                **({"column_types": types} if isinstance(types, dict) else {}),
+                **({"formats": {str(k): str(v) for k, v in formats.items()}} if isinstance(formats, dict) else {})}, None
+
     def hits(self, alias: str, artifact: Any) -> tuple[list[Any], str | None]:
         """检索快照里的命中：(命中列表, 取不到的原因)。"""
         content, why = self._fetch(artifact, "检索快照")
@@ -1418,25 +1554,60 @@ def _snapshots(loader: Loader | _Snapshots | None, *, entities: bool = True,
     return _Snapshots(loader, entities=entities, syntax=syntax, display=display)
 
 
-_CELL_REF = re.compile(r"^(?P<alias>[QK]\d+)\.r(?P<row>\d+)\.(?P<column>.+)$")
+_CELL_REF = re.compile(rf"^(?P<alias>[QK{CATALOG_PREFIX}]\d+)\.r(?P<row>\d+)\.(?P<column>.+)$")
 _NODE_REF = re.compile(r"^N:(?P<node>[^.\s]+)(?:\.(?P<field>.+))?$")
 
 
 def parse_cell_ref(ref: str) -> dict[str, Any] | None:
-    """Q4.r0.amount → {alias: "Q4", row: 0, column: "amount"}；写法不对返回 None。"""
+    """Q4.r0.amount → {alias: "Q4", row: 0, column: "amount"}；写法不对返回 None。分析结论的结果表同一种写法（A3.r0.share）。"""
     m = _CELL_REF.match((ref or "").strip())
     return {"alias": m.group("alias"), "row": int(m.group("row")), "column": m.group("column")} if m else None
 
 
+def _is_analysis_alias(alias: Any) -> bool:
+    return isinstance(alias, str) and alias.startswith(CATALOG_PREFIX) and alias[len(CATALOG_PREFIX):].isdigit()
+
+
 def _query_entry(alias: str, catalog: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """能按单元格、整表引用的条目：查询结果，或者分析结论（引用它的结果表）。"""
     entry = catalog.get(alias)
     if entry is None:
+        if _is_analysis_alias(alias):
+            return None, _Reason(f"引用的分析结论 {alias} 不存在", f"目录里没有 {alias}（能引用的分析结论见证据目录）")
         return None, _Reason(f"引用的查询结果 {alias} 不存在", f"目录里没有 {alias}（能引用的查询见证据目录）")
-    if entry.get("kind") != "query":
+    if entry.get("kind") not in ("query", LEDGER_KIND):
         return None, f"{alias} 不是查询结果，不能按单元格引用"
     if entry.get("code"):
         return None, CODE_REASON
     return entry, ""
+
+
+def _cells_refused(alias: str, catalog: dict[str, Any], cells_allowed: bool) -> str | None:
+    """单元格、整表引用这一次能不能解析：受管级别的正式出具、契约没开「单元格引用」时（cells_allowed=False）解析不了，
+    原因是 CELLS_REASON；分析结论的结果表同一个规矩，只是分析卡做的总能引用（analysis_card，00-总方案 D10）。"""
+    if cells_allowed:
+        return None
+    if _is_analysis_alias(alias):
+        return None if analysis_card(catalog.get(alias)) else ANALYSIS_CELLS_REASON
+    return CELLS_REASON
+
+
+def _noun(entry: dict[str, Any] | None) -> str:
+    """按格引用的那张表在说法里叫什么：查询结果，或者分析结论的结果表。"""
+    return "结果表" if (entry or {}).get("kind") == LEDGER_KIND else "查询结果"
+
+
+def _column_conv(snapshot: Any, column: str, display: int = CELL_DISPLAY) -> str | None:
+    """分析结论的结果表给这一列记的换算（ResultTable.formats：占比、变化率的列记 pct，比率的变化记 pp）。查询快照没有这一项，
+    一切照原样（None）。按分析结论记的格式显示是 4 版起的显示规则：老文档（3 版及以前）里的引用照当年原样显示，复核不因此
+    判对不上。"""
+    if display < 4:
+        return None
+    formats = snapshot.get("formats") if isinstance(snapshot, dict) else None
+    if not isinstance(formats, dict):
+        return None
+    found = formats.get(column)
+    return found if isinstance(found, str) and found else None
 
 
 def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
@@ -1454,19 +1625,26 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
         return _unresolved(marker, ref.split(".")[0], "cell", _Reason(
             "单元格引用格式无法识别", "单元格要写成 Q<编号>.r<行>.<列>（行号从 0 数），比如 [[v:Q1.r0.amount]]"))
     alias = parsed["alias"]
-    if not cells_allowed:
-        return _unresolved(marker, alias, "cell", CELLS_REASON)
+    if refused := _cells_refused(alias, catalog, cells_allowed):
+        return _unresolved(marker, alias, "cell", refused)
     entry, why = _query_entry(alias, catalog)
     if entry is None:
         return _unresolved(marker, alias, "cell", why)
-    snapshot, why = snaps.get(alias, entry.get("artifact"))
+    snapshot, why = snaps.table(alias, entry)
     if why:
         return _unresolved(marker, alias, "cell", why)
     try:
         raw, column = locate_cell(snapshot, parsed["row"], parsed["column"])
         kind = column_kind(snapshot, column)
         shown = snaps.shown(raw)
+        # 分析结论的结果表记了这一列的换算（占比、变化率这类以比率存的列；4 版显示规则起）、写作者没写换算的，按它渲染；
+        # 写作者自己写了换算的照他的。实际用的换算记进引用（导出页、可验证报告照它渲染）
+        conv = conv or _column_conv(snapshot, column, snaps.display)
         rendered = render_cell(shown, conv, kind=kind)
+        if conv and not marker.get("conv") and rendered != render_cell(shown, None, kind=kind):
+            # 按分析结论记的格式渲染、真改了写法（4 版起）：文档的 cell_display 记成 4，引用上记 conv，
+            # 导出页和可验证报告照引用上的换算渲染
+            snaps.needed = max(snaps.needed, 4)
         plain = column in snaps.plain(entry.get("artifact"), snapshot) \
             and render_cell(shown, conv, kind=kind, plain=True) != rendered
         if plain:
@@ -1474,7 +1652,7 @@ def _resolve_cell(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snaps
             rendered = render_cell(shown, conv, kind=kind, plain=True)
             snaps.needed = max(snaps.needed, 3)
     except CellError as e:
-        return _unresolved(marker, alias, "cell", f"{alias} {e}")
+        return _unresolved(marker, alias, "cell", f"{alias} {str(e).replace('查询结果', _noun(entry))}")
     except RenderError as e:
         return _unresolved(marker, alias, "cell", str(e))
     locator = {"row": parsed["row"], "column": column}
@@ -1506,8 +1684,8 @@ def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapsho
     def fail(reason: str, fix: str | None = None) -> tuple[None, dict[str, Any]]:
         return None, _unresolved(marker, alias, "query", _Reason(reason, fix) if fix else reason)
 
-    if not cells_allowed:
-        return fail(CELLS_REASON)
+    if refused := _cells_refused(alias, catalog, cells_allowed):
+        return fail(refused)
     _, *rest = (marker.get("body") or "").split() or [""]
     odd = [p for p in rest if p.partition("=")[0] not in _TABLE_OPTIONS or "=" not in p]
     if odd:
@@ -1516,18 +1694,20 @@ def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapsho
     entry, why = _query_entry(alias, catalog)
     if entry is None:
         return fail(why)
-    snapshot, why = snaps.get(alias, entry.get("artifact"))
+    snapshot, why = snaps.table(alias, entry)
     if why:
         return fail(why)
     columns = [str(c) for c in snapshot.get("columns") or []]
     rows = snapshot["rows"]
+    #: 分析结论的结果表：表头写给人看的列名（labels），格子照样按列 id 引用
+    labels = snapshot.get("labels") if entry.get("kind") == LEDGER_KIND else None
     if "cols" in options:
         wanted = [c.strip() for c in options["cols"].split(",") if c.strip()]
         if not wanted:
             return fail("整表引用的 cols 没有写列名", "cols= 后面要写列名，用逗号分开")
         missing = [c for c in wanted if c not in columns]
         if missing:
-            return fail(f"引用的查询结果 {alias} 中没有列「{missing[0]}」",
+            return fail(f"引用的{_noun(entry)} {alias} 中没有列「{missing[0]}」",
                         f"{alias} 没有列「{missing[0]}」，有：{'、'.join(columns[:12])}")
         if len(wanted) > TABLE_MAX_COLS:
             return fail(f"整表最多 {TABLE_MAX_COLS} 列，当前选了 {len(wanted)} 列",
@@ -1564,12 +1744,20 @@ def _table_plan(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapsho
             return fail(f"列名「{_clean(c)[:30]}」无法放进表格（为空、首尾有空格、含方括号 / 竖线 / 换行，或过长）",
                         f"列名「{_clean(c)[:30]}」写不进表格（空的、首尾有空格、带方括号竖线换行，或者太长）："
                         "在 SQL 里给它起个别名再查")
-    lines = ["| " + " | ".join(_clean(c) for c in wanted) + " |",
+    lines = ["| " + " | ".join(_header_text(c, labels) for c in wanted) + " |",
              "| " + " | ".join("---" for _ in wanted) + " |"]
     lines += ["| " + " | ".join(f"[[v:{alias}.r{r}.{c}]]" for c in wanted) + " |" for r in range(first, last + 1)]
     if snapshot.get("truncated") is True:
         lines.append(_truncated_note(first, last))
     return "\n".join(lines), None
+
+
+def _header_text(column: str, labels: dict[str, str] | None) -> str:
+    """整表表头的一格：查询结果写列名本身；分析结论的结果表写给人看的列名（labels，竖线换成 ¦，同单元格里的文本），没写
+    叫法的列写列 id。复核时表头核对（_header_masks）按同一个写法认。"""
+    if labels and labels.get(column):
+        return _clean(str(labels[column])).replace("|", "¦")
+    return _clean(column)
 
 
 def _truncated_note(first: int, last: int) -> str:
@@ -1620,10 +1808,11 @@ def _expand_tables(text: str, catalog: dict[str, Any], snaps: _Snapshots, cells_
 
 def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_allowed: bool = True,
                    loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
-    """行内标记（m / i / v / t / c / q / table）→ Citation，带 rendered（正文里显示的字）。
+    """行内标记（m / i / v / t / c / q / a / table）→ Citation，带 rendered（正文里显示的字）。
 
-    cells_allowed=False 时单元格和整表一律解析不了，原因是 CELLS_REASON（受管出具没在契约里声明 cells）。
-    loader 是取查询快照的函数，缺省 artifact_store.load。
+    cells_allowed=False 时单元格和整表一律解析不了，原因是 CELLS_REASON（受管出具没在契约里声明 cells）；Agent 现场做的
+    分析结论同一个规矩（ANALYSIS_CELLS_REASON），分析卡做的照常解析。loader 是取查询快照、分析结论的函数，缺省
+    artifact_store.load。
     """
     kind = marker["kind"]
     ref = marker.get("ref") or ""
@@ -1635,17 +1824,20 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
         if bad is not None:
             return bad
         # 整篇渲染时整表已经按上下文展开过了，走到这里的是复核一个片段：给出不带上下文的样子
-        return {"ref": ref, "alias": ref, "locator": {}, "eid": catalog[ref]["eid"], "kind": "query",
+        return {"ref": ref, "alias": ref, "locator": {}, "eid": catalog[ref]["eid"],
+                "kind": LEDGER_KIND if catalog[ref].get("kind") == LEDGER_KIND else "query",
                 "role": "value", "status": "resolved", "rendered": _render(table or "", catalog, snaps, cells_allowed)}
     if kind in ("t", "c"):
         return _resolve_entity(marker, catalog, _snapshots(loader))
     if kind == "q":
         return _resolve_quote(marker, catalog, _snapshots(loader))
+    if kind == MARKER_KIND:
+        return _resolve_analysis(marker, catalog, _snapshots(loader), cells_allowed)
     if kind not in ("m", "i"):
         return _unresolved(marker, f"{kind}:{ref}", kind, _Reason(
             f"引用类型「{kind}」无法识别",
             f"不认识的引用类型 {kind}：只支持 m（口径卡指标）、v（查询单元格）、table（整表）、"
-            "i（运行输入）、t / c（表 / 字段）、q（引文）、see（依据）"))
+            "i（运行输入）、t / c（表 / 字段）、q（引文）、a（分析结论）、see（依据）"))
 
     conv = marker.get("conv")
     if kind == "m":
@@ -1681,6 +1873,76 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
     cite = {"ref": ref, "alias": alias, "locator": dict(entry.get("locator") or {}), "eid": entry["eid"],
             "kind": ev_kind, "role": "value", "status": "resolved", "value": entry.get("value"),
             "rendered": rendered}
+    if conv:
+        cite["conv"] = conv
+    return cite
+
+
+#: [[a:A3]]、[[a:A3.top_share]]：编号，后面可以接一个具名标量的键
+_ANALYSIS_REF = re.compile(rf"^(?P<alias>{CATALOG_PREFIX}\d+)(?:\.(?P<key>[^\s.|]+))?$")
+_ANALYSIS_FIX = (f"分析结论的判定语写 [[{MARKER_KIND}:A1]]，具名的数写 [[{MARKER_KIND}:A1.键]]（键见证据目录，比如 "
+                 f"[[{MARKER_KIND}:A1.top_share|pct]]），结果表的一格写 [[v:A1.r0.列]]")
+
+
+def _resolve_analysis(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
+                      cells_allowed: bool) -> dict[str, Any]:
+    """[[a:A3]] → 判定语：分析结论里系统按模板渲染好的那一整句（判定是平台的算子算的，写作者只引用，00-总方案 D5）。
+    [[a:A3.top_share|pct]] → 具名标量：结论 values 里的一项（数一律十进制字符串），按单元格的规则渲染，换算同 [[m:]]。
+    没写换算、结论给这个数记了格式（value_formats）的按它渲染（0.62 显示成 62.0%，不是 0.62），实际用的换算记进引用。
+
+    判定语是一个片段（种类 analysis），里面的数和字都是系统写的：组装、复核都按带引用的片段整段涂白，不算裸数字。受管级别的
+    正式出具、契约没开「单元格引用」时，Agent 现场做的分析解析不了（ANALYSIS_CELLS_REASON），分析卡做的照常解析。"""
+    ref = (marker.get("ref") or "").strip()
+    conv = marker.get("conv")
+    parsed = _ANALYSIS_REF.match(ref)
+    if parsed is None:
+        return _unresolved(marker, ref.split(".")[0] or ref, LEDGER_KIND,
+                           _Reason("分析结论的引用格式无法识别", _ANALYSIS_FIX))
+    alias, key = parsed.group("alias"), parsed.group("key")
+    entry = catalog.get(alias)
+    if entry is None:
+        return _unresolved(marker, alias, LEDGER_KIND, _Reason(
+            f"引用的分析结论 {alias} 不存在", f"目录里没有 {alias}（能引用的分析结论见证据目录）"))
+    if entry.get("kind") != LEDGER_KIND:
+        return _unresolved(marker, alias, LEDGER_KIND, f"{alias} 不是分析结论")
+    if not cells_allowed and not analysis_card(entry):
+        return _unresolved(marker, alias, LEDGER_KIND, ANALYSIS_CELLS_REASON)
+    result, why = snaps.analysis(alias, entry)
+    if result is None:
+        return _unresolved(marker, alias, LEDGER_KIND, why or f"{alias} 无法读取")
+    if key is None:
+        if conv:
+            return _unresolved(marker, alias, LEDGER_KIND, _Reason(
+                "判定语是一整句话，不能换算",
+                f"判定语 [[{MARKER_KIND}:{alias}]] 不能加换算：要换算就引用具名的数，比如 [[{MARKER_KIND}:{alias}.top_share|pct]]"))
+        phrase = result.get("phrase")
+        if not isinstance(phrase, str) or not phrase.strip():
+            return _unresolved(marker, alias, LEDGER_KIND, f"{alias} 没有判定语")
+        # 判定语按文本格的规则写进正文：压成一行，竖线换成 ¦（同单元格里的文本，表格里不会多切出一格）
+        return {"ref": ref, "alias": alias, "locator": {}, "eid": make_eid(LEDGER_KIND, entry.get("artifact"), {}),
+                "kind": LEDGER_KIND, "role": "value", "status": "resolved",
+                "rendered": render_cell(phrase, kind="text")}
+    values = result.get("values") if isinstance(result.get("values"), dict) else {}
+    if key not in values:
+        names = "、".join(str(k) for k in list(values)[:12]) or "没有"
+        return _unresolved(marker, alias, LEDGER_KIND, _Reason(
+            f"{alias} 中没有名为「{key}」的数", f"{alias} 里没有「{key}」，能引用的数：{names}（写成 [[{MARKER_KIND}:{alias}.键]]）"))
+    raw = values[key]
+    # 结论里给这个数记了换算（value_formats：占比、变化率这类以比率存的数；4 版显示规则起）而写作者没写换算的，按它渲染；
+    # 写作者自己写了换算的照他的。实际用的换算记进引用（导出页、可验证报告照它渲染）
+    named = result.get("value_formats") if isinstance(result.get("value_formats"), dict) else {}
+    if snaps.display >= 4 and not conv and isinstance(named.get(key), str) and named.get(key):
+        conv = named[key]
+        # 按分析结论记的格式渲染了（4 版起）：文档记成 4，引用上记 conv（写了换算才真有换算，写法一定和以前不同）
+        snaps.needed = max(snaps.needed, 4)
+    try:
+        rendered = render_cell(raw, conv)
+    except RenderError as e:
+        return _unresolved(marker, alias, LEDGER_KIND, str(e))
+    locator = {"key": key}
+    cite = {"ref": ref, "alias": alias, "locator": locator,
+            "eid": make_eid(LEDGER_KIND, entry.get("artifact"), locator), "kind": LEDGER_KIND, "role": "value",
+            "status": "resolved", "value": cell_value(raw), "rendered": rendered}
     if conv:
         cite["conv"] = conv
     return cite
@@ -1855,12 +2117,15 @@ def _resolve_quote(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snap
             "source": {k: v for k, v in source.items() if v is not None}}
 
 
-_ROW_REF = re.compile(r"^(?P<alias>[QK]\d+)(?:\.r(?P<row>\d+))?$")
+_ROW_REF = re.compile(rf"^(?P<alias>[QK{CATALOG_PREFIX}]\d+)(?:\.r(?P<row>\d+))?$")
 
 
 def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
-    """[[see:]] 里的一个依据：m:gmv、i:week、Q4、Q4.r0、K2、t:orders、c:orders.amount。只核对「这件证据存在」。"""
+    """[[see:]] 里的一个依据：m:gmv、i:week、Q4、Q4.r0、K2、A3、A3.r0、t:orders、c:orders.amount。只核对「这件证据存在」。
+    分析结论当依据和查询编号一样写（[[see:A3]]），受管级别的出具里也照样可以写；顺手写成 a:A3 的照 A3 认。"""
     ref = ref.strip()
+    if ref.startswith(f"{MARKER_KIND}:") and _is_analysis_alias(ref.partition(":")[2].strip()):
+        ref = ref.partition(":")[2].strip()
     kind, sep, body = ref.partition(":")
     base = {"ref": ref, "role": "support"}
     if sep and kind in ("t", "c"):
@@ -1880,7 +2145,8 @@ def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snap
         alias = ref if ref in catalog else None
         why = f"运行输入中没有「{body}」"
     elif sep:
-        why = _Reason(f"依据「{ref}」的写法无法识别", f"不认识的依据写法 {ref}：写 m:指标、i:输入，或者 Q1 / K1 这样的编号")
+        why = _Reason(f"依据「{ref}」的写法无法识别",
+                      f"不认识的依据写法 {ref}：写 m:指标、i:输入，或者 Q1 / K1 / A1 这样的编号")
     elif m := _ROW_REF.match(ref):
         alias = m.group("alias") if m.group("alias") in catalog else None
         if alias and m.group("row") is not None:
@@ -1900,8 +2166,11 @@ def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snap
 
 
 def resolve_ref(ref: str, catalog: dict[str, Any], *, cells_allowed: bool = True,
-                loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
-    """片段上记的 ref（m:gmv|万、i:week、v:Q1.r0.amount）→ Citation。证据接口点开片段时用它重新解析。"""
+                loader: Loader | _Snapshots | None = None, display: int | None = None) -> dict[str, Any]:
+    """片段上记的 ref（m:gmv|万、i:week、v:Q1.r0.amount）→ Citation。证据接口点开片段时用它重新解析。display 是按哪一版
+    单元格显示规则渲染（文档记下的那一版，doc_cell_display；复核按它），不给按 loader 的（缺省当前版）。"""
+    if display is not None:
+        loader = _snapshots(loader, display=display)
     return resolve_marker(_parse_ref(ref), catalog, cells_allowed=cells_allowed, loader=loader)
 
 
@@ -1910,7 +2179,7 @@ def resolve_ref(ref: str, catalog: dict[str, Any], *, cells_allowed: bool = True
 _UNIT_GAP = 2
 _UNIT_MAX = 10
 UNIT_LOOKAHEAD = _UNIT_GAP + _UNIT_MAX + 1
-_UNIT_KINDS = frozenset({"m", "i", "v"})
+_UNIT_KINDS = frozenset({"m", "i", "v", MARKER_KIND})
 #: 以一个字的单位打头的更长的单位：口径卡是「人」、正文紧跟着写「人次」，是另一个单位，不当重复的去掉（_tidy）
 _LONGER_UNIT = re.compile(
     r"人次|人天|人日|人月|人年|人份|件次|台次|台套|台时|车次|架次|班次|户次|批次|个月|个季度|个工作日|个百分点"
@@ -2663,7 +2932,9 @@ def _context(text: str, start: int, end: int) -> str:
 #: 粗体：**…** 或 __…__，里面可以有标记（标记里的下划线不算收尾，[[m:refund_rate]] 很常见）
 _BOLD = re.compile(r"(\*\*|__)(?P<inner>(?:\[\[" + _MARKER_GUARD + r"[^\[\]\n]*?\]\]|(?!\1)[^\n])+?)\1")
 #: 方向词、因果词：没有数字也没有引用的句子，含这些词才算结论。「同比」「环比」不在里面：它们只说明
-#: 跟谁比，本身不是涨跌；真正的比较结论还会带「增长」「下降」或者数字
+#: 跟谁比，本身不是涨跌；真正的比较结论还会带「增长」「下降」或者数字。
+#: 分析判断词（「主要」「异常」「趋势」「显著」……）不在这里：一句话算不算结论决定了结论句策略要不要它挂依据、出具缺口
+#: 怎么数，已发布的版本按这份词表定了档位，扩了就变；裁判优先判判断句另用 judge._JUDGEMENT 排序，只影响送判的先后
 _DIRECTIONAL = re.compile(
     r"增长|增加|上升|提升|提高|上涨|下降|下滑|减少|降低|回落|下跌|反弹|超过|高于|低于|领先|落后|最高|最低"
     r"|最多|最少|来自|导致|因为|由于|带动|拉动|拖累|驱动|原因|归因|贡献|占比|翻倍|持平|波动"
@@ -2802,6 +3073,14 @@ def _link_entities(segments: list[dict[str, Any]], catalog: dict[str, Any],
     return out
 
 
+def _analysis_segment(marker: dict[str, Any], cite: dict[str, Any]) -> str | None:
+    """[[a:A3]] 的片段种类是 analysis（一整句判定语）；[[a:A3.键]] 是具名标量，照 [[v:]] 按值分数字、取值（交回 None）。"""
+    if marker.get("kind") != MARKER_KIND:
+        return None
+    parsed = _ANALYSIS_REF.match(str(marker.get("ref") or "").strip())
+    return LEDGER_KIND if parsed is None or parsed.group("key") is None else None
+
+
 def _auto_entity(seg: dict[str, Any]) -> bool:
     """系统在正文里自动切出来的实体片段（自动链接的名字、反引号里的可疑名字），不是写作者写的标记。"""
     return seg.get("kind") == "entity" and (bool(seg.get("auto")) or not seg.get("ref"))
@@ -2838,12 +3117,15 @@ def compose_doc(
     entities: bool = True,
     absence: bool = False,
     masked: dict[str, Any] | None = None,
+    analysis_claims: str | None = None,
 ) -> dict[str, Any]:
     """模型写的原文（带标记）→ 报告文档：渲染后的 markdown、块、句、片段、统计、违规。
 
     entities=False（报告节点 entities: off）：表名、字段名整层不管——不链接、不核对反引号，
     [[t:]] / [[c:]] 解析不了，原因是 ENTITIES_OFF_REASON。
     absence=True（写作目录有省略）：另查缺失断言（absence_claims），和句中的 [[see:]] 一样只在组装时查。
+    analysis_claims（报告节点的分析说法核对，check / strict）：文档顶层记下处置和说法表版本（engine/analysis_claims），
+    判断词核对和裸数字一样在 verify_doc 里做，出口复核照它再核一遍。不给（None、off）的文档不记、不核，和以前一字不差。
     masked（{查询快照工件: 取自遮罩列的结果列}，报告节点按数据源的遮罩算好交进来）：另查直接引用了这些列的格子
     （masked_cells），同样只在组装时查。没给的和以前一字不差。目录里值不给的指标（withhold_metrics 记了 masked 的）被引用
     时也在这里记违规（masked_metrics），不靠这个参数：目录本身说了哪几个不给。
@@ -2922,7 +3204,7 @@ def compose_doc(
                             # 紧跟在同一张表名后面：只显示列名，引用上记 short，复核照它核对（老文档没有这一项，照全名）
                             cite = {**cite, "rendered": short, "short": True}
                         seg = {
-                            "kind": _SEG_KIND.get(marker["kind"])
+                            "kind": _SEG_KIND.get(marker["kind"]) or _analysis_segment(marker, cite)
                             or ("number" if marker["kind"] == "m" or (ok and is_number(cite.get("value")))
                                 else "value"),
                             "text": cite["rendered"], "ref": f"{marker['kind']}:{marker['body']}",
@@ -2958,7 +3240,7 @@ def compose_doc(
                     unit["segments"] = _link_entities(unit["segments"], catalog, index)
         all_segments = [s for block in out_blocks for unit in block["units"] for s in unit["segments"]]
     # 裸数字单独切成片段：前端要在那几个字底下画「无出处」
-    refs = [tuple(s["span"]) for s in all_segments if s.get("ref")] + _header_masks(out_blocks, catalog) \
+    refs = [tuple(s["span"]) for s in all_segments if s.get("ref")] + _header_masks(out_blocks, catalog, snaps) \
         + _name_masks(markdown, catalog, snaps)
     syntax = [tuple(s["span"]) for s in all_segments if s["kind"] == "structural"]
     bare = _bare_numbers(markdown, refs, allow_numbers, syntax)
@@ -2996,15 +3278,20 @@ def compose_doc(
     used = {c["alias"] for block in out_blocks for unit in block["units"]
             for c in [*(s["cite"] for s in unit["segments"] if s.get("cite")), *unit["see"]]
             if c.get("status") == "resolved" and c.get("alias")}
-    kept = {a: e for a, e in catalog.items() if e.get("kind") not in ENTITY_KINDS or a in used}
+    # 分析结论只留摘要（stored_entry）：整份结论在工件里，按工件取回、复验哈希
+    kept = {a: stored_entry(e) for a, e in catalog.items() if e.get("kind") not in ENTITY_KINDS or a in used}
     # entity_syntax：这份文档按哪一版实体语法组装，复核照它走（verify_doc）。在文档顶层，参与内容哈希
     # provenance：期 4 的文档标记（P4-SPEC 1.4）。带它的文档才有查询步骤的提示字段、推断来源、裁判摘录的新行；
     # 没有它的（期 4 之前组装的）一律按原样展示。写在顶层、参与内容哈希，事后补不上：补了哈希就变，封存链就断
     # cell_display：有单元格因为显示规则改了写法（ISO 日期时间）才记，记的是渲染得出这些格子的最低一版，复核照它渲染；
     # 没有的文档和以前一字不差
+    # analysis_claims：报告节点要核分析说法时记下处置和说法表版本，复核照它走（只有带这一项的文档核判断词）
+    from app.engine import analysis_claims as said
+
     doc: dict[str, Any] = {
         "schema": DOC_SCHEMA, "entity_syntax": snaps.syntax, "provenance": DOC_PROVENANCE,
         **({"cell_display": snaps.needed} if snaps.needed > 1 else {}),
+        **({said.DOC_FIELD: said.record(analysis_claims)} if analysis_claims in said.MODES else {}),
         "run_id": run_id, "node_id": node_id,
         "markdown": markdown, "source": source, "catalog": kept, "blocks": out_blocks,
     }
@@ -3018,10 +3305,19 @@ def compose_doc(
     return doc
 
 
-def _header_masks(blocks: list[dict[str, Any]], catalog: dict[str, Any]) -> list[tuple[int, int]]:
+def _header_masks(blocks: list[dict[str, Any]], catalog: dict[str, Any],
+                  snaps: _Snapshots | None = None) -> list[tuple[int, int]]:
     """表头里恰好是某次查询的列名的格：整表的表头是系统照快照列名写的，「销售额2025」这种列名
-    里的数字不是结论数字，写作者也改不了它。只放过表头、只放过和列名一字不差的格。"""
+    里的数字不是结论数字，写作者也改不了它。只放过表头、只放过和列名一字不差的格。
+
+    分析结论的结果表同理：整表的表头写的是结果表给人看的列名（_header_text），「基期（2026-W41）」里的数是系统写的。
+    结论按 snaps 取（目录条目带着的直接用，存进文档的摘要按工件取回）；没给 snaps 的只认查询的列名。"""
     names = {_clean(str(c)) for e in catalog.values() if e.get("kind") == "query" for c in e.get("columns") or []}
+    for alias, entry in catalog.items() if snaps is not None else ():
+        if isinstance(entry, dict) and entry.get("kind") == LEDGER_KIND:
+            table, why = snaps.table(alias, entry)
+            if why is None:
+                names.update(_header_text(str(c), table.get("labels")) for c in table.get("columns") or [])
     out: list[tuple[int, int]] = []
     for block in blocks if names else []:
         if not isinstance(block, dict) or block.get("type") != "table":
@@ -3049,12 +3345,13 @@ _UNIT_VALUE = re.compile(
 
 def _text_names(catalog: dict[str, Any], snaps: _Snapshots) -> set[str]:
     """目录里每次查询的快照中，文本格里带数字的值（「冲压5线」「KX-205 线」）：至少有一个数字、至少有一个不是数字的字，
-    本身不是数、也不是带单位的数（_UNIT_VALUE）。按写作目录里显示的样子（压成一行）收。取不回的快照跳过。"""
+    本身不是数、也不是带单位的数（_UNIT_VALUE）。按写作目录里显示的样子（压成一行）收。取不回的快照跳过。分析结论的结果表
+    同样收（维度值照输入快照的原样，写作目录里也列着它们）。"""
     names: set[str] = set()
     for alias, entry in catalog.items():
-        if not isinstance(entry, dict) or entry.get("kind") != "query":
+        if not isinstance(entry, dict) or entry.get("kind") not in ("query", LEDGER_KIND):
             continue
-        snapshot, why = snaps.get(alias, entry.get("artifact"))
+        snapshot, why = snaps.table(alias, entry)
         if why or not isinstance(snapshot, dict):
             continue
         columns = [str(c) for c in snapshot.get("columns") or []]
@@ -3236,6 +3533,7 @@ def verify_doc(
     masks: list[tuple[int, int]] = []                  # 引用渲染出来的字
     syntax: list[tuple[int, int]] = []                 # 结构片段：只涂符号，数字照查
     owners: list[tuple[int, int, str, str]] = []        # (start, end, segment id, unit id)
+    cited_by: dict[int, list[str]] = {}                 # 每句按这次核对的引用算的依据（分析说法核对用）
     pos, tiled = 0, True
     for block, unit in iter_units(doc):
         stats["units"] += 1
@@ -3351,6 +3649,7 @@ def verify_doc(
                                              _unresolved_message("依据", f"see:{again['ref']}", again),
                                              ref=again["ref"], unit=unit.get("id"),
                                              span=list(unit.get("span") or []) or None))
+        cited_by[id(unit)] = cited
         if kind == "claim" and not cited:
             stats["uncited_claims"] += 1
             where = unit.get("span")
@@ -3359,8 +3658,16 @@ def verify_doc(
                             "text": markdown[where[0]:where[1]] if ok_span else ""})
     if tiled and pos != len(markdown):
         violations.append(_violation("segment_mismatch", "正文末尾有一段不属于任何片段，文档可能被修改过"))
+    # 分析说法核对（engine/analysis_claims）：只核记了这一项的文档，按记下的那一版说法表、这次核对的引用核。老文档不核，
+    # 统计也不多这个键。目录条目只带摘要的（存进文档的那份）按工件取回整份结论
+    from app.engine import analysis_claims as said
 
-    masks += _header_masks(list(doc.get("blocks") or []), catalog) + _name_masks(markdown, catalog, snaps)
+    said_found = said.verify(doc, catalog, cited=cited_by, load=lambda alias, entry: snaps.analysis(alias, entry)[0])
+    if said_found is not None:
+        violations.extend(said_found)
+        stats["analysis_claims"] = sum(1 for v in said_found if v["code"] in said.CODES)
+
+    masks += _header_masks(list(doc.get("blocks") or []), catalog, snaps) + _name_masks(markdown, catalog, snaps)
     for token in _bare_numbers(markdown, masks, allow_numbers, syntax):
         owner = next(((sid, uid) for s, e, sid, uid in owners if s <= token.start < e), (None, None))
         violations.append(_violation(
@@ -3708,11 +4015,12 @@ _PROMPT_HITS = 8
 _PROMPT_HIT_CHARS = 300
 
 
-def _sql_check_note(artifact: Any, snaps: _Snapshots) -> str | None:
+def _sql_check_note(artifact: Any, snaps: _Snapshots, who: str | None = None) -> str | None:
     """这次查询（合并查询则是它的输入）没通过 SQL 检查时，写作目录里跟在它后面的那句提醒；没问题返回 None。
 
     口径卡的指标早就标「存疑」了，直接引用查询格子的写作者却看不到：报告照样把一对多关联后求和的数写成定论。
-    出具契约会按缺口降档（issuance.sql_check_gaps），这里先让写作者知道、引用时如实交代。
+    出具契约会按缺口降档（issuance.sql_check_gaps），这里先让写作者知道、引用时如实交代。分析结论的输入查询同样提醒
+    （sql_problems.query_problems 顺着结论的输入往下找），who 是「这次分析的输入查询」。
     """
     from app.engine.sql_problems import query_problems
 
@@ -3720,7 +4028,7 @@ def _sql_check_note(artifact: Any, snaps: _Snapshots) -> str | None:
     if not found:
         return None
     problems = list(dict.fromkeys(text for p in found for text in p.problems))
-    who = "这次查询" if all(p.artifact == artifact for p in found) else "这次合并的输入查询"
+    who = who or ("这次查询" if all(p.artifact == artifact for p in found) else "这次合并的输入查询")
     return (f"  （{who}未通过 SQL 检查：{'；'.join(problems[:3]) or '有错误级的问题'}。其中的数存疑："
             "引用时须如实说明，不要当作确定的结论）")
 
@@ -3776,6 +4084,167 @@ def _query_prompt(entry: dict[str, Any], snaps: _Snapshots, cells_allowed: bool,
     return lines
 
 
+#: 写作目录里「分析结论」一段开头的写法（给模型看）。判定由平台的算子算好、系统按模板渲染，写作者只引用（00-总方案 D5）
+ANALYSIS_PROMPT = (
+    "分析结论（系统按平台的方法算好的判定。判定语、具名的数、结果表都只能用引用标记写，系统照结论渲染、逐字核对）：\n"
+    "写法：判定语单独写 [[a:A1]]，系统换成整句判定；具名的数写 [[a:A1.键]]，换算同指标，比重、变化率这类比率写成 "
+    "[[a:A1.top_share|pct]] 显示成百分数；比重、变化率不写换算也按百分数显示，比率的变化按百分点（[[v:A1.r0.mix]] 显示成「1.2 "
+    "个百分点」）；结果表的一格写 [[v:A1.r0.列]]（行号从 0 数），要列出多行多列，单独一行写 "
+    "[[table:A1 cols=列a,列b rows=0-4]]；拿它当结论的依据，句末写 [[see:A1]]。"
+    "「主要来自」「超出常规波动」「呈上升趋势」这类判断已经写在判定语里：引用判定语，不要自己改写判定；"
+    "算不了的照实写算不了的原因。下面没有的编号、键、列不要编造。"
+)
+#: 受管级别的出具、契约没开「单元格引用」时跟在上面那段后面（给模型看）
+ANALYSIS_SEE_ONLY_PROMPT = ("这次出具不允许直接引用 Agent 现场做的分析：标着只能当依据的几条，判定语、数和结果表都不能写进"
+                            "正文，只能在句末写 [[see:A1]] 这样的依据；分析卡做的照常引用。")
+#: 一条分析结论最多列几个具名的数
+_PROMPT_VALUES = 16
+
+
+def _analysis_sources(entry: dict[str, Any], catalog: dict[str, Any]) -> str:
+    """「，来自 Q2、Q3」「，下钻自 A1」：按输入的工件对到这份目录里的编号（agent 调用时写的是它自己的编号，对不上目录）。
+    目录里没有的输入照实说有几份不在。"""
+    by_artifact = {str(e.get("artifact")): alias for alias, e in catalog.items()
+                   if isinstance(e, dict) and e.get("kind") in ("query", LEDGER_KIND) and e.get("artifact")}
+    inputs = [str(a) for a in entry.get("inputs") or [] if a and str(a) != str(entry.get("artifact") or "")]
+    named = [by_artifact[a] for a in inputs if a in by_artifact]
+    queries = [a for a in named if not _is_analysis_alias(a)]
+    parents = [a for a in named if _is_analysis_alias(a)]
+    missing = len(inputs) - len(named)
+    return "".join([f"，来自 {'、'.join(queries)}" if queries else "",
+                    f"，下钻自 {'、'.join(parents)}" if parents else "",
+                    f"，另有 {missing} 份输入不在这份目录里" if missing else ""])
+
+
+#: 写作目录里一条分析结论的几种样子，从全到简（_analysis_prompt 的 level）：full 连同结果表的前 table_top_k 段；compact 不列
+#: 各段，结果表只写一句；brief 只留判定语和具名的数；head 只列编号、方法和来自哪几个查询
+ANALYSIS_LEVELS = ("full", "compact", "brief", "head")
+
+
+def _analysis_prompt(entry: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool, *,
+                     level: str = "full") -> list[str]:
+    """一条分析结论在写作目录里的样子：编号、方法、来自哪几个查询，判定语（[[a:A1]] 渲染出来的那一句）、判定标准、具名的数
+    （可引用的键，值按渲染规则写）、附带说明、输入查询的 SQL 检查问题、算不了的原因；level 为 full 时再列结果表的前
+    table_top_k 段，其余写「其余 n 段」。目录放不下时往简里降（ANALYSIS_LEVELS）：compact 结果表只写一句；brief 只留
+    判定语和具名的数（判定标准、附带说明、SQL 检查的提醒、算不了的原因那句不列，判定语里本来就写着）；head 只列编号那一行。
+    agent 写的假设不列：它不是结论，只在证据面板显示。
+
+    受管级别的正式出具、契约没开「单元格引用」时，Agent 现场做的分析只列判定语和判定标准，写明只能当依据（[[see:A1]]），
+    不列数和表：列出来的数写作者只能照抄成没有出处的数。"""
+    alias = entry["alias"]
+    head = f"- {alias}：{method_label(entry.get('op'), entry.get('mode'))}{_analysis_sources(entry, catalog)}"
+    result, why = snaps.analysis(alias, entry)
+    if result is None:
+        return [f"{head}（{why}，不要引用）"]
+    if level == "head":
+        return [head]
+    brief = level == "brief"
+    lines = [head]
+    if not brief and (note := _sql_check_note(entry.get("artifact"), snaps, "这次分析的输入查询")):
+        lines.append(note)
+    phrase = _clean(str(result.get("phrase") or ""))
+    see_only = not cells_allowed and not analysis_card(entry)
+    if see_only:
+        lines.append(f"  判定语：{phrase or '没有'}（这次出具不允许直接引用 Agent 现场做的分析，只能在句末写 "
+                     f"[[see:{alias}]] 作依据）")
+    else:
+        lines.append(f"  判定语 [[a:{alias}]] = {phrase}" if phrase else f"  （没有判定语，不要写 [[a:{alias}]]）")
+    if brief:
+        pass
+    elif result.get("status") == "refused":
+        lines.append(f"  算不了：{_clean(str(result.get('reason') or '没有写原因'))}。这条结论不能当「异常」「主要来自」"
+                     "「呈上升趋势」这类判断的依据，只能照实写算不了的原因")
+    elif criterion := _clean(str(result.get("criterion") or "")):
+        lines.append(f"  判定标准：{criterion}")
+    caveats = [_clean(str(c.get("text") or "")) for c in result.get("caveats") or [] if isinstance(c, dict)]
+    if not brief and (caveats := [c for c in caveats if c]):
+        lines.append(f"  附带说明：{'；'.join(caveats)}")
+    if see_only:
+        return lines
+    values = result.get("values") if isinstance(result.get("values"), dict) else {}
+    named = result.get("value_formats") if isinstance(result.get("value_formats"), dict) else {}
+    shown = []
+    for key, raw in list(values.items())[:_PROMPT_VALUES]:
+        try:
+            # 具名的数按结论记的格式写（占比、变化率是百分数）：写作者在这里看到的就是引用之后显示的字
+            conv = named.get(key) if isinstance(named.get(key), str) and named.get(key) else None
+            shown.append(f"{key}={render_cell(raw, conv)}")
+        except RenderError:
+            shown.append(f"{key}={MISSING}")
+    if shown:
+        more = f"，另有 {len(values) - _PROMPT_VALUES} 个" if len(values) > _PROMPT_VALUES else ""
+        lines.append(f"  具名的数（写 [[a:{alias}.键]]）：{'，'.join(shown)}{more}")
+    if brief:
+        return lines
+    snapshot, why = snaps.table(alias, entry)
+    if why is not None:
+        return lines
+    columns = [str(c) for c in snapshot.get("columns") or []][:_PROMPT_COLS]
+    labels = snapshot.get("labels") or {}
+    rows = snapshot["rows"]
+    named = "、".join(f"{c}（{_clean(str(labels[c]))}）" if labels.get(c) else c for c in columns)
+    if level != "full":
+        lines.append(f"  结果表共 {len(rows)} 段，列 {named}（这里没列出各段；要列出就单独一行写 [[table:{alias}]]）")
+        return lines
+    settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
+    top = settings.get("table_top_k")
+    top = top if isinstance(top, int) and not isinstance(top, bool) and top > 0 else _TOP_K
+    lines.append(f"  结果表（共 {len(rows)} 段）：列 {named}")
+    plain = snaps.plain(entry.get("artifact"), snapshot)
+    formats = snapshot.get("formats") if isinstance(snapshot.get("formats"), dict) else {}
+    for r in range(min(top, len(rows))):
+        cells = []
+        for c in columns:
+            try:
+                raw, _ = locate_cell(snapshot, r, c)
+                conv = formats.get(c) if isinstance(formats.get(c), str) and formats.get(c) else None
+                cells.append(f"{c}={render_cell(snaps.shown(raw), conv, kind=column_kind(snapshot, c),
+                                                plain=c in plain)}")
+            except (CellError, RenderError):
+                cells.append(f"{c}={MISSING}")
+        lines.append(f"  r{r}：" + "，".join(cells))
+    if len(rows) > top:
+        lines.append(f"  …其余 {len(rows) - top} 段（这里只列出前 {top} 段；后面的行也能按行号引用）")
+    return lines
+
+
+#: 结论里没记 table_top_k 时写作目录列几段（同分析设置的缺省）
+_TOP_K = 10
+
+
+@dataclass
+class _AnalysisLines:
+    """写作目录里「分析结论」一段：每条结论四种样子（ANALYSIS_LEVELS，从全到简）。放得下时全按 full；放不下时这一段最多占
+    预算的 1/_PROMPT_ANALYSIS_SHARE：先按 compact 列出，还超就从后往前降成 brief、再降成 head，然后按顺序补上结果表，排在
+    查询的行前面（_trimmed_catalog）。"""
+
+    order: list[str]
+    #: 样子 → {编号: 那几行}
+    levels: dict[str, dict[str, list[str]]]
+    #: 有 Agent 现场做的分析只能当依据（受管级别的出具、契约没开「单元格引用」）
+    see_only: bool = False
+
+    @classmethod
+    def of(cls, catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool) -> "_AnalysisLines":
+        entries = [e for e in catalog.values() if isinstance(e, dict) and e.get("kind") == LEDGER_KIND]
+        return cls([e["alias"] for e in entries],
+                   {level: {e["alias"]: _analysis_prompt(e, catalog, snaps, cells_allowed, level=level)
+                            for e in entries} for level in ANALYSIS_LEVELS},
+                   see_only=not cells_allowed and any(not analysis_card(e) for e in entries))
+
+    def shape(self, alias: str, level: str) -> list[str]:
+        return self.levels[level][alias]
+
+    def lines(self, tier: dict[str, str] | None = None) -> list[str]:
+        """这一段的文字：每条按 tier 里记的样子，没记的按 full。没有分析结论时是空的（目录和以前一字不差）。"""
+        if not self.order:
+            return []
+        shapes = [self.shape(a, level if (level := (tier or {}).get(a)) in ANALYSIS_LEVELS else "full")
+                  for a in self.order]
+        head = [f"\n{ANALYSIS_PROMPT}", *([ANALYSIS_SEE_ONLY_PROMPT] if self.see_only else [])]
+        return [*head, *(line for shape in shapes for line in shape)]
+
+
 #: 写作目录的字数预算（catalog_budget）按写作模型的上下文窗口定，不再写死 12000：
 #: - 占窗口的 40%。其余留给写作规则和指令（约 4 千字）、重写轮次（每轮把上一稿和违规清单追加进对话，最多 3 轮）、
 #:   推理模型的思考和报告正文（输出额度）。字数按 1 字 ≈ 1 token 算：中文一个字约 0.6–1 个 token，目录里的数字、
@@ -3791,6 +4260,8 @@ CATALOG_MAX_CHARS = 160_000
 _PROMPT_COMPACT_ROWS = 3
 #: 放不下时表和字段、知识库检索两节合起来最多占预算的几分之一（剩下的给查询）
 _PROMPT_TAIL_SHARE = 4
+#: 放不下时分析结论一段最多占预算的几分之一：几十份结论、每份上千段时，不能把查询挤得只剩一行摘要
+_PROMPT_ANALYSIS_SHARE = 2
 _PROMPT_CUT = "\n…（目录太长，后面的省略了）"
 
 
@@ -3879,12 +4350,31 @@ def _metric_prompt(catalog: dict[str, Any]) -> list[str]:
                     caveat += "（所依据的查询未通过 SQL 检查，结果存疑：引用时须如实说明，不要当作确定的结论）"
                 if e.get("no_data"):
                     caveat += NO_DATA_METRIC_NOTE
+                caveat += _comparability_note(e)
                 lines.append(f"- [[{e['alias']}]] {e.get('name')} = {e.get('rendered')}{caveat}")
     inputs = [e for e in catalog.values() if e.get("kind") == "input"]
     if inputs:
         lines.append("\n运行输入：")
         lines.extend(f"- [[{e['alias']}]] = {e.get('rendered')}" for e in inputs)
     return lines
+
+
+def _comparability_note(entry: dict[str, Any]) -> str:
+    """指标上记的可比性（analysis.contract.MetricComparability）在写作目录里跟在值后面的那句：有条件可比、不可比照实写出
+    原因（一句一个），可比的不写。不可比的环比、同比不能当结论，引用时要照实说。"""
+    comparability = entry.get("comparability")
+    if not isinstance(comparability, dict):
+        return ""
+    reasons = "；".join(str(r) for r in comparability.get("reasons") or [] if r)
+    if not reasons:
+        # 没记原因的照判定语写（「两期不可比：原因；原因」），开头的判定不重复
+        phrase = str(comparability.get("phrase") or "")
+        reasons = phrase.split("：", 1)[1].strip() if "：" in phrase else ""
+    if comparability.get("verdict") == "incomparable":
+        return f"（两期不可比：{reasons or '原因见证据面板'}。这个比较不能当结论，引用时须如实说明两期不可比）"
+    if comparability.get("verdict") == "conditional":
+        return f"（两期有条件可比：{reasons or '原因见证据面板'}。引用时须如实说明这几点）"
+    return ""
 
 
 def _dig_path(data: Any, path: str) -> Any:
@@ -4011,13 +4501,15 @@ def writer_catalog(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUD
     [{node_id, title, data, evidence}]，titles 是节点在画布上的名字（分组标题用）。
 
     放得下就整份给（没有结构化字段时和以前一字不差）。放不下时按优先级、按来源均衡（_trimmed_catalog）：
-    口径卡指标、运行输入、结构化字段一律列出；查询按产出它的节点分组、轮流展开；没展开的列编号和摘要；
-    开头照实说目录有省略、各来源省略了几次。
+    口径卡指标、运行输入、结构化字段一律列出；分析结论的判定、具名的数一律列出，结果表的各段排在查询的行前面补；
+    查询按产出它的节点分组、轮流展开；没展开的列编号和摘要；开头照实说目录有省略、各来源省略了几次。
+    没有分析结论的目录和以前一字不差。
     """
     snaps = _Snapshots(loader)
     head = ["可引用的证据（写数字只能用下面的引用标记，系统会换成真实数值）："]
     field_lines, empty, cited = _fields_prompt(fields or [], catalog, snaps, cells_allowed)
     first = [*_metric_prompt(catalog), *field_lines]
+    analyses = _AnalysisLines.of(catalog, snaps, cells_allowed)
     queries = [e for e in catalog.values() if e.get("kind") == "query"]
     rules = ([f"\n{CELL_RULES}" if cells_allowed else
               "\n查询结果（这次出具不允许直接引用单元格，只能写在 [[see:Q1]] 这样的依据里）："] if queries else [])
@@ -4030,26 +4522,32 @@ def writer_catalog(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUD
         for e in retrievals:
             tail.extend(_retrieval_prompt(e, snaps))
     full = {e["alias"]: _query_prompt(e, snaps, cells_allowed) for e in queries}
-    text = "\n".join([*head, *first, *rules, *(line for e in queries for line in full[e["alias"]]), *tail])
+    text = "\n".join([*head, *first, *analyses.lines(), *rules, *(line for e in queries for line in full[e["alias"]]),
+                      *tail])
     if len(text) <= budget:
         return WriterCatalog(text=text, budget=budget, queries=len(queries), empty_sources=empty)
     return _trimmed_catalog(catalog, head, first, rules, queries, full, tail, budget=budget, snaps=snaps,
-                    cells_allowed=cells_allowed, titles=titles or {}, empty=empty, pinned=cited)
+                            cells_allowed=cells_allowed, titles=titles or {}, empty=empty, pinned=cited,
+                            analyses=analyses)
 
 
 def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str], rules: list[str],
                      queries: list[dict[str, Any]], full: dict[str, list[str]], tail: list[str], *, budget: int,
                      snaps: _Snapshots, cells_allowed: bool, titles: dict[str, str], empty: list[str],
-                     pinned: list[str]) -> WriterCatalog:
+                     pinned: list[str], analyses: _AnalysisLines | None = None) -> WriterCatalog:
     """放不下时的目录。以前从头截断：查询按编号排，前面的节点占满预算，后面的节点一次都不露面。
 
-    1. 口径卡指标、运行输入、结构化字段一律列出（第一优先）
+    1. 口径卡指标、运行输入、结构化字段一律列出（第一优先）；分析结论的判定、判定标准、具名的数、说明也列出，只是这一段
+       最多占预算的 1/_PROMPT_ANALYSIS_SHARE：超了就按结论的先后从后往前降，先只留判定语和具名的数，再只列编号
     2. 表和字段、知识库检索两节合起来最多占预算的 1/_PROMPT_TAIL_SHARE
-    3. 每次查询先只占一行摘要；结构化字段引用到的查询先展开（pinned），再按产出它的节点分组、轮流展开：
+    3. 分析结论的结果表（前 table_top_k 段）先补（不超过那个上限）：判定是从原始明细算出来的结论，比原始明细更值得留
+    4. 每次查询先只占一行摘要；结构化字段引用到的查询先展开（pinned），再按产出它的节点分组、轮流展开：
        第一轮每次列前 _PROMPT_COMPACT_ROWS 行，第二轮补到 _PROMPT_ROWS 行，放不下为止
-    4. 开头写明目录有省略、各来源省略了几次，以及没展开的查询怎么用（OMITTED_RULES）
-    最后整份量一次：超了就把最后展开的退回去；指标和字段本身就超（极少见）才从尾部截断。
+    5. 开头写明目录有省略、各来源省略了几次，以及没展开的查询怎么用（OMITTED_RULES）
+    最后整份量一次：超了就把最后展开的退回去（先退查询，最后才退分析结论的结果表）；指标和字段本身就超（极少见）
+    才从尾部截断。
     """
+    analyses = analyses or _AnalysisLines([], {})
     if tail and len("\n".join(tail)) > budget // _PROMPT_TAIL_SHARE:
         tail = _cut_lines(tail, budget // _PROMPT_TAIL_SHARE, "…（表和字段、知识库检索太长，后面的省略了）")
     tables: dict[str, list[str]] = {}
@@ -4064,6 +4562,7 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
     brief = {e["alias"]: [_query_brief(e, tables.get(e["alias"], []), snaps)] for e in queries}
     shapes = {"brief": brief, "compact": compact, "full": full}
     tier = {e["alias"]: "brief" for e in queries}
+    tier.update({alias: "compact" for alias in analyses.order})
 
     def rows() -> list[dict[str, Any]]:
         out = []
@@ -4081,7 +4580,8 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
         notice = (f"注意：证据太多，这份目录有省略（篇幅上限约 {budget} 字）。共 {len(queries)} 次查询："
                   f"{n['full']} 次列出前 {_PROMPT_ROWS} 行，{n['compact']} 次只列前 {_PROMPT_COMPACT_ROWS} 行，"
                   f"{n['omitted']} 次只列编号和摘要。各来源：{per}。")
-        body = [*head, notice, OMITTED_RULES, *first, *rules]
+        notice += _analysis_notice(Counter(tier[alias] for alias in analyses.order), len(analyses.order))
+        body = [*head, notice, OMITTED_RULES, *first, *analyses.lines(tier), *rules]
         for r, entries in zip(stats, groups.values()):
             body.append(f"\n来自「{r['title']}」的查询（共 {r['total']} 次，展开 {r['full'] + r['compact']} 次）：")
             for e in entries:
@@ -4095,9 +4595,25 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
     def size(lines: list[str]) -> int:
         return sum(len(line) + 1 for line in lines)
 
+    # 分析结论一段最多占预算的 1/_PROMPT_ANALYSIS_SHARE：超了按结论的先后从后往前降，先只留判定语和具名的数，再只列编号
+    cap = budget // _PROMPT_ANALYSIS_SHARE
+    for level in ("brief", "head"):
+        for alias in reversed(analyses.order):
+            if size(analyses.lines(tier)) <= cap:
+                break
+            tier[alias] = level
     # 省略情况那句里的数字会变长几位：留一点余量，最后再整份量一次
     remaining = budget - len(assemble()) - 8 * (len(groups) + 3)
     upgraded: list[tuple[str, str]] = []
+    listed = size(analyses.lines(tier))
+    for alias in analyses.order:
+        # 分析结论的结果表先补，排在查询的行前面（这一段照样不超过上限）；整份量下来超了，最后才退回它们
+        delta = size(analyses.shape(alias, "full")) - size(analyses.shape(alias, "compact"))
+        if tier[alias] == "compact" and delta <= remaining and listed + delta <= cap:
+            tier[alias] = "full"
+            remaining -= delta
+            listed += delta
+            upgraded.append((alias, "compact"))
     for alias in pinned:
         if tier.get(alias) == "brief" and (delta := size(compact[alias]) - size(brief[alias])) <= remaining:
             tier[alias] = "compact"
@@ -4128,6 +4644,29 @@ def _trimmed_catalog(catalog: dict[str, Any], head: list[str], first: list[str],
         text = text[:budget - len(_PROMPT_CUT)].rsplit("\n", 1)[0] + _PROMPT_CUT
     return WriterCatalog(text=text, budget=budget, queries=len(queries), trimmed=True, nodes=rows(),
                          omitted=[e["alias"] for e in queries if tier[e["alias"]] == "brief"], empty_sources=empty)
+
+
+#: 目录有省略、分析结论只是结果表没列各段时，开头那句里接的说明（给模型看）
+ANALYSIS_TABLES_OMITTED_PROMPT = ("另有 {total} 条分析结论，判定和具名的数都列出了，其中 {bare} 条没列出结果表的各段"
+                                  "（要列出就单独一行写整表引用，系统照结果表生成）。")
+#: 分析结论还降到了只留判定语和具名的数、只列编号时接的说明（给模型看）：各样子各有几条（ANALYSIS_LEVEL_PROMPT_WORDS），
+#: 以及没列出的怎么引用
+ANALYSIS_TRIMMED_PROMPT = ("另有 {total} 条分析结论，这一段最多占篇幅的一半：{parts}。没列出的也能引用：判定语单独写 "
+                           "[[a:编号]]，系统照结论渲染；要列出结果表就单独一行写整表引用，系统照结果表生成；没列出的具名的数"
+                           "不要编造。")
+ANALYSIS_LEVEL_PROMPT_WORDS = (("full", "列出了结果表的前几段"), ("compact", "没列出结果表的各段"),
+                               ("brief", "只列了判定语和具名的数（判定标准、附带说明没列）"), ("head", "只列了编号"))
+
+
+def _analysis_notice(levels: Counter, total: int) -> str:
+    """目录有省略时开头那句里分析结论的情况：都列全了的不说；只是结果表没列各段的照旧一句；还降到了只留判定语和具名的数、
+    只列编号的，照实写各有几条，以及没列出的怎么引用。"""
+    if not total or levels["full"] == total:
+        return ""
+    if not levels["brief"] and not levels["head"]:
+        return ANALYSIS_TABLES_OMITTED_PROMPT.format(total=total, bare=levels["compact"])
+    parts = "，".join(f"{levels[level]} 条{word}" for level, word in ANALYSIS_LEVEL_PROMPT_WORDS if levels[level])
+    return ANALYSIS_TRIMMED_PROMPT.format(total=total, parts=parts)
 
 
 def catalog_prompt(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUDGET, cells_allowed: bool = True,
@@ -4247,6 +4786,176 @@ def describe_violations(violations: list[dict[str, Any]], *, limit: int = 20) ->
     if len(violations) > limit:
         lines.append(f"- …另有 {len(violations) - limit} 处")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# 分析结论的出处：复算、代入式（证据面板、报告导出、可验证报告同一套）
+# --------------------------------------------------------------------------
+
+#: 复算不一致时点名哪几项不同的叫法（analysis.contract.AnalysisResult 的字段）
+_RESULT_FIELDS = {
+    "op": "算子", "mode": "模式", "method": "方法版本", "params": "参数", "settings": "阈值", "inputs": "输入",
+    "probes": "现查结果", "status": "算成没算成", "reason_code": "算不了的原因", "reason": "算不了的原因",
+    "table": "结果表", "values": "具名的数", "verdict": "判定", "criterion": "判定标准", "phrase": "判定语",
+    "caveats": "附带说明",
+}
+#: app.analysis.recompute 取不回输入（CallError 的 code input_missing）时那句以「复算」开头（复算取不回 Q2 的查询快照）：
+#: 接在「复算失败：」后面时去掉，不说两遍
+_RECHECK_HEAD = "复算"
+
+
+def _recheck_reason(error: Any) -> str:
+    text = str(getattr(error, "message", "") or "").strip() or "原因未知"
+    if getattr(error, "code", None) == "input_missing" and text.startswith(_RECHECK_HEAD) \
+            and len(text) > len(_RECHECK_HEAD):
+        return text[len(_RECHECK_HEAD):].lstrip()
+    return text
+
+
+def analysis_recheck(result: dict[str, Any], load: Callable[[str], Any], *,
+                     load_result: Callable[[str], Any] | None = None) -> dict[str, Any]:
+    """把一份封存的分析结论按它记下的输入复算一遍，和封存的逐字段比（contract.same，agent 写的假设不比）。
+
+    复算就是 app.analysis.recompute：load 按 sha256 交回查询快照工件的原内容，load_result 交回下钻的上一层结论的原内容，
+    取不回（不在封存范围内、哈希对不上）的交 None；算子按结论里记下的参数、阈值、现查结果算，不再现查、不读目录。
+
+    交回 {status, text, method, method_now?, fields?}：status 是 same（一致）/ different（不一致）/ failed（复算不了）；
+    text 是给人看的一句，证据面板、报告导出、可验证报告照它写。fields 是和封存的不同的那几项（结论的字段名）。
+
+    方法升过版（结论里记的 method 和现在的 contract.METHODS[(op, mode)] 不同）时 method_now 是现在的那一版：复算成立的照实写
+    复算结果同不同（方法版本那一项本来就不同，不算进去），现在的方法按封存的输入不成立（recompute 抛 CallError）的写明原因。
+    复算出错（输入取不回、调用的写法现在不认、出了意外）不往外抛，照实写「复算失败：原因」。"""
+    from app import analysis
+    from app.analysis.contract import METHODS, NOT_RECOMPUTED, CallError, same
+    from app.core.errors import describe_exception
+
+    method = str(result.get("method") or "")
+    now = METHODS.get((result.get("op"), result.get("mode")))
+    upgraded = isinstance(now, str) and now != method
+    out: dict[str, Any] = {"method": method, **({"method_now": now} if upgraded else {})}
+    head = f"运行时用的是 {method}，现在是 {now}" if upgraded else ""
+    try:
+        again = analysis.recompute(result, load, load_result=load_result)  # type: ignore[arg-type]
+    except CallError as e:
+        why = _recheck_reason(e)
+        text = f"{head}：现在的方法按封存的输入复算不了（{why}）" if upgraded else f"复算失败：{why}"
+        return {"status": "failed", **out, "text": text}
+    except Exception as e:  # noqa: BLE001 - 复算出了意外：照实说复算不了，不能让证据面板、导出跟着出错
+        return {"status": "failed", **out, "text": f"复算失败：{describe_exception(e)}"}
+    if not isinstance(again, dict):
+        return {"status": "failed", **out, "text": "复算失败：复算没有交回结论"}
+    ok = same({**result, "method": now} if upgraded else result, again)
+    skip = NOT_RECOMPUTED | ({"method"} if upgraded else set())
+    fields = sorted(k for k in set(result) | set(again) if k not in skip and result.get(k) != again.get(k))
+    out["status"] = "same" if ok else "different"
+    if upgraded:
+        out["text"] = f"{head}，复算结果{'相同' if ok else '不同'}"
+    elif ok:
+        out["text"] = "复算一致：按封存的输入重新计算，结论逐项相同"
+    else:
+        named = "、".join(dict.fromkeys(_RESULT_FIELDS.get(k, k) for k in fields))
+        out["text"] = f"复算不一致：{named}和封存的不同"
+    if fields:
+        out["fields"] = fields
+    return out
+
+
+#: 变化拆解结果表里不是「段」的那几列（细案 01 §2：可加、乘积两种模式的数列和说明列）
+_DECOMPOSE_NUMBERS = ("base", "target", "delta", "pct", "share", "contrib", "flag")
+
+
+def _decompose_row(result: dict[str, Any]) -> tuple[str, list[Any]] | None:
+    """变化拆解的结果表里判定点名的那一段：(这一段的叫法, 那一行)。段按维度列（params.by；乘积模式是 factor 一列）对
+    verdict.subjects 的第一项，对不上就取第一行（结果表按变化的绝对值从大到小排）。维度值和叫法都按算子写段的同一个函数
+    （app.analysis.phrases.key_text：空值写「（空）」、布尔写「是 / 否」，两列用「·」连）：subjects 就是这么写的，拿原值的
+    str 去比，空值、布尔维度的段对不上，代入式会退回第一行。"""
+    from app.analysis.phrases import key_text
+
+    table = result.get("table") if isinstance(result.get("table"), dict) else {}
+    rows = [r for r in table.get("rows") or [] if isinstance(r, list)]
+    columns = [str(c) for c in table.get("columns") or []]
+    if not rows:
+        return None
+    params = result.get("params") if isinstance(result.get("params"), dict) else {}
+    by = ["factor"] if result.get("mode") == "factor" else params.get("by")
+    by = [str(b) for b in (by if isinstance(by, list) else [by] if by else []) if str(b) in columns]
+    if not by:
+        by = [c for c in columns if c not in _DECOMPOSE_NUMBERS][:1]
+    at = [columns.index(b) for b in by]
+    verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else {}
+    subjects = verdict.get("subjects") or []
+    picked = rows[0]
+    if subjects and at and isinstance(subjects[0], list):
+        wanted = [str(v) for v in subjects[0]]
+        picked = next((row for row in rows if [key_text([row[i]]) for i in at if i < len(row)] == wanted), rows[0])
+    name = key_text([picked[i] for i in at if i < len(picked)]) if at else ""
+    return name or "这一段", picked
+
+
+def _paren(text: str) -> str:
+    """代入式里减号、除号后面的负数加括号：「30.0% − （-1.0%）」。"""
+    return f"（{text}）" if text.startswith("-") else text
+
+
+def analysis_formulas(result: dict[str, Any]) -> list[dict[str, str]]:
+    """出处链「计算」一步里关键数的代入式：[{label, text}]，数照单元格的规则渲染（系统写的，不是模型写的）。只给拿结论里
+    记下的数就写得出来的几条：
+
+    - 变化拆解（可加、乘积）：总变化、变化率、点名那一段（因子）的占比——「华东的占比 = 华东的变化 ÷ 总变化 = -120 ÷
+      （-194） = 61.9%」，乘积模式按那个因子的贡献
+    - 变化拆解（比率）：结构效应、自身效应各占比率变化的多少
+    - 波动基线：常规波动范围、稳健 z（按变化率比的，几个数按百分比写）
+
+    量按单元格的规则写（千分位，小数照值本来的样子）；百分比同判定语的写法（app.analysis.phrases.pct：一位小数，不是 0 的值
+    写出来成了 0.0% 的多给小数位）。缺了哪个数、渲染不出来的那条不给，不编。趋势、差异检验、可比性检查的数在结果表和具名的数
+    里，不另写代入式。"""
+    from app.analysis.phrases import pct
+
+    values = result.get("values") if isinstance(result.get("values"), dict) else {}
+    settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
+    params = result.get("params") if isinstance(result.get("params"), dict) else {}
+    op, mode = result.get("op"), result.get("mode")
+    out: list[dict[str, str]] = []
+
+    def add(label: str, build: Callable[[], str]) -> None:
+        try:
+            out.append({"label": label, "text": build()})
+        except (KeyError, IndexError, ValueError, TypeError, RenderError):
+            pass                                        # 缺一个数、渲染不出来：这条不给，不编
+
+    def cell(raw: Any, conv: str | None = None) -> str:
+        return pct(raw, signed=False) if conv == "pct" else render_cell(raw)
+
+    if result.get("status") != "ok":
+        return out
+    if op == "decompose" and mode in ("additive", "factor"):
+        add("总变化", lambda: f"总变化 = 本期合计 − 基期合计 = {cell(values['target_total'])} − "
+                           f"{_paren(cell(values['base_total']))} = {cell(values['delta_total'])}")
+        add("变化率", lambda: f"变化率 = 总变化 ÷ 基期合计 = {cell(values['delta_total'])} ÷ "
+                           f"{_paren(cell(values['base_total']))} = {cell(values['pct_total'], 'pct')}")
+        table = result.get("table") if isinstance(result.get("table"), dict) else {}
+        columns = [str(c) for c in table.get("columns") or []]
+        part = "contrib" if mode == "factor" else "delta"
+        found = _decompose_row(result)
+        if found is not None and {part, "share"} <= set(columns):
+            name, row = found
+            word = "贡献" if mode == "factor" else "变化"
+            add("占比", lambda: f"{name}的占比 = {name}的{word} ÷ 总变化 = {cell(row[columns.index(part)])} ÷ "
+                              f"{_paren(cell(values['delta_total']))} = {cell(row[columns.index('share')], 'pct')}")
+    elif op == "decompose" and mode == "ratio":
+        for part, label in (("mix", "结构效应"), ("rate", "自身效应")):
+            add(f"{label}占比", lambda part=part, label=label: (
+                f"{label}占比 = {label}合计 ÷ 比率的变化 = {cell(values[f'{part}_total'])} ÷ "
+                f"{_paren(cell(values['delta']))} = {cell(values[f'{part}_share'], 'pct')}"))
+    elif op == "baseline":
+        conv = "pct" if params.get("basis") == "change" else None
+        add("常规波动范围", lambda: (
+            f"常规波动范围 = 中位数 ± {settings['k_warn']:g} 倍稳健标准差 = {cell(values['band_lo'], conv)} 至 "
+            f"{cell(values['band_hi'], conv)}（中位数 {cell(values['median'], conv)}，"
+            f"过去 {cell(values['n_history'])} 期）"))
+        add("稳健 z", lambda: f"稳健 z = （本期 − 中位数）÷ 稳健标准差 = （{cell(values['x'], conv)} − "
+                             f"{_paren(cell(values['median'], conv))}）÷ 稳健标准差 = {cell(values['z'])}")
+    return out
 
 
 # --------------------------------------------------------------------------

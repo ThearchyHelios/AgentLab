@@ -25,7 +25,7 @@ from app.main import app
 from app.seed import TEMPLATES
 
 #: 报告撰写节点在受管模板里要写明的三项
-STRICT = {"numbers": "strict", "on_violation": "fail", "claims": "require_citation"}
+STRICT = {"numbers": "strict", "on_violation": "fail", "claims": "require_citation", "analysis_claims": "strict"}
 
 G_CODES = {
     "governed.report_from_required", "governed.exit_text_source", "governed.text_bypass",
@@ -277,7 +277,7 @@ def test_a_looser_setting_is_named(key, value):
 
 def test_graph_defaults_count_like_they_do_at_run_time():
     graph = traceable(report={"claims": "require_citation"})
-    graph["defaults"] = {"numbers": "strict", "on_violation": "fail"}
+    graph["defaults"] = {"numbers": "strict", "on_violation": "fail", "analysis_claims": "strict"}
     assert by_code(graph, "governed.report_policy") == []
     graph["defaults"]["on_violation"] = "flag"
     assert [i.field for i in by_code(graph, "governed.report_policy")] == ["on_violation"]

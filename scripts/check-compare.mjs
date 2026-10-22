@@ -180,6 +180,28 @@ const NOTE = '基准运行中「退货明细」的查询结果已截断（只保
 /** 以更早的一次（B2）为基准时多一条说明：换基准、过时答复的检查靠它认出页面上是哪一份 */
 const NOTE_B2 = '以更早的一次运行为基准'
 
+/**
+ * 分析卡（分析能力一轮，engine/compare._analyses）：两次运行的分析卡按节点和项的标识对齐。形状照服务端真算出来的（用
+ * tests/fixtures/compare_runs 的虚构周报加分析卡的 analysis.end 跑 compare.compare）：判定变了两项、判定一样判定语的数变了
+ * 一项、这次新增（算不了）一项、这次没有一项
+ */
+const side = (verdict, direction, phrase, status = 'ok', item = '') => ({ status, verdict, direction, phrase, artifact: `art-${item}-${verdict}` })
+const ANALYSES = [
+  { node_id: 'insight', title: '异动分析', item: 'wow', op: 'baseline', mode: null, change: 'verdict',
+    base: side('within_band', 'down', '销售额下降 3.1%，在过去 8 周的常规波动范围内（-6.2% 至 5.8%）', 'ok', 'wow'),
+    target: side('outside_band', 'down', '销售额下降 9.8%，超出过去 8 周的常规波动范围（-6.2% 至 5.8%）', 'ok', 'wow') },
+  { node_id: 'insight', title: '异动分析', item: 'where', op: 'decompose', mode: 'additive', change: 'verdict',
+    base: side('driver', 'down', '销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）', 'ok', 'where'),
+    target: side('dispersed', 'down', '销售额下降 120（-4.5%），分散在各地区，没有哪一段占到一半', 'ok', 'where') },
+  { node_id: 'insight', title: '异动分析', item: 'trend', op: 'trend', mode: null, change: 'phrase',
+    base: side('rising', 'up', '过去 8 周线上销售额呈上升趋势（每周约 2.1%）', 'ok', 'trend'),
+    target: side('rising', 'up', '过去 8 周线上销售额呈上升趋势（每周约 2.4%）', 'ok', 'trend') },
+  { node_id: 'insight', title: '异动分析', item: 'refund', op: 'differ', mode: 'rate', change: 'added', base: null,
+    target: side(null, null, '差异检验没有做成：两组各只有 1 个样本，拿不到 p 值', 'refused', 'refund') },
+  { node_id: 'insight', title: '异动分析', item: 'gone', op: 'comparable', mode: null, change: 'removed',
+    base: side('comparable', null, '两期可比', 'ok', 'gone'), target: null },
+]
+
 function comparison(target, base) {
   return { target: refOf(target), base: refOf(base), summary: SUMMARY, template: TEMPLATE, metrics: METRICS, queries: QUERIES,
     notes: base === B2 ? [NOTE, NOTE_B2] : [NOTE] }
@@ -1416,6 +1438,39 @@ const overflow = (page) => page.evaluate(() => {
     return b.width > 0 && b.right > r.right + 1 && !el.closest('[data-compare-scroll]')
   }).map((el) => el.tagName + (el.getAttribute('data-compare-run') ?? ''))
   return { root: root.scrollWidth - root.clientWidth, right: Math.round(r.right - innerWidth), wide: wide.slice(0, 3) }
+})
+
+await section('分析卡：两次的判定按节点和分析项对齐，变了没有照服务端', async () => {
+  const { page, errors } = await open(comparePath(T, B), { compare: (t, b) => ({ json: { ...comparison(t, b), analyses: ANALYSES } }) })
+  await settled(page)
+  const box = page.locator('[data-compare-analyses]')
+  check('分析卡一区：标题、项数、说明（只列判定，不拆变化来源）', (await box.innerText().catch(() => '')).includes('分析卡')
+    && (await box.innerText()).includes('不拆变化来源'), (await box.innerText().catch(() => '')).slice(0, 80))
+  const rows = box.locator('[data-compare-analysis]')
+  check('一项一行，先后照服务端', JSON.stringify(await rows.evaluateAll((els) => els.map((e) => e.dataset.compareAnalysis)))
+    === JSON.stringify(ANALYSES.map((a) => `${a.node_id}:${a.item}`)))
+  const row = (item) => box.locator(`[data-compare-analysis="insight:${item}"]`)
+  const wow = (await row('wow').innerText()).replace(/\s+/g, ' ')
+  check('判定变了：写「判定变了」，两边的判定语照原样', wow.includes('判定变了') && wow.includes('在过去 8 周的常规波动范围内')
+    && wow.includes('超出过去 8 周的常规波动范围'), wow)
+  check('……标题写分析卡的名字和项的标识、算子的叫法（契约）', wow.includes('异动分析 · wow') && wow.includes('波动基线')
+    && (await row('where').innerText()).includes('变化拆解（可加）'))
+  check('判定一样、判定语里的数变了', (await row('trend').innerText()).includes('判定一致，判定语里的数变了'))
+  const added = (await row('refund').innerText()).replace(/\s+/g, ' ')
+  check('这次新增的一项：基准一边写「—」，算不了的判定语照原样', added.includes('这次新增') && added.includes('—')
+    && added.includes('差异检验没有做成'), added)
+  check('这次没有的一项', (await row('gone').innerText()).includes('这次没有'))
+  check('……变化的说法用服务端的代码挑（data-change）', JSON.stringify(await rows.evaluateAll((els) => els.map((e) => e.dataset.change)))
+    === JSON.stringify(ANALYSES.map((a) => a.change)))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  // 老服务端、两次都没有分析卡：不画这一区
+  const old = await open(comparePath(T, B))
+  await settled(old.page)
+  check('没有分析卡（老服务端没有这一项）：不画这一区', await old.page.locator('[data-compare-analyses]').count() === 0)
+  const narrow = await open(comparePath(T, B), { width: 390, height: 900, compare: (t, b) => ({ json: { ...comparison(t, b), analyses: ANALYSES } }) })
+  await settled(narrow.page)
+  const o = await overflow(narrow.page)
+  check('窄屏：分析卡一区不撑出横向滚动', o.root <= 0 && o.right <= 0, JSON.stringify(o))
 })
 
 await section('窄屏', async () => {

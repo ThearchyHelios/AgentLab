@@ -131,6 +131,31 @@ const MERGE_GRAPH = {
     edge('q_visits', 'merge'), edge('think', 'merge'), edge('merge', 'done')],
 }
 
+// 分析卡（分析能力一轮）：整体周销售、按地区两周各查一次，分析卡做两项（波动基线、按地区的变化拆解，带总数核对），报告引用它的
+// 结论。上游另有一个模型调用节点，检查器的输入下拉里不该有它。全是虚构零售库的通用名
+const TOTALS_SQL = 'SELECT week, SUM(amount) AS gmv FROM orders GROUP BY week ORDER BY week'
+const REGION_SQL = 'SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week'
+const ANALYSIS_GRAPH = {
+  nodes: [
+    node('start', 'input', 0, 200, '输入', { fields: [{ name: 'week', required: true }] }),
+    node('weekly', 'tool', 300, 60, '整体周销售', { tool: 'db_query__shop', args: { sql: TOTALS_SQL } }),
+    node('by_region', 'tool', 300, 220, '按地区两周', { tool: 'db_query__shop', args: { sql: REGION_SQL } }),
+    node('think', 'llm', 300, 400, '先想一想', { prompt: '{{ input.week }}' }),
+    node('card', 'analysis', 640, 200, '异动分析', {
+      items: [
+        { id: 'wow', op: 'baseline', from: 'weekly', params: { period: 'week', measure: 'gmv', label: '销售额' } },
+        { id: 'where', op: 'decompose', mode: 'additive', from: 'by_region', hypothesis: '下降是不是集中在某个地区',
+          params: { by: ['region'], period: 'week', base: '2026-W41', target: '2026-W42', measure: 'gmv',
+                    headline: { base: 'weekly.r0.gmv', target: 'weekly.r1.gmv' }, label: '销售额' } },
+      ],
+    }),
+    node('write', 'report', 980, 200, '写周报', { instructions: '写本周销售的异动' }),
+    node('done', 'output', 1300, 200, '成果', { fields: [{ name: 'answer', value: '{{ nodes.write.text }}' }] }),
+  ],
+  edges: [edge('start', 'weekly'), edge('start', 'by_region'), edge('start', 'think'), edge('weekly', 'card'),
+    edge('by_region', 'card'), edge('think', 'card'), edge('card', 'write'), edge('write', 'done')],
+}
+
 const wf = (id, extra) => ({
   id, name: extra.name, description: extra.description ?? '检查脚本伪造的工作流', graph: extra.graph ?? GRAPH,
   tags: extra.tags ?? [], version: extra.version ?? 3, is_template: !!extra.is_template,
@@ -147,6 +172,7 @@ const FAKES = {
   'st-lint': wf('st-lint', { name: '__studio_check_lint__', graph: TEAM_GRAPH, version: 1 }),
   'st-ev': wf('st-ev', { name: '__studio_check_ev__', graph: EV_GRAPH, version: 2 }),
   'st-merge': wf('st-merge', { name: '__studio_check_merge__', graph: MERGE_GRAPH, version: 1 }),
+  'st-analysis': wf('st-analysis', { name: '__studio_check_analysis__', graph: ANALYSIS_GRAPH, version: 1 }),
 }
 const VERSIONS = [
   { id: 'v3', version: 3, note: '', created_at: '2026-09-26T02:00:00Z' },
@@ -819,6 +845,14 @@ await section('窄屏：次要按钮收进「更多」、助手栏默认收起�
   check('768 宽、两枚芯片都在时：工具栏上没有互相压着的控件', bar.overlaps.length === 0, bar.overlaps.join('、'))
   check('768 宽：最右的控件也在视口里、工具栏不溢出', bar.right <= bar.vw && bar.sw <= bar.cw, JSON.stringify({ right: bar.right, vw: bar.vw, sw: bar.sw, cw: bar.cw }))
   check('768 宽：运行和收起助手栏都露在外面', bar.names.includes('运行') && bar.names.some((n) => n.includes('助手栏')), bar.names.join(' '))
+
+  // 改名那个小铅笔收起来了（768 宽挤不下）：改名还在「切换工作流」的列表里
+  check('768 宽：工具栏上看不到改名的图标（挤不下）', !bar.names.some((n) => n.includes('重命名')), bar.names.join(' '))
+  await page.locator('button[title^="切换、新建"]').click()
+  await page.waitForTimeout(250)
+  check('……改名在「切换工作流」的列表里照样有', await count(page, '[role="listbox"][aria-label="工作流"] [aria-label^="重命名"]') > 0)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(200)
 
   const more = page.getByRole('button', { name: '更多操作' })
   check('窄屏把次要按钮收进「更多操作」', await more.count() === 1 && await more.isVisible())
@@ -3140,6 +3174,206 @@ await section('受管工作流在画布上改过之后：页头、版本历史�
     delete FAKES['st-govs']
     delete FAKES['st-gova']
   }
+})
+
+// ================================================================ 分析卡
+await section('分析卡：叫法和服务端契约一字不差（算子、模式、阈值、字段、报告节点两个新字段的取值）', async () => {
+  // 叫法只有服务端契约一份（analysis/contract.py 的 OP_LABELS / MODE_LABELS / LABELS，engine/labels.py 引用它们）：界面上的
+  // 字和校验报错里的字不一样，人就找不到报错说的是哪一项。不开浏览器也能比，terms 借页面的模块加载
+  const py = readFileSync(new URL('../backend/app/analysis/contract.py', import.meta.url), 'utf8')
+  const dict = (name) => Object.fromEntries([...(py.match(new RegExp(`^${name}: dict\\[str, [^\\]]+\\] = \\{([\\s\\S]*?)^\\}`, 'm'))?.[1] ?? '')
+    .matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
+  const ranges = Object.fromEntries([...(py.match(/^RANGES: dict\[[^\]]+\]\] = \{([\s\S]*?)^\}/m)?.[1] ?? '')
+    .matchAll(/"([^"]+)":\s*\((float|int),\s*([\d._]+),\s*([\d._]+)\)/g)].map((m) => [m[1], [m[2], Number(m[3].replace(/_/g, '')), Number(m[4].replace(/_/g, ''))]]))
+  const labelsPy = readFileSync(new URL('../backend/app/engine/labels.py', import.meta.url), 'utf8')
+  const fieldBlock = labelsPy.match(/"analysis": \{([^}]*)\}/)?.[1] ?? ''
+  const fields = Object.fromEntries([...fieldBlock.matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
+  const opt = (key) => Object.fromEntries([...(labelsPy.match(new RegExp(`"${key}": \\{([^}]*)\\}`))?.[1] ?? '')
+    .matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
+  const top = Object.fromEntries([...(labelsPy.match(/^FIELD_LABEL: dict\[str, str\] = \{([\s\S]*?)^\}/m)?.[1] ?? '')
+    .matchAll(/"(analysis_claims|analysis_scope)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]))
+  const { ctx, page } = await open({ path: '/studio/st-analysis' })
+  const t = await page.evaluate(async () => {
+    const m = await window.__appImport('/src/lib/termsAnalysis.ts')
+    return { op: m.ANALYSIS_OP_LABEL, mode: m.ANALYSIS_MODE_LABEL, setting: m.ANALYSIS_SETTING_LABEL, range: m.ANALYSIS_SETTING_RANGE,
+             field: m.ANALYSIS_FIELD_LABEL, option: m.ANALYSIS_OPTION_LABEL, keys: m.ANALYSIS_SETTING_KEYS }
+  })
+  const same = (a, b) => JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort())
+  const diff = (a, b) => Object.keys({ ...a, ...b }).filter((k) => a[k] !== b[k]).map((k) => `${k}：${a[k]} ≠ ${b[k]}`).join('；')
+  check('从 contract.py 读出了 OP_LABELS、MODE_LABELS、LABELS、RANGES', Object.keys(dict('OP_LABELS')).length === 5
+    && Object.keys(dict('MODE_LABELS')).length === 6 && Object.keys(dict('LABELS')).length >= 17 && Object.keys(ranges).length >= 17)
+  check('算子的叫法和 OP_LABELS 一字不差', same(t.op, dict('OP_LABELS')), diff(t.op, dict('OP_LABELS')))
+  check('模式的叫法和 MODE_LABELS 一字不差', same(t.mode, dict('MODE_LABELS')), diff(t.mode, dict('MODE_LABELS')))
+  check('阈值的叫法和 LABELS 一字不差、键的先后同 DEFAULTS', same(t.setting, dict('LABELS'))
+    && t.keys.join(',') === Object.keys(dict('LABELS')).join(','), diff(t.setting, dict('LABELS')))
+  const r = Object.fromEntries(Object.entries(t.range).map(([k, v]) => [k, v.join(',')]))
+  const rp = Object.fromEntries(Object.entries(ranges).map(([k, v]) => [k, v.join(',')]))
+  check('阈值的范围和 RANGES 一致', same(r, rp), diff(r, rp))
+  check('分析卡字段的叫法同 engine/labels.py（分析项、阈值覆盖）', t.field.items === fields.items && t.field.overrides === fields.overrides,
+    JSON.stringify(fields))
+  check('报告节点两个新字段的叫法同 FIELD_LABEL', t.field.analysis_claims === top.analysis_claims && t.field.analysis_scope === top.analysis_scope,
+    JSON.stringify(top))
+  check('……取值的短说法同 _OPTION_LABEL', same(t.option.analysis_claims, opt('analysis_claims')) && same(t.option.analysis_scope, opt('analysis_scope')),
+    `${JSON.stringify(opt('analysis_claims'))} ${JSON.stringify(opt('analysis_scope'))}`)
+  await ctx.close()
+})
+
+await section('分析卡：节点库认得、卡片摘要、检查器按方法摆参数格、只列上游查询节点、阈值覆盖、服务端校验落到那一项、定位、连线带出输入', async () => {
+  const { page, errors } = await open({ path: '/studio/st-analysis' })
+  const entry = page.locator('[aria-label="节点库"] button[data-node-type="analysis"]')
+  check('节点库里有「分析卡」', await entry.count() === 1 && (await entry.innerText()).includes('分析卡'))
+  const card = page.locator('.react-flow__node[data-id="card"]')
+  const summary = (await card.innerText().catch(() => '')).replace(/\s+/g, ' ')
+  check('卡片摘要写做哪几种分析（契约的叫法）', summary.includes('波动基线、变化拆解（可加）'), summary.slice(0, 80))
+  const tint = await card.evaluate((el) => getComputedStyle(el.querySelector('.nt-analysis') ?? el).getPropertyValue('--nt').trim()).catch(() => '')
+  check('分析卡有自己的类型色（--nt-analysis）', !!tint, tint)
+
+  await S(page, () => window.__studio.getState().select('card'))
+  const box = page.locator('[data-inspector-sheet] [data-field="items"]')
+  await box.waitFor({ timeout: 4000 }).catch(() => {})
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((th) => document.documentElement.setAttribute('data-theme', th), theme)
+      await page.waitForTimeout(250)
+      await page.screenshot({ path: `${SHOTS}/studio-analysis-${theme}.png` })
+    }
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'))
+  }
+  const items = box.locator('[data-item]')
+  check('两项各一行，标识 wow、where', await items.count() === 2
+    && (await items.nth(0).locator('[data-sub="id"] input').inputValue()) === 'wow'
+    && (await items.nth(1).locator('[data-sub="id"] input').inputValue()) === 'where')
+  const ops = await items.nth(0).locator('[data-sub="op"] option:not([disabled])').allInnerTexts()
+  check('分析方法下拉是五个算子的叫法', ops.join('、') === '变化拆解、波动基线、趋势判断、差异检验、可比性检查', ops.join('、'))
+  check('波动基线没有模式；变化拆解有模式（可加 / 比率 / 乘积）', await items.nth(0).locator('[data-sub="mode"]').count() === 0
+    && (await items.nth(1).locator('[data-sub="mode"] option:not([disabled])').allInnerTexts()).join('、') === '可加、比率、乘积')
+  const from = await items.nth(1).locator('[data-sub="from"] option:not([disabled])').evaluateAll((els) => els.map((e) => e.value))
+  check('输入只列上游的查询节点，不列模型调用', from.sort().join(',') === 'by_region,weekly', from.join(','))
+  const params = await items.nth(1).locator('[data-analysis-params] [data-sub]').evaluateAll((els) => els.map((e) => e.dataset.sub))
+  check('可加拆解摆维度列、期次、基期、本期、度量列、度量的叫法', params.join(',') === 'params.by,params.period,params.base,params.target,params.measure,params.label',
+    params.join(','))
+  check('……多列用顿号写', (await items.nth(1).locator('[data-sub="params.by"] input').inputValue()) === 'region')
+  check('……总数核对两格照原样', (await items.nth(1).locator('[data-sub="params.headline.base"] input').inputValue()) === 'weekly.r0.gmv'
+    && (await items.nth(1).locator('[data-sub="params.headline.target"] input').inputValue()) === 'weekly.r1.gmv')
+  check('……在验证什么写在这一项上', (await items.nth(1).locator('[data-sub="hypothesis"] input').inputValue()) === '下降是不是集中在某个地区')
+  check('下游取判定的写法写在标识下面', (await items.nth(0).innerText()).includes('nodes.card.results.wow.verdict'))
+  const config = () => S(page, () => JSON.stringify(window.__studio.getState().nodes.find((n) => n.id === 'card')?.data.config))
+  const cfg = async () => JSON.parse(await config())
+
+  // 改模式：参数只留这种模式用得到的（度量列去掉，补分子、分母两格）
+  await items.nth(1).locator('[data-sub="mode"] select').selectOption('ratio')
+  await page.waitForTimeout(150)
+  const ratio = (await cfg()).items[1]
+  check('换成比率模式：度量列去掉，参数格换成分子、分母', ratio.mode === 'ratio' && !('measure' in ratio.params)
+    && await items.nth(1).locator('[data-sub="params.numerator"]').count() === 1, JSON.stringify(ratio.params))
+  await items.nth(1).locator('[data-sub="params.numerator"] input').fill('refunds')
+  await items.nth(1).locator('[data-sub="params.by"] input').fill('region、channel')
+  await page.waitForTimeout(150)
+  const typed = (await cfg()).items[1].params
+  check('……填的列写回配置（几列写成列表）', typed.numerator === 'refunds' && JSON.stringify(typed.by) === '["region","channel"]', JSON.stringify(typed))
+  // 换分析方法：基线换成趋势判断，基线才有的参数去掉
+  await items.nth(0).locator('[data-sub="op"] select').selectOption('trend')
+  await page.waitForTimeout(150)
+  const trend = (await cfg()).items[0]
+  check('换成趋势判断：留下期次列、度量列、叫法，输入不动', trend.op === 'trend' && trend.from === 'weekly'
+    && Object.keys(trend.params).sort().join(',') === 'label,measure,period', JSON.stringify(trend))
+  // 两份查询：基期、本期各选一个查询节点，期次三格不写
+  await items.nth(1).locator('[data-analysis-two]').check()
+  await page.waitForTimeout(150)
+  const two = (await cfg()).items[1]
+  check('勾「基期、本期是两份查询」：输入挪到基期查询，期次三格去掉', two.params.base_query === 'by_region' && !two.from
+    && !('period' in two.params) && await items.nth(1).locator('[data-sub="params.target_query"] select').count() === 1, JSON.stringify(two))
+  await items.nth(1).locator('[data-analysis-two]').uncheck()
+  await page.waitForTimeout(150)
+  check('……取消勾选：基期查询回到输入', (await cfg()).items[1].from === 'by_region')
+
+  // 添加一项：新标识不重名；变化拆解才能下钻，下钻的上一层只列排在前面的变化拆解
+  await box.locator('[data-analysis-add]').click()
+  await page.waitForTimeout(150)
+  const added = (await cfg()).items
+  check('添加分析项：标识 a3，还没选分析方法', added.length === 3 && added[2].id === 'a3' && !added[2].op, JSON.stringify(added[2]))
+  await items.nth(2).locator('[data-sub="op"] select').selectOption('decompose')
+  await page.waitForTimeout(150)
+  const parentOpts = await items.nth(2).locator('[data-sub="params.parent"] select option').evaluateAll((els) => els.map((e) => e.value))
+  check('……选了变化拆解：下钻的上一层可以选前面那一项拆解（where）', parentOpts.includes('where') && !parentOpts.includes('wow'), parentOpts.join(','))
+  await items.nth(2).locator('[data-sub="params.parent"] select').selectOption('where')
+  await items.nth(2).locator('[data-sub="params.parent"] input').fill('华东')
+  await page.waitForTimeout(150)
+  check('……下钻写成上一层的标识和那一段的维度值', JSON.stringify((await cfg()).items[2].params.parent) === '{"of":"where","key":["华东"]}',
+    JSON.stringify((await cfg()).items[2].params))
+  await items.nth(2).locator('[data-sub="id"] input').fill('wow')
+  await page.waitForTimeout(150)
+  check('标识和另一项重复：当场说明', (await items.nth(2).innerText()).includes('与另一项重复'))
+  await items.nth(2).locator('[data-sub="id"] input').fill('east')
+
+  // 阈值覆盖：从没写的里面选一项，范围当场说
+  const ov = page.locator('[data-inspector-sheet] [data-field="overrides"]')
+  check('没写覆盖时写明全部跟随设置', (await ov.innerText()).includes('跟随设置'))
+  await ov.locator('[data-analysis-add-override]').selectOption('main_share')
+  await page.waitForTimeout(150)
+  await ov.locator('[data-analysis-override="main_share"]').fill('0.95')
+  await page.waitForTimeout(150)
+  check('……超出范围当场说（说法同服务端）', (await ov.innerText()).includes('「主要来源」的占比要在 0.3 到 0.9 之间'), (await ov.innerText()).slice(0, 120))
+  await ov.locator('[data-analysis-override="main_share"]').fill('0.6')
+  await page.waitForTimeout(150)
+  check('……填对了写回成数', JSON.stringify((await cfg()).overrides) === '{"main_share":0.6}', JSON.stringify((await cfg()).overrides))
+  await ov.getByRole('button', { name: '删除阈值覆盖「「主要来源」的占比」' }).click()
+  await page.waitForTimeout(150)
+  check('……删掉最后一项：配置里不留空对象', (await cfg()).overrides === undefined, String((await cfg()).overrides))
+
+  // 服务端校验：参数里写了阈值、下钻的上一层排在后面——问题落在那一项的那一格下面（校验是真的服务端算的）
+  await S(page, () => {
+    const st = window.__studio.getState()
+    const n = st.nodes.find((x) => x.id === 'card')
+    const next = n.data.config.items.map((it) => (it.id === 'where' ? { ...it, params: { ...it.params, k_warn: 3 } } : it))
+    st.updateNode('card', { config: { ...n.data.config, items: next } })
+  })
+  await S(page, () => window.__studio.getState().validate())
+  await page.waitForTimeout(800)
+  const whereText = await items.nth(1).innerText()
+  check('参数里写了阈值：服务端的说法落在这一项下面', whereText.includes('阈值不写在分析项里'), whereText.slice(-160))
+  const r = await page.evaluate(async () => {
+    const m = await window.__appImport('/src/canvas/InspectorSheet.tsx')
+    window.__studio.getState().select(null)
+    await new Promise((res) => setTimeout(res, 100))
+    m.revealField('card', 'items[1].params.headline.target', { focus: true })
+    await new Promise((res) => setTimeout(res, 600))
+    const a = document.activeElement
+    return { at: a?.closest('[data-sub]')?.dataset.sub ?? null, value: (a && 'value' in a) ? a.value : null }
+  }).catch((e) => ({ error: e.message.split('\n')[0] }))
+  check('问题落在 items[1].params.headline.target：定位到那一格、光标落进去', r.at === 'params.headline.target' && r.value === 'weekly.r1.gmv',
+    JSON.stringify(r))
+  const r2 = await page.evaluate(async () => {
+    const m = await window.__appImport('/src/canvas/InspectorSheet.tsx')
+    m.revealField('card', 'items[2].params.parent.key', { focus: true })
+    await new Promise((res) => setTimeout(res, 600))
+    return document.activeElement?.closest('[data-sub]')?.dataset.sub ?? null
+  }).catch((e) => e.message.split('\n')[0])
+  check('……落到没有自己一格的子键（params.parent.key）：退到所在的那一块', r2 === 'params.parent', String(r2))
+
+  // 报告节点：分析说法核对缺省是「重写一次后标出」，分析范围在高级选项里
+  await S(page, () => window.__studio.getState().select('write'))
+  await page.waitForSelector('[data-inspector-sheet] [data-field="analysis_claims"]', { timeout: 4000 }).catch(() => {})
+  const claims = page.locator('[data-inspector-sheet] [data-field="analysis_claims"] select')
+  const shown = await claims.evaluate((el) => el.options[el.selectedIndex]?.textContent ?? '').catch(() => '')
+  check('报告节点「分析说法核对」没写时显示缺省（重写一次后标出）', shown.startsWith('重写一次后标出'), shown)
+  const opts = await claims.locator('option').allInnerTexts().catch(() => [])
+  check('……三个取值以服务端的短说法开头', opts.length === 3 && opts[1].startsWith('重写后仍有的计入缺口') && opts[2] === '不核对', opts.join(' | '))
+
+  // 连线带出输入：查询节点连到新拖进来的分析卡，第一项（还没选输入的）选上它；模型调用不算
+  const mid = await S(page, () => {
+    window.__studio.getState().addNode('analysis', { x: 640, y: 620 })
+    return window.__studio.getState().selectedId
+  })
+  const connect = (a, b) => S(page, ([x, y]) => window.__studio.getState().onConnect({ source: x, target: y, sourceHandle: 'out', targetHandle: null }), [a, b])
+  const firstFrom = () => S(page, (x) => window.__studio.getState().nodes.find((n) => n.id === x)?.data.config.items?.[0]?.from ?? '', mid)
+  await connect('think', mid)
+  check('新拖进来的分析卡带一项空的；模型调用连进来不算输入', await firstFrom() === '')
+  await connect('weekly', mid)
+  check('……查询节点连进来：那一项的输入选上它', await firstFrom() === 'weekly', await firstFrom())
+  await S(page, () => window.__studio.getState().undo())
+  check('……撤销连线时一起退回', await firstFrom() === '')
+  check('全程页面没有报错', errors.length === 0, errors.slice(0, 2).join('；'))
 })
 
 check('整个检查没有弹出原生 confirm / prompt', dialogs === 0, `${dialogs} 次`)

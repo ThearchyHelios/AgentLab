@@ -40,7 +40,7 @@
 
 ### 内置模板
 
-内置 9 个模板，从「最小问答」到「可追溯周报」。它们可以直接运行，也是各类节点用法的可执行文档。
+内置 11 个模板，从「最小问答」到「异动分析（可追溯）」。它们可以直接运行，也是各类节点用法的可执行文档。「⑨ 可追溯周报」和「⑪ 异动分析（可追溯）」拿来就能按受管级别发布：前者示范口径卡和按引用出具，后者示范分析卡——两次查询取数，分析卡判这一周的变化在不在常规波动范围内、主要来自哪个地区，报告只引用判定语（见[分析能力](analysis.md#分析卡)）。
 
 ## 节点类型
 
@@ -51,9 +51,9 @@
 | 执行 | `tool` `code` `merge` | 直接调用工具 / 沙箱内执行代码 / 合并几次查询的结果（跨库按键对齐） |
 | 控制 | `branch` `loop` `subgraph` | 条件或语义分支 / 遍历与条件循环 / 嵌套工作流 |
 | 上下文 | `memory` `retrieve` `transform` | 长期记忆读写 / 知识检索 / 数据整形 |
-| 把关 | `human` `validate` `metrics` | 人工介入 / Schema 校验与自动返工 / 口径卡 |
+| 把关 | `human` `validate` `metrics` `analysis` | 人工介入 / Schema 校验与自动返工 / 口径卡 / 分析卡（对上游查询结果固定做几项确定性分析） |
 
-`output` 节点按 JSON Schema 校验结构化成果，不合格时把错误交回模型自动返工。`metrics`（口径卡）和 `report`（报告撰写）见[证据与出具](evidence.md)；`merge`（合并查询）见[数据源](data-sources.md#跨库合并)。
+`output` 节点按 JSON Schema 校验结构化成果，不合格时把错误交回模型自动返工。`metrics`（口径卡）和 `report`（报告撰写）见[证据与出具](evidence.md)；`analysis`（分析卡）见[分析能力](analysis.md#分析卡)；`merge`（合并查询）见[数据源](data-sources.md#跨库合并)。
 
 ## 节点之间怎么传数据
 
@@ -125,7 +125,7 @@
 
 ## Agent 节点
 
-`agent` 节点是一个带工具的模型循环，能用哪些工具由节点上的白名单决定（见[工具](tools.md)）。配了 `output_schema` 的 agent 可以打开 `cite_fields`，让每个字段标出取自哪次查询的哪一格（见[证据与出具](evidence.md#取数链路)）。
+`agent` 节点是一个带工具的模型循环，能用哪些工具由节点上的白名单决定（见[工具](tools.md)）。配了 `output_schema` 的 agent 可以打开 `cite_fields`，让每个字段标出取自哪次查询的哪一格（见[证据与出具](evidence.md#取数链路)）。查库的 agent 可以再绑分析工具：拆变化、判异常、判趋势由平台按固定的方法和阈值算，判定语由系统写，报告引用它（见[Agent 的分析工具](analysis.md#agent-的分析工具)）。
 
 ### 护栏
 
@@ -186,7 +186,7 @@ Excel / CSV 作为数据源上传，会变成可以用 SQL 查的表；放进知
 
 - **G1** 带契约的出口，成果字段的文字只能来自报告撰写节点。
 - **G2** 模型写的文字不绕过报告撰写节点直接流进出口。
-- **G3** 报告撰写节点写明 `numbers: strict`、`on_violation: fail`、`claims: require_citation`（或 `judge`，并写预算）。
+- **G3** 报告撰写节点写明 `numbers: strict`、`on_violation: fail`、`claims: require_citation`（或 `judge`，并写预算）、`analysis_claims: strict`（分析说法核对设为严格，见[分析说法核对](analysis.md#分析说法核对)）。
 - **G4** 口径卡的输入不来自计算角色的沙箱代码。
 - **G5** 给口径卡供数的 agent 配 `output_schema` 并开 `cite_fields`。
 

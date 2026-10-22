@@ -26,6 +26,10 @@ wrong 错、scale 量纲不同（差 10 的整数次幂，比如元和万元、�
   没有数据」引用了地区那一格，说的仍是没有数据。
 - ask：期望反问：作答路径是反问才对。
 - text：文字要点，由裁判判（covered / partial / missing / unjudged），单列「模型判断」，不进准确率（评测-D4）。
+- contribution、verdict（分析期望，规则在 app/eval/judgements.py）：答案引用了判定对得上的分析结论（[[a:]]、[[v:A…]]、
+  [[table:A…]]、[[see:A…]]）是可追溯；没引用、但正文按说法表写对了是对但没引用；判定、来源、方向对不上，或者答成相反、
+  根本没做也没说是错；期望算不了的这一项不能评分。答案的分析结论从作答运行的台账（kind analysis）读，报告怎么引用了它们
+  从报告文档读；正文里有判断词的句子一并读出来（说法表按句子认）。
 
 **题目结论**（verdict）：路径不对（要答出数的题直接回答了、反问了、只建不跑、建图或运行失败）直接不通过、写明原因；
 必需的期望全是 traced / untraced 就通过，另报「可追溯通过」（全是 traced）；有 wrong / scale 的不通过；剩下的（有不能评分的、
@@ -34,8 +38,8 @@ wrong 错、scale 量纲不同（差 10 的整数次幂，比如元和万元、�
 
 **逐题的 E1**（sql_match）：产出答案的那条查询和期望的取数（SQL 题是期望 SQL，口径题是口径卡的取数节点）用口径账本同一个
 比对函数（ledger/match.compare_queries：先绑参数、再由 explain_sql_diff 判等价）比一次，给出等价与否和差在哪个方面（总方案
-X2：E1 只有一份实现）。哪条是产出答案的：答案引用了就是被引用的；没引用、只查了一条就是那一条（写明依据）；没引用、查了
-几条的不硬比（照实写没法对上是哪条，不计入 E1）。
+X2：E1 只有一份实现）。哪条是产出答案的：答案引用了就是被引用的（引用的是分析结论的，按它的输入找到查询，下钻的顺着上一层
+找下去）；没引用、只查了一条就是那一条（写明依据）；没引用、查了几条的不硬比（照实写没法对上是哪条，不计入 E1）。
 """
 from __future__ import annotations
 
@@ -52,7 +56,9 @@ logger = logging.getLogger(__name__)
 #: 评分规则的版本：规则改了就加一，结果里记着按哪一版评的，可以按新规则重评。
 #: 2：期望「没有数据」时引用文字格、空值格不算给了数；判错时「答案里的数」给配对上的那一格；答案没引用查询时逐题 E1
 #: 不硬比第一条查询
-SCORER_VERSION = 2
+#: 3：两种分析期望（贡献、判定）：引用了判定对得上的分析结论是可追溯，正文按说法表写对了是对但没引用；答案引用分析结论
+#: 时逐题 E1 按它的输入查询比（以前把结论的工件当查询，比不上）；分析结论的判定语不当成答案里的数
+SCORER_VERSION = 3
 
 OUTCOMES = ("traced", "untraced", "wrong", "scale", "ungradable")
 OUTCOME_LABEL = {"traced": "对且可追溯", "untraced": "对但没引用", "wrong": "错", "scale": "量纲不同",
@@ -115,15 +121,38 @@ def _masked_columns(snapshot: Mapping[str, Any]) -> set[str]:
     return {str(c) for c in snapshot.get("masked_at_query") or []}
 
 
+def _result_dims(result: Mapping[str, Any], locator: Mapping[str, Any]) -> dict[str, Any]:
+    """分析结论结果表的一格所在行的维度：记成文字的列（地区、期次、因子的叫法……）。结果表里的数一律是十进制字符串，
+    按列类型分，不按值的样子分；遮罩列不会出现在结果表里。"""
+    table = result.get("table") if isinstance(result.get("table"), Mapping) else {}
+    columns = [str(c) for c in table.get("columns") or []]
+    types = table.get("column_types") if isinstance(table.get("column_types"), Mapping) else {}
+    rows = table.get("rows") or []
+    row_index = locator.get("row")
+    dims: dict[str, Any] = {}
+    if isinstance(row_index, int) and 0 <= row_index < len(rows) and isinstance(rows[row_index], (list, tuple)):
+        row = rows[row_index]
+        dims = {c: row[i] for i, c in enumerate(columns) if i < len(row) and c != locator.get("column")
+                and row[i] is not None and types.get(c) != "number"}
+    return {"dims": dims, "masked": False}
+
+
 def _cell_facts(cite: Mapping[str, Any], catalog: Mapping[str, Any], cache: dict[str, Any]) -> dict[str, Any]:
-    """引用的一格：哪份快照、第几行哪一列、这一行的维度（非数值列）、是不是遮罩格。"""
+    """引用的一格：哪份快照、第几行哪一列、这一行的维度（非数值列）、是不是遮罩格。分析结论的结果表、具名的数也是这样的
+    一格（工件是那份结论）。"""
+    from app.analysis.contract import LEDGER_KIND, is_result
+
     entry = catalog.get(cite.get("alias") or "") or {}
     locator = cite.get("locator") or {}
     artifact = entry.get("artifact")
     out: dict[str, Any] = {"artifact": artifact, "row": locator.get("row"), "column": locator.get("column"), "dims": {}}
+    if locator.get("key"):
+        out["column"] = locator["key"]
     snapshot = _snapshot(artifact, cache)
     if snapshot is None:
         return out
+    if entry.get("kind") == LEDGER_KIND or is_result(snapshot):
+        return {**out, **_result_dims(snapshot, locator)}
     columns = [str(c) for c in snapshot.get("columns") or []]
     masked = _masked_columns(snapshot)
     out["masked"] = bool(snapshot.get("masked_whole")) or str(locator.get("column")) in masked
@@ -139,7 +168,11 @@ def _cell_facts(cite: Mapping[str, Any], catalog: Mapping[str, Any], cache: dict
 
 @dataclass
 class Answer:
-    """从封存的作答运行里读出来的答案（评分只看这些）。problem 不为空时整份答案读不了（封存核对不上、没有封存）。"""
+    """从封存的作答运行里读出来的答案（评分只看这些）。problem 不为空时整份答案读不了（封存核对不上、没有封存）。
+
+    analyses：作答运行台账里的分析结论（judgements.record_of 的形状：算子、判定类、点名的段、方向、判定语、输入；alias 是
+    报告文档目录里的编号，cited 记报告怎么引用了它：phrase 判定语、value 具名的数、cell 结果表的格、see 句末依据）。
+    sentences：正文里有判断词的句子（judgements.sentences_of_doc）。老结果的明细里没有这两项，按空读。"""
 
     run_id: str | None
     text: str = ""
@@ -151,18 +184,22 @@ class Answer:
     tier: str | None = None
     report: str | None = None
     problem: str | None = None
+    analyses: list[dict[str, Any]] = field(default_factory=list)
+    sentences: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"run_id": self.run_id, "text": self.text, "values": self.values, "bare": self.bare,
                 "queries": self.queries, "cited": self.cited, "stats": self.stats, "tier": self.tier,
-                "report": self.report, "problem": self.problem}
+                "report": self.report, "problem": self.problem, "analyses": self.analyses,
+                "sentences": self.sentences}
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> Answer:
         return cls(run_id=raw.get("run_id"), text=str(raw.get("text") or ""), values=list(raw.get("values") or []),
                    bare=list(raw.get("bare") or []), queries=list(raw.get("queries") or []),
                    cited=list(raw.get("cited") or []), stats=dict(raw.get("stats") or {}), tier=raw.get("tier"),
-                   report=raw.get("report"), problem=raw.get("problem"))
+                   report=raw.get("report"), problem=raw.get("problem"), analyses=list(raw.get("analyses") or []),
+                   sentences=list(raw.get("sentences") or []))
 
 
 def _output_text(output: Any) -> str:
@@ -180,11 +217,66 @@ def _output_text(output: Any) -> str:
     return "\n".join(parts)
 
 
+def _ledger_analyses(sealed: Any, cache: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """作答运行台账里的分析结论：{结论工件: judgements.record_of}。取不回、不是分析结论的跳过（证据面板照实说取不回）。"""
+    from app.analysis.contract import is_result
+    from app.eval.judgements import record_of
+
+    out: dict[str, dict[str, Any]] = {}
+    for artifact, info in (getattr(sealed, "analyses", None) or {}).items():
+        content = _snapshot(artifact, cache)
+        if is_result(content):
+            out[artifact] = record_of(content, artifact=artifact, info=info)
+    return out
+
+
+def _named_analyses(catalog: Mapping[str, Any], found: dict[str, dict[str, Any]],
+                    cache: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """报告文档目录里的分析结论编号 → 那一份（found 里的同一个对象，记上 alias）。目录里有、台账里没收的照工件补上。"""
+    from app.analysis.contract import LEDGER_KIND, is_result
+    from app.eval.judgements import record_of
+
+    out: dict[str, dict[str, Any]] = {}
+    for alias, entry in catalog.items():
+        if not isinstance(entry, Mapping) or entry.get("kind") != LEDGER_KIND or not entry.get("artifact"):
+            continue
+        artifact = str(entry["artifact"])
+        if artifact not in found:
+            content = _snapshot(artifact, cache)
+            if not is_result(content):
+                continue
+            found[artifact] = record_of(content, artifact=artifact, info={"inputs": entry.get("inputs")})
+        record = found[artifact]
+        record.setdefault("alias", str(alias))
+        out[str(alias)] = record
+    return out
+
+
+def _query_inputs(record: Mapping[str, Any], found: Mapping[str, Mapping[str, Any]], queries: Mapping[str, Any],
+                  seen: set[str] | None = None) -> list[str]:
+    """一份分析结论的输入里的查询快照（逐题 E1 拿它们当产出答案的查询）：下钻的顺着上一层的结论找下去。"""
+    seen = seen if seen is not None else set()
+    out: list[str] = []
+    for artifact in record.get("inputs") or []:
+        if artifact in queries:
+            out.append(artifact)
+        elif artifact in found and artifact not in seen:
+            seen.add(artifact)
+            out += _query_inputs(found[artifact], found, queries, seen)
+    return out
+
+
+def _cited_as(record: dict[str, Any], how: str) -> None:
+    if how not in record["cited"]:
+        record["cited"].append(how)
+
+
 async def read_answer(run_id: str | None, *, reply: str | None = None) -> Answer:
     """读一次作答运行的答案。没有运行（直接回答、反问）的只有原文：reply。"""
     from fastapi import HTTPException
 
     from app.api.evidence import _choose, _reports, _sealed
+    from app.eval import judgements
 
     if not run_id:
         text = reply or ""
@@ -209,6 +301,7 @@ async def read_answer(run_id: str | None, *, reply: str | None = None) -> Answer
                                "columns": [str(c) for c in snap.get("columns") or []],
                                "row_count": snap.get("row_count", len(rows)), "truncated": bool(snap.get("truncated")),
                                "role": snap.get("role")})
+    found = _ledger_analyses(sealed, cache)
     from app.db.base import SessionLocal
     from app.db.models import Run
 
@@ -222,6 +315,8 @@ async def read_answer(run_id: str | None, *, reply: str | None = None) -> Answer
     if chosen is None or chosen.doc is None or chosen.hash_ok is False:
         answer.text = _output_text(final)
         answer.bare = _numbers(answer.text)
+        answer.analyses = list(found.values())
+        answer.sentences = judgements.sentences_of_text(answer.text)
         if chosen is not None and chosen.hash_ok is False:
             answer.problem = "报告文档与哈希不一致，疑似被修改，答案不能当证据"
         return answer
@@ -230,11 +325,22 @@ async def read_answer(run_id: str | None, *, reply: str | None = None) -> Answer
     answer.report = chosen.node_id
     answer.text = str(doc.get("markdown") or "")
     answer.stats = dict(doc.get("stats") or {})
-    from app.engine.evidence import iter_segments
+    from app.engine.evidence import iter_segments, iter_units
 
+    named = _named_analyses(catalog, found, cache)
     cited: list[str] = []
     for seg in iter_segments(doc):
         cite = seg.get("cite") or {}
+        record = named.get(str(cite.get("alias") or "")) if cite.get("status") == "resolved" else None
+        if record is not None:
+            # 引用了分析结论：判定语（[[a:A1]]）、具名的数（[[a:A1.键]]）、结果表的格（[[v:A1.r0.列]]、[[table:A1 …]]）。
+            # 产出答案的查询是它的输入（逐题 E1）；判定语是一句话，不是答案里的数
+            how = "cell" if cite.get("kind") == "cell" else "value" if (cite.get("locator") or {}).get("key") \
+                else "phrase"
+            _cited_as(record, how)
+            cited += _query_inputs(record, found, sealed.queries)
+            if how == "phrase":
+                continue
         if cite.get("role") == "value" and cite.get("status") == "resolved":
             item: dict[str, Any] = {"value": cite.get("value"), "kind": cite.get("kind"), "text": seg.get("text"),
                                     "segment": seg.get("id"), "alias": cite.get("alias")}
@@ -244,11 +350,19 @@ async def read_answer(run_id: str | None, *, reply: str | None = None) -> Answer
             else:
                 item.update(_cell_facts(cite, catalog, cache))
             answer.values.append(item)
-            if item.get("artifact"):
+            if item.get("artifact") and record is None:
                 cited.append(item["artifact"])
         elif seg.get("issue") == "uncited_number" or (seg.get("kind") == "number" and not cite):
             answer.bare += _numbers(str(seg.get("text") or ""))
+    for _, unit in iter_units(doc):
+        for support in unit.get("see") or []:
+            record = named.get(str(support.get("alias") or "")) if support.get("status") == "resolved" else None
+            if record is not None:
+                _cited_as(record, "see")
+                cited += _query_inputs(record, found, sealed.queries)
     answer.cited = list(dict.fromkeys(cited))
+    answer.analyses = list(found.values())
+    answer.sentences = judgements.sentences_of_doc(doc, named)
     return answer
 
 
@@ -513,6 +627,10 @@ def _expectation_scores(expectations: Sequence[Mapping[str, Any]], values: Mappi
             out.append({**base, **_score_set(exp, gold, answer, cache)})
         elif kind == "none":
             out.append({**base, **_score_none(answer)})
+        elif kind in ("contribution", "verdict"):
+            from app.eval import judgements
+
+            out.append({**base, **judgements.score(exp, gold, answer)})
     return out
 
 

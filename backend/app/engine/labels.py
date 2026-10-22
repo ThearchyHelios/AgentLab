@@ -15,13 +15,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.analysis.contract import MODE_LABELS, MODES, OP_LABELS
+
 #: 节点类型的叫法，和前端 lib/terms.ts 的 NODE_TYPE_LABEL 一致
 TYPE_LABEL: dict[str, str] = {
     "input": "输入", "output": "成果", "llm": "模型调用", "agent": "Agent",
     "supervisor": "多 Agent 协作", "tool": "调用工具", "code": "沙箱代码", "merge": "合并查询",
     "branch": "条件分支", "loop": "循环", "subgraph": "子工作流",
     "memory": "长期记忆", "retrieve": "知识检索", "transform": "数据整形",
-    "human": "人工审批", "validate": "结构校验", "metrics": "口径卡", "report": "报告撰写",
+    "human": "人工审批", "validate": "结构校验", "metrics": "口径卡", "analysis": "分析卡", "report": "报告撰写",
     "dual_check": "双盲复算", "challenge": "反方审稿",
 }
 
@@ -59,6 +61,8 @@ FIELD_LABEL: dict[str, str] = {
     "instructions": "写作要求", "metrics_from": "指标来自", "numbers": "未引用的数字",
     "on_violation": "重写后仍有违规时", "max_repairs": "最多重写次数", "claims": "未附依据的结论句",
     "judge": "结论句裁判", "entities": "表名、字段名",
+    # 分析能力一轮：判断词要挂对应的分析结论（engine/analysis_claims）、文档末尾系统写的分析范围（engine/analysis_scope）
+    "analysis_claims": "分析说法核对", "analysis_scope": "分析范围",
     # 口径卡
     "caliber_from": "口径卡来源", "caliber": "口径名称", "caliber_version": "口径版本",
     "metrics": "指标定义", "on_missing": "缺输入时",
@@ -99,9 +103,15 @@ _FIELD_BY_TYPE: dict[str, dict[str, str]] = {
               "stop_on_reject": "驳回即终止运行"},
     "validate": {"source": "待校验内容", "fail_fast": "校验失败即中断"},
     "merge": {"inputs": "输入", "sql": "合并 SQL"},
+    "analysis": {"items": "分析项", "overrides": "阈值覆盖"},
     "dual_check": DUAL_CHECK_FIELD_LABEL,
     "challenge": CHALLENGE_LABEL,
 }
+
+#: 分析卡一项里的分析方法、模式的叫法：只引用 app/analysis/contract.py 的 OP_LABELS / MODE_LABELS（按 MODES 分到各算子），
+#: 不另写一份；前端分析卡的表单照这一份
+ANALYSIS_OP_LABEL: dict[str, str] = OP_LABELS
+ANALYSIS_MODE_LABEL: dict[str, dict[str, str]] = {op: {m: MODE_LABELS[m] for m in modes} for op, modes in MODES.items()}
 
 #: 出具契约里的键（canvas/issues.ts 的 CONTRACT_KEYS、SUB_KEYS）
 CONTRACT_KEY_LABEL: dict[str, str] = {
@@ -123,6 +133,8 @@ _OPTION_LABEL: dict[str, dict[str, str]] = {
     "on_violation": {"flag": "正常产出，并标注违规之处", "fail": "判为失败"},
     "claims": {"off": "不参与出具判档", "require_citation": "计入缺口", "judge": "计入缺口并由模型逐句判断"},
     "entities": {"link": "核对", "off": "不核对"},
+    "analysis_claims": {"off": "不核对", "check": "重写一次后标出", "strict": "重写后仍有的计入缺口"},
+    "analysis_scope": {"auto": "有分析结论时附上", "off": "不附"},
     "evidence_role": {"source": "取数", "compute": "计算"},
     "on_uncited": {"ignore": "仅标注，不计入缺口", "degrade": "计入缺口、出具降档", "withhold": "不予出具"},
     "on_unsupported": {"degrade": "出具降档", "withhold": "不予出具"},

@@ -7,14 +7,16 @@ app/chat/job.py），生成过程是 api/copilot.answer_ops，几个「决定」
     answer_ops → final.next（chat/turn.next_step）→ launch_run(origin=eval) → 等终态 → review_of_run → 要的话带原图重来一次
 
 - 生成：问法就是 instruction，intent=answer，限定的数据源同题目；助手模型按变体覆盖（GenerateIn.provider / model，挑表、
-  复核跟着换）；读哪份目录按变体（answer_ops 的 catalog_view，查看的表详情、自查的 SQL 检查器都按它）。
+  复核跟着换）；读哪份目录按变体（answer_ops 的 catalog_view，查看的表详情、自查的 SQL 检查器都按它）；分析工具开不开按
+  变体（answer_ops 的 analysis_tools，经 TurnDriver 透传：关的那一臂工具清单不列分析工具，节点手册不讲分析卡）。
 - 结局：reply 直接回答、asked 反问、fail 判失败（建图失败）、ready 只建不跑、retry（老服务端那条路：没自查过的图带着原因
   重来一次）、run 运行。生成过程交出 error（助手本轮未完成）、开流前就拒绝（模型没配好、数据源不在）都是建图失败，另记
   「助手调用失败」——连续几题都这样就止损（runner.py）；只有生成过程一个操作都没给（只写了思考，error.next=retry）时按
   同一个规矩先带着原因重来一次，还不行才记建图失败。每次重来的原因照实记在 retries。
 - 运行：fill_input 填入口字段（单轮，history 为空），来源 eval，名字「评测：题集名·第 n 题」，选项带目录视图（Run.options
   的 catalog_view：运行时的 db_schema、冻结快照、自查都按它）、只读和遮罩（同使用者的问数据运行：评测页会显示答案里的数，
-  遮罩值不能从这里露出来；评测不写业务库）。写作模型按变体写进图的 defaults：节点自己点了模型的不覆盖，照实记在
+  遮罩值不能从这里露出来；评测不写业务库），有分析期望的题集另带这次评测的分析设置快照（判定用的阈值和算期望同一份）。
+  写作模型按变体写进图的 defaults：节点自己点了模型的不覆盖，照实记在
   own_models。
 - 终态：停在审批上（危险工具、人工节点）的直接取消、记「评测不代批」；被驳回的（cancelled + end_reason=rejected，总方案
   X9）记路径「被驳回」，不算运行失败；失败、被停止记运行失败。
@@ -68,6 +70,10 @@ class TurnContext:
     writer: Mapping[str, Any] = field(default_factory=dict)
     #: 目录视图（Run.options['catalog_view'] 的形状）
     view: Mapping[str, Any] | None = None
+    #: 这次评测的分析设置快照（有分析期望的题集才有）：作答的运行按它判（Run.options['analysis']），和算期望同一份
+    analysis: Mapping[str, Any] | None = None
+    #: 变体：分析工具开不开（variants.analysis_tools）。关的那一臂建图时助手看不到分析工具（TurnDriver 的 analysis_tools）
+    analysis_tools: bool = True
 
 
 async def writer_usage(run_ids: list[str]) -> dict[str, Any]:
@@ -116,14 +122,18 @@ def with_writer(graph: dict[str, Any], writer: Mapping[str, Any]) -> tuple[dict[
     return out, own
 
 
-def _options(view: Mapping[str, Any] | None) -> dict[str, Any]:
-    """作答运行带的选项：目录视图、只读、遮罩（见模块说明）。"""
+def _options(view: Mapping[str, Any] | None, analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """作答运行带的选项：目录视图、只读、遮罩（见模块说明）；有分析期望的题集另带这次评测的分析设置快照（发起时
+    engine/launch 见调用方给了就照它的，不再现读设置）：判「主要来自」「超出常规波动」的阈值和算期望的是同一份。"""
+    from app.analysis.contract import SETTINGS_KEY
     from app.data.catalog_view import OPTION_KEY
     from app.tools.datasource import MASK_RESULTS_OPTION, READ_ONLY_OPTION
 
     out: dict[str, Any] = {MASK_RESULTS_OPTION: True, READ_ONLY_OPTION: True}
     if view:
         out[OPTION_KEY] = dict(view)
+    if analysis is not None:
+        out[SETTINGS_KEY] = dict(analysis)
     return out
 
 
@@ -146,13 +156,14 @@ async def stop_run(run_id: str | None, actor: str | None = None) -> None:
 
 class Driver(TurnDriver):
     """一轮作答（流程在 TurnDriver）。drive() 跑完一轮，结果在 turn 上；on_phase(阶段) 在每一步开始时调（runner 据此写
-    「正在做什么」）。和问数据不一样的：助手模型、目录视图按变体；写作模型按变体写进图；来源 eval、只读和遮罩；停在审批上
-    直接取消（评测不代批）；复核一直等。"""
+    「正在做什么」）。和问数据不一样的：助手模型、目录视图、分析工具开不开按变体；写作模型按变体写进图；来源 eval、只读和
+    遮罩；停在审批上直接取消（评测不代批）；复核一直等。"""
 
     def __init__(self, question: str, *, datasource_ids: list[str], ctx: TurnContext,
                  on_phase: Callable[[str], Awaitable[None]] | None = None) -> None:
         super().__init__(question, datasource_ids=datasource_ids, on_phase=on_phase,
-                         provider=ctx.assistant.get("provider"), model=ctx.assistant.get("model"))
+                         provider=ctx.assistant.get("provider"), model=ctx.assistant.get("model"),
+                         analysis_tools=ctx.analysis_tools)
         self.ctx = ctx
 
     def catalog_view(self) -> Any:
@@ -168,8 +179,8 @@ class Driver(TurnDriver):
             "suite_id": self.ctx.suite_id, "eval_run_id": self.ctx.eval_run_id, "case_id": self.ctx.case_id,
             "role": "answer", "arm": self.ctx.arm, "repeat": self.ctx.repeat, "attempt": self.turn.attempts}.items()
             if v is not None}
-        return {"actor": self.ctx.actor, "options": _options(self.ctx.view), "origin_kind": "eval", "origin": origin,
-                "workflow_name": run_name(self.ctx.suite_name, self.ctx.case_seq)}
+        return {"actor": self.ctx.actor, "options": _options(self.ctx.view, self.ctx.analysis), "origin_kind": "eval",
+                "origin": origin, "workflow_name": run_name(self.ctx.suite_name, self.ctx.case_seq)}
 
     async def on_interrupted(self, run_id: str, row: Any) -> Any | None:
         t = self.turn

@@ -41,6 +41,10 @@ const JUDGE_SETS = [fxj.formal, fxj.explore, fxj.plain, fxv.formal, fxv.explore]
 // Excel 导入期 4：推断的来源。文档由 compose_doc 真跑（带文档标记），片段答复由 _chain 真跑，推断来源的答复按契约
 // （backend/app/data/provenance_types.py）拼；cases 写明每个场景是哪个片段、片段文字、覆盖 P4-SPEC 4.4 的哪几条
 const fxp = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-provenance.json`, 'utf8'))
+// 分析能力一轮：分析结论（判定语、具名的数、结果表的格）、说法违规、系统写的分析范围、口径卡指标上的两期可比性。文档、片段接口、
+// 证据图、审计、分析范围每个编号的出处链（GET …/evidence/analyses/{alias}）都是真后端答的（/tmp/agentlab-fix/w2c 的录制脚本）
+const fxa = JSON.parse(readFileSync(`${root}frontend/src/run/__tests__/evidence-analysis.json`, 'utf8'))
+const FXA = [fxa.agent, fxa.card, fxa.metric]
 /** 推断来源夹具里各期导入清单的工件 id：夹具只收了两份清单，其余的按「工件不存在」答，不落到真服务端 */
 const FXP_MANIFESTS = new Set(Object.values(fxp.provenance).flatMap((a) => a.version?.parts ?? []).map((p) => p.manifest))
 /** 夹具里某段文字是哪个片段：检查按文字认片段，重新生成夹具时编号变了也不用改 */
@@ -551,6 +555,258 @@ await section('artifacts', '记录页的工件：口径卡指标集、报告文�
   check('口径卡那件写成「口径卡「x」v2」', got.card === '口径卡「周报口径」v2', got.card)
   check('没有 meta 的老数据也有一句说明', got.bare === '口径卡的指标、算式和输入' && got.doc.includes('报告'))
   check('两种都算证据（列表里醒目）', got.evidence)
+})
+
+/** 分析夹具的三次运行：片段、证据图、分析范围编号的出处链按运行 id 答（排在 routed 前面，别的交回 routed） */
+async function analysisRoutes(page, hits, graphOf = (set) => set.graph) {
+  await page.route((u) => FXA.some((x) => new URL(u).pathname.includes(`/runs/${x.run_id}`)), (r) => {
+    const url = new URL(r.request().url())
+    const set = FXA.find((x) => url.pathname.includes(`/runs/${x.run_id}`))
+    const seg = url.pathname.match(/\/evidence\/segments\/([^/]+)$/)
+    if (seg) {
+      const id = decodeURIComponent(seg[1])
+      hits.push(`seg:${id}`)
+      const body = set.segments[id]
+      return body ? r.fulfill({ json: body }) : r.fulfill({ status: 404, json: { detail: '报告中没有这个片段', code: 'evidence_segment_not_found' } })
+    }
+    const an = url.pathname.match(/\/evidence\/analyses\/([^/]+)$/)
+    if (an) {
+      const alias = decodeURIComponent(an[1])
+      hits.push(`analysis:${alias}`)
+      const body = set.analyses[alias]
+      return body ? r.fulfill({ json: body })
+        : r.fulfill({ status: 404, json: { detail: '这份报告的证据目录里没有这份分析结论', code: 'evidence_analysis_not_found' } })
+    }
+    if (/\/evidence$/.test(url.pathname)) return r.fulfill({ json: graphOf(set) })
+    if (url.pathname.endsWith(`/runs/${set.run_id}`)) return r.fulfill({ json: { id: set.run_id, run_class: 'exploratory', status: 'succeeded' } })
+    return r.fulfill({ status: 404, json: { detail: '检查脚本没有这一项' } })
+  })
+}
+
+await section('analysis', '分析结论：判定语、具名的数、结果表的格的出处链（判定 → 方法 → 计算 → 输入 → 复算 → 封存）', async () => {
+  const hits = []
+  const { ctx, page, errors } = await open('/ui-harness.html?evidence=1', { before: (p) => analysisRoutes(p, hits) })
+  const box = page.locator('#evidence-analysis')
+  const A = fxa.agent
+  const phrase = box.locator('[data-seg="s3"]')
+  check('判定语是一个可点的片段，画「有出处」', await phrase.count() === 1 && (await phrase.getAttribute('data-ev-state')) === 'deterministic')
+  check('……读屏写出处：分析结论 A1 · 判定语', (await phrase.getAttribute('aria-label') ?? '').includes('有出处：分析结论 A1 · 判定语'),
+    await phrase.getAttribute('aria-label'))
+  await phrase.click()
+  const p = panel(page)
+  await p.locator('[data-ev-analysis="A1"]').waitFor({ timeout: 8000 })
+  const judged = p.locator('[data-ev-analysis="A1"]')
+  const jt = (await judged.innerText()).replace(/\s+/g, ' ')
+  check('判定一步：标题写编号和方法的叫法（服务端的 method_label）', jt.includes('分析结论 A1 · 变化拆解（可加）'), jt.slice(0, 60))
+  check('……判定语照原样、判定标准、点名的段、方向', (await judged.locator('[data-ev-analysis-phrase]').innerText()) === A.segments.s3.chain[0].phrase
+    && jt.includes('一段占总变化的一半以上算主要来源') && jt.includes('华东') && jt.includes('下降'), jt.slice(0, 200))
+  check('……谁做的：Agent 现场做的分析、哪个节点', jt.includes('Agent 现场做的分析') && jt.includes('问数据'))
+  check('……附带说明、Agent 写的假设（另写一句它不是结论）', jt.includes('没能核对本期的数据是否到齐')
+    && (await judged.locator('[data-ev-analysis-hypothesis]').innerText()).includes('下降是不是集中在某个地区')
+    && jt.includes('不是分析结论'), jt.slice(-200))
+  check('……复算一致（服务端复算的那一句）、封存范围内的台账记过', await judged.locator('[data-ev-analysis-recompute="ok"]').count() === 1
+    && jt.includes('复算一致：按封存的输入重新计算，结论逐项相同') && await judged.locator('[data-ev-analysis-seal="ledger"]').count() === 1)
+  check('……这一处引用的是判定语', (await judged.locator('[data-ev-analysis-cited]').getAttribute('data-ev-analysis-cited')) === 'phrase')
+  const method = (await p.locator('[data-ev-analysis-method]').innerText()).replace(/\s+/g, ' ')
+  check('方法一步：方法与版本、实际用的阈值（契约的叫法）、规范化后的参数', method.includes('变化拆解（可加） · decompose.additive@1')
+    && method.includes('「主要来源」的占比 0.5') && (await p.locator('[data-ev-analysis-params]').innerText()).includes('"by"'), method.slice(0, 160))
+  const calc = p.locator('[data-ev-analysis-calc]')
+  check('计算一步：关键数的代入式照服务端', (await calc.locator('[data-ev-analysis-formulas]').innerText()).includes('华东的占比 = 华东的变化 ÷ 总变化 = -300 ÷ （-340） = 88.2%'))
+  check('……具名的数、结果表（表头是给人看的列名）', await calc.locator('[data-ev-analysis-value="top_share"]').count() === 1
+    && (await calc.locator('[data-ev-analysis-table] th').allInnerTexts()).join('、').includes('占变化的比重'))
+  // 第 2 波 S1：占比、变化率按百分数显示（以前照原样写 0.8823529412），空格写「—」不写 null
+  check('……具名的数按结论记的格式写：占比 88.2%，不是 0.8823529412',
+    (await calc.locator('[data-ev-analysis-value="top_share"]').innerText()).includes('88.2%')
+    && !(await calc.locator('[data-ev-analysis-value="top_share"]').innerText()).includes('0.88'))
+  const calcRows = (await calc.locator('[data-ev-analysis-table] tbody tr').allInnerTexts()).map((t) => t.replace(/\s+/g, ' '))
+  check('……结果表照结论记的格式写：变化率 -30.0%、占变化的比重 88.2%，空格写「—」',
+    calcRows[0].includes('-30.0%') && calcRows[0].includes('88.2%') && !calcRows[0].includes('null')
+    && !calcRows[0].includes('-0.3') && !(await calc.locator('[data-ev-analysis-table] tbody').innerText()).includes('null'),
+    calcRows[0])
+  const inputs = p.locator('[data-ev-analysis-input]')
+  check('输入一步：每份一节（基期总数、本期总数、数据）', JSON.stringify(await inputs.evaluateAll((els) => els.map((e) => e.dataset.evAnalysisInput)))
+    === JSON.stringify(['headline_base', 'headline_target', 'data']))
+  check('……总数那一格和各段之和的闭合核对（服务端算好的数）', (await inputs.nth(0).innerText()).includes('总数 2,700 与各段之和 2,700 闭合')
+    && await inputs.nth(0).locator('[data-ev-analysis-closure="closed"]').count() === 1)
+  // 那一格的值也由服务端渲染（千分位），和闭合核对里的数同一个写法：原来照原值写「2700」，同一节里 2,700 和 2700 并排
+  check('……那一格的值按服务端的写法显示（千分位，和闭合核对一致）', (await inputs.nth(0).innerText()).includes('第 1 行「gmv」 = 2,700')
+    && !(await inputs.nth(0).innerText()).includes('= 2700'), await inputs.nth(0).innerText())
+  check('……数据：用到的列、全部行', (await inputs.nth(2).innerText()).includes('region、week、gmv') && (await inputs.nth(2).innerText()).includes('全部行'))
+  check('输入快照的查询步骤接在后面，写明是 A1 的输入', await p.locator('[data-ev-input-of="A1"]').count() === 2)
+  await inputs.nth(2).locator('[data-ev-goto-query="Q2"]').click()
+  await page.waitForTimeout(150)
+  check('……点输入里的 Q2：焦点跳到那个查询步骤', await page.evaluate(() => document.activeElement?.closest('[data-ev-query-alias]')?.getAttribute('data-ev-query-alias')) === 'Q2')
+  check('分析结论的数不走口径账本：没有「口径」一步', await p.locator('[data-ev-ledger]').count() === 0)
+  check('面板底下写服务端的说明（判定只说明变化来自哪里）', (await p.locator('[data-ev-analysis-note]').innerText()).includes('判定只说明变化来自哪里'))
+
+  // 没写换算的具名的数、结果表的格：按结论记的格式显示（第 2 波 S1），正文、出处链、整表一致
+  for (const [sid, text] of [['s19', '-30.0%'], ['s21', '88.2%'], ['s23', '88.2%']]) {
+    check(`没写换算的 ${sid === 's23' ? '具名的数 [[a:A1.top_share]]' : '结果表的格 [[v:A1.r0.' + (sid === 's19' ? 'pct' : 'share') + ']]'}按结论记的格式显示 ${text}`,
+      (await box.locator(`[data-seg="${sid}"]`).innerText()) === text, await box.locator(`[data-seg="${sid}"]`).innerText())
+  }
+  check('……整表 [[table:A1 cols=region,delta,pct,share]] 的格也按格式写', (await box.locator('[data-seg="s38"]').innerText()) === '-30.0%'
+    && (await box.locator('[data-seg="s40"]').innerText()) === '88.2%')
+
+  // 具名的数、结果表的格：同一条链，「这一处引用的是」写清是哪一项，被引用的那个描出来
+  await box.locator('[data-seg="s9"]').click()
+  await p.locator('[data-ev-analysis-cited="value"]').waitFor({ timeout: 8000 })
+  check('具名的数（88.2%）：这一处引用的是具名的数「top_share」，那个数在计算里描出来', (await p.locator('[data-ev-analysis-cited]').innerText()) === '具名的数「top_share」'
+    && await p.locator('[data-ev-analysis-value="top_share"][data-ev-cited]').count() === 1)
+  await box.locator('[data-seg="s7"]').click()
+  await p.locator('[data-ev-analysis-cited="cell"]').waitFor({ timeout: 8000 })
+  // 列写结果表记的列名（「变化」），不把列 id（delta）当叫法
+  check('结果表的格（-300）：引用的是结果表第 1 行「变化」，那一格高亮', (await p.locator('[data-ev-analysis-cited]').innerText()) === '结果表第 1 行「变化」'
+    && await p.locator('[data-ev-analysis-table] td[data-highlight="cell"]').count() === 1)
+  check('……读屏写出处：分析结论 A1 · 结果表第 1 行「变化」', (await box.locator('[data-seg="s7"]').getAttribute('aria-label') ?? '').includes('分析结论 A1 · 结果表第 1 行「变化」'))
+  check('片段接口按片段 id 取（s3、s9、s7）', ['seg:s3', 'seg:s9', 'seg:s7'].every((h) => hits.includes(h)), hits.join(','))
+
+  // 分析卡的结论：谁做的写分析卡（模板定好的分析）；表格里引用结果表的格
+  const card = page.locator('#evidence-analysis-card')
+  await card.locator('[data-seg="s3"]').click()
+  await p.locator('[data-ev-analysis="A2"]').waitFor({ timeout: 8000 })
+  check('分析卡的结论：谁做的写「分析卡（模板定好的分析）」', (await p.locator('[data-ev-analysis-origin]').getAttribute('data-ev-analysis-origin')) === 'card'
+    && (await p.locator('[data-ev-analysis="A2"]').innerText()).includes('分析卡（模板定好的分析）'))
+  // 「在验证什么」那一句是模板作者写的：照实写「分析卡上写的『在验证什么』」，不标成 Agent 写的假设
+  const cardBody = await p.locator('[data-ev-analysis="A2"]').innerText()
+  check('……「在验证什么」写「分析卡上写的『在验证什么』」，不说 Agent 写的假设', cardBody.includes('分析卡上写的『在验证什么』')
+    && !cardBody.includes('Agent 写的假设'), cardBody.slice(-160))
+  await card.locator('[data-seg="s6"]').click()
+  await p.locator('[data-ev-analysis="A1"]').waitFor({ timeout: 8000 })
+  check('算不了的结论：标「这次分析没有做成」、写算不了的原因', await p.locator('[data-ev-analysis-refused]').count() === 1
+    && (await p.locator('[data-ev-analysis="A1"]').innerText()).includes('只有 0 期历史，至少要 8 期'))
+
+  // 窄栏：分析的几步栏内展开，不出横向滚动
+  const narrow = page.locator('#evidence-analysis-narrow')
+  await narrow.locator('[data-seg="s3"]').click()
+  await page.waitForTimeout(400)
+  const over = await narrow.evaluate((el) => el.scrollWidth - el.clientWidth)
+  check('360 宽：分析结论的出处链栏内展开、不出横向滚动', over <= 1 && await narrow.locator('[data-ev-analysis-calc]').count() === 1, `${over}px`)
+  if (SHOTS) {
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate((t) => document.documentElement.setAttribute('data-theme', t), theme)
+      await page.waitForTimeout(150)
+      await box.locator('[data-seg="s3"]').click()
+      await page.waitForTimeout(300)
+      await page.screenshot({ path: `${SHOTS}/evidence-analysis-${theme}.png` })
+    }
+  }
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await ctx.close()
+})
+
+await section('analysis-claims', '说法违规标在正文上、点开看原话和所挂的结论；n 跳得到；系统写的分析范围编号点得开；整句的依据写派生自谁', async () => {
+  const hits = []
+  const { ctx, page, errors } = await open('/ui-harness.html?evidence=1', { before: (p) => analysisRoutes(p, hits) })
+  const box = page.locator('#evidence-analysis')
+  const flagged = box.locator('[data-ev-state="claim"]')
+  check('三句说法违规各是一个可点的片段', JSON.stringify(await flagged.evaluateAll((els) => els.map((e) => e.dataset.seg))) === '["s12","s14","s16"]')
+  const words = await box.locator('[data-ev-claim-word]').allInnerTexts()
+  check('……只在判断词下面画线（主要来自、异常、由于）', JSON.stringify(words) === '["主要来自","异常","由于"]', JSON.stringify(words))
+  const deco = await box.locator('[data-ev-claim-word]').first().evaluate((el) => getComputedStyle(el).textDecorationStyle)
+  check('……线型是波浪线（和无证据的点状线分得开）', deco === 'wavy', deco)
+  check('……整段文字不画线', await flagged.first().evaluate((el) => getComputedStyle(el).textDecorationLine) === 'none')
+  check('……句末挂「说法待核」', await box.locator('[data-ev-tag="claim"]').count() === 3)
+  check('……读屏写种类', (await flagged.first().getAttribute('aria-label') ?? '').includes('说法待核：判断与分析结论不符'))
+  await flagged.first().click()
+  const p = panel(page)
+  await p.locator('[data-ev-claim-flags]').waitFor({ timeout: 8000 })
+  const flag = p.locator('[data-ev-claim-flag="analysis_claim_mismatch"]')
+  const ft = (await flag.innerText()).replace(/\s+/g, ' ')
+  check('点开：种类的叫法（同审计）、服务端的原话', ft.includes('判断与分析结论不符') && ft.includes('「主要来自华南」与所挂的分析结论 A1 对不上'), ft)
+  await flag.locator('[data-ev-claim-analysis="A1"]').click()
+  await page.waitForTimeout(400)
+  check('……所挂的结论 A1 点一下：落到正文里 A1 的判定语、打开它的出处链', await active(page) === 's3'
+    && await p.locator('[data-ev-analysis="A1"]').count() === 1, await active(page))
+  await box.locator('[data-seg="s14"]').click()
+  await p.locator('[data-ev-claim-flag="analysis_claim_uncited"]').waitFor({ timeout: 8000 })
+  check('判断词没挂分析结论：写这句没有挂分析结论', (await p.locator('[data-ev-claim-flag="analysis_claim_uncited"]').innerText()).includes('这句没有挂分析结论'))
+  await box.locator('[data-seg="s16"]').click()
+  await p.locator('[data-ev-claim-flag="causal_unsupported"]').waitFor({ timeout: 8000 })
+  check('因果说法没有依据：原话照服务端', (await p.locator('[data-ev-claim-flag="causal_unsupported"]').innerText()).includes('是原因判断'))
+  // n：从头跳，第一处就是说法违规
+  await box.locator('[data-seg="s3"]').focus()
+  await page.keyboard.press('n')
+  await page.waitForTimeout(150)
+  check('n 跳到下一处有问题的地方：说法违规那一段', ['s12', 's14', 's16'].includes(await active(page)), await active(page))
+  await page.keyboard.press('Escape')
+
+  // 违规清单：三条说法违规的叫法、能定位
+  await page.evaluate(() => document.querySelector('#evidence-analysis [data-evidence-list]')?.click())
+  await p.locator('[data-ev-violations]').waitFor({ timeout: 8000 })
+  const vt = (await p.locator('[data-ev-violations]').innerText()).replace(/\s+/g, ' ')
+  check('违规清单：三条都写种类的叫法、都能定位', ['判断与分析结论不符', '判断词未挂分析结论', '因果说法没有依据'].every((t) => vt.includes(t))
+    && await p.locator('[data-ev-violation][data-ev-locatable="yes"]').count() === 3, vt.slice(0, 160))
+  await page.keyboard.press('Escape')
+
+  // 分析范围：系统写的一段，编号点得开（正文没引用的 A2、A3 也点得开）
+  const scope = box.locator('[data-ev-scope]')
+  const st = (await scope.innerText()).replace(/\s+/g, ' ')
+  check('正文后面是系统写的「分析范围」：现象、拆过（按地区）、算不了、没拆（渠道）', st.includes('分析范围') && st.includes('系统按这次的分析结论写的')
+    && JSON.stringify(await scope.locator('[data-ev-scope-group]').evaluateAll((els) => els.map((e) => e.dataset.evScopeGroup)))
+      === '["phenomena","decomposed","refused","not_decomposed"]' && st.includes('按地区') && st.includes('候选维度里没拆过的：渠道'), st.slice(0, 200))
+  await scope.locator('[data-seg="scope:A2"]').click()
+  await p.locator('[data-ev-analysis="A2"]').waitFor({ timeout: 8000 })
+  check('点范围里的 A2（正文没引用）：取它的出处链（…/evidence/analyses/A2），面板写判定和算不了的原因', hits.includes('analysis:A2')
+    && await p.locator('[data-ev-analysis-refused]').count() === 1 && (await p.locator('[data-ev-analysis="A2"]').innerText()).includes('至少要 8 期'),
+    hits.join(','))
+  check('……不画所在的句子（它不在正文里）', await p.locator('[data-ev-sentence]').count() === 0)
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(200)
+  check('……Esc 关掉：焦点回到范围里的那个编号', await page.evaluate(() => document.activeElement?.getAttribute('data-seg')) === 'scope:A2')
+  await scope.locator('[data-seg="scope:A1"]').click()
+  await p.locator('[data-ev-analysis="A1"]').waitFor({ timeout: 8000 })
+  check('点范围里的 A1：同一条链（方法、计算、输入都在）', await p.locator('[data-ev-analysis-method]').count() === 1
+    && await p.locator('[data-ev-analysis-input]').count() === 3)
+  await page.keyboard.press('Escape')
+
+  // 审计行：说法违规的那几行带问题代码（记录页的审计表按它写种类的叫法，不写「无证据」）
+  const audit = await page.evaluate(async (a) => (await import('/src/lib/evidence.ts')).auditFromApi(a)
+    .filter((r) => r.kind === 'violation').map((r) => r.issue), fxa.agent.audit)
+  check('审计：说法违规的行带问题代码', JSON.stringify(audit) === '["analysis_claim_mismatch","analysis_claim_uncited","causal_unsupported"]', JSON.stringify(audit))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await ctx.close()
+
+  // 整句面板：挂的依据是分析结论时写它派生自哪几份查询（证据图的 derived_from 边）。这份报告没开裁判，句末没有徽标；
+  // 证据图上加一条封存后的按需判定（探索运行点「判这一句」后就是这样），u1 句末才有徽标、点得开整句
+  const judged = (set) => set !== fxa.agent ? set.graph : { ...set.graph, reports: set.graph.reports.map((r) => ({ ...r,
+    post_seal_verdicts: { u1: { status: 'supported', rationale: '判定语照 A1 的判定写', judge: 'judge-model-b', post_seal: true, used: ['A1'] } } })) }
+  const second = await open('/ui-harness.html?evidence=1', { before: (p) => analysisRoutes(p, [], judged) })
+  const badge = second.page.locator('#evidence-analysis [data-ev-claim="u1"]')
+  await badge.waitFor({ timeout: 8000 })
+  await badge.click()
+  const cites = panel(second.page).locator('[data-ev-cites]')
+  await cites.waitFor({ timeout: 8000 })
+  await second.page.waitForTimeout(300)
+  const derived = cites.locator('[data-ev-cite="A1"] [data-ev-derived]')
+  check('整句的依据是 A1：写「派生自 Q1、Q2」（证据图的 derived_from 边，按这份报告认）', await derived.count() === 1
+    && (await derived.getAttribute('data-ev-derived')) === 'Q1,Q2' && (await derived.innerText()).includes('Q1、Q2'),
+    (await cites.innerText()).replace(/\s+/g, ' '))
+  check('……挂的依据里 A1 写分析结论的叫法', (await cites.locator('[data-ev-cite="A1"]').innerText()).includes('变化拆解'),
+    (await cites.locator('[data-ev-cite="A1"]').innerText()).replace(/\s+/g, ' '))
+  check('没有运行时报错（整句面板）', second.errors.length === 0, second.errors.join(' | '))
+  await second.ctx.close()
+})
+
+await section('analysis-metric', '口径卡指标上的两期可比性：判定、判定语，展开看那份可比性结论的整条链（随卡封存）', async () => {
+  const hits = []
+  const { ctx, page, errors } = await open('/ui-harness.html?evidence=1', { before: (p) => analysisRoutes(p, hits) })
+  const box = page.locator('#evidence-analysis-metric')
+  await box.locator('[data-seg="s1"]').click()
+  const p = panel(page)
+  await p.locator('[data-ev-comparability]').waitFor({ timeout: 8000 })
+  const row = p.locator('[data-ev-comparability]')
+  check('指标一步里多一行「两期可比性」：判定写叫法、判定语照服务端', (await row.getAttribute('data-ev-comparability')) === 'comparable'
+    && (await row.innerText()).includes('两期可比') && (await row.locator('[data-ev-comparability-phrase]').innerText()) === '两期可比，窗口长度、整期、星期构成核对不了')
+  await row.locator('[data-ev-comparability-toggle]').click()
+  await page.waitForTimeout(200)
+  const chain = row.locator('[data-ev-comparability-chain]')
+  check('展开：那份可比性结论的判定、方法、计算、输入', await chain.locator('[data-ev-analysis-origin="metric"]').count() === 1
+    && await chain.locator('[data-ev-analysis-method]').count() === 1 && await chain.locator('[data-ev-analysis-input]').count() === 2)
+  check('……谁做的写「口径卡执行时自动做的可比性检查」，封存写随卡封存（不进台账）', (await chain.innerText()).includes('口径卡执行时自动做的可比性检查')
+    && await chain.locator('[data-ev-analysis-seal="card"]').count() === 1)
+  check('……复算一致', await chain.locator('[data-ev-analysis-recompute="ok"]').count() === 1)
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+  await ctx.close()
 })
 
 await section('long', '长报告：块级 content-visibility、折叠、跳进折叠区自动展开', async () => {

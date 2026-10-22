@@ -87,7 +87,8 @@ async def launch_run(
     参数和 POST /api/runs 的请求体一一对应（input 叫 input_payload）；actor 是记在运行上的发起人。workflow_name 是没挂在
     工作流上的探索运行记在运行上的名字（蓝图的试运行写蓝图名），不给就是「未保存的工作流」；挂在工作流上的用工作流的名字。
     schedule_id 是发起它的定时任务，options 是整次运行沿用的选项快照，都原样交给 run_manager.start；图里有双盲复算、
-    反方审稿节点时 options 另加核查设置的快照（_with_verify_snapshot）。
+    反方审稿节点时 options 另加核查设置的快照（_with_verify_snapshot），有分析卡、或 Agent / 协作成员绑了分析工具时另加
+    分析设置的快照（_with_analysis_snapshot）。
     """
     # 没挂在工作流上（画布没保存就发起、问数据当场搭的）。老数据里是「临时图」，前端两种都认
     name = workflow_name or "未保存的工作流"
@@ -182,6 +183,7 @@ async def launch_run(
         raise LaunchRefused(400, "没有要运行的内容：请求中既没有工作流 ID，也没有工作流内容")
     await _refuse_missing_tools(session, graph)
     options = await _with_verify_snapshot(session, graph, options)
+    options = await _with_analysis_snapshot(session, graph, options)
     options, capability_changes = await _with_capability_snapshot(
         session, graph, options, published=published_capabilities)
 
@@ -311,7 +313,43 @@ async def _with_verify_snapshot(session: AsyncSession, graph: dict[str, Any],
 
 
 async def _has_verify_nodes(session: AsyncSession, spec: GraphSpec) -> bool:
-    """图里有没有双盲复算、反方审稿节点，子工作流里的也算。
+    """图里有没有双盲复算、反方审稿节点，子工作流里的也算。"""
+    return await _any_graph(session, spec, lambda graph: any(node.type in _VERIFY_NODES for node in graph.nodes))
+
+
+async def _with_analysis_snapshot(session: AsyncSession, graph: dict[str, Any],
+                                  options: dict[str, Any] | None) -> dict[str, Any] | None:
+    """图里（含子工作流）有分析卡、或 Agent / 协作成员绑了分析工具时，把分析设置（api/settings.py 的 analysis 一组：
+    判定用的阈值、次数上限）快照进 options["analysis"]（docs/design/analysis-round/00-总方案.md §3.10）。
+
+    道理同 _with_verify_snapshot：分析在运行中途读阈值，审批停下期间有人改了设置，恢复后的那一段就按另一套阈值判，正式
+    运行也说不清当时按什么规则判的「主要来自」。分析工具、分析卡只读这一份（app/tools/analysis.py 的 run_snapshot），
+    没有快照的现读设置。别的图 options 原样不动，run.started 和以前逐字相同；调用方已经给了 options["analysis"] 的照它的。
+    """
+    from app.api.settings import ANALYSIS_GROUP, analysis_settings
+
+    if isinstance(options, dict) and ANALYSIS_GROUP in options:
+        return options
+    try:
+        spec = GraphSpec.model_validate(graph)
+    except Exception:  # noqa: BLE001 - 图本身不成形交给 run_manager.start 报
+        return options
+    if not await _any_graph(session, spec, _analyzes):
+        return options
+    return {**(options or {}), ANALYSIS_GROUP: await analysis_settings(session)}
+
+
+def _analyzes(graph: GraphSpec) -> bool:
+    """这一张图（不含子工作流）会用到分析设置：有分析卡，或者有绑了分析工具的 Agent、协作成员（tool_bindings 的取法，
+    节点上没写就取图级 defaults）。"""
+    from app.tools.analysis import is_analysis_tool
+
+    return any(node.type == NodeType.ANALYSIS for node in graph.nodes) \
+        or any(is_analysis_tool(name) for _, name in tool_bindings(graph))
+
+
+async def _any_graph(session: AsyncSession, spec: GraphSpec, test: Any) -> bool:
+    """这张图或它（一层层）套着的子工作流里，有没有一张让 test(图) 为真。
 
     子工作流照运行时的取法读（同 runner._bound_sources）：固定了版本的读那一版，没固定的读工作流现在的图。读不到、
     图不成形的跳过——那个节点运行时自己会报错。同一个工作流（同一版）只读一次，互相引用也不会转圈。
@@ -320,7 +358,7 @@ async def _has_verify_nodes(session: AsyncSession, spec: GraphSpec) -> bool:
     queue: list[GraphSpec] = [spec]
     while queue:
         graph = queue.pop(0)
-        if any(node.type in _VERIFY_NODES for node in graph.nodes):
+        if test(graph):
             return True
         for node in graph.nodes:
             if node.type != NodeType.SUBGRAPH:

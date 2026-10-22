@@ -715,3 +715,44 @@ export const COPILOT_OBJECT_ISSUES = [
   { op: 'remove_node', id: 'old' },
   { op: 'final', graph: { nodes: [{ id: 'lp' }, { id: 'ask' }] }, issues: [] },
 ]
+
+/**
+ * 协作成员调分析工具（分析能力一轮）：分析员查一次按地区两周的销售额，做一次变化拆解、一次波动基线（两周历史不够，算不了）。
+ * 字段照 engine/nodes/multi.py：tool.end 带 agent、analysis_artifact 和判定那一小段（tools/analysis.event_view，编号是成员自己的
+ * 分析容器里的）；算不了的另有一条 analysis_refused 的提醒（带 agent、call_id）。preview 是结论 JSON 的前一截，判定语在截掉的那段里
+ */
+export const TEAM_PHRASE = '销售额下降 340（-12.6%），主要来自华东（-300，占 88.2%）'
+export function analysisTeamRun(): RunEvent[] {
+  const { out, ev } = builder('syn-analysis-team')
+  const sql = 'SELECT region, week, SUM(amount) AS gmv FROM orders GROUP BY region, week ORDER BY region, week'
+  ev('run.started', null, { nodes: 3, resumed: false })
+  ev('node.started', 'team', { node_type: 'supervisor', label: '销售分析团队' })
+  ev('agent.route.start', 'team', { round: 0 })
+  ev('agent.route.end', 'team', { round: 0, duration_ms: 900, agents: ['分析员'], parallel: 1, done: false, reason: '先拆一下变化来自哪里' }, 0.9)
+  ev('agent.step.start', 'team', { agent: '分析员', instruction: '拆一下销售额的变化', round: 0, parallel: 1 })
+  ev('tool.start', 'team', { tool: 'db_query__shop', agent: '分析员', call_id: 'm1', args: { sql } }, 0.2)
+  ev('tool.end', 'team', { tool: 'db_query__shop', agent: '分析员', call_id: 'm1', duration_ms: 30,
+    preview: JSON.stringify({ columns: ['region', 'week', 'gmv'], rows: [['华东', '2026-W41', 1000], ['华东', '2026-W42', 700]], row_count: 8 }) }, 0.03)
+  ev('tool.start', 'team', { tool: 'analysis_decompose', agent: '分析员', call_id: 'm2', args: {
+    mode: 'additive', query: 'Q1', by: ['region'], period: 'week', base: '2026-W41', target: '2026-W42', measure: 'gmv',
+    label: '销售额', hypothesis: '下降是不是集中在某个地区', parent: null } }, 0.2)
+  ev('tool.end', 'team', { tool: 'analysis_decompose', agent: '分析员', call_id: 'm2', duration_ms: 8,
+    preview: '{\n  "analysis_artifact": "a1f0", \n  "result": {\n    "op": "decompose",\n    "mode": "additive",\n    "method": "decompose.additive@1",',
+    analysis_artifact: 'a1f0c3d2b4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9',
+    analysis: { alias: null, op: 'decompose', mode: 'additive', status: 'ok', verdict: 'driver', direction: 'down', phrase: TEAM_PHRASE,
+                reason_code: null } }, 0.01)
+  ev('tool.start', 'team', { tool: 'analysis_baseline', agent: '分析员', call_id: 'm3', args: { query: 'Q1', period: 'week', measure: 'gmv' } }, 0.1)
+  ev('tool.end', 'team', { tool: 'analysis_baseline', agent: '分析员', call_id: 'm3', duration_ms: 4,
+    preview: '{\n  "analysis_artifact": "b2e1",',
+    analysis_artifact: 'b2e1d4c3a5f6e70819203b4c5d6e7f8091a2b3c4d5e6f70819203b4c5d6e7f80',
+    analysis: { alias: null, op: 'baseline', mode: null, status: 'refused', verdict: null, direction: null,
+                phrase: '波动基线没有做成：只有 0 期历史，至少要 8 期', reason_code: 'history_short' } }, 0.01)
+  ev('log', 'team', { level: 'warn', code: 'analysis_refused', agent: '分析员', call_id: 'm3', tool: 'analysis_baseline',
+    reason_code: 'history_short', reason: '只有 0 期历史，至少要 8 期', message: '分析员 的 analysis_baseline 没有做成：只有 0 期历史，至少要 8 期' })
+  ev('agent.step.end', 'team', { agent: '分析员', duration_ms: 1200, round: 0, parallel: 1, preview: TEAM_PHRASE }, 0.3)
+  ev('agent.route.start', 'team', { round: 1 })
+  ev('agent.route.end', 'team', { round: 1, duration_ms: 600, agents: [], parallel: 0, done: true, reason: '已经说清来源' }, 0.6)
+  ev('node.finished', 'team', { duration_ms: 3200, attempt: 1, preview: TEAM_PHRASE })
+  ev('run.finished', null, { output: { 结论: TEAM_PHRASE }, timing: { wall_ms: 3400, active_ms: 3400, wait_ms: 0 } })
+  return out
+}

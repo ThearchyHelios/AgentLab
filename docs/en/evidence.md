@@ -2,7 +2,7 @@ English | [Simplified Chinese](../zh-CN/evidence.md)
 
 # Evidence and Issuance
 
-This page covers where the numbers in a report come from and how to check them: caliber cards and issuance contracts, the three issuance tiers, citation markers in the report-writer node, what happens when the queried range has no data, what you see when you click a number, sealing and verification, the two kinds of export, and the review tools: double-blind recomputation, adversarial review, approval inquiry, the what-if sandbox, and run comparison. It is for builders, approvers, and people who read reports. The user interface is currently available in Simplified Chinese only.
+This page covers where the numbers in a report come from and how to check them: caliber cards and issuance contracts, the three issuance tiers, citation markers in the report-writer node (including analysis conclusions), what happens when the queried range has no data, what you see when you click a number or an analysis conclusion, sealing and verification, the two kinds of export, and the review tools: double-blind recomputation, adversarial review, approval inquiry, the what-if sandbox, run comparison, and the analysis claim check. It is for builders, approvers, and people who read reports. For how analytical judgments themselves are computed, see [Analysis](analysis.md). The user interface is currently available in Simplified Chinese only.
 
 ## The basic idea
 
@@ -45,6 +45,9 @@ Measured: every number in body text written by Opus 5 traced back successfully, 
 
 When the contract sets `report_from`, the check goes by citation: the hash is verified again when the report document is retrieved, everything is recomputed independently, and only when every number carries a citation is the issuance judged complete.
 
+- The inputs of caliber card metrics the report cites must trace back to raw data (cells of query snapshots, run inputs): in formal runs at the governed level, inputs that can't be traced count as gaps and downgrade the issuance; otherwise they are stated in the issuance declaration, and the evidence panel still marks them "Can't trace back to raw data".
+- Analysis claims in the report are checked again here independently, with the same check used when the report is assembled: when the report-writer node is set to strict, remaining violations count as issuance gaps (see [Analysis claim check](#analysis-claim-check)).
+
 ### Metric issuance
 
 A pure metrics dashboard (the contract sets only `metrics_from`, there is no report-writer node upstream, and the output contains no model-written text) is issued by its metrics. With no narrative to check, the metrics themselves are checked:
@@ -62,6 +65,8 @@ When the source query of a contract metric has SQL check errors, the issuance is
 - An expression can be written as `cell(nodes.pull, 0, 'gmv')`, which makes the provenance precise to the cell.
 - Leave rounding and default values to the caliber card's decimal places and display settings instead of writing them into the data-fetch SQL (for why, see [Caliber Ledger](evaluation-and-ledger.md#a-caliber-label-for-each-number)).
 - When publishing at the governed level, caliber card inputs can't come from sandbox code in the compute role (gate G4).
+- When a metric uses two queries of the same shape that differ only in their dates (this week versus last week), the system runs a comparability check once automatically (see [Comparability check](analysis.md#comparability-check)) and attaches the result to the metric: the writing catalog states it plainly; at an exit with a contract, incomparable periods count as a gap and downgrade the issuance, and conditionally comparable ones are only flagged.
+- Analysis card results are not caliber card inputs: a caliber card that reads them is treated as unable to trace back to raw data.
 
 ### Caliber version bumps
 
@@ -88,8 +93,12 @@ In the report-writer node (`report`), the model writes only citation markers, an
 [[table:Q1 cols=region,amount rows=0-4]]   the system builds the whole table from the snapshot; every cell is clickable
 [[t:orders]]  [[c:orders.week]]            table name, field name; names written in backticks are checked too
 [[q:K1|<quote>]]                           verbatim knowledge-base quote; must appear word for word in the chunks that retrieval hit
-[[see:m:gmv,Q1]]                           basis of a claim sentence; attached at the end of the sentence, not rendered
+[[a:A1]]  [[a:A1.top_share|pct]]          an analysis conclusion's verdict phrase and a named value, both rendered by the system
+[[v:A1.r0.share]]  [[table:A1 rows=0-4]]   one cell and the whole of an analysis conclusion's result table
+[[see:m:gmv,Q1,A1]]                        basis of a claim sentence; attached at the end of the sentence, not rendered
 ```
+
+Analysis conclusions are numbered A1, A2, … in ledger order, and the writing catalog has a separate Analysis Conclusions section. The system shows shares and change rates in analysis conclusions as percentages (`[[a:A1.top_share]]` renders as 62.0%), and changes in rates in percentage points (1.2 percentage points); writers cite them as usual and do not add a conversion. Judgment words such as "mainly from", "unusual", or "rising steadily" must cite a matching analysis conclusion and agree with its verdict; see [Analysis claim check](analysis.md#analysis-claim-check).
 
 ### Handling violations
 
@@ -99,6 +108,7 @@ In the report-writer node (`report`), the model writes only citation markers, an
 ## The data retrieval chain
 
 - Data fetched by agents, tool nodes, code nodes, and knowledge retrieval is recorded in the evidence ledger. The report's source list is numbered from the ledger: Q1… for queries, K1… for knowledge-base chunks.
+- Analysis conclusions from agents' analysis tools and from analysis cards are recorded in the evidence ledger too, numbered A1…. Analyses read only query snapshots the platform executed during this run, and each conclusion is sealed together with its inputs (see [Analysis](analysis.md)).
 - When an agent turns on `cite_fields` (together with `output_schema`), each field records which cell of which query it came from, and that is checked against the snapshot: on a mismatch the snapshot wins and a warning is raised; anything not found is recorded as null, not defaulted to 0.
 - A code node's `evidence_role` is `source` (data retrieval) or `compute` (computation, the default). Numbers computed in the sandbox can't be cited directly by a report; they must go through a caliber card.
 - Cells of uploaded spreadsheets can be traced back to the cell in the original sheet (an inferred source).
@@ -126,6 +136,7 @@ Query a table that keeps only the latest day (fully reloaded every day) for last
 - **Numbers**: the metric's original formula, substituted formula, and recomputed result; whether the inputs match the snapshot; the query's SQL; the cited row plus 2 rows before and after, highlighted down to the cell; and finally the seal status. Only artifacts returned by events inside the sealed scope are accepted. The provenance chain also starts with a Caliber step (see [Caliber Ledger](evaluation-and-ledger.md#a-caliber-label-for-each-number)).
 - **Table and field names**: which query they appear in, their type, and the table they belong to. A name found nowhere in the schema snapshot, the SQL, or the result columns is marked as a suspicious entity ("May be a fabricated name", with the 3 closest matches). When a snapshot was truncated and can't be checked, it only says so, without wrongly calling the name fabricated.
 - **Knowledge-base quotes**: must appear word for word in the chunks that retrieval hit.
+- **Analysis conclusions** (verdict phrases, named values, result table cells): in order, the verdict (verdict phrase, criterion, segments named and direction, who did it, caveats, and the agent's note on what the call was testing), the method (method and version, parameters, thresholds actually used, table ranges checked live), the calculation (the result table and the substituted formula for the key value, such as "share = East's change / total change = -120 / -194", with the cited cell highlighted), the inputs (which columns and rows of which Q, the closure check against the two total cells, the level a drill-down sits under, followed by the steps of the input queries), the recomputation (rerun from the sealed inputs with the same function; it verifies only when every field is identical, and when the method has a new version, it says which version the run used), and the seal. In the evidence graph, an analysis conclusion has a "derived from" edge to its inputs and to the level above it.
 
 ## Claim sentences
 
@@ -165,12 +176,14 @@ The two exports serve different purposes: to prove nothing was altered, use the 
 - The body is rendered on the server, so it is readable without running scripts (email attachment previews often don't run scripts).
 - With scripts running, every number, every number without evidence, and every suspicious table or field name is clickable. The panel shows the same provenance chain as the evidence panel on the web page (caliber, source, calculation, SQL, cited rows), with the seal status marked item by item.
 - Masked columns say "Masked", following the same rules as the web page.
+- Verdict phrases, named values, and result table cells of analysis conclusions are clickable too, and the panel shows the verdict, method, calculation, and inputs in turn; at export time the server recomputes each conclusion from the sealed inputs and writes the result into the panel. The Analysis Scope at the end of the report is rendered from what the document recorded, with clickable numbers.
 - Unsealed runs export as usual, for the same reason you can read their reports on the web.
 
 **Verifiable report**: Export Verifiable Report under Provenance Details on the Records page (`GET /api/runs/{id}/bundle.html`) produces a seal verification document.
 
 - The recipient recomputes the hashes in the browser, without connecting to the service or installing anything, and checks that no number, document, or run record has been altered.
 - The provenance panel for a number likewise shows the caliber, original formula, substituted formula, inputs, and recomputation; the query snapshots that caliber card inputs point to come attached to the file.
+- Analysis conclusions the report cites (including those named in the Analysis Scope) come attached to the file byte for byte, together with their input snapshots and the conclusions they drill down from; at export time the server recomputes them from the sealed inputs and records the result on each conclusion's entry. The browser only verifies hashes and shows the server's recomputation; the page doesn't recompute statistics itself. When any input snapshot can't be shown to leave masked columns untouched, the conclusion is given by id only.
 - It proves only that the file is internally consistent: numbers, documents, and run records agree with one another and haven't been altered. To check authenticity, compare the seal hash on the page with the seal verification of this run in the system (`GET /api/runs/{id}/verify`); the page says so prominently.
 - Events appended after sealing (annotations such as on-demand judging and approval inquiries) are listed separately, with only their type, sequence number, and a content summary, and aren't part of the manifest.
 - When a data source has masked columns, query snapshots that can't be shown to leave them untouched, and caliber cards with inputs from masked columns, are given by id only, without content. Masking only reduces exposure and is not a security boundary.
@@ -246,4 +259,14 @@ For two runs of the same workflow (this week's and last week's weekly report, sa
 - When the caliber and data both changed and a strict split is possible, the caliber effect and the data effect are given separately, and they add up to the total change.
 - For metrics in the data-only, parameters-only, and caliber-and-data classes, when attribution is possible, the dimension values (regions, say) with the largest changes are listed, up to 10. Every item traces back to the query snapshots on both sides; queries run by verification take no part in the comparison.
 - Values from masked columns never appear in the result, and metrics that use masked columns aren't split.
+- When the graph has analysis cards, the two runs' analysis cards are aligned by node and item, listing each run's status, verdict, direction, and verdict phrase; for cards executed several times in a loop, the last execution counts.
 - When a scheduled run finishes successfully and is sealed, it is compared once automatically with the same schedule's last successful run; the trigger history and notifications show only which run was the baseline and how many metrics fall into each class, never the actual numbers.
+
+### Analysis claim check
+
+Judgment words in a report, such as "mainly from East", "outside the usual fluctuation", "rising steadily", or "the difference holds up", must cite a matching analysis conclusion and agree with its verdict; a stated cause needs a verbatim knowledge-base quote or a run input as its basis, or else it is written as a conjecture to be verified.
+
+- The report-writer node checks this sentence by sentence while writing, with a fixed lexicon and binding rules: no model call, no cost. An exit in citation mode checks again independently.
+- By default, the report goes back for one rewrite and what remains is marked in the report (visible in the evidence panel, the audit, and exports), without affecting the issuance tier; set to strict, it rewrites up to the maximum number of repairs, and what remains counts as an issuance gap and downgrades the issuance. The governed level requires strict (gate G3).
+- Only new report documents that carry this check's record are checked; verification results for reports from before the upgrade don't change.
+- For the classes of judgment words, the analysis each one needs, and which wordings aren't checked, see [Analysis claim check](analysis.md#analysis-claim-check).

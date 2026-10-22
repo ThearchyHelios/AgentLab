@@ -9,7 +9,7 @@ import clsx from 'clsx'
 import { ApiError } from '../api/client'
 import { Spinner, StatusBadge, isComposing } from '../components/ui'
 import {
-  EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, citeLabel, claimBasis, closestNames,
+  EVIDENCE_KIND_STYLE, EVIDENCE_STATE, caliberSourceText, caliberUpgradeText, citeLabel, claimBasis, closestNames, derivedFrom,
   docForeign, entitySources, evidenceTrace, evidenceValue as valueText, graphDoc, inputSource, integrityFailures, isJudged,
   isJudgeLimit, judgeFlags, judgeLimitWords, judgeable, judgedVerdicts, limitOf, pointsToSettings,
   locatable, locatorText, notableInput, queryOf, queryWindow, quoteWhere, quoteWindow, reasonOf, rewriteOf, sealVerdict,
@@ -26,7 +26,7 @@ import { useAtLeast, useLoginOn } from '../store/auth'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
-  ApprovalReport, EvidenceBlock, EvidenceChallengeVerdicts, EvidenceDocData, EvidenceDualCheck, EvidenceInput, EvidenceMerge,
+  ApprovalReport, EvidenceAnalysisStep, EvidenceBlock, EvidenceChallengeVerdicts, EvidenceDocData, EvidenceDualCheck, EvidenceInput, EvidenceMerge,
   EvidenceOnDemand, EvidenceQuoteSource, EvidenceSeal, EvidenceSegment, EvidenceSegmentDetail, EvidenceStep, EvidenceUnit,
   EvidenceUnitChallenge, EvidenceUntraced, EvidenceVerdict, EvidenceViolation,
 } from '../types'
@@ -34,6 +34,8 @@ import { ArtifactViewer, ResultTable } from './AssistantStream'
 import { ChallengeSummary, ClaimVerdictPending, type ClaimWait } from './ChallengeSummary'
 import { useEvidenceHost } from './evidenceHost'
 import { EvidenceProvenance } from './EvidenceProvenance'
+import { AnalysisChain, ClaimFlags, ComparabilityRow, isClaimViolation } from './EvidenceAnalysis'
+import { ANALYSIS_TEXT } from '../lib/termsAnalysis'
 import { LedgerPart } from './LedgerStep'
 import { CopyChip } from './Markdown'
 import { SqlCheckList } from './SqlChecks'
@@ -135,8 +137,10 @@ function unverifiedOf(input: EvidenceInput): string {
 
 export type PanelMode = 'side' | 'drawer' | 'inline' | 'dock'
 export type PanelView = { kind: 'seg'; id: string } | { kind: 'unit'; id: string } | { kind: 'violations' }
+  /** 报告末尾「分析范围」里的一个编号（A1）：那份分析结论的出处链（GET …/evidence/analyses/{alias}） */
+  | { kind: 'scope'; alias: string }
 
-export function EvidencePanel({ id, mode, doc, artifact, runId, runClass, marks, view, onClose, onLocate, onViolations }: {
+export function EvidencePanel({ id, mode, doc, artifact, runId, runClass, marks, view, onClose, onLocate, onViolations, onAnalysis }: {
   id: string
   mode: PanelMode
   doc: EvidenceDocData
@@ -155,13 +159,16 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, runClass, marks,
   /** 跳到正文里的某个片段（违规清单里的「定位」） */
   onLocate: (segId: string) => void
   onViolations: () => void
+  /** 打开一份分析结论（说法违规里所挂的结论、分析范围里的编号）：正文引用了它就落到那个判定语，没引用的打开它的出处链 */
+  onAnalysis?: (alias: string) => void
 }) {
   const titleId = `${id}-title`
   // 推断的来源只在面板这次打开期间缓存：回答里有当前状态（原件已清除、接受已作废）和取决于数据文件现状的结论，
   // 关掉面板（卸载）或换了运行就作废，再打开重新取。同一次打开里来回点同一片段只取一次
   const holdProvenance = useEvidence((s) => s.holdProvenance)
   useEffect(() => (runId ? holdProvenance(runId) : undefined), [runId, holdProvenance])
-  const found = useMemo(() => (view.kind === 'seg' ? findSeg(doc, view.id) : null), [doc, view])
+  const found = useMemo(() => (view.kind === 'seg' ? findSeg(doc, view.id) : view.kind === 'scope' ? scopeSeg(doc, view.alias) : null),
+    [doc, view])
   const claimAt = useMemo(() => (view.kind === 'unit' ? findUnit(doc, view.id) : null), [doc, view])
   const overlay = useVerdicts(runId, doc.node_id || undefined)
   const claimVerdict = claimAt ? unitVerdict(claimAt.unit, overlay) : undefined
@@ -232,7 +239,7 @@ export function EvidencePanel({ id, mode, doc, artifact, runId, runClass, marks,
           : found
             ? <SegmentBody panelId={id} doc={doc} artifact={artifact} runId={runId} runClass={runClass} seg={found.seg}
                            unit={found.unit} block={found.block} mark={marks?.[found.unit.id]} onViolations={onViolations}
-                           onLocate={onLocate} />
+                           onLocate={onLocate} onAnalysis={onAnalysis} scope={view.kind === 'scope'} />
             : claimAt
               ? <ClaimBody doc={doc} artifact={artifact} runId={runId} runClass={runClass} unit={claimAt.unit}
                            block={claimAt.block} mark={marks?.[claimAt.unit.id]} />
@@ -250,6 +257,24 @@ function findSeg(doc: EvidenceDocData, id: string): { seg: EvidenceSegment; unit
     }
   }
   return null
+}
+
+/**
+ * 分析范围里一个编号的「片段」：不在正文里，按目录里那份结论的判定语拼一个（片段 id scope:<编号>，store 按它改取
+ * GET …/evidence/analyses/{alias}）。目录里没有这份结论的为 null
+ */
+function scopeSeg(doc: EvidenceDocData, alias: string): { seg: EvidenceSegment; unit: EvidenceUnit; block: EvidenceBlock } | null {
+  const entry = doc.catalog?.[alias]
+  if (entry?.kind !== 'analysis') return null
+  const phrase = (doc.analysis_scope ? [
+    ...(doc.analysis_scope.phenomena ?? []), ...(doc.analysis_scope.decomposed ?? []), ...(doc.analysis_scope.excluded ?? []),
+    ...(doc.analysis_scope.refused ?? []),
+  ] : []).find((i) => i.alias === alias)?.phrase
+  const seg: EvidenceSegment = {
+    id: `scope:${alias}`, kind: 'analysis', state: 'deterministic', text: phrase || alias,
+    cite: { alias, kind: 'analysis', status: 'resolved', locator: {}, eid: entry.eid },
+  }
+  return { seg, unit: { id: `scope:${alias}`, segments: [seg] }, block: { id: 'scope', type: 'paragraph', units: [] } }
 }
 
 function findUnit(doc: EvidenceDocData, id: string): { unit: EvidenceUnit; block: EvidenceBlock } | null {
@@ -276,7 +301,7 @@ function flashOnce(el: HTMLElement) {
   setTimeout(() => { if (el.dataset.flash === 'focus') delete el.dataset.flash }, 1600)
 }
 
-function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block, mark, onViolations, onLocate }: {
+function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block, mark, onViolations, onLocate, onAnalysis, scope = false }: {
   panelId: string
   doc: EvidenceDocData; artifact?: string; runId?: string; runClass?: string; seg: EvidenceSegment; unit: EvidenceUnit
   block: EvidenceBlock
@@ -285,6 +310,10 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
   onViolations: () => void
   /** 跳到正文里的某个片段（推演区「报告中会变的地方」的定位） */
   onLocate: (segId: string) => void
+  /** 打开一份分析结论（说法违规里所挂的结论） */
+  onAnalysis?: (alias: string) => void
+  /** 分析范围里的编号：不在正文里，不画所在的句子、口径、模型的解释和反方审稿 */
+  scope?: boolean
 }) {
   const report = doc.node_id || undefined
   const key = runId ? segmentKey(runId, seg.id, report) : ''
@@ -321,13 +350,17 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
   const entityStep = chain.find((s) => s.step === 'entity')
   const quoteStep = chain.find((s) => s.step === 'quote')
   const queries = chain.filter((s) => s.step === 'query')
-  const isMetric = cite?.kind === 'metric' || entry?.kind === 'metric' || !!metricStep
-  const isInput = cite?.kind === 'input' || entry?.kind === 'input' || !!inputStep
+  // 分析结论：判定语、具名的数（cite 的种类是 analysis），结果表的一格（cite 是 cell、目录条目是 analysis）。链是分析的几步，
+  // 后面接输入快照的查询步骤
+  const analysisChain = chain.filter((s) => s.step.startsWith('analysis')) as unknown as EvidenceAnalysisStep[]
+  const isAnalysis = cite?.kind === 'analysis' || entry?.kind === 'analysis' || analysisChain.some((s) => s.step === 'analysis')
+  const isMetric = !isAnalysis && (cite?.kind === 'metric' || entry?.kind === 'metric' || !!metricStep)
+  const isInput = !isAnalysis && (cite?.kind === 'input' || entry?.kind === 'input' || !!inputStep)
   // 三期：有出处的表名字段名、引文（原话对不上的引文也画这一节：说清原文在哪、对不上）
-  const isEntity = !isMetric && !isInput && seg.kind === 'entity' && state === 'deterministic'
-  const isQuote = !isMetric && !isInput && seg.kind === 'quote'
+  const isEntity = !isAnalysis && !isMetric && !isInput && seg.kind === 'entity' && state === 'deterministic'
+  const isQuote = !isAnalysis && !isMetric && !isInput && seg.kind === 'quote'
   // 报告直接引用的查询单元格（[[v:Q3.r5.amount]]、整表里的一格）：证据链就是那一次查询
-  const isCell = !isMetric && !isInput && !isEntity && !isQuote
+  const isCell = !isAnalysis && !isMetric && !isInput && !isEntity && !isQuote
     && (cite?.kind === 'cell' || entry?.kind === 'query' || !!queries.length)
   const bad = state === 'none' || state === 'suspect' || state === 'unverified'
   const closest = closestNames(detail?.closest ?? entityStep?.closest)
@@ -388,6 +421,13 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
     return i >= 0 ? { index: i, alias: queries[i].alias ?? '', go: () => jumpTo(i) } : undefined
   }
   const violations = (doc.violations ?? []).filter((v) => v.segment === seg.id)
+  // 说法违规（判断词没挂对分析结论、因果没有依据）：落在这一段文字上的，单列一节，不和裸数字那些原因混在一起
+  const claimFlags = violations.filter(isClaimViolation)
+  // 分析结论的输入里点 Q：跳到下面那个查询步骤
+  const jumpToQuery = (alias: string) => {
+    const i = queries.findIndex((q) => q.alias === alias)
+    if (i >= 0) jumpTo(i)
+  }
   // 数字推演：按（运行、报告、口径卡、指标）认一份草稿。同一个指标的几处引用之间来回切，推演不收起（定位到另一处
   // 引用也是这样）；换了指标、换成别的片段才收起清空。卡和指标先按文档目录认：切片段时证据链还没回来，也认得出是同一个
   const whatifCard = entry?.kind === 'metric' ? entry.node_id : metricStep?.node_id
@@ -443,9 +483,13 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
         ]} />
       )}
 
-      <Part title={EVIDENCE_TEXT.sentence} data-ev-sentence="">
-        <Sentence unit={unit} active={seg.id} />
-      </Part>
+      {!scope && (
+        <Part title={EVIDENCE_TEXT.sentence} data-ev-sentence="">
+          <Sentence unit={unit} active={seg.id} />
+        </Part>
+      )}
+
+      {claimFlags.length > 0 && <ClaimFlags violations={claimFlags} onAnalysis={onAnalysis} />}
 
       {state === 'deterministic' && (isMetric || isCell) && !docIssue && (
         // 口径账本：出处链最上面的「口径」一步（来自口径 / 相关口径 / 这次的推理）。比对在封存之后做，这一步按运行另取
@@ -482,6 +526,11 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
             </div>
           )}
         </Part>
+      )}
+
+      {isAnalysis && (
+        // 分析结论：判定 → 方法 → 计算 → 输入；输入快照的查询步骤照常在下面画
+        <AnalysisChain chain={analysisChain} seal={seal} pending={pending} failed={chainFailed} onQuery={jumpToQuery} />
       )}
 
       {isEntity && (
@@ -553,16 +602,20 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
 
       {provenanceOn && runId && <EvidenceProvenance runId={runId} segId={seg.id} report={report} />}
 
-      {state === 'deterministic' && !isMetric && !isInput && !isCell && !isEntity && !isQuote && (
+      {state === 'deterministic' && !isAnalysis && !isMetric && !isInput && !isCell && !isEntity && !isQuote && (
         <p className="text-dim">{sourceOf(seg, doc) || detail?.note}</p>
       )}
 
-      <JudgePart doc={doc} unit={unit} block={block} runId={runId} runClass={runClass}
-                 onDemand={detail?.unit?.on_demand} answered={detail?.unit?.verdict} pending={pending} />
+      {isAnalysis && detail?.note && <p className="text-2xs leading-relaxed text-faint" data-ev-analysis-note="">{detail.note}</p>}
+
+      {!scope && (
+        <JudgePart doc={doc} unit={unit} block={block} runId={runId} runClass={runClass}
+                   onDemand={detail?.unit?.on_demand} answered={detail?.unit?.verdict} pending={pending} />
+      )}
 
       {/* 反方审稿对这一句的判断：点句中的数字也看得到。片段接口还没答、答不了时先按正文标记写判断。正文不是封存的那一份
           时都不用：服务端认的是封存的那份文档 */}
-      {!docIssue && (segChallenge || mark) && (
+      {!scope && !docIssue && (segChallenge || mark) && (
         <ChallengePart challenge={segChallenge} mark={mark} wait={segWait} unit={unit} report={report}
                        onRetry={() => { if (runId) void loadSegment(runId, seg.id, report) }} />
       )}
@@ -652,12 +705,14 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block, mark }: {
   // 有指标依据时才去取证据图（正文挂上时一般已经取过，取过的不再发）
   const graphSlot = useEvidence((s) => (runId ? s.graphs[runId] : undefined))
   const loadGraph = useEvidence((s) => s.loadGraph)
-  const metricCite = (unit.cites ?? []).some((alias) => doc.catalog?.[alias]?.kind === 'metric')
+  // 分析结论的依据另写它派生自哪几份查询、哪一层拆解（证据图的 derived_from 边），同样要证据图
+  const graphCite = (unit.cites ?? []).some((alias) => ['metric', 'analysis'].includes(String(doc.catalog?.[alias]?.kind)))
   useEffect(() => {
-    if (runId && metricCite) void loadGraph(runId)
-  }, [runId, metricCite, loadGraph])
+    if (runId && graphCite) void loadGraph(runId)
+  }, [runId, graphCite, loadGraph])
   const graph = !foreign && graphSlot?.status === 'ok' ? graphSlot.data : undefined
-  const cites = (unit.cites ?? []).map((alias) => ({ alias, label: citeLabel(alias, doc, graph, report, !!runId) }))
+  const cites = (unit.cites ?? []).map((alias) => ({ alias, label: citeLabel(alias, doc, graph, report, !!runId),
+    derived: doc.catalog?.[alias]?.kind === 'analysis' ? derivedFrom(graph, alias, report) : [] }))
   // 讲方法、讲结构的句子：SQL 和字段清单直接列在挂的依据下面。正文不是封存的那份时不列（链是另一份报告的）
   const basis = useMemo(() => (foreign ? null : claimBasis(unit, doc)), [foreign, unit, doc])
   // 反方审稿对这一句的判断：服务端只认审的就是封存的这一份文档；正文不是那一份时不用。片段接口还没答、答不了时先按正文
@@ -685,9 +740,14 @@ function ClaimBody({ doc, artifact, runId, runClass, unit, block, mark }: {
         {cites.length ? (
           <ul className="space-y-0.5">
             {cites.map((c) => (
-              <li key={c.alias} className="flex min-w-0 items-baseline gap-1.5">
+              <li key={c.alias} className="flex min-w-0 items-baseline gap-1.5" data-ev-cite={c.alias}>
                 <span className="mono shrink-0 font-medium">{c.alias}</span>
                 {c.label && <span className="min-w-0 truncate text-dim" title={c.label}>{c.label}</span>}
+                {c.derived.length > 0 && (
+                  <span className="shrink-0 text-2xs text-faint" data-ev-derived={c.derived.join(',')}>
+                    {ANALYSIS_TEXT.evidence.derivedFrom(c.derived)}
+                  </span>
+                )}
               </li>
             ))}
           </ul>
@@ -1478,6 +1538,10 @@ function MetricPart({ step, entry, inputs, runId, runClass, seal, pending, faile
                 : step.recompute_ok ? EVIDENCE_TEXT.recomputeOk : EVIDENCE_TEXT.recomputeBad}
             </dd>
           </div>
+          {step.comparability && typeof step.comparability === 'object' && (
+            // 跨两份同形查询算的环比、同比：口径卡执行时自动做的可比性检查，展开看那份可比性结论的整条链
+            <ComparabilityRow comparability={step.comparability} seal={seal} />
+          )}
           {untraced && (
             <div>
               <dt className="text-2xs text-faint">{EVIDENCE_TEXT.origin}</dt>
@@ -1849,6 +1913,11 @@ function QueryPart({ id, step, seal, masked, pick }: {
               · {MERGE_TEXT.mergedInto(step.merged_into)}
             </span>
           )}
+          {step.input_of && (
+            <span className="ml-1.5 font-normal" data-ev-input-of={step.input_of}>
+              · {ANALYSIS_TEXT.evidence.inputOfAnalysis(step.input_of)}
+            </span>
+          )}
         </span>
         {host.onNode && <NodeChip id={step.node_id} />}
         {step.sql && (
@@ -2057,6 +2126,8 @@ const CODE_LABEL: Record<string, string> = {
   unverified_entity: '无法核实的名称',
   absence_claim: ABSENCE_CLAIM_TEXT.label,
   masked_cell: MASKED_CELL_TEXT.label,
+  // 分析说法核对（engine/analysis_claims.CODES）：叫法同审计
+  ...ANALYSIS_TEXT.claim.label,
 }
 
 /** 违规清单：报告撰写节点核对出来的全部问题，画得出线的能定位，画不出的说清在哪 */

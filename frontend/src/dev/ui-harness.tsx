@@ -32,6 +32,7 @@ import evidenceEntity from '../run/__tests__/evidence-entity.json'
 import evidenceJudge from '../run/__tests__/evidence-judge.json'
 import evidenceVerdict from '../run/__tests__/evidence-verdict.json'
 import evidenceProvenance from '../run/__tests__/evidence-provenance.json'
+import evidenceAnalysis from '../run/__tests__/evidence-analysis.json'
 import { EvidenceGuessView } from '../run/EvidenceGuess'
 import { IssuanceBanner } from '../run/AssistantStream'
 import mdPinned from '../run/__tests__/markdown-pinned.json'
@@ -214,6 +215,14 @@ const EV_VERDICT_EXPLORE = evidenceVerdict.explore.doc as unknown as EvidenceDoc
  * 片段接口、推断来源接口、导入清单的工件都由 check-evidence 用 page.route 伪造（按 runId 认出这一份夹具）
  */
 const EV_PROVENANCE = evidenceProvenance.doc as unknown as EvidenceDocData
+/**
+ * 分析能力一轮：判定语、具名的数、结果表的格（evidence-analysis.json，真运行组装的文档）。agent 那份有三句说法违规和系统写的
+ * 分析范围；card 是分析卡的结论（报告里有一张表引用结果表的格）；metric 是口径卡指标上挂着两期可比性。片段接口、证据图、分析
+ * 范围编号的出处链由 check-evidence 用 page.route 伪造（按 runId 认出这一份夹具）
+ */
+const EV_ANALYSIS = evidenceAnalysis.agent.doc as unknown as EvidenceDocData
+const EV_ANALYSIS_CARD = evidenceAnalysis.card.doc as unknown as EvidenceDocData
+const EV_ANALYSIS_METRIC = evidenceAnalysis.metric.doc as unknown as EvidenceDocData
 /** 同一份旧契约的出具，去掉位置：老运行就是这样，只能按字符串标 */
 const LEGACY_LOOSE = {
   matched: EV_LEGACY.matched.map(({ start: _s, end: _e, ...m }) => m),
@@ -450,6 +459,28 @@ function EvidenceOnly() {
           <div id="evidence-provenance-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
             <EvidenceDoc doc={EV_PROVENANCE} artifact={evidenceProvenance.doc_artifact} runId={evidenceProvenance.run_id}
                          label="answer" dense tally />
+          </div>
+        </div>
+        {/* 分析能力一轮：分析结论的出处链、说法违规的标注、系统写的分析范围、口径卡指标上的两期可比性 */}
+        <div className="flex flex-col gap-4" id="evidence-analysis-demo">
+          <div id="evidence-analysis" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">分析结论（Agent 的分析工具）、说法违规、分析范围</div>
+            <EvidenceDoc doc={EV_ANALYSIS} artifact={evidenceAnalysis.agent.doc_artifact} runId={evidenceAnalysis.agent.run_id}
+                         runClass="exploratory" label="answer" tally />
+          </div>
+          <div id="evidence-analysis-narrow" className="rounded-lg border bg-panel p-2.5" style={{ width: 360, maxWidth: '100%' }}>
+            <EvidenceDoc doc={EV_ANALYSIS} artifact={evidenceAnalysis.agent.doc_artifact} runId={evidenceAnalysis.agent.run_id}
+                         runClass="exploratory" label="answer" dense tally />
+          </div>
+          <div id="evidence-analysis-card" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">分析卡的结论（模板定好的分析），表格里引用结果表的格</div>
+            <EvidenceDoc doc={EV_ANALYSIS_CARD} artifact={evidenceAnalysis.card.doc_artifact} runId={evidenceAnalysis.card.run_id}
+                         runClass="exploratory" label="answer" tally />
+          </div>
+          <div id="evidence-analysis-metric" className="rounded-lg border p-3">
+            <div className="mb-1 text-2xs text-faint">口径卡指标上的两期可比性</div>
+            <EvidenceDoc doc={EV_ANALYSIS_METRIC} artifact={evidenceAnalysis.metric.doc_artifact}
+                         runId={evidenceAnalysis.metric.run_id} runClass="exploratory" label="answer" tally />
           </div>
         </div>
         <div id="evidence-long" className="rounded-lg border p-3">

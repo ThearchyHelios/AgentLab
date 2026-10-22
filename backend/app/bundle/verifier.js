@@ -19,6 +19,11 @@
  *      有格的列，伪造的缩进、列号挤不走核对过的数；
  *   ⑥ 运行信息：运行结果、运行类别、出具档位拿封存范围内已核对的事件对照。工作流名、版本、起止时间、节点名称
  *      绑不进封存，页面上写明它们取自运行记录。
+ * 分析结论（判定语 [[a:A3]]、具名的数 [[a:A3.键]]、结果表的格 [[v:A3.r0.列]]）在 ③ ④ 里和查询快照一样核哈希、核引用链
+ * （它的输入快照按「已核对的分析结论的输入」认）；⑤ 里核正文显示的判定语、数是不是结论里写的那几个字（同服务端的渲染
+ * 规则）。本页不重算统计：结论随文件附带时，出处面板展示导出时服务端按封存的输入复算的结论（工件条目上的 recheck）。
+ * 口径卡指标上的可比性结论不进台账、只从卡上引用：④ 按「已核对的口径卡记着的可比性」认它，指标的数字详情里展示它。
+ * 报告文档带着系统写的「分析范围」（analysis_scope）的，正文后面照它渲染，编号点得开那条结论。
  * 每项给出通过 / 不通过 / 无法核对和原因。服务端导出时不会出现的状态（被引用的工件不在清单里、检索快照这类工件标着
  * 遮罩）一律算不通过：只可能是文件被改过。报告文档的证据目录里写着取自遮罩列的指标的值时，服务端只给它的哈希
  * （升级前生成的文档，或者生成之后数据源才设的遮罩），页面照实说明，这份报告算未能核对。总览只有一项无法核对都没有、
@@ -46,7 +51,10 @@
 
   const RESULT = { pass: '通过', fail: '不通过', na: '无法核对', partial: '部分无法核对' }
   const MARK = { pass: '✓', fail: '✗', na: '?', partial: '?' }
-  const KIND_LABEL = { report_doc: '报告文档', metric_set: '口径卡', query: '查询快照' }
+  const KIND_LABEL = { report_doc: '报告文档', metric_set: '口径卡', query: '查询快照', analysis_result: '分析结论' }
+  /** 分析结论（app/analysis）：工件种类、目录条目种类、分析范围里的几组 */
+  const ANALYSIS = 'analysis_result'
+  const SCOPE_GROUPS = [['phenomena', '现象'], ['decomposed', '拆过'], ['excluded', '排除'], ['refused', '算不了']]
   const TIER_LABEL = { formal: '完整出具', degraded: '降档出具', withheld: '不予出具' }
   const CLASS_LABEL = { formal: '正式运行', exploratory: '探索运行' }
   // rejected：被审批人驳回结束（运行记录 cancelled + end_reason=rejected）。封存里它和手动停止是同一种结束事件（运行取消），
@@ -60,7 +68,8 @@
     'node.failed': '节点失败', 'node.skipped': '节点跳过', 'edge.taken': '分支走向', 'llm.start': '模型调用开始',
     'llm.end': '模型调用结束', 'llm.thinking': '模型思考', 'tool.start': '工具调用', 'tool.end': '工具返回',
     'tool.error': '工具出错', 'tool.gated': '门控判定', 'retrieve.end': '知识检索', 'memory.end': '记忆读写',
-    'merge.end': '合并查询', 'sandbox.start': '沙箱开始', 'sandbox.end': '沙箱结束', 'agent.step.start': 'Agent 步骤开始',
+    'merge.end': '合并查询', 'analysis.end': '分析卡的一项',
+    'sandbox.start': '沙箱开始', 'sandbox.end': '沙箱结束', 'agent.step.start': 'Agent 步骤开始',
     'agent.step.end': 'Agent 步骤结束', 'agent.route.start': '调度决策开始', 'agent.route.end': '调度决策结束',
     'human.requested': '请求人工审批', 'human.resolved': '人工审批结果', 'approval.inquiry': '审批质询',
     'issuance': '出具判定', 'caliber.upgrade': '口径卡升版处置', 'catalog.drift': '数据目录变化',
@@ -111,7 +120,7 @@
     sumEvents: (n) => `${n} 条带内容的事件；其余事件只附哈希，参与 ② 的清单核对`,
     sumManifest: (n) => `按 ${n} 条事件的哈希重算`,
     sumCount: (n, unit) => `${n} ${unit}`,
-    sumNumbers: (numbers, values) => `数字 ${numbers} 个 · 取值 ${values} 个`,
+    sumNumbers: (numbers, values, phrases = 0) => `数字 ${numbers} 个 · 取值 ${values} 个${phrases ? ` · 判定语 ${phrases} 个` : ''}`,
     sumMeta: '与封存范围内已核对的事件对照',
     showAll: (n) => `展开全部 ${n} 项`,
     eventMismatch: '内容与记录的哈希不一致',
@@ -136,13 +145,16 @@
     maskedUnparsable: '导出时服务端的这份文件无法解析，认不出是否含遮罩列，按含遮罩列处理，未随文件附带',
     /** 报告文档只给哈希：证据目录里写着值取自遮罩列的指标的原值（升级前的报告撰写节点生成的，或者生成之后数据源才设的遮罩） */
     maskedDoc: '证据目录里写着取自遮罩列的指标的值（生成时没有按遮罩换掉），未随文件附带，只能核对到哈希',
-    maskedOdd: '只有查询快照、口径卡和报告文档会因遮罩不随文件附带，这份工件却标着遮罩：导出时不会出现这种情况，文件可能被改过',
+    maskedOdd: '只有查询快照、口径卡、分析结论和报告文档会因遮罩不随文件附带，这份工件却标着遮罩：导出时不会出现这种情况，文件可能被改过',
+    /** 分析结论只给哈希：它的输入快照有一份证明不了没碰设了遮罩的列（结果表里的维度值取自输入快照） */
+    maskedAnalysis: '这份分析结论的输入查询用到或可能用到设了遮罩的列，结论未随文件附带，只能核对到哈希',
     artifactMissing: '导出时服务端已没有这份工件的文件',
     artifactAbsent: '内容未随文件附带：导出时不会出现这种情况，文件可能被改过',
     chainDoc: (label) => `报告「${label}」的文档`,
     chainByEvent: (seq, what) => `第 ${seq} 条事件（${what}）`,
     chainByDoc: (label, alias) => `报告「${label}」的证据目录（${alias}）`,
     chainByCard: (label, metric) => `口径卡「${label}」的输入（指标 ${metric}）`,
+    chainByAnalysis: (label) => `分析结论（${label}）的输入`,
     chainFrom: '引用自',
     chainNoCheckEvent: '找不到这个报告节点的报告自查事件',
     chainCheckEventFailed: '报告自查事件的内容没有通过核对',
@@ -159,6 +171,9 @@
     srcCell: (alias, row, column) => `查询 ${alias} · 第 ${row + 1} 行 · ${column}`,
     srcQuery: (alias) => `查询 ${alias}`,
     srcInput: (field) => `运行输入「${field}」`,
+    srcAnalysis: (alias) => `分析结论 ${alias} 的判定语`,
+    srcAnalysisValue: (alias, key) => `分析结论 ${alias} 的具名的数「${key}」`,
+    srcAnalysisCell: (alias, row, column) => `分析结论 ${alias} 的结果表 · 第 ${row + 1} 行 · ${column}`,
     srcNone: '没有出处',
     srcOther: '其他引用',
     numUncited: '该数字未使用引用标记，无法核对其来源',
@@ -175,9 +190,16 @@
     numMetricDiffers: '引用的值与口径卡里的值不一致',
     numNoCell: (why) => `快照里找不到这一格：${why}`,
     numCellDiffers: '引用的值与快照里那一格的值不一致',
+    numNoPhrase: '分析结论里没有判定语',
+    numNoValue: (key) => `分析结论里没有名为「${key}」的数`,
+    numValueDiffers: '引用的值与分析结论里记的值不一致',
+    numNoTable: '分析结论里没有结果表',
+    numAnalysisCell: '引用的值与分析结论结果表里那一格的值不一致',
     /** cited 已经加好引号（空值写「空值（NULL）」）；expected 和引用的值写法一样时不写（文字取值） */
     numShownDiffers: (shown, cited, expected) => `正文显示「${shown}」，引用的值是${cited}`
       + (expected == null ? '' : `，按显示规则应显示为「${expected}」`),
+    /** 判定语的引用不带值（判定语就是结论里的那句话）：只点名正文显示的字和结论里的判定语，不写「引用的值是空值」 */
+    numPhraseDiffers: (shown, expected) => `正文显示「${shown}」，分析结论里的判定语是「${expected}」`,
     numShownUnknown: (why) => `无法核对显示文字：${why}`,
     shownFormat: (fmt) => `显示格式「${fmt}」无法识别`,
     shownConv: (conv) => `换算「${conv}」无法识别`,
@@ -206,7 +228,7 @@
     shownLookalike: '紧挨着长得像数字的字母或符号（l、I、O、上标数字、圈码这类），读起来可能多出一位',
     shownOdd: '紧挨着这个数的字不在常见写法里，无法确认读者看到的数',
     numNotShown: '正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过',
-    numAria: (kind, text, result) => `${kind === 'value' ? '取值' : '数字'} ${text}，${result}，查看出处`,
+    numAria: (kind, text, result) => `${kind === 'value' ? '取值' : kind === 'analysis' ? '判定语' : '数字'} ${text}，${result}，查看出处`,
     // 数字详情里口径卡一节：指标、计算方式（原式、代入式）、输入、复算。遮罩未附带的卡没有这一节（原因见核对明细 ③）
     dMetric: '指标', dUnit: '单位', dExpression: '原式（计算方式）', dSubstituted: '代入式（代入输入后的算式）',
     dInputs: '输入', dRecompute: '复算', dSourceName: '数据源', dInputValue: '取值', dFrom: '取自',
@@ -236,6 +258,21 @@
     dResult: '核对结果', dSource: '出处', dNode: '来源节点', dCaliber: '口径', dCited: '引用的值', dCard: '口径卡里的值',
     dCell: '快照里的值', dShown: '正文显示', dShownSame: '与按显示规则渲染的结果一致', dExpected: '按显示规则应为',
     dArtifact: '所在工件', dReport: '所在报告',
+    dPhrase: '判定语', dCriterion: '判定标准', dMethod: '方法与版本', dAnalysis: '分析结论里的值', dRecheck: '复算',
+    dAnalysisInputs: '输入', dHypothesis: 'Agent 写的假设', dCardHypothesis: '分析卡上写的『在验证什么』', dCaveats: '附带说明',
+    recheckBy: '导出时服务端按封存的输入复算的结论；本页只核哈希，不在浏览器里重算统计',
+    recheckNone: '导出时没有复算（结论未随文件附带）',
+    analysisInput: (role, alias) => `${role}${alias ? ` · ${alias}` : ''}`,
+    // 分析结论输入的角色（analysis.contract.AnalysisInput.role），同证据面板的叫法
+    roleLabel: { data: '数据', base: '基期', target: '本期', headline_base: '基期总数', headline_target: '本期总数',
+      parent: '上一层拆解' },
+    dComparability: '两期可比性', comparabilityLabel: { comparable: '两期可比', conditional: '两期有条件可比', incomparable: '两期不可比' },
+    dJudged: '判定', dChecks: '各项检查', comparabilityNotAttached: '可比性结论未随文件附带（见核对明细 ③ ④），这里按口径卡的记录展示',
+    scopeTitle: '分析范围', scopeNote: '这一段由系统按这次运行的分析结论写成，写作者改不了；点开编号看判定语、判定标准、输入和复算。',
+    scopeMissing: '没拆', scopeAll: '候选维度都拆过了', scopeUnknown: '候选维度核对不了', scopeTests: '检验',
+    scopeTestsText: (n) => `这次做了 ${n} 次差异检验`, scopeParent: (alias) => `下钻自 ${alias}`, scopeDims: (dims) => `按${dims}`,
+    // 「检验」后面接的校正说明（ScopeBlock.corrected），同导出页（report_export/build.py 的 SCOPE_CORRECTED）
+    scopeCorrected: '（一次里比了几对的已按次数校正）', scopeUncorrected: '，几次检验之间没有按次数校正',
     dSql: 'SQL', dRow: (row) => `快照第 ${row + 1} 行`,
     nullValue: '空值（NULL）',
     appendedNote: '这些事件追加在封存之后，不在封存范围内，不参与清单核对，也不能当作证据。',
@@ -559,7 +596,8 @@
 
   const shifted = (d, k) => ({ neg: d.neg, coef: d.coef, exp: d.exp + k })
 
-  /** _render_numeric：万 / 亿留两位、去尾零，单位接在后面；pct、比率乘 100 加 %（不接单位）；int、.N 改小数位 */
+  /** _render_numeric：万 / 亿留两位、去尾零，单位接在后面；pct、比率乘 100 加 %（不接单位）；pp 乘 100 写成「+1.2 个百分点」；
+   * int、.N 改小数位 */
   function renderNumeric(d, unit, decimals, fmt, conv) {
     if (adjusted(d) >= MAX_DIGITS) throw new Unshown(T.shownTooLong)
     const ratio = fmt === 'percent_of_ratio'
@@ -571,6 +609,20 @@
     if (conv === 'pct') {
       if (unit.includes('%') || unit.includes('％')) throw new Unshown(T.shownPctUnit)
       return `${digitsOf(shifted(d, 2), decimals != null ? Math.max(decimals - 2, 0) : 1, group, false)}%`
+    }
+    if (conv === 'pp') {
+      // 比率的变化按百分点写：一位小数、正数带「+」（0 不带）；不是 0 的值写出来成了 0.0 的多给小数位（最多 4 位），
+      // 不写假的 0（同服务端 engine/evidence._render_numeric 的 pp）
+      if (unit.includes('%') || unit.includes('％')) throw new Unshown(T.shownPctUnit)
+      const points = shifted(d, 2)
+      if (isZero(points)) return `${digitsOf(points, 1, group, false)} 个百分点`
+      let places = 1
+      for (; places < 5; places++) {
+        if (!isZero(quantize(points, -places))) break
+      }
+      if (places >= 5) throw new Unshown(T.shownZero)
+      const out = digitsOf(points, places, group, false)
+      return `${out.startsWith('-') ? out : `+${out}`} 个百分点`
     }
     let places
     if (conv === 'int') places = 0
@@ -615,12 +667,13 @@
 
   /**
    * render_cell(shown(raw))：快照里的一格。kind 是查询时记下的列类型，display 是报告文档记下的单元格显示规则版本
-   * （2 版起 ISO 日期时间的 T 换成空格；3 版起标识列的数不分千位）。plain 是引用上记下的「这一格按标识列显示」：
+   * （2 版起 ISO 日期时间的 T 换成空格；3 版起标识列的数不分千位；4 版起引用分析结论时按结论记的格式换算）。
+   * plain 是引用上记下的「这一格按标识列显示」：
    * 哪几列是标识列服务端按 SQL 和冻结的数据目录判（cell_format.plain_columns），本页解析不了 SQL，照引用上记的渲染——
    * 它只决定分不分千位，值本身照样逐位比对。DECIMAL 落成的数字文本按数渲染、不经 float；文字压成一行，竖线换成 ¦
    */
   function renderCell(raw, token, conv, kind, display, plain = false) {
-    if (display !== 1 && display !== 2 && display !== 3) throw new Unshown(T.shownDisplay(display))
+    if (display !== 1 && display !== 2 && display !== 3 && display !== 4) throw new Unshown(T.shownDisplay(display))
     if (!PY_NUMERIC || !ISO_DATETIME) throw new Unshown(T.shownOld)
     const fmt = display >= 3 && plain === true ? 'plain' : 'thousands'
     let value = raw
@@ -1175,7 +1228,7 @@
   async function verify(data, digest, shownSeal) {
     const out = {
       events: [], manifest: [], artifacts: [], chain: [], numbers: [], docs: [], meta: [], checked: new Map(), order: [],
-      arts: new Map(), queryAliases: new Map(),
+      arts: new Map(), queryAliases: new Map(), analysisEntries: new Map(),
     }
     const events = Array.isArray(data.events) ? data.events.filter(isObj) : []
     const meta = data.meta
@@ -1260,7 +1313,7 @@
         // 内容不随文件附带，浏览器算不出它对不对得上：导出时服务端看到自己的文件和 id 对不上（mismatch）、解析不出来
         // （unparsable）的照实说，对不上的判不通过——不然被改过的文件看起来和正常的遮罩一样，篡改的证据就丢了。报告文档
         // 只给哈希时页面上没有正文可核，总览不是绿色的通过（overallOf 按报告文档没核对上算）
-        if (a.kind !== 'query' && a.kind !== 'metric_set' && a.kind !== 'report_doc') {
+        if (a.kind !== 'query' && a.kind !== 'metric_set' && a.kind !== 'report_doc' && a.kind !== ANALYSIS) {
           item.result = FAIL
           item.reason = T.maskedOdd
         } else if (a.mismatch) {
@@ -1268,7 +1321,7 @@
           item.reason = T.maskedMismatch
         } else {
           item.reason = a.unparsable ? T.maskedUnparsable : a.kind === 'query' ? T.maskedQuery
-            : a.kind === 'report_doc' ? T.maskedDoc : T.masked
+            : a.kind === 'report_doc' ? T.maskedDoc : a.kind === ANALYSIS ? T.maskedAnalysis : T.masked
         }
       } else if (a.missing) {
         item.reason = T.artifactMissing
@@ -1336,7 +1389,17 @@
     for (const [id, refs] of byDoc) {
       if (refs.length && !out.queryAliases.has(id)) out.queryAliases.set(id, refs[0].alias)
     }
+    // 工件 → 报告目录里这条分析结论的条目（item、call_id）：谁做的那一行、「在验证什么」的说法照它认
+    out.analysisEntries = new Map()
+    for (const [id, refs] of byDoc) {
+      for (const ref of refs) {
+        const doc = trusted.get(ref.report)
+        const entry = own(isObj(doc) ? doc.catalog : null, ref.alias)
+        if (isObj(entry) && entry.kind === 'analysis' && !out.analysisEntries.has(id)) out.analysisEntries.set(id, entry)
+      }
+    }
     out.arts = arts
+    out.chained = chained
     // 已核对的口径卡记着的输入 → 输入指向的查询快照。卡本身核过哈希（③ 通过），它记的引用和文档的证据目录
     // 同一个分量：报告只引用指标、不直接引用查询时，查询快照就是从这条路嵌进来、也是从这条路认的。
     // 没核对过的卡（哈希对不上）不认：被改过的卡说输入来自哪，不能替它圆
@@ -1351,14 +1414,33 @@
           }
         }
       }
+      // 指标上的可比性结论不进台账、只从卡上引用（卡记着它的 sha256）：已核对的卡记着的，同卡的输入一样认
+      for (const metric of Array.isArray(item.json.metrics) ? item.json.metrics : []) {
+        const c = isObj(metric) && isObj(metric.comparability) ? metric.comparability : null
+        if (c && typeof c.artifact === 'string' && c.artifact) {
+          push(byCard, c.artifact, { card: item, metric: metric.id })
+        }
+      }
+    }
+    // 已核对的分析结论记着的输入 → 输入快照、下钻的上一层结论。同口径卡：结论本身核过哈希，它记的输入和文档的证据目录
+    // 同一个分量；没核对过的（哈希对不上）不认
+    const byAnalysis = new Map()   // 工件 id → [{ analysis }]
+    for (const item of out.artifacts) {
+      if (item.a.kind !== ANALYSIS || item.result !== PASS) continue
+      for (const input of Array.isArray(item.json.inputs) ? item.json.inputs : []) {
+        if (isObj(input) && typeof input.artifact === 'string' && input.artifact && input.artifact !== item.a.id) {
+          push(byAnalysis, input.artifact, { analysis: item })
+        }
+      }
     }
     for (const item of out.artifacts) {
       if (item.a.kind === 'report_doc') continue
       const evs = byEvent.get(item.a.id) || []
       const docs = byDoc.get(item.a.id) || []
       const cards = byCard.get(item.a.id) || []
-      const ok = evs.length > 0 || docs.length > 0 || cards.length > 0
-      out.chain.push({ kind: item.a.kind, art: item, events: evs, docs, cards, result: ok ? PASS : FAIL,
+      const analyses = byAnalysis.get(item.a.id) || []
+      const ok = evs.length > 0 || docs.length > 0 || cards.length > 0 || analyses.length > 0
+      out.chain.push({ kind: item.a.kind, art: item, events: evs, docs, cards, analyses, result: ok ? PASS : FAIL,
         reason: ok ? '' : T.chainUnreferenced })
       if (ok) chained.add(item.a.id)
     }
@@ -1371,7 +1453,7 @@
       out.docs.push({ report, art, link, doc, trusted: trusted.has(report) })
       if (!doc) continue
       for (const [seg, path] of segmentsOf(doc)) {
-        if (seg.kind !== 'number' && seg.kind !== 'value') continue
+        if (seg.kind !== 'number' && seg.kind !== 'value' && seg.kind !== 'analysis') continue
         // 引用的值在文档 JSON 里的原文：超过 2^53 的整数照原文写进原因和出处面板
         const citedToken = () => tokenAt(tokensOf(art), [...path, 'cite', 'value'])
         const check = trusted.has(report) ? checkNumber(seg, doc, arts, chained, citedToken)
@@ -1394,10 +1476,17 @@
     const entry = own(doc.catalog, cite.alias)
     const loc = isObj(cite.locator) ? cite.locator : {}
     if (cite.kind === 'metric') return T.srcMetric(own(entry, 'name') || loc.metric || cite.ref || '')
+    if (cite.kind === 'cell' && own(entry, 'kind') === 'analysis' && Number.isInteger(loc.row)) {
+      // 结果表的格写列名：核对到结论之后换成结论记的列名（checkAnalysis 的 info.source），这里先照引用里的列 id 说
+      return T.srcAnalysisCell(cite.alias, loc.row, String(loc.column ?? ''))
+    }
     if (cite.kind === 'cell') {
       return Number.isInteger(loc.row) ? T.srcCell(cite.alias, loc.row, String(loc.column ?? '')) : T.srcQuery(cite.alias)
     }
     if (cite.kind === 'input') return T.srcInput(loc.field || cite.ref || '')
+    if (cite.kind === 'analysis') {
+      return loc.key != null ? T.srcAnalysisValue(cite.alias, String(loc.key)) : T.srcAnalysis(cite.alias)
+    }
     return T.srcOther
   }
 
@@ -1418,10 +1507,14 @@
         { fmt: 'plain', conv: convOf(cite) }))
       return shown.result === FAIL ? shown : { ...shown, result: NA, reason: T.numInput }
     }
-    if (cite.kind !== 'metric' && cite.kind !== 'cell') return { result: NA, reason: T.numOther, source }
+    if (cite.kind !== 'metric' && cite.kind !== 'cell' && cite.kind !== 'analysis') {
+      return { result: NA, reason: T.numOther, source }
+    }
     const entry = own(doc.catalog, cite.alias)
     const info = { source, kind: cite.kind, cite }
-    const wanted = cite.kind === 'metric' ? 'metric' : 'query'
+    // 分析结论：判定语、具名的数（cite.kind analysis），和它结果表里的一格（cite.kind cell，目录条目是 analysis）
+    const analysis = cite.kind === 'analysis' || (cite.kind === 'cell' && own(entry, 'kind') === 'analysis')
+    const wanted = cite.kind === 'metric' ? 'metric' : analysis ? 'analysis' : 'query'
     if (!isObj(entry) || entry.kind !== wanted || typeof entry.artifact !== 'string') {
       return { ...info, result: FAIL, reason: T.numNoEntry }
     }
@@ -1436,6 +1529,7 @@
     }
     if (!chained.has(entry.artifact)) return { ...info, result: NA, reason: T.numNotChained }
     info.citedToken = citedToken()
+    if (analysis) return checkAnalysis(info, seg, doc, art)
     if (cite.kind === 'metric') {
       const metricId = own(cite.locator, 'metric') ?? own(entry.locator, 'metric')
       const metrics = Array.isArray(art.json.metrics) ? art.json.metrics : []
@@ -1478,6 +1572,74 @@
   /** 引用上记的换算（|万、|pct 这类），没写是 null */
   const convOf = (cite) => (own(cite, 'conv') === undefined ? null : cite.conv)
 
+  /** 分析结论给这一列 / 这个数记的换算（formats / value_formats：占比、变化率的列 pct，比率的变化 pp），没记是 null */
+  const namedConv = (formats, key) => {
+    const found = isObj(formats) ? formats[key] : null
+    return typeof found === 'string' && found ? found : null
+  }
+
+  /**
+   * 分析结论的一处引用（checkNumber 已核过工件的哈希和引用链）：引用的值等于结论里记的那个值，正文显示的字等于按服务端
+   * 的规则渲染出来的字。判定语按文本格渲染（engine/evidence.render_cell 的 kind=text：压成一行、竖线换成 ¦），具名的数按
+   * 单元格的规则（不做日期时间的改写，同服务端），结果表的一格同查询快照的一格（显示规则照文档记的版本）。不重算统计
+   */
+  function checkAnalysis(info, seg, doc, art) {
+    const cite = info.cite
+    const result = art.json
+    const loc = isObj(cite.locator) ? cite.locator : {}
+    info.analysis = result
+    if (cite.kind === 'cell') {
+      const table = isObj(result.table) ? result.table : null
+      if (!table) return { ...info, result: FAIL, reason: T.numNoTable }
+      let cell
+      try {
+        const [raw, column, key] = locateCell(table, loc.row, loc.column)
+        info.row = loc.row
+        info.column = column
+        // 出处面板写结果表记的列名（labels），不把列 id 当叫法；目录条目和文档引用里带的那份先认，没有再查这份结论
+        info.columnLabel = analysisColumnLabel(table, column)
+        info.source = T.srcAnalysisCell(cite.alias, loc.row, info.columnLabel)
+        info.truth = cellValue(raw, columnKind(table, column))
+        info.truthToken = tokenAt(tokensOf(art), ['table', 'rows', loc.row, key])
+        if (typeof raw === 'string' && typeof info.truth === 'number') info.truthText = pyStrip(raw)
+        cell = { raw, column }
+      } catch (e) {
+        return { ...info, result: FAIL, reason: T.numNoCell(e.message) }
+      }
+      if (!sameValue(cite.value, info.truth)) return { ...info, result: FAIL, reason: T.numAnalysisCell }
+      const display = Object.prototype.hasOwnProperty.call(doc, 'cell_display') ? doc.cell_display : 1
+      // 没写换算、结论的结果表给这一列记了格式（formats：4 版显示规则起）、文档也按 4 版复核的，按它渲染（服务端同样）；
+      // 写作者自己写了换算的照他的
+      const conv = convOf(cite) ?? (display >= 4 ? namedConv(table.formats, cell.column) : null)
+      return checkShown(info, seg, () => renderCell(cell.raw, info.truthToken, conv,
+        columnKind(table, cell.column), display, own(cite, 'plain') === true))
+    }
+    if (loc.key != null) {
+      const values = isObj(result.values) ? result.values : {}
+      if (!Object.prototype.hasOwnProperty.call(values, loc.key)) return { ...info, result: FAIL, reason: T.numNoValue(loc.key) }
+      const raw = values[loc.key]
+      info.truth = cellValue(raw)
+      info.truthToken = tokenAt(tokensOf(art), ['values', loc.key])
+      if (typeof raw === 'string' && typeof info.truth === 'number') info.truthText = pyStrip(raw)
+      if (!sameValue(cite.value, info.truth)) return { ...info, result: FAIL, reason: T.numValueDiffers }
+      // 没写换算、结论给这个数记了格式（value_formats；4 版显示规则起）的按它渲染（服务端同样）；写作者自己写了换算的照他的
+      const display = Object.prototype.hasOwnProperty.call(doc, 'cell_display') ? doc.cell_display : 1
+      const conv = convOf(cite) ?? (display >= 4 ? namedConv(result.value_formats, loc.key) : null)
+      return checkShown(info, seg, () => renderCell(raw, info.truthToken, conv, null, 1))
+    }
+    if (typeof result.phrase !== 'string' || !result.phrase.trim()) return { ...info, result: FAIL, reason: T.numNoPhrase }
+    info.truth = result.phrase
+    return checkShown(info, seg, () => renderCell(result.phrase, null, null, 'text', 1))
+  }
+
+  /** 分析结论结果表的一格写给人看的列名：结论结果表记的 labels（「占变化的比重」），没起名字的列才写列 id。
+   *  文档里的引用只记列 id（引用就这么写），列名照随文件附带的结论认 */
+  function analysisColumnLabel(table, column) {
+    const id = String(column ?? '')
+    const labels = isObj(table.labels) ? table.labels : {}
+    return own(labels, id) ? String(labels[id]) : id
+  }
+
   /** 口径卡的单位：服务端是 str(unit or "")，不是文字的本页不认 */
   function unitOf(unit) {
     if (!unit) return ''
@@ -1508,6 +1670,9 @@
     info.expected = expected
     const shown = String(seg.text ?? '')
     if (pyStrip(shown) === pyStrip(expected)) return { ...info, result: PASS, shownOk: true }
+    if (info.cite.kind === 'analysis' && !Object.prototype.hasOwnProperty.call(info.cite, 'value')) {
+      return { ...info, result: FAIL, reason: T.numPhraseDiffers(shown, expected) }
+    }
     const value = info.cite.value
     const cited = typeof value === 'number' ? numberText(value, info.citedToken) : value == null ? null : textOf(value)
     return { ...info, result: FAIL, reason: T.numShownDiffers(shown, cited == null ? T.nullValue : `「${cited}」`,
@@ -1752,7 +1917,7 @@
   const eventWhat = (ev) => [EVENT_LABEL[ev.type] || ev.type, ev.node_id ? nodeLabel(ev.node_id) : null].filter(Boolean).join(' · ')
 
   function numberButton(number, body) {
-    const kind = number.seg.kind === 'value' ? 'value' : 'number'
+    const kind = number.seg.kind === 'value' ? 'value' : number.seg.kind === 'analysis' ? 'analysis' : 'number'
     const btn = h('button', {
       type: 'button', class: 'num', 'data-num': number.key, 'data-kind': kind, 'data-result': number.result,
       'aria-label': T.numAria(kind, String(number.seg.text ?? ''), RESULT[number.result]),
@@ -1811,10 +1976,12 @@
       metric ? [T.dMetric, [metric.name || metric.id || '—', metric.id && metric.name ? h('span', { class: 'muted' }, `（${metric.id}）`) : null]] : null,
       metric && metric.unit ? [T.dUnit, String(metric.unit)] : null,
       cite && cite.status === 'resolved' && 'value' in cite ? [T.dCited, exactText(cite.value, number.citedToken)] : null,
-      'truth' in number ? [number.kind === 'metric' ? T.dCard : T.dCell,
+      'truth' in number ? [number.kind === 'metric' ? T.dCard : number.analysis ? T.dAnalysis : T.dCell,
         number.truthText ?? exactText(number.truth, number.truthToken)] : null,
       checked && !same ? [T.dExpected, number.expected] : null,
-      [T.dShown, [String(number.seg.text ?? ''), same ? h('span', { class: 'muted' }, `（${T.dShownSame}）`) : null]],
+      // 分析范围里的编号不是正文里的字：没有「正文显示」可核
+      number.scope ? null
+        : [T.dShown, [String(number.seg.text ?? ''), same ? h('span', { class: 'muted' }, `（${T.dShownSame}）`) : null]],
       number.artifact ? [T.dArtifact, [h('code', {}, short(number.artifact)), artifactState(number.artifact)]] : null,
       [T.dReport, nodeLabel(number.report.node_id)],
     ]
@@ -1861,11 +2028,142 @@
       }
       parts.push(kv([[T.dRecompute, metric.recompute_ok == null ? T.recomputeNone
         : metric.recompute_ok ? T.recomputeOk : T.recomputeBad]]))
+      if (isObj(metric.comparability)) parts.push(...comparabilityBlock(metric.comparability))
     }
     const snap = number.snapshot
     if (snap) parts.push(...snapshotBlock(snap, number.row, number.column,
       view.out.artifacts.find((a) => a.a.id === number.artifact)))
+    if (number.analysis || number.kind === 'analysis') parts.push(...analysisBlock(number))
     return parts
+  }
+
+  /** 方法与版本那一行：服务端在工件条目上带的叫法（method_label，和导出页同一份「变化拆解（可加） · decompose.additive@1」）
+   *  加方法 id；条目上没带叫法的只写 id */
+  function methodText(art, result) {
+    const label = art && isObj(art.a) && typeof art.a.method_label === 'string' ? art.a.method_label : ''
+    const id = String(result.method || '—')
+    return label ? `${label} · ${id}` : id
+  }
+
+  /** 口径卡指标上的可比性（口径卡执行时自动做的可比性检查）：卡上记的判定和原因；那份结论随文件附带、核对通过的，再给
+   *  判定标准、方法与版本、各项检查和导出时服务端的复算。没附带的照卡上的记录写，说明为什么没有更多 */
+  function comparabilityBlock(c) {
+    const why = Array.isArray(c.reasons) && c.reasons.length ? `：${c.reasons.map(String).join('；')}` : ''
+    const label = own(T.comparabilityLabel, c.verdict) || String(c.phrase || '—')
+    const artifact = typeof c.artifact === 'string' && c.artifact ? c.artifact : null
+    const art = artifact ? view.out.arts.get(artifact) : null
+    const ok = art && art.result === PASS && view.out.chained && view.out.chained.has(artifact)
+    const result = ok && isObj(art.json) ? art.json : null
+    const parts = [h('p', { class: 'sub' }, T.dComparability), kv([
+      [T.dJudged, `${label}${c.verdict === 'comparable' ? '' : why}`],
+      artifact ? [T.dArtifact, [h('code', {}, short(artifact)), artifactState(artifact)]] : null,
+    ])]
+    if (!result) {
+      if (artifact) parts.push(h('p', { class: 'note' }, T.comparabilityNotAttached))
+      return parts
+    }
+    parts.push(kv([
+      result.criterion ? [T.dCriterion, String(result.criterion)] : null,
+      [T.dMethod, methodText(art, result)],
+    ]))
+    const table = isObj(result.table) ? result.table : null
+    const columns = table && Array.isArray(table.columns) ? table.columns.map(String) : []
+    const labels = table && isObj(table.labels) ? table.labels : {}
+    if (columns.length && Array.isArray(table.rows) && table.rows.length) {
+      parts.push(h('p', { class: 'sub' }, T.dChecks), h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, columns.map((col) => h('th', {}, String(own(labels, col) || col))))),
+        h('tbody', {}, table.rows.filter(Array.isArray).map((row) => h('tr', {},
+          columns.map((_, i) => h('td', {}, row[i] == null ? '—' : textOf(row[i])))))))))
+    }
+    const recheck = isObj(art.a.recheck) ? art.a.recheck : null
+    parts.push(kv([[T.dRecheck, recheck
+      ? [String(recheck.text || '—'), h('span', { class: 'muted' }, `（${T.recheckBy}）`)] : T.recheckNone]]))
+    return parts
+  }
+
+  /** 数字详情里分析结论一节：判定语、判定标准、方法与版本、附带说明、「在验证什么」（谁写的照实标：Agent 写的假设 /
+   *  分析卡上写的『在验证什么』，照报告目录里这条结论的条目认）、输入（各自的核对状态）、导出时服务端的复算结论。
+   *  结论没随文件附带（遮罩、文件不在）时只写复算一句 */
+  function analysisBlock(number) {
+    const result = isObj(number.analysis) ? number.analysis : null
+    const art = view.out.artifacts.find((a) => a.a.id === number.artifact)
+    const recheck = art && isObj(art.a.recheck) ? art.a.recheck : null
+    // 谁做的：报告目录里这条结论的条目（带 item 的是分析卡做的，带 call_id 的是 Agent 现场做的）。「在验证什么」的说法照它认，
+    // 不把模板作者写的那一句标成 Agent 写的假设
+    const entry = view.out.analysisEntries.get(number.artifact)
+    const card = isObj(entry) ? !!entry.item && !entry.call_id : false
+    const parts = []
+    if (result) {
+      parts.push(kv([
+        [T.dPhrase, String(result.phrase || '—')],
+        result.criterion ? [T.dCriterion, String(result.criterion)] : null,
+        [T.dMethod, methodText(art, result)],
+      ]))
+      const caveats = (Array.isArray(result.caveats) ? result.caveats : []).filter(isObj).map((c) => String(c.text || ''))
+      if (caveats.length) parts.push(h('p', { class: 'sub' }, T.dCaveats), h('ul', { class: 'items' }, caveats.map((c) => h('li', {}, c))))
+      if (typeof result.hypothesis === 'string' && result.hypothesis.trim()) {
+        parts.push(h('p', { class: 'sub' }, card ? T.dCardHypothesis : T.dHypothesis), h('p', {}, result.hypothesis))
+      }
+      const inputs = (Array.isArray(result.inputs) ? result.inputs : []).filter((i) => isObj(i) && typeof i.artifact === 'string')
+      if (inputs.length) {
+        parts.push(h('p', { class: 'sub' }, T.dAnalysisInputs), h('ul', { class: 'items' }, inputs.map((i) => h('li', {},
+          h('span', { class: 'what' }, [T.analysisInput(own(T.roleLabel, i.role) || String(i.role || ''),
+            view.out.queryAliases.get(i.artifact)), ' ',
+            h('code', {}, short(i.artifact))]), artifactState(i.artifact)))))
+      }
+    }
+    parts.push(kv([[T.dRecheck, recheck ? [String(recheck.text || '—'), h('span', { class: 'muted' }, `（${T.recheckBy}）`)]
+      : T.recheckNone]]))
+    return parts
+  }
+
+  /** 报告文档里系统写的「分析范围」：现象、拆过（下钻按链缩进）、排除、算不了、没拆、检验了几次、校正过没有。编号点得开那条结论 */
+  function renderScope(doc, report) {
+    const scope = isObj(doc.analysis_scope) ? doc.analysis_scope : null
+    if (!scope) return null
+    const rows = []
+    for (const [key, title] of SCOPE_GROUPS) {
+      const items = (Array.isArray(scope[key]) ? scope[key] : []).filter(isObj)
+      if (!items.length) continue
+      const depth = new Map()
+      rows.push(h('dt', {}, title), h('dd', {}, h('ul', {}, items.map((item) => {
+        const level = item.parent ? (depth.get(String(item.parent)) ?? -1) + 1 : 0
+        depth.set(String(item.alias || ''), level)
+        const dims = Array.isArray(item.dims) && item.dims.length ? T.scopeDims(item.dims.join('、')) : null
+        const lead = [dims, item.parent ? T.scopeParent(String(item.parent)) : null].filter(Boolean).join('，')
+        const said = item.phrase || item.reason || ''
+        const li = h('li', {}, scopeButton(String(item.alias || ''), doc, report), lead ? `（${lead}）` : '', said ? `：${said}` : '')
+        if (level) li.style.marginLeft = `${level * 14}px`
+        return li
+      }))))
+    }
+    if (Array.isArray(scope.not_decomposed)) {
+      rows.push(h('dt', {}, T.scopeMissing), h('dd', {}, scope.not_decomposed.length ? scope.not_decomposed.join('、') : T.scopeAll))
+    } else if (Object.prototype.hasOwnProperty.call(scope, 'not_decomposed')) {
+      rows.push(h('dt', {}, T.scopeMissing), h('dd', {}, String(scope.note || T.scopeUnknown)))
+    }
+    if (Number.isInteger(scope.tests) && scope.tests > 0) {
+      const corrected = scope.corrected === true ? T.scopeCorrected : scope.corrected === false ? T.scopeUncorrected : ''
+      rows.push(h('dt', {}, T.scopeTests), h('dd', {}, T.scopeTestsText(scope.tests) + corrected))
+    }
+    if (!rows.length) return null
+    return h('section', { class: 'scope', 'data-scope': '' }, h('h4', {}, T.scopeTitle), h('p', { class: 'note' }, T.scopeNote),
+      h('dl', { class: 'kv' }, rows))
+  }
+
+  /** 分析范围里的一个编号：点开那条结论（工件的核对状态同 ③ ④；没有这条结论、没核对上的照实写） */
+  function scopeButton(alias, doc, report) {
+    if (!alias) return ''
+    const entry = own(doc.catalog, alias)
+    const artifact = isObj(entry) && typeof entry.artifact === 'string' ? entry.artifact : null
+    const art = artifact ? view.out.arts.get(artifact) : null
+    const ok = art && art.result === PASS && view.out.chained && view.out.chained.has(artifact)
+    const number = { seg: { text: alias, kind: 'analysis', cite: { alias, kind: 'analysis', status: 'resolved', locator: {} } },
+      key: `${report.node_id}|scope:${alias}`, report, kind: 'analysis', scope: true, artifact,
+      node: isObj(entry) ? entry.node_id : null,
+      source: T.srcAnalysis(alias), result: ok ? PASS : art && art.result === FAIL ? FAIL : NA,
+      reason: ok ? '' : !art ? T.numArtifactNotListed : art.reason || T.numNotChained, analysis: ok ? art.json : null }
+    return numberButton(number, alias)
   }
 
   function openNumber(number) {
@@ -1978,6 +2276,8 @@
         box.append(h('p', { class: 'warn', 'data-why': why.key }, why.text))
       }
       if (item.doc) box.append(renderDoc(item.doc, { report: item.report, numbers }))
+      const scope = item.doc && item.trusted ? renderScope(item.doc, item.report) : null
+      if (scope) box.append(scope)
       root.append(box)
     }
   }
@@ -2026,12 +2326,14 @@
       }
       const refs = [...c.docs.map((d) => T.chainByDoc(nodeLabel(d.report.node_id), d.alias)),
         ...c.cards.map((k) => T.chainByCard(nodeLabel(k.card.a.node_id), k.metric)),
+        ...(c.analyses || []).map((k) => T.chainByAnalysis(view.out.queryAliases.get(k.analysis.a.id) || short(k.analysis.a.id))),
         ...c.events.map((ev) => T.chainByEvent(ev.seq, eventWhat(ev)))]
       return [KIND_LABEL[c.kind] || c.kind, ' ', h('code', {}, short(c.art.a.id)),
         refs.length ? ` ← ${T.chainFrom}${refs.join('、')}` : '']
     }))
     const values = out.numbers.filter((n) => n.seg.kind === 'value').length
-    root.append(checkBlock('numbers', T.checkNumbers, T.sumNumbers(out.numbers.length - values, values), out.numbers,
+    const phrases = out.numbers.filter((n) => n.seg.kind === 'analysis').length
+    root.append(checkBlock('numbers', T.checkNumbers, T.sumNumbers(out.numbers.length - values - phrases, values, phrases), out.numbers,
       (n) => h('button', { type: 'button', 'data-num-item': n.key, onclick: () => {
         if (n.button) n.button.scrollIntoView({ block: 'center' })
         openNumber(n)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import math
 import re
@@ -55,6 +56,10 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     取数的那条 SQL 对照数据目录查出 error 级问题的（查询快照的 checks，见 data/sqlcheck.py：一对多关联后重复计算、
     存量跨期加总），同样值照算，标 sql_check_failed 并写明原因，出具契约据此降档（issuance.sql_check_gaps）。
+
+    一个指标的输入落在两份不同的查询快照上、两份 SQL 同形只差字面量、不同的字面量里有日期或期次（本周对上周）时，自动做
+    一次可比性检查（分析算子 comparable），结论落成工件、记在指标的 comparability 上（_comparability）。只差地区、门店号这类
+    字面量的（华东对华南）是两段不是两期，不查。做不成不挡口径卡，照实记一条日志。
     """
     definitions = ctx.cfg("metrics", []) or []
     caliber_raw, caliber_version = ctx.cfg("caliber", "") or ctx.node.title, str(ctx.cfg("caliber_version", "") or "v1")
@@ -84,6 +89,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     failed_by: dict[str, list[QueryProblem]] = {}
     #: 查询快照工件 id → 快照本身（读输入的格落在哪一列「查询区间里这张表没有数据」，_no_data_inputs）
     snapshots: dict[str, Any] = {}
+    #: 可比性检查：同一对查询快照只查一次（几个指标都用本周、上周两份快照时），和做检查要用的几样（_Comparing）
+    comparing = _Comparing()
     for definition in definitions:
         metric_id = str(definition.get("id") or "").strip()
         expr = str(definition.get("expression") or "").strip()
@@ -167,6 +174,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         no_data: dict[str, Any] = {}
         if lacking := _no_data_inputs(inputs, carried, snapshots):
             no_data = {"no_data": True, "no_data_reason": _no_data_reason(lacking), "no_data_sources": lacking}
+        comparability = await _comparability(metric_id, str(definition.get("name") or metric_id), inputs, ctx,
+                                             comparing, snapshots)
         metrics.append(
             {
                 "id": metric_id,
@@ -192,6 +201,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 **sql_check,
                 # 只在输入取自「查询区间里这张表没有数据」的列时出现，同上
                 **no_data,
+                # 只在输入落在两份同形、只差字面量的查询快照上、可比性检查做成了时出现（contract.MetricComparability）
+                **({"comparability": comparability} if comparability else {}),
             }
         )
 
@@ -462,6 +473,206 @@ def _rendered(value: Any, definition: dict[str, Any], display: dict[str, Any]) -
         return MISSING
 
 
+# --------------------------------------------------------------------------
+# 可比性检查（docs/design/analysis-round/00-总方案.md §3.4 第 3 条）
+# --------------------------------------------------------------------------
+
+#: 可比性检查没做成（快照读不出来、探查失败、算子出错、算不了……）时那条日志的 code
+COMPARABILITY_SKIPPED = "metric_comparability_skipped"
+#: 那条日志的说法
+COMPARABILITY_SKIPPED_TEXT = "指标「{name}」用到的两次查询没做成可比性检查：{why}。指标照常计算，两期能不能直接比请自行核对"
+#: 期次的几种写法（_period_key，排先后用）：月 2026-09、202609，周 2026-W41，季 2026Q3、2026-Q3，年 2026
+_MONTH_TEXT = re.compile(r"^(\d{4})-?(0[1-9]|1[0-2])$")
+_WEEK_TEXT = re.compile(r"^(\d{4})-?[Ww](\d{1,2})$")
+_QUARTER_TEXT = re.compile(r"^(\d{4})-?[Qq]([1-4])$")
+_YEAR_TEXT = re.compile(r"^(?:19|20|21)\d{2}$")
+
+
+class _Comparing:
+    """一张口径卡执行时做可比性检查记下的：同一对快照的结论（没做成的记 None，不再试）、数据源的类型（规范化 SQL 按
+    它的方言解析）。阈值、运行期依赖到真要检查时才读。"""
+
+    def __init__(self) -> None:
+        self.done: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self.kinds: dict[str, str | None] = {}
+
+
+async def _comparability(metric_id: str, name: str, inputs: list[dict[str, Any]], ctx: NodeContext,
+                         comparing: _Comparing, snapshots: dict[str, Any]) -> dict[str, Any] | None:
+    """指标的可比性（contract.MetricComparability：结论工件、判定、判定语、原因）。只在这种时候做：输入里取自查询快照的格
+    （cell() 取的格、按位置取的格、Agent 按出处交来的字段）恰好落在两份不同的快照上，两份 SQL 同形、只差字面量，查的是同一个
+    数据源，而且不同的字面量里至少有一处两边都是日期或期次（_dated_pairs：时间条件的界、像日期的常量）——本周对上周。SQL 结构不同的
+    （退款额 / 销售额）不是同一个量的两期，不查；只差地区、门店号这类字面量的（华东对华南、门店 1203 对 1204）是两段，也
+    不查。日期和别的筛选都不同的照查，算子判不可比（两边除了日期，筛选的还不一样）。
+
+    哪份是基期：不同的日期、期次里第一处两边写法相同、排得出先后的（真正的日期，或同一种写法的月、周、季、年），早的是基期；
+    排不出的（按运行当天现算的界 date('now', '-7 days')），表达式里先出现的那份算本期（「(本周 - 上周) / 上周」的写法）。
+
+    做不成（快照读不出来、探查失败、算子出错、算不了）不挡口径卡：照实记一条日志（COMPARABILITY_SKIPPED），
+    这个指标不写 comparability。同一对快照只查一次。"""
+    from app.engine.lineage import SNAPSHOT_VIAS
+
+    artifacts = list(dict.fromkeys(str(i["artifact"]) for i in inputs if i.get("via") in SNAPSHOT_VIAS
+                                   and isinstance(i.get("artifact"), str) and i["artifact"]))
+    if len(artifacts) != 2:
+        return None
+    pair = (artifacts[0], artifacts[1])
+    key = (min(pair), max(pair))        # 本周减上周、上周减本周用的是同一对快照
+    if key in comparing.done:
+        return comparing.done[key]
+    found: dict[str, Any] | None = None
+    try:
+        found = await _check_comparable(pair, inputs, ctx, comparing, snapshots)
+    except _NotPeriods:
+        found = None
+    except Exception as e:  # noqa: BLE001 - 检查是附加的，不能挡住口径卡
+        why = e.message if isinstance(e, _Skipped) else describe_exception(e)
+        ctx.emit(EventType.LOG, level="warn", code=COMPARABILITY_SKIPPED, metric=metric_id, metric_name=name,
+                 reason=why, message=COMPARABILITY_SKIPPED_TEXT.format(name=name, why=why))
+    comparing.done[key] = found
+    return found
+
+
+class _NotPeriods(Exception):
+    """两份快照不是同一个量的两期（SQL 结构不同、数据源不同、字面量一样、不同的字面量里没有日期或期次、没有 SQL）：不查，
+    也不记日志。"""
+
+
+class _Skipped(Exception):
+    """该查、却做不成（结论算不了、判定认不出）：记一条日志，message 是给人看的原因。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+async def _check_comparable(pair: tuple[str, str], inputs: list[dict[str, Any]], ctx: NodeContext,
+                            comparing: _Comparing, snapshots: dict[str, Any]) -> dict[str, Any]:
+    import app.analysis as analysis_ops   # 按模块取 run：测试换替身时只换模块上的这一个函数
+
+    from app.analysis.contract import VERDICTS
+    from app.data.sql_semantics import normalize_sql
+    from app.tools.analysis import (
+        context_of, input_snapshot, masked_of, run_snapshot, settings_of, store, tool_context,
+    )
+
+    contents = []
+    for artifact in pair:
+        if artifact not in snapshots:
+            try:
+                # 快照可能有几 MB：读文件、复验哈希放进线程，不占着事件循环（同 tools/analysis.prepare）
+                snapshots[artifact] = await asyncio.to_thread(artifact_store.load, artifact)
+            except (ValueError, OSError):
+                snapshots[artifact] = None
+        if not isinstance(snapshots[artifact], dict):
+            raise _Skipped("查询快照读不出来")
+        contents.append(snapshots[artifact])
+    sqls = [c.get("sql") for c in contents]
+    sources = [str(c.get("source") or "") for c in contents]
+    if not all(isinstance(q, str) and q.strip() for q in sqls) or sources[0] != sources[1]:
+        raise _NotPeriods()
+    dialect = await _dialect_of(sources[0], comparing)
+    norms = [normalize_sql(q, dialect) for q in sqls]
+    if not norms[0].same_shape(norms[1]) or norms[0].literals == norms[1].literals:
+        raise _NotPeriods()
+    dated = _dated_pairs(sqls[0], sqls[1], dialect)
+    if not dated:
+        raise _NotPeriods()                       # 不同的字面量里没有日期或期次：比的是两段，不是两期
+    first, second = _period_order(dated)
+    order = (pair[first], pair[second])           # (基期, 本期)
+    refs: dict[str, str] = {}
+    for role, artifact in zip(("base", "target"), order):
+        producer = next((str(i.get("node_id") or "") for i in inputs if i.get("artifact") == artifact), "")
+        refs[artifact] = producer if producer and producer not in refs.values() else f"{producer or 'query'}·{role}"
+    snaps = {}
+    for artifact in order:
+        snaps[refs[artifact]] = input_snapshot(snapshots[artifact], ref=refs[artifact], artifact=artifact,
+                                               node_id=refs[artifact].split("·")[0],
+                                               masked=await masked_of(snapshots[artifact], artifact))
+    settings = await settings_of(run_snapshot(ctx.run))
+    context = await context_of(list(snaps.values()), tool_ctx=tool_context(ctx.run, ctx.node.id, ctx.emit))
+    request = {"op": "comparable", "mode": None,
+               "params": {"base_query": refs[order[0]], "target_query": refs[order[1]]}}
+    result = await analysis_ops.run(request, snaps.get, settings=settings, context=context)
+    verdict = (result.get("verdict") or {}).get("code")
+    if result.get("status") != "ok" or verdict not in VERDICTS["comparable"]:
+        raise _Skipped(str(result.get("reason") or "检查没有给出判定"))
+    artifact = await store(result, run_id=ctx.run.run_id, node_id=ctx.node.id)
+    # 原因的拆法只有算子那一处（analysis.comparable_reasons，按检查表的说明拆）
+    return {"artifact": artifact, "verdict": result["verdict"]["code"], "phrase": result["phrase"],
+            "reasons": analysis_ops.comparable_reasons(result)}
+
+
+async def _dialect_of(source: str, comparing: _Comparing) -> str | None:
+    """数据源的类型（规范化 SQL 按它的方言解析）；合并查询在 SQLite 里执行。认不出为 None（通用读法）。"""
+    from app.engine.merge_query import MERGE_SOURCE
+
+    if source == MERGE_SOURCE:
+        return "sqlite"
+    if source not in comparing.kinds:
+        from sqlalchemy import select
+
+        from app.db.base import SessionLocal
+        from app.db.models import DataSource
+
+        async with SessionLocal() as session:
+            comparing.kinds[source] = (await session.execute(
+                select(DataSource.kind).where(DataSource.name == source))).scalar_one_or_none()
+    return comparing.kinds[source]
+
+
+def _dated_pairs(a: str, b: str, dialect: str | None) -> list[tuple[str, str]]:
+    """两份同形 SQL 里不同的字面量中，两边都是日期或期次的那几对：[(左边的值, 右边的值)]（不带引号），按语法树里的先后。
+    一对都没有（只差地区、门店号这类字面量），或者解析不了、两边的字面量对不上的，为空。
+
+    日期、期次的认法和可比性算子「同口径」一项同一套（app/analysis/comparable 的 _undated）：data/coverage 认出的时间条件的
+    界（整个界的表达式：day BETWEEN '2026-10-12' AND …、month = '2026-09'、yr = 2026、week = '2026-W41'，按运行当天现算的
+    date('now', '-7 days') 里的字面量也算），加上别处像日期的常量（coverage.literal_bound 认得出的真正的日期）。两边同形，
+    语法树一样，字面量按同一个先后一一对上。"""
+    from sqlglot import exp
+
+    from app.data import coverage
+
+    sides: list[list[tuple[Any, bool]]] = []
+    for sql in (a, b):
+        tree = coverage.parse_sql(sql, dialect)
+        if tree is None:
+            return []
+        kept = {id(n) for flt in coverage.filters(tree) for _, bound, _ in flt.conds for n in bound.walk()}
+        sides.append([(lit, id(lit) in kept or coverage.literal_bound(lit)[1] is not None)
+                      for lit in tree.find_all(exp.Literal)])
+    if len(sides[0]) != len(sides[1]):
+        return []
+    return [(str(x.this), str(y.this)) for (x, x_dated), (y, y_dated) in zip(*sides)
+            if x_dated and y_dated and (x.this, x.is_string) != (y.this, y.is_string)]
+
+
+def _period_key(text: str) -> tuple[str, tuple[int, ...]] | None:
+    """一个日期、期次字面量（去掉引号）排先后用的 (写法, 键)：真正的日期（YYYY-MM-DD、YYYYMMDD，带不带时间）按那一天，
+    月、周、季、年按 (年, 第几)。认不出的（-7 days 这类偏移量、序号）为 None：只有写法相同的两个才比先后。"""
+    from app.data import coverage
+
+    day = coverage.as_day(text)
+    if day is not None:
+        return "day", (day.day.toordinal(),)
+    for shape, pattern in (("month", _MONTH_TEXT), ("week", _WEEK_TEXT), ("quarter", _QUARTER_TEXT)):
+        if found := pattern.match(text):
+            return shape, (int(found.group(1)), int(found.group(2)))
+    if _YEAR_TEXT.match(text):
+        return "year", (int(text),)
+    return None
+
+
+def _period_order(pairs: list[tuple[str, str]]) -> tuple[int, int]:
+    """两份同形 SQL 里不同的日期、期次（_dated_pairs）→ (基期的下标, 本期的下标)。第一对两边写法相同、排得出先后的
+    （_period_key）定先后，早的是基期；都排不出的，表达式里先出现的那份（下标 0）是本期。"""
+    for x, y in pairs:
+        kx, ky = _period_key(x.strip()), _period_key(y.strip())
+        if kx is not None and ky is not None and kx[0] == ky[0] and kx[1] != ky[1]:
+            return (0, 1) if kx[1] < ky[1] else (1, 0)
+    return 1, 0
+
+
 #: 清单里输入取自「查询区间里这张表没有数据」的列的指标后面那句：直接读清单的模型节点不能把 0 当成真的是 0
 LISTED_NO_DATA = "（这段时间表里没有数据：不要当成 0 解读）"
 #: 指标的 no_data_reason 打头那半句（后面接查询记下的说明）
@@ -694,7 +905,7 @@ _REF_HEAD = re.compile(r"^(vars|nodes|input)\.([A-Za-z_一-鿿][\w\-一-鿿]*)(.
 _VIA = {"input": "input", "code": "code", "agent": "agent", "llm": "llm", "tool": "tool",
         "transform": "transform", "metrics": "metric", "retrieve": "retrieval", "loop": "loop",
         "human": "human", "validate": "validate", "supervisor": "team", "subgraph": "subgraph",
-        "memory": "memory", "merge": "merge"}
+        "memory": "memory", "merge": "merge", "analysis": "analysis"}
 
 
 def _input_of(path: str, value: Any, state: GraphState, ctx: NodeContext,

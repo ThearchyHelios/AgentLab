@@ -5,10 +5,12 @@
  * 统计、结论、能不能做都由服务端给，这里只有叫法和句式：数字一律是服务端算好交来的，这里只负责写成话。
  */
 import type {
-  EvalCatalogMode, EvalCause, EvalE1Band, EvalE3Band, EvalExpectationKind, EvalGoldKind, EvalOutcome, EvalPath,
-  EvalRate, EvalStatus, EvalTextOutcome, EvalTransition, EvalTrialStatus, EvalTrigger, EvalUpgradePolicy, EvalVerdict,
+  EvalAnalysisMode, EvalAnalysisOp, EvalAnalysisTools, EvalCatalogMode, EvalCause, EvalE1Band, EvalE3Band, EvalExpectationKind,
+  EvalGoldKind, EvalJudgement, EvalOutcome, EvalPath, EvalRate, EvalStatus, EvalTextOutcome, EvalTransition, EvalTrialStatus,
+  EvalTrigger, EvalUpgradePolicy, EvalVerdict,
 } from '../typesEval'
 import { formatCost, formatNumber } from './format'
+import { ANALYSIS_MODE_LABEL, ANALYSIS_OP_LABEL, ANALYSIS_TEXT } from './termsAnalysis'
 
 /** 比率写成百分数：0.756 → 「75.6%」；没有分母（null）写「—」 */
 export function pct(rate: number | null | undefined, digits = 1): string {
@@ -150,7 +152,8 @@ export const EVAL_TEXT = {
   },
   expectation: {
     kind: {
-      scalar: '一个数', table: '多行', set: '名单', none: '没有数据', ask: '反问', text: '文字要点',
+      scalar: '一个数', table: '多行', set: '名单', none: '没有数据', ask: '反问', text: '文字要点', contribution: '贡献',
+      verdict: '判定',
     } as Record<EvalExpectationKind, string>,
     scalarCell: (column: string, row: number) => `「${column}」第 ${row + 1} 行`,
     scalarWhere: (column: string, where: string) => `「${column}」（${where}）`,
@@ -160,6 +163,9 @@ export const EVAL_TEXT = {
     none: '期望答「没有数据」',
     ask: '期望反问',
     text: (n: number) => `${n} 条文字要点（模型判断，不计入准确率）`,
+    /** 贡献、判定：「变化拆解（可加）· 按地区」「波动基线 · 订单数」 */
+    analysis: (method: string, about: string) => (about ? `${method} · ${about}` : method),
+    topN: (n: number) => `点名前 ${n} 段`,
     optional: '非必需',
     tolerance: (t: number) => `允许误差 ${(t * 100).toFixed(t < 0.01 ? 2 : 1)}%`,
   },
@@ -254,6 +260,21 @@ export const EVAL_TEXT = {
     specialNoneHint: '写一条查这件事的 SQL，它应当返回 0 行',
     specialAsk: '期望助手反问',
     specialAskHint: '问法含糊、该先问清楚的题：助手反问了就算对，不需要期望答案',
+    // 分析期望
+    analysisLabel: '或者定分析期望',
+    analysisHint: '在这条 SQL 的结果上按平台的分析方法算一次：期望的主要来源、判定都由算子算出来，不靠人填；阈值按评测时的分析设置，和作答用同一份',
+    analysisKind: {
+      contribution: '贡献：变化从哪来', verdict: '判定：算不算异常、有没有趋势、差异站不站得住、能不能比',
+    } as Record<'contribution' | 'verdict', string>,
+    analysisOp: '分析方法',
+    analysisMode: '模式',
+    analysisTopN: '期望点名主要来源的前几段',
+    analysisColumn: '选一列',
+    analysisNone: '不填',
+    analysisPeriodHint: '不填基期、本期时，期望 SQL 只能返回两期：先的一期是基期、后的一期是本期；可以写 {{ schedule.last_week_start }} 这类时间变量',
+    analysisPairsHint: '每行一对，两组之间用逗号隔开，例如：西南，华东',
+    analysisPick: '定这个分析期望',
+    analysisOthers: '这道题另外的期望（照旧保留）',
     // 文字要点
     points: '文字要点（可选）',
     pointsHint: '一行一条；由结论裁判判断有没有答到，单列「模型判断」，不计入准确率',
@@ -285,6 +306,40 @@ export const EVAL_TEXT = {
     table: (n: number) => `${formatNumber(n)} 行`,
     none: '0 行（没有数据）',
     dims: (d: string) => `（${d}）`,
+    /** 分析期望：判定类和系统渲染的判定语 */
+    analysis: (judgement: string, phrase: string) => (phrase ? `${judgement} · ${phrase}` : judgement),
+    refused: (reason: string) => `算不了：${reason}（这一项不能评分）`,
+  },
+  /**
+   * 分析期望（贡献、判定）的叫法。分析方法、模式的叫法只有 lib/termsAnalysis 一份（照服务端契约 app/analysis/contract 的
+   * OP_LABELS、MODE_LABELS 一字不差，tests/test_frontend_eval_unions.py 与 check-studio 逐个对照），这里引用它，不另抄；
+   * 判定类是评测自己的（app/eval/judgements.JUDGEMENTS）
+   */
+  analysis: {
+    op: ANALYSIS_OP_LABEL as Record<EvalAnalysisOp, string>,
+    mode: ANALYSIS_MODE_LABEL as Record<EvalAnalysisMode, string>,
+    judgement: {
+      source: '主要来源', dispersed: '分散，没有主要来源', flat: '基本持平', mix: '主要来自结构变化', rate: '主要来自各段自身的变化',
+      mixed: '几方面都有影响', normal: '常规波动', anomaly: '超出常规波动', rising: '上升趋势', falling: '下降趋势',
+      no_trend: '没有明显趋势', differs: '差异站得住', no_evidence: '不足以下结论', comparable: '可比', incomparable: '不可比',
+    } as Record<EvalJudgement, string>,
+    direction: { up: '上升', down: '下降' } as Record<'up' | 'down', string>,
+    /** 「主要来源：华东（下降）」「西南高于华东」 */
+    withSubjects: (judgement: string, subjects: string) => `${judgement}：${subjects}`,
+    withDirection: (text: string, direction: string) => `${text}（${direction}）`,
+    higher: (a: string, b: string) => `${a}高于${b}`,
+    lower: (a: string, b: string) => `${a}低于${b}`,
+    pair: (a: string, b: string) => `${a}和${b}`,
+    /** 方法的叫法加模式：「变化拆解（可加）」 */
+    method: (op: string, mode: string | null) => (mode ? `${op}（${mode}）` : op),
+    by: (columns: string) => `按${columns}`,
+    ratio: (numerator: string, denominator: string) => `${numerator} ÷ ${denominator}`,
+    /** 答案里同类的分析没有做成 */
+    refused: (reason: string) => `没有做成：${reason}`,
+    /** 参数格的叫法只有 lib/termsAnalysis 一份（ANALYSIS_TEXT.node.param / basis / grain）：分析卡和评测页的分析期望按同一份参数名 */
+    param: ANALYSIS_TEXT.node.param,
+    basis: ANALYSIS_TEXT.node.basis,
+    grain: ANALYSIS_TEXT.node.grain,
   },
   upgrade: {
     title: (seq: number) => `第 ${seq} 题：处置口径升版`,
@@ -319,12 +374,15 @@ export const EVAL_TEXT = {
   start: {
     title: '发起评测',
     mode: '评测方式',
-    modes: { single: '评一次', ab: 'A/B 对照', catalog: '目录贡献对照' } as Record<'single' | 'ab' | 'catalog', string>,
+    modes: {
+      single: '评一次', ab: 'A/B 对照', catalog: '目录贡献对照', analysis_tools: '分析工具贡献对照',
+    } as Record<'single' | 'ab' | 'catalog' | 'analysis_tools', string>,
     modeHint: {
       single: '按一组变体评一遍题集',
       ab: '两到三臂各自一组变体，共用同一份期望答案，同一题几臂同时作答',
       catalog: '预设的 A/B：当前目录 vs 关目录，可以再加一臂「只用已核实和已确认的项」，量出数据目录帮了多少',
-    } as Record<'single' | 'ab' | 'catalog', string>,
+      analysis_tools: '预设的 A/B：分析工具开 vs 关，量出分析工具（变化拆解、波动基线……）帮了多少',
+    } as Record<'single' | 'ab' | 'catalog' | 'analysis_tools', string>,
     arm: (name: string) => `${name} 臂`,
     addArm: '再加一臂',
     removeArm: '去掉这一臂',
@@ -346,6 +404,9 @@ export const EVAL_TEXT = {
     catalogHint: '当前目录、只用已核实的项都在开评时拍一份快照按它读：评测期间目录被改也不影响可比性',
     snapshot: '选一份目录快照',
     snapshotNone: '还没有可用的目录快照',
+    analysisTools: '分析工具',
+    analysisToolsMode: { on: '开', off: '关' } as Record<EvalAnalysisTools, string>,
+    analysisToolsHint: '关掉时助手建图看不到分析工具和分析卡；工作流题按固定的版本运行，不受影响',
     repeats: '每题重复几次',
     repeatsHint: '模型有随机性：对照建议每题 3 次',
     reviewedArm: '再加一臂「只用已核实和已确认的项」',
@@ -451,6 +512,7 @@ export const EVAL_TEXT = {
     role: { assistant: '助手', writer: '写作', judge: '结论裁判', gold: '算期望' } as Record<string, string>,
     passRates: '重复评的题的通过率',
     outcomes: '各期望的结论',
+    outcomesByKind: '按期望的种类',
     baseline: '和上一次比',
     baselineText: (regressed: number, improved: number) => `退步 ${formatNumber(regressed)} 题 · 进步 ${formatNumber(improved)} 题`,
     baselineNone: '没有可比的上一次',
@@ -509,6 +571,11 @@ export const EVAL_TEXT = {
     retriesWhy: (reasons: string[]) => `：${reasons.join('；')}`,
     turnReason: '作答的经过',
     answer: '答案原文',
+    /** 分析期望展开的明细 */
+    analysisWant: '期望的判定',
+    analysisFound: '答案',
+    analysisCited: (alias: string) => `引用了 ${alias}`,
+    analysisSaid: (text: string) => `正文写的「${text}」`,
     expand: '展开',
     collapse: '收起',
   },
@@ -519,7 +586,7 @@ export const EVAL_TEXT = {
     baseText: (short: string, when: string) => `${short} · ${when}`,
     none: '没有可比的上一次：同一题集、同一变体里还没有比这次先发起、已经评完的评测',
     fingerprint: '两次之间变了什么',
-    fingerprintNone: '模型、目录、提示词、表结构、题目、评分规则都没变',
+    fingerprintNone: '模型、目录、分析工具、提示词、表结构、题目、评分规则、分析设置都没变',
     changed: '变了',
     transitions: '逐题转移',
     transition: { regressed: '退步', improved: '进步', same: '不变', incomparable: '不可比' } as Record<EvalTransition, string>,

@@ -1,0 +1,209 @@
+{
+  "format": "agentlab-eval-suite",
+  "version": 1,
+  "exported_at": "2026-10-21T00:00:00+00:00",
+  "suite": {
+    "name": "零售分析题集",
+    "description": "配 tests/fixtures/acceptance/retail_trends.py 的虚构零售库（数据源名 retail_trends）：上周销售额下降主要来自华东、退款率的结构变化（辛普森）、订单数的常规波动、取消单激增、线上销售额持续上升、线上销售额的变化来自订单数、小样本门店的退款率、本周和上周不可比。期望的来源、判定都由平台的分析方法在期望 SQL 的结果上算，不靠人填。用于分析能力的回归和真实模型验收；店名、金额都是虚构的",
+    "timezone": "Asia/Shanghai",
+    "budget": {}
+  },
+  "cases": [
+    {
+      "seq": 1,
+      "kind": "ask",
+      "question": "上周销售额为什么下降？",
+      "datasources": ["retail_trends"],
+      "tags": ["分析", "贡献", "按地区拆"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_trends",
+        "sql": "SELECT s.region AS 地区, date(o.order_date, 'weekday 0', '-6 days') AS 周, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN stores s ON s.id = o.store_id WHERE o.status = 'paid' AND o.order_date BETWEEN date('{{ schedule.last_week_start }}', '-7 days') AND '{{ schedule.last_week_end }}' GROUP BY 地区, 周 ORDER BY 地区, 周"
+      },
+      "expectations": [
+        {
+          "id": "source",
+          "kind": "contribution",
+          "mode": "additive",
+          "params": {"by": ["地区"], "period": "周", "measure": "销售额", "label": "销售额"},
+          "top_n": 1,
+          "label": "上周销售额的下降主要来自哪个地区"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 2,
+      "kind": "ask",
+      "question": "退款率为什么上升了？",
+      "datasources": ["retail_trends"],
+      "tags": ["分析", "贡献", "结构变化"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_trends",
+        "sql": "SELECT channel AS 渠道, date(order_date, 'weekday 0', '-6 days') AS 周, SUM(status = 'refunded') AS 退款单数, COUNT(*) AS 订单数 FROM orders WHERE status <> 'cancelled' AND order_date BETWEEN date('{{ schedule.last_week_start }}', '-7 days') AND '{{ schedule.last_week_end }}' GROUP BY 渠道, 周 ORDER BY 渠道, 周"
+      },
+      "expectations": [
+        {
+          "id": "mix",
+          "kind": "contribution",
+          "mode": "ratio",
+          "params": {"by": ["渠道"], "period": "周", "numerator": "退款单数", "denominator": "订单数", "label": "退款率"},
+          "top_n": 1,
+          "label": "上周退款率的上升来自结构变化还是各渠道自身"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 3,
+      "kind": "ask",
+      "question": "上周订单数下降算不算异常？",
+      "datasources": ["retail_trends"],
+      "tags": ["分析", "判定", "常规波动"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_trends",
+        "sql": "SELECT date(order_date, 'weekday 0', '-6 days') AS 周, COUNT(*) AS 订单数 FROM orders WHERE status <> 'cancelled' AND order_date BETWEEN date('{{ schedule.this_week_start }}', '-175 days') AND '{{ schedule.last_week_end }}' GROUP BY 周 ORDER BY 周"
+      },
+      "expectations": [
+        {
+          "id": "band",
+          "kind": "verdict",
+          "op": "baseline",
+          "params": {"period": "周", "measure": "订单数", "label": "订单数"},
+          "label": "上周订单数的变化在不在常规波动范围内"
+        },
+        {
+          "id": "orders",
+          "kind": "scalar",
+          "column": "订单数",
+          "row": 24,
+          "required": false,
+          "label": "上周的订单数"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 4,
+      "kind": "ask",
+      "question": "上周取消的订单是不是突然变多了？",
+      "datasources": ["retail_trends"],
+      "tags": ["分析", "判定", "异常"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_trends",
+        "sql": "SELECT date(order_date, 'weekday 0', '-6 days') AS 周, COUNT(*) AS 取消单数 FROM orders WHERE status = 'cancelled' AND order_date BETWEEN date('{{ schedule.this_week_start }}', '-175 days') AND '{{ schedule.last_week_end }}' GROUP BY 周 ORDER BY 周"
+      },
+      "expectations": [
+        {
+          "id": "spike",
+          "kind": "verdict",
+          "op": "baseline",
+          "params": {"period": "周", "measure": "取消单数", "label": "取消单数"},
+          "label": "上周取消单数是不是明显超出常规波动"
+        },
+        {
+          "id": "cancelled",
+          "kind": "scalar",
+          "column": "取消单数",
+          "row": 24,
+          "required": false,
+          "label": "上周的取消单数"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 5,
+      "kind": "ask",
+      "question": "线上销售额最近是什么走势？",
+      "datasources": ["retail_trends"],
+      "tags": ["分析", "判定", "趋势"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_trends",
+        "sql": "SELECT date(order_date, 'weekday 0', '-6 days') AS 周, ROUND(SUM(amount), 2) AS 线上销售额 FROM orders WHERE status = 'paid' AND channel = '线上' AND order_date BETWEEN date('{{ schedule.this_week_start }}', '-84 days') AND '{{ schedule.last_week_end }}' GROUP BY 周 ORDER BY 周"
+      },
+      "expectations": [
+        {
+          "id": "trend",
+          "kind": "verdict",
+          "op": "trend",
+          "params": {"period": "周", "measure": "线上销售额", "label": "线上销售额"},
+          "label": "最近 12 周线上销售额的走势"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 6,
+      "kind": "ask",
+      "question": "上周线上销售额涨了，是订单多了还是客单价高了？",
+      "datasources": ["retail_trends"],
+      "tags": ["分析", "贡献", "因子"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_trends",
+        "sql": "SELECT date(order_date, 'weekday 0', '-6 days') AS 周, SUM(amount) AS 线上销售额, COUNT(*) AS 订单数, SUM(amount) * 1.0 / COUNT(*) AS 客单价 FROM orders WHERE status = 'paid' AND channel = '线上' AND order_date BETWEEN date('{{ schedule.last_week_start }}', '-7 days') AND '{{ schedule.last_week_end }}' GROUP BY 周 ORDER BY 周"
+      },
+      "expectations": [
+        {
+          "id": "factor",
+          "kind": "contribution",
+          "mode": "factor",
+          "params": {"period": "周", "product": "线上销售额", "factors": ["订单数", "客单价"], "label": "线上销售额"},
+          "top_n": 1,
+          "label": "上周线上销售额的变化主要来自订单数还是客单价"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 7,
+      "kind": "ask",
+      "question": "最近四周，西南店的退款率是不是比华东高？",
+      "datasources": ["retail_trends"],
+      "tags": ["分析", "判定", "小样本"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_trends",
+        "sql": "SELECT s.region AS 地区, SUM(o.status = 'refunded') AS 退款单数, COUNT(*) AS 订单数 FROM orders o JOIN stores s ON s.id = o.store_id WHERE o.status <> 'cancelled' AND s.region IN ('西南', '华东') AND o.order_date BETWEEN date('{{ schedule.last_week_start }}', '-21 days') AND '{{ schedule.last_week_end }}' GROUP BY 地区 ORDER BY 地区"
+      },
+      "expectations": [
+        {
+          "id": "differ",
+          "kind": "verdict",
+          "op": "differ",
+          "mode": "rate",
+          "params": {"by": ["地区"], "pairs": [["西南", "华东"]], "numerator": "退款单数", "denominator": "订单数", "label": "退款率"},
+          "label": "西南和华东退款率的差异站不站得住"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 8,
+      "kind": "ask",
+      "question": "这周和上周比卖得怎么样？",
+      "datasources": ["retail_trends"],
+      "tags": ["分析", "判定", "可比性"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "retail_trends",
+        "sql": "SELECT date(order_date, 'weekday 0', '-6 days') AS 周, COUNT(*) AS 订单数, ROUND(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 2) AS 销售额 FROM orders WHERE status <> 'cancelled' AND order_date >= '{{ schedule.last_week_start }}' GROUP BY 周 ORDER BY 周"
+      },
+      "expectations": [
+        {
+          "id": "comparable",
+          "kind": "verdict",
+          "op": "comparable",
+          "params": {"period": "周", "base": "{{ schedule.last_week_start }}", "target": "{{ schedule.this_week_start }}", "measure": "订单数"},
+          "label": "本周和上周能不能直接比"
+        }
+      ],
+      "enabled": true
+    }
+  ]
+}

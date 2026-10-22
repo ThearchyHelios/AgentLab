@@ -33,7 +33,12 @@ async def _clear_ledger() -> None:
 
 
 @pytest.fixture(autouse=True)
-async def engine_up():
+async def engine_up(monkeypatch):
+    # 同一个测试进程里别的测试建的数据源可能超过评测拍目录快照的上限（app/eval/snapshots.MAX_SOURCES），评测会按
+    # 设计报「数据源超过 20 个」——这里的评测不测这个上限，分到哪个进程都要照常跑
+    from app.eval import snapshots
+
+    monkeypatch.setattr(snapshots, "MAX_SOURCES", 10_000)
     await run_manager.setup()
     await _clear_ledger()
     yield
@@ -47,6 +52,16 @@ async def engine_up():
 async def client():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
+
+
+async def _until(cond, what: str, *, timeout: float = 30.0) -> None:
+    """等到 cond() 为真；等不到就让测试失败、说清在等什么，不让整次测试卡死（作答运行在排队之前就失败时，排队永远等不到）。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not await cond():
+        if loop.time() > deadline:
+            raise AssertionError(f"等了 {timeout:g} 秒还没等到：{what}")
+        await asyncio.sleep(0.02)
 
 
 def ask_cases(n: int) -> list[dict]:
@@ -327,12 +342,13 @@ async def test_time_queued_for_a_run_slot_does_not_count_against_the_case_limit(
     monkeypatch.setattr(runner.EvalExecution, "_prepare", prepare)
     held = asyncio.create_task(blocker())
     try:
-        while not (await slots.snapshot())["classes"]["system"]["running"]:
-            await asyncio.sleep(0.02)
+        async def blocking() -> bool:
+            return bool((await slots.snapshot())["classes"]["system"]["running"])
+
+        await _until(blocking, "占名额的那一段拿到名额")
         suite_id = await es.make_suite("none", cases=ask_cases(1))
         [run] = await start(suite_id)
-        while not await slots.waiting("eval-answer-in-queue"):
-            await asyncio.sleep(0.02)
+        await _until(lambda: slots.waiting("eval-answer-in-queue"), "作答运行排队等名额")
         await asyncio.sleep(2.0)
         gate.set()
         await es.wait_eval(run.id)
@@ -428,6 +444,67 @@ async def test_the_api_starts_estimates_and_reports_progress(client, monkeypatch
     assert bad.status_code == 422 and bad.json()["code"] == "eval_variant_invalid"
 
 
+async def test_the_variant_switches_the_analysis_tools(client, monkeypatch):
+    """变体的分析工具（analysis.tools）：缺省开，只认 on、off；同一变体的指纹在开着时和加这一项之前一样（以前的评测照样
+    当基准），关着时不同；变体那一句写「分析工具开 / 关」。「分析工具贡献」预设一次发起开、关两臂，关的那一臂作答的 Driver
+    不给助手分析工具（TurnDriver 的 analysis_tools 透传给 answer_ops，见 test_copilot_analysis）。"""
+    from app.eval import variants
+    from app.eval.cases import CaseInvalid
+
+    on = variants.normalize_variant({})
+    off = variants.normalize_variant({"analysis": {"tools": "off"}})
+    assert on["analysis"] == {"tools": "on"} and off["analysis"] == {"tools": "off"}
+    for bad in ("off", {"tools": "maybe"}, {"tools": None}, {"tools": "off", "mode": "x"}):
+        with pytest.raises(CaseInvalid) as caught:
+            variants.normalize_variant({"analysis": bad})
+        assert (caught.value.field, caught.value.code) == ("variant.analysis", variants.VARIANT_INVALID), bad
+    models = {"assistant": "mock-fast", "writer": None}
+    before = {k: v for k, v in on.items() if k != "analysis"}
+    assert variants.variant_key(on, models) == variants.variant_key(before, models), "开着时和加这一项之前一样"
+    assert variants.variant_key(off, models) != variants.variant_key(on, models)
+    assert variants.describe(before, models) == variants.describe(on, models) \
+        == "助手 mock-fast · 写作 各节点自己的 · 当前目录 · 分析工具开 · 结论裁判关 · 每题 1 次"
+    assert "· 分析工具关 ·" in variants.describe(off, models)
+    arms = variants.analysis_tools_preset({**off, "catalog": {"mode": "off", "snapshot": None}, "repeats": 3,
+                                           "label": "x"})
+    assert [(a["label"], a["analysis"], a["catalog"]["mode"], a["repeats"]) for a in arms] == [
+        ("分析工具开", {"tools": "on"}, "off", 3), ("分析工具关", {"tools": "off"}, "off", 3)]
+
+    seen: list[tuple[str | None, bool]] = []
+
+    async def drive(self):
+        seen.append((self.ctx.arm, self.analysis_tools))
+        self.turn.path = "asked"
+        return self.turn
+
+    monkeypatch.setattr(answer_mod.Driver, "drive", drive)
+    suite_id = await es.make_suite("none", cases=ask_cases(1))
+    estimate = (await client.post(f"/api/evals/suites/{suite_id}/evaluations/estimate",
+                                  json={"preset": "analysis_tools"})).json()
+    assert [(a["label"], a["variant"]["analysis"]["tools"]) for a in estimate["arms"]] == [
+        ("分析工具开", "on"), ("分析工具关", "off")]
+    assert estimate["repeats"] == variants.PAIR_REPEATS and "分析工具关" in estimate["arms"][1]["text"]
+    started = await client.post(f"/api/evals/suites/{suite_id}/evaluations",
+                                json={"preset": "analysis_tools", "variant": {"repeats": 1}})
+    assert started.status_code == 202, started.text
+    lit, dark = started.json()["evaluations"]
+    await es.wait_eval(lit["id"])
+    assert sorted(seen) == [("分析工具关", False), ("分析工具开", True)]
+    assert (lit["fingerprint"]["analysis_tools"], dark["fingerprint"]["analysis_tools"]) == ("on", "off")
+    assert lit["fingerprint"]["variant_key"] != dark["fingerprint"]["variant_key"]
+    # 一臂、A/B 里写的照样认；不合规的照实拒、落到那一格
+    one = await client.post(f"/api/evals/suites/{suite_id}/evaluations/estimate",
+                            json={"variant": {"analysis": {"tools": "off"}}})
+    assert one.json()["arms"][0]["variant"]["analysis"] == {"tools": "off"}
+    bad = await client.post(f"/api/evals/suites/{suite_id}/evaluations/estimate",
+                            json={"arms": [{"label": "开"}, {"label": "关", "analysis": {"tools": "nope"}}]})
+    assert bad.status_code == 422
+    assert (bad.json()["code"], bad.json()["field"]) == ("eval_variant_invalid", "variant.analysis")
+    unknown = await client.post(f"/api/evals/suites/{suite_id}/evaluations/estimate", json={"preset": "tools"})
+    assert unknown.status_code == 422 and unknown.json()["field"] == "preset"
+    assert "analysis_tools" in unknown.json()["detail"]
+
+
 async def test_the_estimate_says_it_cannot_price_instead_of_zero():
     """上一次评测的模型都不在价格目录里（价格目录空）：估算以前写「约 $0」，像不花钱。现在一分都没估出来的写估不出；估出了
     一部分的写「至少」、另有几次估不出（老总表里每题平均记成 0、却有估不出的调用的，也按估不出算）。"""
@@ -455,6 +532,30 @@ async def test_the_estimate_says_it_cannot_price_instead_of_zero():
         await session.commit()
         got = await runner.estimate(session, suite_id, 3)
     assert got["total_usd"] == 0.0 and not got.get("at_least") and not got.get("unpriced_calls"), "目录价是 0 的才是真不花钱"
+
+
+def test_the_prompt_fingerprint_covers_the_intent_lexicon_and_the_self_check_sentence(monkeypatch):
+    """提示词指纹认得出「问题意图词表变了」和「自查交回模型的那一句变了」：改词表要升 INTENT_VERSION，改那句话它自己
+    就带在里面。两者任一变了，两次评测比的时候标「提示词变了」。"""
+    from app.analysis import intent
+    from app.api import copilot_gen
+
+    before = runner.prompt_fingerprint()
+    assert before == runner.prompt_fingerprint(), "同一份提示词指纹一样"
+    monkeypatch.setattr(intent, "INTENT_VERSION", intent.INTENT_VERSION + 1)
+    assert runner.prompt_fingerprint() != before, "词表升版本要认得出"
+    monkeypatch.undo()
+
+    real = copilot_gen.analysis_gaps_fix
+    monkeypatch.setattr(copilot_gen, "analysis_gaps_fix",
+                        lambda **kw: real(**kw).replace("按「分析类问题」的形状改", "换一种形状改"))
+    assert runner.prompt_fingerprint() != before, "自查那句话变了要认得出"
+    monkeypatch.undo()
+
+    # 那句话里写着两条东西：分析类问题的形状、以及不改这一处时在说明里讲清为什么
+    said = copilot_gen.analysis_gaps_fix(asked="问题问的是原因（「为什么下降」）", nid="bot")
+    assert said.startswith("问题问的是原因（「为什么下降」）。按「分析类问题」的形状改：给查库的 agent「bot」的 tools 加上")
+    assert "analysis_decompose" in said and "done 的 explanation" in said
 
 
 def test_the_judge_role_keeps_its_unpriced_calls():

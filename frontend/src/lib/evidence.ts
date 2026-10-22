@@ -26,6 +26,7 @@ import {
   EVIDENCE_AUDIT_TEXT, EVIDENCE_KIND_LABEL, EVIDENCE_STATE_LABEL, EVIDENCE_TEXT, JUDGE_TEXT, UPGRADE_POLICY_LABEL,
   claimTally, evidenceTally, type ClaimTallyCounts,
 } from './terms'
+import { ANALYSIS_TEXT } from './termsAnalysis'
 import { NONE, formatNumber, shortId } from './format'
 import type {
   EvidenceBlock, EvidenceCaliberSource, EvidenceCaliberUpgrade, EvidenceCandidate, EvidenceDocData, EvidenceFieldRef,
@@ -238,6 +239,21 @@ export function citeLabel(alias: string, doc: Pick<EvidenceDocData, 'catalog'>, 
 }
 
 /**
+ * 证据图里一份分析结论派生自谁（edges 的 rel derived_from：A → Q 是它的输入快照，A → A 是下钻的上一层），按图里的先后、去重。
+ * 只认同一份报告的边（多份报告的运行里同一个编号可能各指各的）；不是分析结论、证据图没给边的是空列表
+ */
+export function derivedFrom(graph: EvidenceGraph | undefined, alias: string, report?: string): string[] {
+  const out: string[] = []
+  for (const e of graph?.edges ?? []) {
+    const edge = e as { from?: string; to?: string; rel?: string; report?: string }
+    if (edge.rel !== 'derived_from' || edge.from !== alias || !edge.to) continue
+    if (report && edge.report && edge.report !== report) continue
+    if (!out.includes(edge.to)) out.push(edge.to)
+  }
+  return out
+}
+
+/**
  * 片段的来源说一句：「口径卡指标 环比增幅」「运行输入 week」「查询 Q3 · 第 6 行 · amount」。
  * 单元格先看 cite 的种类：查询条目在目录里是 query，引用它的一格是 cell
  */
@@ -245,6 +261,17 @@ export function sourceOf(seg: EvidenceSegment, doc?: Pick<EvidenceDocData, 'cata
   const cite = seg.cite
   if (!cite) return ''
   const entry = cite.alias ? doc?.catalog?.[cite.alias] : undefined
+  if (cite.kind === 'analysis' || entry?.kind === 'analysis') {
+    // 分析结论：判定语（[[a:A1]]）、具名的数（[[a:A1.top_share]]）、结果表的一格（[[v:A1.r0.delta]]，cite 的种类是 cell）。
+    // 结果表的格写结果表记的列名（目录条目上的 labels），不把列 id 当叫法
+    const E = ANALYSIS_TEXT.evidence
+    const loc = cite.locator ?? {}
+    const column = String(loc.column ?? '')
+    const labels = entry && typeof entry.labels === 'object' && entry.labels ? entry.labels as Record<string, string> : {}
+    const what = cite.kind === 'cell' ? E.citedCell(Number(loc.row) || 0, labels[column] || column)
+      : loc.key ? E.citedValue(loc.key) : E.citedPhrase
+    return [`${E.title} ${cite.alias ?? ''}`.trim(), what].join(' · ')
+  }
   if (cite.kind === 'cell' || (cite.kind !== 'metric' && cite.kind !== 'input' && entry?.kind === 'query')) {
     const where = locatorText(cite.locator)
     return [EVIDENCE_TEXT.query(cite.alias ?? ''), where].filter(Boolean).join(' · ')
@@ -1273,6 +1300,8 @@ export interface AuditRow {
   sealed: boolean | null
   /** 结论句那几行：是哪一句（正文里有句末徽标时点这一行打开它的「模型的解释」） */
   unit?: string
+  /** 违规那几行的问题代码（说法违规的叫法按它取：ANALYSIS_TEXT.claim.label） */
+  issue?: string
 }
 
 const GROUP_OF: Record<EvidenceStateCode, AuditGroup> = {
@@ -1330,6 +1359,7 @@ export function auditFromApi(body: unknown): AuditRow[] {
         sentence: String(r.sentence ?? '').trim(),
         sealed: typeof r.sealed === 'boolean' ? r.sealed : null,
         ...(kind === 'claim' && typeof r.unit === 'string' && r.unit ? { unit: r.unit } : {}),
+        ...(kind === 'violation' && typeof r.issue === 'string' && r.issue ? { issue: r.issue } : {}),
       })
     }
   })

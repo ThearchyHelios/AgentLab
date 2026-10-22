@@ -413,7 +413,7 @@ def test_an_unknown_cell_display_version_cannot_pass():
 
     bundle = formats_bundle()
     art, doc = doc_of(bundle)
-    doc["cell_display"] = 4
+    doc["cell_display"] = 9
     got = verdicts(reseal(bundle, art, doc))
     cells = [n for n in got["numbers"] if n["ref"].startswith("v:")]
     assert cells and all(n["result"] == "na" and n["reason"].startswith("无法核对显示文字：") for n in cells)
