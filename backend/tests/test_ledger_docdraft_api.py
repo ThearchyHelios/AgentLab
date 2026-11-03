@@ -220,7 +220,7 @@ async def test_a_model_that_is_unavailable_leaves_the_draft_with_an_error(client
     monkeypatch.setattr(docdraft, "extract", unavailable)
     body = (await client.post("/api/ledger/drafts/extract", json={"documents": [doc]})).json()
     made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
-    assert made["status"] == "drafting" and made["error"] == "还没有接入可用的起草模型"
+    assert made["status"] == "failed" and made["error"] == "还没有接入可用的起草模型"
     assert made["metric_count"] == 0 and not made.get("metrics")
 
 

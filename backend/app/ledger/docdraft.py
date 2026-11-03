@@ -22,7 +22,8 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 #: 草稿的状态。path_pending 不是合法图，attached 之后取数路径才来自一次真实运行。
-STATUSES = ("drafting", "questions_open", "path_pending", "attached", "rejected")
+#: failed 是起草这一步没跑成（没有可用模型、模型回复读不懂），和 rejected（人判它不是口径）不是一回事。
+STATUSES = ("drafting", "questions_open", "path_pending", "attached", "rejected", "failed")
 
 #: 一次发给模型的总字数上限（按 chunk 边界截断，见 extract）
 MAX_INPUT_CHARS = 40000

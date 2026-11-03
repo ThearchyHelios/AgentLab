@@ -28,12 +28,12 @@ const D = LEDGER_UI.drafts
 
 /** 列表的状态筛：全部加四种落点，起草中的只出现在全部里 */
 type Filter = '' | Exclude<CaliberDraftStatus, 'drafting'>
-const FILTERS: Filter[] = ['', 'questions_open', 'path_pending', 'attached', 'rejected']
+const FILTERS: Filter[] = ['', 'questions_open', 'path_pending', 'attached', 'rejected', 'failed']
 
-/** 状态标签：起草中 / 待确认问题 / 待接数据路径 / 已接上 / 已驳回 */
+/** 状态标签：起草中 / 待确认问题 / 待接数据路径 / 已接上 / 已驳回 / 起草失败 */
 function StatusPill({ status }: { status: CaliberDraftStatus }) {
   const color = status === 'attached' ? 'var(--ok)' : status === 'rejected' ? 'var(--text-faint)'
-    : status === 'drafting' ? 'var(--accent)' : 'var(--warn)'
+    : status === 'drafting' ? 'var(--accent)' : status === 'failed' ? 'var(--err)' : 'var(--warn)'
   return (
     <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px]"
           style={{ color, borderColor: `color-mix(in srgb, ${color} 40%, var(--border))` }}>

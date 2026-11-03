@@ -518,11 +518,13 @@ async def _extract_in_background(draft_id: str) -> None:
             }
         except docdraft.DraftUnavailable as e:
             draft.error = str(e) or "AI 起草不可用"
+            draft.status = "failed"
             await session.commit()
             return
         except Exception as e:  # noqa: BLE001 - 后台出错要写回这一行，不然界面永远停在「起草中」
             logger.exception("从文档起草口径出错（草稿 %s）", draft_id)
             draft.error = f"起草出错：{e}"
+            draft.status = "failed"
             await session.commit()
             return
         draft.payload = payload
@@ -575,7 +577,7 @@ async def draft_extract(payload: DraftExtractIn, background: BackgroundTasks,
 
 @router.get("/drafts")
 async def list_drafts(status: str | None = Query(default=None, description="按状态筛：drafting / questions_open / "
-                                                   "path_pending / attached / rejected"),
+                                                   "path_pending / attached / rejected / failed"),
                       session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """口径草稿列表，最近改过的在前。只给计数和状态，正文用 GET /api/ledger/drafts/{id} 看。"""
     from app.api.deps import ensure_role
@@ -658,7 +660,10 @@ async def patch_draft(draft_id: str, payload: DraftPatchIn, session: AsyncSessio
                                         if not (isinstance(q, str) and q.strip() in drop)]
     if payload.metrics is not None or payload.resolved is not None:
         draft.payload = payload_data
-        if draft.status in ("drafting", "questions_open", "path_pending"):
+        metrics = payload_data.get("metrics")
+        # 起草失败的草稿补上真指标后要能往前走；没有指标时不重算，免得空草稿被当成「待接数据路径」
+        if isinstance(metrics, list) and metrics and draft.status in ("drafting", "questions_open",
+                                                                     "path_pending", "failed"):
             draft.status = _status_for(payload_data)
     await session.commit()
     return await _draft_view(session, draft)

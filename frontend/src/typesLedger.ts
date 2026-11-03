@@ -444,7 +444,7 @@ export interface CaliberTrialOut {
  * 草稿的状态（app/ledger/docdraft.STATUSES）：起草中 → 有待确认的问题 / 待接数据路径 → 已接上；
  * 另有已驳回。path_pending 不是合法图，取数路径只能来自一次真实运行。
  */
-export type CaliberDraftStatus = 'drafting' | 'questions_open' | 'path_pending' | 'attached' | 'rejected'
+export type CaliberDraftStatus = 'drafting' | 'questions_open' | 'path_pending' | 'attached' | 'rejected' | 'failed'
 
 /** 一条引用：逐字原文、原文所在段落（chunk）、span 是原文里的 [start, end) */
 export interface DraftCitation {

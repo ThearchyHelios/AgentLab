@@ -230,13 +230,14 @@ export const LEDGER_UI = {
     subtitle: '文档里写的是业务说法，这里整理成定义草稿；取数路径接上一次真实运行',
     back: '返回口径目录',
     refresh: '刷新',
-    /** 列表按状态筛：全部加四种落点，起草中的只出现在全部里 */
+    /** 列表按状态筛：全部加五种落点，起草中的只出现在全部里 */
     filter: {
       all: '全部',
       questions_open: '待确认问题',
       path_pending: '待接数据路径',
       attached: '已接上',
       rejected: '已驳回',
+      failed: '起草失败',
     } as Record<string, string>,
     status: {
       drafting: '起草中',
@@ -244,6 +245,7 @@ export const LEDGER_UI = {
       path_pending: '待接数据路径',
       attached: '已接上',
       rejected: '已驳回',
+      failed: '起草失败',
     } as Record<string, string>,
     filterLabel: '按状态筛',
     summary: (metrics: number, questions: number) => `${formatNumber(metrics)} 个指标 · ${
