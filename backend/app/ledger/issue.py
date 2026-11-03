@@ -392,6 +392,16 @@ async def issue(run_id: str, workflow_id: str, version: int, *, principal: Any, 
             except BaseException:
                 await quota.give_back(QUOTA, day=day)
                 raise
+            try:
+                from app.ledger import usage as ledger_usage
+
+                await ledger_usage.record_use(
+                    session, workflow_id=workflow_id, version=int(version), how="issued", params=plan.inputs,
+                    run_id=run_id, actor=actor, auto=auto)
+                await session.commit()
+            except Exception:  # noqa: BLE001 - 审计是附加记录，正式运行已经发起，不能因此回滚
+                logger.warning("记录口径调用审计失败（来源运行 %s，口径 %s@%s）", run_id, workflow_id, version,
+                               exc_info=True)
             return launched, True
 
 

@@ -2076,6 +2076,14 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
     spent = usage.meter()
     async for op in usage.metered(steps(), spent):
         yield op
+    if applier.caliber_uses:
+        # 调用审计（caliber.use）：这一轮选用了哪几版口径、带什么参数。只记指纹，不落参数值；失败不影响这一轮交付
+        from app.ledger.usage import audit_composed_uses
+
+        try:
+            await audit_composed_uses(applier.caliber_uses, conversation_id=payload.conversation_id)
+        except Exception:  # noqa: BLE001 - 审计是附加记录，不能挡住已经生成的图
+            logger.warning("记录口径调用审计失败", exc_info=True)
     yield {"op": "usage", **spent.summary()}
 
 

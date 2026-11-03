@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from app.api.deps import Principal
 from app.db.base import SessionLocal
-from app.db.models import Run, Setting, WorkflowVersion
+from app.db.models import AuditEvent, Run, Setting, WorkflowVersion
 from app.engine.runner import run_manager
 from app.ledger import issue as ledger_issue
 from app.ledger import match as ledger_match
@@ -130,6 +130,13 @@ async def test_an_independent_equivalent_answer_to_a_governed_caliber_is_issued_
     origin = formal.origin
     assert origin["source_run"] == row.id and origin["caliber"] == f"{wf}@1" and origin["how"] == "independent"
     assert origin["auto"] is True and origin["binding_hash"] and origin["match"]
+    async with SessionLocal() as session:
+        rows = (await session.execute(select(AuditEvent).where(
+            AuditEvent.action == "caliber.use", AuditEvent.subject_id == f"{wf}@1"))).scalars().all()
+    [use] = [r for r in rows if r.data.get("run_id") == row.id]
+    assert use.data["how"] == "issued" and use.data["auto"] is True
+    assert use.data["param_fields"] == ["end", "start", "store"] and use.data["params_hash"]
+    assert "2026-09-01" not in str(use.data)
 
     body = (await client.get(f"/api/runs/{row.id}/ledger")).json()
     [action] = [a for a in body["actions"] if a["kind"] == "issue"]

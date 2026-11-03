@@ -544,6 +544,9 @@ class GraphApplier:
         self.composer = composer
         #: 选用口径实例化出来的段：[(第一个取数节点, 全部节点 id)]，接入口用
         self.composed: list[tuple[str, list[str]]] = []
+        #: 这一轮选用过的口径（调用审计 caliber.use 用）：[{workflow_id, version, card, metrics, inputs}]。
+        #: inputs 只在内存里，写审计时只留指纹，不落参数值
+        self.caliber_uses: list[dict[str, Any]] = []
         #: 已经落地的 use_caliber（ledger/compose.signature），接着写时重发的同一个不再落地
         self._composed_ops: set[str] = set()
         #: 系统接上的连线（入口 → 取数）：模型再发一条一模一样的不重复加
@@ -643,6 +646,12 @@ class GraphApplier:
         if composed.op_id not in self._landed:
             self._landed.append(composed.op_id)
         self._wire()
+        self.caliber_uses.append({
+            "workflow_id": composed.option.workflow_id, "version": int(composed.option.version),
+            "card": composed.option.node_id,
+            "metrics": [str(m.get("id")) for m in composed.metrics if m.get("id")],
+            "inputs": dict(composed.inputs or {}),
+        })
         op["result"] = composed.result()
         return Applied(True, True)
 
