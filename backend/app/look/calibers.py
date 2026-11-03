@@ -33,6 +33,11 @@ OVERVIEW_LINE_PROMPT = "- {workflow} v{version}：{metrics}"
 OVERVIEW_MORE_PROMPT = "- …另有 {n} 个工作流"
 DETAIL_HEAD_PROMPT = "· {name}（指标 id {metric}{unit}）：出自「{workflow}」v{version} 的口径卡「{card}」（{caliber}）"
 DETAIL_EXPR_PROMPT = "    指标式：{expression}"
+#: 定义说明只在详情里给：它是这张口径的业务边界（适用范围、不包含什么），选口径时要看的就是这一句。
+#: 概览一行放不下，也不该让它挤掉指标名
+DETAIL_DEFINITION_PROMPT = "    定义：{text}"
+#: 定义说明写进查看结果的上限：口述给人看的边界通常一两句，超出的部分在口径账本里看全文
+DEFINITION_MAX = 240
 DETAIL_REUSE_PROMPT = ("    复用写法（「看哪些数」这一项的 reuse 照抄，不要改）：{reuse}\n"
                        "    这张卡读：{inputs}。实例化时那个库的取数节点就叫这个名字、交出这几列，复用才算得出来")
 DETAIL_INPUT_PROMPT = "{node}（{tool}）的列 {columns}"
@@ -77,6 +82,8 @@ class CaliberView:
     expression: str
     inputs: tuple[tuple[str, str, tuple[str, ...]], ...]
     reason: str | None
+    #: 指标卡上的定义说明（说明、适用范围、不包含什么），压成一句；没有定义时为空串
+    definition: str = ""
 
     @property
     def label(self) -> str:
@@ -159,6 +166,29 @@ def _metric_paths(metric: Any) -> list[str] | None:
     return paths
 
 
+def definition_text(definition: Any) -> str:
+    """指标卡上的定义说明 → 一句给模型看的文字：说明、适用范围、不包含什么。
+
+    只取这三项：负责人和生效日期是治理信息，模型选口径时用不上，写进去只会挤占额度。
+    """
+    if not isinstance(definition, dict):
+        return ""
+    parts: list[str] = []
+    text = definition.get("text")
+    if isinstance(text, str) and text.strip():
+        parts.append(text.strip())
+    scope = definition.get("scope")
+    if isinstance(scope, str) and scope.strip():
+        parts.append(f"适用范围：{scope.strip()}")
+    exclusions = definition.get("exclusions")
+    if isinstance(exclusions, list):
+        kept = [str(x).strip() for x in exclusions if str(x).strip()]
+        if kept:
+            parts.append("不包含：" + "、".join(kept))
+    merged = "；".join(parts)
+    return merged[:DEFINITION_MAX] + ("…" if len(merged) > DEFINITION_MAX else "")
+
+
 def views_of(workflow_id: str, workflow_name: str, version: Any) -> list[CaliberView]:
     """一个已发布版本里每张口径卡（源头的）的每个指标。"""
     from app.apps.tree import node_map
@@ -179,7 +209,7 @@ def views_of(workflow_id: str, workflow_name: str, version: Any) -> list[Caliber
                 level=str(getattr(version, "level", None) or ""), node_id=nid, card=node["title"], caliber=caliber,
                 metric_id=str(metric["id"]), name=str(metric.get("name") or metric["id"]),
                 unit=str(metric.get("unit") or ""), expression=str(metric.get("expression") or ""), inputs=packed,
-                reason=reason))
+                reason=reason, definition=definition_text(metric.get("definition"))))
     return out
 
 
@@ -314,6 +344,8 @@ class CaliberKind:
                                                workflow=item.workflow_name, version=item.version, card=item.card,
                                                caliber=item.caliber),
                      DETAIL_EXPR_PROMPT.format(expression=item.expression)]
+            if item.definition:
+                block.append(DETAIL_DEFINITION_PROMPT.format(text=item.definition))
             option = self.option_of(item)
             if option is not None:
                 block += _compose_lines(item, option, seen)
