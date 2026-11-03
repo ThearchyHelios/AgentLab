@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.engine.issuance import metrics_only
 from app.engine.labels import contract_label, field_label, judge_label, option_label, q
 from app.engine.schema import (
+    CALIBER_SQL_CODES,
     CLAIMS_JUDGE,
     GraphNode,
     GraphSpec,
@@ -19,6 +20,7 @@ from app.engine.schema import (
     _ancestors,
     _caliber_inputs,
     analysis_claims_problem,
+    caliber_sql_issues,
     claims_problem,
     contract_needs_metrics,
     judge_problems,
@@ -132,6 +134,7 @@ def lint_for_publish(spec: GraphSpec, *, level: str, checkers: Mapping[str, Any]
     _lint_evidence(spec, flag, strict=strict)
     _lint_reject_exits(spec, flag)
     _lint_sql(spec, flag, checkers)
+    _lint_caliber_sql(spec, flag)
     _load_extra_lints()
     for check in EXTRA_LINTS:
         check(spec, flag, level=level, strict=strict)
@@ -215,9 +218,22 @@ def _lint_sql(spec: GraphSpec, flag: Callable[..., None], checkers: Mapping[str,
              sql_level=check.level)
 
 
+def _lint_caliber_sql(spec: GraphSpec, flag: Callable[..., None]) -> None:
+    """口径卡上游取数节点的 SQL 书写（data/caliber_lint.py）：ROUND、COALESCE(…, 0)。
+
+    取整、缺省值应当交给口径卡：取数 SQL 里写了它们，口径账本（ledger/match）永远认不出未取整的查询与口径等价。
+    已发布档只警告，受管档挡住发布——和别的受管要求同一个口径。定义来自上游的卡（caliber_from）不在本图，跳过。
+    """
+    for feeder, problem in caliber_sql_issues(spec):
+        flag(f"取数节点「{feeder.title}」：{problem['message']}（{problem['excerpt']}）",
+             code=problem["code"], node_id=feeder.id, hard=True, field="args.sql")
+
+
 #: validate 里和门禁 G4、G5 说同一件事的两条提示（schema.evidence_issues），和受管级分析卡输入那条（governed.analysis_input）
-#: 说同一件事的画布提醒（schema.analysis_issues 对调用别的工具的「调用工具」节点的那条）
-_REPEATS = frozenset({"evidence.caliber_compute_input", "evidence.cite_fields_off", "analysis.input_invalid"})
+#: 说同一件事的画布提醒（schema.analysis_issues 对调用别的工具的「调用工具」节点的那条），以及口径取数 SQL 的两条
+#: lint（门禁和画布说的是同一条 SQL、同一个字段）
+_REPEATS = frozenset({"evidence.caliber_compute_input", "evidence.cite_fields_off", "analysis.input_invalid",
+                      *CALIBER_SQL_CODES})
 
 
 def _not_repeated(issues: list[Any], gate: list[Any], spec: GraphSpec) -> list[Any]:
@@ -234,6 +250,7 @@ def _not_repeated(issues: list[Any], gate: list[Any], spec: GraphSpec) -> list[A
     compute = {i.node_id for i in gate if i.code == "governed.caliber_compute_input"}
     covered = {("evidence.cite_fields_off", nid, "output_schema") for nid in cited}
     covered |= {("analysis.input_invalid", i.node_id, i.field) for i in gate if i.code == "governed.analysis_input"}
+    covered |= {(i.code, i.node_id, i.field) for i in gate if i.code in CALIBER_SQL_CODES}
     for card in spec.nodes:
         if card.type == NodeType.METRICS and compute:
             covered |= {("evidence.caliber_compute_input", card.id, f"metrics[{i}].expression")

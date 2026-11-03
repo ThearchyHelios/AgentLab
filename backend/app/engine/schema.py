@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any, Iterable, Literal
 
@@ -1645,6 +1646,9 @@ def text_parse_issues(spec: GraphSpec) -> list[ValidationIssue]:
 EVIDENCE_ROLES = ("source", "compute")
 _REF_HEAD = re.compile(r"^(vars|nodes)\.([\w-]+)")
 
+#: 口径卡上游取数 SQL 的书写问题（data/caliber_lint.py）：取整、补 0 应交给口径卡
+CALIBER_SQL_CODES = frozenset({"caliber.round_in_source", "caliber.zero_default"})
+
 
 def _caliber_inputs(card: GraphNode, spec: GraphSpec) -> list[tuple[int, GraphNode]]:
     """口径卡每个指标表达式里读到的节点：(指标下标, 产出它的节点)。"""
@@ -1667,6 +1671,40 @@ def _caliber_inputs(card: GraphNode, spec: GraphSpec) -> list[tuple[int, GraphNo
             else:
                 producers = [n for n in spec.nodes if str(n.config.get("assign_to") or "").strip() == name]
             out.extend((i, n) for n in producers)
+    return out
+
+
+def caliber_sql_issues(spec: GraphSpec) -> list[tuple[GraphNode, dict[str, Any]]]:
+    """口径卡上游取数节点里写坏了的取数 SQL：(取数节点, 问题)，每个节点最多一条。
+
+    取数 SQL 里的 ROUND、COALESCE(…, 0) 让未取整的查询永远认不成等价（ledger/match 只认规范化后完全相同），
+    取整、缺省值应当交给口径卡。定义来自上游的卡（caliber_from）不在本图，跳过；调用工具节点照 ledger/match
+    的认法：工具名以 QUERY_PREFIX 开头、SQL 里没有「{{」运行时模板。
+    """
+    from app.data.caliber_lint import issues_for_sql
+    from app.tools.datasource import QUERY_PREFIX
+
+    out: list[tuple[GraphNode, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for card in spec.nodes:
+        if card.type != NodeType.METRICS or card.config.get("caliber_from") not in (None, "", {}):
+            continue
+        for _, feeder in _caliber_inputs(card, spec):
+            if feeder.id in seen:
+                continue
+            seen.add(feeder.id)
+            if feeder.type != NodeType.TOOL:
+                continue
+            cfg = feeder.config
+            args = cfg.get("args")
+            sql = args.get("sql") if isinstance(args, Mapping) else None
+            if not str(cfg.get("tool") or "").startswith(QUERY_PREFIX):
+                continue
+            if not isinstance(sql, str) or not sql.strip() or "{{" in sql:
+                continue
+            found = issues_for_sql(sql)
+            if found:
+                out.append((feeder, found[0]))
     return out
 
 
@@ -1745,6 +1783,9 @@ def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
                     "无法追溯出处。负责取数的代码节点请将「证据角色」设为「取数」；业务计算请移到口径卡的表达式中",
                     node, f"metrics[{i}].expression",
                     code="evidence.caliber_compute_input")
+    for feeder, problem in caliber_sql_issues(spec):
+        add(f"取数节点「{feeder.title}」：{problem['message']}（{problem['excerpt']}）",
+            feeder, "args.sql", code=problem["code"])
     return out
 
 
