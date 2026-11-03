@@ -86,10 +86,17 @@ def _related(query: Mapping[str, Any], *, reason: str | None = None) -> dict[str
 
 
 def _caliber(cand: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
-    return {"kind": "caliber", "how": "composed" if cand.get("how") == "composed" else "independent",
-            "caliber": cand.get("caliber"),
-            "workflow_id": cand.get("workflow_id"), "version": cand.get("version"), "level": cand.get("level"),
-            "binding": dict(cand.get("binding") or {}), **extra}
+    """来自口径的标签。定义的内容指纹取自候选：版本级的 caliber_hash，或者候选自带 / extra 覆盖的 definition_hash
+    （指标标签按它所在的那张卡的哈希覆盖版本级，见 metric_label）。"""
+    out: dict[str, Any] = {
+        "kind": "caliber", "how": "composed" if cand.get("how") == "composed" else "independent",
+        "caliber": cand.get("caliber"),
+        "workflow_id": cand.get("workflow_id"), "version": cand.get("version"), "level": cand.get("level"),
+        "binding": dict(cand.get("binding") or {}),
+    }
+    if hash := cand.get("definition_hash") or cand.get("caliber_hash"):
+        out["definition_hash"] = hash
+    return {**out, **extra}
 
 
 def _proven(query: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -358,7 +365,10 @@ def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mappin
                     if theirs == mine), None)
         if hit is None:
             continue
-        label = {**_caliber(chosen[0], card=hit[0], metric=hit[1]), "binding": binding,
+        # 指标按它对上的那张卡的哈希记（版本里不止一张卡时版本级哈希不够细）；版本信息里没有这张卡的哈希就保留候选里的
+        card_hash = ((calibers.get(key) or {}).get("card_hashes") or {}).get(hit[0])
+        label = {**_caliber(chosen[0], card=hit[0], metric=hit[1],
+                            **({"definition_hash": card_hash} if card_hash else {})), "binding": binding,
                  "queries": [str(i["artifact"]) for i in from_queries]}
         if any(c.get("how") == "composed" for c in chosen):
             # 几个输入里有一个是助手选用的，整个指标就按助手选用说（不能说成都是独立写出来的）

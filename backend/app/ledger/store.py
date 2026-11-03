@@ -74,11 +74,14 @@ def counts_of(queries: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def meta_of(content: dict[str, Any]) -> dict[str, Any]:
-    """工件引用的 meta：{calibers: [等价已证明的「工作流@版本」], related: [相关的], counts}。"""
+    """工件引用的 meta：{calibers: [等价已证明的「工作流@版本」], related: [相关的], definition_hashes: {「工作流@版本」:
+    定义的内容指纹}, counts}。calibers 保持「W@V」的写法（召回按旧版本反查、统计按种类数都照旧）；定义指纹只收非空的，
+    供后续做定义变更影响分析时按版本找。"""
     from app.ledger.labels import candidates_of
 
     proven: list[str] = []
     related: list[str] = []
+    hashes: dict[str, str] = {}
     for query in content.get("queries") or []:
         # 逐格证明了的口径也算（召回按旧版本反查、统计按种类数都只读这一份 meta）
         for cand in candidates_of(query):
@@ -88,8 +91,12 @@ def meta_of(content: dict[str, Any]) -> dict[str, Any]:
             bucket = proven if cand.get("status") == "proven" else related
             if key not in bucket:
                 bucket.append(key)
+            if value := str(cand.get("caliber_hash") or ""):
+                hashes.setdefault(key, value)
     related = [key for key in related if key not in proven]
-    return {"calibers": sorted(proven), "related": sorted(related), "counts": counts_of(content.get("queries") or [])}
+    return {"calibers": sorted(proven), "related": sorted(related),
+            "definition_hashes": dict(sorted(hashes.items())),
+            "counts": counts_of(content.get("queries") or [])}
 
 
 async def save(run_id: str, content: dict[str, Any], *, seal: tuple[int | None, str | None],

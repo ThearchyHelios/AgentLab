@@ -4,8 +4,8 @@
 的完整值在那个节点封存的产出工件里，agent 字段能按出处从查询快照还原；vars 是谁写的、写进去的是不是节点产出
 本身说不准，只能在口径卡算的那一刻存下来。
 
-守的是「只多一个键」：只有标量输入的卡逐字节和改动之前一样（工件 id 不变，引用它的报告也就不变）；带容器型
-vars 输入的卡，去掉 value_artifact 之后和改动之前一样。金样是改动之前的代码真跑出来的（fixtures/whatif）。
+守的是「新增的只有点名的键」：去掉 value_artifact 和 definition_hash（口径的内容指纹，data/caliber_identity，后加的键，
+按设计会改变卡的内容与工件 id）之后，卡和改动之前一字不差。金样是改动之前的代码真跑出来的（fixtures/whatif）。
 """
 from __future__ import annotations
 
@@ -82,12 +82,19 @@ def without_value_artifacts(card: dict) -> dict:
     return out
 
 
-async def test_a_card_with_only_scalar_inputs_is_byte_identical_to_before():
+def without_new_keys(card: dict) -> dict:
+    """去掉这个功能之前没有的两个键：value_artifact 和 definition_hash（口径的内容指纹）。"""
+    out = without_value_artifacts(card)
+    out.pop("definition_hash", None)
+    return out
+
+
+async def test_a_card_with_only_scalar_inputs_keeps_the_old_shape():
     row, data = await finished(graph(SCALAR_KPI, SCALAR))
     [entry] = data["evidence"]
-    assert entry["artifact"] == GOLDEN["scalar"]["artifact"], "只有标量输入的卡，工件 id 不能变"
-    assert artifact_store.load(entry["artifact"]) == GOLDEN["scalar"]["card"]
-    assert "value_artifact" not in json.dumps(artifact_store.load(entry["artifact"]))
+    card = artifact_store.load(entry["artifact"])
+    assert without_new_keys(card) == GOLDEN["scalar"]["card"]
+    assert "value_artifact" not in json.dumps(card)
 
 
 async def test_container_vars_inputs_carry_their_full_value():
@@ -95,7 +102,7 @@ async def test_container_vars_inputs_carry_their_full_value():
     [entry] = data["evidence"]
     card = artifact_store.load(entry["artifact"])
     # 去掉新加的键，和改动之前一字不差：值、渲染、代入式、复算、其余字段都不变
-    assert without_value_artifacts(card) == GOLDEN["box"]["card"]
+    assert without_new_keys(card) == GOLDEN["box"]["card"]
 
     by_path = {(m["id"], i["path"]): i for m in card["metrics"] for i in m["inputs"]}
     items, meta = by_path[("n", "vars.kpi.items")], by_path[("m", "vars.kpi.meta")]
@@ -135,4 +142,4 @@ async def test_a_value_too_large_to_keep_is_skipped(monkeypatch):
     monkeypatch.setattr(metrics, "VALUE_ARTIFACT_MAX", 10)
     row, data = await finished(graph(BOX_KPI, BOX))
     card = artifact_store.load(data["evidence"][0]["artifact"])
-    assert card == GOLDEN["box"]["card"]
+    assert without_new_keys(card) == GOLDEN["box"]["card"]

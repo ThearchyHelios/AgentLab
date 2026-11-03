@@ -10,6 +10,7 @@ from typing import Any
 from app.core import artifact_store
 from app.core.errors import describe_exception
 from app.core.events import EventType
+from app.data.caliber_identity import card_hash_of
 from app.engine.context import NodeContext, NodeError
 from app.engine.evidence import (
     DEFAULT_FORMAT,
@@ -71,6 +72,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         caliber_raw, caliber_version = pinned["caliber"], pinned["caliber_version"]
     if not definitions:
         raise NodeError(ctx.node.id, "口径卡没有定义任何指标")
+    # 定义的内容指纹（data/caliber_identity）：同一位置的口径定义变没变按它认，运行时算出来的值不进哈希。
+    # 口径名和版本不参与（这里只按指标算），和账本里的源头口径卡两侧对得上
+    definition_hash = card_hash_of({"metrics": definitions})
 
     tctx = template_context(state)
     caliber = ctx.render_str(caliber_raw, state)
@@ -236,6 +240,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "kind": "metric_set",
         "caliber": caliber,
         "caliber_version": caliber_version,
+        "definition_hash": definition_hash,
         "metrics": metrics,
     }
     if source:
@@ -262,6 +267,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             "artifact": artifact,
             "caliber": caliber,
             "version": caliber_version,
+            "definition_hash": definition_hash,
             "metrics": [m["id"] for m in metrics],
             **({"source": source} if source else {}),
         }]
@@ -1279,7 +1285,8 @@ async def _store(card: dict[str, Any], caliber: str, version: str, ctx: NodeCont
 
     try:
         return await put_json(card, kind="metric_set", run_id=ctx.run.run_id, node_id=ctx.node.id,
-                              meta={"caliber": caliber, "version": version})
+                              meta={"caliber": caliber, "version": version,
+                                    "definition_hash": str(card.get("definition_hash") or "")})
     except Exception as e:  # noqa: BLE001
         ctx.emit(EventType.LOG, level="warn", code="evidence_store_failed",
                  message=f"口径卡的指标保存失败（{describe_exception(e)}），报告将无法引用这些指标")

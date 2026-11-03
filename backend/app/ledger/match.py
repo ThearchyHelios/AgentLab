@@ -69,6 +69,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from app.data.caliber_identity import card_hash_of, version_hash
 from app.db.base import SessionLocal
 from app.db.models import DataSource, Run, Workflow, WorkflowVersion
 from app.ledger import labels as ledger_labels
@@ -154,7 +155,9 @@ class Fetch:
 class Caliber:
     """一个工作流最新的已发布、未退役版本（只收里面有查库节点的）。fields 是入口节点的字段原样（取缺省值用，不进工件），
     cards 是源头口径卡的节点 id，expressions 是这些卡上每个指标换成记号后的式子（labels.card_expressions），reads 是每个
-    指标读了哪几个取数节点的哪几列（labels.card_reads：口径一侧按它投影，不进工件）。"""
+    指标读了哪几个取数节点的哪几列（labels.card_reads：口径一侧按它投影，不进工件）。card_hashes 是每张源头口径卡的内容
+    指纹（节点 id → data/caliber_identity.card_hash_of），definition_hash 是整份版本的定义指纹（version_hash），用于发现
+    同一位置的定义变化。"""
 
     workflow_id: str
     version: int
@@ -165,6 +168,8 @@ class Caliber:
     cards: tuple[str, ...] = ()
     expressions: tuple[tuple[str, str, str], ...] = ()
     reads: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = ()
+    card_hashes: dict[str, str] = field(default_factory=dict)
+    definition_hash: str = ""
 
     @property
     def key(self) -> str:
@@ -174,6 +179,7 @@ class Caliber:
         """工件里记的「考虑过的口径版本」：不放工作流名（会改）、不放缺省值。"""
         return {"caliber": self.key, "workflow_id": self.workflow_id, "version": self.version, "level": self.level,
                 "graph_hash": self.graph_hash, "fetches": [f.node_id for f in self.fetches], "cards": list(self.cards),
+                "definition_hash": self.definition_hash, "card_hashes": dict(self.card_hashes),
                 "fields": [{"name": f.get("name"), "required": bool(f.get("required")),
                             "has_default": f.get("default") not in (None, "")} for f in self.fields]}
 
@@ -207,7 +213,10 @@ def _table_keys(sql: str) -> frozenset[str]:
 
 
 def caliber_of(workflow_id: str, row: Any) -> Caliber | None:
-    """一个已发布版本 → Caliber；里面没有查库的调用工具节点（SQL 写在 args.sql 里）的不算口径的取数，返回 None。"""
+    """一个已发布版本 → Caliber；里面没有查库的调用工具节点（SQL 写在 args.sql 里）的不算口径的取数，返回 None。
+
+    顺手算定义的内容指纹：每张源头口径卡的哈希（data/caliber_identity.card_hash_of，只按指标定义算，卡上没有
+    口径名）和整份版本的指纹（version_hash）。不查库、不拿名字。"""
     from app.apps.tree import node_map
     from app.tools.datasource import QUERY_PREFIX
 
@@ -229,11 +238,13 @@ def caliber_of(workflow_id: str, row: Any) -> Caliber | None:
             cards.append({"node_id": node_id, "metrics": [m for m in cfg.get("metrics") or [] if isinstance(m, dict)]})
     if not fetches:
         return None
+    card_hashes = {str(card["node_id"]): card_hash_of(card) for card in cards}
     return Caliber(workflow_id=workflow_id, version=int(row.version), level=str(getattr(row, "level", None) or ""),
                    graph_hash=getattr(row, "graph_hash", None), fetches=tuple(fetches), fields=tuple(fields),
                    cards=tuple(c["node_id"] for c in cards),
                    expressions=tuple(ledger_labels.card_expressions(cards)),
-                   reads=tuple(ledger_labels.card_reads(cards)))
+                   reads=tuple(ledger_labels.card_reads(cards)),
+                   card_hashes=card_hashes, definition_hash=version_hash(card_hashes.values()))
 
 
 async def load_calibers(session: Any) -> list[Caliber]:
@@ -324,7 +335,7 @@ def _candidate(caliber: Caliber, fetch: Fetch, m: Any) -> dict[str, Any]:
     """一份口径取数的比对结果，进工件。"""
     out: dict[str, Any] = {
         "caliber": caliber.key, "workflow_id": caliber.workflow_id, "version": caliber.version,
-        "level": caliber.level, "node_id": fetch.node_id,
+        "level": caliber.level, "caliber_hash": caliber.definition_hash, "node_id": fetch.node_id,
         "status": "proven" if m.equivalent else "related", "comparable": m.comparable,
         "via": m.level, "binding": dict(m.binding), "unbound": list(m.unbound),
     }
@@ -340,7 +351,8 @@ def _candidate(caliber: Caliber, fetch: Fetch, m: Any) -> dict[str, Any]:
 
 def _skipped(caliber: Caliber, fetch: Fetch, reason: str) -> dict[str, Any]:
     return {"caliber": caliber.key, "workflow_id": caliber.workflow_id, "version": caliber.version,
-            "level": caliber.level, "node_id": fetch.node_id, "status": "skipped", "reason": reason}
+            "level": caliber.level, "caliber_hash": caliber.definition_hash, "node_id": fetch.node_id,
+            "status": "skipped", "reason": reason}
 
 
 def composed_nodes(graph: Any) -> dict[str, tuple[str, str]]:
@@ -654,7 +666,8 @@ def compute(sealed: Any, calibers: list[Caliber], kinds: dict[str, str | None], 
                                   referenced=referenced)
     used = {c["caliber"] for q in results for c in q["candidates"]}
     considered = [c for c in calibers if c.key in used]
-    by_key = {c.key: {"level": c.level, "fields": c.summary()["fields"], "expressions": list(c.expressions)}
+    by_key = {c.key: {"level": c.level, "fields": c.summary()["fields"], "expressions": list(c.expressions),
+                      "card_hashes": dict(c.card_hashes)}
               for c in considered}
     by_artifact = {q["artifact"]: q for q in results}
     # 合并查询的快照不比（read_queries 跳过了它），引用了它的格照实写为什么没比对；不进工件的 queries，统计不数它
