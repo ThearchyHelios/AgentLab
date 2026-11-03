@@ -1,12 +1,12 @@
-"""业务文档 → 口径草稿：只产出定义，不产出取数（docs/design/next-round/02-口径账本.md 做法 8 的文档一侧）。
+"""业务文档 → 口径草稿的定义抽取，以及草稿共用的引用核对、对齐和合并（docs/design/next-round/02-口径账本.md 做法 8 的文档一侧）。
 
-**为什么草稿只到定义为止。** 文档里写的是业务说法（名称、同义词、粒度、时间字段、过滤、分子分母、维度），不是库里的
-表、列和 SQL。取数必须来自一次真实运行：运行里执行过什么、结果对不对，只有运行本身能证明。所以这个模块的产出固定为
-定义卡需要的那几项，模型回复里一旦出现 SQL / 表名 / 列名字段，整条指标丢弃，不带着它往下走。
+**这条抽取路径只产出定义。** 主路径（定义 + 取数 SQL 一次到位）在 ledger/draftplan.py：那边读数据目录、由模型写 SQL、
+服务端建图并试跑。这里的 extract 仍然只抽定义，留给「已经有跑对的答案，让它认这份定义」的辅助路径（docattach）；引用核对、
+对齐、合并定义这些规则两边共用，所以留在这个模块。
 
-**为什么草稿不写成图。** path_pending 的草稿还没有取数路径，不是合法图（validate_graph 会挡），写进 workflows.graph
-只会让工作流列表和画布读到一个跑不了的版本。草稿先独立存在，等取数路径有了、人审过了再进版本。这个模块因此不碰
-数据库：纯逻辑 + 一次模型调用，调用方拿到结果自己决定存哪里。
+**为什么这个模块不写成图。** 它只负责把原文里的业务说法抽成定义卡需要的那几项：不碰取数、不碰数据库，纯逻辑加一次模型
+调用，调用方拿到结果自己决定存哪里。建图（取数 SQL → start / fetch / card / write / out）在 draftplan.build_graph，
+docattach 接上运行的那一路用的是 certify.build_graph。
 
 **为什么引用要逐字核对。** 「文档里说过」是这份草稿唯一的事实来源。模型转述得再像，也要能在原文里按归一化空白
 （换行、制表、全角空格）定位到那一句；定位不到就不算引用。span 是原文下标，界面据此高亮，也是之后复核的依据。
@@ -21,9 +21,11 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-#: 草稿的状态。path_pending 不是合法图，attached 之后取数路径才来自一次真实运行。
-#: failed 是起草这一步没跑成（没有可用模型、模型回复读不懂），和 rejected（人判它不是口径）不是一回事。
-STATUSES = ("drafting", "questions_open", "path_pending", "attached", "rejected", "failed")
+#: 草稿的状态。ready 是主路径的常态：图已生成（含取数 SQL）、没有未决问题、可试跑可签字发布；questions_open 有图也有数，
+#: 只是问题还没清完（不阻断试跑）；path_pending 只留给这次改版之前起草、还没有取数路径的老草稿；attached 是经辅助入口接上
+#: 一次真实运行之后的。failed 是起草这一步没跑成（没有可用模型、模型回复读不懂、SQL 不合格），和 rejected（人判它不是口径）
+#: 不是一回事。
+STATUSES = ("drafting", "ready", "questions_open", "path_pending", "attached", "rejected", "failed")
 
 #: 一次发给模型的总字数上限（按 chunk 边界截断，见 extract）
 MAX_INPUT_CHARS = 40000

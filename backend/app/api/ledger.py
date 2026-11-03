@@ -19,8 +19,10 @@
 - GET /api/ledger/calibers、GET /api/ledger/calibers/{workflow_id}/{version}/{node_id}（router，搭建者）：口径可调用描述
   （app/ledger/descriptor.py）：入口字段的 JSON Schema、依赖、能不能组合和出具；不返回 SQL 和参数值。
 - POST /api/ledger/drafts/extract、GET /api/ledger/drafts、GET/PATCH /api/ledger/drafts/{id}、POST …/{id}/dismiss、
-  POST …/{id}/attach（router，搭建者）：从业务文档起草口径（app/ledger/docdraft.py），草稿独立存在、不写进
-  workflows.graph；attach 才按一次真实运行补上取数路径（app/ledger/docattach.py）。
+  POST …/{id}/attach、GET …/{id}/trial（router，搭建者）：从业务文档起草口径。主路径一次到位：模型读文档和数据目录，
+  产出定义 + 取数 SQL + 入口字段 + 指标表达式（app/ledger/draftplan.py），服务端校验收成草稿图、建草稿工作流和 v1，
+  后台自动只读试跑；草稿页给「定义 + 数 + 原文引用」。attach 保留为辅助入口：已经有跑对的答案时让它认这份定义
+  （app/ledger/docattach.py）。
 这几个新接口都不放给访问密钥（auth/keys.KEY_ROUTES 不登记）。
 """
 from __future__ import annotations
@@ -404,8 +406,142 @@ def _question_count(payload: dict[str, Any]) -> int:
 
 
 def _status_for(payload: dict[str, Any]) -> str:
-    """还有问题 → questions_open，否则 path_pending（等一次真实运行补取数路径）。"""
-    return "questions_open" if _question_count(payload) else "path_pending"
+    """还有问题 → questions_open；没有问题且有图 → ready；没有图的老草稿 → path_pending。
+
+    questions_open 现在也有图和数，只是问题还没清完，不阻断试跑；path_pending 只留给这次改版之前起草、还没有取数路径的草稿。
+    """
+    if _question_count(payload):
+        return "questions_open"
+    if payload.get("workflow_id") and payload.get("sql"):
+        return "ready"
+    return "path_pending"
+
+
+#: 试跑最多等多久（秒）和轮询间隔：和 trial_caliber 的 300 × 0.1 一致
+TRIAL_TIMEOUT_S = 30
+TRIAL_POLL_S = 0.1
+#: 运行到这里就是终态了（interrupted 归到 failed，接口契约只有三种状态）
+TERMINAL_RUN_STATUSES = ("succeeded", "failed", "cancelled", "interrupted")
+
+
+def _run_status(status: Any) -> str:
+    """运行状态 → 接口契约里的 succeeded / failed / running。"""
+    if status == "succeeded":
+        return "succeeded"
+    if status in ("failed", "cancelled", "interrupted"):
+        return "failed"
+    return "running"
+
+
+def _source_tables(source: DataSource) -> dict[str, Any]:
+    cache = source.schema_cache if isinstance(source.schema_cache, dict) else {}
+    tables = cache.get("tables")
+    return tables if isinstance(tables, dict) else {}
+
+
+async def _schema_material(session: AsyncSession, source: DataSource) -> tuple[str, set[str]]:
+    """这个数据源给模型看的表结构 + 数据目录文本，以及 SQL 允许出现的表名集合。
+
+    给模型的是「库概览 + 紧凑表名索引 + 前几十张表的字段/目录」（schema_view 的现成渲染），表名一律照目录原文，模型照着抄。
+    allowed_tables 收全部探查到的表（含 schema 前缀写法）：文本里被截掉详情的表也允许，因为索引里有名字。
+    """
+    from app.data import catalog, schema_view
+
+    cache = source.schema_cache if isinstance(source.schema_cache, dict) else {}
+    tables = _source_tables(source)
+    if not tables:
+        return "", set()
+    entries = await catalog.read_catalog(session, source.id)
+    notes = {table: entry.notes for table, entry in entries.items()}
+    lines = [schema_view.overview_line(source, catalog_tables=sum(
+        1 for entry in entries.values() if catalog.visible_notes(entry.notes)))]
+    lines.append(schema_view.table_index(source, notes))
+    for position, table in enumerate(tables):
+        if position >= 60:
+            break
+        lines.append(schema_view.table_detail(source, table, catalog_notes=notes))
+    schema = cache.get("schema")
+    allowed: set[str] = set()
+    for table in tables:
+        allowed.add(str(table))
+        if isinstance(schema, str) and schema:
+            allowed.add(f"{schema}.{table}")
+    return "\n\n".join(line for line in lines if line), allowed
+
+
+async def _save_trial(draft_id: str, trial: dict[str, str]) -> None:
+    """把试跑状态写进 draft.payload["trial"]（用新会话：后台这一段和起草那段不是同一个事务）。"""
+    async with SessionLocal() as fresh:
+        row = await fresh.get(CaliberDraft, draft_id)
+        if row is None or not isinstance(row.payload, dict):
+            return
+        body = dict(row.payload)
+        body["trial"] = trial
+        row.payload = body
+        await fresh.commit()
+
+
+async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], values: dict[str, Any],
+                     started_by: str | None) -> dict[str, str]:
+    """后台试跑草稿的取数与口径卡，返回 payload["trial"] 的形状（run_id / status / error）。
+
+    跑的是**探针图**（取数 + 口径卡，`derive.caliber_probe`），不是整张草稿图：草稿图里带着报告撰写节点，
+    试跑只关心数对不对，不该为了一次试跑多花一次模型调用、也不该因为没有可用模型就判这份口径不行。
+
+    不复用 trial_caliber：那里要求「已发布」，草稿本来就没发布。来源记 caliber_trial；起来之后先写一次 run_id，
+    页面这时就能去看运行；轮询到终态或者等满 TRIAL_TIMEOUT_S，没跑完就照实答 running。
+    """
+    from app.engine.runner import run_manager
+    from app.ledger.derive import NotDerivable, caliber_probe, load_pinned
+
+    card_id = next((n.get("id") for n in graph.get("nodes") or []
+                    if isinstance(n, dict) and n.get("type") == "metrics"), None)
+    if not card_id:
+        return {"run_id": "", "status": "failed", "error": "这份草稿没有口径卡，没有可试运行的指标"}
+    try:
+        async with SessionLocal() as read:
+            pinned = await load_pinned(read, workflow_id, 1, str(card_id))
+        target = caliber_probe(pinned).graph
+    except NotDerivable as e:
+        return {"run_id": "", "status": "failed", "error": f"口径卡不能派生探针：{e.message}"}
+
+    try:
+        run = await run_manager.start(
+            graph=target, input_payload=values, run_class="exploratory", origin_kind="caliber_trial",
+            origin={"kind": "caliber_trial", "draft_id": draft_id, "workflow_id": workflow_id, "version": 1,
+                    "node_id": str(card_id)},
+            started_by=started_by)
+    except Exception as e:  # noqa: BLE001 - 试跑发起失败不该把已经生成的草稿弄没
+        logger.exception("草稿 %s 的试运行没有发起", draft_id)
+        return {"run_id": "", "status": "failed", "error": f"试运行没有发起：{e}"}
+    await _save_trial(draft_id, {"run_id": run.id, "status": "running", "error": ""})
+    row: Run | None = None
+    for _ in range(int(TRIAL_TIMEOUT_S / TRIAL_POLL_S)):
+        async with SessionLocal() as poll:
+            row = await poll.get(Run, run.id)
+        if row is None or row.status in TERMINAL_RUN_STATUSES:
+            break
+        await asyncio.sleep(TRIAL_POLL_S)
+    status = _run_status(row.status if row is not None else "running")
+    error = str(row.error or "") if row is not None and status == "failed" else ""
+    return {"run_id": run.id, "status": status, "error": error}
+
+
+async def _trial_metrics(run_id: str) -> list[dict[str, Any]]:
+    """试跑运行里口径卡上的指标值：复用证据接口读封存的现成函数，不另写指标集解析。"""
+    from app.api.evidence import _sealed, _sealed_cards
+
+    try:
+        sealed = await _sealed(run_id)
+        cards = {node_id: card for node_id, _, card in _sealed_cards(sealed)}
+    except Exception:  # noqa: BLE001 - 证据读不出来就只给状态，不编造指标值
+        logger.exception("试跑 %s 的指标值读不出来", run_id)
+        return []
+    card = cards.get("card") or next(iter(cards.values()), None)
+    if not isinstance(card, dict):
+        return []
+    return [{k: m.get(k) for k in ("id", "name", "rendered", "value") if m.get(k) is not None}
+            for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id")]
 
 
 def _draft_summary(draft: CaliberDraft) -> dict[str, Any]:
@@ -466,12 +602,15 @@ def _doc_title(docs: list[Document]) -> str:
 
 
 async def _extract_in_background(draft_id: str) -> None:
-    """后台起草：读文档的段落、调一次模型、和已发布口径对齐，结果写回这一行。
+    """后台起草：读文档的段落和数据目录、调一次模型、校验收成草稿图、建草稿工作流、再跑一次试跑。
 
-    用新的会话：请求那一份在响应发出后就关了，后台接着用它写库是错的。失败写进 error、状态留在 drafting——
-    草稿不是「被驳回」，人改完文档还能再来一次。
+    用新的会话：请求那一份在响应发出后就关了，后台接着用它写库是错的。没有数据源或没有表结构时起草必须失败——SQL 只能
+    对照真实目录写，没有目录就不让模型猜。个别指标不合格只丢那一条、写进 dropped / open_questions；SQL 本身不合格才整份
+    失败（图跑不了，留着也没有意义）。
     """
-    from app.ledger import docdraft
+    from app.core.artifact_store import graph_hash
+    from app.db.models import WorkflowVersion
+    from app.ledger import docdraft, draftplan
 
     async with SessionLocal() as session:
         draft = await session.get(CaliberDraft, draft_id)
@@ -496,25 +635,69 @@ async def _extract_in_background(draft_id: str) -> None:
                 chunk_ids.append(chunk.id)
             entries.append({"document_id": doc.id, "title": doc.title or doc.source or doc.id,
                             "chunk_ids": chunk_ids})
-        datasource = None
-        if draft.datasource_id:
-            source = await session.get(DataSource, draft.datasource_id)
-            if source is not None:
-                datasource = {"name": source.name, "type": source.kind, "description": source.description}
+
+        source = await session.get(DataSource, draft.datasource_id) if draft.datasource_id else None
+        if source is None:
+            draft.error = "没有数据源：生成取数 SQL 必须对照数据目录里的表和列"
+            draft.status = "failed"
+            await session.commit()
+            return
+        tables_text, allowed_tables = await _schema_material(session, source)
+        if not allowed_tables:
+            draft.error = "这个数据源还没有表结构：先探查表结构，再起草口径"
+            draft.status = "failed"
+            await session.commit()
+            return
+        datasource = {"name": source.name, "type": source.kind, "description": source.description}
+
+        guidance = str(origin.get("guidance") or "")
+        alignment: dict[str, list[Any]] = {"new": [], "duplicate": [], "conflict": []}
         try:
-            result = await docdraft.extract(session, docs=entries, chunks=chunks,
-                                            guidance=str(origin.get("guidance") or ""), datasource=datasource)
+            result = await draftplan.plan(session, docs=entries, chunks=chunks, guidance=guidance,
+                                          datasource=datasource, tables_text=tables_text)
+            plan, problems = draftplan.normalize_plan(result, chunks, allowed_tables=allowed_tables)
+            base = {
+                "documents": entries, "metrics": plan["metrics"], "entry_fields": plan["entry_fields"],
+                "sql": plan["sql"], "version": 1,
+                "trial": {"run_id": "", "status": "running", "error": ""},
+                "dropped": problems, "truncated": result["truncated"], "model_id": result["model_id"],
+            }
+            if not plan["sql"] or not plan["metrics"]:
+                error = _problems_text(problems) or "模型没有给出可用的取数 SQL 和指标"
+                draft.payload = {**base, "trial": {"run_id": "", "status": "failed", "error": error}}
+                draft.model_id = result["model_id"] or None
+                draft.error = error
+                draft.status = "failed"
+                await session.commit()
+                return
             # 对齐要扫所有已发布口径：某一份读不出来不该让整份草稿失败，照实不做对齐（alignment 三个空列表）
             try:
                 existing = await _published_metrics(session)
             except Exception:  # noqa: BLE001 - 对齐是辅助信息，不是草稿本身
                 logger.exception("读已发布口径失败，草稿 %s 不做对齐", draft_id)
                 existing = []
+            alignment = docdraft.alignment(plan["metrics"], existing)
+
+            plan["datasource"] = source.name
+            graph = draftplan.build_graph(plan, name=draft.title,
+                                          question=guidance or draft.title)
+            questions = list(plan["open_questions"]) + [
+                f"{p['name']}：{p['reason']}" for p in problems
+                if p.get("name") not in ("sql", "metrics")]
+            workflow = Workflow(
+                name=(draft.title.strip() or "文档口径草稿")[:200],
+                description=(f"从业务文档起草的口径：{len(plan['metrics'])} 个指标，取数 SQL 由模型对照数据目录生成，"
+                             f"后台自动只读试运行；人工审改后按受管级别发布"),
+                graph=graph, status="draft", tags=["doc_draft"],
+                origin={"kind": "doc_draft", "draft_id": draft.id, "datasource_id": source.id,
+                        "documents": [doc.id for doc in docs], "guidance": guidance})
+            session.add(workflow)
+            await session.flush()
+            session.add(WorkflowVersion(workflow_id=workflow.id, version=1, graph=graph,
+                                        graph_hash=graph_hash(graph), note="从业务文档一次生成"))
             payload = {
-                "documents": entries, "metrics": result["metrics"], "dropped": result["dropped"],
-                "open_questions": result["open_questions"],
-                "alignment": docdraft.alignment(result["metrics"], existing),
-                "truncated": result["truncated"], "model_id": result["model_id"],
+                **base, "workflow_id": workflow.id, "open_questions": questions,
+                "alignment": alignment,
             }
         except docdraft.DraftUnavailable as e:
             draft.error = str(e) or "AI 起草不可用"
@@ -528,14 +711,31 @@ async def _extract_in_background(draft_id: str) -> None:
             await session.commit()
             return
         draft.payload = payload
+        draft.workflow_id = workflow.id
         draft.model_id = result["model_id"] or None
         draft.error = None
         draft.status = _status_for(payload)
         await session.commit()
+        values = {field["name"]: field.get("default") for field in plan["entry_fields"]
+                  if field.get("default") not in (None, "")}
+
+    try:
+        trial = await _run_trial(draft_id=draft_id, workflow_id=workflow.id, graph=graph, values=values,
+                                 started_by=draft.created_by)
+    except Exception as e:  # noqa: BLE001 - 试运行出错也要写进 payload，不能让界面停在「试运行中」
+        logger.exception("草稿 %s 的试运行出错", draft_id)
+        trial = {"run_id": "", "status": "failed", "error": f"试运行出错：{e}"}
+    await _save_trial(draft_id, trial)
+
+
+def _problems_text(problems: list[dict[str, Any]]) -> str:
+    """把校验问题拼成一句给人看的原因（接口的 error 只有一个字段）。"""
+    return "；".join(f"{p.get('name') or '问题'}：{p.get('reason') or ''}".strip("：")
+                    for p in problems if p.get("reason"))[:2000]
 
 
 class DraftExtractIn(BaseModel):
-    """从哪几份文档起草、起草时给模型看的附加要求。数据源只用来写清适用范围，不给表结构。"""
+    """从哪几份文档起草、起草时给模型看的附加要求。数据源必须给：它的表结构和目录是 SQL 的唯一依据。"""
 
     documents: list[str] = Field(min_length=1, max_length=20)
     collection: str | None = Field(default=None, max_length=100)
@@ -546,23 +746,29 @@ class DraftExtractIn(BaseModel):
 @router.post("/drafts/extract", status_code=201)
 async def draft_extract(payload: DraftExtractIn, background: BackgroundTasks,
                         session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """从业务文档起草一份口径（app/ledger/docdraft.py）：先建一行 drafting 立刻返回，模型在后台跑。
+    """从业务文档起草一份口径（app/ledger/draftplan.py）：先建一行 drafting 立刻返回，模型在后台跑。
 
-    文档必须都存在（缺的回 422，一个草稿都不建）；数据源给了也必须存在。草稿只产出定义，不产出取数，也不写进
-    workflows.graph——path_pending 不是合法的图。抽取完的 payload / status 用 GET 看。"""
+    文档必须都存在（缺的回 422，一个草稿都不建）；数据源必须给、必须存在，而且已经探查到表结构——SQL 只能对照真实目录
+    写，没有目录时让模型猜表，图跑不了。模型产出定义 + SQL + 入口字段后由服务端校验收成草稿图和 v1，后台自动只读试跑。
+    起草完的 payload / status / trial 用 GET 看。"""
     from app.api.deps import current_principal, ensure_role
 
     ensure_role("builder")
     doc_ids = list(dict.fromkeys(str(d) for d in payload.documents if str(d).strip()))
     if not doc_ids:
         raise HTTPException(422, "至少要给一份文档")
+    if not payload.datasource_id:
+        raise HTTPException(422, "生成取数 SQL 需要数据源：请选一个已经探查过表结构的数据源")
     found = {doc.id: doc for doc in (await session.execute(
         select(Document).where(Document.id.in_(doc_ids)))).scalars()}
     missing = [doc_id for doc_id in doc_ids if doc_id not in found]
     if missing:
         raise HTTPException(422, f"文档不存在，可能已被删除：{'、'.join(missing)}")
-    if payload.datasource_id and await session.get(DataSource, payload.datasource_id) is None:
+    source = await session.get(DataSource, payload.datasource_id)
+    if source is None:
         raise HTTPException(422, "数据源不存在，可能已被删除")
+    if not _source_tables(source):
+        raise HTTPException(422, "这个数据源还没有表结构：先探查表结构，再起草口径")
     docs = [found[doc_id] for doc_id in doc_ids]
     draft = CaliberDraft(title=_doc_title(docs),
                          collection=payload.collection or (docs[0].collection or "default"),
@@ -576,8 +782,8 @@ async def draft_extract(payload: DraftExtractIn, background: BackgroundTasks,
 
 
 @router.get("/drafts")
-async def list_drafts(status: str | None = Query(default=None, description="按状态筛：drafting / questions_open / "
-                                                   "path_pending / attached / rejected / failed"),
+async def list_drafts(status: str | None = Query(default=None, description="按状态筛：drafting / ready / "
+                                                   "questions_open / path_pending / attached / rejected / failed"),
                       session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """口径草稿列表，最近改过的在前。只给计数和状态，正文用 GET /api/ledger/drafts/{id} 看。"""
     from app.api.deps import ensure_role
@@ -595,11 +801,36 @@ async def list_drafts(status: str | None = Query(default=None, description="按�
 
 @router.get("/drafts/{draft_id}")
 async def get_draft(draft_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """一份草稿的完整内容：指标（含引用和 span）、丢弃原因、未决问题、和已发布口径的对齐结果、关联工作流名。"""
+    """一份草稿的完整内容：指标（含引用和 span）、取数 SQL、入口字段、试跑状态、丢弃原因、未决问题、和已发布口径的对齐
+    结果、关联工作流名。"""
     from app.api.deps import ensure_role
 
     ensure_role("builder")
     return await _draft_view(session, await _draft_or_404(session, draft_id))
+
+
+@router.get("/drafts/{draft_id}/trial")
+async def get_draft_trial(draft_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """这份草稿的试跑：{run_id, status, metrics: [{id, name, rendered, value}], error}。
+
+    状态只有 succeeded / failed / running 三种；指标值读试跑运行封存的口径卡（和口径试跑同一个读法）。还没试跑（老草稿、
+    起草失败）回 404。只读，不发起运行。"""
+    from app.api.deps import ensure_role
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    payload = draft.payload if isinstance(draft.payload, dict) else {}
+    trial = payload.get("trial") if isinstance(payload.get("trial"), dict) else {}
+    run_id = trial.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise HTTPException(404, "这份草稿还没有试运行")
+    run = await session.get(Run, run_id)
+    if run is None:
+        return {"run_id": run_id, "status": _run_status(trial.get("status")), "metrics": [],
+                "error": str(trial.get("error") or "")}
+    status = _run_status(run.status)
+    metrics = await _trial_metrics(run.id) if status == "succeeded" else []
+    return {"run_id": run.id, "status": status, "metrics": metrics, "error": str(run.error or "")}
 
 
 def _check_metrics(metrics: Any) -> list[dict[str, Any]]:
@@ -633,8 +864,8 @@ class DraftPatchIn(BaseModel):
 async def patch_draft(draft_id: str, payload: DraftPatchIn, session: AsyncSession = Depends(get_session)
                       ) -> dict[str, Any]:
     """改一份草稿：metrics 整体替换（只做结构校验，不重跑引用核对）；resolved 里的问题从跨指标和各指标的问题里删掉。
-    据此重算状态（还有问题 → questions_open，否则 path_pending）。已经 attach 或驳回的草稿不改状态——那时它说的
-    已经不是一份草稿了。"""
+    据此重算状态（还有问题 → questions_open，否则有图 → ready、没有图的老草稿 → path_pending）。已经 attach 或驳回的
+    草稿不改状态——那时它说的已经不是一份草稿了。"""
     from app.api.deps import ensure_role
 
     ensure_role("builder")
@@ -663,7 +894,7 @@ async def patch_draft(draft_id: str, payload: DraftPatchIn, session: AsyncSessio
         metrics = payload_data.get("metrics")
         # 起草失败的草稿补上真指标后要能往前走；没有指标时不重算，免得空草稿被当成「待接数据路径」
         if isinstance(metrics, list) and metrics and draft.status in ("drafting", "questions_open",
-                                                                     "path_pending", "failed"):
+                                                                     "path_pending", "ready", "failed"):
             draft.status = _status_for(payload_data)
     await session.commit()
     return await _draft_view(session, draft)

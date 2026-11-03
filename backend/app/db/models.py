@@ -1094,12 +1094,12 @@ class WebhookDelivery(Base):
 
 
 class CaliberDraft(Base, TimestampMixin):
-    """从业务文档起草的一份口径（app/ledger/docdraft.py 的产出）。
+    """从业务文档起草的一份口径（app/ledger/draftplan.py 的产出）。
 
-    草稿在 path_pending 下没有取数路径，不是合法图（validate_graph 会挡），所以不写进 workflows.graph：另存一行，
-    等 attach（app/ledger/docattach.py）按一次真实运行补上取数路径、人审过再进版本。payload 的形状见
-    docdraft.extract 的返回（documents / metrics / dropped / open_questions / alignment / truncated / model_id），
-    origin 记这一份草稿从哪些文档、用哪句话问出来的，attach 之后工作流 id 记在 workflow_id 上。
+    主路径一次到位：模型读文档和数据目录，产出定义 + 取数 SQL + 入口字段 + 指标表达式；服务端校验收成草稿图，建一个
+    status="draft" 的工作流和 v1，后台自动只读试跑。payload 的形状见接口契约（documents / metrics / entry_fields / sql /
+    workflow_id / version / trial / open_questions / alignment / dropped / truncated / model_id），这张草稿对应的工作流 id
+    记在 workflow_id 上。attach（app/ledger/docattach.py）保留为辅助入口：已经有跑对的答案时让它认这份定义。
     """
 
     __tablename__ = "caliber_drafts"
@@ -1107,11 +1107,11 @@ class CaliberDraft(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     title: Mapped[str] = mapped_column(String(200), default="")
     collection: Mapped[str] = mapped_column(String(100), default="default")
-    # 起草时给模型看的数据源（只给名字和类型，用来写清适用范围）；源删了草稿照旧在，只丢这一条线索
+    # 起草时给模型看的数据源：表结构和数据目录是取数 SQL 的唯一依据；源删了草稿照旧在，只丢这一条线索
     datasource_id: Mapped[str | None] = mapped_column(
         ForeignKey("data_sources.id", ondelete="SET NULL"), default=None
     )
-    # 同 docdraft.STATUSES：drafting | questions_open | path_pending | attached | rejected
+    # 同 docdraft.STATUSES：drafting | ready | questions_open | path_pending | attached | rejected | failed
     status: Mapped[str] = mapped_column(String(20), default="drafting", index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(default=dict)
     # 这份草稿从哪来：{"documents": [文档 id], "guidance": 用户补充要求}
