@@ -330,6 +330,8 @@ async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: T
         pinned = await load_pinned(session, workflow_id, int(version), node_id)
     except NotDerivable as e:
         raise HTTPException(409, e.message) from None
+    if not pinned.published or pinned.retired:
+        raise HTTPException(409, "这一版没有发布或已退役，不能试运行")
     fields = [dict(f) for f in pinned.entry_fields]
     known = {str(f.get("name")) for f in fields}
     unknown = sorted(str(k) for k in payload.inputs if str(k) not in known)
@@ -343,7 +345,7 @@ async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: T
     graph = caliber_probe(pinned).graph
     principal = current_principal()
     run = await run_manager.start(
-        graph=graph, input_payload=values, run_class="exploratory", origin_kind="trial",
+        graph=graph, input_payload=values, run_class="exploratory", origin_kind="caliber_trial",
         origin={"kind": "caliber_trial", "workflow_id": workflow_id, "version": int(version),
                 "node_id": node_id, "card": pinned.node_id},
         started_by=principal.username)

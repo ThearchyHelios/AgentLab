@@ -108,8 +108,11 @@ def run_fixtures(rule: Mapping[str, Any], table: str, fixtures: Iterable[Mapping
         columns: dict[str, str] = {}
         for item in items:
             for row in item.get("rows") or []:
+                if not isinstance(row, Mapping):
+                    raise RuleInvalid("fixture 的 rows 需要是对象")
                 for name, value in row.items():
-                    columns.setdefault(str(name), "INTEGER" if isinstance(value, int) and not isinstance(value, bool)
+                    key = _ident(name, "fixture 列名")
+                    columns.setdefault(key, "INTEGER" if isinstance(value, int) and not isinstance(value, bool)
                                        else "REAL" if isinstance(value, float) else "TEXT")
         if not columns:
             raise RuleInvalid("fixture 需要至少一行 rows")

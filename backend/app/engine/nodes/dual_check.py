@@ -512,6 +512,9 @@ async def _plan_metric(state: GraphState, metric: dict[str, Any], options: _Opti
         "status": "pending", "original": {"value": metric.get("value"), "rendered": metric.get("rendered")},
         "blind": {"value": None, "rendered": None}, "delta_pct": None, "inputs": [], "differing": [],
     }
+    if metric.get("rule") is not None or metric.get("assessment") is not None or metric.get("external") is not None:
+        row.update(status=UNCHECKED, reason="这个指标不是按表达式算的，不参与双盲复算")
+        return row, {}
     tops = _tops(metric)
     # masks 是每份用到的快照要遮的列（cell() 的、按位置取的格落在的），queries 只是 cell() 用到的那几份：重算时容器
     # 输入按内容对快照只对这几份。按位置取的格落在的快照算遮罩只为认这一格，不当成指标用到的结果——放进去的话，同一个

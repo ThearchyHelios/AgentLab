@@ -65,9 +65,9 @@ export function CaliberCatalog() {
     try {
       const out = await api.caliberLedger.trial(d.workflow_id, d.version, d.card.node_id, values[key] ?? {})
       setTrials((t) => ({ ...t, [key]: out }))
-      if (out.status === 'succeeded') toast.ok('试跑完成')
-      else if (out.status === 'running') toast.warn('试跑还在运行，打开运行记录看结果')
-      else toast.error(out.error || '试跑没有成功')
+      if (out.status === 'succeeded') toast.ok('试运行完成')
+      else if (out.status === 'running') toast.warn('试运行还在进行，打开运行记录看结果')
+      else toast.error(out.error || '试运行没有成功')
     } catch (e) {
       toast.error(e)
     } finally {
@@ -77,7 +77,7 @@ export function CaliberCatalog() {
 
   return (
     <div className="flex h-full flex-col" data-caliber-catalog="">
-      <PageHeader icon={<Layers size={14} />} title="口径" subtitle="已发布口径的入口、指标、依赖与试跑"
+      <PageHeader icon={<Layers size={14} />} title="口径" subtitle="已发布口径的入口、指标、依赖与试运行"
                   actions={<button type="button" className="btn btn-xs btn-ghost" onClick={load} title="重新加载">
                     <RefreshCw size={12} aria-hidden /> 刷新
                   </button>} />
@@ -164,17 +164,24 @@ export function CaliberCatalog() {
                         <h3 className="mb-1 text-2xs font-semibold text-dim">入口字段</h3>
                         {d.entry_schema.properties && Object.keys(d.entry_schema.properties).length > 0 ? (
                           <SchemaForm schema={d.entry_schema} value={values[key] ?? {}}
-                                      onChange={(v) => setValues((all) => ({ ...all, [key]: v }))}
+                                      onChange={(v) => {
+                                        setValues((all) => ({ ...all, [key]: v }))
+                                        setTrials((all) => {
+                                          const next = { ...all }
+                                          delete next[key]
+                                          return next
+                                        })
+                                      }}
                                       idPrefix={`caliber-${key}`} />
                         ) : <p className="text-2xs text-faint">这份口径不需要参数。</p>}
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
                         <button type="button" className="btn btn-primary btn-sm" disabled={busy === key}
                                 onClick={() => void trial(d)} data-caliber-trial="">
-                          {busy === key ? <Spinner size={12} /> : <Play size={12} aria-hidden />} 试跑
+                          {busy === key ? <Spinner size={12} /> : <Play size={12} aria-hidden />} 试运行
                         </button>
                         <Link to={`/studio/${d.workflow_id}`} className="btn btn-sm btn-ghost">打开工作流</Link>
-                        <span className="text-2xs text-faint">试跑是只读探索运行，不是正式出具</span>
+                        <span className="text-2xs text-faint">试运行是只读探索运行，不是正式出具</span>
                       </div>
                       {result && (
                         <div className="rounded-md border bg-elev px-3 py-2 text-xs" data-caliber-trial-result={result.status}>
@@ -189,7 +196,7 @@ export function CaliberCatalog() {
                             </ul>
                           ) : (
                             <Notice tone={result.status === 'running' ? 'info' : 'err'}>
-                              {result.status === 'running' ? '还在运行：' : '试跑没有成功：'}
+                              {result.status === 'running' ? '还在运行：' : '试运行没有成功：'}
                               {result.error || result.status}
                               {' '}<Link className="underline" to={`/runs/${result.run_id}`}>看运行</Link>
                             </Notice>

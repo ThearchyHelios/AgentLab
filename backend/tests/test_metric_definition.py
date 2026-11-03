@@ -1,7 +1,6 @@
-"""指标定义卡（definition）与参数（params）的最小结构校验。
+"""指标定义卡（definition）与参数（params）：结构校验、四种 kind（公式/外部常量/规则/评估）的执行与标签。
 
-执行还是公式这一种；定义文本、参数先作为语义元数据校验、进内容指纹、进 descriptor。规则/评估/外部常量没实现前，
-写进图里要按错误挡住，免得被当成能算的指标。
+定义文本、参数进内容指纹和 descriptor；不认识的 kind 写进图里要按错误挡住，免得被当成能算的指标。
 """
 from __future__ import annotations
 
@@ -30,7 +29,7 @@ def test_a_formula_metric_can_carry_a_definition_and_params():
 
 def test_an_unimplemented_kind_is_refused():
     errors = _errors(_graph(kind="normative"))
-    assert any(i.code == "metrics.kind_unsupported" and "还没有实现" in i.message for i in errors)
+    assert any(i.code == "metrics.kind_unsupported" and "不认识" in i.message for i in errors)
 
 
 def test_params_must_be_named_and_typed_once_each():
@@ -72,6 +71,7 @@ async def test_an_external_constant_metric_runs_without_a_query():
         metric = card["metrics"][0]
         assert metric["external"]["source"] == "2026 年度预算决议"
         assert metric["external"]["stale"] is False
+        assert metric["recompute_ok"] is None and metric["recompute_reason"]
     finally:
         await run_manager.shutdown()
 
@@ -147,7 +147,8 @@ def test_a_rule_metric_is_labelled_derived_with_its_input_queries():
     }]}
     label = metric_label(card, "big", {}, {})
     assert label["kind"] == "derived" and label["queries"] == ["q1"]
-    assert label["definition_hash"] == "abc" and label["rule"]["all"][0]["op"] == "eq"
+    assert label["definition_hash"] == "abc" and label["rule"]["conditions"] == 1
+    assert "paid" not in str(label)
 
 
 def test_an_assessment_metric_needs_unique_dimensions_and_descending_levels():
@@ -198,9 +199,12 @@ def test_an_assessment_metric_is_labelled_assessed():
     from app.ledger.labels import metric_label
 
     card = {"definition_hash": "abc", "metrics": [{
-        "id": "quality", "assessment": {"score": 80, "level": "B"},
+        "id": "quality",
+        "assessment": {"score": 80, "level": "B",
+                       "dimensions": [{"name": "手机号", "weight": 1, "value": "19900000501"}]},
         "inputs": [{"artifact": "q1", "via": "tool_cell"}],
     }]}
     label = metric_label(card, "quality", {}, {})
     assert label["kind"] == "assessed" and label["queries"] == ["q1"]
     assert label["assessment"]["level"] == "B" and label["definition_hash"] == "abc"
+    assert "19900000501" not in str(label)

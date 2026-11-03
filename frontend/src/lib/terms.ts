@@ -5482,6 +5482,7 @@ export const ORIGIN_LABEL: Record<OriginKind, string> = {
   ledger_issue: '按口径正式出具',
   reconcile: '口径对账',
   recall: '口径召回',
+  caliber_trial: '口径试运行',
 }
 
 export const ORIGIN_TEXT = {

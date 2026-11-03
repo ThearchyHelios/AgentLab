@@ -822,7 +822,7 @@ export interface NotifyEventRow {
 export type OriginKind =
   | 'chat' | 'canvas' | 'launcher' | 'schedule' | 'app_entry' | 'app_view' | 'app_backfill' | 'hook' | 'api'
   | 'trial' | 'personal_app'
-  | 'eval' | 'ledger_issue' | 'reconcile' | 'recall'
+  | 'eval' | 'ledger_issue' | 'reconcile' | 'recall' | 'caliber_trial'
 
 /**
  * GET /api/runs/unlisted：同样的筛选下，记录页因为「系统派生的运行默认不列」而没列出的次数。系统派生的是评测、口径对账、

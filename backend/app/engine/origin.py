@@ -29,6 +29,7 @@ ORIGIN_KINDS = (
     "ledger_issue",  # 问数据的答案按已治理口径正式出具（正式运行）
     "reconcile",     # 口径对账：这次的取数和口径在同一份数据上各算一次（探索运行）
     "recall",        # 口径召回：新旧两版口径在同一份数据上各算一次（探索运行）
+    "caliber_trial", # 口径目录里的试跑（探索运行，不是问数回答，也不进统计/召回）
 )
 
 #: 客户端在 POST /api/runs 里能声明的来源
@@ -38,7 +39,7 @@ CLIENT_ORIGINS = ("chat", "canvas", "launcher", "api")
 #: 不是有人在用。它们是完整的运行（证据、封存都在、点得开），但不进使用统计——探索问题聚类、工具白名单衰减、数据目录的
 #: 使用次数和「被哪些运行用过」、审阅队列的使用权重、以后的账本统计——否则一跑评测，治理信号和目录的使用热度就失真了。
 #: 记录页默认也不列（筛选里能选，列表照实写有几次没列出）。ledger_issue 是替用户正式出具，照常计入
-SYSTEM_ORIGINS = ("eval", "reconcile", "recall")
+SYSTEM_ORIGINS = ("eval", "reconcile", "recall", "caliber_trial")
 
 
 def counted_runs() -> Any:

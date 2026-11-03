@@ -15,7 +15,7 @@ ROUND_IN_SOURCE = "caliber.round_in_source"
 ZERO_DEFAULT = "caliber.zero_default"
 
 ROUND_MESSAGE = (
-    "取数 SQL 里写了 ROUND(...)：取整交给口径卡的小数位和展示；取数 SQL 里写 ROUND 会让未取整的查询"
+    "取数 SQL 里写了取整函数：取整交给口径卡的小数位和展示；取数 SQL 里写取整会让未取整的查询"
     "永远认不成等价（口径账本只认规范化后完全相同的结果）"
 )
 ZERO_MESSAGE = (

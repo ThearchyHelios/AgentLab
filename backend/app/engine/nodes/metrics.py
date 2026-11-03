@@ -120,18 +120,31 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             value: Any = None
             details: list[dict[str, Any]] = []
             level: str | None = None
+            out_of_range: list[str] = []
             if not missing:
                 total = sum(float(d.get("weight", 1)) for d in dimensions)
                 points = 0.0
+                bad: str | None = None
                 for d in dimensions:
                     low, high = float(d.get("min", 0)), float(d.get("max", 100))
-                    raw = float(values_by_name[str(d["name"])])
+                    try:
+                        raw = float(values_by_name[str(d["name"])])
+                    except (TypeError, ValueError):
+                        bad = f"维度「{d['name']}」的输入不是数（{values_by_name[str(d['name'])]!r}）"
+                        break
                     normalized = max(0.0, min(100.0, (raw - low) / (high - low) * 100))
                     weight = float(d.get("weight", 1))
                     points += normalized * weight
-                    details.append({"name": d["name"], "value": raw, "normalized": normalized, "weight": weight})
-                value = round_metric(points / total, display["decimals"])
-                level = next((str(l["name"]) for l in assessment["levels"] if value >= float(l["min"])), None)
+                    if raw < low or raw > high:
+                        out_of_range.append(str(d["name"]))
+                    details.append({"name": d["name"], "value": raw, "normalized": normalized, "weight": weight,
+                                    "out_of_range": raw < low or raw > high})
+                if bad:
+                    errors.append(f"指标「{metric_id}」：{bad}")
+                    continue
+                raw_score = points / total
+                value = round_metric(raw_score, display["decimals"])
+                level = next((str(l["name"]) for l in assessment["levels"] if raw_score >= float(l["min"])), None)
             inputs = [_input_of(str(d["input"]), values_by_name[str(d["name"])], state, ctx, tctx)
                       for d in dimensions]
             metrics.append({
@@ -145,10 +158,14 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "rendered": _rendered(value, definition, display),
                 "inputs": inputs,
                 "substituted": "加权评分",
-                "recompute_ok": True,
+                "recompute_ok": None,
+                "recompute_reason": "这个指标不按表达式复算",
                 "status": "ok" if value is not None else "missing_input",
                 "assessment": {"score": value, "level": level, "dimensions": details,
-                               "levels": assessment["levels"], **({"missing": missing} if missing else {})},
+                               "levels": assessment["levels"],
+                               **({"missing": missing} if missing else {}),
+                               **({"out_of_range": out_of_range} if out_of_range else {}),
+                               **({"unlevelled": True} if value is not None and level is None else {})},
             })
             continue
         if str(definition.get("kind") or "formula") == "rule":
@@ -179,7 +196,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "rendered": _rendered(value, definition, display),
                 "inputs": inputs,
                 "substituted": _rule_text(rule),
-                "recompute_ok": True,
+                "recompute_ok": None,
+                "recompute_reason": "这个指标不按表达式复算",
                 "status": "ok" if value is not None else "missing_input",
                 "rule": rule,
             })
@@ -202,7 +220,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "rendered": _rendered(value, definition, display),
                 "inputs": [],
                 "substituted": str(value),
-                "recompute_ok": True,
+                "recompute_ok": None,
+                "recompute_reason": "这个指标不按表达式复算",
                 "status": "ok",
                 "external": external,
             })
@@ -605,10 +624,18 @@ def _rule_matches(values: dict[str, Any], rule: dict[str, Any]) -> bool:
                 return False
             continue
         b = cond.get("value")
-        try:
-            ok = {"eq": a == b, "ne": a != b, "gt": a > b, "gte": a >= b, "lt": a < b, "lte": a <= b}.get(op, False)
-        except TypeError:
-            ok = False
+        # 类型对不上（字符串和数）按条件不成立，不静默走 ne；大小比较只对数
+        if op in ("eq", "ne"):
+            comparable = (isinstance(a, (int, float)) and not isinstance(a, bool)
+                          and isinstance(b, (int, float)) and not isinstance(b, bool)) or type(a) is type(b)
+            if not comparable:
+                return False
+            equals = a == b
+            ok = equals if op == "eq" else not equals
+        else:
+            if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (a, b)):
+                return False
+            ok = {"gt": a > b, "gte": a >= b, "lt": a < b, "lte": a <= b}.get(op, False)
         if not ok:
             return False
     return True

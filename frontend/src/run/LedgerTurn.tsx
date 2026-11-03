@@ -21,8 +21,8 @@ import { ReconcileDialog, ReconcileResults } from './LedgerReconcile'
  * 能不能自动、不能的原因都是服务端给的；摘要只是把主报告里服务端标好的数按标签数一数、写出是哪份口径。
  */
 
-/** 摘要认的四种标签。服务端不给别的标签（分析结论的数不和口径比对，00-总方案 D11），以后多了也不计、不出 NaN */
-const COUNTED_KINDS = ['caliber', 'related', 'reasoning', 'unknown'] as const
+/** 摘要认的标签。分析结论的数不和口径比对（00-总方案 D11），但外部常量、规则派生、评估值要照实计数 */
+const COUNTED_KINDS = ['caliber', 'external', 'derived', 'assessed', 'related', 'reasoning', 'unknown'] as const
 type CountedKind = (typeof COUNTED_KINDS)[number]
 const counted = (kind: unknown): kind is CountedKind => (COUNTED_KINDS as readonly unknown[]).includes(kind)
 
@@ -33,7 +33,9 @@ const counted = (kind: unknown): kind is CountedKind => (COUNTED_KINDS as readon
 function summaryOf(data: RunLedger) {
   const labels = Object.values((data.primary ? data.reports?.[data.primary]?.labels : undefined) ?? {})
     .filter((l) => !!l && typeof l === 'object' && counted(l.kind))
-  const counts: Record<CountedKind, number> = { caliber: 0, related: 0, reasoning: 0, unknown: 0 }
+  const counts: Record<CountedKind, number> = {
+    caliber: 0, external: 0, derived: 0, assessed: 0, related: 0, reasoning: 0, unknown: 0,
+  }
   const calibers: string[] = []
   for (const l of labels) {
     counts[l.kind as CountedKind] += 1

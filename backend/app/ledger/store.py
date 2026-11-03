@@ -34,7 +34,8 @@ FORMAT = "agentlab.caliber_match/1"
 #: 3：整条比不等价时按报告引用的列投影再比（ledger/match 的 _projected），候选记 projection；没投影的照旧
 #: 4：按全部引用列投影仍没证明的查询，被引用的每一列逐格各比一次（queries[].cells、one_row），每个数按它那一格标；老工件
 #: 没有 cells，照旧按整条查询读
-ALGO = "4"
+#: 5：候选记定义指纹（caliber_hash / definition_hashes），标签新增 external / derived / assessed；老工件没有这些键照旧读
+ALGO = "5"
 #: 触发方式（见模块说明）。certified（第 3 波）：从问数据固化出的口径发布之后，对来源运行补比的（ledger/certify）
 TRIGGERS = ("sealed", "backfill", "on_demand", "certified")
 

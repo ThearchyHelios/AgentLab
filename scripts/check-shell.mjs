@@ -147,11 +147,11 @@ await section('导航', '=== 导航 ===', async () => {
   const labels = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').allInnerTexts()
   // 定时任务是后加的，排在设置前面；设置留在最底下，快捷键还是 ⌥7（定时任务用 ⌥8）。应用（⌥9）排在编排后面。
   // 评测（next-round 评测-D8，搭建者以上）也排在设置前面，用最后一个空着的 ⌥0
-  check('导航十项：问数据、编排、应用、记录、数据、工具、知识、定时任务、评测、设置',
-    labels.join(',') === '问数据,编排,应用,记录,数据,工具,知识,定时任务,评测,设置', labels.join(','))
+  check('导航十一项：问数据、编排、应用、记录、数据、工具、知识、定时任务、评测、口径、设置',
+    labels.join(',') === '问数据,编排,应用,记录,数据,工具,知识,定时任务,评测,口径,设置', labels.join(','))
   const keys = await nav(page).locator('li > a[aria-keyshortcuts]').evaluateAll((els) => els.map((el) => el.getAttribute('aria-keyshortcuts')))
-  check('原有快捷键都没动：问数据 ⌥1、编排 ⌥2、记录 ⌥3 … 设置 ⌥7、定时任务 ⌥8；应用是 ⌥9、评测是 ⌥0',
-    keys.join(',') === 'Alt+1,Alt+2,Alt+9,Alt+3,Alt+4,Alt+5,Alt+6,Alt+8,Alt+0,Alt+7', keys.join(','))
+  check('原有快捷键都没动：问数据 ⌥1、编排 ⌥2、记录 ⌥3 … 设置 ⌥7、定时任务 ⌥8；应用是 ⌥9、评测是 ⌥0；口径是 ⌥L',
+    keys.join(',') === 'Alt+1,Alt+2,Alt+9,Alt+3,Alt+4,Alt+5,Alt+6,Alt+8,Alt+0,Alt+L,Alt+7', keys.join(','))
   const fontSize = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').first()
     .evaluate((el) => getComputedStyle(el).fontSize)
   check('导航标签 11px', fontSize === '11px', fontSize)

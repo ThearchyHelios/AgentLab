@@ -42,8 +42,10 @@ async def test_trial_runs_the_pinned_caliber_and_returns_its_metrics(client):
     assert body["metrics"][0]["unit"] == "元"
     async with SessionLocal() as session:
         run = await session.get(Run, body["run_id"])
-    assert run is not None and run.origin_kind == "trial" and run.run_class == "exploratory"
+    assert run is not None and run.origin_kind == "caliber_trial" and run.run_class == "exploratory"
     assert run.origin["kind"] == "caliber_trial" and run.origin["workflow_id"] == wf
+    # 试运行不是问数回答：不参与账本比对、不计入使用统计/召回
+    assert not ledger_match.wanted(run.run_class, run.origin_kind)
 
 
 async def test_trial_refuses_missing_required_inputs_and_unknown_fields(client):

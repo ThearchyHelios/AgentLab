@@ -264,7 +264,7 @@ async def test_last_weeks_sales_labels_only_the_sales_number_as_from_the_caliber
     row = await S.explore(monkeypatch, ANSWER, origin="chat", text=(
         "上周销售额 [[v:Q1.r0.销售额]] 元，共 [[v:Q1.r0.订单数]] 单（[[v:Q1.r0.区间首日]] 至 [[v:Q1.r0.区间末日]]）。"))
     content = (await store.latest(row.id)).content
-    assert content["algo"] == store.ALGO == "4"
+    assert content["algo"] == store.ALGO == "5"
     [query] = content["queries"]
     assert query["status"] == "related" and set(query["cells"]) == set(COLUMNS)
     [labels] = [r["labels"] for r in content["reports"].values()]

@@ -117,3 +117,17 @@ async def test_metric_definition_and_params_are_described(client):
     [m] = made["metrics"]
     assert m["definition"]["text"] == "已支付订单的销售额" and m["definition"]["owner"] == "运营"
     assert m["params"] == [{"name": "store", "type": "string", "default": "all"}]
+
+
+async def test_an_external_only_card_is_not_promised_automatic_issuance(client):
+    graph = S.chain(
+        S.node("start", "input"),
+        S.node("card", "metrics", caliber="年度目标", caliber_version="v1", metrics=[{
+            "id": "target", "name": "年度目标", "unit": "元", "kind": "external",
+            "external": {"value": 100, "source": "预算", "as_of": "2026-01-01"}}]),
+        S.node("out", "output", fields=[{"name": "v", "value": "{{ nodes.card.metrics[0].value }}"}]))
+    wf = await S.publish(name="只有外部常量", graph=graph)
+    [made] = await descriptors(client, wf)
+    assert made["composable"] is True
+    assert made["issuance"]["auto_issue"] is False
+    assert any("没有取数节点" in r for r in made["issuance"]["reasons"])

@@ -77,6 +77,17 @@ async def _describe(session: AsyncSession, workflow: Workflow, row: Any, node_id
     cfg = card["config"]
     level = str(row.level or "")
     _, reason = card_inputs(graph, node_id)
+    if reason is None:
+        from app.ledger.derive import template_problem
+
+        for nid, node in nodes.items():
+            tool = str((node.get("config") or {}).get("tool") or "")
+            sql = ((node.get("config") or {}).get("args") or {}).get("sql") \
+                if isinstance((node.get("config") or {}).get("args"), dict) else None
+            if node.get("type") == "tool" and tool.startswith(QUERY_PREFIX) and isinstance(sql, str) and sql.strip():
+                if problem := template_problem(str(nid), node.get("config") or {}):
+                    reason = problem
+                    break
     key = (workflow.id, int(row.version))
     if key not in side_cache:
         side_cache[key] = await graph_side_effect(session, graph, level=level or None)
@@ -86,7 +97,9 @@ async def _describe(session: AsyncSession, workflow: Workflow, row: Any, node_id
     if level != "governed":
         reasons.append("这一版是已发布级别，只支持一键出具")
     if side_effect is not None:
-        reasons.append(f"这一版{side_effect}，不能替人重跑")
+        reasons.append(f"这一版{side_effect}，不能替人再次执行")
+    if not sources:
+        reasons.append("这一版没有取数节点，账本不能按口径证明等价")
     return {
         "workflow_id": workflow.id,
         "workflow_name": workflow.name,
@@ -103,7 +116,7 @@ async def _describe(session: AsyncSession, workflow: Workflow, row: Any, node_id
         "compose_reason": reason,
         "dependencies": {"sources": sorted(sources), "tables": sorted(tables),
                          "catalog_versions": row.catalog_versions, "schema_versions": row.schema_versions},
-        "issuance": {"level": level, "auto_issue": level == "governed" and side_effect is None,
+        "issuance": {"level": level, "auto_issue": level == "governed" and side_effect is None and bool(sources),
                      "requires_independent_proof": True, "side_effects": side_effect, "reasons": reasons},
     }
 

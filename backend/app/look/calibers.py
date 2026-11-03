@@ -106,31 +106,57 @@ def card_inputs(graph: dict[str, Any], card_id: str) -> tuple[list[dict[str, Any
         return [], CHAINED_REASON
     found: dict[str, dict[str, Any]] = {}
     for metric in card["config"].get("metrics") or []:
-        try:
-            tree = parse_expression(str((metric or {}).get("expression") or ""))[0]
-        except ExpressionError:
+        paths = _metric_paths(metric)
+        if paths is None:
             return [], NOT_TOOL_REASON
-        for path in leaf_refs(tree):
-            parts = cell_parts(path)
-            if parts is None:
-                return [], NOT_TOOL_REASON
-            chain, row, column = parts
-            node_id = chain[len("nodes."):] if chain.startswith("nodes.") else ""
-            tool = str((nodes.get(node_id) or {}).get("config", {}).get("tool") or "")
-            if (nodes.get(node_id) or {}).get("type") != "tool" or not tool.startswith(QUERY_PREFIX):
-                return [], NOT_TOOL_REASON
-            if row.strip() != "0":
-                return [], ROW_REASON
+        for path in paths:
             try:
-                col = json.loads(column.replace("'", '"')) if column[:1] in ("'", '"') else None
-            except ValueError:
-                col = None
-            if not isinstance(col, str):
+                tree = parse_expression(path)[0]
+            except ExpressionError:
                 return [], NOT_TOOL_REASON
-            entry = found.setdefault(node_id, {"node": node_id, "tool": tool, "columns": []})
-            if col not in entry["columns"]:
-                entry["columns"].append(col)
+            for leaf in leaf_refs(tree):
+                parts = cell_parts(leaf)
+                if parts is None:
+                    return [], NOT_TOOL_REASON
+                chain, row, column = parts
+                node_id = chain[len("nodes."):] if chain.startswith("nodes.") else ""
+                tool = str((nodes.get(node_id) or {}).get("config", {}).get("tool") or "")
+                if (nodes.get(node_id) or {}).get("type") != "tool" or not tool.startswith(QUERY_PREFIX):
+                    return [], NOT_TOOL_REASON
+                if row.strip() != "0":
+                    return [], ROW_REASON
+                try:
+                    col = json.loads(column.replace("'", '"')) if column[:1] in ("'", '"') else None
+                except ValueError:
+                    col = None
+                if not isinstance(col, str):
+                    return [], NOT_TOOL_REASON
+                entry = found.setdefault(node_id, {"node": node_id, "tool": tool, "columns": []})
+                if col not in entry["columns"]:
+                    entry["columns"].append(col)
     return list(found.values()), None
+
+
+def _metric_paths(metric: Any) -> list[str] | None:
+    """一个指标读的取值路径：公式的表达式、规则各输入、评估各维度。外部常量没有输入。认不出为 None。"""
+    if not isinstance(metric, dict):
+        return None
+    paths: list[str] = []
+    if metric.get("expression"):
+        paths.append(str(metric["expression"]))
+    rule = metric.get("rule")
+    if isinstance(rule, dict):
+        inputs = rule.get("inputs")
+        if not isinstance(inputs, dict):
+            return None
+        paths.extend(str(path) for path in inputs.values())
+    assessment = metric.get("assessment")
+    if isinstance(assessment, dict):
+        dimensions = assessment.get("dimensions")
+        if not isinstance(dimensions, list):
+            return None
+        paths.extend(str(d.get("input")) for d in dimensions if isinstance(d, dict) and d.get("input"))
+    return paths
 
 
 def views_of(workflow_id: str, workflow_name: str, version: Any) -> list[CaliberView]:

@@ -153,12 +153,16 @@ export const LEDGER_UI = {
     pending: '正在比对口径…',
     timeout: '比对口径还没有结果',
     /** 一行摘要：几个数来自哪份口径、几个是这次的推理、几个没有比对 */
-    summary: (parts: { caliber: number; calibers: string[]; reasoning: number; related: number; unknown: number }) => {
+    summary: (parts: { caliber: number; calibers: string[]; reasoning: number; related: number; unknown: number;
+      external?: number; derived?: number; assessed?: number }) => {
       const out: string[] = []
       if (parts.caliber) {
         out.push(parts.calibers.length === 1 ? `${formatNumber(parts.caliber)} 个数来自口径${parts.calibers[0]}`
           : `${formatNumber(parts.caliber)} 个数来自 ${formatNumber(parts.calibers.length)} 份口径`)
       }
+      if (parts.external) out.push(`${formatNumber(parts.external)} 个数是外部常量`)
+      if (parts.derived) out.push(`${formatNumber(parts.derived)} 个数是规则派生`)
+      if (parts.assessed) out.push(`${formatNumber(parts.assessed)} 个数是评估值`)
       const reasoning = parts.reasoning + parts.related
       if (reasoning) {
         out.push(`${formatNumber(reasoning)} 个数是这次的推理${parts.related ? `（其中 ${formatNumber(parts.related)} 个有相关口径）` : ''}`)

@@ -364,7 +364,7 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
           <p className="text-2xs text-dim">
             数由规则从查询结果算出，不是某条查询与口径等价；输入仍然逐格可追溯。
           </p>
-          {label.rule?.all?.length ? <p className="text-2xs text-faint">条件：{label.rule.all.length} 条</p> : null}
+          {label.rule?.conditions ? <p className="text-2xs text-faint">条件：{label.rule.conditions} 条</p> : null}
         </div>
       )}
       {label.kind === 'assessed' && (

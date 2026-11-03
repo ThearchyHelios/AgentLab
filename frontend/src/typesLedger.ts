@@ -58,8 +58,13 @@ export interface LedgerLabel {
   source?: string
   as_of?: string
   stale?: boolean
-  rule?: { inputs?: Record<string, string>; all?: unknown[]; then?: number; else?: number }
-  assessment?: { score?: number | null; level?: string | null; dimensions?: unknown[]; levels?: unknown[] }
+  rule?: { inputs?: string[]; conditions?: number; then?: number; else?: number }
+  assessment?: {
+    score?: number | null
+    level?: string | null
+    dimensions?: { name?: string; weight?: number }[]
+    levels?: { name?: string; min?: number }[]
+  }
   caliber?: string
   workflow_id?: string
   version?: number
@@ -385,7 +390,7 @@ export interface CaliberMetric {
   unit?: string
   decimals?: number
   format?: string
-  /** 公式（formula）；规则、评估、外部常量还没实现 */
+  /** 公式（formula）、外部常量（external）、单元格条件规则（rule）、评估（assessment） */
   kind?: string
   /** 定义卡：文字定义、范围、排除项、负责人、生效日期、引用 */
   definition?: { text?: string; scope?: string; exclusions?: string[]; owner?: string; effective_from?: string; citations?: unknown[] }
