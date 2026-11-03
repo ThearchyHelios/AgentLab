@@ -155,7 +155,8 @@ async def test_old_graphs_without_the_mapping_are_unchanged():
     card = artifact_store.load(entry["artifact"])
     assert card["source"] == pinned and entry["source"] == pinned
     assert [m["expression"] for m in card["metrics"]] == ["cell(nodes.fetch,0,'gmv')"]
-    assert set(card) == {"kind", "caliber", "caliber_version", "metrics", "source"}
+    assert set(card) == {"kind", "caliber", "caliber_version", "definition_hash", "metrics", "source"}
+    assert card["definition_hash"]
 
 
 async def test_a_malformed_mapping_is_refused_before_running():
