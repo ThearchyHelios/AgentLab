@@ -29,6 +29,9 @@ metrics_from（有多行结果的另加 cells: true），过 validate_graph。�
 [{run_id, conversation_id, turn_id, question}]，这就是「口径 → 来源问题」的记录。之后由人在画布上审改、按受管级别发布——
 提取器是作者，不是发布者。
 
+「从查询快照建图」那一段单独成 build_graph：以后从业务文档提炼口径时，文档只供定义，取数路径仍要来自一次真实运行，两边
+共用同一个建图入口，草稿图的样子（节点 id、顺序、报告配置、出口契约、指标）才不会分叉。
+
 **发布之后补比**（after_publish）：工作流发布时，origin.sources 里的来源运行在后台按现在的口径补比一次（trigger=certified，
 标「按之后发布的口径回看」），E1 也就有了回溯数据。
 """
@@ -37,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -486,6 +489,82 @@ async def _labels(session: Any, snap: dict[str, Any], source: str) -> Any:
     return _labeler(names)
 
 
+async def build_graph(*, shapes: Sequence[Shape], snaps: Sequence[dict[str, Any]], kinds: dict[str, str | None],
+                      labels: Callable[[dict[str, Any], str], Awaitable[Any]], name: str, question: str,
+                      report_cfg_extra: dict[str, Any] | None = None,
+                      peers: dict[tuple[str, str], Sequence[Sequence[str]]] | None = None,
+                      ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """查询形状 + 快照 → (草稿图, 入口字段, 口径卡指标, 有没有多行结果)。freeze 用它建工作流的图；从业务文档提炼口径
+    时也用它，但那时只取定义，图不落 workflows.graph（path_pending 不是合法的图，见 docs/design 的做法 L9）。
+
+    labels 是异步回调：结果列的中文名要查数据目录，查目录要 session，而 session 不是建图的输入。report_cfg_extra 是建图
+    之外才知道的报告配置（代表运行里报告节点的 provider / model / entities），先合进来，键序和原来一致。peers 是同形状别的
+    运行的字面量（按规范形先后），只用来认哪些位置跨轮变了——这一信息只有调用方手里有，不能从单次快照推出来。
+    """
+    from app.engine.governance import REPORT_POLICY
+    from app.engine.layout import auto_layout
+    from app.engine.schema import GraphSpec
+    from app.tools.datasource import QUERY_PREFIX
+
+    peer_literals = peers or {}
+
+    def nid(i: int) -> str:
+        return "fetch" if len(shapes) == 1 else f"fetch_{i + 1}"
+
+    nodes: list[dict[str, Any]] = []
+    fields: list[dict[str, Any]] = []
+    metrics: list[dict[str, Any]] = []
+    multi = False
+    for i, (shape, snap) in enumerate(zip(shapes, snaps)):
+        params = shape.params(varying([shape.canonical, *peer_literals.get((shape.source, shape.key), [])]))
+        template, new_fields = template_of(shape, params, kinds.get(shape.source), start=len(fields) + 1)
+        fields += new_fields
+        nodes.append({"id": nid(i), "type": "tool", "position": {"x": 0, "y": 0},
+                      "data": {"label": f"取数 {i + 1}" if len(shapes) > 1 else "取数",
+                               "config": {"tool": f"{QUERY_PREFIX}{shape.source}", "args": {"sql": template}}}})
+        rows = snap.get("rows") if isinstance(snap.get("rows"), list) else []
+        columns = [str(c) for c in snap.get("columns") or []]
+        if len(rows) == 1 and isinstance(rows[0], (list, tuple)):
+            label = await labels(snap, shape.source)
+            for col, value in zip(columns, rows[0]):
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    metrics.append({"id": f"m{len(metrics) + 1}", "name": label((None, col)) or col,
+                                    "expression": f"cell(nodes.{nid(i)}, 0, {col!r})"})
+        else:
+            multi = True
+    report_cfg: dict[str, Any] = dict(report_cfg_extra or {})
+    if fields:
+        report_cfg["instructions"] = REPORT_INSTRUCTIONS_PARAMS.format(
+            params="，".join(f"{f['name']} = {{{{ input.{f['name']} }}}}" for f in fields))
+    else:
+        # 没有入口参数：取数的字面量都是口径的常量，问题原文里的日期和它们对得上
+        report_cfg["instructions"] = REPORT_INSTRUCTIONS.format(question=question or "（问题）")
+    # 报告的核对规则一律按受管级别的要求写（engine/governance.REPORT_POLICY，和发布门禁同一份）：草稿要能按受管发布
+    report_cfg.update({key: value for key, value, _ in REPORT_POLICY})
+    contract: dict[str, Any] = {"report_from": "write"}
+    tail: list[dict[str, Any]] = []
+    if metrics:
+        tail.append({"id": "card", "type": "metrics", "position": {"x": 0, "y": 0},
+                     "data": {"label": "口径卡", "config": {"caliber": (name.strip() or question or "口径")[:40],
+                                                         "caliber_version": "v1", "metrics": metrics}}})
+        report_cfg["metrics_from"] = ["card"]
+        # 受管出具要写必需指标（不然「不予出具」这一档触发不了）：固化出的每个指标都是这个口径要给的数
+        contract.update({"metrics_from": "card", "required": [m["id"] for m in metrics]})
+    if multi or not metrics:
+        contract["cells"] = True
+    chain = [{"id": "start", "type": "input", "position": {"x": 0, "y": 0},
+              "data": {"label": "入口", "config": {"fields": fields}}},
+             *nodes, *tail,
+             {"id": "write", "type": "report", "position": {"x": 0, "y": 0},
+              "data": {"label": "报告", "config": report_cfg}},
+             {"id": "out", "type": "output", "position": {"x": 0, "y": 0},
+              "data": {"label": "出口", "config": {"fields": [{"name": "报告", "value": "{{ nodes.write.text }}"}],
+                                                  "contract": contract}}}]
+    edges = [{"source": a["id"], "target": b["id"]} for a, b in zip(chain, chain[1:])]
+    graph = auto_layout(GraphSpec.model_validate({"nodes": chain, "edges": edges})).model_dump(mode="json")
+    return graph, fields, metrics, multi
+
+
 async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: str = "",
                  conversation_id: str | None = None, turn_id: str | None = None) -> dict[str, Any]:
     """把一次问数据运行固化成口径草稿（见模块说明），落库成新的草稿工作流，返回 {workflow_id, name, nodes, edges, params,
@@ -494,11 +573,7 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
     from app.api.evidence import _reports, _sealed
     from app.core.artifact_store import graph_hash, load
     from app.db.models import DataSource, Workflow, WorkflowVersion
-    from app.engine.governance import REPORT_POLICY
-    from app.engine.layout import auto_layout
-    from app.engine.schema import GraphSpec
     from app.ledger import store
-    from app.tools.datasource import QUERY_PREFIX
 
     run = await session.get(Run, run_id)
     principal = current_principal()
@@ -544,66 +619,16 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
         shapes.append(shape)
         snaps.append(snap)
 
-    def nid(i: int) -> str:
-        return "fetch" if len(shapes) == 1 else f"fetch_{i + 1}"
-
-    nodes: list[dict[str, Any]] = []
-    fields: list[dict[str, Any]] = []
-    metrics: list[dict[str, Any]] = []
-    multi = False
-    for i, (shape, snap) in enumerate(zip(shapes, snaps)):
-        params = shape.params(varying([shape.canonical, *peer_literals.get((shape.source, shape.key), [])]))
-        template, new_fields = template_of(shape, params, kinds.get(shape.source), start=len(fields) + 1)
-        fields += new_fields
-        nodes.append({"id": nid(i), "type": "tool", "position": {"x": 0, "y": 0},
-                      "data": {"label": f"取数 {i + 1}" if len(shapes) > 1 else "取数",
-                               "config": {"tool": f"{QUERY_PREFIX}{shape.source}", "args": {"sql": template}}}})
-        rows = snap.get("rows") if isinstance(snap.get("rows"), list) else []
-        columns = [str(c) for c in snap.get("columns") or []]
-        if len(rows) == 1 and isinstance(rows[0], (list, tuple)):
-            label = await _labels(session, snap, shape.source)
-            for col, value in zip(columns, rows[0]):
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    metrics.append({"id": f"m{len(metrics) + 1}", "name": label((None, col)) or col,
-                                    "expression": f"cell(nodes.{nid(i)}, 0, {col!r})"})
-        else:
-            multi = True
     question = ((await _turns(session, [run])).get(run.id) or {}).get("question") or ""
     reports = _reports(sealed)
-    report_cfg: dict[str, Any] = {}
+    report_cfg_extra: dict[str, Any] = {}
     if reports:
         found = next((n for n in (run.graph or {}).get("nodes") or [] if n.get("id") == reports[0].node_id), None)
         cfg = ((found or {}).get("data") or {}).get("config") or {}
-        report_cfg = {k: cfg[k] for k in ("provider", "model", "entities") if k in cfg}
-    if fields:
-        report_cfg["instructions"] = REPORT_INSTRUCTIONS_PARAMS.format(
-            params="，".join(f"{f['name']} = {{{{ input.{f['name']} }}}}" for f in fields))
-    else:
-        # 没有入口参数：取数的字面量都是口径的常量，问题原文里的日期和它们对得上
-        report_cfg["instructions"] = REPORT_INSTRUCTIONS.format(question=question or "（问题）")
-    # 报告的核对规则一律按受管级别的要求写（engine/governance.REPORT_POLICY，和发布门禁同一份）：草稿要能按受管发布
-    report_cfg.update({key: value for key, value, _ in REPORT_POLICY})
-    contract: dict[str, Any] = {"report_from": "write"}
-    tail: list[dict[str, Any]] = []
-    if metrics:
-        tail.append({"id": "card", "type": "metrics", "position": {"x": 0, "y": 0},
-                     "data": {"label": "口径卡", "config": {"caliber": (name.strip() or question or "口径")[:40],
-                                                         "caliber_version": "v1", "metrics": metrics}}})
-        report_cfg["metrics_from"] = ["card"]
-        # 受管出具要写必需指标（不然「不予出具」这一档触发不了）：固化出的每个指标都是这个口径要给的数
-        contract.update({"metrics_from": "card", "required": [m["id"] for m in metrics]})
-    if multi or not metrics:
-        contract["cells"] = True
-    chain = [{"id": "start", "type": "input", "position": {"x": 0, "y": 0},
-              "data": {"label": "入口", "config": {"fields": fields}}},
-             *nodes, *tail,
-             {"id": "write", "type": "report", "position": {"x": 0, "y": 0},
-              "data": {"label": "报告", "config": report_cfg}},
-             {"id": "out", "type": "output", "position": {"x": 0, "y": 0},
-              "data": {"label": "出口", "config": {"fields": [{"name": "报告", "value": "{{ nodes.write.text }}"}],
-                                                  "contract": contract}}}]
-    edges = [{"source": a["id"], "target": b["id"]} for a, b in zip(chain, chain[1:])]
-    graph = auto_layout(GraphSpec.model_validate({"nodes": chain, "edges": edges})).model_dump(mode="json")
+        report_cfg_extra = {k: cfg[k] for k in ("provider", "model", "entities") if k in cfg}
+    graph, fields, metrics, _ = await build_graph(
+        shapes=shapes, snaps=snaps, kinds=kinds, labels=lambda snap, source: _labels(session, snap, source),
+        name=name, question=question, report_cfg_extra=report_cfg_extra, peers=peer_literals)
 
     info = (await _turns(session, [run])).get(run.id) or {}
     sources = [{"run_id": run.id, "conversation_id": conversation_id or info.get("conversation_id"),
@@ -623,7 +648,8 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
     session.add(WorkflowVersion(workflow_id=workflow.id, version=1, graph=graph, graph_hash=graph_hash(graph),
                                 note=f"从运行 {run.id} 固化"))
     await session.commit()
-    return {"workflow_id": workflow.id, "name": workflow.name, "nodes": len(chain), "edges": len(edges),
+    return {"workflow_id": workflow.id, "name": workflow.name, "nodes": len(graph["nodes"]),
+            "edges": len(graph["edges"]),
             "dropped_nodes": 0, "source_run": run.id, "frozen": True, "params": [f["name"] for f in fields],
             "metrics": [m["id"] for m in metrics], "sources": sources}
 
@@ -653,4 +679,5 @@ def after_publish(workflow_id: str, origin: Any) -> int:
 
 
 __all__ = ["DISMISS_ACTION", "KINDS", "REPEAT_CONVERSATIONS", "REPEAT_RUNS", "CertifyRefused", "Shape", "after_publish",
-           "dismiss", "freeze", "item_id", "queue", "referenced_queries", "shape_of", "template_of", "varying"]
+           "build_graph", "dismiss", "freeze", "item_id", "queue", "referenced_queries", "shape_of", "template_of",
+           "varying"]
