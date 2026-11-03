@@ -227,12 +227,13 @@ export const LEDGER_UI = {
   drafts: {
     entry: '从业务文档起草',
     title: '从业务文档起草口径',
-    subtitle: '文档里写的是业务说法，这里整理成定义草稿；取数路径接上一次真实运行',
+    subtitle: '文档整理成定义和取数，自动试运行一次；去画布审改后由人签字发布',
     back: '返回口径目录',
     refresh: '刷新',
-    /** 列表按状态筛：全部加五种落点，起草中的只出现在全部里 */
+    /** 列表按状态筛：全部加六种落点，起草中的只出现在全部里 */
     filter: {
       all: '全部',
+      ready: '待签字发布',
       questions_open: '待确认问题',
       path_pending: '待接数据路径',
       attached: '已接上',
@@ -241,6 +242,7 @@ export const LEDGER_UI = {
     } as Record<string, string>,
     status: {
       drafting: '起草中',
+      ready: '待签字发布',
       questions_open: '待确认问题',
       path_pending: '待接数据路径',
       attached: '已接上',
@@ -252,7 +254,7 @@ export const LEDGER_UI = {
       questions ? `${formatNumber(questions)} 个未决问题` : '没有未决问题'}`,
     loadFailed: '无法读取口径草稿',
     empty: '还没有口径草稿',
-    emptyBody: '选一份业务文档，把里面的指标整理成定义草稿',
+    emptyBody: '选一份业务文档，把里面的指标整理成定义和取数草稿',
     emptyFiltered: '这个状态下没有草稿，换个状态看看',
 
     // ---- 发起：选文档、可选数据源和起草要求 ----
@@ -262,21 +264,31 @@ export const LEDGER_UI = {
     noDocuments: '知识库里还没有已完成的文档',
     noDocumentsBody: '先在知识页上传业务文档，切块完成后再来起草',
     documentMeta: (collection: string, chunks: number) => `${collection} · ${formatNumber(chunks)} 段`,
-    datasource: '数据源（可选）',
-    datasourceHint: '只写进适用范围，不读表结构',
-    datasourceNone: '不指定',
+    datasource: '数据源（必选）',
+    datasourceHint: '取数 SQL 对照这个库的真实表和列写，先探查过表结构才能起草',
     guidance: '起草要求（可选）',
     guidancePlaceholder: '例如：只整理和月度结算有关的指标',
     submit: '开始起草',
     submitting: '正在发起…',
     needDoc: '请至少选一份文档',
-    started: '已开始起草，完成后指标会出现在下面',
+    started: '已开始起草，完成并试运行后指标和数会出现在下面',
 
     // ---- 抽取中 ----
     drafting: '正在抽取指标…',
-    draftingHint: '模型在后台读文档、核对引用，通常不到一分钟；离开页面不影响结果',
+    draftingHint: '模型在后台读文档、对照数据目录写定义和取数，通常不到一分钟；离开页面不影响结果',
     draftingTimeout: '起草超过一分钟还没有结果：稍后刷新再看；失败原因会写在这份草稿上',
     draftingFailed: '起草没有完成',
+
+    // ---- 自动试运行 ----
+    trial: '自动试运行',
+    trialHint: '发起时按草稿图只读运行一次，只用来看数和定义对不对得上',
+    trialRunning: '正在试运行…',
+    trialSucceeded: '试运行已完成',
+    trialFailed: '试运行没有成功',
+    trialTimeout: '试运行超过一分钟还没有结果：稍后刷新再看',
+    trialNoMetrics: '这次试运行没有产出指标值',
+    trialUnavailable: '暂时无法读取试运行状态',
+    trialRun: '看这次运行',
 
     // ---- 详情 ----
     documentsUsed: (n: number) => `${formatNumber(n)} 份文档`,
@@ -286,6 +298,9 @@ export const LEDGER_UI = {
     noMetricsBody: '文档里没有能逐字核对上引用的指标定义，可以换一份文档或补充起草要求后重来',
     synonyms: (list: string) => `又称：${list}`,
     unit: '单位',
+    decimals: '小数位',
+    expression: '表达式',
+    definition: '定义',
     grain: '粒度',
     timeField: '时间字段',
     dimensions: '维度',
@@ -306,7 +321,7 @@ export const LEDGER_UI = {
     resolveNeed: '请先勾选已经问清的问题',
     resolved: (n: number) => `已移除 ${formatNumber(n)} 个问题`,
     dropped: '被丢弃的条目',
-    droppedHint: '只产出定义：带 SQL、表名痕迹，或引用无法逐字核对上的指标不留下',
+    droppedHint: '带不了能对照数据目录的取数，或引用无法逐字核对上的指标不留下',
     alignment: '和已发布口径对齐',
     alignmentNew: '新的',
     alignmentDuplicate: '已有出处',
@@ -314,9 +329,20 @@ export const LEDGER_UI = {
     model: (id: string) => `起草模型：${id}`,
     createdBy: (who: string) => `起草人：${who}`,
 
-    // ---- 接上一次运行 ----
-    attach: '接上一次真实运行',
-    attachHint: '取数路径照抄这次运行里执行过的查询，文档只贡献定义；接上后产出可试运行的工作流版本，不发布',
+    // ---- 入口字段与发布 ----
+    entryFields: '入口字段',
+    entryFieldsHint: '发布后按这些字段收参数；缺省值可以不填',
+    entryFieldNone: '这份草稿的图没有入口字段',
+    required: '必填',
+    optional: '可选',
+    defaultValue: (value: string) => `缺省 ${value}`,
+    publish: '去画布审改并发布',
+    publishHint: '在画布上核对图、改完再发布；发布这一步由人签字',
+    workflowVersion: (version: number) => `工作流 v${version}`,
+
+    // ---- 接上一次运行（辅助入口） ----
+    attach: '接上一次运行',
+    attachHint: '已经有一次运行得出的答案，让它认这份定义：取数照抄那次运行执行过的查询，不重新生成；接上后产出可试运行的工作流版本，不发布',
     runId: '运行 id',
     runIdPlaceholder: '粘贴运行记录里的 id',
     recentRuns: '最近成功的运行',

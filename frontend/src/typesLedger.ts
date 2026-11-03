@@ -441,15 +441,18 @@ export interface CaliberTrialOut {
 // ---------------------------------------------------------------- 从业务文档起草口径
 
 /**
- * 草稿的状态（app/ledger/docdraft.STATUSES）：起草中 → 有待确认的问题 / 待接数据路径 → 已接上；
- * 另有已驳回。path_pending 不是合法图，取数路径只能来自一次真实运行。
+ * 草稿的状态（app/ledger/docdraft.STATUSES）：起草中 → 待确认问题 / 待接数据路径 / 待签字发布 → 已接上；
+ * 另有已驳回。ready 表示图已经生成、没有未决问题，可以试运行、可以签字发布；questions_open 也有图和数，
+ * 只是还没清完问题，不阻断试运行。path_pending 是旧路径：图还没生成，取数只能来自一次真实运行。
  */
-export type CaliberDraftStatus = 'drafting' | 'questions_open' | 'path_pending' | 'attached' | 'rejected' | 'failed'
+export type CaliberDraftStatus = 'drafting' | 'questions_open' | 'path_pending' | 'ready' | 'attached' | 'rejected' | 'failed'
 
-/** 一条引用：逐字原文、原文所在段落（chunk）、span 是原文里的 [start, end) */
+/** 一条引用：逐字原文、原文所在段落（chunk）、段号、span 是原文里的 [start, end) */
 export interface DraftCitation {
   chunk: string
   document_id?: string
+  /** 原文所在段落的段号（1 起） */
+  ordinal?: number
   quote: string
   span?: [number, number]
 }
@@ -464,11 +467,16 @@ export interface DraftDefinition {
   citations?: DraftCitation[]
 }
 
-/** 草稿里的一条指标：只有业务定义，不含 SQL、表名、列名 */
+/** 草稿里的一条指标：业务定义 + 取数表达式；SQL 在画布上看，这里不返回。 */
 export interface DraftMetric {
+  id?: string
   name: string
   synonyms?: string[]
   unit?: string
+  /** 小数位 */
+  decimals?: number
+  /** 指标表达式，形如 cell(nodes.fetch, 0, '列') */
+  expression?: string
   /** 粒度，如「日」「订单行」 */
   grain?: string
   /** 业务时间字段的业务叫法 */
@@ -479,6 +487,38 @@ export interface DraftMetric {
   dimensions?: string[]
   definition?: DraftDefinition
   open_questions?: string[]
+}
+
+/** 草稿图的入口字段：发布后按这些字段收参数 */
+export interface DraftEntryField {
+  name: string
+  type: string
+  required: boolean
+  default?: unknown
+  description?: string
+}
+
+/** 起草后自动发起的那次只读试运行（draft.payload.trial） */
+export interface DraftTrial {
+  run_id: string
+  status: 'running' | 'succeeded' | 'failed'
+  error?: string
+}
+
+/** GET /api/ledger/drafts/{id}/trial 的一条：name 和 rendered 一一对应 */
+export interface DraftTrialMetric {
+  id: string
+  name: string
+  value?: unknown
+  rendered?: string
+}
+
+/** GET /api/ledger/drafts/{id}/trial：这次自动试运行的状态和每个指标的值 */
+export interface DraftTrialOut {
+  run_id: string
+  status: 'running' | 'succeeded' | 'failed'
+  metrics: DraftTrialMetric[]
+  error?: string | null
 }
 
 /** 被丢弃的条目和原因（含 SQL 痕迹、引用核对不上） */
@@ -517,9 +557,15 @@ export interface CaliberDraftSummary {
 export interface CaliberDraft extends CaliberDraftSummary {
   documents?: DraftDocument[]
   metrics?: DraftMetric[]
+  /** 草稿图的入口字段 */
+  entry_fields?: DraftEntryField[]
   dropped?: DraftDropped[]
   open_questions?: string[]
   alignment?: DraftAlignment
+  /** 起草后自动发起的那次只读试运行；旧草稿可能没有 */
+  trial?: DraftTrial | null
+  /** 草稿图对应的版本号 */
+  version?: number | null
   /** 文档超过一次能发给模型的字数，后面的段落没有参与起草 */
   truncated?: boolean
   model_id?: string | null

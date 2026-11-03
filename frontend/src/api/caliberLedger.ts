@@ -13,7 +13,8 @@
  */
 import type {
   CaliberDescriptor, CaliberDraft, CaliberDraftAttachOut, CaliberDraftSummary, CaliberTrialOut, CertifyQueue, DraftMetric,
-  FreezeOut, LedgerFeedbackOut, LedgerFeedbackVerdict, LedgerIssueOut, LedgerReconcileIn, LedgerReconcileOut, RunLedger,
+  DraftTrialOut, FreezeOut, LedgerFeedbackOut, LedgerFeedbackVerdict, LedgerIssueOut, LedgerReconcileIn, LedgerReconcileOut,
+  RunLedger,
 } from '../typesLedger'
 import { get, patch, post, type RequestOptions } from './http'
 
@@ -48,19 +49,21 @@ export const caliberLedger = {
       { inputs },
     ),
   /**
-   * 从业务文档起草口径（app/ledger/docdraft.py，搭建者）：草稿只产出定义，不产出取数。发起后立刻返回 drafting，模型在后台跑，
-   * 结果用 draft() 反复取，直到状态离开 drafting
+   * 从业务文档起草口径（app/ledger/docdraft.py，搭建者）：发起后立刻返回 drafting，模型在后台读文档、对照数据目录
+   * 写定义和取数，落成草稿图并自动试运行；结果用 draft() 反复取，直到状态离开 drafting
    */
   drafts: (status?: string, opts?: RequestOptions) =>
     get<{ drafts: CaliberDraftSummary[] }>(`/ledger/drafts${status ? `?status=${encodeURIComponent(status)}` : ''}`, opts),
-  /** 一份草稿的完整内容：payload 摊平在上层（metrics / dropped / open_questions / alignment） */
+  /** 一份草稿的完整内容：payload 摊平在上层（metrics / entry_fields / dropped / open_questions / alignment / trial） */
   draft: (draftId: string, opts?: RequestOptions) => get<CaliberDraft>(draftAt(draftId), opts),
+  /** 起草后自动发起的那次只读试运行：状态和每个指标的值，running 时轮询到终态 */
+  draftTrial: (draftId: string, opts?: RequestOptions) => get<DraftTrialOut>(`${draftAt(draftId)}/trial`, opts),
   /** 选文档发起起草：documents 是要用的知识库文档 id，guidance 是给模型看的附加要求 */
   extractDraft: (body: { documents: string[]; collection?: string; datasource_id?: string; guidance?: string }) =>
     post<{ draft_id: string; status: string }>('/ledger/drafts/extract', body),
   /**
    * 改标题、整体换掉指标、或把答清的问题消掉（resolved 是问题原文）。服务端据此重算状态：还有问题 → questions_open，
-   * 否则 path_pending；已经接上或驳回的不改状态
+   * 否则 ready；已经接上或驳回的不改状态
    */
   patchDraft: (draftId: string, body: { title?: string; metrics?: DraftMetric[]; resolved?: string[] }) =>
     patch<CaliberDraft>(draftAt(draftId), body),

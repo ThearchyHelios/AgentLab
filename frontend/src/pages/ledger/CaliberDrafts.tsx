@@ -1,19 +1,20 @@
 /**
  * 从业务文档起草口径（/ledger/drafts；服务端 app/ledger/docdraft.py、docattach.py）。
  *
- * 业务文档写的是业务说法（名称、粒度、分子分母、过滤），不是库里的表和 SQL。这一页做三段：
- * - 发起：选知识库文档，可选数据源（只写进适用范围）和一段起草要求。模型在后台读文档、核对引用，页面轮询详情直到状态离开
- *   drafting（最多一分钟），期间显示抽取中；
- * - 审读：每条指标带单位、粒度、定义和逐字核对过的引用原文（第 N 段），逐条的未决问题可以勾掉；被丢弃的条目单独列出原因。
- *   引用的段落正文按需从知识库取，省得一次读几十份文档的全部段落；
- * - 接上：草稿只到定义为止，取数路径必须来自一次真实运行。填运行 id（也可以从最近成功的运行里选），attach 之后产出可试运行
- *   的工作流版本，不发布；不是口径就驳回并记一条审计。
+ * 主路径一次到位：选文档 → 模型读文档、对照数据目录产出定义 + 取数 + 入口字段 + 指标表达式 → 服务端校验后落成草稿图
+ * → 后台自动只读试运行 → 这里展示「定义 + 数 + 原文引用」→ 人去画布审改并发布。发布才需要人签字。
+ * - 发起：选知识库文档，可选数据源（只写进适用范围）和一段起草要求，页面轮询详情直到状态离开 drafting（最多一分钟）；
+ * - 试运行：草稿顶部显示这次自动试运行的状态和每个指标的值，running 时每两秒取一次，最多等一分钟；失败照实写原因；
+ * - 审读：每条指标带单位、粒度、指标表达式、定义和逐字核对过的引用原文（第 N 段），逐条的未决问题可以勾掉；被丢弃
+ *   的条目单独列出原因；入口字段列出名字、类型、必填和缺省值；
+ * - 发布：主按钮去画布审改并发布。「接上一次运行」只是辅助入口：已经有答案时让它认这份定义。
  *
- * 状态由服务端算（还有问题 → questions_open，否则 path_pending；attach 之后 attached），页面只按状态画。
+ * 页面不显示 SQL，取数到画布上看。状态由服务端算（还有问题 → questions_open，否则 ready；旧路径可能停在 path_pending），
+ * 页面只按状态画。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ChevronLeft, FileText, RefreshCw, ScrollText } from 'lucide-react'
+import { ChevronLeft, FileText, PenLine, RefreshCw, ScrollText } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
 import { EmptyState, ErrorState, Notice, PageHeader, Skeleton, Spinner, promptDialog, toast } from '../../components/ui'
@@ -21,18 +22,18 @@ import { formatDateTime, formatTime } from '../../lib/format'
 import { LEDGER_UI } from '../../lib/termsLedger'
 import type { DataSourceName, KbDocument, Run } from '../../types'
 import type {
-  CaliberDraft, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftCitation, DraftMetric,
+  CaliberDraft, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftCitation, DraftMetric, DraftTrialOut,
 } from '../../typesLedger'
 
 const D = LEDGER_UI.drafts
 
-/** 列表的状态筛：全部加四种落点，起草中的只出现在全部里 */
+/** 列表的状态筛：全部加六种落点，起草中的只出现在全部里 */
 type Filter = '' | Exclude<CaliberDraftStatus, 'drafting'>
-const FILTERS: Filter[] = ['', 'questions_open', 'path_pending', 'attached', 'rejected', 'failed']
+const FILTERS: Filter[] = ['', 'ready', 'questions_open', 'path_pending', 'attached', 'rejected', 'failed']
 
-/** 状态标签：起草中 / 待确认问题 / 待接数据路径 / 已接上 / 已驳回 / 起草失败 */
+/** 状态标签：起草中 / 待签字发布 / 待确认问题 / 待接数据路径 / 已接上 / 已驳回 / 起草失败 */
 function StatusPill({ status }: { status: CaliberDraftStatus }) {
-  const color = status === 'attached' ? 'var(--ok)' : status === 'rejected' ? 'var(--text-faint)'
+  const color = status === 'ready' || status === 'attached' ? 'var(--ok)' : status === 'rejected' ? 'var(--text-faint)'
     : status === 'drafting' ? 'var(--accent)' : status === 'failed' ? 'var(--err)' : 'var(--warn)'
   return (
     <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px]"
@@ -94,6 +95,13 @@ function AlignmentBlock({ alignment }: { alignment: DraftAlignment }) {
   )
 }
 
+/** 缺省值直接读：字符串照写，其他转成 JSON 文本 */
+function defaultText(value: unknown): string {
+  if (typeof value === 'string') return value
+  const text = JSON.stringify(value)
+  return text ?? String(value)
+}
+
 export function CaliberDrafts() {
   const [drafts, setDrafts] = useState<CaliberDraftSummary[] | null>(null)
   const [listError, setListError] = useState<unknown>(null)
@@ -122,6 +130,12 @@ export function CaliberDrafts() {
   const [pollingId, setPollingId] = useState<string | null>(null)
   const [pollTimedOut, setPollTimedOut] = useState(false)
 
+  /** 这次自动试运行的结果；running 时单独轮询，和草稿抽取的轮询互不相干 */
+  const [trial, setTrial] = useState<DraftTrialOut | null>(null)
+  const [trialPollId, setTrialPollId] = useState<string | null>(null)
+  const [trialTimedOut, setTrialTimedOut] = useState(false)
+  const [trialError, setTrialError] = useState<unknown>(null)
+
   /** 引用所在段落的正文和段号：按文档懒取，取过的记在这里 */
   const [chunks, setChunks] = useState<Record<string, { ordinal: number; content: string }>>({})
   const asked = useRef(new Set<string>())
@@ -141,7 +155,12 @@ export function CaliberDrafts() {
     api.kb.documents().then((rows) => { setDocs(rows); setDocsError(null) },
       (e) => { setDocs([]); setDocsError(e) })
     api.datasources.names().then(
-      (all) => setSources(all.filter((s) => s.enabled !== false)),
+      (all) => {
+        const enabled = all.filter((s) => s.enabled !== false)
+        setSources(enabled)
+        // 数据源必选（取数 SQL 要对照这个库的表和列写），默认选中第一个，别让人对着 422 才知道要填
+        setDatasourceId((cur) => cur || (enabled[0]?.id ?? ''))
+      },
       () => setSources([]),
     )
   }, [])
@@ -170,6 +189,10 @@ export function CaliberDrafts() {
     setRecentRuns(null)
     setPollingId(null)
     setPollTimedOut(false)
+    setTrial(null)
+    setTrialPollId(null)
+    setTrialTimedOut(false)
+    setTrialError(null)
     try {
       const draft = await api.caliberLedger.draft(id)
       if (seq !== openSeq.current) return
@@ -213,6 +236,63 @@ export function CaliberDrafts() {
     return () => { alive = false; clearInterval(timer) }
   }, [pollingId, loadList])
 
+  /** 草稿有了试运行就取一次结果；还在 running 就交给下面的轮询 */
+  useEffect(() => {
+    const id = detail?.id
+    const run = detail?.trial?.run_id
+    if (!id || !run) return
+    let alive = true
+    setTrial((cur) => (cur?.run_id === run ? cur : {
+      run_id: run, status: detail?.trial?.status ?? 'running', metrics: [], error: detail?.trial?.error ?? '',
+    }))
+    api.caliberLedger.draftTrial(id).then((out) => {
+      if (!alive) return
+      setTrial(out)
+      setTrialError(null)
+      setTrialTimedOut(false)
+      if (out.status === 'running') setTrialPollId(id)
+    }, (e) => {
+      if (!alive) return
+      setTrialError(e)
+      setTrialPollId(null)
+    })
+    return () => { alive = false }
+  }, [detail?.id, detail?.trial?.run_id])
+
+  /** 试运行还在跑：每两秒取一次，超过一分钟就停；收尾时顺带刷新详情（状态可能已变成待签字发布） */
+  useEffect(() => {
+    if (!trialPollId) return
+    const until = Date.now() + 60_000
+    let alive = true
+    const timer = setInterval(() => {
+      api.caliberLedger.draftTrial(trialPollId).then((out) => {
+        if (!alive) return
+        setTrial(out)
+        setTrialError(null)
+        if (out.status === 'running') {
+          if (Date.now() > until) {
+            setTrialPollId(null)
+            setTrialTimedOut(true)
+          }
+          return
+        }
+        setTrialPollId(null)
+        setTrialTimedOut(false)
+        loadList()
+        const seq = openSeq.current
+        api.caliberLedger.draft(trialPollId).then((fresh) => {
+          if (seq !== openSeq.current) return
+          setDetail((cur) => (cur && cur.id === fresh.id ? fresh : cur))
+        }, () => undefined)
+      }, (e) => {
+        if (!alive) return
+        setTrialPollId(null)
+        setTrialError(e)
+      })
+    }, 2000)
+    return () => { alive = false; clearInterval(timer) }
+  }, [trialPollId, loadList])
+
   useEffect(() => {
     for (const doc of detail?.documents ?? []) ensureChunks(doc.document_id)
   }, [detail, ensureChunks])
@@ -231,6 +311,7 @@ export function CaliberDrafts() {
   const paragraphOf = (citation: DraftCitation): number | null => {
     const ordinal = chunks[citation.chunk]?.ordinal
     if (typeof ordinal === 'number') return ordinal
+    if (typeof citation.ordinal === 'number') return citation.ordinal
     const documentId = citation.document_id || chunkDoc[citation.chunk]
     const doc = detail?.documents?.find((d) => d.document_id === documentId)
     const at = doc?.chunk_ids.indexOf(citation.chunk) ?? -1
@@ -354,11 +435,93 @@ export function CaliberDrafts() {
     )
   }
 
+  /** 自动试运行：状态、每个指标的值（名字和值成对）、失败原因；没有试运行就整块不画 */
+  const renderTrial = (draft: CaliberDraft) => {
+    const status = trial?.status ?? draft.trial?.status
+    if (!status) return null
+    const rows = trial?.metrics ?? []
+    const color = status === 'succeeded' ? 'var(--ok)' : status === 'failed' ? 'var(--err)' : 'var(--accent)'
+    const label = status === 'succeeded' ? D.trialSucceeded : status === 'failed' ? D.trialFailed : D.trialRunning
+    const unitOf = (id: string) => (draft.metrics ?? []).find((m) => m.id === id)?.unit
+    return (
+      <div className="rounded-md border bg-elev px-3 py-2" data-draft-trial={status}>
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <h3 className="text-2xs font-semibold text-dim">{D.trial}</h3>
+          <span className="text-2xs" style={{ color }}>{label}</span>
+          {trial?.run_id && (
+            <Link to={`/runs/${trial.run_id}`} className="text-2xs text-accent hover:underline" data-draft-trial-run="">
+              {D.trialRun}
+            </Link>
+          )}
+          <span className="text-[10px] text-faint">{D.trialHint}</span>
+        </div>
+        {status === 'running' && (
+          <p className="mt-1 flex items-center gap-1.5 text-2xs text-dim">
+            <Spinner size={11} /> {D.trialRunning}
+          </p>
+        )}
+        {status === 'running' && trialTimedOut && <div className="mt-1"><Notice tone="warn">{D.trialTimeout}</Notice></div>}
+        {status === 'failed' && (
+          <div className="mt-1">
+            <Notice tone="err">{D.trialFailed}：{trial?.error || draft.trial?.error || D.loadFailed}</Notice>
+          </div>
+        )}
+        {status === 'succeeded' && (rows.length > 0 ? (
+          <ul className="mt-1 grid gap-x-4 gap-y-0.5 text-2xs sm:grid-cols-[1fr_auto]">
+            {rows.map((row) => {
+              const unit = unitOf(row.id)
+              return (
+                <li key={row.id} className="contents" data-draft-trial-metric={row.id}>
+                  <span className="text-dim [overflow-wrap:anywhere]">{row.name || row.id}</span>
+                  <span className="tnum text-right font-medium">
+                    {row.rendered ?? (row.value == null ? '—' : String(row.value))}{unit ? ` ${unit}` : ''}
+                  </span>
+                </li>
+              )
+            })}
+          </ul>
+        ) : (
+          <p className="mt-1 text-2xs text-faint">{D.trialNoMetrics}</p>
+        ))}
+        {trialError != null && <div className="mt-1"><Notice tone="warn">{D.trialUnavailable}</Notice></div>}
+      </div>
+    )
+  }
+
+  /** 入口字段：发布后按这些字段收参数 */
+  const renderEntryFields = (draft: CaliberDraft) => {
+    const fields = draft.entry_fields
+    if (!fields) return null
+    return (
+      <div data-draft-entry-fields="">
+        <h3 className="mb-1 text-2xs font-semibold text-dim">{D.entryFields}</h3>
+        <p className="mb-1 text-2xs text-faint">{D.entryFieldsHint}</p>
+        {fields.length > 0 ? (
+          <ul className="space-y-0.5 text-2xs leading-relaxed">
+            {fields.map((field) => {
+              const hasDefault = field.default !== undefined && field.default !== null && field.default !== ''
+              return (
+                <li key={field.name} className="flex flex-wrap items-baseline gap-x-2" data-draft-entry-field={field.name}>
+                  <code className="font-medium text-dim">{field.name}</code>
+                  <span className="text-faint">{field.type || 'string'}</span>
+                  <span className="text-faint">{field.required ? D.required : D.optional}</span>
+                  {hasDefault && <span className="text-faint">{D.defaultValue(defaultText(field.default))}</span>}
+                  {field.description && <span className="text-dim [overflow-wrap:anywhere]">{field.description}</span>}
+                </li>
+              )
+            })}
+          </ul>
+        ) : <p className="text-2xs text-faint">{D.entryFieldNone}</p>}
+      </div>
+    )
+  }
+
   const renderMetric = (metric: DraftMetric, index: number) => {
     const definition = metric.definition ?? {}
     const citations = definition.citations ?? []
     const rows = [
       [D.unit, metric.unit],
+      [D.decimals, metric.decimals != null ? String(metric.decimals) : ''],
       [D.grain, metric.grain],
       [D.timeField, metric.time_field],
       [D.numerator, metric.numerator],
@@ -371,7 +534,7 @@ export function CaliberDrafts() {
       [D.exclusions, definition.exclusions?.join('；')],
     ].filter(([, value]) => typeof value === 'string' && value.trim()) as [string, string][]
     return (
-      <li key={`${metric.name}:${index}`} className="rounded-md border bg-panel px-3 py-2" data-draft-metric={metric.name}>
+      <li key={`${metric.id ?? metric.name}:${index}`} className="rounded-md border bg-panel px-3 py-2" data-draft-metric={metric.name}>
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
           <span className="text-xs font-medium">{metric.name}</span>
           {!!metric.synonyms?.length && <span className="text-2xs text-faint">{D.synonyms(metric.synonyms.join('、'))}</span>}
@@ -386,7 +549,20 @@ export function CaliberDrafts() {
             ))}
           </dl>
         )}
-        {definition.text && <p className="mt-1.5 text-2xs leading-relaxed text-dim">{definition.text}</p>}
+        {metric.expression && (
+          <div className="mt-1.5" data-draft-expression="">
+            <h4 className="text-2xs font-semibold text-faint">{D.expression}</h4>
+            <code className="mt-0.5 block whitespace-pre-wrap rounded bg-elev px-1.5 py-1 text-2xs text-dim [overflow-wrap:anywhere]">
+              {metric.expression}
+            </code>
+          </div>
+        )}
+        {definition.text && (
+          <div className="mt-1.5">
+            <h4 className="text-2xs font-semibold text-faint">{D.definition}</h4>
+            <p className="text-2xs leading-relaxed text-dim">{definition.text}</p>
+          </div>
+        )}
         {citations.length > 0 && (
           <div className="mt-1.5">
             <h4 className="mb-1 text-2xs font-semibold text-faint">{D.citations}</h4>
@@ -417,9 +593,10 @@ export function CaliberDrafts() {
           {draft.created_at && <span title={formatDateTime(draft.created_at)}>{formatTime(draft.created_at)}</span>}
           {draft.created_by && <span>{D.createdBy(draft.created_by)}</span>}
           {draft.model_id && <span title={draft.model_id}>{D.model(draft.model_id)}</span>}
-          {draft.workflow_id && draft.status === 'attached' && (
+          {draft.workflow_id && draft.status !== 'rejected' && (
             <Link to={`/studio/${draft.workflow_id}`} className="text-accent hover:underline" data-draft-workflow="">
               {D.openWorkflow}{draft.workflow_name ? `：${draft.workflow_name}` : ''}
+              {draft.version != null ? ` · ${D.workflowVersion(draft.version)}` : ''}
             </Link>
           )}
         </div>
@@ -438,6 +615,9 @@ export function CaliberDrafts() {
         )}
         {drafting && pollTimedOut && <Notice tone="warn">{D.draftingTimeout}</Notice>}
         {draft.truncated && <Notice tone="warn">{D.truncated}</Notice>}
+
+        {renderTrial(draft)}
+        {renderEntryFields(draft)}
 
         <div>
           <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
@@ -485,9 +665,18 @@ export function CaliberDrafts() {
 
         {draft.alignment && <AlignmentBlock alignment={draft.alignment} />}
 
+        {!drafting && !terminal && draft.workflow_id && (
+          <div className="flex flex-wrap items-center gap-2" data-draft-publish="">
+            <Link to={`/studio/${draft.workflow_id}`} className="btn btn-primary btn-sm">
+              <PenLine size={12} aria-hidden /> {D.publish}
+            </Link>
+            <span className="text-2xs text-faint">{D.publishHint}</span>
+          </div>
+        )}
+
         {!drafting && !terminal && (
-          <div className="rounded-md border bg-elev px-3 py-2" data-draft-attach="">
-            <h3 className="text-2xs font-semibold text-dim">{D.attach}</h3>
+          <details className="rounded-md border bg-elev px-3 py-2" data-draft-attach="">
+            <summary className="cursor-pointer text-2xs font-semibold text-dim">{D.attach}</summary>
             <p className="mt-0.5 text-2xs leading-relaxed text-faint">{D.attachHint}</p>
             <div className="mt-1.5 flex flex-wrap items-end gap-2">
               <label className="min-w-40 flex-1 text-2xs text-faint">
@@ -509,12 +698,12 @@ export function CaliberDrafts() {
                   ))}
                 </select>
               </label>
-              <button type="button" className="btn btn-primary btn-sm" disabled={busy === `attach:${draft.id}`}
+              <button type="button" className="btn btn-sm" disabled={busy === `attach:${draft.id}`}
                       onClick={() => void attach(draft)} data-draft-attach-submit="">
                 {busy === `attach:${draft.id}` ? <Spinner size={12} /> : null} {busy === `attach:${draft.id}` ? D.attaching : D.attachAction}
               </button>
             </div>
-          </div>
+          </details>
         )}
 
         {attachOut && (
@@ -593,8 +782,8 @@ export function CaliberDrafts() {
               <div className="space-y-2">
                 <label className="block text-2xs text-faint">
                   <span className="mb-0.5 block font-semibold text-dim">{D.datasource}</span>
-                  <select className="field w-full" value={datasourceId} onChange={(e) => setDatasourceId(e.target.value)}>
-                    <option value="">{D.datasourceNone}</option>
+                  <select className="field w-full" value={datasourceId} required
+                          onChange={(e) => setDatasourceId(e.target.value)}>
                     {sources.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
                   </select>
                   <span className="mt-0.5 block">{D.datasourceHint}</span>
@@ -604,7 +793,7 @@ export function CaliberDrafts() {
                   <textarea className="field min-h-[64px] w-full text-xs" rows={3} value={guidance}
                             placeholder={D.guidancePlaceholder} onChange={(e) => setGuidance(e.target.value)} />
                 </label>
-                <button type="button" className="btn btn-primary btn-sm" disabled={submitting}
+                <button type="button" className="btn btn-primary btn-sm" disabled={submitting || !datasourceId}
                         onClick={() => void submit()} data-draft-submit="">
                   {submitting ? <Spinner size={12} /> : <FileText size={12} aria-hidden />} {submitting ? D.submitting : D.submit}
                 </button>
@@ -641,6 +830,8 @@ export function CaliberDrafts() {
                               setOpenId(null)
                               setDetail(null)
                               setPollingId(null)
+                              setTrial(null)
+                              setTrialPollId(null)
                             } else {
                               void open(draft.id)
                             }
