@@ -45,6 +45,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
@@ -480,6 +481,91 @@ async def write_entry(session: AsyncSession, source_id: str, table: str, notes: 
         await session.commit()
     await session.refresh(row)
     return _entry(row)
+
+
+# ==========================================================================
+# 遮罩列的历史清理
+# ==========================================================================
+
+
+def _list_text(value: Any) -> list[str]:
+    """关系两端的列名列表（旧数据可能不合规，不是列表就当空的）。"""
+    return [str(c) for c in value] if isinstance(value, list) else []
+
+
+async def scrub_masked_columns(session: AsyncSession, source_id: str, columns: Iterable[str], *,
+                               actor: str | None = None, commit: bool = True) -> int:
+    """新设了遮罩列：把这个数据源目录里这些列留下的取值类历史清掉，返回实际改动的表数。
+
+    遮罩列（数据源 options.mask_columns）以前只在读取侧过滤（visible_notes、schema_view），目录里写下的码值、含义、
+    备注和确认依据照旧带着取值。新设遮罩时清掉这些历史，才是真的不再留着：
+
+    - 列级项：这一列的 meaning、codes 整项删掉（码值和含义本身可能就是取值）；
+    - 列级其它项（中文名、单位、度量类型）：只删 note、reason（机器说明和确认依据里可能写着样例值），
+      value、source、status 保留；
+    - 关系：本表字段或目标字段里有遮罩列的，同样只删 note、reason（关系说明里可能带样例值），两端、基数、
+      覆盖率、来源、状态都留着。
+
+    只清历史，不改「遮罩列只给列名和类型」的读取规则，也不删除整列的目录：中文名、单位、度量类型是列本身的
+    事实，保留下来照旧可以给模型看。表级说明不动——遮罩的是一个列，不是整张表。
+
+    写库走乐观锁（UPDATE … WHERE version = ?），不调 write_entry：write_entry 冲突时会 rollback，会把调用方同一
+    事务里的其它写入（保存数据源、发布应用）一起回滚。rowcount 不是 1 说明这张表刚被别人改过，跳过这一张，不抛
+    异常、不回滚——清理是尽力而为。commit=False 只 flush，由调用方随自己的事务提交。
+
+    columns 去空白、去重、不分大小写。
+    """
+    wanted = {str(c).strip().lower() for c in columns if str(c).strip()}
+    if not wanted:
+        return 0
+    rows = (await session.execute(select(CatalogNote).where(CatalogNote.source_id == source_id))).scalars().all()
+    changed = 0
+    for row in rows:
+        slots = _slots(row.notes or {})
+        drop: list[Slot] = []
+        touched = False
+        for key, item in slots.items():
+            if key[0] == "c":
+                if key[1].lower() not in wanted:
+                    continue
+                if key[2] in ("meaning", "codes"):
+                    drop.append(key)
+                    touched = True
+                    continue
+            elif key[0] == "r":
+                ends = _list_text(item.get("columns")) + _list_text(item.get("to_columns"))
+                if not any(name.lower() in wanted for name in ends):
+                    continue
+            else:
+                continue
+            for name in ("note", "reason"):
+                if name in item:
+                    item.pop(name)
+                    touched = True
+        if not touched:
+            continue
+        for key in drop:
+            del slots[key]
+        notes = _assemble(slots)
+        if problems := validate_notes(notes):
+            logging.getLogger(__name__).warning(
+                "遮罩列清理跳过了表 %s：清理后的目录不合规（%s）", row.table_name, "；".join(problems[:5]))
+            continue
+        current = int(row.version or 0)
+        result = await session.execute(
+            update(CatalogNote)
+            .where(CatalogNote.id == row.id, CatalogNote.version == current)
+            .values(notes=notes, version=current + 1, updated_by=actor, updated_at=datetime.now(timezone.utc))
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            continue
+        changed += 1
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    return changed
 
 
 def relation_id(table: str, columns: list[str], to_table: str, to_columns: list[str]) -> str:

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -397,6 +398,15 @@ async def _sync_registration(session: AsyncSession, row: RecordsTable, wanted: l
     source.options = {**options, **({MASK_COLUMNS_OPTION: masked} if masked else {})}
     source.schema_cache = schema_cache_of(merged, row.name)
     source.schema_synced_at = utcnow()
+    if add:
+        # 新加的敏感列成了遮罩列：清掉目录里这几列留下的取值类历史（码值、含义、备注、确认依据）。只 flush、不提交，
+        # 跟随调用方的事务；清理是尽力而为，冲突时 scrub 自己跳过，出错也不能挡住发布或起草
+        from app.data import catalog as data_catalog
+
+        try:
+            await data_catalog.scrub_masked_columns(session, source.id, add, actor=None, commit=False)
+        except Exception:  # noqa: BLE001 - 清理失败不影响登记本身
+            logging.getLogger(__name__).warning("设置遮罩列后清理数据目录失败（数据源 %s）", source.id, exc_info=True)
 
 
 def columns_of(row: RecordsTable) -> list[Column]:

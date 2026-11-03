@@ -32,7 +32,7 @@ from app.data import introspect_jobs, source_objects
 from app.data import table_versions
 from app.data.engine import (
     CATALOG_DRAFT_GUIDANCE_OPTION, MASK_COLUMNS_OPTION, MAX_QUERY_TIMEOUT_S, QUERY_TIMEOUT_OPTION, SUPPORTED_KINDS,
-    SnapshotTampered, build_url, engine_args, engines, mask_columns_problem, query_timeout_problem,
+    SnapshotTampered, build_url, engine_args, engines, mask_columns_problem, masked_columns, query_timeout_problem,
 )
 from app.db.base import get_session, new_id
 from app.db.models import DataSource, ImportStaging, SourceSnapshot, TableImport, TableRecipe
@@ -552,6 +552,16 @@ async def update_source(
     if after != before:
         # 连的已经不是测过的那个了：旧结果作废，表单里测过这一份的话换成那一次
         row.last_check = health.draft_result(after)
+    if "options" in data:
+        # 新设了遮罩列：清掉目录里这些列留下的取值类历史（码值、含义、备注、确认依据）。清理是尽力而为——遮罩设置
+        # 本身必须保存成功，清理失败只记日志。actor 不传：这个接口没有请求上下文，署名留给调用方按需补
+        was_masked = {c.lower() for c in masked_columns(old_options)}
+        newly_masked = [c for c in masked_columns(dict(row.options or {})) if c.lower() not in was_masked]
+        if newly_masked:
+            try:
+                await data_catalog.scrub_masked_columns(session, source_id, newly_masked, actor=None, commit=False)
+            except Exception:  # noqa: BLE001 - 清理失败不能挡住遮罩本身的保存
+                logger.warning("设置遮罩列后清理数据目录失败（数据源 %s）", source_id, exc_info=True)
     await session.commit()
     await session.refresh(row)
     # 连接参数可能变了，旧连接池不能再用——否则改完密码还在用旧连接，很难排查
