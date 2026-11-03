@@ -1086,6 +1086,73 @@ def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult)
                    field="model", code="challenge.same_model")
 
 
+#: 指标定义的类型。现在只有公式（表达式）这一种在运行时能算；规则、评估、外部常量还没实现，
+#: 先在校验里挡住，免得写进图里以后被当成能算的指标
+METRIC_KINDS = ("formula",)
+#: 定义卡参数的标量类型（和入口表单的字段类型同一套子集）
+METRIC_PARAM_TYPES = ("string", "number", "integer", "boolean")
+
+
+def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[ValidationIssue]:
+    """一条指标定义卡的结构：ID / 表达式、kind、定义文本、参数。形状错是 error，运行时没法按它算。"""
+    out: list[ValidationIssue] = []
+    field = f"metrics[{index}]"
+
+    def add(message: str, key: str = field, level: str = "error", code: str | None = None) -> None:
+        out.append(ValidationIssue(level=level, message=message, node_id=node.id, field=key, code=code))  # type: ignore[arg-type]
+
+    if not isinstance(metric, dict):
+        add("指标定义需要是一个对象")
+        return out
+    if not metric.get("id") or not str(metric.get("id")).strip():
+        add(f"指标定义缺少 ID：{field}", code="metrics.id_missing")
+    kind = str(metric.get("kind") or "formula")
+    if kind not in METRIC_KINDS:
+        add(f"指标「{metric.get('id') or index + 1}」的类型「{kind}」还没有实现：现在只支持「公式」（formula）。"
+            "规则、评估、外部常量请先在定义卡里写成说明，等对应的执行方式上线后再发布",
+            f"{field}.kind", code="metrics.kind_unsupported")
+    if not metric.get("expression"):
+        add(f"指标定义缺少表达式：{metric.get('id') or '（空）'}", code="metrics.expression_missing")
+
+    definition = metric.get("definition")
+    if definition is not None:
+        if not isinstance(definition, dict):
+            add("指标的定义说明需要是一个对象（text / scope / exclusions / owner / effective_from / citations）",
+                f"{field}.definition", code="metrics.definition_invalid")
+        else:
+            for key in ("text", "scope", "owner", "effective_from"):
+                if definition.get(key) is not None and not isinstance(definition[key], str):
+                    add(f"指标定义说明的「{key}」需要是文字", f"{field}.definition.{key}",
+                        code="metrics.definition_invalid")
+            if definition.get("exclusions") is not None and not isinstance(definition["exclusions"], list):
+                add("指标定义说明的「exclusions」需要是列表", f"{field}.definition.exclusions",
+                    code="metrics.definition_invalid")
+            if definition.get("citations") is not None and not isinstance(definition["citations"], list):
+                add("指标定义说明的「citations」需要是列表", f"{field}.definition.citations",
+                    code="metrics.definition_invalid")
+
+    params = metric.get("params")
+    if params is not None:
+        if not isinstance(params, list):
+            add("指标参数需要是一个列表", f"{field}.params", code="metrics.params_invalid")
+        else:
+            seen: set[str] = set()
+            for j, param in enumerate(params):
+                key = f"{field}.params[{j}]"
+                if not isinstance(param, dict) or not isinstance(param.get("name"), str) \
+                        or not param["name"].strip():
+                    add("参数需要是一个带 name 的对象", key, code="metrics.params_invalid")
+                    continue
+                name = param["name"].strip()
+                if name in seen:
+                    add(f"参数「{name}」重复了", f"{key}.name", code="metrics.params_invalid")
+                seen.add(name)
+                if param.get("type") not in METRIC_PARAM_TYPES:
+                    add(f"参数「{name}」的类型只能是 {'、'.join(METRIC_PARAM_TYPES)}，当前为「{param.get('type')}」",
+                        f"{key}.type", code="metrics.params_invalid")
+    return out
+
+
 def validate_graph(spec: GraphSpec) -> ValidationResult:
     """编译前的静态检查。错误会挡住运行，警告只在画布上提示。"""
     result = ValidationResult()
@@ -1173,9 +1240,9 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
             if not defs and not cfg.get("caliber_from"):
                 result.add("口径卡还没有定义指标", node_id=node.id, field="metrics")
             for i, d in enumerate(defs):
-                if not d.get("id") or not d.get("expression"):
-                    result.add(f"指标定义缺少 ID 或表达式：{d.get('id') or '（空）'}",
-                               node_id=node.id, field=f"metrics[{i}]")
+                for issue in metric_definition_issues(node, d, i):
+                    result.add(issue.message, level=issue.level, node_id=issue.node_id, field=issue.field,
+                               code=issue.code)
         elif node.type == NodeType.DUAL_CHECK:
             _check_dual_check(node, spec, result)
         elif node.type == NodeType.REPORT:

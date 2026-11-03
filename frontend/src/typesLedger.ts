@@ -380,6 +380,11 @@ export interface CaliberMetric {
   unit?: string
   decimals?: number
   format?: string
+  /** 公式（formula）；规则、评估、外部常量还没实现 */
+  kind?: string
+  /** 定义卡：文字定义、范围、排除项、负责人、生效日期、引用 */
+  definition?: { text?: string; scope?: string; exclusions?: string[]; owner?: string; effective_from?: string; citations?: unknown[] }
+  params?: { name: string; type: string; default?: unknown; min?: number; max?: number }[]
 }
 
 /** GET /api/ledger/calibers：一份已发布口径卡的可调用描述（不返回 SQL、不返回参数值） */

@@ -105,3 +105,15 @@ async def test_a_card_that_copies_another_caliber_is_not_listed(client):
     listed = await descriptors(client, wf)
     assert [d["card"]["node_id"] for d in listed] == ["card"]
     assert (await client.get(f"/api/ledger/calibers/{wf}/1/copy")).status_code == 404
+
+
+async def test_metric_definition_and_params_are_described(client):
+    graph = S.caliber_graph()
+    metric = graph["nodes"][2]["data"]["config"]["metrics"][0]
+    metric["definition"] = {"text": "已支付订单的销售额", "scope": "全部门店", "owner": "运营"}
+    metric["params"] = [{"name": "store", "type": "string", "default": "all"}]
+    wf = await S.publish(graph=graph)
+    [made] = await descriptors(client, wf)
+    [m] = made["metrics"]
+    assert m["definition"]["text"] == "已支付订单的销售额" and m["definition"]["owner"] == "运营"
+    assert m["params"] == [{"name": "store", "type": "string", "default": "all"}]

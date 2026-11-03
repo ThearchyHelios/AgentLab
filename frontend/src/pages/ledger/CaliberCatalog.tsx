@@ -129,9 +129,19 @@ export function CaliberCatalog() {
                           <h3 className="mb-1 text-2xs font-semibold text-dim">指标</h3>
                           <ul className="space-y-1 text-xs">
                             {d.metrics.map((m) => (
-                              <li key={m.id} className="flex items-baseline justify-between gap-2 border-b border-hairline pb-1 last:border-0">
-                                <span>{m.name ?? m.id}</span>
-                                <span className="text-2xs text-faint">{m.unit || '—'}</span>
+                              <li key={m.id} className="border-b border-hairline pb-1 last:border-0">
+                                <div className="flex items-baseline justify-between gap-2">
+                                  <span>{m.name ?? m.id}</span>
+                                  <span className="text-2xs text-faint">{m.unit || '—'}</span>
+                                </div>
+                                {m.definition?.text && (
+                                  <p className="mt-0.5 text-2xs leading-relaxed text-faint">{m.definition.text}</p>
+                                )}
+                                {!!m.params?.length && (
+                                  <p className="mt-0.5 text-2xs text-faint">
+                                    参数：{m.params.map((p) => `${p.name}（${p.type}）`).join('、')}
+                                  </p>
+                                )}
                               </li>
                             ))}
                           </ul>
