@@ -20,6 +20,8 @@ from app.db.base import SessionLocal
 from app.db.models import RunEvent
 from app.engine.lineage import traced, untraced
 from app.engine.runner import run_manager
+from app.ledger import match as ledger_match
+from app.ledger import store as ledger_store
 from tests import ledger_samples as S
 
 PAID = "SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid'"
@@ -526,6 +528,22 @@ async def test_the_bundle_and_whatif_read_a_subgraph_card_in_its_own_layer(clien
     # nodes.parse.rows 这种整份产出的输入从 parse 那一次的产出还原：子图里的 parse（1 行），不是父图里同名的那个（2 行）
     [cnt] = [m for m in res.json()["metrics"] if m.get("id") == "cnt"]
     assert cnt.get("new") == cnt.get("old") == 1, cnt
+
+
+async def test_the_ledger_matches_the_subgraph_query_against_its_published_caliber():
+    """子图的查询快照进了父图封存，账本就能把它和子图那一版的已发布口径比对出来。"""
+    sub_id = await publish(fetch_card_graph())
+    started = await run_manager.start(
+        graph=parent(sub_id, contract_from=None,
+                     out=[{"name": "数", "value": "{{ nodes.sub.output.gmv }}"}]),
+        input_payload={}, origin_kind="canvas")
+    row = await S.wait(started.id)
+    assert row.status == "succeeded", row.error
+    assert await ledger_match.match_run(row.id, trigger="on_demand")
+    recorded = await ledger_store.latest(row.id)
+    [query] = [q for q in (recorded.content or {}).get("queries") or [] if q.get("node_id") == "sub/fetch"]
+    assert query["status"] == "proven", query
+    assert query["candidates"][0]["caliber"] == f"{sub_id}@1"
 
 
 async def card_entries(run_id: str) -> list[dict]:
