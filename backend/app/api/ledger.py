@@ -16,6 +16,8 @@
   （app/ledger/certify.py）。
 - GET /api/ledger/recall/{workflow_id}/{version}、POST …/continue（router，搭建者，第 4 波）：口径升到这一版之后的召回批次——
   每组的结论、「另有 M 组未重算」、手动接着算（app/ledger/recall.py）。版本用量（workflow-versions）另加问数回答、导出、召回。
+- GET /api/ledger/calibers、GET /api/ledger/calibers/{workflow_id}/{version}/{node_id}（router，搭建者）：口径可调用描述
+  （app/ledger/descriptor.py）：入口字段的 JSON Schema、依赖、能不能组合和出具；不返回 SQL 和参数值。
 这几个新接口都不放给访问密钥（auth/keys.KEY_ROUTES 不登记）。
 """
 from __future__ import annotations
@@ -256,3 +258,28 @@ async def certify_dismiss(payload: DismissIn, session: AsyncSession = Depends(ge
     await certify.dismiss(session, payload.item_id, kind=payload.kind, note=payload.note,
                           principal=current_principal())
     return {"ok": True, "item_id": payload.item_id}
+
+
+@router.get("/calibers")
+async def calibers(workflow_id: str | None = None, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """口径可调用描述（app/ledger/descriptor.py）：每个工作流最新「已发布且未退役」版本里的源头口径卡一张一条，含入口字段的
+    JSON Schema、指标、依赖的表和发布时钉住的数据目录/结构版本、能不能组合、出具策略。workflow_id 可只列一个工作流。
+
+    不返回取数 SQL、不返回参数值（SQL 里可能写着遮罩值）。issuance 只描述这一版的策略（级别、有没有人工节点或写外部系统），
+    不代表这次运行一定能出具：全局自动出具开关、每日上限这类运行时条件不在这里判。"""
+    from app.ledger.descriptor import list_calibers as list_descriptors
+
+    return {"calibers": await list_descriptors(session, workflow_id=workflow_id)}
+
+
+@router.get("/calibers/{workflow_id}/{version}/{node_id}")
+async def caliber_descriptor(workflow_id: str, version: int, node_id: str,
+                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """一张源头口径卡的描述（形状同列表里的一条）。工作流不存在、这一版没发布过或已退役、节点不是源头口径卡（转抄卡也算）
+    回 404。同样不返回 SQL、参数值；issuance 只描述版本策略，不代表这次运行一定能出具。"""
+    from app.ledger.descriptor import caliber_descriptor as descriptor_of
+
+    made = await descriptor_of(session, workflow_id, version, node_id)
+    if made is None:
+        raise HTTPException(404, "没有这份口径：工作流不存在、这一版没发布过或已退役，或者节点不是源头口径卡")
+    return made
