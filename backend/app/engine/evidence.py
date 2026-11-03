@@ -4797,7 +4797,7 @@ _RESULT_FIELDS = {
     "op": "算子", "mode": "模式", "method": "方法版本", "params": "参数", "settings": "阈值", "inputs": "输入",
     "probes": "现查结果", "status": "算成没算成", "reason_code": "算不了的原因", "reason": "算不了的原因",
     "table": "结果表", "values": "具名的数", "verdict": "判定", "criterion": "判定标准", "phrase": "判定语",
-    "caveats": "附带说明",
+    "phrase_version": "说法模板版本", "caveats": "附带说明",
 }
 #: app.analysis.recompute 取不回输入（CallError 的 code input_missing）时那句以「复算」开头（复算取不回 Q2 的查询快照）：
 #: 接在「复算失败：」后面时去掉，不说两遍
@@ -4824,32 +4824,50 @@ def analysis_recheck(result: dict[str, Any], load: Callable[[str], Any], *,
 
     方法升过版（结论里记的 method 和现在的 contract.METHODS[(op, mode)] 不同）时 method_now 是现在的那一版：复算成立的照实写
     复算结果同不同（方法版本那一项本来就不同，不算进去），现在的方法按封存的输入不成立（recompute 抛 CallError）的写明原因。
+    说法模板升过版（结论里记的 phrase_version 和现在的 phrases.PHRASE_VERSION 不同，旧结论没有这一项也算）时 phrase_now 是
+    现在的那一版：渲染出来的 phrase、caveats 不参与比较，也不列成差异，文字里写明升过版。
+
     复算出错（输入取不回、调用的写法现在不认、出了意外）不往外抛，照实写「复算失败：原因」。"""
     from app import analysis
+    from app.analysis import phrases as ph
     from app.analysis.contract import METHODS, NOT_RECOMPUTED, CallError, same
     from app.core.errors import describe_exception
 
     method = str(result.get("method") or "")
     now = METHODS.get((result.get("op"), result.get("mode")))
     upgraded = isinstance(now, str) and now != method
-    out: dict[str, Any] = {"method": method, **({"method_now": now} if upgraded else {})}
+    phrase = result.get("phrase_version")
+    phrase_now = ph.PHRASE_VERSION
+    phrase_upgraded = phrase != phrase_now
+    out: dict[str, Any] = {"method": method, **({"method_now": now} if upgraded else {}),
+                           **({"phrase_version": phrase, "phrase_now": phrase_now} if phrase_upgraded else {})}
     head = f"运行时用的是 {method}，现在是 {now}" if upgraded else ""
+    phrase_head = f"说法模板没有记录版本，现在是 v{phrase_now}" if phrase is None \
+        else f"说法模板升过版（v{phrase} → v{phrase_now}）"
+    lead = "；".join(x for x in (head, phrase_head if phrase_upgraded else "") if x)
     try:
         again = analysis.recompute(result, load, load_result=load_result)  # type: ignore[arg-type]
     except CallError as e:
         why = _recheck_reason(e)
-        text = f"{head}：现在的方法按封存的输入复算不了（{why}）" if upgraded else f"复算失败：{why}"
+        if upgraded:
+            text = f"{lead}：现在的方法按封存的输入复算不了（{why}）"
+        else:
+            text = f"复算失败：{why}" + (f"；{phrase_head}" if phrase_upgraded else "")
         return {"status": "failed", **out, "text": text}
     except Exception as e:  # noqa: BLE001 - 复算出了意外：照实说复算不了，不能让证据面板、导出跟着出错
-        return {"status": "failed", **out, "text": f"复算失败：{describe_exception(e)}"}
+        return {"status": "failed", **out,
+                "text": f"复算失败：{describe_exception(e)}" + (f"；{phrase_head}" if phrase_upgraded else "")}
     if not isinstance(again, dict):
-        return {"status": "failed", **out, "text": "复算失败：复算没有交回结论"}
+        return {"status": "failed", **out,
+                "text": "复算失败：复算没有交回结论" + (f"；{phrase_head}" if phrase_upgraded else "")}
     ok = same({**result, "method": now} if upgraded else result, again)
     skip = NOT_RECOMPUTED | ({"method"} if upgraded else set())
+    if phrase_upgraded:
+        skip |= {"phrase", "caveats", "phrase_version"}
     fields = sorted(k for k in set(result) | set(again) if k not in skip and result.get(k) != again.get(k))
     out["status"] = "same" if ok else "different"
-    if upgraded:
-        out["text"] = f"{head}，复算结果{'相同' if ok else '不同'}"
+    if lead:
+        out["text"] = f"{lead}，复算结果{'相同' if ok else '不同'}"
     elif ok:
         out["text"] = "复算一致：按封存的输入重新计算，结论逐项相同"
     else:

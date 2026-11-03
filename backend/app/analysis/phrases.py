@@ -19,6 +19,10 @@
 
 **附带说明**：判定语后面用「；」接，最多两条（按 PHRASE_ORDER 的先后），其余只在证据面板。度量类型没标、以各段之和为
 总数这类方法上的交代不进判定语。
+
+**版本**（PHRASE_VERSION）：判定语是结论的一部分，复算时逐字段比。改了判定语模板、数的写法、附带说明的拼接规则就升
+版本，结论里记下渲染时用的那一版；复算遇到版本不同时渲染文字不参与比较，免得改一句模板就让旧结论误报「复算不一致」。
+engine/analysis_claims 的说法表词表改了也要升：label 消毒按它认判断词，消完的叫法会变。
 """
 from __future__ import annotations
 
@@ -31,6 +35,8 @@ from typing import Any
 from app.analysis.contract import OP_LABELS
 from app.analysis.numbers import fixed, to_fraction
 
+#: 判定语模板的版本（见文件头）：改了模板、数的写法、附带说明的拼接规则，或者 engine/analysis_claims 的说法表词表就升
+PHRASE_VERSION = 1
 #: 附带说明进判定语的先后；不在这里的（measure_unlabeled、headline_basis、partial_periods）只在证据面板
 PHRASE_ORDER = ("comparability", "untested", "simpson", "offset", "outlier_sensitive", "small_sample", "record_high",
                 "record_low", "multiple_comparisons", "weekday_effect", "small_denominator", "null_values")
@@ -572,7 +578,7 @@ CRITERION_COMPARABLE = ("只差日期、窗口一样长、是整期、星期构�
 
 __all__ = [
     "CRITERION_COMPARABLE", "EMPTY_KEY", "HEADLINE_BASIS", "KEY_JOIN", "LABEL_MAX", "MEASURE_WORDS", "NO_DATES",
-    "PHRASE_CAVEATS", "PHRASE_ORDER", "UNKNOWN_WEEKS", "UNVERIFIED_COMPLETE", "WEEKDAY_EFFECT", "amount", "band_text",
+    "PHRASE_CAVEATS", "PHRASE_ORDER", "PHRASE_VERSION", "UNKNOWN_WEEKS", "UNVERIFIED_COMPLETE", "WEEKDAY_EFFECT", "amount", "band_text",
     "baseline_flat_phrase", "baseline_phrase", "caveat", "change", "clean_label", "comparable_phrase",
     "criterion_additive", "criterion_baseline", "criterion_differ", "criterion_factor", "criterion_ratio",
     "criterion_trend", "current_text", "decompose_concentrated", "decompose_dispersed", "decompose_driver",

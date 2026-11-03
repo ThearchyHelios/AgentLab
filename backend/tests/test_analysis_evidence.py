@@ -612,6 +612,22 @@ def test_recheck_says_what_differs_and_what_is_missing():
     assert analysis_recheck(sealed, lambda sha: other)["status"] == "different"
 
 
+def test_recheck_says_the_phrase_template_was_upgraded(monkeypatch):
+    """说法模板升过版：复算按新模板渲染，旧结论改过的 phrase 不算差异，文字写明升过版；旧结论没记版本也照实说。"""
+    store = Store()
+    q = store.put(SNAPSHOT)
+    sealed = {**real_result(q), "phrase_version": 1, "phrase": "旧模板的判定语"}
+    monkeypatch.setattr("app.analysis.phrases.PHRASE_VERSION", 2)
+    out = analysis_recheck(sealed, store.get)
+    assert out == {"status": "same", "method": "decompose.additive@1", "phrase_version": 1, "phrase_now": 2,
+                   "text": "说法模板升过版（v1 → v2），复算结果相同"}
+    assert "fields" not in out
+    old = {k: v for k, v in sealed.items() if k != "phrase_version"}
+    out = analysis_recheck(old, store.get)
+    assert out["status"] == "same" and out["phrase_version"] is None and out["phrase_now"] == 2
+    assert out["text"] == "说法模板没有记录版本，现在是 v2，复算结果相同"
+
+
 def test_recheck_names_both_versions_when_the_method_was_upgraded(monkeypatch):
     store = Store()
     q = store.put(SNAPSHOT)

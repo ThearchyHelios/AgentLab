@@ -312,6 +312,9 @@ class AnalysisResult(TypedDict, total=False):
     verdict: Verdict | None
     criterion: str            # 判定标准，一句，照实际阈值写
     phrase: str               # 判定语（app/analysis/phrases 渲染），[[a:A3]] 渲染成它
+    #: 渲染判定语时用的模板版本（app/analysis/phrases.PHRASE_VERSION）：版本不同时 phrase、caveats 不参与复算比较，
+    #: 旧结论没有这一项按没有记录版本算
+    phrase_version: int
     caveats: list[Caveat]
     hypothesis: str | None
 
@@ -436,8 +439,12 @@ FORMAT_CONVS: tuple[str, ...] = (CONV_PCT, CONV_POINTS)
 
 
 def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
-    """两份结论（封存的、复算的）是否逐字段相同（hypothesis 除外）。"""
+    """两份结论（封存的、复算的）是否逐字段相同（hypothesis 除外）。说法模板版本不同时，渲染出来的 phrase、caveats
+    和版本号本身都不比：改一句模板不该让旧结论报「复算不一致」；版本相同（两边都没有版本也算相同）仍严格比 phrase、
+    caveats。"""
     keys = (set(a) | set(b)) - NOT_RECOMPUTED
+    if a.get("phrase_version") != b.get("phrase_version"):
+        keys -= {"phrase", "caveats", "phrase_version"}
     return all(a.get(k) == b.get(k) for k in keys)
 
 

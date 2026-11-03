@@ -48,6 +48,17 @@ def test_recompute_comparison_ignores_only_the_hypothesis():
     assert not c.same(sealed, {**sealed, "phrase": "改过的判定语"})
 
 
+def test_recompute_comparison_ignores_the_rendered_phrase_when_versions_differ():
+    """说法模板升过版：旧结论记的 phrase、caveats 不参与比较；版本相同（包括两边都没有版本）仍严格比。"""
+    sealed = {**fake_result(), "phrase_version": 1}
+    upgraded = {**sealed, "phrase_version": 2, "phrase": "新版判定语",
+                "caveats": [{"code": "offset", "text": "新版附带说明"}]}
+    assert c.same(sealed, upgraded)
+    assert not c.same(sealed, {**sealed, "phrase": "改过的判定语"})
+    assert not c.same({k: v for k, v in sealed.items() if k != "phrase_version"},
+                      {k: v for k, v in sealed.items() if k != "phrase_version"} | {"phrase": "改过的判定语"})
+
+
 def test_every_op_has_a_method_and_a_tool_name():
     for op in c.OPS:
         modes = c.MODES.get(op, (None,))

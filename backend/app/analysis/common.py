@@ -91,6 +91,7 @@ def build(env: Env, params: dict[str, Any], used: Sequence[str], *, status: str 
         "verdict": dict(verdict) if verdict is not None else None,  # type: ignore[typeddict-item]
         "criterion": criterion,
         "phrase": phrase,
+        "phrase_version": ph.PHRASE_VERSION,
         "caveats": [dict(c) for c in caveats],  # type: ignore[misc]
         "hypothesis": env.hypothesis,
     }
