@@ -55,7 +55,9 @@ async def _run(origin: str | None, *, minutes: int = 0, **extra) -> str:
 
 
 def test_system_origins_are_server_only_and_ledger_issue_counts():
-    assert set(SYSTEM_ORIGINS) == {"eval", "reconcile", "recall"}
+    # caliber_trial 是口径试跑（服务端按固定版本派生的只读图）：它查的是真实数据，但不是有人在用这份口径，
+    # 计入使用统计会把「试一下」算成「在用」，还会污染召回口径。
+    assert set(SYSTEM_ORIGINS) == {"eval", "reconcile", "recall", "caliber_trial"}
     assert set(SYSTEM_ORIGINS) <= set(ORIGIN_KINDS)
     assert not set(SYSTEM_ORIGINS) & set(CLIENT_ORIGINS)
     assert "ledger_issue" in ORIGIN_KINDS and "ledger_issue" not in SYSTEM_ORIGINS, "替用户正式出具照常计入"
