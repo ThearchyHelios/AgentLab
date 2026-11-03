@@ -7,12 +7,13 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ChevronDown, Layers, Play, RefreshCw, Search } from 'lucide-react'
+import { ChevronDown, FileText, Layers, Play, RefreshCw, Search } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
 import { SchemaForm } from '../../components/SchemaForm'
 import { EmptyState, ErrorState, Notice, PageHeader, Skeleton, Spinner, toast } from '../../components/ui'
 import { LEDGER_TEXT } from '../../lib/terms'
+import { LEDGER_UI } from '../../lib/termsLedger'
 import type { FormSchema } from '../../typesApp'
 import type { CaliberDescriptor, CaliberTrialOut } from '../../typesLedger'
 
@@ -78,9 +79,14 @@ export function CaliberCatalog() {
   return (
     <div className="flex h-full flex-col" data-caliber-catalog="">
       <PageHeader icon={<Layers size={14} />} title="口径" subtitle="已发布口径的入口、指标、依赖与试运行"
-                  actions={<button type="button" className="btn btn-xs btn-ghost" onClick={load} title="重新加载">
-                    <RefreshCw size={12} aria-hidden /> 刷新
-                  </button>} />
+                  actions={<>
+                    <Link to="/ledger/drafts" className="btn btn-xs btn-ghost" data-caliber-drafts-link="">
+                      <FileText size={12} aria-hidden /> {LEDGER_UI.drafts.entry}
+                    </Link>
+                    <button type="button" className="btn btn-xs btn-ghost" onClick={load} title="重新加载">
+                      <RefreshCw size={12} aria-hidden /> 刷新
+                    </button>
+                  </>} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-5xl space-y-3 p-4">
           <label className="relative block">

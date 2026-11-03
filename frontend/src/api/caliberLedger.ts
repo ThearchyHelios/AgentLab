@@ -12,12 +12,13 @@
  * 请求函数从 ./http 导入，不从 ./client 导入（client.ts 要导入这个文件，反过来就成了循环）。
  */
 import type {
-  CaliberDescriptor, CaliberTrialOut, CertifyQueue, FreezeOut, LedgerFeedbackOut, LedgerFeedbackVerdict, LedgerIssueOut,
-  LedgerReconcileIn, LedgerReconcileOut, RunLedger,
+  CaliberDescriptor, CaliberDraft, CaliberDraftAttachOut, CaliberDraftSummary, CaliberTrialOut, CertifyQueue, DraftMetric,
+  FreezeOut, LedgerFeedbackOut, LedgerFeedbackVerdict, LedgerIssueOut, LedgerReconcileIn, LedgerReconcileOut, RunLedger,
 } from '../typesLedger'
-import { get, post, type RequestOptions } from './http'
+import { get, patch, post, type RequestOptions } from './http'
 
 const at = (runId: string) => `/ledger/answers/${encodeURIComponent(runId)}`
+const draftAt = (draftId: string) => `/ledger/drafts/${encodeURIComponent(draftId)}`
 
 export const caliberLedger = {
   run: (runId: string, opts?: RequestOptions) => get<RunLedger>(`/runs/${encodeURIComponent(runId)}/ledger`, opts),
@@ -46,4 +47,26 @@ export const caliberLedger = {
       `/ledger/calibers/${encodeURIComponent(workflowId)}/${version}/${encodeURIComponent(nodeId)}/trial`,
       { inputs },
     ),
+  /**
+   * 从业务文档起草口径（app/ledger/docdraft.py，搭建者）：草稿只产出定义，不产出取数。发起后立刻返回 drafting，模型在后台跑，
+   * 结果用 draft() 反复取，直到状态离开 drafting
+   */
+  drafts: (status?: string, opts?: RequestOptions) =>
+    get<{ drafts: CaliberDraftSummary[] }>(`/ledger/drafts${status ? `?status=${encodeURIComponent(status)}` : ''}`, opts),
+  /** 一份草稿的完整内容：payload 摊平在上层（metrics / dropped / open_questions / alignment） */
+  draft: (draftId: string, opts?: RequestOptions) => get<CaliberDraft>(draftAt(draftId), opts),
+  /** 选文档发起起草：documents 是要用的知识库文档 id，guidance 是给模型看的附加要求 */
+  extractDraft: (body: { documents: string[]; collection?: string; datasource_id?: string; guidance?: string }) =>
+    post<{ draft_id: string; status: string }>('/ledger/drafts/extract', body),
+  /**
+   * 改标题、整体换掉指标、或把答清的问题消掉（resolved 是问题原文）。服务端据此重算状态：还有问题 → questions_open，
+   * 否则 path_pending；已经接上或驳回的不改状态
+   */
+  patchDraft: (draftId: string, body: { title?: string; metrics?: DraftMetric[]; resolved?: string[] }) =>
+    patch<CaliberDraft>(draftAt(draftId), body),
+  /** 接上一次真实运行补取数路径（app/ledger/docattach.py）：由它建工作流和版本，定义来自草稿 */
+  attachDraft: (draftId: string, runId: string) => post<CaliberDraftAttachOut>(`${draftAt(draftId)}/attach`, { run_id: runId }),
+  /** 「不是口径」：置 rejected，写一条审计，以后不再出现在列表的待办里 */
+  dismissDraft: (draftId: string, note?: string) =>
+    post<{ ok: boolean; draft_id: string; status: string }>(`${draftAt(draftId)}/dismiss`, { note: note ?? null }),
 }

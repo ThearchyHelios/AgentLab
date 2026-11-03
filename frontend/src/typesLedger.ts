@@ -437,3 +437,107 @@ export interface CaliberTrialOut {
   error?: string | null
   metrics: CaliberTrialMetric[]
 }
+
+// ---------------------------------------------------------------- 从业务文档起草口径
+
+/**
+ * 草稿的状态（app/ledger/docdraft.STATUSES）：起草中 → 有待确认的问题 / 待接数据路径 → 已接上；
+ * 另有已驳回。path_pending 不是合法图，取数路径只能来自一次真实运行。
+ */
+export type CaliberDraftStatus = 'drafting' | 'questions_open' | 'path_pending' | 'attached' | 'rejected'
+
+/** 一条引用：逐字原文、原文所在段落（chunk）、span 是原文里的 [start, end) */
+export interface DraftCitation {
+  chunk: string
+  document_id?: string
+  quote: string
+  span?: [number, number]
+}
+
+/** 一条指标的定义（docdraft.DEFINITION_FIELDS） */
+export interface DraftDefinition {
+  text?: string
+  scope?: string
+  exclusions?: string[]
+  owner?: string
+  effective_from?: string
+  citations?: DraftCitation[]
+}
+
+/** 草稿里的一条指标：只有业务定义，不含 SQL、表名、列名 */
+export interface DraftMetric {
+  name: string
+  synonyms?: string[]
+  unit?: string
+  /** 粒度，如「日」「订单行」 */
+  grain?: string
+  /** 业务时间字段的业务叫法 */
+  time_field?: string
+  filters?: string[]
+  numerator?: string
+  denominator?: string
+  dimensions?: string[]
+  definition?: DraftDefinition
+  open_questions?: string[]
+}
+
+/** 被丢弃的条目和原因（含 SQL 痕迹、引用核对不上） */
+export interface DraftDropped {
+  name: string
+  reason: string
+}
+
+/** 草稿和已发布口径的对齐结果：新的、已有出处的、和现有口径定义不同的 */
+export interface DraftAlignment {
+  new: string[]
+  duplicate: { name: string; workflow_id?: string; version?: number; node_id?: string }[]
+  conflict: { name: string; workflow_id?: string; version?: number; reason?: string }[]
+}
+
+/** 起草时用了哪份文档的哪些段落 */
+export interface DraftDocument {
+  document_id: string
+  title: string
+  chunk_ids: string[]
+}
+
+/** GET /api/ledger/drafts 的一条：只有计数和状态，正文用 GET /api/ledger/drafts/{id} 看 */
+export interface CaliberDraftSummary {
+  id: string
+  title: string
+  status: CaliberDraftStatus
+  metric_count: number
+  question_count: number
+  workflow_id: string | null
+  created_at: string | null
+  error: string | null
+}
+
+/** GET /api/ledger/drafts/{id}：payload 摊平在上层（documents / metrics / dropped / open_questions / alignment） */
+export interface CaliberDraft extends CaliberDraftSummary {
+  documents?: DraftDocument[]
+  metrics?: DraftMetric[]
+  dropped?: DraftDropped[]
+  open_questions?: string[]
+  alignment?: DraftAlignment
+  /** 文档超过一次能发给模型的字数，后面的段落没有参与起草 */
+  truncated?: boolean
+  model_id?: string | null
+  collection?: string | null
+  datasource_id?: string | null
+  /** 起草时的文档 id 和附加要求 */
+  origin?: { documents?: string[]; guidance?: string }
+  created_by?: string | null
+  updated_at?: string | null
+  workflow_name?: string | null
+}
+
+/** POST /api/ledger/drafts/{id}/attach：接上一次真实运行后建出的工作流版本 */
+export interface CaliberDraftAttachOut {
+  workflow_id: string
+  version: number
+  /** 并进了定义的指标（口径卡上的 metric） */
+  metrics: unknown[]
+  /** 对不上已有指标名的那些，由人决定新建还是忽略 */
+  warnings: string[]
+}
