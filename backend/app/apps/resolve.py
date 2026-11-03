@@ -61,9 +61,9 @@ SEALED_ORIGINS = ("launcher", "schedule", "app_entry", "app_view", "hook", "api"
 #: - app_backfill：按新口径补算的是现在才算的历史期，不是「最近一次」；趋势另经 trend_runs 按它对应的输入期排进去；
 #: - ledger_issue：问数据的答案按已治理口径正式出具（docs/design/next-round/02-口径账本.md §5），参数是从某人的提问里
 #:   绑出来的。取到它，看板、趋势、分享链接就悄悄换成了那个人问的那组数；
-#: - 其余是探索运行（问数据、画布试跑、试运行、个人应用的刷新，评测、口径对账、口径召回），本来就不是正式运行。
+#: - 其余是探索运行（问数据、画布试跑、试运行、个人应用的刷新，评测、口径对账、口径召回、口径试跑），本来就不是正式运行。
 NOT_SEALED_ORIGINS = (BACKFILL_ORIGIN, "ledger_issue", "chat", "canvas", "trial", "personal_app", "eval", "reconcile",
-                      "recall")
+                      "recall", "caliber_trial")
 
 VIEW_REFUSED = "app_view_refused"
 DAILY_LIMIT = "app_view_daily_limit"
