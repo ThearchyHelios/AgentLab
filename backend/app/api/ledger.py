@@ -286,6 +286,27 @@ async def caliber_descriptor(workflow_id: str, version: int, node_id: str,
     return made
 
 
+class RuleCompileIn(BaseModel):
+    """规则 DSL 编译：表 + 结构化条件 → 只读 SQL；fixtures 可选，用内存 SQLite 跑一遍。"""
+
+    rule: dict[str, Any]
+    table: str
+    fixtures: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("/rules/compile")
+async def compile_rule_endpoint(payload: RuleCompileIn) -> dict[str, Any]:
+    """把结构化规则编译成 SQL，并（给了 fixtures 时）用样例行验证。只生成 SELECT，不碰业务库。"""
+    from app.data.rule_compile import RuleInvalid, compile_rule, run_fixtures
+
+    try:
+        sql = compile_rule(payload.rule, payload.table)
+        checks = run_fixtures(payload.rule, payload.table, payload.fixtures)
+    except RuleInvalid as e:
+        raise HTTPException(422, str(e)) from None
+    return {"sql": sql, "fixtures": checks}
+
+
 class TrialIn(BaseModel):
     """试跑只收入口字段的值；没写的按口径里的缺省值补。"""
 
