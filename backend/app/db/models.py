@@ -1089,6 +1089,43 @@ class WebhookDelivery(Base):
 
 
 # --------------------------------------------------------------------------
+# 口径账本（docs/design/next-round/02-口径账本.md 做法 8 的文档一侧）
+# --------------------------------------------------------------------------
+
+
+class CaliberDraft(Base, TimestampMixin):
+    """从业务文档起草的一份口径（app/ledger/docdraft.py 的产出）。
+
+    草稿在 path_pending 下没有取数路径，不是合法图（validate_graph 会挡），所以不写进 workflows.graph：另存一行，
+    等 attach（app/ledger/docattach.py）按一次真实运行补上取数路径、人审过再进版本。payload 的形状见
+    docdraft.extract 的返回（documents / metrics / dropped / open_questions / alignment / truncated / model_id），
+    origin 记这一份草稿从哪些文档、用哪句话问出来的，attach 之后工作流 id 记在 workflow_id 上。
+    """
+
+    __tablename__ = "caliber_drafts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    collection: Mapped[str] = mapped_column(String(100), default="default")
+    # 起草时给模型看的数据源（只给名字和类型，用来写清适用范围）；源删了草稿照旧在，只丢这一条线索
+    datasource_id: Mapped[str | None] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="SET NULL"), default=None
+    )
+    # 同 docdraft.STATUSES：drafting | questions_open | path_pending | attached | rejected
+    status: Mapped[str] = mapped_column(String(20), default="drafting", index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # 这份草稿从哪来：{"documents": [文档 id], "guidance": 用户补充要求}
+    origin: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    workflow_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="SET NULL"), default=None
+    )
+    # 起草失败的说法（没有可用模型、模型回的东西取不出 JSON……）。草稿不置成 rejected：人改完还能再试
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_by: Mapped[str | None] = mapped_column(String(120), default=None)
+    model_id: Mapped[str | None] = mapped_column(String(120), default=None)
+
+
+# --------------------------------------------------------------------------
 # 应用平台（docs/design/app-platform-and-look.md §3.1）：按领域分文件，这里统一导入，
 # 让 init_db 的 create_all 和其他模块 `from app.db.models import ...` 都认得到
 # --------------------------------------------------------------------------

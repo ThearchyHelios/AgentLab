@@ -18,23 +18,29 @@
   每组的结论、「另有 M 组未重算」、手动接着算（app/ledger/recall.py）。版本用量（workflow-versions）另加问数回答、导出、召回。
 - GET /api/ledger/calibers、GET /api/ledger/calibers/{workflow_id}/{version}/{node_id}（router，搭建者）：口径可调用描述
   （app/ledger/descriptor.py）：入口字段的 JSON Schema、依赖、能不能组合和出具；不返回 SQL 和参数值。
+- POST /api/ledger/drafts/extract、GET /api/ledger/drafts、GET/PATCH /api/ledger/drafts/{id}、POST …/{id}/dismiss、
+  POST …/{id}/attach（router，搭建者）：从业务文档起草口径（app/ledger/docdraft.py），草稿独立存在、不写进
+  workflows.graph；attach 才按一次真实运行补上取数路径（app/ledger/docattach.py）。
 这几个新接口都不放给访问密钥（auth/keys.KEY_ROUTES 不登记）。
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import SessionLocal, get_session
-from app.db.models import Run, Workflow
+from app.db.models import CaliberDraft, Chunk, DataSource, Document, Run, Workflow
 from app.db.models_process import ActionRecord
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ledger", tags=["ledger"])
 #: 口径账本里按运行读的那几个（一个答案里每个数的口径标签等，docs/design/next-round/02-口径账本.md）：挂在
@@ -372,4 +378,338 @@ async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: T
                  if m.get(k) is not None}
                 for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id")
             ]
+    return out
+
+
+# --------------------------------------------------------------------------
+# 从业务文档起草口径（app/ledger/docdraft.py；attach 是 app/ledger/docattach.py）
+# --------------------------------------------------------------------------
+
+#: 草稿被驳回的审计（和 certify.dismiss 同一个写法：subject 是草稿 id）
+DRAFT_DISMISS_ACTION = "ledger.docdraft.dismiss"
+DRAFT_SUBJECT_KIND = "ledger_draft"
+
+
+def _question_count(payload: dict[str, Any]) -> int:
+    """未决问题数：跨指标的 open_questions + 各指标自己的。status 就按它算，PATCH 之后重算也用它。"""
+    def count(items: Any) -> int:
+        return len([q for q in items if isinstance(q, str) and q.strip()]) if isinstance(items, list) else 0
+
+    total = count(payload.get("open_questions"))
+    metrics = payload.get("metrics")
+    for metric in metrics if isinstance(metrics, list) else []:
+        if isinstance(metric, dict):
+            total += count(metric.get("open_questions"))
+    return total
+
+
+def _status_for(payload: dict[str, Any]) -> str:
+    """还有问题 → questions_open，否则 path_pending（等一次真实运行补取数路径）。"""
+    return "questions_open" if _question_count(payload) else "path_pending"
+
+
+def _draft_summary(draft: CaliberDraft) -> dict[str, Any]:
+    payload = draft.payload if isinstance(draft.payload, dict) else {}
+    metrics = payload.get("metrics")
+    return {"id": draft.id, "title": draft.title, "status": draft.status,
+            "metric_count": len(metrics) if isinstance(metrics, list) else 0,
+            "question_count": _question_count(payload), "workflow_id": draft.workflow_id,
+            "created_at": draft.created_at.isoformat() if draft.created_at else None, "error": draft.error}
+
+
+async def _draft_view(session: AsyncSession, draft: CaliberDraft) -> dict[str, Any]:
+    """一份草稿的完整样子：payload 摊平在上层（界面直接读 metrics / open_questions），另加状态和关联工作流名。"""
+    payload = draft.payload if isinstance(draft.payload, dict) else {}
+    workflow = await session.get(Workflow, draft.workflow_id) if draft.workflow_id else None
+    return {**payload, **_draft_summary(draft),
+            "collection": draft.collection, "datasource_id": draft.datasource_id,
+            "origin": draft.origin if isinstance(draft.origin, dict) else {},
+            "model_id": draft.model_id or payload.get("model_id"), "created_by": draft.created_by,
+            "updated_at": draft.updated_at.isoformat() if draft.updated_at else None,
+            "workflow_name": workflow.name if workflow is not None else None}
+
+
+async def _draft_or_404(session: AsyncSession, draft_id: str) -> CaliberDraft:
+    draft = await session.get(CaliberDraft, draft_id)
+    if draft is None:
+        raise HTTPException(404, "口径草稿不存在，可能已被删除")
+    return draft
+
+
+async def _published_metrics(session: AsyncSession) -> list[dict[str, Any]]:
+    """已发布口径里的每一项指标，给 docdraft.alignment 用：{workflow_id, version, node_id, name, synonyms, unit,
+    definition_text}。直接复用 descriptor.list_calibers 的认法（只看最新已发布且未退役版本的源头口径卡）。"""
+    from app.ledger.descriptor import list_calibers
+
+    out: list[dict[str, Any]] = []
+    for described in await list_calibers(session):
+        for metric in described.get("metrics") or []:
+            if not isinstance(metric, dict):
+                continue
+            definition = metric.get("definition")
+            text = definition.get("text") if isinstance(definition, dict) else None
+            name = metric.get("name") or metric.get("id")
+            if not name:
+                continue
+            out.append({"workflow_id": described["workflow_id"], "version": described["version"],
+                        "node_id": described["card"]["node_id"], "name": str(name),
+                        "synonyms": metric.get("synonyms") if isinstance(metric.get("synonyms"), list) else [],
+                        "unit": metric.get("unit") or "", "definition_text": text or ""})
+    return out
+
+
+def _doc_title(docs: list[Document]) -> str:
+    """草稿标题取第一份文档的名字；多份文档写明还有几份。"""
+    first = docs[0]
+    title = (first.title or first.source or first.id).strip() or first.id
+    return (f"{title}等 {len(docs)} 份文档" if len(docs) > 1 else title)[:200]
+
+
+async def _extract_in_background(draft_id: str) -> None:
+    """后台起草：读文档的段落、调一次模型、和已发布口径对齐，结果写回这一行。
+
+    用新的会话：请求那一份在响应发出后就关了，后台接着用它写库是错的。失败写进 error、状态留在 drafting——
+    草稿不是「被驳回」，人改完文档还能再来一次。
+    """
+    from app.ledger import docdraft
+
+    async with SessionLocal() as session:
+        draft = await session.get(CaliberDraft, draft_id)
+        if draft is None or draft.status != "drafting":
+            return
+        origin = draft.origin if isinstance(draft.origin, dict) else {}
+        wanted = [str(d) for d in origin.get("documents") or []]
+        docs: list[Document] = []
+        for doc_id in wanted:
+            doc = await session.get(Document, doc_id)
+            if doc is not None:
+                docs.append(doc)
+        chunks: dict[str, dict[str, Any]] = {}
+        entries: list[dict[str, Any]] = []
+        for doc in docs:
+            rows = (await session.execute(select(Chunk).where(Chunk.document_id == doc.id)
+                                          .order_by(Chunk.ordinal, Chunk.id))).scalars()
+            chunk_ids: list[str] = []
+            for chunk in rows:
+                chunks[chunk.id] = {"ordinal": chunk.ordinal, "content": chunk.content or "",
+                                    "document_id": doc.id}
+                chunk_ids.append(chunk.id)
+            entries.append({"document_id": doc.id, "title": doc.title or doc.source or doc.id,
+                            "chunk_ids": chunk_ids})
+        datasource = None
+        if draft.datasource_id:
+            source = await session.get(DataSource, draft.datasource_id)
+            if source is not None:
+                datasource = {"name": source.name, "type": source.kind, "description": source.description}
+        try:
+            result = await docdraft.extract(session, docs=entries, chunks=chunks,
+                                            guidance=str(origin.get("guidance") or ""), datasource=datasource)
+            # 对齐要扫所有已发布口径：某一份读不出来不该让整份草稿失败，照实不做对齐（alignment 三个空列表）
+            try:
+                existing = await _published_metrics(session)
+            except Exception:  # noqa: BLE001 - 对齐是辅助信息，不是草稿本身
+                logger.exception("读已发布口径失败，草稿 %s 不做对齐", draft_id)
+                existing = []
+            payload = {
+                "documents": entries, "metrics": result["metrics"], "dropped": result["dropped"],
+                "open_questions": result["open_questions"],
+                "alignment": docdraft.alignment(result["metrics"], existing),
+                "truncated": result["truncated"], "model_id": result["model_id"],
+            }
+        except docdraft.DraftUnavailable as e:
+            draft.error = str(e) or "AI 起草不可用"
+            await session.commit()
+            return
+        except Exception as e:  # noqa: BLE001 - 后台出错要写回这一行，不然界面永远停在「起草中」
+            logger.exception("从文档起草口径出错（草稿 %s）", draft_id)
+            draft.error = f"起草出错：{e}"
+            await session.commit()
+            return
+        draft.payload = payload
+        draft.model_id = result["model_id"] or None
+        draft.error = None
+        draft.status = _status_for(payload)
+        await session.commit()
+
+
+class DraftExtractIn(BaseModel):
+    """从哪几份文档起草、起草时给模型看的附加要求。数据源只用来写清适用范围，不给表结构。"""
+
+    documents: list[str] = Field(min_length=1, max_length=20)
+    collection: str | None = Field(default=None, max_length=100)
+    datasource_id: str | None = Field(default=None, max_length=32)
+    guidance: str = Field(default="", max_length=2000)
+
+
+@router.post("/drafts/extract", status_code=201)
+async def draft_extract(payload: DraftExtractIn, background: BackgroundTasks,
+                        session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """从业务文档起草一份口径（app/ledger/docdraft.py）：先建一行 drafting 立刻返回，模型在后台跑。
+
+    文档必须都存在（缺的回 422，一个草稿都不建）；数据源给了也必须存在。草稿只产出定义，不产出取数，也不写进
+    workflows.graph——path_pending 不是合法的图。抽取完的 payload / status 用 GET 看。"""
+    from app.api.deps import current_principal, ensure_role
+
+    ensure_role("builder")
+    doc_ids = list(dict.fromkeys(str(d) for d in payload.documents if str(d).strip()))
+    if not doc_ids:
+        raise HTTPException(422, "至少要给一份文档")
+    found = {doc.id: doc for doc in (await session.execute(
+        select(Document).where(Document.id.in_(doc_ids)))).scalars()}
+    missing = [doc_id for doc_id in doc_ids if doc_id not in found]
+    if missing:
+        raise HTTPException(422, f"文档不存在，可能已被删除：{'、'.join(missing)}")
+    if payload.datasource_id and await session.get(DataSource, payload.datasource_id) is None:
+        raise HTTPException(422, "数据源不存在，可能已被删除")
+    docs = [found[doc_id] for doc_id in doc_ids]
+    draft = CaliberDraft(title=_doc_title(docs),
+                         collection=payload.collection or (docs[0].collection or "default"),
+                         datasource_id=payload.datasource_id or None, status="drafting", payload={},
+                         origin={"documents": doc_ids, "guidance": payload.guidance.strip()},
+                         created_by=current_principal().username)
+    session.add(draft)
+    await session.commit()
+    background.add_task(_extract_in_background, draft.id)
+    return {"draft_id": draft.id, "status": draft.status}
+
+
+@router.get("/drafts")
+async def list_drafts(status: str | None = Query(default=None, description="按状态筛：drafting / questions_open / "
+                                                   "path_pending / attached / rejected"),
+                      session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """口径草稿列表，最近改过的在前。只给计数和状态，正文用 GET /api/ledger/drafts/{id} 看。"""
+    from app.api.deps import ensure_role
+    from app.ledger import docdraft
+
+    ensure_role("builder")
+    query = select(CaliberDraft).order_by(CaliberDraft.updated_at.desc(), CaliberDraft.id.desc())
+    if status:
+        if status not in docdraft.STATUSES:
+            raise HTTPException(422, f"不认识的状态：{status}")
+        query = query.where(CaliberDraft.status == status)
+    rows = (await session.execute(query)).scalars()
+    return {"drafts": [_draft_summary(draft) for draft in rows]}
+
+
+@router.get("/drafts/{draft_id}")
+async def get_draft(draft_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """一份草稿的完整内容：指标（含引用和 span）、丢弃原因、未决问题、和已发布口径的对齐结果、关联工作流名。"""
+    from app.api.deps import ensure_role
+
+    ensure_role("builder")
+    return await _draft_view(session, await _draft_or_404(session, draft_id))
+
+
+def _check_metrics(metrics: Any) -> list[dict[str, Any]]:
+    """PATCH 换指标时只做结构校验（不重跑引用核对：引用是模型交的，人改过的段落没法再逐字对一遍）。"""
+    if not isinstance(metrics, list):
+        raise HTTPException(422, "metrics 要是数组")
+    for position, metric in enumerate(metrics, start=1):
+        if not isinstance(metric, dict):
+            raise HTTPException(422, f"第 {position} 条指标不是一个对象")
+        name = metric.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(422, f"第 {position} 条指标缺少名称")
+        for key in ("synonyms", "open_questions"):
+            value = metric.get(key)
+            if value is not None and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)):
+                raise HTTPException(422, f"第 {position} 条指标的 {key} 要是字符串数组")
+        if metric.get("definition") is not None and not isinstance(metric.get("definition"), dict):
+            raise HTTPException(422, f"第 {position} 条指标的 definition 要是一个对象")
+    return [dict(metric) for metric in metrics]
+
+
+class DraftPatchIn(BaseModel):
+    """改标题、整体换掉指标、或把已经答清的问题消掉。"""
+
+    title: str | None = Field(default=None, max_length=200)
+    metrics: list[dict[str, Any]] | None = None
+    resolved: list[str] | None = None
+
+
+@router.patch("/drafts/{draft_id}")
+async def patch_draft(draft_id: str, payload: DraftPatchIn, session: AsyncSession = Depends(get_session)
+                      ) -> dict[str, Any]:
+    """改一份草稿：metrics 整体替换（只做结构校验，不重跑引用核对）；resolved 里的问题从跨指标和各指标的问题里删掉。
+    据此重算状态（还有问题 → questions_open，否则 path_pending）。已经 attach 或驳回的草稿不改状态——那时它说的
+    已经不是一份草稿了。"""
+    from app.api.deps import ensure_role
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    body = draft.payload if isinstance(draft.payload, dict) else {}
+    payload_data = dict(body)
+    if payload.title is not None:
+        if not payload.title.strip():
+            raise HTTPException(422, "标题不能为空")
+        draft.title = payload.title.strip()
+    if payload.metrics is not None:
+        payload_data["metrics"] = _check_metrics(payload.metrics)
+    if payload.resolved is not None:
+        drop = {q.strip() for q in payload.resolved if isinstance(q, str) and q.strip()}
+        questions = payload_data.get("open_questions")
+        payload_data["open_questions"] = [q for q in questions if isinstance(q, str) and q.strip() not in drop] \
+            if isinstance(questions, list) else []
+        metrics = payload_data.get("metrics")
+        for metric in metrics if isinstance(metrics, list) else []:
+            if not isinstance(metric, dict) or not isinstance(metric.get("open_questions"), list):
+                continue
+            metric["open_questions"] = [q for q in metric["open_questions"]
+                                        if not (isinstance(q, str) and q.strip() in drop)]
+    if payload.metrics is not None or payload.resolved is not None:
+        draft.payload = payload_data
+        if draft.status in ("drafting", "questions_open", "path_pending"):
+            draft.status = _status_for(payload_data)
+    await session.commit()
+    return await _draft_view(session, draft)
+
+
+class DraftDismissIn(BaseModel):
+    note: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/drafts/{draft_id}/dismiss")
+async def dismiss_draft(draft_id: str, payload: DraftDismissIn,
+                        session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """这份草稿不是口径：置 rejected，写一条审计（ledger.docdraft.dismiss），以后不再出现在待办里。"""
+    from app.api.deps import ensure_role
+    from app.auth.audit import record
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    draft.status = "rejected"
+    await record(session, DRAFT_DISMISS_ACTION, DRAFT_SUBJECT_KIND, draft.id,
+                 data={k: v for k, v in {"title": draft.title, "note": payload.note}.items() if v})
+    await session.commit()
+    return {"ok": True, "draft_id": draft.id, "status": draft.status}
+
+
+class DraftAttachIn(BaseModel):
+    """按哪次运行补取数路径：运行里执行过的查询就是这份口径的取数，不另写 SQL。"""
+
+    run_id: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/drafts/{draft_id}/attach")
+async def attach_draft(draft_id: str, payload: DraftAttachIn,
+                       session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """把定义接到一次真实运行上（app/ledger/docattach.py）：由它建工作流和版本，交回 {workflow_id, version, metrics,
+    warnings}。成功后草稿记下工作流 id、置 attached。接不上时照 docattach 自己的状态码和说法回。"""
+    from app.api.deps import ensure_role
+    from app.ledger.docattach import attach
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    try:
+        out = await attach(session, payload=draft.payload, name=draft.title, run_id=payload.run_id,
+                           draft_id=draft.id)
+    except Exception as e:  # noqa: BLE001 - docattach 的拒绝带着 status_code / message，照原样交回
+        status = getattr(e, "status_code", None)
+        if isinstance(status, int) and getattr(e, "message", None):
+            raise HTTPException(status, e.message) from e
+        raise
+    draft.workflow_id = out.get("workflow_id") or draft.workflow_id
+    draft.status = "attached"
+    draft.error = None
+    await session.commit()
     return out
