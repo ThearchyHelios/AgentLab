@@ -105,6 +105,52 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if problem:
             errors.append(f"指标「{metric_id}」：{problem}")
             continue
+        if str(definition.get("kind") or "formula") == "assessment":
+            assessment, problem = _assessment_of(definition)
+            if problem:
+                errors.append(f"指标「{metric_id}」：{problem}")
+                continue
+            dimensions = assessment["dimensions"]
+            values_by_name = {str(d["name"]): _value_of(str(d["input"]), tctx) for d in dimensions}
+            missing = [name for name, value in values_by_name.items() if value is None]
+            if missing and on_missing != "null":
+                errors.append(f"指标「{metric_id}」：" + _missing_reason([str(d["input"]) for d in dimensions
+                                                                         if d["name"] in missing]))
+                continue
+            value: Any = None
+            details: list[dict[str, Any]] = []
+            level: str | None = None
+            if not missing:
+                total = sum(float(d.get("weight", 1)) for d in dimensions)
+                points = 0.0
+                for d in dimensions:
+                    low, high = float(d.get("min", 0)), float(d.get("max", 100))
+                    raw = float(values_by_name[str(d["name"])])
+                    normalized = max(0.0, min(100.0, (raw - low) / (high - low) * 100))
+                    weight = float(d.get("weight", 1))
+                    points += normalized * weight
+                    details.append({"name": d["name"], "value": raw, "normalized": normalized, "weight": weight})
+                value = round_metric(points / total, display["decimals"])
+                level = next((str(l["name"]) for l in assessment["levels"] if value >= float(l["min"])), None)
+            inputs = [_input_of(str(d["input"]), values_by_name[str(d["name"])], state, ctx, tctx)
+                      for d in dimensions]
+            metrics.append({
+                "id": metric_id,
+                "name": definition.get("name") or metric_id,
+                "unit": definition.get("unit") or "",
+                "value": value,
+                "expression": "",
+                "decimals": display["decimals"],
+                "format": display["format"],
+                "rendered": _rendered(value, definition, display),
+                "inputs": inputs,
+                "substituted": "加权评分",
+                "recompute_ok": True,
+                "status": "ok" if value is not None else "missing_input",
+                "assessment": {"score": value, "level": level, "dimensions": details,
+                               "levels": assessment["levels"], **({"missing": missing} if missing else {})},
+            })
+            continue
         if str(definition.get("kind") or "formula") == "rule":
             rule, problem = _rule_of(definition)
             if problem:
@@ -499,6 +545,27 @@ def _external_of(definition: dict[str, Any]) -> tuple[Any, dict[str, Any], str |
         return None, {}, "external.stale_after_days 需要是非负整数"
     stale = days is not None and date.today() > as_of + timedelta(days=days)
     return value, {"source": source, "as_of": as_of.isoformat(), "stale_after_days": days, "stale": stale}, None
+
+
+def _assessment_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """评估型指标：{dimensions: [{name, input, weight, min, max}], levels: [{name, min}]}。"""
+    assessment = definition.get("assessment")
+    if not isinstance(assessment, dict):
+        return {}, "评估型指标需要 assessment 对象（dimensions / levels）"
+    dimensions = assessment.get("dimensions")
+    if not isinstance(dimensions, list) or not dimensions:
+        return {}, "评估需要至少一个维度"
+    for dimension in dimensions:
+        if not isinstance(dimension, dict) or not isinstance(dimension.get("name"), str) \
+                or not isinstance(dimension.get("input"), str) \
+                or isinstance(dimension.get("weight", 1), bool) \
+                or not isinstance(dimension.get("weight", 1), (int, float)) \
+                or float(dimension.get("weight", 1)) <= 0:
+            return {}, "评估维度需要 name、input 和正的 weight"
+    levels = assessment.get("levels")
+    if not isinstance(levels, list) or not levels:
+        return {}, "评估需要至少一个等级"
+    return assessment, None
 
 
 def _rule_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]:

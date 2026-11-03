@@ -53,12 +53,13 @@ export interface LedgerRelated {
  * - unknown：没比对（reason 写为什么）
  */
 export interface LedgerLabel {
-  kind: 'caliber' | 'external' | 'derived' | 'related' | 'reasoning' | 'unknown'
+  kind: 'caliber' | 'external' | 'derived' | 'assessed' | 'related' | 'reasoning' | 'unknown'
   how?: 'independent' | 'composed'
   source?: string
   as_of?: string
   stale?: boolean
   rule?: { inputs?: Record<string, string>; all?: unknown[]; then?: number; else?: number }
+  assessment?: { score?: number | null; level?: string | null; dimensions?: unknown[]; levels?: unknown[] }
   caliber?: string
   workflow_id?: string
   version?: number

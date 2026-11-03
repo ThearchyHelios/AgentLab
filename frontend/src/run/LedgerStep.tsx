@@ -367,6 +367,20 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
           {label.rule?.all?.length ? <p className="text-2xs text-faint">条件：{label.rule.all.length} 条</p> : null}
         </div>
       )}
+      {label.kind === 'assessed' && (
+        <div className="space-y-1" data-ledger-assessed="">
+          <p className="font-medium">评估值</p>
+          <p className="text-2xs text-dim">
+            按评分协议从输入算出，不是测量值；不参与自动正式出具。
+          </p>
+          {label.assessment?.level && (
+            <p className="text-2xs text-faint">
+              等级：{label.assessment.level}
+              {label.assessment.score != null ? ` · 得分：${label.assessment.score}` : ''}
+            </p>
+          )}
+        </div>
+      )}
       {label.kind === 'related' && (
         <div className="space-y-2">
           <p className="text-2xs text-dim">{LEDGER_UI.step.relatedSub}{label.reason ? `：${label.reason}` : ''}</p>

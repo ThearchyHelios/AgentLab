@@ -29,7 +29,7 @@ def test_a_formula_metric_can_carry_a_definition_and_params():
 
 
 def test_an_unimplemented_kind_is_refused():
-    errors = _errors(_graph(kind="assessment"))
+    errors = _errors(_graph(kind="normative"))
     assert any(i.code == "metrics.kind_unsupported" and "还没有实现" in i.message for i in errors)
 
 
@@ -148,3 +148,59 @@ def test_a_rule_metric_is_labelled_derived_with_its_input_queries():
     label = metric_label(card, "big", {}, {})
     assert label["kind"] == "derived" and label["queries"] == ["q1"]
     assert label["definition_hash"] == "abc" and label["rule"]["all"][0]["op"] == "eq"
+
+
+def test_an_assessment_metric_needs_unique_dimensions_and_descending_levels():
+    bad = _errors(_graph(kind="assessment", assessment={
+        "dimensions": [{"name": "a", "input": "x"}, {"name": "a", "input": "y"}],
+        "levels": [{"name": "B", "min": 70}, {"name": "A", "min": 85}]}))
+    assert [i.code for i in bad].count("metrics.assessment_invalid") >= 2
+    good = _graph(kind="assessment", assessment={
+        "dimensions": [{"name": "响应", "input": "cell(nodes.fetch, 0, 'response')", "weight": 0.5},
+                       {"name": "解决", "input": "cell(nodes.fetch, 0, 'resolution')", "weight": 0.5}],
+        "levels": [{"name": "A", "min": 85}, {"name": "B", "min": 70}, {"name": "C", "min": 0}]})
+    assert _errors(good) == []
+
+
+async def test_an_assessment_metric_scores_and_picks_a_level(tmp_path):
+    from app.api.evidence import _sealed, _sealed_cards
+    from app.engine.runner import run_manager
+
+    await run_manager.setup()
+    try:
+        await S.fresh_source(tmp_path / "assessment.db")
+        graph = S.chain(
+            S.node("start", "input"),
+            S.node("fetch", "tool", tool=S.tool(), args={"sql": "SELECT 90 AS response, 70 AS resolution"}),
+            S.node("card", "metrics", caliber="服务质量", caliber_version="v1", metrics=[{
+                "id": "quality", "name": "服务质量", "unit": "分", "kind": "assessment",
+                "assessment": {
+                    "dimensions": [{"name": "响应", "input": "cell(nodes.fetch, 0, 'response')", "weight": 0.5},
+                                   {"name": "解决", "input": "cell(nodes.fetch, 0, 'resolution')", "weight": 0.5}],
+                    "levels": [{"name": "A", "min": 85}, {"name": "B", "min": 70}, {"name": "C", "min": 0}],
+                },
+            }]),
+            S.node("out", "output", fields=[{"name": "v", "value": "{{ nodes.card.metrics[0].value }}"}]))
+        started = await run_manager.start(graph=graph, input_payload={})
+        row = await S.wait(started.id)
+        assert row.status == "succeeded", row.error
+        assert float(row.output["v"]) == 80
+        sealed = await _sealed(row.id)
+        [card] = [c for _, _, c in _sealed_cards(sealed)]
+        assessment = card["metrics"][0]["assessment"]
+        assert assessment["level"] == "B" and assessment["score"] == 80
+        assert [d["normalized"] for d in assessment["dimensions"]] == [90.0, 70.0]
+    finally:
+        await run_manager.shutdown()
+
+
+def test_an_assessment_metric_is_labelled_assessed():
+    from app.ledger.labels import metric_label
+
+    card = {"definition_hash": "abc", "metrics": [{
+        "id": "quality", "assessment": {"score": 80, "level": "B"},
+        "inputs": [{"artifact": "q1", "via": "tool_cell"}],
+    }]}
+    label = metric_label(card, "quality", {}, {})
+    assert label["kind"] == "assessed" and label["queries"] == ["q1"]
+    assert label["assessment"]["level"] == "B" and label["definition_hash"] == "abc"

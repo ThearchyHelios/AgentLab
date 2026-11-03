@@ -26,7 +26,7 @@ from typing import Any
 
 #: 指标的语义字段：只有这几样算定义，运行时值（value、rendered、inputs……）不参与哈希
 SEMANTIC_FIELDS = ("id", "name", "expression", "unit", "decimals", "format", "kind", "definition", "params", "external",
-                   "rule")
+                   "rule", "assessment")
 
 
 def _blank(value: Any) -> bool:

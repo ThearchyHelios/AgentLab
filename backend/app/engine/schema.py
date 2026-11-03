@@ -1088,7 +1088,7 @@ def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult)
 
 #: 指标定义的类型。现在只有公式（表达式）这一种在运行时能算；规则、评估、外部常量还没实现，
 #: 先在校验里挡住，免得写进图里以后被当成能算的指标
-METRIC_KINDS = ("formula", "external", "rule")
+METRIC_KINDS = ("formula", "external", "rule", "assessment")
 #: 定义卡参数的标量类型（和入口表单的字段类型同一套子集）
 METRIC_PARAM_TYPES = ("string", "number", "integer", "boolean")
 #: 规则条件能用的比较
@@ -1170,6 +1170,56 @@ def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[V
             for key in ("then", "else"):
                 if key in rule and (isinstance(rule[key], bool) or not isinstance(rule[key], (int, float))):
                     add(f"规则的 {key} 需要是数", f"{field}.rule.{key}", code="metrics.rule_invalid")
+    elif kind == "assessment":
+        assessment = metric.get("assessment")
+        if not isinstance(assessment, dict):
+            add("评估型指标需要 assessment 对象（dimensions / levels）", f"{field}.assessment",
+                code="metrics.assessment_invalid")
+        else:
+            dimensions = assessment.get("dimensions")
+            if not isinstance(dimensions, list) or not dimensions:
+                add("评估需要 dimensions：至少一个维度", f"{field}.assessment.dimensions",
+                    code="metrics.assessment_invalid")
+                dimensions = []
+            names: set[str] = set()
+            for j, dimension in enumerate(dimensions):
+                key = f"{field}.assessment.dimensions[{j}]"
+                if not isinstance(dimension, dict):
+                    add("评估维度需要是一个对象", key, code="metrics.assessment_invalid")
+                    continue
+                name = dimension.get("name")
+                if not isinstance(name, str) or not name.strip() or name in names:
+                    add("评估维度需要唯一的名字", f"{key}.name", code="metrics.assessment_invalid")
+                else:
+                    names.add(name)
+                if not isinstance(dimension.get("input"), str) or not dimension["input"].strip():
+                    add("评估维度需要 input（取值路径）", f"{key}.input", code="metrics.assessment_invalid")
+                weight = dimension.get("weight", 1)
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
+                    add("评估维度的 weight 需要是正数", f"{key}.weight", code="metrics.assessment_invalid")
+                low, high = dimension.get("min", 0), dimension.get("max", 100)
+                if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (low, high)) or high <= low:
+                    add("评估维度的 min / max 需要是数，且 max 大于 min", key, code="metrics.assessment_invalid")
+            levels = assessment.get("levels")
+            if not isinstance(levels, list) or not levels:
+                add("评估需要 levels：至少一个等级", f"{field}.assessment.levels",
+                    code="metrics.assessment_invalid")
+                levels = []
+            previous: float | None = None
+            for j, level in enumerate(levels):
+                key = f"{field}.assessment.levels[{j}]"
+                if not isinstance(level, dict):
+                    add("评估等级需要是一个对象", key, code="metrics.assessment_invalid")
+                    continue
+                if not isinstance(level.get("name"), str) or not level["name"].strip():
+                    add("评估等级需要名字", f"{key}.name", code="metrics.assessment_invalid")
+                minimum = level.get("min")
+                if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+                    add("评估等级的 min 需要是数", f"{key}.min", code="metrics.assessment_invalid")
+                elif previous is not None and minimum >= previous:
+                    add("评估等级要按 min 从高到低排列", f"{key}.min", code="metrics.assessment_invalid")
+                else:
+                    previous = float(minimum)
     elif not metric.get("expression"):
         add(f"指标定义缺少表达式：{metric.get('id') or '（空）'}", code="metrics.expression_missing")
 
