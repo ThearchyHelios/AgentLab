@@ -1088,9 +1088,11 @@ def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult)
 
 #: 指标定义的类型。现在只有公式（表达式）这一种在运行时能算；规则、评估、外部常量还没实现，
 #: 先在校验里挡住，免得写进图里以后被当成能算的指标
-METRIC_KINDS = ("formula", "external")
+METRIC_KINDS = ("formula", "external", "rule")
 #: 定义卡参数的标量类型（和入口表单的字段类型同一套子集）
 METRIC_PARAM_TYPES = ("string", "number", "integer", "boolean")
+#: 规则条件能用的比较
+RULE_OPS = ("eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in")
 
 
 def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[ValidationIssue]:
@@ -1133,6 +1135,41 @@ def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[V
             if days is not None and (isinstance(days, bool) or not isinstance(days, int) or days < 0):
                 add("external.stale_after_days 需要是非负整数", f"{field}.external.stale_after_days",
                     code="metrics.external_invalid")
+    elif kind == "rule":
+        rule = metric.get("rule")
+        if not isinstance(rule, dict):
+            add("规则型指标需要 rule 对象（inputs / all / then / else）", f"{field}.rule",
+                code="metrics.rule_invalid")
+        else:
+            inputs = rule.get("inputs")
+            if not isinstance(inputs, dict) or not inputs:
+                add("规则需要 inputs：输入名 → 取值路径（例如 cell(nodes.fetch, 0, 'status')）",
+                    f"{field}.rule.inputs", code="metrics.rule_invalid")
+                inputs = {}
+            else:
+                for name, path in inputs.items():
+                    if not isinstance(name, str) or not name.strip() or not isinstance(path, str) \
+                            or not path.strip():
+                        add("规则的每个输入都要有名字和取值路径", f"{field}.rule.inputs", code="metrics.rule_invalid")
+            conditions = rule.get("all")
+            if not isinstance(conditions, list) or not conditions:
+                add("规则需要 all：至少一条条件", f"{field}.rule.all", code="metrics.rule_invalid")
+                conditions = []
+            for j, cond in enumerate(conditions):
+                key = f"{field}.rule.all[{j}]"
+                if not isinstance(cond, dict) or cond.get("input") not in inputs:
+                    add("条件要指向一个已声明的输入", key, code="metrics.rule_invalid")
+                    continue
+                if cond.get("op") not in RULE_OPS:
+                    add(f"条件运算符只能是 {'、'.join(RULE_OPS)}", f"{key}.op", code="metrics.rule_invalid")
+                if cond.get("op") in ("in", "not_in"):
+                    if not isinstance(cond.get("values"), list):
+                        add("in / not_in 需要 values 列表", f"{key}.values", code="metrics.rule_invalid")
+                elif "value" not in cond:
+                    add("条件需要 value", f"{key}.value", code="metrics.rule_invalid")
+            for key in ("then", "else"):
+                if key in rule and (isinstance(rule[key], bool) or not isinstance(rule[key], (int, float))):
+                    add(f"规则的 {key} 需要是数", f"{field}.rule.{key}", code="metrics.rule_invalid")
     elif not metric.get("expression"):
         add(f"指标定义缺少表达式：{metric.get('id') or '（空）'}", code="metrics.expression_missing")
 

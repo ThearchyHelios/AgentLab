@@ -105,6 +105,39 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if problem:
             errors.append(f"指标「{metric_id}」：{problem}")
             continue
+        if str(definition.get("kind") or "formula") == "rule":
+            rule, problem = _rule_of(definition)
+            if problem:
+                errors.append(f"指标「{metric_id}」：{problem}")
+                continue
+            inputs_cfg = {str(name): str(path) for name, path in (rule.get("inputs") or {}).items()}
+            values_by_name = {name: _value_of(path, tctx) for name, path in inputs_cfg.items()}
+            missing = [name for name, value in values_by_name.items() if value is None]
+            if missing and on_missing != "null":
+                errors.append(f"指标「{metric_id}」：" + _missing_reason([inputs_cfg[name] for name in missing]))
+                continue
+            value: Any = None
+            if not missing:
+                value = rule.get("then", 1) if _rule_matches(values_by_name, rule) else rule.get("else", 0)
+            decimals = display["decimals"]
+            value = round_metric(value, decimals)
+            inputs = [_input_of(path, values_by_name[name], state, ctx, tctx) for name, path in inputs_cfg.items()]
+            metrics.append({
+                "id": metric_id,
+                "name": definition.get("name") or metric_id,
+                "unit": definition.get("unit") or "",
+                "value": value,
+                "expression": "",
+                "decimals": decimals,
+                "format": display["format"],
+                "rendered": _rendered(value, definition, display),
+                "inputs": inputs,
+                "substituted": _rule_text(rule),
+                "recompute_ok": True,
+                "status": "ok" if value is not None else "missing_input",
+                "rule": rule,
+            })
+            continue
         if str(definition.get("kind") or "formula") == "external":
             value, external, problem = _external_of(definition)
             if problem:
@@ -466,6 +499,61 @@ def _external_of(definition: dict[str, Any]) -> tuple[Any, dict[str, Any], str |
         return None, {}, "external.stale_after_days 需要是非负整数"
     stale = days is not None and date.today() > as_of + timedelta(days=days)
     return value, {"source": source, "as_of": as_of.isoformat(), "stale_after_days": days, "stale": stale}, None
+
+
+def _rule_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """规则型指标：{inputs: {名字: 取值路径}, all: [{input, op, value|values}], then, else}。"""
+    rule = definition.get("rule")
+    if not isinstance(rule, dict):
+        return {}, "规则型指标需要 rule 对象（inputs / all / then / else）"
+    inputs = rule.get("inputs")
+    if not isinstance(inputs, dict) or not inputs:
+        return {}, "规则需要 inputs：输入名 → 取值路径"
+    if any(not isinstance(name, str) or not str(name).strip() or not isinstance(path, str) or not path.strip()
+           for name, path in inputs.items()):
+        return {}, "规则的每个输入都要有名字和取值路径"
+    conditions = rule.get("all")
+    if not isinstance(conditions, list) or not conditions:
+        return {}, "规则需要 all：至少一条条件"
+    for cond in conditions:
+        if not isinstance(cond, dict) or cond.get("input") not in inputs:
+            return {}, "规则的条件要指向一个已声明的输入"
+        if cond.get("op") not in ("eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in"):
+            return {}, "规则条件的运算符不认识"
+        if cond.get("op") in ("in", "not_in") and not isinstance(cond.get("values"), list):
+            return {}, "in / not_in 需要 values 列表"
+        if cond.get("op") not in ("in", "not_in") and "value" not in cond:
+            return {}, "规则条件需要 value"
+    return rule, None
+
+
+def _rule_matches(values: dict[str, Any], rule: dict[str, Any]) -> bool:
+    """所有条件都成立才为真；类型对不上（字符串和数比较）按不成立，不抛。"""
+    for cond in rule.get("all") or []:
+        a = values.get(str(cond.get("input")))
+        op = cond.get("op")
+        if op in ("in", "not_in"):
+            found = a in (cond.get("values") or [])
+            if found != (op == "in"):
+                return False
+            continue
+        b = cond.get("value")
+        try:
+            ok = {"eq": a == b, "ne": a != b, "gt": a > b, "gte": a >= b, "lt": a < b, "lte": a <= b}.get(op, False)
+        except TypeError:
+            ok = False
+        if not ok:
+            return False
+    return True
+
+
+def _rule_text(rule: dict[str, Any]) -> str:
+    """规则的一句话写法，给指标清单和证据面板看。"""
+    parts = []
+    for cond in rule.get("all") or []:
+        right = cond.get("values") if cond.get("op") in ("in", "not_in") else cond.get("value")
+        parts.append(f"{cond.get('input')} {cond.get('op')} {right}")
+    return " 且 ".join(parts)
 
 
 def _display_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]:

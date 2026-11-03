@@ -34,7 +34,7 @@ from typing import Any
 from app.analysis.contract import LEDGER_KIND
 
 #: 标签的四种、认法的两种
-KINDS = ("caliber", "external", "related", "reasoning", "unknown")
+KINDS = ("caliber", "external", "derived", "related", "reasoning", "unknown")
 HOWS = ("independent", "composed")
 #: 界面上标签要写明的两句：比对在封存之后做，不在封存范围内；事后补比的是按现在的口径回看
 POST_SEAL_NOTE = "封存后比对，不在封存范围内"
@@ -308,6 +308,11 @@ def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mappin
                 **({"definition_hash": card.get("definition_hash")} if card.get("definition_hash") else {})}
     inputs = [i for i in metric.get("inputs") or [] if isinstance(i, dict)]
     from_queries = [i for i in inputs if i.get("artifact") and i.get("via") in _SNAPSHOT_VIAS]
+    if metric.get("rule") is not None:
+        # 规则型指标：数由规则从输入算出，不是某条查询与口径等价；输入仍然逐格可追溯
+        return {"kind": "derived", "rule": metric.get("rule"),
+                "queries": [str(i["artifact"]) for i in from_queries],
+                **({"definition_hash": card.get("definition_hash")} if card.get("definition_hash") else {})}
     if not from_queries:
         return {"kind": "reasoning"}
     rows = [queries.get(str(i["artifact"])) for i in from_queries]

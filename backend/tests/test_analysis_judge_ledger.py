@@ -88,7 +88,7 @@ def test_analysis_numbers_get_no_caliber_label_and_are_not_counted():
     labelled = {s["id"]: s.get("ref") for s in iter_segments(doc) if s["id"] in labels}
     assert list(labelled.values()) == ["v:Q1.r0.gmv"]
     whole = ledger_labels.whole_of(labels, {})
-    assert whole["counts"] == {"caliber": 0, "external": 0, "related": 0, "reasoning": 1, "unknown": 0}
+    assert whole["counts"] == {"caliber": 0, "external": 0, "derived": 0, "related": 0, "reasoning": 1, "unknown": 0}
     assert ledger_labels.referenced_columns([doc], lambda _: None) == {q: {"gmv"}}
 
 

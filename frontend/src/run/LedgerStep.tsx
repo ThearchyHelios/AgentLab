@@ -358,6 +358,15 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
           <p className="text-2xs text-faint">不来自查询，没有等价证明；正式出具前请核对来源和有效期。</p>
         </div>
       )}
+      {label.kind === 'derived' && (
+        <div className="space-y-1" data-ledger-derived="">
+          <p className="font-medium">按规则派生</p>
+          <p className="text-2xs text-dim">
+            数由规则从查询结果算出，不是某条查询与口径等价；输入仍然逐格可追溯。
+          </p>
+          {label.rule?.all?.length ? <p className="text-2xs text-faint">条件：{label.rule.all.length} 条</p> : null}
+        </div>
+      )}
       {label.kind === 'related' && (
         <div className="space-y-2">
           <p className="text-2xs text-dim">{LEDGER_UI.step.relatedSub}{label.reason ? `：${label.reason}` : ''}</p>
