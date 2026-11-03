@@ -21,6 +21,7 @@ import { SettingsPage } from './pages/SettingsPage'
 import { SchedulesPage } from './pages/schedules/SchedulesPage'
 // 评测（下一轮第 4 波，评测-D8）：顶级导航，搭建者以上可见
 import { EvalsPage } from './pages/evals/EvalsPage'
+import { CaliberCatalog } from './pages/ledger/CaliberCatalog'
 import { NotFound } from './pages/NotFound'
 // 应用平台：使用面（FE-5）、搭建面的应用编辑（FE-6）
 import { AppsHome } from './pages/apps/AppsHome'
@@ -194,6 +195,7 @@ function Shell() {
               <Route path="/evals" element={<EvalsPage />} />
               <Route path="/evals/:section" element={<EvalsPage />} />
               <Route path="/evals/:section/:id" element={<EvalsPage />} />
+              <Route path="/ledger/calibers" element={<CaliberCatalog />} />
               {/* 应用：固定路径（inbox）写在 /apps/:appId 前面，读的人一眼看出它不是应用 id */}
               <Route path="/apps" element={<AppsHome />} />
               {/* 要在 /apps/:appId 之前：create 不是应用 id */}

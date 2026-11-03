@@ -5,8 +5,8 @@ import type { NavigateFunction } from 'react-router-dom'
 import { create } from 'zustand'
 import clsx from 'clsx'
 import {
-  Bell, BellOff, BookOpen, CalendarClock, Database, FlaskConical, Gauge, History, Hourglass, Inbox, Keyboard, LayoutGrid,
-  MessageSquare, MessageSquarePlus, Monitor, Plus, Search, Settings, SunMoon, Workflow as WorkflowIcon, Wrench,
+  Bell, BellOff, BookOpen, CalendarClock, Database, FlaskConical, Gauge, History, Hourglass, Inbox, Keyboard, Layers,
+  LayoutGrid, MessageSquare, MessageSquarePlus, Monitor, Plus, Search, Settings, SunMoon, Workflow as WorkflowIcon, Wrench,
 } from 'lucide-react'
 import { ApiError, api } from '../api/client'
 import { hasPendingApproval, useCatalog } from '../store/catalog'
@@ -66,6 +66,8 @@ export const PAGES: PageDef[] = [
   { to: '/schedules', label: SCHEDULE_TEXT.title, hint: SCHEDULE_TEXT.hint, icon: CalendarClock, shortcut: 'Alt+8', keywords: 'schedules schedule cron 定时 计划 周期 自动运行' },
   // 评测（评测-D8）：搭建者以上可见（使用者的页面表在 visiblePages 里收窄，用不着另判），同样排在设置前面；快捷键用最后一个空着的 ⌥0
   { to: '/evals', label: EVAL_TEXT.nav, hint: EVAL_TEXT.hint, icon: Gauge, shortcut: 'Alt+0', keywords: 'evals eval evaluation 评测 回归 题集 准确率 A/B 口径命中 重复度' },
+  // 口径目录：已发布口径的入口、依赖和试跑。后加的页，快捷键用没占用的 Alt+L
+  { to: '/ledger/calibers', label: '口径', hint: '查看已发布口径的入口、依赖，并按参数试跑', icon: Layers, shortcut: 'Alt+L', keywords: 'caliber ledger 口径 指标 试跑 入口' },
   { to: '/settings', label: '设置', hint: '模型接入、偏好、运行环境', icon: Settings, shortcut: 'Alt+7', keywords: 'settings provider 模型 署名 主题 偏好' },
 ]
 

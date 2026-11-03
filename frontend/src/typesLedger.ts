@@ -5,6 +5,7 @@
  * 给，界面照着画。比对在封存之后做（不在封存范围内），GET /api/runs/{id}/ledger 在比对还没出结果时答 state=pending，
  * 页面按退避再取（store/ledger.ts），不靠实时流：ledger.matched 在事件总线关闭之后才追加，打开着的页面收不到。
  */
+import type { FormSchema } from './typesApp'
 
 /** 绑定的一个参数：值是这次运行查到过的遮罩值时不给值（masked），也不能拿它代填出具 */
 export interface LedgerBinding {
@@ -369,4 +370,55 @@ export interface FreezeOut {
   params: string[]
   metrics: string[]
   sources: CertifyTurn[]
+}
+
+// ---------------------------------------------------------------- 口径目录 / 试跑
+
+export interface CaliberMetric {
+  id: string
+  name?: string
+  unit?: string
+  decimals?: number
+  format?: string
+}
+
+/** GET /api/ledger/calibers：一份已发布口径卡的可调用描述（不返回 SQL、不返回参数值） */
+export interface CaliberDescriptor {
+  workflow_id: string
+  workflow_name: string
+  version: number
+  level: string
+  graph_hash?: string | null
+  card: { node_id: string; title: string; caliber?: string | null; caliber_version?: string | null }
+  metrics: CaliberMetric[]
+  entry_schema: FormSchema
+  composable: boolean
+  compose_reason?: string | null
+  dependencies: {
+    sources: string[]
+    tables: string[]
+    catalog_versions?: Record<string, unknown> | null
+    schema_versions?: Record<string, unknown> | null
+  }
+  issuance: {
+    level: string
+    auto_issue: boolean
+    requires_independent_proof: boolean
+    side_effects?: string | null
+    reasons: string[]
+  }
+}
+
+export interface CaliberTrialMetric extends CaliberMetric {
+  value?: unknown
+  rendered?: string
+}
+
+/** POST /api/ledger/calibers/{wf}/{version}/{node}/trial：按固定版本试跑一次 */
+export interface CaliberTrialOut {
+  run_id: string
+  status: string
+  output?: Record<string, unknown> | null
+  error?: string | null
+  metrics: CaliberTrialMetric[]
 }

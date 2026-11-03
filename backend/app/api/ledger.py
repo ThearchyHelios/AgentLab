@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from datetime import datetime
@@ -32,7 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import SessionLocal, get_session
-from app.db.models import Workflow
+from app.db.models import Run, Workflow
 from app.db.models_process import ActionRecord
 
 router = APIRouter(prefix="/api/ledger", tags=["ledger"])
@@ -283,3 +284,69 @@ async def caliber_descriptor(workflow_id: str, version: int, node_id: str,
     if made is None:
         raise HTTPException(404, "没有这份口径：工作流不存在、这一版没发布过或已退役，或者节点不是源头口径卡")
     return made
+
+
+class TrialIn(BaseModel):
+    """试跑只收入口字段的值；没写的按口径里的缺省值补。"""
+
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/calibers/{workflow_id}/{version}/{node_id}/trial")
+async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: TrialIn,
+                        session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """按固定版本试跑一份口径：派生只读小图（取数 + 口径卡），跑一次探索运行，返回指标值和运行 id。
+
+    试跑不是正式出具：来源记 trial，不进使用统计、不自动出具；参数按入口 Schema 校验，缺的补缺省值。不能派生的口径
+    （输入不是查库结果里的格、取数模板引用了运行时变量……）照实回 409。最多等 30 秒；还没跑完就回 running，前端按
+    run_id 去看运行。"""
+    from app.api.deps import current_principal
+    from app.apps.forms import input_schema, validate_form
+    from app.engine.runner import run_manager
+    from app.ledger.derive import NotDerivable, caliber_probe, load_pinned
+
+    try:
+        pinned = await load_pinned(session, workflow_id, int(version), node_id)
+    except NotDerivable as e:
+        raise HTTPException(409, e.message) from None
+    fields = [dict(f) for f in pinned.entry_fields]
+    known = {str(f.get("name")) for f in fields}
+    unknown = sorted(str(k) for k in payload.inputs if str(k) not in known)
+    if unknown:
+        raise HTTPException(422, f"不认识的入口字段：{'、'.join(unknown)}")
+    values = {str(f["name"]): f.get("default") for f in fields if f.get("default") not in (None, "")}
+    values.update({str(k): v for k, v in payload.inputs.items()})
+    if errors := validate_form(input_schema(fields), values):
+        raise HTTPException(422, "；".join(str(e.get("message")) for e in errors[:5]))
+
+    graph = caliber_probe(pinned).graph
+    principal = current_principal()
+    run = await run_manager.start(
+        graph=graph, input_payload=values, run_class="exploratory", origin_kind="trial",
+        origin={"kind": "caliber_trial", "workflow_id": workflow_id, "version": int(version),
+                "node_id": node_id, "card": pinned.node_id},
+        started_by=principal.username)
+    row = None
+    for _ in range(300):
+        async with SessionLocal() as poll:
+            row = await poll.get(Run, run.id)
+        if row is None or row.status in ("succeeded", "failed", "cancelled"):
+            break
+        await asyncio.sleep(0.1)
+
+    out: dict[str, Any] = {"run_id": run.id, "status": row.status if row is not None else "unknown",
+                           "output": row.output if row is not None else None,
+                           "error": row.error if row is not None else None, "metrics": []}
+    if row is not None and row.status == "succeeded":
+        from app.api.evidence import _sealed, _sealed_cards
+
+        sealed = await _sealed(run.id)
+        cards = {nid: card for nid, _, card in _sealed_cards(sealed)}
+        card = cards.get(pinned.node_id) or next(iter(cards.values()), None)
+        if card is not None:
+            out["metrics"] = [
+                {k: m.get(k) for k in ("id", "name", "unit", "value", "rendered", "decimals", "format")
+                 if m.get(k) is not None}
+                for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id")
+            ]
+    return out

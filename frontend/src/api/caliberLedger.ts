@@ -12,7 +12,8 @@
  * 请求函数从 ./http 导入，不从 ./client 导入（client.ts 要导入这个文件，反过来就成了循环）。
  */
 import type {
-  CertifyQueue, FreezeOut, LedgerFeedbackOut, LedgerFeedbackVerdict, LedgerIssueOut, LedgerReconcileIn, LedgerReconcileOut, RunLedger,
+  CaliberDescriptor, CaliberTrialOut, CertifyQueue, FreezeOut, LedgerFeedbackOut, LedgerFeedbackVerdict, LedgerIssueOut,
+  LedgerReconcileIn, LedgerReconcileOut, RunLedger,
 } from '../typesLedger'
 import { get, post, type RequestOptions } from './http'
 
@@ -37,4 +38,12 @@ export const caliberLedger = {
       ...(opts.conversation_id ? { conversation_id: opts.conversation_id } : {}),
       ...(opts.turn_id ? { turn_id: opts.turn_id } : {}),
     }),
+  /** 口径目录：每份已发布口径卡的入口 Schema、依赖、能否组合/出具（不返回 SQL、参数值） */
+  catalog: (opts?: RequestOptions) => get<{ calibers: CaliberDescriptor[] }>('/ledger/calibers', opts),
+  /** 按固定版本试跑：只读探索运行，返回指标值和 run_id；不是正式出具 */
+  trial: (workflowId: string, version: number, nodeId: string, inputs: Record<string, unknown>) =>
+    post<CaliberTrialOut>(
+      `/ledger/calibers/${encodeURIComponent(workflowId)}/${version}/${encodeURIComponent(nodeId)}/trial`,
+      { inputs },
+    ),
 }
