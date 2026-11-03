@@ -131,3 +131,15 @@ async def test_an_external_only_card_is_not_promised_automatic_issuance(client):
     assert made["composable"] is True
     assert made["issuance"]["auto_issue"] is False
     assert any("没有取数节点" in r for r in made["issuance"]["reasons"])
+
+
+async def test_metric_synonyms_reach_the_descriptor(client):
+    """文档带来的同义词要出现在机器可读描述里：按名字找口径时，「月活」和指标名一样是入口。"""
+    graph = S.caliber_graph()
+    for node in graph["nodes"]:
+        if node["type"] == "metrics":
+            node["data"]["config"]["metrics"][0]["synonyms"] = ["月活", "MAU"]
+    wf = await S.publish(graph=graph)
+    [made] = await descriptors(client, wf)
+    [metric] = made["metrics"]
+    assert metric["synonyms"] == ["月活", "MAU"]

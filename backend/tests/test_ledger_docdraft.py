@@ -177,6 +177,8 @@ def test_merge_definition_matches_by_synonym_and_keeps_expression():
     assert card["id"] == "gmv"
     assert card["expression"] == "cell(nodes.q, 0, '金额')"
     assert card["definition"] == {"text": "新说明", "owner": "财务", "scope": "全渠道"}
+    # 文档里的叫法要留在卡上：以后按同义词找这份口径，「成交额」才对得上
+    assert card["synonyms"] == ["GMV"]
     assert len(warnings) == 1 and "客单价" in warnings[0]
 
 

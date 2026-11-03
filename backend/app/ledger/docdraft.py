@@ -536,7 +536,9 @@ def _find_card(card_metrics: list[dict], draft: Mapping[str, Any]) -> dict | Non
 def merge_definition(card_metrics: list[dict], draft_metrics: list[dict]) -> tuple[list[dict], list[str]]:
     """把草稿的 definition 并进同名 / 同义词的口径卡指标；不改 expression / id。
 
-    只并 definition：草稿不知道取数，改写式子或 id 会破坏已有口径的算法。匹配不上的进 warnings，由人决定新建还是忽略。
+    只并 definition（和卡上还没有的同义词）：草稿不知道取数，改写式子或 id 会破坏已有口径的算法。匹配不上的进
+    warnings，由人决定新建还是忽略。同义词要带下去——文档里的叫法就是以后按名字找这份口径时的另一种说法，丢了它，
+    「月活」和「月度活跃买家」就永远对不上。
     """
     merged = copy.deepcopy(list(card_metrics))
     warnings: list[str] = []
@@ -549,6 +551,19 @@ def merge_definition(card_metrics: list[dict], draft_metrics: list[dict]) -> tup
         if target is None:
             warnings.append(f"草稿指标「{name or '（未命名）'}」在口径卡上找不到同名或同义词指标，定义未合并")
             continue
+        synonyms = draft.get("synonyms")
+        if isinstance(synonyms, list):
+            kept = [s.strip() for s in synonyms if isinstance(s, str) and s.strip()]
+            if kept:
+                have = target.get("synonyms")
+                have = [s for s in have if isinstance(s, str)] if isinstance(have, list) else []
+                # 大小写和空白不算新说法：卡上已有「GMV」时不再加一条「gmv」
+                known = {s.strip().casefold() for s in have}
+                added = [s for s in kept if s.casefold() not in known]
+                for s in added:
+                    known.add(s.casefold())
+                if added:
+                    target["synonyms"] = have + added
         definition = draft.get("definition")
         if not isinstance(definition, Mapping) or not definition:
             warnings.append(f"草稿指标「{name}」没有可合并的定义说明")
