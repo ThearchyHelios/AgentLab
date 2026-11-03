@@ -28,7 +28,7 @@ from app.look.calibers import card_inputs
 from app.tools.datasource import QUERY_PREFIX
 
 #: 指标只写口径卡配置里真有的这几个键
-METRIC_KEYS = ("id", "name", "unit", "decimals", "format", "kind", "definition", "params")
+METRIC_KEYS = ("id", "name", "unit", "decimals", "format", "kind", "definition", "params", "external")
 
 
 async def list_calibers(session: AsyncSession, *, workflow_id: str | None = None) -> list[dict[str, Any]]:

@@ -348,6 +348,16 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
             i.workflow_id === issue.workflow_id && i.version === issue.version) }} />}
         </div>
       )}
+      {label.kind === 'external' && (
+        <div className="space-y-1" data-ledger-external="">
+          <p className="font-medium">外部常量</p>
+          <p className="text-2xs text-dim">
+            来源：{label.source || '未写'} · 生效日期：{label.as_of || '未写'}
+            {label.stale && <span className="ml-1.5 text-[var(--warn)]">已过期</span>}
+          </p>
+          <p className="text-2xs text-faint">不来自查询，没有等价证明；正式出具前请核对来源和有效期。</p>
+        </div>
+      )}
       {label.kind === 'related' && (
         <div className="space-y-2">
           <p className="text-2xs text-dim">{LEDGER_UI.step.relatedSub}{label.reason ? `：${label.reason}` : ''}</p>

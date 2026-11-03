@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import re
+from datetime import date, timedelta
 from typing import Any
 
 from app.core import artifact_store
@@ -97,13 +98,39 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     comparing = _Comparing()
     for definition in definitions:
         metric_id = str(definition.get("id") or "").strip()
-        expr = str(definition.get("expression") or "").strip()
-        if not metric_id or not expr:
-            errors.append(f"指标定义不完整（缺少 ID 或计算表达式）：{definition}")
+        if not metric_id:
+            errors.append(f"指标定义不完整（缺少 ID）：{definition}")
             continue
         display, problem = _display_of(definition)
         if problem:
             errors.append(f"指标「{metric_id}」：{problem}")
+            continue
+        if str(definition.get("kind") or "formula") == "external":
+            value, external, problem = _external_of(definition)
+            if problem:
+                errors.append(f"指标「{metric_id}」：{problem}")
+                continue
+            decimals = display["decimals"]
+            value = round_metric(value, decimals)
+            metrics.append({
+                "id": metric_id,
+                "name": definition.get("name") or metric_id,
+                "unit": definition.get("unit") or "",
+                "value": value,
+                "expression": "",
+                "decimals": decimals,
+                "format": display["format"],
+                "rendered": _rendered(value, definition, display),
+                "inputs": [],
+                "substituted": str(value),
+                "recompute_ok": True,
+                "status": "ok",
+                "external": external,
+            })
+            continue
+        expr = str(definition.get("expression") or "").strip()
+        if not expr:
+            errors.append(f"指标定义不完整（缺少计算表达式）：{definition}")
             continue
         try:
             tree, _, _ = parse_expression(expr)
@@ -412,6 +439,33 @@ def source_expression(expression: str, source: Any) -> str:
 
 #: 新写法的小数位范围。负数是取整到十位、百位（round(x, -2)）
 _DECIMALS_RANGE = 15
+
+
+def _external_of(definition: dict[str, Any]) -> tuple[Any, dict[str, Any], str | None]:
+    """外部常量指标：{value, external: {source, as_of, stale_after_days, stale}}，以及写错时的一句话。
+
+    外部常量不来自查询，但也不能没有出处：来源和生效日期必填；过了 stale_after_days 天标 stale，出具契约据此降档。
+    值只收数（布尔不算），单位的换算、取整仍交给 decimals/format。
+    """
+    external = definition.get("external")
+    if not isinstance(external, dict):
+        return None, {}, "外部常量指标需要 external 对象（value / source / as_of / stale_after_days）"
+    value = external.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, {}, "external.value 需要是数"
+    source = str(external.get("source") or "").strip()
+    if not source:
+        return None, {}, "external.source 需要写明来源"
+    raw_as_of = external.get("as_of")
+    try:
+        as_of = date.fromisoformat(str(raw_as_of))
+    except (TypeError, ValueError):
+        return None, {}, "external.as_of 需要是 YYYY-MM-DD"
+    days = external.get("stale_after_days")
+    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or days < 0):
+        return None, {}, "external.stale_after_days 需要是非负整数"
+    stale = days is not None and date.today() > as_of + timedelta(days=days)
+    return value, {"source": source, "as_of": as_of.isoformat(), "stale_after_days": days, "stale": stale}, None
 
 
 def _display_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]:

@@ -151,7 +151,9 @@ def _apply_contract(
     from datetime import datetime, timezone
 
     from app.engine.governance import board_only
-    from app.engine.issuance import decide_tier, incomplete_gaps, no_data_gaps, sql_check_findings, trace_numbers
+    from app.engine.issuance import (
+        decide_tier, external_stale_gaps, incomplete_gaps, no_data_gaps, sql_check_findings, trace_numbers,
+    )
 
     nodes = state.get("nodes") or {}
     # 写了 report_from 就是引用模式：按报告文档逐段复核，不再按数值回指叙述
@@ -194,6 +196,8 @@ def _apply_contract(
     gaps.extend(incomplete_gaps(metrics))
     # 输入取自「查询区间里这张表没有数据」的列的指标：数回指得上、复算一致，但那个 0 不代表真的是 0，不能完整出具
     gaps.extend(no_data_gaps(metrics))
+    # 外部常量过了有效期：值还是那个值，但已经不能代表现在
+    gaps.extend(external_stale_gaps(metrics))
     # 来源查询没通过 SQL 检查（error 级：重复计算、存量跨期加总）：口径卡复算得一致，算的却是错数。
     # 报告直接引用的查询要等引用核对之后才知道，缺口放在这个位置，下面一起算
     sql_at = len(gaps)

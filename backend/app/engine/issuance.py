@@ -475,6 +475,17 @@ def incomplete_gaps(metrics: list[dict[str, Any]]) -> list[str]:
             for m in metrics if isinstance(m, dict) and m.get("incomplete")]
 
 
+def external_stale_gaps(metrics: list[dict[str, Any]]) -> list[str]:
+    """外部常量过期：过了 stale_after_days 天，值还是那个值，但它已经不能代表现在。"""
+    out: list[str] = []
+    for m in metrics:
+        external = m.get("external") if isinstance(m, dict) else None
+        if isinstance(external, dict) and external.get("stale"):
+            out.append(f"指标「{m.get('name') or m.get('id')}」的外部常量已过期"
+                       f"（来源：{external.get('source') or '未写'}，生效日期 {external.get('as_of') or '未写'}）")
+    return out
+
+
 def no_data_gaps(metrics: list[dict[str, Any]]) -> list[str]:
     """契约收来的指标里，输入取自「查询区间里这张表没有数据」的列的（口径卡标了 no_data，data/coverage.py），每个一句缺口。
 

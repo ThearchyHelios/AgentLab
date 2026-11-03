@@ -273,8 +273,8 @@ async def test_last_weeks_sales_labels_only_the_sales_number_as_from_the_caliber
     assert cols["销售额"]["binding"] == {"start": "2026-10-05", "end": "2026-10-11"}
     assert {c: cols[c]["kind"] for c in COLUMNS[1:]} == {c: "related" for c in COLUMNS[1:]}
     whole = content["whole"]
-    assert whole["equivalent"] is False and whole["counts"] == {"caliber": 1, "related": 3, "reasoning": 0,
-                                                                 "unknown": 0}
+    assert whole["equivalent"] is False and whole["counts"] == {"caliber": 1, "external": 0, "related": 3,
+                                                                 "reasoning": 0, "unknown": 0}
     # 工件 meta：逐格证明了的口径也记上（召回按旧版本反查只读它）
     from sqlalchemy import select
 

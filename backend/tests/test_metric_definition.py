@@ -44,3 +44,51 @@ def test_params_must_be_named_and_typed_once_each():
 def test_definition_must_be_an_object_with_text_fields():
     errors = _errors(_graph(definition={"text": 1, "exclusions": "新客"}))
     assert [i.code for i in errors].count("metrics.definition_invalid") >= 2
+
+
+async def test_an_external_constant_metric_runs_without_a_query():
+    from app.engine.runner import run_manager
+    from tests import ledger_samples as S
+
+    await run_manager.setup()
+    try:
+        graph = S.chain(
+            S.node("start", "input"),
+            S.node("card", "metrics", caliber="年度目标", caliber_version="v1", metrics=[{
+                "id": "target", "name": "年度目标", "unit": "元", "decimals": 0, "kind": "external",
+                "definition": {"text": "董事会批准的年度目标", "owner": "财务"},
+                "external": {"value": 120000000, "source": "2026 年度预算决议", "as_of": "2026-01-01",
+                             "stale_after_days": 365},
+            }]),
+            S.node("out", "output", fields=[{"name": "v", "value": "{{ nodes.card.metrics[0].rendered }}"}]))
+        started = await run_manager.start(graph=graph, input_payload={})
+        row = await S.wait(started.id)
+        assert row.status == "succeeded", row.error
+        assert row.output["v"] == "120,000,000元"
+        from app.api.evidence import _sealed, _sealed_cards
+
+        sealed = await _sealed(row.id)
+        [card] = [c for _, _, c in _sealed_cards(sealed)]
+        metric = card["metrics"][0]
+        assert metric["external"]["source"] == "2026 年度预算决议"
+        assert metric["external"]["stale"] is False
+    finally:
+        await run_manager.shutdown()
+
+
+def test_an_external_constant_needs_a_source_and_an_effective_date():
+    errors = _errors(_graph(kind="external", external={"value": 10, "as_of": "not-a-date"}))
+    codes = [i.code for i in errors]
+    assert codes.count("metrics.external_invalid") >= 2
+    assert _errors(_graph(kind="external", external={
+        "value": 10, "source": "预算", "as_of": "2026-01-01", "stale_after_days": 30})) == []
+
+
+def test_an_external_metric_is_labelled_external_not_reasoning():
+    from app.ledger.labels import metric_label
+
+    card = {"definition_hash": "abc", "metrics": [{"id": "target", "external": {
+        "source": "预算", "as_of": "2026-01-01", "stale": True}}]}
+    label = metric_label(card, "target", {}, {})
+    assert label == {"kind": "external", "source": "预算", "as_of": "2026-01-01", "stale": True,
+                     "definition_hash": "abc"}

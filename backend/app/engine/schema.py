@@ -1088,7 +1088,7 @@ def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult)
 
 #: 指标定义的类型。现在只有公式（表达式）这一种在运行时能算；规则、评估、外部常量还没实现，
 #: 先在校验里挡住，免得写进图里以后被当成能算的指标
-METRIC_KINDS = ("formula",)
+METRIC_KINDS = ("formula", "external")
 #: 定义卡参数的标量类型（和入口表单的字段类型同一套子集）
 METRIC_PARAM_TYPES = ("string", "number", "integer", "boolean")
 
@@ -1108,10 +1108,32 @@ def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[V
         add(f"指标定义缺少 ID：{field}", code="metrics.id_missing")
     kind = str(metric.get("kind") or "formula")
     if kind not in METRIC_KINDS:
-        add(f"指标「{metric.get('id') or index + 1}」的类型「{kind}」还没有实现：现在只支持「公式」（formula）。"
-            "规则、评估、外部常量请先在定义卡里写成说明，等对应的执行方式上线后再发布",
+        add(f"指标「{metric.get('id') or index + 1}」的类型「{kind}」还没有实现：现在支持「公式」（formula）和"
+            "「外部常量」（external）。规则、评估请先在定义卡里写成说明，等对应的执行方式上线后再发布",
             f"{field}.kind", code="metrics.kind_unsupported")
-    if not metric.get("expression"):
+    if kind == "external":
+        external = metric.get("external")
+        if not isinstance(external, dict):
+            add("外部常量指标需要 external 对象（value / source / as_of / stale_after_days）",
+                f"{field}.external", code="metrics.external_invalid")
+        else:
+            value = external.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                add("external.value 需要是数", f"{field}.external.value", code="metrics.external_invalid")
+            if not isinstance(external.get("source"), str) or not external["source"].strip():
+                add("external.source 需要写明来源", f"{field}.external.source", code="metrics.external_invalid")
+            raw = external.get("as_of")
+            try:
+                from datetime import date
+
+                date.fromisoformat(str(raw))
+            except (TypeError, ValueError):
+                add("external.as_of 需要是 YYYY-MM-DD", f"{field}.external.as_of", code="metrics.external_invalid")
+            days = external.get("stale_after_days")
+            if days is not None and (isinstance(days, bool) or not isinstance(days, int) or days < 0):
+                add("external.stale_after_days 需要是非负整数", f"{field}.external.stale_after_days",
+                    code="metrics.external_invalid")
+    elif not metric.get("expression"):
         add(f"指标定义缺少表达式：{metric.get('id') or '（空）'}", code="metrics.expression_missing")
 
     definition = metric.get("definition")

@@ -53,8 +53,11 @@ export interface LedgerRelated {
  * - unknown：没比对（reason 写为什么）
  */
 export interface LedgerLabel {
-  kind: 'caliber' | 'related' | 'reasoning' | 'unknown'
+  kind: 'caliber' | 'external' | 'related' | 'reasoning' | 'unknown'
   how?: 'independent' | 'composed'
+  source?: string
+  as_of?: string
+  stale?: boolean
   caliber?: string
   workflow_id?: string
   version?: number
