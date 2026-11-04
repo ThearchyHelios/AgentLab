@@ -35,7 +35,7 @@ const FILTERS: Filter[] = ['', 'drafting', 'ready', 'questions_open', 'path_pend
 
 /** 起草轮询：每两秒一次，多轮续跑要几分钟，最多等十分钟 */
 const DRAFT_POLL_MS = 2_000
-const DRAFT_POLL_LIMIT_MS = 10 * 60_000
+const DRAFT_POLL_LIMIT_MS = 15 * 60_000
 
 /** 状态标签：起草中 / 待签字发布 / 待确认问题 / 待接数据路径 / 已接上 / 已驳回 / 起草失败 */
 function StatusPill({ status }: { status: CaliberDraftStatus }) {
