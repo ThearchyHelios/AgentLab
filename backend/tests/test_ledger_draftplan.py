@@ -159,6 +159,86 @@ def test_build_graph_is_deterministic_and_passes_validation():
 
 
 # ==========================================================================
+# build_graph：多组
+# ==========================================================================
+
+START = {"name": "start", "type": "string", "required": True, "default": "2026-09-01",
+         "description": "开始日期"}
+
+
+def block(sql: str, metrics: list[dict], fields: list[dict] | None = None) -> dict:
+    return {"sql": sql, "entry_fields": [dict(f) for f in ([START] if fields is None else fields)],
+            "metrics": [dict(m) for m in metrics]}
+
+
+def test_build_graph_gives_each_group_its_own_fetch_node_and_rewrites_expressions():
+    """一张草稿图挂多个取数节点：第 i 组指标读 fetch_i，指标 id 跨组重排，出口要求全部指标。"""
+    first = block("SELECT SUM(amount) AS gmv FROM orders",
+                  [dict(METRIC), {**METRIC, "id": "m2", "name": "订单数",
+                                  "expression": "cell(nodes.fetch, 0, 'cnt')"}])
+    second = block("SELECT COUNT(DISTINCT customer_id) AS buyers FROM orders",
+                   [{**METRIC, "id": "m1", "name": "买家数",
+                     "expression": "cell(nodes.fetch, 0, 'buyers')"}])
+    graph = draftplan.build_graph([first, second], name="销售口径", question="上周", datasource="shop")
+    assert draftplan.build_graph([first, second], name="销售口径", question="上周",
+                                 datasource="shop") == graph
+    assert [node["id"] for node in graph["nodes"]] == ["start", "fetch_1", "fetch_2", "card",
+                                                       "write", "out"]
+    assert [edge["source"] for edge in graph["edges"]] == ["start", "fetch_1", "fetch_2", "card",
+                                                           "write"]
+    nodes = {node["id"]: node for node in graph["nodes"]}
+    assert nodes["fetch_1"]["data"]["config"] == {
+        "tool": "db_query__shop", "args": {"sql": first["sql"]}}
+    assert nodes["fetch_2"]["data"]["config"]["args"]["sql"] == second["sql"]
+    metrics = nodes["card"]["data"]["config"]["metrics"]
+    assert [m["id"] for m in metrics] == ["m1", "m2", "m3"]
+    assert [m["expression"] for m in metrics] == ["cell(nodes.fetch_1, 0, 'gmv')",
+                                                  "cell(nodes.fetch_1, 0, 'cnt')",
+                                                  "cell(nodes.fetch_2, 0, 'buyers')"]
+    contract = nodes["out"]["data"]["config"]["contract"]
+    assert contract == {"report_from": "write", "metrics_from": "card",
+                        "required": ["m1", "m2", "m3"]}
+    result = validate_graph(GraphSpec.model_validate(graph))
+    assert result.ok, [issue.message for issue in result.issues if issue.level == "error"]
+
+
+def test_build_graph_leaves_expressions_that_already_carry_an_index_alone():
+    """已经写成 nodes.fetch_2 的式子不能再被改坏（改成了 nodes.fetch_1_2 这类）。"""
+    first = block("SELECT SUM(amount) AS gmv FROM orders",
+                  [{**METRIC, "expression": "cell(nodes.fetch_2, 0, 'gmv')"}])
+    second = block("SELECT 1 AS gmv FROM orders", [dict(METRIC)])
+    graph = draftplan.build_graph([first, second], name="x")
+    metrics = next(node for node in graph["nodes"] if node["id"] == "card")["data"]["config"]["metrics"]
+    assert metrics[0]["expression"] == "cell(nodes.fetch_2, 0, 'gmv')"
+    assert metrics[1]["expression"] == "cell(nodes.fetch_2, 0, 'gmv')"
+
+
+def test_build_graph_accepts_one_block_as_a_single_group():
+    """老调用传一份草案（含 datasource）也要能建图：取数节点仍叫 fetch。"""
+    graph = draftplan.build_graph({**block("SELECT 1 AS gmv FROM orders", [dict(METRIC)]),
+                                   "datasource": "shop"}, name="销售额口径")
+    assert [node["id"] for node in graph["nodes"]] == ["start", "fetch", "card", "write", "out"]
+    fetch = next(node for node in graph["nodes"] if node["id"] == "fetch")
+    assert fetch["data"]["config"]["tool"] == "db_query__shop"
+    card = next(node for node in graph["nodes"] if node["id"] == "card")["data"]["config"]
+    assert card["metrics"][0]["expression"] == "cell(nodes.fetch, 0, 'gmv')"
+
+
+def test_build_graph_merges_entry_fields_and_refuses_conflicting_ones():
+    same = block("SELECT 1 AS gmv FROM orders", [dict(METRIC)])
+    merged = draftplan.build_graph([same, block("SELECT 2 AS cnt FROM orders", [{**METRIC, "id": "m2"}])],
+                                   name="x")
+    fields = next(node for node in merged["nodes"] if node["id"] == "start")["data"]["config"]["fields"]
+    assert [f["name"] for f in fields] == ["start"]
+
+    conflicting = block("SELECT 1 AS gmv FROM orders", [dict(METRIC)],
+                        fields=[{**START, "required": False}])
+    with pytest.raises(ValueError, match="start"):
+        draftplan.build_graph([same, conflicting], name="x")
+
+
+
+# ==========================================================================
 # plan：注入假模型
 # ==========================================================================
 
@@ -225,3 +305,35 @@ async def test_plan_passes_uncovered_through():
     model = FakeModel(json.dumps({**raw(), "uncovered": ["月活买家"]}, ensure_ascii=False))
     result = await draftplan.plan(None, docs=[], chunks={}, model=model)
     assert result["uncovered"] == ["月活买家"]
+
+
+async def test_plan_tells_the_model_which_metrics_were_already_drafted():
+    """续跑时把已经起草过的指标写进提示词，模型才会换下一组，不会重复起草前几轮。"""
+    model = FakeModel(json.dumps(raw(), ensure_ascii=False))
+    await draftplan.plan(None, docs=[], chunks={}, model=model, covered=["销售额", "订单数"])
+    human = model.messages[-1].content
+    assert "已经起草过的指标" in human
+    assert "销售额、订单数" in human
+    assert "不要重复起草" in model.messages[0].content
+
+
+async def test_plan_reports_document_and_catalog_truncation_separately():
+    """文档被截（doc_truncated）和表目录被截（catalog_truncated）要分开说：改文档、改目录是两件事。"""
+    text = json.dumps(raw(), ensure_ascii=False)
+    long_tables = "t" * (draftplan.MAX_TABLES_CHARS + 100)
+    result = await draftplan.plan(None, docs=[], chunks={}, model=FakeModel(text), tables_text=long_tables)
+    assert result["catalog_truncated"] is True
+    assert result["doc_truncated"] is False
+    assert result["truncated"] is True
+
+    chunks = {"c1": {"ordinal": 1, "content": CHUNK, "document_id": "d1"},
+              "c2": {"ordinal": 2, "content": "长" * (draftplan.MAX_INPUT_CHARS + 100), "document_id": "d1"}}
+    result = await draftplan.plan(None, docs=[], chunks=chunks, model=FakeModel(text), tables_text="表 orders")
+    assert result["doc_truncated"] is True
+    assert result["catalog_truncated"] is False
+    assert result["truncated"] is True
+
+    result = await draftplan.plan(None, docs=[], chunks=CHUNKS, model=FakeModel(text), tables_text="表 orders")
+    assert result["doc_truncated"] is False
+    assert result["catalog_truncated"] is False
+    assert result["truncated"] is False

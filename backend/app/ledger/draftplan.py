@@ -12,8 +12,13 @@ SELECT，服务端把 SQL、入口字段、口径卡、报告串成图，后台�
 这里按 sqlglot 解析后的语句数判定，不靠字符串里有没有分号（字符串字面量里的分号不算）。注释里的第二条照样会被解析成
 第二条语句，所以也拒。
 
-**为什么表达式必须是 cell(nodes.fetch, 0, '列名')。** 试跑和之后按口径出具都从口径卡读值。取数节点固定叫 fetch（见
-build_graph），单行结果取第 0 行的某一列；写成别的样子，卡上就没有值，图能建但出不了数。
+**为什么表达式必须是 cell(nodes.fetch, 0, '列名')。** 试跑和之后按口径出具都从口径卡读值。一次 plan 只起草一组，这组的
+取数节点固定叫 fetch（多组拼图时由 build_graph 改成 fetch_1、fetch_2…），单行结果取第 0 行的某一列；写成别的样子，卡上
+就没有值，图能建但出不了数。
+
+**为什么 build_graph 收多组 blocks。** 一张草稿图原来只能挂一条 SQL，业务文档几十条指标得分几十次起草、几十张图。取数
+节点多几个、口径卡读全部，试跑一次就跑完；入口字段按 name 合并，同名但类型/必填对不上就抛 ValueError——那是两份草案自己
+打架，调用方当成问题记下来，比悄悄取一个更能让人发现。
 
 **为什么引用核对还是照 docdraft 的老规矩。** 定义的事实来源还是文档原文。模型转述得再像，也要能在原文里逐字定位；一条
 引用都核不上的指标整条丢弃，写进 problems 交给人看。这里只做校验，不改 docdraft 的规则。
@@ -25,7 +30,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from app.ledger import docdraft
@@ -45,6 +50,8 @@ METRIC_FIELDS = ("id", "name", "synonyms", "unit", "decimals", "expression", "de
 _INPUT = re.compile(r"\{\{\s*input\.([A-Za-z_][\w-]*)\s*\}\}")
 #: 口径卡的取值表达式，列名可以用单引号或双引号
 _EXPRESSION = re.compile(r"^cell\(\s*nodes\.fetch\s*,\s*0\s*,\s*['\"]([^'\"]+)['\"]\s*\)$")
+#: 指标表达式里的取数节点引用；后面紧跟字母数字下划线的不算（nodes.fetch_2 已经带下标，不改）
+_FETCH_REF = re.compile(r"nodes\.fetch(?![A-Za-z0-9_])")
 #: 只读查询的根节点：普通 SELECT，或各分支都是 SELECT 的 UNION
 _WRITE_NODES = ("Insert", "Update", "Delete", "Create", "Drop", "Alter", "Merge", "TruncateTable", "Command")
 
@@ -62,6 +69,7 @@ _SYSTEM = """你是业务口径与取数模板的起草助手。读给定的业�
 6. 拿不准的不要猜，写进 open_questions，用一句问得清的话。不要编造文档里没有的数字、单位、生效日期。
 7. **一次只起草能共用同一条 SQL 的一组指标，最多 6 条。** 文档里其余的指标不要硬凑进这一条 SQL，把名称写进
    uncovered（字符串数组），下一轮再起草。不同粒度、不同表、不同时间字段的指标本来就不该共用一条 SQL。
+   human 里会列出「已经起草过的指标」：这些不要重复起草，这一组只从未起草的指标里选，剩下的未起草指标都写进 uncovered。
 8. **sql 要短。** 能用 GROUP BY 和聚合表达的，不要为每个属性枚举一长串 CASE WHEN 列；输出额度有限，SQL 写长了，
    后面的指标就写不出来了。
 9. 写不下时宁可少写几条指标、把剩下的写进 uncovered，**也不要让 JSON 半截断掉**。
@@ -127,7 +135,7 @@ def _chunk_block(chunk_id: str, chunk: Any) -> str:
 
 
 def _human(docs: list[dict], chunks: Mapping[str, dict], guidance: str, datasource: dict | None,
-           tables_text: str) -> str:
+           tables_text: str, covered: Sequence[str] = ()) -> str:
     parts = ["文档清单：", *(_doc_line(doc) for doc in docs), "",
              "逐段原文（引用时 chunk 写方括号里的 id，quote 逐字抄）："]
     parts.extend(_chunk_block(chunk_id, chunks[chunk_id]) for chunk_id in _order(chunks))
@@ -139,17 +147,21 @@ def _human(docs: list[dict], chunks: Mapping[str, dict], guidance: str, datasour
     parts.append("数据目录（sql 只能用这里的表和列，表名列名照抄）：")
     parts.append(tables_text.strip() or "（没有给出表结构，不能写 sql）")
     parts.append("")
+    parts.append("已经起草过的指标（不要重复起草）：")
+    names = [name.strip() for name in covered if isinstance(name, str) and name.strip()]
+    parts.append("、".join(names) if names else "（无）")
+    parts.append("")
     parts.append("用户补充要求：{}".format(guidance.strip() if guidance and guidance.strip() else "（无）"))
     return "\n".join(parts)
 
 
 def prompt(docs: list[dict], chunks: dict[str, dict], guidance: str = "", datasource: dict | None = None,
-           tables_text: str = "") -> list[Any]:
-    """构造 system + human：文档原文 + 数据目录。目录是 sql 的唯一依据，和原文一样原样交给模型。"""
+           tables_text: str = "", covered: Sequence[str] = ()) -> list[Any]:
+    """构造 system + human：文档原文 + 数据目录 + 已经起草过的指标。目录是 sql 的唯一依据，和原文一样原样交给模型。"""
     from langchain_core.messages import HumanMessage, SystemMessage
 
     return [SystemMessage(content=_SYSTEM),
-            HumanMessage(content=_human(docs, chunks, guidance, datasource, tables_text))]
+            HumanMessage(content=_human(docs, chunks, guidance, datasource, tables_text, covered))]
 
 
 def _chars(messages: list[Any]) -> int:
@@ -157,25 +169,30 @@ def _chars(messages: list[Any]) -> int:
 
 
 def _fit(docs: list[dict], chunks: dict[str, dict], guidance: str,
-         datasource: dict | None, tables_text: str) -> tuple[dict[str, dict], str, bool]:
+         datasource: dict | None, tables_text: str,
+         covered: Sequence[str] = ()) -> tuple[dict[str, dict], str, bool, bool]:
     """把材料压到 MAX_INPUT_CHARS 以内：先截表目录尾部，再从后往前按 chunk 边界丢，最后截仅剩的那一段。
 
     表目录先截：SQL 必须写在目录里的表上，目录比文档的细枝末节更硬；被截掉的是表详情，表名索引还在最前面。
+
+    截断来源分开报：doc_truncated 是文档段落被丢/被截，catalog_truncated 是表目录被截。调用方要能说清「指标没覆盖
+    完，是因为原文没给全，还是因为目录没给全」——改文档、改目录是两件不同的事。
     """
     kept = dict(chunks)
     tables = tables_text
-    truncated = False
+    doc_truncated = False
+    catalog_truncated = False
     if len(tables) > MAX_TABLES_CHARS:
         tables = tables[:MAX_TABLES_CHARS]
-        truncated = True
+        catalog_truncated = True
 
     def size() -> int:
-        return _chars(prompt(docs, kept, guidance, datasource, tables))
+        return _chars(prompt(docs, kept, guidance, datasource, tables, covered))
 
     order = _order(kept)
     while size() > MAX_INPUT_CHARS and len(order) > 1:
         kept.pop(order.pop())
-        truncated = True
+        doc_truncated = True
     if size() > MAX_INPUT_CHARS and order:
         chunk_id = order[0]
         chunk = dict(kept[chunk_id]) if isinstance(kept[chunk_id], Mapping) else {}
@@ -183,12 +200,12 @@ def _fit(docs: list[dict], chunks: dict[str, dict], guidance: str,
         excess = size() - MAX_INPUT_CHARS
         chunk["content"] = content[:max(0, len(content) - excess)]
         kept[chunk_id] = chunk
-        truncated = True
+        doc_truncated = True
     if size() > MAX_INPUT_CHARS:
         excess = size() - MAX_INPUT_CHARS
         tables = tables[:max(0, len(tables) - excess)]
-        truncated = True
-    return kept, tables, truncated
+        catalog_truncated = True
+    return kept, tables, doc_truncated, catalog_truncated
 
 
 def _salvage_value(text: str, key: str) -> Any:
@@ -225,11 +242,15 @@ def _salvage_reply(text: str) -> dict:
 
 
 async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guidance: str = "",
-               datasource: dict | None = None, tables_text: str = "", model: Any = None) -> dict:
-    """一次模型调用，返回 {entry_fields, sql, metrics, open_questions, model_id, truncated}（未校验）。
+               datasource: dict | None = None, tables_text: str = "", model: Any = None,
+               covered: Sequence[str] = ()) -> dict:
+    """一次模型调用，返回 {entry_fields, sql, metrics, open_questions, model_id, doc_truncated,
+    catalog_truncated, truncated}（未校验）。
 
-    不落库。model 可注入（测试用假对象：有 async ainvoke(messages)，回复有 .content）；不给就按设置解析，模型不可用时抛
-    docdraft.DraftUnavailable。SQL 的对错、引用能不能核对，交给 normalize_plan。
+    covered 是前几轮已经起草过的指标名，写进提示词让模型不要重复；调用方按 uncovered 续跑，直到 covered 不再增长。
+    truncated 仍是两者的「或」，老前端只认这一个键。不落库。model 可注入（测试用假对象：有 async ainvoke(messages)，
+    回复有 .content）；不给就按设置解析，模型不可用时抛 docdraft.DraftUnavailable。SQL 的对错、引用能不能核对，交给
+    normalize_plan。
     """
     from app.engine.state import message_text
 
@@ -243,8 +264,9 @@ async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guida
         named = getattr(model, "model_name", None) or getattr(model, "model", None)
         model_id = named if isinstance(named, str) else ""
 
-    kept, tables, truncated = _fit(docs, chunks, guidance, datasource, tables_text)
-    reply = await model.ainvoke(prompt(docs, kept, guidance, datasource, tables))
+    kept, tables, doc_truncated, catalog_truncated = _fit(docs, chunks, guidance, datasource, tables_text,
+                                                          covered)
+    reply = await model.ainvoke(prompt(docs, kept, guidance, datasource, tables, covered))
     text = message_text(reply)
     salvaged = False
     try:
@@ -276,7 +298,9 @@ async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guida
         "salvaged": salvaged,
         "diagnostics": diagnostics,
         "model_id": model_id,
-        "truncated": truncated,
+        "doc_truncated": doc_truncated,
+        "catalog_truncated": catalog_truncated,
+        "truncated": doc_truncated or catalog_truncated,
     }
 
 
@@ -462,12 +486,44 @@ def normalize_plan(raw: Any, chunks: Mapping[str, dict], *, allowed_tables: set[
 # ==========================================================================
 
 
-def build_graph(plan: dict, *, name: str, question: str = "") -> dict:
-    """草案 → 草稿图：start(input) → fetch(tool) → card(metrics) → write(report) → out(output)，过 auto_layout。
+def _blocks(value: Any) -> list[dict]:
+    """blocks 可以是 [{"sql", "entry_fields", "metrics"}]，也可以是老调用的单个 plan 字典（当成只有一组）。"""
+    if isinstance(value, Mapping):
+        return [dict(value)]
+    return [dict(block) for block in value or [] if isinstance(block, Mapping)]
 
-    plan["datasource"] 是取数节点指向的数据源名（调用方按这次的数据源补，不采信模型回复里的名字）。调用两次结果逐字一致：
-    节点 id、坐标都由输入决定，没有时间戳。报告配置、出口契约照 certify.build_graph 的写法，发布门禁认的就是这一套
-    （REPORT_POLICY、metrics_from、required）。
+
+def _merge_fields(target: dict[str, dict], value: Any) -> None:
+    """入口字段按 name 合并；同名但类型或必填对不上就抛 ValueError，不拿其中一组去覆盖另一组。"""
+    for field in value if isinstance(value, list) else []:
+        if not isinstance(field, Mapping):
+            continue
+        name = str(field.get("name") or "").strip()
+        if not name:
+            continue
+        item = dict(field)
+        item["name"] = name
+        old = target.get(name)
+        if old is None:
+            target[name] = item
+            continue
+        if (str(old.get("type") or "string") != str(item.get("type") or "string")
+                or bool(old.get("required")) != bool(item.get("required"))):
+            raise ValueError(f"入口字段「{name}」在各组里的类型或必填不一致，不能合成一个入口")
+
+
+def build_graph(blocks: Any, *, name: str, question: str = "", datasource: str = "") -> dict:
+    """各组草案 → 一张草稿图：start(input) → fetch…(tool，每组一个) → card(metrics) → write(report) → out(output)。
+
+    blocks 是 [{"sql", "entry_fields", "metrics"}]，也兼容老调用的单个 plan 字典（当成只有一组）。一组时取数节点仍叫
+    fetch，多组叫 fetch_1、fetch_2…（和 certify.build_graph 一致）；第 i 组指标表达式里的 nodes.fetch 改写成对应的
+    节点 id，已经带下标的（nodes.fetch_2）不动。指标 id 跨组重名时按 m1…mN 全局重排，口径卡和出口写重排后的 id——
+    重名会让口径卡读错值，宁可换号也不能让两个指标共用一个 id。入口字段按 name 合并，同名但类型/必填对不上抛
+    ValueError（两份草案自己打架，调用方当成问题记下来）。datasource 是取数节点指向的数据源名，调用方按这次的数据源
+    补，也可以写在某一组里；各组指向不同数据源时用第一组的（草稿图只连一个数据源）。
+
+    调用两次结果逐字一致：节点 id、坐标都由输入决定，没有时间戳。报告配置、出口契约照 certify.build_graph 的写法，
+    发布门禁认的就是这一套（REPORT_POLICY、metrics_from、required）。
     """
     from app.engine.governance import REPORT_POLICY
     from app.engine.layout import auto_layout
@@ -475,9 +531,38 @@ def build_graph(plan: dict, *, name: str, question: str = "") -> dict:
     from app.ledger.certify import REPORT_INSTRUCTIONS, REPORT_INSTRUCTIONS_PARAMS
     from app.tools.datasource import QUERY_PREFIX
 
-    fields = [dict(f) for f in plan.get("entry_fields") or []]
-    metrics = [dict(m) for m in plan.get("metrics") or []]
-    source = str(plan.get("datasource") or "")
+    groups = _blocks(blocks) or [{}]
+    multi = len(groups) > 1
+
+    def nid(index: int) -> str:
+        return f"fetch_{index + 1}" if multi else "fetch"
+
+    merged: dict[str, dict] = {}
+    metrics: list[dict] = []
+    fetch_nodes: list[dict[str, Any]] = []
+    source = str(datasource or "")
+    for index, group in enumerate(groups):
+        _merge_fields(merged, group.get("entry_fields"))
+        node_id = nid(index)
+        for metric in group.get("metrics") or []:
+            if not isinstance(metric, Mapping):
+                continue
+            item = dict(metric)
+            item["expression"] = _FETCH_REF.sub(f"nodes.{node_id}", str(item.get("expression") or ""))
+            metrics.append(item)
+        source = source or str(group.get("datasource") or "")
+        fetch_nodes.append({"id": node_id, "type": "tool", "position": {"x": 0, "y": 0},
+                            "data": {"label": f"取数 {index + 1}" if multi else "取数",
+                                     "config": {"tool": f"{QUERY_PREFIX}{source}",
+                                                "args": {"sql": str(group.get("sql") or "")}}}})
+
+    ids = [str(metric.get("id") or "").strip() for metric in metrics]
+    if "" in ids or len(set(ids)) != len(ids):
+        for position, metric in enumerate(metrics, start=1):
+            metric["id"] = f"m{position}"
+        ids = [metric["id"] for metric in metrics]
+
+    fields = list(merged.values())
     report_cfg: dict[str, Any] = {}
     if fields:
         report_cfg["instructions"] = REPORT_INSTRUCTIONS_PARAMS.format(
@@ -486,14 +571,11 @@ def build_graph(plan: dict, *, name: str, question: str = "") -> dict:
         report_cfg["instructions"] = REPORT_INSTRUCTIONS.format(question=question or name or "（问题）")
     report_cfg.update({key: value for key, value, _ in REPORT_POLICY})
     report_cfg["metrics_from"] = ["card"]
-    contract: dict[str, Any] = {"report_from": "write", "metrics_from": "card",
-                                "required": [m["id"] for m in metrics]}
+    contract: dict[str, Any] = {"report_from": "write", "metrics_from": "card", "required": ids}
     chain = [
         {"id": "start", "type": "input", "position": {"x": 0, "y": 0},
          "data": {"label": "入口", "config": {"fields": fields}}},
-        {"id": "fetch", "type": "tool", "position": {"x": 0, "y": 0},
-         "data": {"label": "取数", "config": {"tool": f"{QUERY_PREFIX}{source}",
-                                             "args": {"sql": str(plan.get("sql") or "")}}}},
+        *fetch_nodes,
         {"id": "card", "type": "metrics", "position": {"x": 0, "y": 0},
          "data": {"label": "口径卡", "config": {"caliber": (name.strip() or question or "口径")[:40],
                                               "caliber_version": "v1", "metrics": metrics}}},
