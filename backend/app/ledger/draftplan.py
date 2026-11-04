@@ -23,6 +23,7 @@ build_graph），单行结果取第 0 行的某一列；写成别的样子，卡
 """
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -59,6 +60,11 @@ _SYSTEM = """你是业务口径与取数模板的起草助手。读给定的业�
 5. 每条指标的定义必须带 citations：引用逐字抄原文，chunk 写材料里方括号内的 id。核对不上、或原文里没有依据的定义
    不要写进指标，写进 open_questions。
 6. 拿不准的不要猜，写进 open_questions，用一句问得清的话。不要编造文档里没有的数字、单位、生效日期。
+7. **一次只起草能共用同一条 SQL 的一组指标，最多 6 条。** 文档里其余的指标不要硬凑进这一条 SQL，把名称写进
+   uncovered（字符串数组），下一轮再起草。不同粒度、不同表、不同时间字段的指标本来就不该共用一条 SQL。
+8. **sql 要短。** 能用 GROUP BY 和聚合表达的，不要为每个属性枚举一长串 CASE WHEN 列；输出额度有限，SQL 写长了，
+   后面的指标就写不出来了。
+9. 写不下时宁可少写几条指标、把剩下的写进 uncovered，**也不要让 JSON 半截断掉**。
 
 输出格式：
 {
@@ -85,7 +91,8 @@ _SYSTEM = """你是业务口径与取数模板的起草助手。读给定的业�
       "open_questions": ["还没说清、需要业务确认的问题"]
     }
   ],
-  "open_questions": ["跨指标、以及整条 SQL 还没把握的问题"]
+  "open_questions": ["跨指标、以及整条 SQL 还没把握的问题"],
+  "uncovered": ["这次没有起草的指标名称（不同粒度、不同表、或写不下的）"]
 }
 """
 
@@ -184,6 +191,39 @@ def _fit(docs: list[dict], chunks: dict[str, dict], guidance: str,
     return kept, tables, truncated
 
 
+def _salvage_value(text: str, key: str) -> Any:
+    """从被截断的回复里抢回一个完整的顶层字段（"sql": "…" 这样的值）。值本身不完整就返回 None。"""
+    at = text.find(f'"{key}"')
+    if at < 0:
+        return None
+    colon = text.find(":", at + len(key) + 2)
+    if colon < 0:
+        return None
+    start = colon + 1
+    while start < len(text) and text[start] in " \t\r\n":
+        start += 1
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text, start)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    return value
+
+
+def _salvage_reply(text: str) -> dict:
+    """JSON 被截断时，把还能完整读出来的部分抢回来。
+
+    指标逐条抢（docdraft 按平衡括号找完整的指标对象），sql 和入口字段按完整的 JSON 值抢。抢不回来的留空，
+    由调用方照实说「这次起草不完整」，而不是把半截回复当成没有指标。
+    """
+    return {
+        "metrics": docdraft.salvage_metrics(text),
+        "sql": _salvage_value(text, "sql") or "",
+        "entry_fields": _salvage_value(text, "entry_fields") or [],
+        "open_questions": _salvage_value(text, "open_questions") or [],
+        "uncovered": _salvage_value(text, "uncovered") or [],
+    }
+
+
 async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guidance: str = "",
                datasource: dict | None = None, tables_text: str = "", model: Any = None) -> dict:
     """一次模型调用，返回 {entry_fields, sql, metrics, open_questions, model_id, truncated}（未校验）。
@@ -205,15 +245,36 @@ async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guida
 
     kept, tables, truncated = _fit(docs, chunks, guidance, datasource, tables_text)
     reply = await model.ainvoke(prompt(docs, kept, guidance, datasource, tables))
-    data = docdraft.parse_reply(message_text(reply))
+    text = message_text(reply)
+    salvaged = False
+    try:
+        data = docdraft.parse_reply(text)
+    except ValueError:
+        # 回复被截断（SQL 写长了、指标太多）：能抢回多少算多少，别整份当成「没有指标」
+        data, salvaged = _salvage_reply(text), True
     metrics = data.get("metrics")
     questions = data.get("open_questions")
+    uncovered = data.get("uncovered")
+    metrics_list = metrics if isinstance(metrics, list) else []
+    diagnostics = ""
+    if salvaged:
+        diagnostics = f"回复被截断，从完整片段里抢救出 {len(metrics_list)} 条指标"
+    if not metrics_list:
+        keys = "、".join(str(k) for k in data) or "无"
+        shape = {"dict": "对象", "list": "数组", "str": "字符串", "NoneType": "空"}.get(
+            type(metrics).__name__, type(metrics).__name__)
+        diagnostics = (f"模型回复里没有可读的指标数组（metrics 是{shape}；顶层键：{keys}）"
+                       + (f"；{diagnostics}" if diagnostics else ""))
     return {
         "entry_fields": data.get("entry_fields") if isinstance(data.get("entry_fields"), list) else [],
         "sql": data.get("sql") if isinstance(data.get("sql"), str) else "",
-        "metrics": metrics if isinstance(metrics, list) else [],
+        "metrics": metrics_list,
         "open_questions": [q for q in questions if isinstance(q, str) and q.strip()]
         if isinstance(questions, list) else [],
+        "uncovered": [q.strip() for q in uncovered if isinstance(q, str) and q.strip()]
+        if isinstance(uncovered, list) else [],
+        "salvaged": salvaged,
+        "diagnostics": diagnostics,
         "model_id": model_id,
         "truncated": truncated,
     }

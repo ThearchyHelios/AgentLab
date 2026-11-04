@@ -661,9 +661,13 @@ async def _extract_in_background(draft_id: str) -> None:
                 "sql": plan["sql"], "version": 1,
                 "trial": {"run_id": "", "status": "running", "error": ""},
                 "dropped": problems, "truncated": result["truncated"], "model_id": result["model_id"],
+                "open_questions": plan["open_questions"], "uncovered": result.get("uncovered") or [],
+                "salvaged": bool(result.get("salvaged")),
             }
             if not plan["sql"] or not plan["metrics"]:
                 error = _problems_text(problems) or "模型没有给出可用的取数 SQL 和指标"
+                if result.get("diagnostics"):
+                    error = f"{error}（{result['diagnostics']}）"
                 draft.payload = {**base, "trial": {"run_id": "", "status": "failed", "error": error}}
                 draft.model_id = result["model_id"] or None
                 draft.error = error

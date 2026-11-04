@@ -579,8 +579,12 @@ def merge_definition(card_metrics: list[dict], draft_metrics: list[dict]) -> tup
     return merged, warnings
 
 
+#: 被截断的回复里抢回已经完整的指标对象（draftplan 生成取数草稿时也要用）
+salvage_metrics = _salvage_metrics
+
+
 __all__ = [
     "DEFINITION_FIELDS", "DraftUnavailable", "FORBIDDEN_FIELDS", "MAX_INPUT_CHARS", "METRIC_FIELDS",
     "MIN_QUOTE_CHARS", "STATUSES", "alignment", "extract", "merge_definition", "normalize_metrics",
-    "parse_reply", "prompt", "verify_quote",
+    "parse_reply", "prompt", "salvage_metrics", "verify_quote",
 ]

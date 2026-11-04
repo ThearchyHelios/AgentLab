@@ -198,3 +198,30 @@ async def test_plan_refuses_when_no_draft_model_is_available(monkeypatch):
     monkeypatch.setattr(recipe_ai, "resolve_draft_model", resolve)
     with pytest.raises(docdraft.DraftUnavailable, match="起草模型"):
         await draftplan.plan(None, docs=[], chunks={})
+
+
+async def test_plan_salvages_metrics_when_the_reply_is_cut_off():
+    """SQL 把输出额度吃光、JSON 在指标数组里断掉：抢回完整的指标和 SQL，并照实说「回复被截断」。"""
+    text = ('{"entry_fields": [], "sql": "SELECT SUM(amount) AS gmv FROM orders", "metrics": ['
+            + json.dumps(raw()["metrics"][0], ensure_ascii=False) + ', {"id": "m2", "name": "写到这里就断了')
+    result = await draftplan.plan(None, docs=[], chunks={}, model=FakeModel(text))
+    assert result["salvaged"] is True
+    assert len(result["metrics"]) == 1 and result["metrics"][0]["name"] == "销售额"
+    assert result["sql"].startswith("SELECT SUM(amount)")
+    assert "截断" in result["diagnostics"]
+
+
+async def test_plan_explains_what_came_back_when_metrics_is_not_a_list():
+    """指标为空时不能只说「没有一条通过校验」：要说出模型到底交回了什么形状。"""
+    model = FakeModel(json.dumps({"sql": "SELECT 1", "metrics": {}}, ensure_ascii=False))
+    result = await draftplan.plan(None, docs=[], chunks={}, model=model)
+    assert result["metrics"] == []
+    assert "metrics 是对象" in result["diagnostics"]
+    assert "sql" in result["diagnostics"]
+
+
+async def test_plan_passes_uncovered_through():
+    """一次只起草能共用一条 SQL 的一组，其余的写进 uncovered，下一轮再起草。"""
+    model = FakeModel(json.dumps({**raw(), "uncovered": ["月活买家"]}, ensure_ascii=False))
+    result = await draftplan.plan(None, docs=[], chunks={}, model=model)
+    assert result["uncovered"] == ["月活买家"]
