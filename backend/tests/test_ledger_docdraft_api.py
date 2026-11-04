@@ -96,7 +96,7 @@ async def fake_trial(monkeypatch):
     """试跑换成写一行 succeeded 的运行：不启动引擎、不查库，接口和 payload 的形状照真的一样。"""
     made: list[str] = []
 
-    async def start(*, draft_id, workflow_id, graph, values, started_by):
+    async def start(*, draft_id, workflow_id, graph, values, started_by, entry_fields=()):
         run_id = f"run-draft-{uuid.uuid4().hex[:10]}"
         async with SessionLocal() as session:
             session.add(Run(id=run_id, workflow_id=workflow_id, status="succeeded", graph=graph,
@@ -691,3 +691,48 @@ def test_questions_asked_again_next_round_are_deduped():
              "报废模架数需要跨表，关联键未确认"]
     merged = api_ledger._merge_questions(first, again)
     assert merged == [first[0], "报废模架数需要跨表，关联键未确认"]
+
+
+async def test_a_trial_without_required_inputs_waits_for_them_instead_of_failing():
+    """必填入口没有值时不拿系统编的日期去跑：停在 needs_input，等人在页面上填。"""
+    fields = [{"name": "start", "type": "string", "required": True}]
+    out = await REAL_RUN_TRIAL(draft_id="d", workflow_id="w", graph={"nodes": []}, values={},
+                               started_by=None, entry_fields=fields)
+    assert out["status"] == "needs_input" and "start" in out["error"]
+
+
+async def test_running_the_trial_with_inputs_typed_on_the_page(client, documents, datasource, monkeypatch):
+    """自动试跑缺必填输入，人填了再跑：参数按入口字段校验，缺值 422，填了才发起。"""
+    doc = await documents("dd-inputs")
+    source_id = await datasource()
+    reply = json.loads(plan_reply(f"{doc}-2"))
+    reply["entry_fields"] = [{"name": "start", "type": "string", "required": True, "default": "",
+                              "description": "开始日期"}]
+    reply["sql"] = ("SELECT COUNT(*) * 1.0 AS refund_rate FROM orders WHERE status = 'paid' "
+                    "AND paid_at >= '{{ input.start }}'")
+    fake_model(monkeypatch, json.dumps(reply, ensure_ascii=False))
+
+    async def waiting(*, draft_id, workflow_id, graph, values, started_by, entry_fields=()):
+        return {"run_id": "", "status": "needs_input", "error": "缺少必填输入：start"}
+
+    monkeypatch.setattr(api_ledger, "_run_trial", waiting)
+    body = await extract(client, doc, source_id)
+    made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
+    assert made["trial"]["status"] == "needs_input"
+    trial = (await client.get(f"/api/ledger/drafts/{body['draft_id']}/trial")).json()
+    assert trial["status"] == "needs_input" and trial["metrics"] == []
+
+    missing = await client.post(f"/api/ledger/drafts/{body['draft_id']}/trial", json={"inputs": {}})
+    assert missing.status_code == 422
+
+    seen: dict[str, object] = {}
+
+    async def started(*, draft_id, workflow_id, graph, values, started_by, entry_fields=()):
+        seen.clear()
+        seen.update(values)
+        return {"run_id": "", "status": "running", "error": ""}
+
+    monkeypatch.setattr(api_ledger, "_run_trial", started)
+    res = await client.post(f"/api/ledger/drafts/{body['draft_id']}/trial", json={"inputs": {"start": "2026-01-01"}})
+    assert res.status_code == 200, res.text
+    assert seen["start"] == "2026-01-01"

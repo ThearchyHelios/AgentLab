@@ -40,7 +40,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import SessionLocal, get_session
-from app.db.models import CaliberDraft, Chunk, DataSource, Document, Run, Workflow
+from app.db.models import CaliberDraft, Chunk, DataSource, Document, Run, Workflow, WorkflowVersion
 from app.db.models_process import ActionRecord
 
 logger = logging.getLogger(__name__)
@@ -522,8 +522,12 @@ async def _save_trial(draft_id: str, trial: dict[str, str]) -> None:
 
 
 async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], values: dict[str, Any],
-                     started_by: str | None) -> dict[str, str]:
+                     started_by: str | None,
+                     entry_fields: list[dict[str, Any]] | tuple[dict[str, Any], ...] = ()) -> dict[str, str]:
     """后台试跑草稿的取数与口径卡，返回 payload["trial"] 的形状（run_id / status / error）。
+
+    必填入口没有值时不跑：试跑是为了「看数对不对」，拿系统编的日期跑出来的数没有意义。这时状态记 needs_input，
+    页面上让人把入口字段填了再点试运行（POST 同一个路径）。
 
     跑的是**探针图**（取数 + 口径卡，`derive.caliber_probe`），不是整张草稿图：草稿图里带着报告撰写节点，
     试跑只关心数对不对，不该为了一次试跑多花一次模型调用、也不该因为没有可用模型就判这份口径不行。
@@ -533,6 +537,12 @@ async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], 
     """
     from app.engine.runner import run_manager
     from app.ledger.derive import NotDerivable, caliber_probe, load_pinned
+
+    missing = [str(field.get("name")) for field in entry_fields
+               if field.get("required") and values.get(str(field.get("name"))) in (None, "")]
+    if missing:
+        return {"run_id": "", "status": "needs_input",
+                "error": f"缺少必填输入：{'、'.join(missing)}"}
 
     card_id = next((n.get("id") for n in graph.get("nodes") or []
                     if isinstance(n, dict) and n.get("type") == "metrics"), None)
@@ -927,7 +937,7 @@ async def _extract_in_background(draft_id: str) -> None:
 
     try:
         trial = await _run_trial(draft_id=draft_id, workflow_id=workflow.id, graph=graph, values=values,
-                                 started_by=draft.created_by)
+                                 started_by=draft.created_by, entry_fields=_merged_fields(blocks))
     except Exception as e:  # noqa: BLE001 - 试运行出错也要写进 payload，不能让界面停在「试运行中」
         logger.exception("草稿 %s 的试运行出错", draft_id)
         trial = {"run_id": "", "status": "failed", "error": f"试运行出错：{e}"}
@@ -1029,6 +1039,9 @@ async def get_draft_trial(draft_id: str, session: AsyncSession = Depends(get_ses
     trial = payload.get("trial") if isinstance(payload.get("trial"), dict) else {}
     run_id = trial.get("run_id")
     if not isinstance(run_id, str) or not run_id:
+        if trial.get("status") == "needs_input":
+            return {"run_id": "", "status": "needs_input", "metrics": [],
+                    "error": str(trial.get("error") or "")}
         raise HTTPException(404, "这份草稿还没有试运行")
     run = await session.get(Run, run_id)
     if run is None:
@@ -1037,6 +1050,45 @@ async def get_draft_trial(draft_id: str, session: AsyncSession = Depends(get_ses
     status = _run_status(run.status)
     metrics = await _trial_metrics(run.id) if status == "succeeded" else []
     return {"run_id": run.id, "status": status, "metrics": metrics, "error": str(run.error or "")}
+
+
+class DraftTrialIn(BaseModel):
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/drafts/{draft_id}/trial")
+async def run_draft_trial(draft_id: str, payload: DraftTrialIn,
+                          session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """按填好的入口字段试跑一次（builder 及以上）。
+
+    自动试跑缺必填输入时停在 needs_input（不拿系统编的日期跑，那样跑出来的数没有意义），人在这里补上再跑。
+    参数按入口字段校验，和正式运行同一套（apps/forms）；跑的仍是探针图：只取数与口径卡，不写报告、不进统计。
+    """
+    from app.api.deps import current_principal, ensure_role
+    from app.apps.forms import input_schema, validate_form
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    body = draft.payload if isinstance(draft.payload, dict) else {}
+    fields = [field for field in body.get("entry_fields") or [] if isinstance(field, dict)]
+    workflow_id = draft.workflow_id or body.get("workflow_id")
+    if not workflow_id:
+        raise HTTPException(409, "这份草稿还没有取数图，不能试运行")
+    version = int(body.get("version") or 1)
+    row = (await session.execute(select(WorkflowVersion).where(
+        WorkflowVersion.workflow_id == workflow_id, WorkflowVersion.version == version))).scalar_one_or_none()
+    if row is None or not isinstance(row.graph, dict):
+        raise HTTPException(409, "找不到这份草稿的取数图，可能已被删除")
+    values: dict[str, Any] = {str(field.get("name")): field.get("default") for field in fields
+                              if field.get("default") not in (None, "")}
+    values.update({str(key): value for key, value in payload.inputs.items()})
+    if errors := validate_form(input_schema(fields), values):
+        raise HTTPException(422, "；".join(str(e.get("message")) for e in errors[:5]))
+    trial = await _run_trial(draft_id=draft.id, workflow_id=str(workflow_id), graph=row.graph,
+                             values=values, started_by=current_principal().username, entry_fields=fields)
+    await _save_trial(draft.id, trial)
+    run_id = str(trial.get("run_id") or "")
+    return {**trial, "metrics": await _trial_metrics(run_id) if run_id else []}
 
 
 def _check_metrics(metrics: Any) -> list[dict[str, Any]]:

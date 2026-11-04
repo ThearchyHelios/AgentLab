@@ -293,6 +293,11 @@ export const LEDGER_UI = {
     trialNoMetrics: '这次试运行没有产出指标值',
     trialUnavailable: '暂时无法读取试运行状态',
     trialRun: '看这次运行',
+    /** 必填入口字段没有值：状态停在 needs_input，不拿系统编的值去跑 */
+    trialNeedsInput: '等补入口字段',
+    trialNeedsInputHint: '填好入口字段再试运行',
+    trialRunAction: '试运行',
+    trialRunStarting: '正在发起…',
 
     // ---- 详情 ----
     documentsUsed: (n: number) => `${formatNumber(n)} 份文档`,
@@ -342,8 +347,9 @@ export const LEDGER_UI = {
 
     // ---- 入口字段与发布 ----
     entryFields: '入口字段',
-    entryFieldsHint: '发布后按这些字段收参数；缺省值可以不填',
+    entryFieldsHint: '试运行和发布后都按这些字段取值；带缺省值的可以不改',
     entryFieldNone: '这份草稿的图没有入口字段',
+    entryPrefilled: '已预填，可改',
     required: '必填',
     optional: '可选',
     defaultValue: (value: string) => `缺省 ${value}`,

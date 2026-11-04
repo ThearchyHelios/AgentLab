@@ -58,6 +58,12 @@ export const caliberLedger = {
   draft: (draftId: string, opts?: RequestOptions) => get<CaliberDraft>(draftAt(draftId), opts),
   /** 起草后自动发起的那次只读试运行：状态和每个指标的值，running 时轮询到终态 */
   draftTrial: (draftId: string, opts?: RequestOptions) => get<DraftTrialOut>(`${draftAt(draftId)}/trial`, opts),
+  /**
+   * 按填好的入口字段再试运行一次（POST 同一个路径）：参数按入口字段校验，缺必填回 422；
+   * 返回 {run_id, status, metrics, error}，status 是 running / succeeded / failed / needs_input
+   */
+  runDraftTrial: (draftId: string, inputs: Record<string, unknown>) =>
+    post<DraftTrialOut>(`${draftAt(draftId)}/trial`, { inputs }),
   /** 选文档发起起草：documents 是要用的知识库文档 id，guidance 是给模型看的附加要求 */
   extractDraft: (body: { documents: string[]; collection?: string; datasource_id?: string; guidance?: string }) =>
     post<{ draft_id: string; status: string }>('/ledger/drafts/extract', body),

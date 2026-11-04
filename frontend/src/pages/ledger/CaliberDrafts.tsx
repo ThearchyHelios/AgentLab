@@ -3,9 +3,10 @@
  *
  * 主路径一次到位：选文档 → 模型读文档、对照数据目录产出定义 + 取数 + 入口字段 + 指标表达式 → 服务端校验后落成草稿图
  * → 后台自动只读试运行 → 这里展示「定义 + 数 + 原文引用」→ 人去画布审改并发布。发布才需要人签字。
- * - 发起：选知识库文档，可选数据源（只写进适用范围）和一段起草要求，页面轮询详情直到状态离开 drafting（最多十分钟，
- *   指标多时服务端会分几轮续跑，进度写在 payload.progress）；
- * - 试运行：草稿顶部显示这次自动试运行的状态和每个指标的值，running 时每两秒取一次，最多等一分钟；失败照实写原因；
+ * - 发起：选知识库文档和**必选的数据源**（取数 SQL 只对照它的表和列写），可加一段起草要求；页面轮询详情直到状态离开
+ *   drafting（最多十五分钟，指标多时服务端会分几轮续跑，进度写在 payload.progress）；
+ * - 试运行：草稿顶部显示这次自动试运行的状态和每个指标的值，running 时每两秒取一次，最多等一分钟；必填入口没有值时停在
+ *   needs_input，在入口字段里填了再点「试运行」；失败照实写原因；
  * - 审读：指标默认收成一行（名字、单位、值和未决问题数），展开看单位、粒度、指标表达式、定义和逐字核对过的引用原文
  *   （第 N 段），逐条的未决问题可以勾掉；被丢弃的条目单独列出原因；入口字段列出名字、类型、必填和缺省值；
  * - 发布：主按钮去画布审改并发布。「接上一次运行」只是辅助入口：已经有答案时让它认这份定义。
@@ -15,7 +16,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ChevronLeft, FileText, PenLine, RefreshCw, ScrollText } from 'lucide-react'
+import { ChevronLeft, FileText, PenLine, Play, RefreshCw, ScrollText } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
 import { EmptyState, ErrorState, Notice, PageHeader, Skeleton, Spinner, promptDialog, toast } from '../../components/ui'
@@ -23,8 +24,8 @@ import { formatDateTime, formatTime } from '../../lib/format'
 import { LEDGER_UI } from '../../lib/termsLedger'
 import type { DataSourceName, KbDocument, Run } from '../../types'
 import type {
-  CaliberDraft, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftCitation, DraftMetric, DraftTrialMetric,
-  DraftTrialOut,
+  CaliberDraft, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftCitation, DraftEntryField, DraftMetric,
+  DraftTrialMetric, DraftTrialOut,
 } from '../../typesLedger'
 
 const D = LEDGER_UI.drafts
@@ -108,6 +109,69 @@ function defaultText(value: unknown): string {
   return text ?? String(value)
 }
 
+/** 入口字段预填的日期：YYYY-MM-DD，按本地日期算 */
+function dayText(offsetDays: number): string {
+  const day = new Date()
+  day.setDate(day.getDate() + offsetDays)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}`
+}
+
+/**
+ * 名字或说明里带「开始 / start」的日期字段预填七天前，带「结束 / end」的预填今天：
+ * 这两个值基本总是要填的，给个能改的范围比留空省一步。其余必填字段留空，让人自己写。
+ */
+function datePrefill(field: DraftEntryField): string | null {
+  if ((field.type || 'string') !== 'string') return null
+  const hint = `${field.name} ${field.description ?? ''}`.toLowerCase()
+  if (hint.includes('开始') || /(^|[^a-z])start([^a-z]|$)/.test(hint)) return dayText(-7)
+  if (hint.includes('结束') || /(^|[^a-z])end([^a-z]|$)/.test(hint)) return dayText(0)
+  return null
+}
+
+/** 入口字段的初值：有缺省值就用缺省值，日期字段按上面的规则预填，其余留空 */
+function entryInitialValues(fields: DraftEntryField[], prefilled: Record<string, boolean>): Record<string, string> {
+  const values: Record<string, string> = {}
+  for (const field of fields) {
+    const hasDefault = field.default !== undefined && field.default !== null && field.default !== ''
+    if (hasDefault) { values[field.name] = defaultText(field.default); continue }
+    const guess = datePrefill(field)
+    values[field.name] = guess ?? ''
+    if (guess) prefilled[field.name] = true
+  }
+  return values
+}
+
+/** 必填字段是不是都填了：布尔量总有值，数字要能读成数 */
+function entryReady(fields: DraftEntryField[], values: Record<string, string>): boolean {
+  return fields.every((field) => {
+    if (!field.required) return true
+    const type = field.type || 'string'
+    if (type === 'boolean') return true
+    const text = (values[field.name] ?? '').trim()
+    if (!text) return false
+    return type === 'number' || type === 'integer' ? Number.isFinite(Number(text)) : true
+  })
+}
+
+/** 表单值换成接口要的 inputs：空字符串不传（服务端会用缺省值），数字转成数，布尔转成开关 */
+function entryInputs(fields: DraftEntryField[], values: Record<string, string>): Record<string, unknown> {
+  const inputs: Record<string, unknown> = {}
+  for (const field of fields) {
+    const type = field.type || 'string'
+    const text = values[field.name] ?? ''
+    if (type === 'boolean') { inputs[field.name] = text === 'true'; continue }
+    if (!text.trim()) continue
+    if (type === 'number' || type === 'integer') {
+      const num = Number(text)
+      if (Number.isFinite(num)) inputs[field.name] = num
+      continue
+    }
+    inputs[field.name] = text
+  }
+  return inputs
+}
+
 export function CaliberDrafts() {
   const [drafts, setDrafts] = useState<CaliberDraftSummary[] | null>(null)
   const [listError, setListError] = useState<unknown>(null)
@@ -141,6 +205,11 @@ export function CaliberDrafts() {
   const [trialPollId, setTrialPollId] = useState<string | null>(null)
   const [trialTimedOut, setTrialTimedOut] = useState(false)
   const [trialError, setTrialError] = useState<unknown>(null)
+
+  /** 试运行的表单值：入口字段可改，必填没填满时按钮禁用；prefilled 记哪些是页面替人预填的 */
+  const [entryValues, setEntryValues] = useState<Record<string, string>>({})
+  const [prefilled, setPrefilled] = useState<Record<string, boolean>>({})
+  const [trialStarting, setTrialStarting] = useState(false)
 
   /** 引用所在段落的正文和段号：按文档懒取，取过的记在这里 */
   const [chunks, setChunks] = useState<Record<string, { ordinal: number; content: string }>>({})
@@ -203,6 +272,9 @@ export function CaliberDrafts() {
       const draft = await api.caliberLedger.draft(id)
       if (seq !== openSeq.current) return
       setDetail(draft)
+      const marks: Record<string, boolean> = {}
+      setEntryValues(entryInitialValues(draft.entry_fields ?? [], marks))
+      setPrefilled(marks)
       if (draft.status === 'drafting') { setPollTimedOut(false); setPollingId(id) }
     } catch (e) {
       if (seq !== openSeq.current) return
@@ -441,13 +513,33 @@ export function CaliberDrafts() {
     )
   }
 
+  /** 按填好的入口字段再试运行一次：自动试跑缺必填输入时停在 needs_input，人在这里补上 */
+  const runTrial = async (draft: CaliberDraft) => {
+    const fields = draft.entry_fields ?? []
+    if (!entryReady(fields, entryValues)) return
+    setTrialStarting(true)
+    setTrialError(null)
+    try {
+      const out = await api.caliberLedger.runDraftTrial(draft.id, entryInputs(fields, entryValues))
+      setTrial(out)
+      setTrialTimedOut(false)
+      if (out.status === 'running' && out.run_id) setTrialPollId(draft.id)
+    } catch (e) {
+      setTrialError(e)
+    } finally {
+      setTrialStarting(false)
+    }
+  }
+
   /** 自动试运行：状态、每个指标的值（名字和值成对）、失败原因；没有试运行就整块不画 */
   const renderTrial = (draft: CaliberDraft) => {
     const status = trial?.status ?? draft.trial?.status
     if (!status) return null
     const rows = trial?.metrics ?? []
-    const color = status === 'succeeded' ? 'var(--ok)' : status === 'failed' ? 'var(--err)' : 'var(--accent)'
-    const label = status === 'succeeded' ? D.trialSucceeded : status === 'failed' ? D.trialFailed : D.trialRunning
+    const color = status === 'succeeded' ? 'var(--ok)' : status === 'failed' ? 'var(--err)'
+      : status === 'needs_input' ? 'var(--warn)' : 'var(--accent)'
+    const label = status === 'succeeded' ? D.trialSucceeded : status === 'failed' ? D.trialFailed
+      : status === 'needs_input' ? D.trialNeedsInput : D.trialRunning
     const unitOf = (id: string) => (draft.metrics ?? []).find((m) => m.id === id)?.unit
     return (
       <div className="rounded-md border bg-elev px-3 py-2" data-draft-trial={status}>
@@ -471,6 +563,11 @@ export function CaliberDrafts() {
           <div className="mt-1">
             <Notice tone="err">{D.trialFailed}：{trial?.error || draft.trial?.error || D.loadFailed}</Notice>
           </div>
+        )}
+        {status === 'needs_input' && (
+          <p className="mt-1 text-2xs text-dim" data-draft-trial-needs-input="">
+            {D.trialNeedsInputHint}：{trial?.error || draft.trial?.error || ''}
+          </p>
         )}
         {status === 'succeeded' && (rows.length > 0 ? (
           <ul className="mt-1 grid gap-x-4 gap-y-0.5 text-2xs sm:grid-cols-[1fr_auto]">
@@ -499,6 +596,7 @@ export function CaliberDrafts() {
     const fields = draft.entry_fields
     const notes = draft.entry_notes ?? []
     if (!fields) return null
+    const canTrial = !!draft.workflow_id
     return (
       <div data-draft-entry-fields="">
         <h3 className="mb-1 text-2xs font-semibold text-dim">{D.entryFields}</h3>
@@ -508,12 +606,26 @@ export function CaliberDrafts() {
             {fields.map((field) => {
               const hasDefault = field.default !== undefined && field.default !== null && field.default !== ''
               return (
-                <li key={field.name} className="flex flex-wrap items-baseline gap-x-2" data-draft-entry-field={field.name}>
+                <li key={field.name} className="flex flex-wrap items-center gap-x-2 gap-y-1"
+                    data-draft-entry-field={field.name}>
                   <code className="font-medium text-dim">{field.name}</code>
                   <span className="text-faint">{field.type || 'string'}</span>
                   <span className="text-faint">{field.required ? D.required : D.optional}</span>
                   {hasDefault && <span className="text-faint">{D.defaultValue(defaultText(field.default))}</span>}
                   {field.description && <span className="text-dim [overflow-wrap:anywhere]">{field.description}</span>}
+                  {canTrial && (field.type === 'boolean' ? (
+                    <input type="checkbox" className="accent-[var(--accent)]" disabled={trialStarting}
+                           data-draft-entry-input={field.name}
+                           checked={(entryValues[field.name] ?? '') === 'true'}
+                           onChange={(e) => setEntryValues((cur) => ({
+                             ...cur, [field.name]: e.target.checked ? 'true' : 'false',
+                           }))} />
+                  ) : (
+                    <input className="field w-36 text-2xs" value={entryValues[field.name] ?? ''}
+                           disabled={trialStarting} data-draft-entry-input={field.name}
+                           placeholder={prefilled[field.name] ? D.entryPrefilled : ''}
+                           onChange={(e) => setEntryValues((cur) => ({ ...cur, [field.name]: e.target.value }))} />
+                  ))}
                 </li>
               )
             })}
@@ -523,6 +635,19 @@ export function CaliberDrafts() {
           <ul className="mt-1 space-y-0.5 text-2xs leading-relaxed text-warn" data-draft-entry-notes="">
             {notes.map((note, i) => <li key={`${i}:${note}`}>{note}</li>)}
           </ul>
+        )}
+        {canTrial && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+            <button type="button" className="btn btn-xs btn-primary"
+                    disabled={trialStarting || !entryReady(fields, entryValues)}
+                    onClick={() => void runTrial(draft)} data-draft-trial-run-button="">
+              {trialStarting ? <Spinner size={11} /> : <Play size={11} aria-hidden />}
+              {trialStarting ? D.trialRunStarting : D.trialRunAction}
+            </button>
+            {Object.keys(prefilled).length > 0 && (
+              <span className="text-[10px] text-faint">{D.entryPrefilled}</span>
+            )}
+          </div>
         )}
       </div>
     )

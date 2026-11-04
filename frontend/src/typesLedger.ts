@@ -498,10 +498,15 @@ export interface DraftEntryField {
   description?: string
 }
 
+/**
+ * 试运行的状态：还会缺必填入口字段（needs_input），这时不跑，等人填了再发起；needs_input 没有 run_id。
+ */
+export type DraftTrialStatus = 'running' | 'succeeded' | 'failed' | 'needs_input'
+
 /** 起草后自动发起的那次只读试运行（draft.payload.trial） */
 export interface DraftTrial {
   run_id: string
-  status: 'running' | 'succeeded' | 'failed'
+  status: DraftTrialStatus
   error?: string
 }
 
@@ -513,10 +518,10 @@ export interface DraftTrialMetric {
   rendered?: string
 }
 
-/** GET /api/ledger/drafts/{id}/trial：这次自动试运行的状态和每个指标的值 */
+/** GET /api/ledger/drafts/{id}/trial：这次自动试运行的状态和每个指标的值；POST 同一个路径按填好的入口字段再发起一次 */
 export interface DraftTrialOut {
   run_id: string
-  status: 'running' | 'succeeded' | 'failed'
+  status: DraftTrialStatus
   metrics: DraftTrialMetric[]
   error?: string | null
 }
