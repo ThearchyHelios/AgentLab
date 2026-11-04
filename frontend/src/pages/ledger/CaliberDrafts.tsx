@@ -497,6 +497,7 @@ export function CaliberDrafts() {
   /** 入口字段：发布后按这些字段收参数 */
   const renderEntryFields = (draft: CaliberDraft) => {
     const fields = draft.entry_fields
+    const notes = draft.entry_notes ?? []
     if (!fields) return null
     return (
       <div data-draft-entry-fields="">
@@ -518,6 +519,11 @@ export function CaliberDrafts() {
             })}
           </ul>
         ) : <p className="text-2xs text-faint">{D.entryFieldNone}</p>}
+        {notes.length > 0 && (
+          <ul className="mt-1 space-y-0.5 text-2xs leading-relaxed text-warn" data-draft-entry-notes="">
+            {notes.map((note, i) => <li key={`${i}:${note}`}>{note}</li>)}
+          </ul>
+        )}
       </div>
     )
   }

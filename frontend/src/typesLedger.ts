@@ -566,6 +566,8 @@ export interface CaliberDraft extends CaliberDraftSummary {
   metrics?: DraftMetric[]
   /** 草稿图的入口字段 */
   entry_fields?: DraftEntryField[]
+  /** 入口字段在各组里声明不一致的地方（必填取并集、类型取更宽），合并时记下的说明 */
+  entry_notes?: string[]
   dropped?: DraftDropped[]
   open_questions?: string[]
   /** 还没有起草出来的指标名称：续跑跑到轮数上限或没有新指标后剩下的，可以再起一份 */

@@ -493,8 +493,15 @@ def _blocks(value: Any) -> list[dict]:
     return [dict(block) for block in value or [] if isinstance(block, Mapping)]
 
 
-def _merge_fields(target: dict[str, dict], value: Any) -> None:
-    """入口字段按 name 合并；同名但类型或必填对不上就抛 ValueError，不拿其中一组去覆盖另一组。"""
+def _merge_fields(target: dict[str, dict], value: Any, notes: list[str]) -> None:
+    """入口字段按 name 合并，冲突取更保守的一边，**不抛错**。
+
+    同一份文档分几轮起草，各组对同一个字段的声明常常对不上：一组说必填、另一组给了缺省；一组按数、另一组按文本。
+    这不是错误——它们本来就是从不同批指标里各看了一次。合并时必填取并集（有一组要就必须给），类型取更宽的一个
+    （能填进文本），缺省和说明取先出现的非空值；每一处不一致记一条 note 交给人看，不悄悄拿一组覆盖另一组。
+
+    早先这里抛 ValueError，结果一份 34 条指标的草稿因为一个字段的 required 不同就整份作废——代价完全不成比例。
+    """
     for field in value if isinstance(value, list) else []:
         if not isinstance(field, Mapping):
             continue
@@ -507,9 +514,30 @@ def _merge_fields(target: dict[str, dict], value: Any) -> None:
         if old is None:
             target[name] = item
             continue
-        if (str(old.get("type") or "string") != str(item.get("type") or "string")
-                or bool(old.get("required")) != bool(item.get("required"))):
-            raise ValueError(f"入口字段「{name}」在各组里的类型或必填不一致，不能合成一个入口")
+        merged = dict(old)
+        old_type = str(old.get("type") or "string")
+        new_type = str(item.get("type") or "string")
+        if old_type != new_type:
+            merged["type"] = "string" if "string" in (old_type, new_type) else old_type
+            notes.append(f"入口字段「{name}」在各组里的类型不一致（{old_type} / {new_type}），按「{merged['type']}」合并")
+        if bool(old.get("required")) != bool(item.get("required")):
+            merged["required"] = bool(old.get("required")) or bool(item.get("required"))
+            notes.append(f"入口字段「{name}」在各组里的必填不一致，合并后按"
+                         f"{'必填' if merged['required'] else '可选'}")
+        if not merged.get("default") and item.get("default") not in (None, ""):
+            merged["default"] = item["default"]
+        if not merged.get("description") and item.get("description"):
+            merged["description"] = item["description"]
+        target[name] = merged
+
+
+def merge_entry_fields(blocks: Any) -> tuple[list[dict], list[str]]:
+    """各组草案的入口字段合成一份：(字段, 不一致的说明)。调用方把说明摆给起草的人看。"""
+    target: dict[str, dict] = {}
+    notes: list[str] = []
+    for block in _blocks(blocks):
+        _merge_fields(target, block.get("entry_fields"), notes)
+    return list(target.values()), notes
 
 
 def build_graph(blocks: Any, *, name: str, question: str = "", datasource: str = "") -> dict:
@@ -518,9 +546,9 @@ def build_graph(blocks: Any, *, name: str, question: str = "", datasource: str =
     blocks 是 [{"sql", "entry_fields", "metrics"}]，也兼容老调用的单个 plan 字典（当成只有一组）。一组时取数节点仍叫
     fetch，多组叫 fetch_1、fetch_2…（和 certify.build_graph 一致）；第 i 组指标表达式里的 nodes.fetch 改写成对应的
     节点 id，已经带下标的（nodes.fetch_2）不动。指标 id 跨组重名时按 m1…mN 全局重排，口径卡和出口写重排后的 id——
-    重名会让口径卡读错值，宁可换号也不能让两个指标共用一个 id。入口字段按 name 合并，同名但类型/必填对不上抛
-    ValueError（两份草案自己打架，调用方当成问题记下来）。datasource 是取数节点指向的数据源名，调用方按这次的数据源
-    补，也可以写在某一组里；各组指向不同数据源时用第一组的（草稿图只连一个数据源）。
+    重名会让口径卡读错值，宁可换号也不能让两个指标共用一个 id。入口字段按 name 合并，冲突取更保守的一边并记一条
+    note（见 merge_entry_fields），**不抛错**：一个字段的声明差异不该把整份草稿判死。datasource 是取数节点指向的
+    数据源名，调用方按这次的数据源补，也可以写在某一组里；各组指向不同数据源时用第一组的（草稿图只连一个数据源）。
 
     调用两次结果逐字一致：节点 id、坐标都由输入决定，没有时间戳。报告配置、出口契约照 certify.build_graph 的写法，
     发布门禁认的就是这一套（REPORT_POLICY、metrics_from、required）。
@@ -542,7 +570,7 @@ def build_graph(blocks: Any, *, name: str, question: str = "", datasource: str =
     fetch_nodes: list[dict[str, Any]] = []
     source = str(datasource or "")
     for index, group in enumerate(groups):
-        _merge_fields(merged, group.get("entry_fields"))
+        _merge_fields(merged, group.get("entry_fields"), [])
         node_id = nid(index)
         for metric in group.get("metrics") or []:
             if not isinstance(metric, Mapping):

@@ -649,19 +649,21 @@ MAX_METRICS = 60
 
 
 def _merged_fields(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """各组声明的入口字段按名字合并去重（先出现的为准），给 payload 看：它是整张图的入口。
+    """各组声明的入口字段合成一份，给界面看：它和建图用的是同一套合并（draftplan.merge_entry_fields）。
 
-    建图时 draftplan.build_graph 还会再合一次，并在同名冲突时抛 ValueError；这里只负责让界面看到一份像样的 entry_fields。
+    早先这里是「先出现的为准」的另一份实现，建图那边还会因为同名冲突抛错——两份逻辑说不到一起。现在只有一处。
     """
-    merged: dict[str, dict[str, Any]] = {}
-    for block in blocks:
-        for field in block.get("entry_fields") or []:
-            if not isinstance(field, dict):
-                continue
-            name = str(field.get("name") or "").strip()
-            if name and name not in merged:
-                merged[name] = dict(field)
-    return list(merged.values())
+    from app.ledger import draftplan
+
+    fields, _ = draftplan.merge_entry_fields(blocks)
+    return fields
+
+
+def _entry_notes(blocks: list[dict[str, Any]]) -> list[str]:
+    """入口字段在各组里声明不一致的地方（必填取并集、类型取更宽），摆给起草的人看。"""
+    from app.ledger import draftplan
+
+    return draftplan.merge_entry_fields(blocks)[1]
 
 
 def _fresh_metrics(metrics: list[dict[str, Any]], covered: list[str]) -> list[dict[str, Any]]:
@@ -695,6 +697,7 @@ def _draft_payload(*, entries: list[dict[str, Any]], blocks: list[dict[str, Any]
         "documents": entries,
         "metrics": [m for block in blocks for m in block["metrics"]],
         "entry_fields": _merged_fields(blocks),
+        "entry_notes": _entry_notes(blocks),
         "sql": "\n\n".join(str(block["sql"]) for block in blocks),
         "version": 1,
         "blocks": len(blocks),
@@ -833,7 +836,7 @@ async def _extract_in_background(draft_id: str) -> None:
                 graph = draftplan.build_graph(blocks, name=draft.title, question=guidance or draft.title,
                                               datasource=source.name)
             except ValueError as e:
-                # 各组声明的入口对不上（同名不同类型 / 必填）：合不成一个入口，整份草稿建不出图，照实记为失败
+                # build_graph 现在合并入口字段不再抛错；这条留着兜底：真出现合不了的图，照实记为失败，别留半成品
                 draft.payload = {**state(), "dropped": [*problems, {"name": "入口字段", "reason": str(e)}],
                                  "trial": {"run_id": "", "status": "failed", "error": str(e)}}
                 draft.model_id = model_id or None

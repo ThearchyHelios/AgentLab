@@ -575,15 +575,15 @@ async def test_a_round_that_brings_nothing_new_stops_the_loop_without_a_half_bui
     assert [m["id"] for m in card["data"]["config"]["metrics"]] == ["m1"]
 
 
-async def test_conflicting_entry_fields_across_groups_fail_the_draft_with_a_reason(
+async def test_conflicting_entry_field_declarations_are_merged_not_failed(
         client, documents, datasource, monkeypatch):
-    """两组都声明 region，但类型对不上：合不成一个入口，build_graph 抛 ValueError，草稿照实记为失败。"""
+    """两组把 region 声明得不一样：必填取并集、类型取更宽，草稿照常出图，只把不一致摆给人看。"""
     doc = await documents("dd-rounds-clash")
     source_id = await datasource()
     first = json.loads(plan_reply(f"{doc}-2"))
     first["uncovered"] = ["已支付订单数"]
     second = json.loads(plan_reply(f"{doc}-2"))
-    second["entry_fields"] = [{**second["entry_fields"][0], "type": "integer"}]
+    second["entry_fields"] = [{**second["entry_fields"][0], "required": True}]
     second["metrics"] = [{**second["metrics"][0], "id": "m2", "name": "已支付订单数",
                           "expression": "cell(nodes.fetch, 0, 'orders')"}]
     second["uncovered"] = []
@@ -591,10 +591,11 @@ async def test_conflicting_entry_fields_across_groups_fail_the_draft_with_a_reas
 
     body = await extract(client, doc, source_id)
     made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
-    assert made["status"] == "failed" and made["workflow_id"] is None
-    assert "入口字段" in made["error"] and "store" in made["error"]
-    assert made["metric_count"] == 2 and made["progress"] == {"round": 2, "covered": 2, "uncovered": 0}
-    assert any(d["name"] == "入口字段" for d in made["dropped"])
+    assert made["status"] in ("ready", "questions_open") and made["workflow_id"] is not None
+    assert made["metric_count"] == 2 and made["blocks"] == 2
+    fields = {f["name"]: f for f in made["entry_fields"]}
+    assert fields["store"]["required"] is True
+    assert any("store" in note for note in made["entry_notes"])
 
 
 async def test_a_real_trial_run_reads_values_from_both_fetch_nodes(client, documents, tmp_path, monkeypatch):

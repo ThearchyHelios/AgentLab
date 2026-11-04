@@ -224,17 +224,26 @@ def test_build_graph_accepts_one_block_as_a_single_group():
     assert card["metrics"][0]["expression"] == "cell(nodes.fetch, 0, 'gmv')"
 
 
-def test_build_graph_merges_entry_fields_and_refuses_conflicting_ones():
+def test_build_graph_merges_entry_fields_and_widens_conflicts():
+    """同名字段在各组里声明不一致时按更保守的一边合并，不抛错：一个字段的差异不该让整份草稿作废。"""
     same = block("SELECT 1 AS gmv FROM orders", [dict(METRIC)])
     merged = draftplan.build_graph([same, block("SELECT 2 AS cnt FROM orders", [{**METRIC, "id": "m2"}])],
                                    name="x")
     fields = next(node for node in merged["nodes"] if node["id"] == "start")["data"]["config"]["fields"]
     assert [f["name"] for f in fields] == ["start"]
 
-    conflicting = block("SELECT 1 AS gmv FROM orders", [dict(METRIC)],
-                        fields=[{**START, "required": False}])
-    with pytest.raises(ValueError, match="start"):
-        draftplan.build_graph([same, conflicting], name="x")
+    not_required = block("SELECT 1 AS gmv FROM orders", [dict(METRIC)],
+                         fields=[{**START, "required": False}])
+    fields, notes = draftplan.merge_entry_fields([same, not_required])
+    assert fields[0]["required"] is True
+    assert any("start" in note and "必填" in note for note in notes)
+
+    typed = block("SELECT 1 AS gmv FROM orders", [dict(METRIC)],
+                  fields=[{**START, "type": "integer"}])
+    fields, notes = draftplan.merge_entry_fields([same, typed])
+    assert fields[0]["type"] == "string"
+    assert any("start" in note and "类型" in note for note in notes)
+    assert draftplan.build_graph([same, typed], name="x")["nodes"]
 
 
 
