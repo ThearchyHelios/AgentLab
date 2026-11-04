@@ -322,6 +322,8 @@ export const LEDGER_UI = {
     resolved: (n: number) => `已移除 ${formatNumber(n)} 个问题`,
     dropped: '被丢弃的条目',
     droppedHint: '带不了能对照数据目录的取数，或引用无法逐字核对上的指标不留下',
+    uncovered: (n: number) => `这次没起草的指标（${n} 条）`,
+    uncoveredHint: '它们和这一组指标不能共用同一条取数 SQL，可以再起一份草稿接着做',
     alignment: '和已发布口径对齐',
     alignmentNew: '新的',
     alignmentDuplicate: '已有出处',

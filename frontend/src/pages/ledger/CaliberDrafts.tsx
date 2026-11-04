@@ -584,6 +584,7 @@ export function CaliberDrafts() {
     const terminal = draft.status === 'attached' || draft.status === 'rejected'
     const questions = draft.open_questions ?? []
     const dropped = draft.dropped ?? []
+    const uncovered = draft.uncovered ?? []
     const metrics = draft.metrics ?? []
     return (
       <div className="space-y-3 border-t px-3 py-3" data-draft-detail="">
@@ -660,6 +661,14 @@ export function CaliberDrafts() {
                 </li>
               ))}
             </ul>
+          </div>
+        )}
+
+        {uncovered.length > 0 && (
+          <div data-draft-uncovered="">
+            <h3 className="text-2xs font-semibold text-dim">{D.uncovered(uncovered.length)}</h3>
+            <p className="mb-1 text-2xs leading-relaxed text-faint">{D.uncoveredHint}</p>
+            <p className="text-2xs leading-relaxed text-dim">{uncovered.join('、')}</p>
           </div>
         )}
 

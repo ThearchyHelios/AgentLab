@@ -561,6 +561,10 @@ export interface CaliberDraft extends CaliberDraftSummary {
   entry_fields?: DraftEntryField[]
   dropped?: DraftDropped[]
   open_questions?: string[]
+  /** 这次没起草的指标名称：它们和这一组不能共用同一条取数 SQL，可以再起一份 */
+  uncovered?: string[]
+  /** 模型回复被截断，指标是从完整片段里抢救出来的 */
+  salvaged?: boolean
   alignment?: DraftAlignment
   /** 起草后自动发起的那次只读试运行；旧草稿可能没有 */
   trial?: DraftTrial | null
