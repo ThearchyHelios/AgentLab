@@ -507,3 +507,28 @@ async def test_a_real_trial_run_feeds_the_trial_endpoint(client, documents, tmp_
             if source is not None:
                 await session.delete(source)
             await session.commit()
+
+
+async def test_the_model_asking_questions_is_not_a_failure(client, documents, datasource, monkeypatch):
+    """模型说「目录里没有这些列、写不了 SQL」时，这是要补信息的草稿，不是失败：问题原样留下，不编指标。"""
+    doc = await documents("dd-questions")
+    source_id = await datasource()
+    fake_model(monkeypatch, json.dumps({
+        "entry_fields": [], "sql": "", "metrics": [],
+        "open_questions": ["数据目录里没有 attribute01…54 的取值列，写不出时间类指标"],
+    }, ensure_ascii=False))
+
+    body = await extract(client, doc, source_id)
+    made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
+    assert made["status"] == "questions_open" and made["error"] == ""
+    assert made["open_questions"] == ["数据目录里没有 attribute01…54 的取值列，写不出时间类指标"]
+    assert made["metrics"] == [] and made["workflow_id"] is None
+    assert made["trial"]["run_id"] == ""
+
+
+def test_the_schema_text_expands_the_tables_the_document_names_first():
+    """目录十万字符、预算只有两万多：先展开文档点到的表，其余只靠列名清单认。"""
+    tables = ["orders", "refunds", "stores", "kpi_info", "attr_info"]
+    picked = api_ledger._focus_tables(tables, "指标取自 kpi_info，属性在 attr_info 里")
+    assert picked[:2] == ["kpi_info", "attr_info"]
+    assert set(picked) >= {"kpi_info", "attr_info"}

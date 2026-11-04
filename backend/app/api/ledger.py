@@ -439,11 +439,51 @@ def _source_tables(source: DataSource) -> dict[str, Any]:
     return tables if isinstance(tables, dict) else {}
 
 
-async def _schema_material(session: AsyncSession, source: DataSource) -> tuple[str, set[str]]:
+def _focus_tables(tables: list[str], text: str, limit: int = 8) -> list[str]:
+    """文档里点到的表优先展开：按它在原文里第一次出现的位置排，没点到的按目录顺序补几张。
+
+    目录动辄十万字符，全塞给模型会把文档和别的表挤掉。先给全量列名（见 _columns_digest），再把文档点到的
+    那几张表展开注释和目录——写 SQL 需要的列名一个不少，细节只给用得上的。
+    """
+    lowered = (text or "").lower()
+    hit: list[tuple[int, str]] = []
+    for table in tables:
+        name = str(table).lower()
+        short = name.split(".")[-1]
+        at = lowered.find(name)
+        if at < 0:
+            at = lowered.find(short)
+        if at >= 0:
+            hit.append((at, table))
+    hit.sort(key=lambda pair: pair[0])
+    picked = [table for _, table in hit][:limit]
+    for table in tables:
+        if len(picked) >= min(limit, 5):
+            break
+        if table not in picked:
+            picked.append(table)
+    return picked
+
+
+def _columns_digest(source: DataSource, tables: list[str]) -> str:
+    """每张表的列名清单（只给名字）：要写 SQL，先得知道有哪些列。注释和目录留给下面展开的那几张。"""
+    from app.data import introspect
+
+    lines = ["各表的列（只列名字；下面展开的表另有类型、注释和数据目录）："]
+    for table in tables:
+        meta = introspect.find_table(source, table)
+        columns = [str(c.get("name")) for c in (meta or {}).get("columns") or [] if c.get("name")]
+        if columns:
+            lines.append(f"{table}: {', '.join(columns)}")
+    return "\n".join(lines)
+
+
+async def _schema_material(session: AsyncSession, source: DataSource, focus_text: str = ""
+                           ) -> tuple[str, set[str]]:
     """这个数据源给模型看的表结构 + 数据目录文本，以及 SQL 允许出现的表名集合。
 
-    给模型的是「库概览 + 紧凑表名索引 + 前几十张表的字段/目录」（schema_view 的现成渲染），表名一律照目录原文，模型照着抄。
-    allowed_tables 收全部探查到的表（含 schema 前缀写法）：文本里被截掉详情的表也允许，因为索引里有名字。
+    文本按「概览 → 全量表索引 → 全量列名 → 文档点到的表展开」的顺序排：预算不够时先丢的是最后那一段，
+    列名不会丢。表名一律照目录原文，模型照着抄。
     """
     from app.data import catalog, schema_view
 
@@ -456,9 +496,8 @@ async def _schema_material(session: AsyncSession, source: DataSource) -> tuple[s
     lines = [schema_view.overview_line(source, catalog_tables=sum(
         1 for entry in entries.values() if catalog.visible_notes(entry.notes)))]
     lines.append(schema_view.table_index(source, notes))
-    for position, table in enumerate(tables):
-        if position >= 60:
-            break
+    lines.append(_columns_digest(source, tables))
+    for table in _focus_tables(tables, focus_text):
         lines.append(schema_view.table_detail(source, table, catalog_notes=notes))
     schema = cache.get("schema")
     allowed: set[str] = set()
@@ -642,7 +681,8 @@ async def _extract_in_background(draft_id: str) -> None:
             draft.status = "failed"
             await session.commit()
             return
-        tables_text, allowed_tables = await _schema_material(session, source)
+        focus_text = "\n".join(str(c.get("content") or "") for c in chunks.values())
+        tables_text, allowed_tables = await _schema_material(session, source, focus_text)
         if not allowed_tables:
             draft.error = "这个数据源还没有表结构：先探查表结构，再起草口径"
             draft.status = "failed"
@@ -668,6 +708,14 @@ async def _extract_in_background(draft_id: str) -> None:
                 error = _problems_text(problems) or "模型没有给出可用的取数 SQL 和指标"
                 if result.get("diagnostics"):
                     error = f"{error}（{result['diagnostics']}）"
+                if plan["open_questions"]:
+                    # 模型把缺什么说清楚了（目录里没有这些列、业务上还没定）：这是一份要补信息的草稿，不是失败
+                    draft.payload = {**base, "trial": {"run_id": "", "status": "", "error": ""}}
+                    draft.model_id = result["model_id"] or None
+                    draft.error = ""
+                    draft.status = "questions_open"
+                    await session.commit()
+                    return
                 draft.payload = {**base, "trial": {"run_id": "", "status": "failed", "error": error}}
                 draft.model_id = result["model_id"] or None
                 draft.error = error
