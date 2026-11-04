@@ -475,7 +475,7 @@ export interface DraftMetric {
   unit?: string
   /** 小数位 */
   decimals?: number
-  /** 指标表达式，形如 cell(nodes.fetch, 0, '列') */
+  /** 指标表达式，形如 cell(nodes.fetch_1, 0, '列')；一组取数时节点 id 是 fetch */
   expression?: string
   /** 粒度，如「日」「订单行」 */
   grain?: string
@@ -553,6 +553,13 @@ export interface CaliberDraftSummary {
   error: string | null
 }
 
+/** 起草轮次和覆盖情况：多轮续跑时每轮更新，covered 是已经起草出的指标名数，uncovered 是还没覆盖的 */
+export interface DraftProgress {
+  round: number
+  covered: number
+  uncovered: number
+}
+
 /** GET /api/ledger/drafts/{id}：payload 摊平在上层（documents / metrics / dropped / open_questions / alignment） */
 export interface CaliberDraft extends CaliberDraftSummary {
   documents?: DraftDocument[]
@@ -561,8 +568,12 @@ export interface CaliberDraft extends CaliberDraftSummary {
   entry_fields?: DraftEntryField[]
   dropped?: DraftDropped[]
   open_questions?: string[]
-  /** 这次没起草的指标名称：它们和这一组不能共用同一条取数 SQL，可以再起一份 */
+  /** 还没有起草出来的指标名称：续跑跑到轮数上限或没有新指标后剩下的，可以再起一份 */
   uncovered?: string[]
+  /** 这张草稿图有几个取数节点（fetch_1、fetch_2…）：多组指标共用一张口径卡 */
+  blocks?: number
+  /** 多轮续跑的进度；旧草稿没有 */
+  progress?: DraftProgress
   /** 模型回复被截断，指标是从完整片段里抢救出来的 */
   salvaged?: boolean
   alignment?: DraftAlignment
@@ -571,6 +582,10 @@ export interface CaliberDraft extends CaliberDraftSummary {
   /** 草稿图对应的版本号 */
   version?: number | null
   /** 文档超过一次能发给模型的字数，后面的段落没有参与起草 */
+  doc_truncated?: boolean
+  /** 数据目录太大，只展开了文档点到的几张表 */
+  catalog_truncated?: boolean
+  /** 旧服务端只给这一个：上面两种截断之一，界面按较窄的那条说 */
   truncated?: boolean
   model_id?: string | null
   collection?: string | null

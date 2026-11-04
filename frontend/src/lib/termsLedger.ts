@@ -230,9 +230,10 @@ export const LEDGER_UI = {
     subtitle: '文档整理成定义和取数，自动试运行一次；去画布审改后由人签字发布',
     back: '返回口径目录',
     refresh: '刷新',
-    /** 列表按状态筛：全部加六种落点，起草中的只出现在全部里 */
+    /** 列表按状态筛：全部加起草中和六种落点；起草中会停留几分钟，单独筛出来看 */
     filter: {
       all: '全部',
+      drafting: '起草中',
       ready: '待签字发布',
       questions_open: '待确认问题',
       path_pending: '待接数据路径',
@@ -275,8 +276,11 @@ export const LEDGER_UI = {
 
     // ---- 抽取中 ----
     drafting: '正在抽取指标…',
-    draftingHint: '模型在后台读文档、对照数据目录写定义和取数，通常不到一分钟；离开页面不影响结果',
-    draftingTimeout: '起草超过一分钟还没有结果：稍后刷新再看；失败原因会写在这份草稿上',
+    draftingHint: '模型在服务端读文档、对照数据目录写定义和取数；指标多时会分几轮接着起草，离开页面不影响结果',
+    /** 第 N 轮 · 已覆盖 M 条 · 还有 K 条 */
+    progress: (round: number, covered: number, uncovered: number) =>
+      `第 ${formatNumber(round)} 轮 · 已覆盖 ${formatNumber(covered)} 条 · 还有 ${formatNumber(uncovered)} 条`,
+    draftingTimeout: '还没起草完，稍后刷新看结果',
     draftingFailed: '起草没有完成',
 
     // ---- 自动试运行 ----
@@ -292,8 +296,13 @@ export const LEDGER_UI = {
 
     // ---- 详情 ----
     documentsUsed: (n: number) => `${formatNumber(n)} 份文档`,
-    truncated: '文档太长，后面的段落没有参与起草：可以少选几份，或先拆分文档',
-    metrics: '指标',
+    docTruncated: '文档太长，后面的段落没有参与起草',
+    catalogTruncated: '数据目录太大，只展开了文档点到的几张表',
+    blocks: (n: number) => `${formatNumber(n)} 个取数节点`,
+    metricsCount: (n: number) => `指标（${formatNumber(n)} 条）`,
+    /** 指标卡默认收起：标题行看名字、单位、值和未决问题数，展开看定义、表达式和引用 */
+    metricSummaryHint: '展开看定义、表达式和引用原文',
+    metricQuestions: (n: number) => `${formatNumber(n)} 个未决问题`,
     noMetrics: '没有整理出指标',
     noMetricsBody: '文档里没有能逐字核对上引用的指标定义，可以换一份文档或补充起草要求后重来',
     synonyms: (list: string) => `又称：${list}`,
@@ -322,8 +331,8 @@ export const LEDGER_UI = {
     resolved: (n: number) => `已移除 ${formatNumber(n)} 个问题`,
     dropped: '被丢弃的条目',
     droppedHint: '带不了能对照数据目录的取数，或引用无法逐字核对上的指标不留下',
-    uncovered: (n: number) => `这次没起草的指标（${n} 条）`,
-    uncoveredHint: '它们和这一组指标不能共用同一条取数 SQL，可以再起一份草稿接着做',
+    uncovered: (n: number) => `还没起草出来的指标（${formatNumber(n)} 条）`,
+    uncoveredHint: '这轮起草结束后还是没能起草出来的指标：可以再起一份草稿，或在起草要求里写清它们的取数口径',
     alignment: '和已发布口径对齐',
     alignmentNew: '新的',
     alignmentDuplicate: '已有出处',

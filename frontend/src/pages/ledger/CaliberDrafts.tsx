@@ -3,10 +3,11 @@
  *
  * 主路径一次到位：选文档 → 模型读文档、对照数据目录产出定义 + 取数 + 入口字段 + 指标表达式 → 服务端校验后落成草稿图
  * → 后台自动只读试运行 → 这里展示「定义 + 数 + 原文引用」→ 人去画布审改并发布。发布才需要人签字。
- * - 发起：选知识库文档，可选数据源（只写进适用范围）和一段起草要求，页面轮询详情直到状态离开 drafting（最多一分钟）；
+ * - 发起：选知识库文档，可选数据源（只写进适用范围）和一段起草要求，页面轮询详情直到状态离开 drafting（最多十分钟，
+ *   指标多时服务端会分几轮续跑，进度写在 payload.progress）；
  * - 试运行：草稿顶部显示这次自动试运行的状态和每个指标的值，running 时每两秒取一次，最多等一分钟；失败照实写原因；
- * - 审读：每条指标带单位、粒度、指标表达式、定义和逐字核对过的引用原文（第 N 段），逐条的未决问题可以勾掉；被丢弃
- *   的条目单独列出原因；入口字段列出名字、类型、必填和缺省值；
+ * - 审读：指标默认收成一行（名字、单位、值和未决问题数），展开看单位、粒度、指标表达式、定义和逐字核对过的引用原文
+ *   （第 N 段），逐条的未决问题可以勾掉；被丢弃的条目单独列出原因；入口字段列出名字、类型、必填和缺省值；
  * - 发布：主按钮去画布审改并发布。「接上一次运行」只是辅助入口：已经有答案时让它认这份定义。
  *
  * 页面不显示 SQL，取数到画布上看。状态由服务端算（还有问题 → questions_open，否则 ready；旧路径可能停在 path_pending），
@@ -22,14 +23,19 @@ import { formatDateTime, formatTime } from '../../lib/format'
 import { LEDGER_UI } from '../../lib/termsLedger'
 import type { DataSourceName, KbDocument, Run } from '../../types'
 import type {
-  CaliberDraft, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftCitation, DraftMetric, DraftTrialOut,
+  CaliberDraft, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftCitation, DraftMetric, DraftTrialMetric,
+  DraftTrialOut,
 } from '../../typesLedger'
 
 const D = LEDGER_UI.drafts
 
-/** 列表的状态筛：全部加六种落点，起草中的只出现在全部里 */
-type Filter = '' | Exclude<CaliberDraftStatus, 'drafting'>
-const FILTERS: Filter[] = ['', 'ready', 'questions_open', 'path_pending', 'attached', 'rejected', 'failed']
+/** 列表的状态筛：全部加七种状态；起草中也会停留几分钟，可以单独筛出来看 */
+type Filter = '' | CaliberDraftStatus
+const FILTERS: Filter[] = ['', 'drafting', 'ready', 'questions_open', 'path_pending', 'attached', 'rejected', 'failed']
+
+/** 起草轮询：每两秒一次，多轮续跑要几分钟，最多等十分钟 */
+const DRAFT_POLL_MS = 2_000
+const DRAFT_POLL_LIMIT_MS = 10 * 60_000
 
 /** 状态标签：起草中 / 待签字发布 / 待确认问题 / 待接数据路径 / 已接上 / 已驳回 / 起草失败 */
 function StatusPill({ status }: { status: CaliberDraftStatus }) {
@@ -126,7 +132,7 @@ export function CaliberDrafts() {
   const [recentRuns, setRecentRuns] = useState<Run[] | null>(null)
   const [attachOut, setAttachOut] = useState<{ workflow_id: string; version: number; warnings: string[] } | null>(null)
 
-  /** 起草中的草稿：每两秒取一次详情，状态离开 drafting 或超过一分钟就停 */
+  /** 起草中的草稿：每两秒取一次详情，状态离开 drafting 或超过十分钟就停 */
   const [pollingId, setPollingId] = useState<string | null>(null)
   const [pollTimedOut, setPollTimedOut] = useState(false)
 
@@ -212,7 +218,7 @@ export function CaliberDrafts() {
 
   useEffect(() => {
     if (!pollingId) return
-    const until = Date.now() + 60_000
+    const until = Date.now() + DRAFT_POLL_LIMIT_MS
     let alive = true
     const timer = setInterval(() => {
       api.caliberLedger.draft(pollingId).then((draft) => {
@@ -232,7 +238,7 @@ export function CaliberDrafts() {
         setPollingId(null)
         setDetailError(e)
       })
-    }, 2000)
+    }, DRAFT_POLL_MS)
     return () => { alive = false; clearInterval(timer) }
   }, [pollingId, loadList])
 
@@ -516,9 +522,16 @@ export function CaliberDrafts() {
     )
   }
 
-  const renderMetric = (metric: DraftMetric, index: number) => {
+  /**
+   * 一条指标：默认收成一行，名字、单位、值和未决问题数直接看得见；展开才是定义、表达式、引用。
+   * 指标多到几十条时这样一屏能扫完，找哪条再展开哪条。
+   */
+  const renderMetric = (metric: DraftMetric, index: number, values: Map<string, DraftTrialMetric>) => {
     const definition = metric.definition ?? {}
     const citations = definition.citations ?? []
+    const questions = metric.open_questions ?? []
+    const row = metric.id ? values.get(metric.id) : undefined
+    const value = row ? row.rendered ?? (row.value == null ? '' : String(row.value)) : ''
     const rows = [
       [D.unit, metric.unit],
       [D.decimals, metric.decimals != null ? String(metric.decimals) : ''],
@@ -532,49 +545,60 @@ export function CaliberDrafts() {
       [D.dimensions, metric.dimensions?.join('、')],
       [D.filters, metric.filters?.join('；')],
       [D.exclusions, definition.exclusions?.join('；')],
-    ].filter(([, value]) => typeof value === 'string' && value.trim()) as [string, string][]
+    ].filter(([, text]) => typeof text === 'string' && text.trim()) as [string, string][]
     return (
-      <li key={`${metric.id ?? metric.name}:${index}`} className="rounded-md border bg-panel px-3 py-2" data-draft-metric={metric.name}>
-        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span className="text-xs font-medium">{metric.name}</span>
-          {!!metric.synonyms?.length && <span className="text-2xs text-faint">{D.synonyms(metric.synonyms.join('、'))}</span>}
-        </div>
-        {rows.length > 0 && (
-          <dl className="mt-1 grid gap-x-3 gap-y-0.5 text-2xs sm:grid-cols-[auto_1fr]">
-            {rows.map(([label, value]) => (
-              <div key={label} className="contents">
-                <dt className="text-faint">{label}</dt>
-                <dd className="text-dim">{value}</dd>
+      <li key={`${metric.id ?? metric.name}:${index}`} data-draft-metric={metric.name}>
+        <details className="rounded-md border bg-panel">
+          <summary className="flex cursor-pointer flex-wrap items-baseline gap-x-2 gap-y-0.5 px-3 py-2"
+                   title={D.metricSummaryHint}>
+            <span className="text-xs font-medium [overflow-wrap:anywhere]">{metric.name}</span>
+            {!!questions.length && <span className="text-2xs text-[var(--warn)]">{D.metricQuestions(questions.length)}</span>}
+            {!!value && (
+              <span className="tnum ml-auto text-xs font-medium" data-draft-metric-value={metric.id}>
+                {value}{metric.unit ? ` ${metric.unit}` : ''}
+              </span>
+            )}
+          </summary>
+          <div className="border-t px-3 py-2">
+            {!!metric.synonyms?.length && <p className="text-2xs text-faint">{D.synonyms(metric.synonyms.join('、'))}</p>}
+            {rows.length > 0 && (
+              <dl className="mt-1 grid gap-x-3 gap-y-0.5 text-2xs sm:grid-cols-[auto_1fr]">
+                {rows.map(([label, text]) => (
+                  <div key={label} className="contents">
+                    <dt className="text-faint">{label}</dt>
+                    <dd className="text-dim">{text}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
+            {metric.expression && (
+              <div className="mt-1.5" data-draft-expression="">
+                <h4 className="text-2xs font-semibold text-faint">{D.expression}</h4>
+                <code className="mt-0.5 block whitespace-pre-wrap rounded bg-elev px-1.5 py-1 text-2xs text-dim [overflow-wrap:anywhere]">
+                  {metric.expression}
+                </code>
               </div>
-            ))}
-          </dl>
-        )}
-        {metric.expression && (
-          <div className="mt-1.5" data-draft-expression="">
-            <h4 className="text-2xs font-semibold text-faint">{D.expression}</h4>
-            <code className="mt-0.5 block whitespace-pre-wrap rounded bg-elev px-1.5 py-1 text-2xs text-dim [overflow-wrap:anywhere]">
-              {metric.expression}
-            </code>
+            )}
+            {definition.text && (
+              <div className="mt-1.5">
+                <h4 className="text-2xs font-semibold text-faint">{D.definition}</h4>
+                <p className="text-2xs leading-relaxed text-dim">{definition.text}</p>
+              </div>
+            )}
+            {citations.length > 0 && (
+              <div className="mt-1.5">
+                <h4 className="mb-1 text-2xs font-semibold text-faint">{D.citations}</h4>
+                <ul className="space-y-1">{citations.map((c, i) => citationRow(c, `${index}:${i}`, metric.name))}</ul>
+              </div>
+            )}
+            {!!questions.length && (
+              <div className="mt-1.5" data-draft-questions="">
+                <h4 className="text-2xs font-semibold text-faint">{D.questions}</h4>
+                {questionList(questions, `${index}`)}
+              </div>
+            )}
           </div>
-        )}
-        {definition.text && (
-          <div className="mt-1.5">
-            <h4 className="text-2xs font-semibold text-faint">{D.definition}</h4>
-            <p className="text-2xs leading-relaxed text-dim">{definition.text}</p>
-          </div>
-        )}
-        {citations.length > 0 && (
-          <div className="mt-1.5">
-            <h4 className="mb-1 text-2xs font-semibold text-faint">{D.citations}</h4>
-            <ul className="space-y-1">{citations.map((c, i) => citationRow(c, `${index}:${i}`, metric.name))}</ul>
-          </div>
-        )}
-        {!!metric.open_questions?.length && (
-          <div className="mt-1.5" data-draft-questions="">
-            <h4 className="text-2xs font-semibold text-faint">{D.questions}</h4>
-            {questionList(metric.open_questions, `${index}`)}
-          </div>
-        )}
+        </details>
       </li>
     )
   }
@@ -586,11 +610,15 @@ export function CaliberDrafts() {
     const dropped = draft.dropped ?? []
     const uncovered = draft.uncovered ?? []
     const metrics = draft.metrics ?? []
+    const values = new Map((trial?.metrics ?? []).map((row) => [row.id, row]))
+    // 第一轮还没落库时服务端写的是空对象：没有轮次就不画，别显示「第 undefined 轮」
+    const progress = draft.progress && typeof draft.progress.round === 'number' ? draft.progress : null
     return (
       <div className="space-y-3 border-t px-3 py-3" data-draft-detail="">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-faint">
           <StatusPill status={draft.status} />
           {!!draft.documents?.length && <span>{D.documentsUsed(draft.documents.length)}</span>}
+          {typeof draft.blocks === 'number' && draft.blocks > 1 && <span>{D.blocks(draft.blocks)}</span>}
           {draft.created_at && <span title={formatDateTime(draft.created_at)}>{formatTime(draft.created_at)}</span>}
           {draft.created_by && <span>{D.createdBy(draft.created_by)}</span>}
           {draft.model_id && <span title={draft.model_id}>{D.model(draft.model_id)}</span>}
@@ -611,18 +639,35 @@ export function CaliberDrafts() {
         {drafting && pollingId === draft.id && (
           <Notice tone="info">
             <span className="inline-flex items-center gap-1.5"><Spinner size={12} /> {D.drafting}</span>
+            {progress && (
+              <span className="tnum mt-0.5 block" data-draft-progress="">
+                {D.progress(progress.round, progress.covered, progress.uncovered)}
+              </span>
+            )}
             <span className="mt-0.5 block text-faint">{D.draftingHint}</span>
           </Notice>
         )}
-        {drafting && pollTimedOut && <Notice tone="warn">{D.draftingTimeout}</Notice>}
-        {draft.truncated && <Notice tone="warn">{D.truncated}</Notice>}
+        {drafting && pollTimedOut && (
+          <Notice tone="warn">
+            {D.draftingTimeout}
+            {progress && (
+              <span className="tnum mt-0.5 block" data-draft-progress="">
+                {D.progress(progress.round, progress.covered, progress.uncovered)}
+              </span>
+            )}
+          </Notice>
+        )}
+        {(draft.doc_truncated || (draft.truncated && !draft.catalog_truncated)) && (
+          <Notice tone="warn">{D.docTruncated}</Notice>
+        )}
+        {draft.catalog_truncated && <Notice tone="warn">{D.catalogTruncated}</Notice>}
 
         {renderTrial(draft)}
         {renderEntryFields(draft)}
 
         <div>
           <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-2xs font-semibold text-dim">{D.metrics}</h3>
+            <h3 className="text-2xs font-semibold text-dim">{D.metricsCount(metrics.length)}</h3>
             {pickedQuestions.length > 0 && (
               <div className="flex items-center gap-2">
                 <span className="text-2xs text-faint">{D.resolveHint}</span>
@@ -634,7 +679,7 @@ export function CaliberDrafts() {
             )}
           </div>
           {metrics.length ? (
-            <ul className="space-y-2">{metrics.map(renderMetric)}</ul>
+            <ul className="space-y-2">{metrics.map((metric, index) => renderMetric(metric, index, values))}</ul>
           ) : !drafting ? (
             <EmptyState offline={false} icon={<ScrollText size={20} />} title={D.noMetrics} body={D.noMetricsBody} />
           ) : (
