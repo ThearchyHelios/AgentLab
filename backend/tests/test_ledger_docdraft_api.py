@@ -3,6 +3,7 @@
 - 抽取先建一行 drafting、在后台跑模型；结果写成草稿：payload 里有 metrics / sql / entry_fields / trial，工作流和 v1 已建；
 - 没有数据源、或数据源没有表结构时 422，一个草稿都不建；SQL 对照不上目录时草稿 failed；
 - 有未决问题 → questions_open（图和试跑照样有），没有 → ready；
+- 一轮覆盖不完就带着 covered 续跑：第二轮收成第二个取数节点，两组指标挂同一张口径卡；某一轮没交新指标就停；
 - PATCH 换指标 / 消问题并重算状态；dismiss 置 rejected 并写审计；列表给计数、按改过的先后排；
 - GET /drafts/{id}/trial 交回契约里的形状。
 
@@ -495,6 +496,154 @@ async def test_a_real_trial_run_feeds_the_trial_endpoint(client, documents, tmp_
             "试跑只跑取数与口径卡，不该触发报告撰写"
         assert run.origin["kind"] == "caliber_trial" and run.origin["draft_id"] == draft_id
         assert run.origin["workflow_id"] == made["workflow_id"] and run.origin["version"] == 1
+    finally:
+        await run_manager.shutdown()
+        async with SessionLocal() as session:
+            if run_id:
+                row = await session.get(Run, run_id)
+                if row is not None:
+                    await session.delete(row)
+            source = (await session.execute(select(DataSource).where(
+                DataSource.name == S.CURRENT["source"]))).scalars().first()
+            if source is not None:
+                await session.delete(source)
+            await session.commit()
+
+
+async def test_a_big_document_is_drafted_in_several_rounds_onto_one_multi_fetch_graph(
+        client, documents, datasource, monkeypatch):
+    """第一轮交一组、uncovered 还剩一条：续跑第二轮，收成一张两个取数节点、卡上两条指标的图。"""
+    doc = await documents("dd-rounds")
+    source_id = await datasource()
+    first = json.loads(plan_reply(f"{doc}-2"))
+    first["uncovered"] = ["已支付订单数"]
+    second = json.loads(plan_reply(f"{doc}-2"))
+    second["sql"] = ("SELECT COUNT(*) AS orders FROM orders WHERE status = 'paid' "
+                     "AND store = '{{ input.store }}'")
+    second["metrics"] = [{**second["metrics"][0], "id": "m1", "name": "已支付订单数",
+                          "expression": "cell(nodes.fetch, 0, 'orders')"}]
+    second["uncovered"] = []
+    model = fake_model(monkeypatch, json.dumps(first, ensure_ascii=False), json.dumps(second, ensure_ascii=False))
+
+    body = await extract(client, doc, source_id)
+    made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
+
+    assert made["status"] == "ready"
+    assert [m["name"] for m in made["metrics"]] == ["已支付退款率", "已支付订单数"]
+    assert made["blocks"] == 2
+    assert made["progress"] == {"round": 2, "covered": 2, "uncovered": 0}
+    assert made["truncated"] is False and made["doc_truncated"] is False and made["catalog_truncated"] is False
+    # 第二轮提示词写明上一轮起草过什么：模型据此不再重复起草
+    assert len(model.calls) == 2 and "已支付退款率" in str(model.calls[1][-1].content)
+
+    async with SessionLocal() as session:
+        row = await session.get(CaliberDraft, body["draft_id"])
+        workflow = await session.get(Workflow, row.workflow_id)
+    graph = workflow.graph
+    assert [n["id"] for n in graph["nodes"]] == ["start", "fetch_1", "fetch_2", "card", "write", "out"]
+    card = next(n for n in graph["nodes"] if n["id"] == "card")["data"]["config"]["metrics"]
+    # 两组都交 m1：跨组重名按 m1…mN 重排，表达式改写到各自的取数节点
+    assert [m["id"] for m in card] == ["m1", "m2"]
+    assert [m["expression"] for m in card] == ["cell(nodes.fetch_1, 0, 'refund_rate')",
+                                               "cell(nodes.fetch_2, 0, 'orders')"]
+    assert graph["nodes"][-1]["data"]["config"]["contract"]["required"] == ["m1", "m2"]
+    assert validate_graph(GraphSpec.model_validate(graph)).ok
+    assert made["trial"]["status"] == "succeeded" and made["trial"]["run_id"]
+
+
+async def test_a_round_that_brings_nothing_new_stops_the_loop_without_a_half_built_group(
+        client, documents, datasource, monkeypatch):
+    """第二轮什么也没交：停在那一轮，不拿空 SQL 拼出第三组取数，也不留一条半成品指标。"""
+    doc = await documents("dd-rounds-stop")
+    source_id = await datasource()
+    first = json.loads(plan_reply(f"{doc}-2"))
+    first["uncovered"] = ["已支付订单数"]
+    fake_model(monkeypatch, json.dumps(first, ensure_ascii=False), json.dumps({
+        "entry_fields": [], "sql": "", "metrics": [], "open_questions": [], "uncovered": ["已支付订单数"],
+    }, ensure_ascii=False))
+
+    body = await extract(client, doc, source_id)
+    made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
+    assert made["status"] == "ready" and made["blocks"] == 1 and made["metric_count"] == 1
+    assert made["progress"] == {"round": 2, "covered": 1, "uncovered": 1}
+    assert made["uncovered"] == ["已支付订单数"]
+    async with SessionLocal() as session:
+        row = await session.get(CaliberDraft, body["draft_id"])
+        workflow = await session.get(Workflow, row.workflow_id)
+    assert [n["id"] for n in workflow.graph["nodes"]] == ["start", "fetch", "card", "write", "out"]
+    card = next(n for n in workflow.graph["nodes"] if n["id"] == "card")
+    assert [m["id"] for m in card["data"]["config"]["metrics"]] == ["m1"]
+
+
+async def test_conflicting_entry_fields_across_groups_fail_the_draft_with_a_reason(
+        client, documents, datasource, monkeypatch):
+    """两组都声明 region，但类型对不上：合不成一个入口，build_graph 抛 ValueError，草稿照实记为失败。"""
+    doc = await documents("dd-rounds-clash")
+    source_id = await datasource()
+    first = json.loads(plan_reply(f"{doc}-2"))
+    first["uncovered"] = ["已支付订单数"]
+    second = json.loads(plan_reply(f"{doc}-2"))
+    second["entry_fields"] = [{**second["entry_fields"][0], "type": "integer"}]
+    second["metrics"] = [{**second["metrics"][0], "id": "m2", "name": "已支付订单数",
+                          "expression": "cell(nodes.fetch, 0, 'orders')"}]
+    second["uncovered"] = []
+    fake_model(monkeypatch, json.dumps(first, ensure_ascii=False), json.dumps(second, ensure_ascii=False))
+
+    body = await extract(client, doc, source_id)
+    made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
+    assert made["status"] == "failed" and made["workflow_id"] is None
+    assert "入口字段" in made["error"] and "store" in made["error"]
+    assert made["metric_count"] == 2 and made["progress"] == {"round": 2, "covered": 2, "uncovered": 0}
+    assert any(d["name"] == "入口字段" for d in made["dropped"])
+
+
+async def test_a_real_trial_run_reads_values_from_both_fetch_nodes(client, documents, tmp_path, monkeypatch):
+    """两个取数节点的草稿图真跑一次探针：两条 SQL 各出一个值，卡上两条指标都读得出来（不 mock 试跑）。"""
+    from app.engine.runner import run_manager
+    from tests import ledger_samples as S
+
+    await run_manager.setup()
+    run_id = None
+    try:
+        name = await S.fresh_source(tmp_path / "shop-two.db")
+        async with SessionLocal() as session:
+            row = (await session.execute(select(DataSource).where(DataSource.name == name))).scalar_one()
+            row.schema_cache = {"tables": {"orders": {"columns": [
+                {"name": "status", "type": "TEXT"}, {"name": "region", "type": "TEXT"},
+                {"name": "amount", "type": "REAL"}, {"name": "paid_at", "type": "TEXT"}]}}, "total": 1}
+            await session.commit()
+            source_id = row.id
+        doc = await documents("dd-real-two")
+        fields = [{"name": "region", "type": "string", "required": False, "default": "east",
+                   "description": "区域"}]
+        gmv = json.loads(plan_reply(f"{doc}-2"))
+        gmv.update({"entry_fields": fields, "uncovered": ["已支付订单数"]})
+        gmv["sql"] = ("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' "
+                      "AND region = '{{ input.region }}'")
+        gmv["metrics"][0].update({"expression": "cell(nodes.fetch, 0, 'gmv')", "name": "已支付销售额",
+                                  "unit": "元", "decimals": 2})
+        count = json.loads(plan_reply(f"{doc}-2"))
+        count.update({"entry_fields": fields, "uncovered": []})
+        count["sql"] = ("SELECT COUNT(*) AS orders FROM orders WHERE status = 'paid' "
+                        "AND region = '{{ input.region }}'")
+        count["metrics"] = [{**count["metrics"][0], "id": "m1", "name": "已支付订单数", "unit": "单",
+                             "decimals": 0, "expression": "cell(nodes.fetch, 0, 'orders')"}]
+        fake_model(monkeypatch, json.dumps(gmv, ensure_ascii=False), json.dumps(count, ensure_ascii=False))
+        S.script(monkeypatch, "已支付销售额 [[m:m1]]，已支付订单数 [[m:m2]]。")
+        monkeypatch.setattr(api_ledger, "_run_trial", REAL_RUN_TRIAL)
+
+        draft_id = (await extract(client, doc, source_id))["draft_id"]
+        made = (await client.get(f"/api/ledger/drafts/{draft_id}")).json()
+        assert made["status"] == "ready" and made["trial"]["status"] == "succeeded", made.get("error")
+        run_id = made["trial"]["run_id"]
+
+        trial = (await client.get(f"/api/ledger/drafts/{draft_id}/trial")).json()
+        assert trial["status"] == "succeeded" and trial["error"] == ""
+        assert {m["id"]: float(m["value"]) for m in trial["metrics"]} == {"m1": 156.5, "m2": 4.0}
+        async with SessionLocal() as session:
+            run = await session.get(Run, run_id)
+        tools = [n["id"] for n in (run.graph or {}).get("nodes") or [] if n.get("type") == "tool"]
+        assert tools == ["fetch_1", "fetch_2"], "试跑要把两组取数都带上"
     finally:
         await run_manager.shutdown()
         async with SessionLocal() as session:

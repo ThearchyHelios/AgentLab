@@ -21,8 +21,9 @@
 - POST /api/ledger/drafts/extract、GET /api/ledger/drafts、GET/PATCH /api/ledger/drafts/{id}、POST …/{id}/dismiss、
   POST …/{id}/attach、GET …/{id}/trial（router，搭建者）：从业务文档起草口径。主路径一次到位：模型读文档和数据目录，
   产出定义 + 取数 SQL + 入口字段 + 指标表达式（app/ledger/draftplan.py），服务端校验收成草稿图、建草稿工作流和 v1，
-  后台自动只读试跑；草稿页给「定义 + 数 + 原文引用」。attach 保留为辅助入口：已经有跑对的答案时让它认这份定义
-  （app/ledger/docattach.py）。
+  后台自动只读试跑；草稿页给「定义 + 数 + 原文引用」。模型一轮只起草一组指标，一轮覆盖不完就带着 uncovered 续跑，
+  一组一个取数节点挂到同一张口径卡上（见 _extract_in_background）。attach 保留为辅助入口：已经有跑对的答案时让它认
+  这份定义（app/ledger/docattach.py）。
 这几个新接口都不放给访问密钥（auth/keys.KEY_ROUTES 不登记）。
 """
 from __future__ import annotations
@@ -640,12 +641,86 @@ def _doc_title(docs: list[Document]) -> str:
     return (f"{title}等 {len(docs)} 份文档" if len(docs) > 1 else title)[:200]
 
 
+#: 一次起草最多续跑几轮：模型一轮只给一组指标，文档里的指标分成几组由它自己切，覆盖完就停
+MAX_ROUNDS = 6
+#: 一张草稿图最多收几条指标：再多，一张口径卡和一次试跑都读不动
+MAX_METRICS = 40
+
+
+def _merged_fields(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """各组声明的入口字段按名字合并去重（先出现的为准），给 payload 看：它是整张图的入口。
+
+    建图时 draftplan.build_graph 还会再合一次，并在同名冲突时抛 ValueError；这里只负责让界面看到一份像样的 entry_fields。
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for block in blocks:
+        for field in block.get("entry_fields") or []:
+            if not isinstance(field, dict):
+                continue
+            name = str(field.get("name") or "").strip()
+            if name and name not in merged:
+                merged[name] = dict(field)
+    return list(merged.values())
+
+
+def _fresh_metrics(metrics: list[dict[str, Any]], covered: list[str]) -> list[dict[str, Any]]:
+    """这一轮里还没起草过的指标，按名字认；同一轮重复交同名指标的只留第一条。
+
+    提示词里已经写了「这些起草过、别重复」，但模型偶尔照抄一遍上一轮的指标。照单全收会出现同名两条指标，口径卡上
+    读的是哪条也说不清，所以在这里挡掉。
+    """
+    seen = set(covered)
+    fresh: list[dict[str, Any]] = []
+    for metric in metrics:
+        name = str(metric.get("name") or "").strip()
+        if name:
+            if name in seen:
+                continue
+            seen.add(name)
+        fresh.append(metric)
+    return fresh
+
+
+def _draft_payload(*, entries: list[dict[str, Any]], blocks: list[dict[str, Any]], problems: list[dict[str, Any]],
+                   questions: list[str], uncovered: list[str], progress: dict[str, int],
+                   doc_truncated: bool, catalog_truncated: bool, model_id: str,
+                   salvaged: bool) -> dict[str, Any]:
+    """草稿 payload 的形状：整份指标、各组 SQL、进度。起草中途也按它写回，页面靠 progress 显示第几轮、覆盖了几条。
+
+    blocks 是组数（不是内容）；sql 把各组的取数拼在一起（组间空一行），人看的是「这次一共要跑哪几条」。truncated 仍是
+    doc_truncated 与 catalog_truncated 的「或」，老前端只认这一个键。
+    """
+    return {
+        "documents": entries,
+        "metrics": [m for block in blocks for m in block["metrics"]],
+        "entry_fields": _merged_fields(blocks),
+        "sql": "\n\n".join(str(block["sql"]) for block in blocks),
+        "version": 1,
+        "blocks": len(blocks),
+        "progress": progress,
+        "trial": {"run_id": "", "status": "running", "error": ""},
+        "dropped": problems,
+        "truncated": doc_truncated or catalog_truncated,
+        "doc_truncated": doc_truncated,
+        "catalog_truncated": catalog_truncated,
+        "model_id": model_id,
+        "open_questions": questions,
+        "uncovered": uncovered,
+        "salvaged": salvaged,
+    }
+
+
 async def _extract_in_background(draft_id: str) -> None:
-    """后台起草：读文档的段落和数据目录、调一次模型、校验收成草稿图、建草稿工作流、再跑一次试跑。
+    """后台起草：读文档的段落和数据目录，分组反复调模型直到覆盖完，收成一张多取数的草稿图、建工作流、再跑一次试跑。
 
     用新的会话：请求那一份在响应发出后就关了，后台接着用它写库是错的。没有数据源或没有表结构时起草必须失败——SQL 只能
     对照真实目录写，没有目录就不让模型猜。个别指标不合格只丢那一条、写进 dropped / open_questions；SQL 本身不合格才整份
     失败（图跑不了，留着也没有意义）。
+
+    **为什么一轮接一轮地跑。** 模型一轮只交一组能共用同一条 SQL 的指标（提示词里限 6 条），39 条指标的文档一轮必然覆盖
+    不完。以前只跑一轮，其余全进 uncovered，草稿就停在 6 条。现在把已起草的名字（covered）交回提示词、按 uncovered 续跑，
+    每轮收一组；直到模型不再给出新指标、uncovered 空了、或到轮数/条数上限。每轮都先写一次 payload 的 progress 再
+    commit：一轮要等一次模型调用，页面得能看见进展，而不是停在「起草中」。
     """
     from app.core.artifact_store import graph_hash
     from app.db.models import WorkflowVersion
@@ -692,63 +767,105 @@ async def _extract_in_background(draft_id: str) -> None:
 
         guidance = str(origin.get("guidance") or "")
         alignment: dict[str, list[Any]] = {"new": [], "duplicate": [], "conflict": []}
+        # 每组一组指标：{sql, entry_fields, metrics}，循环结束时拼成一张图
+        blocks: list[dict[str, Any]] = []
+        problems: list[dict[str, Any]] = []
+        covered: list[str] = []
+        questions: list[str] = []
+        uncovered: list[str] = []
+        progress: dict[str, int] = {}
+        diagnostics = ""
+        doc_truncated = False
+        catalog_truncated = False
+        salvaged = False
+        model_id = ""
+
+        def state() -> dict[str, Any]:
+            return _draft_payload(entries=entries, blocks=blocks, problems=problems, questions=questions,
+                                  uncovered=uncovered, progress=progress, doc_truncated=doc_truncated,
+                                  catalog_truncated=catalog_truncated, model_id=model_id, salvaged=salvaged)
+
         try:
-            result = await draftplan.plan(session, docs=entries, chunks=chunks, guidance=guidance,
-                                          datasource=datasource, tables_text=tables_text)
-            plan, problems = draftplan.normalize_plan(result, chunks, allowed_tables=allowed_tables)
-            base = {
-                "documents": entries, "metrics": plan["metrics"], "entry_fields": plan["entry_fields"],
-                "sql": plan["sql"], "version": 1,
-                "trial": {"run_id": "", "status": "running", "error": ""},
-                "dropped": problems, "truncated": result["truncated"], "model_id": result["model_id"],
-                "open_questions": plan["open_questions"], "uncovered": result.get("uncovered") or [],
-                "salvaged": bool(result.get("salvaged")),
-            }
-            if not plan["sql"] or not plan["metrics"]:
+            for rnd in range(1, MAX_ROUNDS + 1):
+                result = await draftplan.plan(session, docs=entries, chunks=chunks, guidance=guidance,
+                                              datasource=datasource, tables_text=tables_text, covered=covered)
+                plan, round_problems = draftplan.normalize_plan(result, chunks, allowed_tables=allowed_tables)
+                fresh = _fresh_metrics(plan["metrics"], covered)
+                if plan["sql"] and fresh:
+                    blocks.append({"sql": plan["sql"], "entry_fields": plan["entry_fields"], "metrics": fresh})
+                    covered += [m["name"] for m in fresh if m.get("name")]
+                problems += round_problems
+                questions += plan["open_questions"]
+                uncovered = list(result.get("uncovered") or [])
+                diagnostics = result.get("diagnostics") or diagnostics
+                doc_truncated = doc_truncated or bool(result.get("doc_truncated"))
+                catalog_truncated = catalog_truncated or bool(result.get("catalog_truncated"))
+                salvaged = salvaged or bool(result.get("salvaged"))
+                model_id = result.get("model_id") or model_id
+                progress = {"round": rnd, "covered": len(covered), "uncovered": len(uncovered)}
+                # 每轮先落一次库：这一轮要等一次模型调用，页面这时就能显示「第几轮、起草了几条、还剩几条」
+                draft.payload = state()
+                await session.commit()
+                if not fresh or not uncovered or len(covered) >= MAX_METRICS:
+                    break
+
+            if not blocks:
                 error = _problems_text(problems) or "模型没有给出可用的取数 SQL 和指标"
-                if result.get("diagnostics"):
-                    error = f"{error}（{result['diagnostics']}）"
-                if plan["open_questions"]:
+                if diagnostics:
+                    error = f"{error}（{diagnostics}）"
+                if questions:
                     # 模型把缺什么说清楚了（目录里没有这些列、业务上还没定）：这是一份要补信息的草稿，不是失败
-                    draft.payload = {**base, "trial": {"run_id": "", "status": "", "error": ""}}
-                    draft.model_id = result["model_id"] or None
+                    draft.payload = {**state(), "trial": {"run_id": "", "status": "", "error": ""}}
+                    draft.model_id = model_id or None
                     draft.error = ""
                     draft.status = "questions_open"
                     await session.commit()
                     return
-                draft.payload = {**base, "trial": {"run_id": "", "status": "failed", "error": error}}
-                draft.model_id = result["model_id"] or None
+                draft.payload = {**state(), "trial": {"run_id": "", "status": "failed", "error": error}}
+                draft.model_id = model_id or None
                 draft.error = error
                 draft.status = "failed"
                 await session.commit()
                 return
+
+            try:
+                graph = draftplan.build_graph(blocks, name=draft.title, question=guidance or draft.title,
+                                              datasource=source.name)
+            except ValueError as e:
+                # 各组声明的入口对不上（同名不同类型 / 必填）：合不成一个入口，整份草稿建不出图，照实记为失败
+                draft.payload = {**state(), "dropped": [*problems, {"name": "入口字段", "reason": str(e)}],
+                                 "trial": {"run_id": "", "status": "failed", "error": str(e)}}
+                draft.model_id = model_id or None
+                draft.error = str(e)
+                draft.status = "failed"
+                await session.commit()
+                return
+
             # 对齐要扫所有已发布口径：某一份读不出来不该让整份草稿失败，照实不做对齐（alignment 三个空列表）
             try:
                 existing = await _published_metrics(session)
             except Exception:  # noqa: BLE001 - 对齐是辅助信息，不是草稿本身
                 logger.exception("读已发布口径失败，草稿 %s 不做对齐", draft_id)
                 existing = []
-            alignment = docdraft.alignment(plan["metrics"], existing)
+            metrics = [m for block in blocks for m in block["metrics"]]
+            alignment = docdraft.alignment(metrics, existing)
 
-            plan["datasource"] = source.name
-            graph = draftplan.build_graph(plan, name=draft.title,
-                                          question=guidance or draft.title)
-            questions = list(plan["open_questions"]) + [
+            asked = list(dict.fromkeys(questions + [
                 f"{p['name']}：{p['reason']}" for p in problems
-                if p.get("name") not in ("sql", "metrics")]
+                if p.get("name") not in ("sql", "metrics")]))
             workflow = Workflow(
                 name=(draft.title.strip() or "文档口径草稿")[:200],
-                description=(f"从业务文档起草的口径：{len(plan['metrics'])} 个指标，取数 SQL 由模型对照数据目录生成，"
-                             f"后台自动只读试运行；人工审改后按受管级别发布"),
+                description=(f"从业务文档起草的口径：{len(metrics)} 个指标、{len(blocks)} 组取数，取数 SQL 由模型对照"
+                             f"数据目录生成，后台自动只读试运行；人工审改后按受管级别发布"),
                 graph=graph, status="draft", tags=["doc_draft"],
                 origin={"kind": "doc_draft", "draft_id": draft.id, "datasource_id": source.id,
                         "documents": [doc.id for doc in docs], "guidance": guidance})
             session.add(workflow)
             await session.flush()
             session.add(WorkflowVersion(workflow_id=workflow.id, version=1, graph=graph,
-                                        graph_hash=graph_hash(graph), note="从业务文档一次生成"))
+                                        graph_hash=graph_hash(graph), note="从业务文档分组生成"))
             payload = {
-                **base, "workflow_id": workflow.id, "open_questions": questions,
+                **state(), "workflow_id": workflow.id, "open_questions": asked,
                 "alignment": alignment,
             }
         except docdraft.DraftUnavailable as e:
@@ -764,11 +881,11 @@ async def _extract_in_background(draft_id: str) -> None:
             return
         draft.payload = payload
         draft.workflow_id = workflow.id
-        draft.model_id = result["model_id"] or None
+        draft.model_id = model_id or None
         draft.error = None
         draft.status = _status_for(payload)
         await session.commit()
-        values = {field["name"]: field.get("default") for field in plan["entry_fields"]
+        values = {field["name"]: field.get("default") for field in _merged_fields(blocks)
                   if field.get("default") not in (None, "")}
 
     try:
