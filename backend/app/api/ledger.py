@@ -641,10 +641,11 @@ def _doc_title(docs: list[Document]) -> str:
     return (f"{title}等 {len(docs)} 份文档" if len(docs) > 1 else title)[:200]
 
 
-#: 一次起草最多续跑几轮：模型一轮只给一组指标，文档里的指标分成几组由它自己切，覆盖完就停
-MAX_ROUNDS = 6
+#: 一次起草最多续跑几轮：模型一轮只给一组指标，文档里的指标分成几组由它自己切，覆盖完就停。
+#: 实测一份 39 条指标的文档，每轮 3–5 条，6 轮只覆盖 22 条，所以放到 10 轮（约 5 分钟）。
+MAX_ROUNDS = 10
 #: 一张草稿图最多收几条指标：再多，一张口径卡和一次试跑都读不动
-MAX_METRICS = 40
+MAX_METRICS = 60
 
 
 def _merged_fields(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
