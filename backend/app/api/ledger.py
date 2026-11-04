@@ -666,6 +666,39 @@ def _entry_notes(blocks: list[dict[str, Any]]) -> list[str]:
     return draftplan.merge_entry_fields(blocks)[1]
 
 
+#: 问题去重时取第一句多长：同一件事每轮换个说法，前面那句「问的是什么」通常一样，后面才是补充
+_QUESTION_KEY = 30
+_CLAUSE = "，,。；;：:！!？?"
+_PUNCT = set(" \t\r\n，。；：、！？,.!?;:'\"（）()[]【】《》<>-_/\\|`~")
+
+
+def _question_key(text: str) -> str:
+    """一句话的「问的是什么」：取第一个分句（问的是同一件事，后面常跟着各轮的补充说明）。"""
+    head = text
+    for mark in _CLAUSE:
+        at = head.find(mark)
+        if at > 0:
+            head = head[:at]
+    return "".join(ch for ch in head if ch not in _PUNCT)[:_QUESTION_KEY]
+
+
+def _merge_questions(kept: list[str], incoming: list[str]) -> list[str]:
+    """跨轮合并未决问题：同一件事每轮都会重新问一遍（68 条里有一半是重复），按归一化后的前 24 个字去重，
+    保留先出现的那一句。措辞不同但意思一样的仍会留下——机器分不出来，交给人决定要不要回。"""
+    seen = {_question_key(q) for q in kept}
+    out = list(kept)
+    for item in incoming:
+        text = item.strip() if isinstance(item, str) else ""
+        if not text:
+            continue
+        key = _question_key(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
 def _fresh_metrics(metrics: list[dict[str, Any]], covered: list[str]) -> list[dict[str, Any]]:
     """这一轮里还没起草过的指标，按名字认；同一轮重复交同名指标的只留第一条。
 
@@ -799,7 +832,7 @@ async def _extract_in_background(draft_id: str) -> None:
                     blocks.append({"sql": plan["sql"], "entry_fields": plan["entry_fields"], "metrics": fresh})
                     covered += [m["name"] for m in fresh if m.get("name")]
                 problems += round_problems
-                questions += plan["open_questions"]
+                questions = _merge_questions(questions, plan["open_questions"])
                 uncovered = list(result.get("uncovered") or [])
                 diagnostics = result.get("diagnostics") or diagnostics
                 doc_truncated = doc_truncated or bool(result.get("doc_truncated"))

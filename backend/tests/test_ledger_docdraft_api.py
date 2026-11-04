@@ -682,3 +682,12 @@ def test_the_schema_text_expands_the_tables_the_document_names_first():
     picked = api_ledger._focus_tables(tables, "指标取自 kpi_info，属性在 attr_info 里")
     assert picked[:2] == ["kpi_info", "attr_info"]
     assert set(picked) >= {"kpi_info", "attr_info"}
+
+
+def test_questions_asked_again_next_round_are_deduped():
+    """同一件事每轮换个说法再问一遍：只留先出现的那一句，别在页面上堆几十条重复问题。"""
+    first = ["文档说明比率类指标可被「配置 → 计算口径」覆盖，要不要读配置？"]
+    again = ["文档说明比率类指标可被「配置 → 计算口径」覆盖，本模板按内置口径起草，是否要读？",
+             "报废模架数需要跨表，关联键未确认"]
+    merged = api_ledger._merge_questions(first, again)
+    assert merged == [first[0], "报废模架数需要跨表，关联键未确认"]
