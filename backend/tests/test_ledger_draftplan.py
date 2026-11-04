@@ -346,3 +346,21 @@ async def test_plan_reports_document_and_catalog_truncation_separately():
     assert result["doc_truncated"] is False
     assert result["catalog_truncated"] is False
     assert result["truncated"] is False
+
+
+async def test_plan_tells_the_model_which_conditions_are_fixed():
+    """固定条件要原样交到模型手里，并明确说「写死在 SQL 里、不要做成入口」。"""
+    model = FakeModel(json.dumps(raw(), ensure_ascii=False))
+    await draftplan.plan(None, docs=[], chunks={}, model=model, fixed="line_code = 'FOAM01'")
+    human = model.messages[-1].content
+    assert "固定条件" in human and "FOAM01" in human
+    assert "不要" in human and "入口" in human
+
+
+def test_too_many_entry_fields_is_reported_not_silently_trimmed():
+    """入口超过 4 个说明把不常变的条件也做成了参数：照实报出来，但不悄悄删（删了 SQL 还引用着）。"""
+    fields = [{"name": "start", "type": "string", "required": True, "default": "2026-09-01"}]
+    fields += [{"name": f"dim{i}", "type": "string", "required": False} for i in range(4)]
+    plan, problems = draftplan.normalize_plan(raw(entry_fields=fields), CHUNKS, allowed_tables={"orders"})
+    assert len(plan["entry_fields"]) == 5
+    assert any(p["name"] == "入口字段" and "上限" in p["reason"] for p in problems)

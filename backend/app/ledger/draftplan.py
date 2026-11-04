@@ -46,7 +46,10 @@ ENTRY_TYPES = ("string", "number", "integer", "boolean")
 #: 指标里固定出现的字段（顺序照接口契约）
 METRIC_FIELDS = ("id", "name", "synonyms", "unit", "decimals", "expression", "definition", "open_questions")
 
-#: SQL 模板里的入口占位符：{{ input.x }}（引号内外都认）
+#: 入口字段最多几个（时间范围占两个）。再多说明把「每次都不变」的条件也做成了参数，
+#: 人每跑一次都要填一遍，口径就没法用了
+MAX_ENTRY_FIELDS = 4
+#: 输入里能出现的入口占位符：{{ input.x }}（引号内外都认）
 _INPUT = re.compile(r"\{\{\s*input\.([A-Za-z_][\w-]*)\s*\}\}")
 #: 口径卡的取值表达式，列名可以用单引号或双引号
 _EXPRESSION = re.compile(r"^cell\(\s*nodes\.fetch\s*,\s*0\s*,\s*['\"]([^'\"]+)['\"]\s*\)$")
@@ -73,6 +76,15 @@ _SYSTEM = """你是业务口径与取数模板的起草助手。读给定的业�
 8. **sql 要短。** 能用 GROUP BY 和聚合表达的，不要为每个属性枚举一长串 CASE WHEN 列；输出额度有限，SQL 写长了，
    后面的指标就写不出来了。
 9. 写不下时宁可少写几条指标、把剩下的写进 uncovered，**也不要让 JSON 半截断掉**。
+10. **同一件事只做一个入口。** 工厂、产线这类维度全图只给一个字段，不要为不同的表各造一个
+    （factory_code / gc_code / scx_code 说的是同一件事）；跨表的编码差异在 sql 里用 JOIN 或子查询映射，
+    不要让填参数的人重复填等价编码。
+11. **编码和主键不当必填入口。** object_id、line_code 这类字段只有业务上确实每次按它跑时才做入口，
+    而且必须是可选（留空不过滤）；人填不出来才能跑的入口，等于这份口径跑不了。
+12. **可选维度要写成「空值不过滤」**：`AND ('{{ input.line_code }}' = '' OR t.line_code = '{{ input.line_code }}')`。
+    不这么写，留空会把结果筛成空。
+13. **入口最多 4 个**，时间范围占两个。再多就把不常变的条件写死在 sql 里（见第 14 条）。
+14. **不常变的条件写进 sql，不做入口**：固定筛选段里给出的取值（工厂、产线、属性组、状态）直接写成常量。
 
 输出格式：
 {
@@ -135,7 +147,7 @@ def _chunk_block(chunk_id: str, chunk: Any) -> str:
 
 
 def _human(docs: list[dict], chunks: Mapping[str, dict], guidance: str, datasource: dict | None,
-           tables_text: str, covered: Sequence[str] = ()) -> str:
+           tables_text: str, covered: Sequence[str] = (), fixed: str = "") -> str:
     parts = ["文档清单：", *(_doc_line(doc) for doc in docs), "",
              "逐段原文（引用时 chunk 写方括号里的 id，quote 逐字抄）："]
     parts.extend(_chunk_block(chunk_id, chunks[chunk_id]) for chunk_id in _order(chunks))
@@ -151,17 +163,20 @@ def _human(docs: list[dict], chunks: Mapping[str, dict], guidance: str, datasour
     names = [name.strip() for name in covered if isinstance(name, str) and name.strip()]
     parts.append("、".join(names) if names else "（无）")
     parts.append("")
+    parts.append("固定条件（这些写死在 sql 里，**不要**做成入口字段）：{}".format(
+        fixed.strip() if fixed and fixed.strip() else "（无）"))
+    parts.append("")
     parts.append("用户补充要求：{}".format(guidance.strip() if guidance and guidance.strip() else "（无）"))
     return "\n".join(parts)
 
 
 def prompt(docs: list[dict], chunks: dict[str, dict], guidance: str = "", datasource: dict | None = None,
-           tables_text: str = "", covered: Sequence[str] = ()) -> list[Any]:
-    """构造 system + human：文档原文 + 数据目录 + 已经起草过的指标。目录是 sql 的唯一依据，和原文一样原样交给模型。"""
+           tables_text: str = "", covered: Sequence[str] = (), fixed: str = "") -> list[Any]:
+    """构造 system + human：文档原文 + 数据目录 + 已经起草过的指标 + 固定条件。目录是 sql 的唯一依据。"""
     from langchain_core.messages import HumanMessage, SystemMessage
 
     return [SystemMessage(content=_SYSTEM),
-            HumanMessage(content=_human(docs, chunks, guidance, datasource, tables_text, covered))]
+            HumanMessage(content=_human(docs, chunks, guidance, datasource, tables_text, covered, fixed))]
 
 
 def _chars(messages: list[Any]) -> int:
@@ -170,7 +185,7 @@ def _chars(messages: list[Any]) -> int:
 
 def _fit(docs: list[dict], chunks: dict[str, dict], guidance: str,
          datasource: dict | None, tables_text: str,
-         covered: Sequence[str] = ()) -> tuple[dict[str, dict], str, bool, bool]:
+         covered: Sequence[str] = (), fixed: str = "") -> tuple[dict[str, dict], str, bool, bool]:
     """把材料压到 MAX_INPUT_CHARS 以内：先截表目录尾部，再从后往前按 chunk 边界丢，最后截仅剩的那一段。
 
     表目录先截：SQL 必须写在目录里的表上，目录比文档的细枝末节更硬；被截掉的是表详情，表名索引还在最前面。
@@ -187,7 +202,7 @@ def _fit(docs: list[dict], chunks: dict[str, dict], guidance: str,
         catalog_truncated = True
 
     def size() -> int:
-        return _chars(prompt(docs, kept, guidance, datasource, tables, covered))
+        return _chars(prompt(docs, kept, guidance, datasource, tables, covered, fixed))
 
     order = _order(kept)
     while size() > MAX_INPUT_CHARS and len(order) > 1:
@@ -243,11 +258,12 @@ def _salvage_reply(text: str) -> dict:
 
 async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guidance: str = "",
                datasource: dict | None = None, tables_text: str = "", model: Any = None,
-               covered: Sequence[str] = ()) -> dict:
+               covered: Sequence[str] = (), fixed: str = "") -> dict:
     """一次模型调用，返回 {entry_fields, sql, metrics, open_questions, model_id, doc_truncated,
     catalog_truncated, truncated}（未校验）。
 
-    covered 是前几轮已经起草过的指标名，写进提示词让模型不要重复；调用方按 uncovered 续跑，直到 covered 不再增长。
+    covered 是前几轮已经起草过的指标名，写进提示词让模型不要重复；fixed 是「每次都不变的条件」（工厂、产线、
+    属性组），提示词要求它写死在 sql 里、不做成入口字段。调用方按 uncovered 续跑，直到 covered 不再增长。
     truncated 仍是两者的「或」，老前端只认这一个键。不落库。model 可注入（测试用假对象：有 async ainvoke(messages)，
     回复有 .content）；不给就按设置解析，模型不可用时抛 docdraft.DraftUnavailable。SQL 的对错、引用能不能核对，交给
     normalize_plan。
@@ -265,8 +281,8 @@ async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guida
         model_id = named if isinstance(named, str) else ""
 
     kept, tables, doc_truncated, catalog_truncated = _fit(docs, chunks, guidance, datasource, tables_text,
-                                                          covered)
-    reply = await model.ainvoke(prompt(docs, kept, guidance, datasource, tables, covered))
+                                                          covered, fixed)
+    reply = await model.ainvoke(prompt(docs, kept, guidance, datasource, tables, covered, fixed))
     text = message_text(reply)
     salvaged = False
     try:
@@ -435,6 +451,11 @@ def normalize_plan(raw: Any, chunks: Mapping[str, dict], *, allowed_tables: set[
     body = raw if isinstance(raw, Mapping) else {}
     problems: list[dict] = []
     entry_fields = _entry_fields(body.get("entry_fields"), problems)
+    if len(entry_fields) > MAX_ENTRY_FIELDS:
+        # 不自动删：入口删了 SQL 还引用着，跑不通。照实说清楚，让人把不常变的条件写成固定条件重起一份
+        problems.append({"name": "入口字段",
+                         "reason": f"入口有 {len(entry_fields)} 个（上限 {MAX_ENTRY_FIELDS}）：同一维度只该有一个，"
+                                   f"不常变的条件应当写死在 sql 里（用「固定条件」重起一份）"})
 
     sql = body.get("sql")
     sql_text = sql.strip() if isinstance(sql, str) else ""

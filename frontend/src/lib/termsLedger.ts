@@ -269,6 +269,10 @@ export const LEDGER_UI = {
     datasourceHint: '取数 SQL 对照这个库的真实表和列写，先探查过表结构才能起草',
     guidance: '起草要求（可选）',
     guidancePlaceholder: '例如：只整理和月度结算有关的指标',
+    fixedFilters: '固定条件（可选）',
+    fixedFiltersHint: '每次运行都不变的条件写死在 SQL 里，不变成入口字段：工厂、产线、属性组这类编码都放这里。'
+      + '入口只留时间范围，最多再一个业务维度',
+    fixedFiltersPlaceholder: "例如：line_code = 'FOAM01'、attribute_group = 'OEE'",
     submit: '开始起草',
     submitting: '正在发起…',
     needDoc: '请至少选一份文档',

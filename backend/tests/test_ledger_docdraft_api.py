@@ -736,3 +736,25 @@ async def test_running_the_trial_with_inputs_typed_on_the_page(client, documents
     res = await client.post(f"/api/ledger/drafts/{body['draft_id']}/trial", json={"inputs": {"start": "2026-01-01"}})
     assert res.status_code == 200, res.text
     assert seen["start"] == "2026-01-01"
+
+
+async def test_extract_hands_the_fixed_filters_to_every_round(client, documents, datasource, monkeypatch):
+    """固定条件（工厂、产线、属性组）要交给模型写死在 SQL 里，不做成入口字段。"""
+    from app.ledger import draftplan
+
+    doc = await documents("dd-fixed")
+    source_id = await datasource()
+    fake_model(monkeypatch, plan_reply(f"{doc}-2"))
+    seen: dict[str, object] = {}
+    real_plan = draftplan.plan
+
+    async def spy(session, **kwargs):
+        seen.update(kwargs)
+        return await real_plan(session, **kwargs)
+
+    monkeypatch.setattr(draftplan, "plan", spy)
+    body = await client.post("/api/ledger/drafts/extract", json={
+        "documents": [doc], "datasource_id": source_id, "fixed_filters": "line_code = 'FOAM01'"})
+    made = (await client.get(f"/api/ledger/drafts/{body.json()['draft_id']}")).json()
+    assert made["workflow_id"]
+    assert seen["fixed"] == "line_code = 'FOAM01'"

@@ -64,8 +64,10 @@ export const caliberLedger = {
    */
   runDraftTrial: (draftId: string, inputs: Record<string, unknown>) =>
     post<DraftTrialOut>(`${draftAt(draftId)}/trial`, { inputs }),
-  /** 选文档发起起草：documents 是要用的知识库文档 id，guidance 是给模型看的附加要求 */
-  extractDraft: (body: { documents: string[]; collection?: string; datasource_id?: string; guidance?: string }) =>
+  /** 选文档发起起草：documents 是要用的知识库文档 id，guidance 是给模型看的附加要求，
+   *  fixed_filters 是每次跑都不变的条件（工厂、产线、属性组），服务端要求写死在 SQL 里、不做成入口字段 */
+  extractDraft: (body: { documents: string[]; collection?: string; datasource_id?: string; guidance?: string;
+    fixed_filters?: string }) =>
     post<{ draft_id: string; status: string }>('/ledger/drafts/extract', body),
   /**
    * 改标题、整体换掉指标、或把答清的问题消掉（resolved 是问题原文）。服务端据此重算状态：还有问题 → questions_open，

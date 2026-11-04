@@ -188,6 +188,8 @@ export function CaliberDrafts() {
   const [pickedDocs, setPickedDocs] = useState<string[]>([])
   const [datasourceId, setDatasourceId] = useState('')
   const [guidance, setGuidance] = useState('')
+  /** 每次跑都不变的条件（工厂、产线、属性组）：要求写死在 SQL 里，不做成入口字段 */
+  const [fixedFilters, setFixedFilters] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
   const [pickedQuestions, setPickedQuestions] = useState<string[]>([])
@@ -404,10 +406,12 @@ export function CaliberDrafts() {
         documents: pickedDocs,
         ...(datasourceId ? { datasource_id: datasourceId } : {}),
         ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
+        ...(fixedFilters.trim() ? { fixed_filters: fixedFilters.trim() } : {}),
       })
       toast.ok(D.started)
       setPickedDocs([])
       setGuidance('')
+      setFixedFilters('')
       setDatasourceId('')
       setFilter('')
       loadList()
@@ -977,6 +981,13 @@ export function CaliberDrafts() {
                   <span className="mb-0.5 block font-semibold text-dim">{D.guidance}</span>
                   <textarea className="field min-h-[64px] w-full text-xs" rows={3} value={guidance}
                             placeholder={D.guidancePlaceholder} onChange={(e) => setGuidance(e.target.value)} />
+                </label>
+                <label className="block text-2xs text-faint">
+                  <span className="mb-0.5 block font-semibold text-dim">{D.fixedFilters}</span>
+                  <textarea className="field min-h-[52px] w-full text-xs" rows={2} value={fixedFilters}
+                            placeholder={D.fixedFiltersPlaceholder} data-draft-fixed-filters=""
+                            onChange={(e) => setFixedFilters(e.target.value)} />
+                  <span className="mt-0.5 block">{D.fixedFiltersHint}</span>
                 </label>
                 <button type="button" className="btn btn-primary btn-sm" disabled={submitting || !datasourceId}
                         onClick={() => void submit()} data-draft-submit="">

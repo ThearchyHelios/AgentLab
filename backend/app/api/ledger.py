@@ -813,6 +813,7 @@ async def _extract_in_background(draft_id: str) -> None:
         datasource = {"name": source.name, "type": source.kind, "description": source.description}
 
         guidance = str(origin.get("guidance") or "")
+        fixed_filters = str(origin.get("fixed_filters") or "")
         alignment: dict[str, list[Any]] = {"new": [], "duplicate": [], "conflict": []}
         # 每组一组指标：{sql, entry_fields, metrics}，循环结束时拼成一张图
         blocks: list[dict[str, Any]] = []
@@ -835,7 +836,8 @@ async def _extract_in_background(draft_id: str) -> None:
         try:
             for rnd in range(1, MAX_ROUNDS + 1):
                 result = await draftplan.plan(session, docs=entries, chunks=chunks, guidance=guidance,
-                                              datasource=datasource, tables_text=tables_text, covered=covered)
+                                              datasource=datasource, tables_text=tables_text, covered=covered,
+                                              fixed=fixed_filters)
                 plan, round_problems = draftplan.normalize_plan(result, chunks, allowed_tables=allowed_tables)
                 fresh = _fresh_metrics(plan["metrics"], covered)
                 if plan["sql"] and fresh:
@@ -951,12 +953,17 @@ def _problems_text(problems: list[dict[str, Any]]) -> str:
 
 
 class DraftExtractIn(BaseModel):
-    """从哪几份文档起草、起草时给模型看的附加要求。数据源必须给：它的表结构和目录是 SQL 的唯一依据。"""
+    """从哪几份文档起草、起草时给模型看的附加要求。数据源必须给：它的表结构和目录是 SQL 的唯一依据。
+
+    fixed_filters 是「每次跑都不变的条件」（工厂、产线、属性组）：写死在 SQL 里，不做成入口字段。
+    入口只留「每次跑都可能不同」的东西（时间范围，最多再一个业务维度），否则每问一次数都要填一遍编码。
+    """
 
     documents: list[str] = Field(min_length=1, max_length=20)
     collection: str | None = Field(default=None, max_length=100)
     datasource_id: str | None = Field(default=None, max_length=32)
     guidance: str = Field(default="", max_length=2000)
+    fixed_filters: str = Field(default="", max_length=1000)
 
 
 @router.post("/drafts/extract", status_code=201)
@@ -989,7 +996,8 @@ async def draft_extract(payload: DraftExtractIn, background: BackgroundTasks,
     draft = CaliberDraft(title=_doc_title(docs),
                          collection=payload.collection or (docs[0].collection or "default"),
                          datasource_id=payload.datasource_id or None, status="drafting", payload={},
-                         origin={"documents": doc_ids, "guidance": payload.guidance.strip()},
+                         origin={"documents": doc_ids, "guidance": payload.guidance.strip(),
+                                 "fixed_filters": payload.fixed_filters.strip()},
                          created_by=current_principal().username)
     session.add(draft)
     await session.commit()
